@@ -327,7 +327,9 @@ def test_glm5next_rejects_unaligned_fresh_prefix(
     ):
         state.add_request(
             3,
-            SimpleNamespace(num_computed_tokens=prefix_length),
+            SimpleNamespace(
+                num_computed_tokens=prefix_length, boundary_checkpoint=None
+            ),
         )
 
     assert calls == []
@@ -342,7 +344,9 @@ def test_glm5next_accepts_pool_aligned_fresh_prefix(monkeypatch) -> None:
         lambda self, req_index, new_req_data: calls.append(req_index),
     )
 
-    state.add_request(3, SimpleNamespace(num_computed_tokens=4))
+    state.add_request(
+        3, SimpleNamespace(num_computed_tokens=4, boundary_checkpoint=None)
+    )
 
     assert calls == [3]
     assert state.selector_state_is_fresh_gpu[3]
