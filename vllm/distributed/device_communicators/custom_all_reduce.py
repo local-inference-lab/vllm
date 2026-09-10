@@ -258,17 +258,66 @@ class CustomAllreduce:
             self.close()
             self.disabled = True
 
+    def _all_ranks_agree(self, ok: bool) -> bool:
+        """Reduce a per-rank boolean with MIN over the (CPU) group.
+
+        The symmetric-memory rendezvous and the barrier in
+        ``_init_mnnvl_buffer`` are collectives. A rank that fails a local step
+        must not enter them alone, and a rank that succeeds must not enter them
+        while a peer has already given up, or the group hangs at start-up.
+        Every collective there is therefore preceded by a vote so all ranks
+        take the same branch.
+
+        Args:
+            ok: Whether the local step succeeded on this rank.
+
+        Returns:
+            True when every rank in the group reported success.
+        """
+        vote = torch.tensor([1 if ok else 0], dtype=torch.int32)
+        dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=self.group)
+        return bool(vote.item())
+
     def _init_mnnvl_buffer(self, stage_size: int) -> None:
+        """Set up the MNNVL Lamport all-gather/reduce-scatter staging buffer.
+
+        Allocates a symmetric-memory buffer, performs the rendezvous, registers
+        the peer buffers and publishes the ``mnnvl_*`` attributes. Each
+        collective step is gated by a rank-wide vote so that a failure on any
+        rank makes every rank skip the remaining steps together.
+
+        Args:
+            stage_size: Bytes reserved per Lamport stage; the buffer holds six
+                stages (three for all-gather and three for reduce-scatter).
+        """
         if torch_symm_mem is None or not current_platform.is_cuda():
             return
+        buffer_size = stage_size * 6
+        buffer = None
         try:
-            buffer_size = stage_size * 6
             buffer = torch_symm_mem.empty(
                 buffer_size, dtype=torch.uint8, device=self.device
             )
+        except RuntimeError as error:
+            logger.debug(
+                "MNNVL AG/RS buffer allocation failed on rank %d: %s",
+                self.rank,
+                error,
+            )
+        if not self._all_ranks_agree(buffer is not None):
+            return
+        handle = None
+        try:
             handle = torch_symm_mem.rendezvous(buffer, self.group.group_name)
-            if handle.multicast_ptr == 0:
-                return
+        except RuntimeError as error:
+            logger.debug(
+                "MNNVL AG/RS rendezvous failed on rank %d: %s", self.rank, error
+            )
+        if not self._all_ranks_agree(handle is not None and handle.multicast_ptr != 0):
+            return
+        assert handle is not None
+        ready = False
+        try:
             peer_buffers = [
                 handle.get_buffer(
                     peer,
@@ -293,23 +342,28 @@ class CustomAllreduce:
                 device=self.device,
             )
             torch.accelerator.synchronize()
-            dist.barrier(group=self.group)
-
-            self.mnnvl_buffer = buffer
-            self.mnnvl_handle = handle
-            self.mnnvl_peer_buffers = peer_buffers
-            self.mnnvl_multicast_ptr = handle.multicast_ptr
-            self.mnnvl_buffer_size = stage_size
-            self.mnnvl_lamport_ag_local_ptr = lamport_ag_ptrs[self.rank]
-            self.mnnvl_lamport_ag_multicast_ptr = (
-                handle.multicast_ptr + lamport_ag_offset
-            )
-            self.mnnvl_lamport_rs_local_ptr = lamport_rs_ptrs[self.rank]
-            self.mnnvl_lamport_epochs = epochs
-            self.mnnvl_lamport_ag_epoch_ptr = epochs[0].data_ptr()
-            self.mnnvl_lamport_rs_epoch_ptr = epochs[1].data_ptr()
+            ready = True
         except RuntimeError as error:
-            logger.debug("MNNVL AG/RS initialization failed: %s", error)
+            logger.debug(
+                "MNNVL AG/RS buffer registration failed on rank %d: %s",
+                self.rank,
+                error,
+            )
+        if not self._all_ranks_agree(ready):
+            return
+        dist.barrier(group=self.group)
+
+        self.mnnvl_buffer = buffer
+        self.mnnvl_handle = handle
+        self.mnnvl_peer_buffers = peer_buffers
+        self.mnnvl_multicast_ptr = handle.multicast_ptr
+        self.mnnvl_buffer_size = stage_size
+        self.mnnvl_lamport_ag_local_ptr = lamport_ag_ptrs[self.rank]
+        self.mnnvl_lamport_ag_multicast_ptr = handle.multicast_ptr + lamport_ag_offset
+        self.mnnvl_lamport_rs_local_ptr = lamport_rs_ptrs[self.rank]
+        self.mnnvl_lamport_epochs = epochs
+        self.mnnvl_lamport_ag_epoch_ptr = epochs[0].data_ptr()
+        self.mnnvl_lamport_rs_epoch_ptr = epochs[1].data_ptr()
 
     @contextmanager
     def capture(self):
