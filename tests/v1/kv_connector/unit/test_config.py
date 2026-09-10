@@ -105,8 +105,20 @@ def _build_config(
     enable_sleep_mode: bool = False,
     enable_cumem_allocator: bool = False,
 ) -> VllmConfig:
-    """Build a VllmConfig that exercises _verify_kv_transfer_compat without
-    requiring a real model (avoids HF downloads in CI)."""
+    """Build a model-free config for KV-transfer compatibility checks.
+
+    Args:
+        kv_connector: KV connector name, or None to disable KV transfer.
+        kv_connector_extra_config: Optional connector-specific configuration.
+        enable_sleep_mode: Whether sleep mode is enabled.
+        enable_cumem_allocator: Whether the cuMem allocator is enabled.
+
+    Returns:
+        A VllmConfig suitable for exercising KV-transfer compatibility checks.
+
+    Raises:
+        ValueError: If the requested KV-transfer configuration is incompatible.
+    """
     from types import SimpleNamespace
 
     kv_transfer_config = (
