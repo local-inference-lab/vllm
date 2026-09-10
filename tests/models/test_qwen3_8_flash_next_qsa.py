@@ -475,7 +475,7 @@ def test_qsa_prefill_context_capacities_cover_the_configured_limit() -> None:
 
 @pytest.mark.parametrize("max_tokens", [4, 10])
 @pytest.mark.parametrize("draft", [False, True])
-def test_qsa_warmup_runs_every_context_with_only_padded_requests(
+def test_qsa_warmup_prewarms_prefill_and_runs_padded_decode(
     monkeypatch, max_tokens, draft
 ) -> None:
     caps = SimpleNamespace(
@@ -514,6 +514,11 @@ def test_qsa_warmup_runs_every_context_with_only_padded_requests(
     )
     calls = []
 
+    def prewarm(binding, *, rows):
+        assert any(binding is context for context in contexts)
+        assert rows == max_tokens - 2
+        calls.append((binding, rows))
+
     def run(binding, **inputs):
         rows = inputs["query"].shape[0]
         calls.append((binding, rows))
@@ -533,7 +538,9 @@ def test_qsa_warmup_runs_every_context_with_only_padded_requests(
     monkeypatch.setattr(
         qsa_module,
         "get_b12x_qsa",
-        lambda: SimpleNamespace(run=run, DraftSelectionReuse=SimpleNamespace),
+        lambda: SimpleNamespace(
+            run=run, prewarm=prewarm, DraftSelectionReuse=SimpleNamespace
+        ),
     )
     unit = qsa_module._B12xQSAWarmup().get_b12x_warmup_unit(
         layer, (1, 4, 8), torch.bfloat16

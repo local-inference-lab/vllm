@@ -809,6 +809,11 @@ class DeepseekV4MoE(nn.Module):
             output_size=config.n_routed_experts,
             bias=False,
             out_dtype=torch.float32,
+            params_dtype=(
+                torch.float32
+                if getattr(config, "router_dtype", None) == "float32"
+                else None
+            ),
             prefix=f"{prefix}.gate",
         )
 

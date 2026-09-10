@@ -133,6 +133,7 @@ class KVCacheSpecKind(str, Enum):
     SLIDING_WINDOW = "sliding_window"
     SLIDING_WINDOW_MLA = "sliding_window_mla"
     MAMBA = "mamba"
+    CIRCULAR_BUFFER = "circular_buffer"
     CHUNKED_LOCAL_ATTENTION = "chunked_local_attention"
     SINK_FULL_ATTENTION = "sink_full_attention"
     ENCODER_ONLY_ATTENTION = "encoder_only_attention"
@@ -148,6 +149,10 @@ class KVCacheSpec:
 
     # number of tokens in a block
     block_size: int
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return True
 
     @property
     def num_heads(self) -> int:
@@ -781,6 +786,28 @@ class SlidingWindowSpec(AttentionSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class CircularBufferSpec(AttentionSpec):
+    """One private, fixed-capacity state block for each request."""
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        return self.page_size_bytes
+
+    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
+        return 1
+
+    def is_uniform_with_collection(
+        self, kv_cache_specs: dict[str, KVCacheSpec]
+    ) -> bool:
+        return all(
+            isinstance(spec, CircularBufferSpec) for spec in kv_cache_specs.values()
+        )
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return False
+
+
+@dataclass(frozen=True, kw_only=True)
 class SlidingWindowMLASpec(SlidingWindowSpec):
     """Sliding window attention with MLA cache format."""
 
@@ -793,7 +820,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     head_size_v: int = 0
 
     def __post_init__(self):
-        assert self.model_version in (None, "deepseek_v4"), (
+        assert self.model_version in (None, "deepseek_v4", "deepseek_v41"), (
             f"Unsupported model version: {self.model_version}"
         )
         super().__post_init__()
@@ -1037,6 +1064,10 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     kv_cache_specs: dict[str, KVCacheSpec]
 
     @property
+    def prefix_cacheable(self) -> bool:
+        return all(spec.prefix_cacheable for spec in self.kv_cache_specs.values())
+
+    @property
     def page_size_bytes(self) -> int:
         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
 
@@ -1169,6 +1200,8 @@ def get_kv_cache_spec_kind(kv_cache_spec: KVCacheSpec) -> KVCacheSpecKind:
         return KVCacheSpecKind.CHUNKED_LOCAL_ATTENTION
     if isinstance(kv_cache_spec, SlidingWindowSpec):
         return KVCacheSpecKind.SLIDING_WINDOW
+    if isinstance(kv_cache_spec, CircularBufferSpec):
+        return KVCacheSpecKind.CIRCULAR_BUFFER
     if isinstance(kv_cache_spec, MambaSpec):
         return KVCacheSpecKind.MAMBA
     if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):

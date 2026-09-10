@@ -601,6 +601,8 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
     # Whether all step-dependent draft decode metadata can be updated in place,
     # allowing one metadata build to be reused across autoregressive draft steps.
     supports_draft_decode_metadata_update: bool = False
+    # Variable-length decode can be graph-safe without graph-safe mixed prefill.
+    supports_varlen_decode_cudagraph: ClassVar[bool] = False
 
     @abstractmethod
     def __init__(

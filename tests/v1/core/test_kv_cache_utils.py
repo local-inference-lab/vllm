@@ -2718,6 +2718,60 @@ def test_dflash_draft_cache_partition_is_pp1_only():
             assert any(set(group.layer_names) == draft_names for group in groups)
 
 
+def test_glm_dspark_cache_groups_preserve_recurrent_target_and_draft_layers():
+    mamba = MambaSpec(
+        block_size=256,
+        shapes=((18432,),),
+        dtypes=(torch.bfloat16,),
+        mamba_cache_mode="align",
+    )
+    mla = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        model_version="glm5_next",
+    )
+    draft = SlidingWindowMLASpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=584,
+        dtype=torch.uint8,
+        sliding_window=192,
+    )
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        speculative_config=SimpleNamespace(
+            method="dspark",
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(model_type="glm53_dspark")
+            ),
+        ),
+        model_config=SimpleNamespace(get_num_layers=lambda _parallel_config: 4),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+    )
+    specs = {
+        **{f"model.layers.{i}.linear_attn": mamba for i in range(3)},
+        "model.layers.3.self_attn": mla,
+        "model.layers.4.attn.swa_cache": draft,
+        "model.layers.5.attn.swa_cache": draft,
+    }
+
+    groups = get_kv_cache_groups(config, dict(specs))
+
+    assigned = [name for group in groups for name in group.layer_names]
+    assert len(assigned) == len(specs)
+    assert set(assigned) == set(specs)
+    draft_group = next(
+        g for g in groups if "model.layers.4.attn.swa_cache" in g.layer_names
+    )
+    assert set(draft_group.layer_names) == {
+        "model.layers.4.attn.swa_cache",
+        "model.layers.5.attn.swa_cache",
+    }
+    assert draft_group.kv_cache_spec == draft
+
+
 def test_hidden_state_group_preserves_hybrid_prefix_cache_granularity():
     block_size = 544
     full_spec = FullAttentionSpec(

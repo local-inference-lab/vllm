@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from importlib import import_module
 from itertools import islice
 
@@ -79,7 +79,20 @@ from .hyperconnection import (
     HyperConnectionConfig,
     HyperConnectionWorkspace,
 )
-from .ple_layer import Qwen3_8FlashNextPLELayer
+from .ple_layer import Qwen3_8FlashNextPLELayer, _resolve_ple_table_memory
+
+
+def _is_file_backed_ple_weight(name: str) -> bool:
+    _, marker, shard_suffix = name.rpartition(
+        ".ple.ple_embedding.ngram_embedding.shard_"
+    )
+    shard_index, separator, suffix = shard_suffix.partition(".")
+    return bool(
+        marker
+        and separator
+        and shard_index.isdigit()
+        and suffix in {"weight", "weight_scale"}
+    )
 
 
 def _remap_qsa_cache_scale_name(name: str, qsa_layer_ids: frozenset[int]) -> str:
@@ -174,7 +187,6 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
-                prefer_b12x_gdn_decode=True,
                 overlap_input_projections=envs.VLLM_QWEN3_8_FLASH_NEXT_OVERLAP,
             )
         elif layer_type == "full_attention":
@@ -464,7 +476,10 @@ class Qwen3_8FlashNextModel(nn.Module):
                 and ngram_context is not None
             ):
                 next_ple = self.layers[layer_idx + 1].ple
-                if next_ple is not None:
+                if (
+                    next_ple is not None
+                    and not next_ple.ple_embedding.requires_disk_preparation
+                ):
                     next_ple.ple_embedding.prefetch(
                         input_ids, query_start_loc, ngram_context
                     )
@@ -711,6 +726,16 @@ class Qwen3_8FlashNextForCausalLM(
         positions = torch.arange(len(input_tokens), dtype=torch.long)
         return positions.unsqueeze(0).expand(3, -1), 0
 
+    @property
+    def checkpoint_file_weight_filter(self) -> Callable[[str], bool] | None:
+        if (
+            self.config.ple_layer_ids
+            and _resolve_ple_table_memory(self.vllm_config.additional_config)
+            == "io_uring"
+        ):
+            return _is_file_backed_ple_weight
+        return None
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
@@ -812,6 +837,10 @@ class Qwen3_8FlashNextForConditionalGeneration(
             self.language_model.make_empty_intermediate_tensors
         )
         self.set_moe_parameters(self.language_model.model.layers)
+
+    @property
+    def checkpoint_file_weight_filter(self) -> Callable[[str], bool] | None:
+        return self.language_model.checkpoint_file_weight_filter
 
     def embed_input_ids(
         self,

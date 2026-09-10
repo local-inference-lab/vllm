@@ -27,7 +27,7 @@ from typing import Any
 
 import torch
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
@@ -85,6 +85,25 @@ class DSparkSpeculator(DFlashSpeculator):
         self.enable_adaptive_verification = (
             self.speculative_config.enable_adaptive_verification
         )
+
+    @property
+    def attn_vllm_config(self) -> VllmConfig:
+        config = super().attn_vllm_config
+        if self.draft_model_config.hf_config.model_type != "glm53_dspark":
+            return config
+        # The draft's sliding-window MLA geometry differs from the GLM verifier.
+        config.model_config = self.draft_model_config
+        config.quant_config = None
+        config.attention_config = replace(
+            config.attention_config,
+            backend=self.speculative_config.attention_backend,
+        )
+        if self.speculative_config.kv_cache_dtype is not None:
+            config.cache_config = replace(
+                config.cache_config,
+                cache_dtype=self.speculative_config.kv_cache_dtype,
+            )
+        return config
 
     def load_draft_model(
         self,

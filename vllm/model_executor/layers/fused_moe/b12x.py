@@ -333,6 +333,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             w2_global_scale=w2_global_scale,
             a2_gscale=a2_gscale,
             params_dtype=params_dtype,
+            # Loaded inference scales remain constant for this prepared owner
+            # and its CUDA graphs; reloading constructs another owner.
+            immutable_input_scales=True,
         )
 
     def _refresh_quant_config(self, layer: torch.nn.Module) -> None:

@@ -351,19 +351,30 @@ def test_compilation_config():
     )
 
 
-def test_gdn_decode_kernel():
+@pytest.mark.parametrize(
+    "flag,field,backends",
+    [
+        ("--gdn-decode-kernel", "gdn_decode_kernel", ("b12x", "cuda", "triton")),
+        (
+            "--gdn-prefill-backend",
+            "gdn_prefill_backend",
+            ("b12x", "flashinfer", "triton", "cutedsl"),
+        ),
+    ],
+)
+def test_gdn_backend_selection_args(flag, field, backends):
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
 
     args = parser.parse_args([])
-    assert EngineArgs.from_cli_args(args).gdn_decode_kernel is None
+    assert getattr(EngineArgs.from_cli_args(args), field) is None
 
-    for kernel in ("b12x", "cuda", "triton"):
-        args = parser.parse_args(["--gdn-decode-kernel", kernel])
-        assert EngineArgs.from_cli_args(args).gdn_decode_kernel == kernel
+    for backend in backends:
+        args = parser.parse_args([flag, backend])
+        assert getattr(EngineArgs.from_cli_args(args), field) == backend
 
     parser.exit_on_error = False
     with pytest.raises(ArgumentError):
-        parser.parse_args(["--gdn-decode-kernel", "invalid"])
+        parser.parse_args([flag, "invalid"])
 
 
 def test_attention_config():

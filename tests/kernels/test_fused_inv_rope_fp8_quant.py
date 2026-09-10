@@ -21,6 +21,7 @@ Usage:
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from vllm.models.deepseek_v4.common.ops import fused_inv_rope_fp8_quant
 
@@ -150,6 +151,91 @@ def reference_inv_rope(
     o_rot = o_rot_f32.to(o.dtype)
 
     return torch.cat([o_pass, o_rot], dim=-1)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("tokens", [1, 7, 28])
+@pytest.mark.parametrize("backend", ["shared", "b12x"])
+def test_bf16_output_projection_preserves_rotary_and_grouped_weights(
+    device, tokens, backend
+):
+    from types import SimpleNamespace
+
+    from vllm.models.deepseek_v4.nvidia.b12x import DeepseekV4B12xAttention
+    from vllm.models.deepseek_v4.nvidia.ops.o_proj import deep_gemm_fp8_o_proj
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    torch.manual_seed(42)
+    groups, heads, width, rank, hidden = 2, 4, 512, 32, 64
+    o = torch.randn(tokens, heads, width, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(tokens, device=device) + 17
+    cache = make_cos_sin_cache(tokens + 17, device=device)
+    wo_a = torch.nn.Linear(
+        heads * width // groups,
+        groups * rank,
+        bias=False,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    wo_b = torch.nn.Linear(
+        groups * rank, hidden, bias=False, dtype=torch.bfloat16, device=device
+    )
+    with torch.no_grad():
+        rotated = reference_inv_rope(o, positions, cache).view(tokens, groups, -1)
+        weight = wo_a.weight.view(groups, rank, -1)
+        projected = torch.stack(
+            [F.linear(rotated[:, i], weight[i]) for i in range(groups)], 1
+        )
+        expected = wo_b(projected.flatten(1))
+        if backend == "b12x":
+            attention = SimpleNamespace(
+                wo_a=wo_a,
+                wo_b=wo_b,
+                rotary_emb=SimpleNamespace(cos_sin_cache=cache),
+                n_local_groups=groups,
+                nope_head_dim=448,
+                o_lora_rank=rank,
+                _b12x_wo_projection_weights=None,
+            )
+            DeepseekV4B12xAttention.setup_b12x_wo_projection(attention)
+
+            def run():
+                return DeepseekV4B12xAttention._o_proj(attention, o, positions)
+        else:
+
+            def run():
+                return deep_gemm_fp8_o_proj(
+                    o,
+                    positions,
+                    cache,
+                    wo_a,
+                    wo_b,
+                    n_groups=groups,
+                    heads_per_group=heads // groups,
+                    nope_dim=448,
+                    rope_dim=64,
+                    o_lora_rank=rank,
+                    einsum_recipe=(1, 1, 128),
+                    tma_aligned_scales=True,
+                )
+
+        actual = run()
+        torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.004)
+        if device == "cuda":
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    run()
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = run()
+            o.normal_()
+            expected = run()
+            graph.replay()
+            torch.testing.assert_close(captured, expected, atol=0, rtol=0)
 
 
 def _ref_ue8m0_quant_block(x_f32: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

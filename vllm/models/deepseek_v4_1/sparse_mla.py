@@ -1,0 +1,293 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Byte-exact V4.1 cache metadata. No foreign attention scheduler is involved."""
+
+from dataclasses import dataclass
+from typing import ClassVar
+
+import torch
+
+from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backend import (
+    AttentionBackend,
+    AttentionCGSupport,
+    AttentionMetadataBuilder,
+    CommonAttentionMetadata,
+    MultipleOf,
+)
+from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheLayout
+
+
+@triton.jit(do_not_specialize=["nr", "nt"])
+def _requests(
+    Starts, Seq, OutStarts, Pos, Counts, nr, nt, R: tl.constexpr, B: tl.constexpr
+):
+    r = tl.program_id(0) * B + tl.arange(0, B)
+    start = tl.load(Starts + r, r <= nr, other=nt)
+    end = tl.load(Starts + r + 1, r < nr, other=nt)
+    seq = tl.load(Seq + r, r < nr, other=0)
+    tl.store(OutStarts + r, start, r <= R)
+    tl.store(Pos + r, tl.where(r < nr, seq - (end - start), -1), r < R)
+    if tl.program_id(0) == 0:
+        tl.store(Counts, nt)
+        tl.store(Counts + 1, nr)
+
+
+@triton.jit(do_not_specialize=["nr", "nt", "stride", "table_width"])
+def _tokens(
+    Starts,
+    Seq,
+    Table,
+    InputSlots,
+    Positions,
+    Reqs,
+    Slots,
+    Visible,
+    nr,
+    nt,
+    stride,
+    table_width,
+    T: tl.constexpr,
+    PAGE: tl.constexpr,
+    RATIO: tl.constexpr,
+    B: tl.constexpr,
+    CIRCULAR: tl.constexpr = False,
+):
+    t = tl.program_id(0) * B + tl.arange(0, B)
+    lo = tl.full((B,), 0, tl.int32)
+    hi = tl.full((B,), nr, tl.int32)
+    while tl.sum((lo < hi).to(tl.int32), 0) > 0:
+        mid = (lo + hi) // 2
+        end = tl.load(Starts + mid + 1, mid < nr, other=nt)
+        right = end <= t
+        active = lo < hi
+        lo = tl.where(active & right, mid + 1, lo)
+        hi = tl.where(active & ~right, mid, hi)
+    valid = (t < nt) & (lo < nr)
+    start = tl.load(Starts + lo, valid, other=0)
+    end = tl.load(Starts + lo + 1, valid, other=0)
+    seq = tl.load(Seq + lo, valid, other=0)
+    pos = seq.to(tl.int64) - (end - start) + t - start
+    input_slot = tl.load(InputSlots + t, t < nt, other=-1)
+    valid = valid & (pos >= 0) & (input_slot >= 0)
+    logical = pos // RATIO
+    if CIRCULAR:
+        page_col = tl.full((B,), 0, tl.int64)
+    else:
+        page_col = logical // PAGE
+    valid = valid & (page_col < table_width)
+    block = tl.load(Table + lo.to(tl.int64) * stride + page_col, valid, other=0).to(
+        tl.int64
+    )
+    valid = valid & (block > 0)
+    slot = block * PAGE + logical % PAGE
+    emit = valid & ((pos + 1) % RATIO == 0)
+    if CIRCULAR:
+        # Only the final capacity rows may write: earlier rows would race
+        # later writers to the same ring slots during a long prefill.
+        emit = emit & (t >= end - PAGE)
+    tl.store(Positions + t, tl.where(valid, pos, -1), t < T)
+    tl.store(Reqs + t, tl.where(valid, lo, -1), t < T)
+    tl.store(Slots + t, tl.where(emit, slot, -1), t < T)
+    tl.store(Visible + t, tl.where(valid, (pos + 1) // RATIO, 0), t < T)
+
+
+@triton.jit(do_not_specialize=["offset", "table_stride"])
+def _chunk(
+    Positions,
+    Reqs,
+    Table,
+    Swa,
+    Lengths,
+    TopLengths,
+    Visible,
+    Starts,
+    RequestPositions,
+    offset,
+    table_stride,
+    PAGE: tl.constexpr,
+    WINDOW: tl.constexpr,
+    WIDTH: tl.constexpr,
+    DRAFT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.arange(0, BLOCK)
+    req = tl.load(Reqs + offset + row)
+    pos = tl.load(Positions + offset + row)
+    if DRAFT:
+        first = tl.load(Starts + req, req >= 0, other=0)
+        end = tl.load(Starts + req + 1, req >= 0, other=0)
+        prefix = tl.load(RequestPositions + req, req >= 0, other=0)
+        start = tl.maximum(prefix - WINDOW, 0)
+        length = prefix + end - first - start
+        logical = start + col
+    else:
+        length = tl.minimum(pos + 1, WINDOW)
+        logical = pos - length + 1 + col
+    page = tl.load(
+        Table + req.to(tl.int64) * table_stride + logical // PAGE,
+        (req >= 0) & (col < length),
+        other=-1,
+    ).to(tl.int64)
+    physical = page * PAGE + logical % PAGE
+    tl.store(
+        Swa + row * WIDTH + col,
+        tl.where((page > 0) & (col < length), physical, -1),
+        col < WIDTH,
+    )
+    tl.store(Lengths + row, tl.maximum(length, 0))
+    visible = tl.load(Visible + offset + row)
+    tl.store(TopLengths + row, tl.minimum(visible, 512))
+
+
+@dataclass
+class DeepseekV41B12xMetadata:
+    num_actual_tokens: int
+    num_reqs: int
+    max_query_len: int
+    block_size: int
+    block_table: torch.Tensor
+    query_start_loc: torch.Tensor
+    request_positions: torch.Tensor
+    live_counts: torch.Tensor
+    positions: torch.Tensor
+    req_id_per_token: torch.Tensor
+    slot_mapping: torch.Tensor
+    cache_lengths: torch.Tensor
+    is_decode: bool
+
+
+class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+
+    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        self.tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self.requests = vllm_config.scheduler_config.max_num_seqs
+        self.ratio = int(kv_cache_spec.tokens_per_state)
+        self.page = int(kv_cache_spec.num_states)
+        self.circular = isinstance(kv_cache_spec, CircularBufferSpec)
+
+        def alloc(shape, dtype):
+            return torch.empty(shape, dtype=dtype, device=device)
+
+        self.starts = alloc((self.requests + 1,), torch.int32)
+        self.request_positions = alloc((self.requests,), torch.int64)
+        self.counts = alloc((2,), torch.int32)
+        self.positions = alloc((self.tokens,), torch.int64)
+        self.reqs = alloc((self.tokens,), torch.int32)
+        self.slots = alloc((self.tokens,), torch.int64)
+        self.lengths = alloc((self.tokens,), torch.int32)
+
+    def build(
+        self,
+        common_prefix_len,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build=False,
+    ):
+        cm = common_attn_metadata
+        table = cm.block_table_tensor
+        _requests[(triton.cdiv(self.requests + 1, 128),)](
+            cm.query_start_loc,
+            cm.seq_lens,
+            self.starts,
+            self.request_positions,
+            self.counts,
+            cm.num_reqs,
+            cm.num_actual_tokens,
+            self.requests,
+            128,
+        )
+        _tokens[(triton.cdiv(self.tokens, 128),)](
+            cm.query_start_loc,
+            cm.seq_lens,
+            table,
+            cm.slot_mapping,
+            self.positions,
+            self.reqs,
+            self.slots,
+            self.lengths,
+            cm.num_reqs,
+            cm.num_actual_tokens,
+            table.stride(0),
+            table.shape[1],
+            self.tokens,
+            self.page,
+            self.ratio,
+            128,
+            self.circular,
+        )
+        return DeepseekV41B12xMetadata(
+            cm.num_actual_tokens,
+            cm.num_reqs,
+            cm.max_query_len,
+            self.page,
+            table,
+            self.starts,
+            self.request_positions,
+            self.counts,
+            self.positions,
+            self.reqs,
+            self.slots,
+            self.lengths,
+            self.reorder_batch_threshold is not None
+            and cm.max_query_len <= self.reorder_batch_threshold,
+        )
+
+
+class DeepseekV41B12xBackend(AttentionBackend):
+    supported_dtypes = [torch.bfloat16]
+    supported_kv_cache_dtypes = ["auto", "fp8", "fp8_ds_mla"]
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        # SWA, main KV, index keys, and partial states have different byte pages.
+        return (KVCacheLayout.BLHNC,)
+
+    @staticmethod
+    def get_name():
+        return "B12X_MLA_SPARSE_DSV41"
+
+    @staticmethod
+    def get_builder_cls():
+        return DeepseekV41B12xMetadataBuilder
+
+    @staticmethod
+    def get_supported_kernel_block_sizes():
+        return [MultipleOf(32)]
+
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size):
+        return 128
+
+    @classmethod
+    def get_supported_head_sizes(cls):
+        return [68, 288, 512, 528, 1024]
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str="auto"
+    ):
+        return (num_blocks, block_size, head_size)
+
+    @classmethod
+    def is_mla(cls):
+        return True
+
+    @classmethod
+    def is_sparse(cls):
+        return True
+
+    @classmethod
+    def supports_sink(cls):
+        return True
+
+    @classmethod
+    def supports_sliding_window(cls):
+        return True
+
+    @classmethod
+    def supports_compute_capability(cls, capability):
+        return capability.major == 12
