@@ -204,9 +204,9 @@ class KVCacheManager:
             if enable_boundary_checkpoints and enable_caching
             else None
         )
+        self._boundary_imports: set[int] = set()
         self._boundary_allocations: dict[str, list[KVCacheBlock]] = {}
         self._boundary_readers: dict[str, BoundaryCheckpoint] = {}
-        self._boundary_imports: set[int] = set()
         if self.boundary_checkpoints is not None:
             logger.info(
                 "Request-boundary recurrent checkpoint caching is enabled. "
