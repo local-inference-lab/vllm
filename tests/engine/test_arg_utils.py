@@ -655,6 +655,37 @@ def test_numa_bind_args():
     assert engine_args.numa_bind_cpus == ["0-3", "4-7", "8-11", "12-15"]
 
 
+@pytest.mark.parametrize(
+    "options,expected",
+    [
+        ([], "b12x"),
+        (["--moe-backend", "auto"], "auto"),
+        (["--moe-backend", "flashinfer-cutlass"], "flashinfer_cutlass"),
+        (["--kernel-config.moe_backend", "auto"], "auto"),
+        (["--kernel-config", '{"moe_backend":"triton"}'], "triton"),
+        (["--kernel-config.moe_backend", "triton", "--moe-backend", "auto"], "auto"),
+    ],
+)
+def test_moe_backend_cli_precedence(monkeypatch, tmp_path, options, expected):
+    """An omitted flat option preserves the nested deployment configuration."""
+    from transformers import LlamaConfig
+
+    monkeypatch.setenv("VLLM_DEFAULT_MOE_BACKEND", "b12x")
+    LlamaConfig(
+        architectures=["LlamaForCausalLM"],
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        vocab_size=128,
+    ).save_pretrained(tmp_path)
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(["--model", str(tmp_path), *options])
+    engine_args = EngineArgs.from_cli_args(args)
+    assert engine_args.create_engine_config().kernel_config.moe_backend == expected
+
+
 def test_ir_op_priority():
     from vllm.config.kernel import IrOpPriorityConfig, KernelConfig
 
