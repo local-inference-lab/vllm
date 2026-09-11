@@ -6,6 +6,7 @@ import pytest
 from vllm.config import SchedulerConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.v1.core.boundary_checkpoint import BoundaryCheckpointCache
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
@@ -1143,6 +1144,43 @@ def test_async_restore_does_not_consume_parallel_prefill_lane(
 
     assert restore.status == RequestStatus.WAITING_FOR_REMOTE_KVS
     assert output.num_scheduled_tokens == {"local0": 8, "local1": 8}
+
+
+@pytest.mark.parametrize("lanes", [1, 2])
+def test_pending_recurrent_import_releases_prefill_admission(
+    opt_model_path, monkeypatch, lanes
+):
+    """Unpublished imports cannot occupy lanes needed by local model work."""
+    scheduler = _create_interleaving_scheduler(
+        opt_model_path,
+        max_parallel_prefills=lanes,
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+    )
+    manager = scheduler.kv_cache_manager
+    manager.boundary_checkpoints = BoundaryCheckpointCache(manager.block_pool)
+    assert scheduler.connector is not None
+    monkeypatch.setattr(
+        scheduler.connector,
+        "poll_boundary_checkpoint",
+        lambda request: request.request_id != "pending",
+    )
+    pending, first, second = create_requests(
+        num_requests=3,
+        num_tokens=64,
+        block_size=scheduler.block_size,
+        req_ids=["pending", "first", "second"],
+    )
+    for request in (pending, first, second):
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    expected = {"first": 16} if lanes == 1 else {"first": 8, "second": 8}
+    assert output.num_scheduled_tokens == expected
+    assert pending.num_computed_tokens == 0
+    assert pending.status == RequestStatus.WAITING
+    assert manager.get_blocks(pending.request_id).get_block_ids() == ([],)
 
 
 def test_prefill_fairness_hot_switch_is_atomic(opt_model_path):
