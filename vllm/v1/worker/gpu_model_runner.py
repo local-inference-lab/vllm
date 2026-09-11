@@ -1275,6 +1275,13 @@ class GPUModelRunner(
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+        if scheduler_output.mamba_endpoint_copies:
+            # The request-endpoint cache needs the v2 runner's recurrent-state
+            # shadow; this runner leaves the entries unmaterialized.
+            logger.warning_once(
+                "Request-endpoint state copies are not applied by this runner; "
+                "run with the v2 model runner to use the request-endpoint cache."
+            )
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
                 self.kv_caches,

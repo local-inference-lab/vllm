@@ -239,6 +239,12 @@ if TYPE_CHECKING:
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
+    VLLM_K3_REQUEST_ENDPOINT_CACHE: bool = False
+    VLLM_K3_REQUEST_ENDPOINT_CACHE_MAX_ENTRIES: int = 4
+    VLLM_K3_REQUEST_ENDPOINT_CACHE_DISABLE_FILE: str = ""
+    VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG: bool = False
+    VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY: bool = False
+    VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY_FILE: str = ""
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -2423,6 +2429,40 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_USE_DIRECT_DCP_KV_GATHER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_DIRECT_DCP_KV_GATHER")
+    ),
+    # Publish every finished request's end state (attention pages, draft
+    # pages and a normalized recurrent state) under a request-endpoint
+    # prefix-cache entry, so the next turn that extends the same sequence
+    # resumes at the last computed token instead of the last hash boundary.
+    # Needs a hybrid (recurrent + attention) cache in align mode and at
+    # most two concurrent batches; the scheduler disables it otherwise.
+    "VLLM_K3_REQUEST_ENDPOINT_CACHE": lambda: bool(
+        int(os.getenv("VLLM_K3_REQUEST_ENDPOINT_CACHE", "0"))
+    ),
+    # Upper bound on live request-endpoint entries. Each entry pins one
+    # pool block per recurrent cache group for its state, so the bound caps
+    # the KV capacity the endpoint cache can hold back from attention pages.
+    "VLLM_K3_REQUEST_ENDPOINT_CACHE_MAX_ENTRIES": lambda: int(
+        os.getenv("VLLM_K3_REQUEST_ENDPOINT_CACHE_MAX_ENTRIES", "4")
+    ),
+    # File whose presence switches request-endpoint registration and lookup
+    # off without an engine restart.
+    "VLLM_K3_REQUEST_ENDPOINT_CACHE_DISABLE_FILE": lambda: os.getenv(
+        "VLLM_K3_REQUEST_ENDPOINT_CACHE_DISABLE_FILE", ""
+    ),
+    # Log endpoint registration/hit geometry and, on the worker, checksums of
+    # the recurrent-state pages read and written by the endpoint copies.
+    "VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG", "0"))
+    ),
+    # Materialize request-endpoint recurrent states with per-state torch
+    # copies instead of the fused Triton kernel (same results; a fallback
+    # and reference path). The file, when named, enables it while present.
+    "VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY": lambda: bool(
+        int(os.getenv("VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY", "0"))
+    ),
+    "VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY_FILE": lambda: os.getenv(
+        "VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY_FILE", ""
     ),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to

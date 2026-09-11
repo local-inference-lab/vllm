@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable, Sequence
+from collections import deque
+from collections.abc import Iterable, Iterator, Sequence
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -13,6 +14,7 @@ from vllm.distributed.kv_events import (
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
+    ENDPOINT_GROUP_ID_OFFSET,
     BlockHash,
     BlockHashWithGroupId,
     ExternalBlockHash,
@@ -140,6 +142,61 @@ class BlockHashToBlockMap:
         raise AssertionError(f"Invalid KV cache block type {type(blocks)}")
 
 
+def _iter_group_blocks(
+    group_blocks: dict[int, tuple[int, list[KVCacheBlock]]],
+) -> Iterator[tuple[int, KVCacheBlock]]:
+    for group_id, (_, blocks) in group_blocks.items():
+        for block in blocks:
+            yield group_id, block
+
+
+class EndpointEntry:
+    """A finished request's end position, reachable by a later prefix.
+
+    ``num_tokens`` tokens of the producing request are restorable. For each
+    KV cache group ``group_blocks[group_id] = (first_block_index, blocks)``
+    lists the blocks that must be handed to a consumer starting at block
+    index ``first_block_index``: the page holding position ``num_tokens - 1``
+    for attention groups, that page plus the window before it for
+    sliding-window groups, and for every recurrent group the one pool block
+    holding the state after ``num_tokens`` tokens. The entry hangs off
+    ``parent_hash``, the chain hash of the last full hash unit below
+    ``num_tokens``; ``tail_tokens`` and ``extra_keys`` describe the tokens
+    between that unit and ``num_tokens`` and must match the consumer's.
+    """
+
+    __slots__ = (
+        "parent_hash",
+        "num_tokens",
+        "tail_tokens",
+        "extra_keys",
+        "group_blocks",
+    )
+
+    def __init__(
+        self,
+        parent_hash: BlockHash,
+        num_tokens: int,
+        tail_tokens: tuple[int, ...],
+        extra_keys: tuple[Any, ...] | None,
+        group_blocks: dict[int, tuple[int, list[KVCacheBlock]]],
+    ) -> None:
+        self.parent_hash = parent_hash
+        self.num_tokens = num_tokens
+        self.tail_tokens = tail_tokens
+        self.extra_keys = extra_keys
+        self.group_blocks = group_blocks
+
+    def blocks(self) -> Iterator[tuple[int, KVCacheBlock]]:
+        for group_id, (_, blocks) in self.group_blocks.items():
+            for block in blocks:
+                yield group_id, block
+
+
+# Endpoint entries kept per parent hash; older entries are dropped first.
+_MAX_ENDPOINTS_PER_PARENT = 2
+
+
 class BlockPool:
     """BlockPool that manages KVCacheBlocks.
     It provides methods to allocate, free and cache the kv cache blocks. The
@@ -183,6 +240,13 @@ class BlockPool:
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
         self.cached_block_hashes_by_block: dict[int, set[BlockHashWithGroupId]] = {}
+
+        # Request-endpoint entries by parent hash, the entries each block takes
+        # part in (an entry is dropped when any of its blocks is reused), and
+        # their registration order for the global cap.
+        self.endpoint_entries: dict[BlockHash, list[EndpointEntry]] = {}
+        self._endpoints_by_block: dict[int, list[EndpointEntry]] = {}
+        self._endpoint_order: deque[EndpointEntry] = deque()
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
@@ -558,6 +622,122 @@ class BlockPool:
         # entry for any group block size is the hash at that prefix boundary.
         return request.block_hashes[num_hash_blocks - 1]
 
+    def cache_endpoint(
+        self,
+        parent_hash: BlockHash,
+        num_tokens: int,
+        tail_tokens: tuple[int, ...],
+        extra_keys: tuple[Any, ...] | None,
+        group_blocks: dict[int, tuple[int, list[KVCacheBlock]]],
+        max_entries: int,
+    ) -> EndpointEntry | None:
+        """Register a request-endpoint entry over the given per-group blocks.
+
+        Every block gains an endpoint key (the parent hash in the endpoint
+        group-id namespace) so it is retained like a cached block and so
+        eviction, reset and promotion drop the entry together with the block.
+        Older entries beyond ``max_entries`` (globally) or beyond the
+        per-parent cap are dropped. Returns ``None`` when caching is disabled,
+        ``max_entries`` is not positive, or a block is the null block.
+        """
+        if not self.enable_caching or not group_blocks or max_entries <= 0:
+            return None
+        if any(block.is_null for _, block in _iter_group_blocks(group_blocks)):
+            return None
+        entry = EndpointEntry(
+            parent_hash, num_tokens, tail_tokens, extra_keys, group_blocks
+        )
+        for group_id, block in entry.blocks():
+            key = make_block_hash_with_group_id(
+                parent_hash, ENDPOINT_GROUP_ID_OFFSET + group_id
+            )
+            self._insert_block_hash(key, block, num_tokens=num_tokens)
+            refs = self._endpoints_by_block.setdefault(block.block_id, [])
+            if entry not in refs:
+                refs.append(entry)
+        entries = self.endpoint_entries.setdefault(parent_hash, [])
+        entries.append(entry)
+        self._endpoint_order.append(entry)
+        while len(entries) > _MAX_ENDPOINTS_PER_PARENT:
+            self._drop_endpoint_entry(entries[0])
+        while len(self._endpoint_order) > max_entries:
+            self._drop_endpoint_entry(self._endpoint_order[0])
+        return entry
+
+    def find_endpoints(self, parent_hash: BlockHash) -> list[EndpointEntry]:
+        """Return the endpoint entries registered under ``parent_hash``,
+        longest first."""
+        entries = self.endpoint_entries.get(parent_hash)
+        if not entries:
+            return []
+        return sorted(entries, key=lambda entry: entry.num_tokens, reverse=True)
+
+    @property
+    def num_endpoint_entries(self) -> int:
+        return len(self._endpoint_order)
+
+    def _drop_endpoint_entry(self, entry: EndpointEntry) -> None:
+        """Forget ``entry`` and remove its endpoint keys from its blocks (a key
+        shared with a surviving entry of the same parent stays)."""
+        parent_hash = entry.parent_hash
+        entries = self.endpoint_entries.get(parent_hash)
+        if entries is not None:
+            if entry in entries:
+                entries.remove(entry)
+            if not entries:
+                del self.endpoint_entries[parent_hash]
+        if entry in self._endpoint_order:
+            self._endpoint_order.remove(entry)
+        for group_id, block in entry.blocks():
+            refs = self._endpoints_by_block.get(block.block_id)
+            if refs is None:
+                continue
+            refs[:] = [ref for ref in refs if ref is not entry]
+            if not refs:
+                del self._endpoints_by_block[block.block_id]
+            if any(
+                ref.parent_hash == parent_hash
+                and any(
+                    peer is block for peer in ref.group_blocks.get(group_id, (0, ()))[1]
+                )
+                for ref in refs
+            ):
+                continue
+            self._remove_endpoint_key(
+                block,
+                make_block_hash_with_group_id(
+                    parent_hash, ENDPOINT_GROUP_ID_OFFSET + group_id
+                ),
+            )
+
+    def _remove_endpoint_key(
+        self, block: KVCacheBlock, key: BlockHashWithGroupId
+    ) -> None:
+        if block.block_hash == key:
+            # The endpoint key was the block's primary hash: promote one of
+            # its secondary keys (if any) so the block stays a cached block.
+            secondary = self.cached_block_hashes_by_block.pop(block.block_id, set())
+            self.cached_block_hash_to_block.pop(key, block.block_id)
+            block.reset_hash()
+            for other in secondary:
+                self.cached_block_hash_to_block.pop(other, block.block_id)
+                self._insert_block_hash(other, block, num_tokens=None)
+            return
+        remaining = self.cached_block_hashes_by_block.get(block.block_id)
+        if remaining is not None:
+            remaining.discard(key)
+            if not remaining:
+                del self.cached_block_hashes_by_block[block.block_id]
+        self.cached_block_hash_to_block.pop(key, block.block_id)
+
+    def _drop_endpoints_of_block(self, block: KVCacheBlock) -> None:
+        """Forget every endpoint entry that used ``block`` (block reuse)."""
+        refs = self._endpoints_by_block.get(block.block_id)
+        if not refs:
+            return
+        for entry in list(refs):
+            self._drop_endpoint_entry(entry)
+
     def _get_partial_block_parent_hash_and_start(
         self,
         request: Request,
@@ -586,9 +766,12 @@ class BlockPool:
             if (
                 self.cached_block_hash_to_block.pop(block_hash, block.block_id)
                 is not None
-            ):
+            ) and get_group_id(block_hash) < ENDPOINT_GROUP_ID_OFFSET:
+                # Endpoint keys never emit events; their entries are dropped
+                # with the block below.
                 removed_hashes.append(block_hash)
         block.reset_hash()
+        self._drop_endpoints_of_block(block)
         return removed_hashes
 
     def _emit_block_removed_events(
@@ -783,6 +966,9 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block.clear()
+        self.endpoint_entries.clear()
+        self._endpoints_by_block.clear()
+        self._endpoint_order.clear()
 
         # Remove all hashes from all blocks.
         for block in self.blocks:
