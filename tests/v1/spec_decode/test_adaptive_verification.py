@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.worker.gpu.async_utils import StepTimingSample
@@ -34,6 +36,65 @@ def make_manager(
     manager._max_total_logits = 1 << 30
     manager.num_bonus_tokens = 1
     return manager
+
+
+@pytest.mark.parametrize("world_size,expected_budget", [(1, 0), (2, 1)])
+def test_confidence_snapshot_agrees_before_cpu_and_gpu_budgeting(
+    monkeypatch, world_size, expected_budget
+):
+    # One FP32 ULP across a utility threshold changes the graph's token count.
+    local = torch.tensor([[np.nextafter(np.float32(0.5), np.float32(0.0))]])
+    leader = torch.tensor([[np.nextafter(np.float32(0.5), np.float32(1.0))]])
+    manager = make_manager(local.numpy().copy(), np.array([1.0, 1.0, 1.5]))
+    manager.req_states.device = torch.device("cpu")
+    manager._confidence_probs = torch.empty_like(local)
+    manager._pending_resets = []
+
+    class CopyBuffer:
+        """Synchronous CPU double for a confidence snapshot transfer buffer."""
+
+        def __init__(self):
+            """Allocate independent source and destination snapshot storage."""
+            self.np = np.ones((1, 1), dtype=np.float32)
+            self.gpu = torch.empty_like(local)
+
+        def copy_to_cpu(self):
+            """Copy the synchronized snapshot into the CPU selection buffer."""
+            self.np[:] = self.gpu.numpy()
+
+    manager._stale_confidences = [CopyBuffer(), CopyBuffer()]
+    manager._copy_events = [
+        SimpleNamespace(synchronize=lambda: None, record=lambda: None) for _ in range(2)
+    ]
+    manager._copy_stream = SimpleNamespace(wait_stream=lambda _stream: None)
+    calls = []
+
+    def broadcast(tensor, src):
+        assert src == 0
+        calls.append(tensor)
+        tensor.copy_(leader)
+
+    monkeypatch.setattr(
+        adaptive_module,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=world_size, broadcast=broadcast),
+    )
+    monkeypatch.setattr(adaptive_module, "gpu_sync_allowed", nullcontext)
+    monkeypatch.setattr(adaptive_module.torch.cuda, "current_stream", lambda _: None)
+    monkeypatch.setattr(adaptive_module, "stream", lambda *_: nullcontext())
+    batch = SimpleNamespace(num_reqs=1, idx_mapping=torch.tensor([0]))
+
+    # Two records expose the completed previous-step snapshot to CPU selection.
+    for _ in range(2):
+        manager.record_confidences(local, batch)
+    expected = leader if world_size > 1 else local
+    torch.testing.assert_close(manager._confidence_probs, expected, rtol=0, atol=0)
+    np.testing.assert_array_equal(
+        manager._stale_confidences[manager._stale_idx].np, expected.numpy()
+    )
+    assert manager.get_num_tokens({"low": 2}, {"low": [7]}) == 1 + expected_budget
+    assert len(calls) == (2 if world_size > 1 else 0)
+    assert local.item() < 0.5  # The caller's proposal confidence is not mutated.
 
 
 @pytest.mark.parametrize(

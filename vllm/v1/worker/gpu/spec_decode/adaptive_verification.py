@@ -257,6 +257,12 @@ class AdaptiveVerificationManager:
         self._stale_idx, write_idx = ready_idx, self._stale_idx
 
         self._confidence_probs[input_batch.idx_mapping] = confidence_probs[:num_reqs]
+        # Replicated projections may differ through unordered floating-point
+        # reductions. Both CPU graph selection and GPU request compaction must
+        # consume one TP-wide confidence snapshot to issue matching collectives.
+        tp_group = get_tp_group()
+        if tp_group.world_size > 1:
+            tp_group.broadcast(self._confidence_probs, src=0)
         write_slot = self._stale_confidences[write_idx]
         write_slot.gpu.copy_(self._confidence_probs)
 

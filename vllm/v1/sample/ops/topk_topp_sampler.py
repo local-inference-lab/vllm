@@ -434,6 +434,30 @@ def apply_top_k_top_p_probs(
     return probs.scatter_(dim=-1, index=logits_idx, src=probs_sort)
 
 
+def warmup_top_k_top_p(
+    vocab_size: int, max_num_rows: int, device: torch.device
+) -> None:
+    """Compile GPU filter variants without executing the model or consuming RNG."""
+    if not HAS_TRITON or device.type == "cpu" or max_num_rows < 8:
+        return
+
+    # Top-k-only, top-p-only and combined filtering have distinct compile keys.
+    # Triton also specializes the row count on divisibility by 16; two small
+    # representative batches cover that distinction without allocating the
+    # maximum speculative verification batch's logits.
+    for num_rows in (8, 16):
+        if num_rows > max_num_rows:
+            continue
+        logits = torch.empty(num_rows, vocab_size, dtype=torch.float32, device=device)
+        top_k = torch.full(
+            (num_rows,), min(20, vocab_size), dtype=torch.int32, device=device
+        )
+        top_p = torch.full((num_rows,), 0.95, dtype=torch.float32, device=device)
+        for k, p in ((top_k, None), (None, top_p), (top_k, top_p)):
+            logits.zero_()
+            apply_top_k_top_p(logits, k, p)
+
+
 def apply_top_k_top_p_pytorch(
     logits: torch.Tensor,
     k: torch.Tensor | None,

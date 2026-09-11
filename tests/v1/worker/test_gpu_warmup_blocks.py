@@ -80,6 +80,7 @@ def _make_runner(
         is_pooling_model=False,
         is_encoder_decoder=False,
         is_last_pp_rank=True,
+        device=torch.device(current_platform.device_type),
         max_num_reqs=4,
         max_model_len=MAX_MODEL_LEN,
         model_config=SimpleNamespace(get_vocab_size=lambda: 64),
@@ -180,7 +181,7 @@ def test_warmup_covers_both_sampling_paths_without_repeating_model_warmup(
     runner.max_num_reqs = num_reqs
     runner.is_last_pp_rank = is_last_pp_rank
     recorder = _StepRecorder()
-    live_params = {}
+    live_params: dict[str, SamplingParams | None] = {}
     sampled_paths = set()
     pending = None
     prefill_tokens = 0
