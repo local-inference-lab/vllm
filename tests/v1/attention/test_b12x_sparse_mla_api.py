@@ -824,16 +824,18 @@ def test_b12x_glm5_next_full_ckv_workspaces_follow_cache_format(
 
     specs = impl._workspace_specs(plan, input_num_heads=8, include_ckv=True)
 
-    assert specs[-2:] == (
-        ((128, record_bytes), torch.uint8),
-        ((512, record_bytes), torch.uint8),
-    )
+    assert len(specs) == 3
+    assert specs[-1] == ((512, record_bytes), torch.uint8)
 
 
 @pytest.mark.parametrize("record_bytes", [528, 304])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("padded_tokens", [2, 4])
 def test_b12x_glm5_next_full_ckv_gather_preserves_native_records(
     monkeypatch: pytest.MonkeyPatch,
     record_bytes: int,
+    rank: int,
+    padded_tokens: int,
 ) -> None:
     impl = object.__new__(B12xMLASparseImpl)
     impl._kernel_page_size = 2
@@ -847,37 +849,48 @@ def test_b12x_glm5_next_full_ckv_gather_preserves_native_records(
         .to(torch.uint8)
         .view(2, 2, record_bytes)
     )
-    local_buffer = torch.full((4, record_bytes), 255, dtype=torch.uint8)
-    gathered_buffer = torch.empty((8, record_bytes), dtype=torch.uint8)
+    gathered_buffer = torch.full((8, record_bytes), 255, dtype=torch.uint8)
+    local_tokens = padded_tokens - 1
     metadata = SimpleNamespace(
-        num_actual_tokens=3,
-        dcp_local_total_tokens=3,
-        dcp_padded_total_tokens=4,
-        dcp_local_cu_seq_lens=torch.tensor([0, 3], dtype=torch.int32),
+        num_actual_tokens=local_tokens,
+        dcp_local_total_tokens=local_tokens,
+        dcp_padded_total_tokens=padded_tokens,
+        dcp_local_cu_seq_lens=torch.tensor([0, local_tokens], dtype=torch.int32),
         block_table=torch.tensor([[0, 1]], dtype=torch.int32),
         num_reqs=1,
     )
 
     def fake_cp_gather_cache(**kwargs: Any) -> None:
-        kwargs["dst"].copy_(kwargs["src_cache"].view(-1, record_bytes)[:3])
+        kwargs["dst"].copy_(kwargs["src_cache"].view(-1, record_bytes)[:local_tokens])
 
     def fake_all_gather(_group: Any, src: torch.Tensor, dst: torch.Tensor) -> None:
+        assert src.data_ptr() == dst.data_ptr() + rank * padded_tokens * record_bytes
         dst.copy_(src.repeat(2))
 
     monkeypatch.setattr(b12x_mla_sparse.ops, "cp_gather_cache", fake_cp_gather_cache)
     monkeypatch.setattr(
         b12x_mla_sparse, "_dcp_all_gather_current_stream", fake_all_gather
     )
-    monkeypatch.setattr(b12x_mla_sparse, "get_dcp_group", lambda: object())
+    monkeypatch.setattr(
+        b12x_mla_sparse,
+        "get_dcp_group",
+        lambda: SimpleNamespace(rank_in_group=rank, world_size=2),
+    )
 
-    gathered = impl._gather_full_ckv(kv_cache, metadata, local_buffer, gathered_buffer)
+    gathered = impl._gather_full_ckv(kv_cache, metadata, gathered_buffer)
 
     expected_rank = torch.cat(
-        (kv_cache.view(-1, record_bytes)[:3], torch.zeros((1, record_bytes))),
+        (
+            kv_cache.view(-1, record_bytes)[:local_tokens],
+            torch.zeros((1, record_bytes), dtype=torch.uint8),
+        ),
         dim=0,
     )
     assert gathered.shape == (4, 2, record_bytes)
-    assert torch.equal(gathered.view(-1, record_bytes), expected_rank.repeat(2, 1))
+    assert torch.equal(
+        gathered.view(-1, record_bytes)[: 2 * padded_tokens], expected_rank.repeat(2, 1)
+    )
+    assert torch.all(gathered.view(-1, record_bytes)[2 * padded_tokens :] == 255)
 
 
 def test_b12x_glm5_next_full_ckv_gather_rejects_wrong_record_width() -> None:
@@ -893,7 +906,6 @@ def test_b12x_glm5_next_full_ckv_gather_rejects_wrong_record_width() -> None:
         impl._gather_full_ckv(
             torch.empty((2, 2, 528), dtype=torch.uint8),
             metadata,
-            torch.empty((4, 304), dtype=torch.uint8),
             torch.empty((8, 304), dtype=torch.uint8),
         )
 
@@ -1171,7 +1183,6 @@ def test_b12x_glm5_next_cache_geometry_is_finalized_before_bind(monkeypatch) -> 
     assert reservations[2] == (
         ((4096, 16, 512), torch.bfloat16),
         ((256,), torch.uint8),
-        ((131328, 528), torch.uint8),
         ((525312, 528), torch.uint8),
     )
 

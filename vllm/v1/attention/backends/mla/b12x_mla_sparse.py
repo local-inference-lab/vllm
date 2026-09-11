@@ -1463,10 +1463,6 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         scratch_spec = ((self._scratch_nbytes,), torch.uint8)
         ckv_specs = (
             (
-                (self._ckv_local_capacity, self._cache_record_bytes),
-                torch.uint8,
-            ),
-            (
                 (
                     self.dcp_world_size * self._ckv_local_capacity,
                     self._cache_record_bytes,
@@ -1756,7 +1752,6 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         self,
         kv_cache: torch.Tensor,
         attn_metadata: B12xMLASparseMetadata,
-        local_buffer: torch.Tensor,
         gathered_buffer: torch.Tensor,
     ) -> torch.Tensor:
         if not self.uses_full_ckv_dcp(attn_metadata, attn_metadata.num_actual_tokens):
@@ -1771,22 +1766,22 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 f"{self._cache_record_bytes}-byte records; "
                 f"got shape={tuple(kv_cache.shape)}, stride={kv_cache.stride()}"
             )
-        expected_local_shape = (
-            self._ckv_local_capacity,
-            self._cache_record_bytes,
-        )
         expected_gathered_shape = (
             self.dcp_world_size * self._ckv_local_capacity,
             self._cache_record_bytes,
         )
-        if tuple(local_buffer.shape) != expected_local_shape:
-            raise RuntimeError("CKV local workspace has an invalid shape")
         if tuple(gathered_buffer.shape) != expected_gathered_shape:
             raise RuntimeError("CKV gathered workspace has an invalid shape")
 
         assert attn_metadata.dcp_local_cu_seq_lens is not None
         local_tokens = attn_metadata.dcp_local_total_tokens
         padded_tokens = attn_metadata.dcp_padded_total_tokens
+        group = get_dcp_group()
+        # NCCL in-place all-gather reads each rank's contribution from its
+        # receive slice. The stride is this call's padded count, not capacity.
+        local_buffer = gathered_buffer.narrow(
+            0, group.rank_in_group * padded_tokens, padded_tokens
+        )
         if local_tokens:
             ops.cp_gather_cache(
                 src_cache=kv_cache,
@@ -1798,7 +1793,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         if local_tokens < padded_tokens:
             local_buffer[local_tokens:padded_tokens].zero_()
         _dcp_all_gather_current_stream(
-            get_dcp_group(),
+            group,
             local_buffer[:padded_tokens].view(-1),
             gathered_buffer[: self.dcp_world_size * padded_tokens].view(-1),
         )
@@ -1877,11 +1872,10 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         topk_indices = self.topk_indices_buffer[:num_tokens]
         kv_cache_for_run = kv_c_and_k_pe_cache
         if use_ckv_gather:
-            local_buffer, gathered_buffer = workspaces[2:]
+            gathered_buffer = workspaces[2]
             kv_cache_for_run = self._gather_full_ckv(
                 kv_c_and_k_pe_cache,
                 attn_metadata,
-                local_buffer,
                 gathered_buffer,
             )
             assert attn_metadata.ckv_selected_indices is not None

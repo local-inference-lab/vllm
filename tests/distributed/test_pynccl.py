@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+from types import SimpleNamespace
 
 import multiprocess as mp
 import numpy as np
@@ -198,6 +199,59 @@ def all_gather_worker_fn():
 )
 def test_pynccl_all_gather():
     distributed_run(all_gather_worker_fn, 2)
+
+
+@worker_fn_wrapper
+def ckv_inplace_all_gather_worker_fn():
+    from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
+        _dcp_all_gather_current_stream,
+    )
+
+    world = get_world_group()
+    comm = PyNcclCommunicator(world.cpu_group, device=world.device)
+    rank, size = comm.rank, comm.world_size
+    with ensure_current_vllm_config():
+        ensure_model_parallel_initialized(size, 1)
+    tp = get_tp_group()
+    storage = torch.empty((size * 8192, 528), dtype=torch.uint8, device=world.device)
+    for transport in ("pynccl", "torch", "coordinator"):
+        group = SimpleNamespace(
+            world_size=size,
+            rank_in_group=rank,
+            device_communicator=SimpleNamespace(
+                pynccl_comm=comm if transport == "pynccl" else None
+            ),
+            device_group=world.device_group if transport == "torch" else None,
+            all_gather=tp.all_gather,
+        )
+        for padded in (1024, 2048, 8192, 1024):
+            storage.fill_(255)
+            expected_parts = []
+            for source_rank in range(size):
+                part = (
+                    (
+                        torch.arange(padded * 528, device=world.device).remainder(251)
+                        + source_rank
+                    )
+                    .to(torch.uint8)
+                    .view(padded, 528)
+                )
+                part[padded - source_rank * 4 - 1 :].zero_()
+                expected_parts.append(part)
+            send = storage[rank * padded : (rank + 1) * padded]
+            send.copy_(expected_parts[rank])
+            receive = storage[: size * padded]
+            _dcp_all_gather_current_stream(group, send.view(-1), receive.view(-1))
+            torch.accelerator.synchronize()
+            assert torch.equal(receive, torch.cat(expected_parts))
+            assert torch.all(storage[size * padded :] == 255)
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_ckv_inplace_all_gather_preserves_padded_rank_records(world_size):
+    if torch.accelerator.device_count() < world_size:
+        pytest.skip(f"Need {world_size} GPUs")
+    distributed_run(ckv_inplace_all_gather_worker_fn, world_size)
 
 
 @worker_fn_wrapper
