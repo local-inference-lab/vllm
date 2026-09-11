@@ -40,10 +40,13 @@ def _fwht_quant_kernel(
     q,
     q_out,
     scale_out,
+    weights,
     rows,
     HEAD_DIM: tl.constexpr,
     FP8_MAX: tl.constexpr,
     BLOCK_R: tl.constexpr,
+    SCALE_WEIGHTS: tl.constexpr,
+    WEIGHT_NORM: tl.constexpr,
 ):
     pid = tl.program_id(0)
     row = pid * BLOCK_R + tl.arange(0, BLOCK_R)
@@ -74,14 +77,20 @@ def _fwht_quant_kernel(
         mask=row_mask[:, None],
     )
     tl.store(scale_out + row, scale, mask=row_mask)
+    if SCALE_WEIGHTS:
+        weight = tl.load(weights + row, mask=row_mask, other=0.0).to(tl.float32)
+        weight *= scale
+        weight *= WEIGHT_NORM
+        tl.store(weights + row, weight, mask=row_mask)
 
 
 def fwht128_quant_fp8(
     q: torch.Tensor,
     q_out: torch.Tensor,
     scale_out: torch.Tensor,
+    weights: torch.Tensor | None = None,
 ) -> None:
-    """Rotate and per-vector quantize contiguous BF16 rows into caller storage."""
+    """Rotate and quantize BF16 rows, optionally scaling their head weights."""
     if q.ndim != 2 or q.shape[1] != _HEAD_DIM or q.dtype != torch.bfloat16:
         raise ValueError("GLM index queries must be contiguous BF16 [rows, 128]")
     if not q.is_contiguous():
@@ -91,17 +100,26 @@ def fwht128_quant_fp8(
         raise ValueError("GLM FP8 query output must match the query shape")
     if scale_out.shape != (rows,) or scale_out.dtype != torch.float32:
         raise ValueError("GLM query scales must be FP32 [rows]")
+    if weights is not None and (
+        weights.shape != (rows,)
+        or weights.dtype != torch.float32
+        or not weights.is_contiguous()
+    ):
+        raise ValueError("GLM index head weights must be contiguous FP32 [rows]")
     if rows:
-        block_r = 32
+        block_r = 4
         _fwht_quant_kernel[(triton.cdiv(rows, block_r),)](
             q,
             q_out,
             scale_out,
+            weights if weights is not None else scale_out,
             rows,
             HEAD_DIM=_HEAD_DIM,
             FP8_MAX=_FP8_MAX,
             BLOCK_R=block_r,
-            num_warps=2,
+            SCALE_WEIGHTS=weights is not None,
+            WEIGHT_NORM=(_HEAD_DIM * 32) ** -0.5,
+            num_warps=1,
         )
 
 
