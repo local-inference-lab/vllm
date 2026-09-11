@@ -7,8 +7,6 @@ from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
-from .b12x_layers import B12xEmbeddingMethod, B12xFP8LinearMethod, B12xLinearMethod
-
 
 class DeepseekV41FP8Config(Fp8Config):
     is_scale_e8m0 = True
@@ -28,6 +26,8 @@ class DeepseekV41FP8Config(Fp8Config):
 
     def get_quant_method(self, layer, prefix):
         if isinstance(layer, LinearBase):
+            from .b12x_layers import B12xFP8LinearMethod, B12xLinearMethod
+
             if is_layer_skipped(
                 prefix=prefix,
                 ignored_layers=self.ignored_layers,
@@ -37,6 +37,8 @@ class DeepseekV41FP8Config(Fp8Config):
                 return B12xLinearMethod()
             return B12xFP8LinearMethod(self)
         if isinstance(layer, VocabParallelEmbedding):
+            from .b12x_layers import B12xEmbeddingMethod
+
             return B12xEmbeddingMethod()
         # Routed experts own their checkpoint loader and native recipe rather
         # than delegating to a generic MoE provider.
