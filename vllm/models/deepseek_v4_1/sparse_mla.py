@@ -211,7 +211,9 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
             self.requests,
             128,
         )
-        _tokens[(triton.cdiv(self.tokens, 128),)](
+        # num_actual_tokens already includes the selected graph's padding.
+        # Retain capacity-sized storage, but refresh only that readable domain.
+        _tokens[(max(1, triton.cdiv(cm.num_actual_tokens, 128)),)](
             cm.query_start_loc,
             cm.seq_lens,
             table,

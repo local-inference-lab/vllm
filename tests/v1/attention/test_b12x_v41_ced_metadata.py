@@ -219,6 +219,7 @@ def test_frozen_packing_graph_replays_new_live_rows(monkeypatch):
 
 @cuda
 def test_dspark_compact_context_preserves_query_anchor_and_rejections(monkeypatch):
+    from vllm.v1.attention.backends.utils import PAD_SLOT_ID
     from vllm.v1.worker.gpu.input_batch import InputBuffers
     from vllm.v1.worker.gpu.spec_decode.dflash.speculator import prepare_dflash_inputs
 
@@ -296,6 +297,7 @@ def test_dspark_compact_context_preserves_query_anchor_and_rejections(monkeypatc
     # Exercise propose itself: this catches packing after combine (too late),
     # packing raw rather than prepared slots, and checkpoint context overwrites.
     from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker.gpu.spec_decode import speculator as base_speculator
     from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash
 
     table[1, 31] = 72
@@ -317,7 +319,9 @@ def test_dspark_compact_context_preserves_query_anchor_and_rejections(monkeypatc
     proposer.model = SimpleNamespace(
         combine_hidden_states=combine, precompute_and_store_context_kv=project
     )
-    proposer.model_state = SimpleNamespace(get_ced_indices=state.get_indices)
+    proposer.model_state = SimpleNamespace(
+        get_ced_indices=state.get_indices, prepare_draft_attn_metadata=lambda **_: None
+    )
     proposer.hidden_states = torch.zeros((8192, 2), device=device)
     proposer.context_positions = context_positions
     proposer._context_slot_mappings = context_slots[None]
@@ -349,9 +353,25 @@ def test_dspark_compact_context_preserves_query_anchor_and_rejections(monkeypatc
     proposer.dp_size = 1
     proposer.dp_rank = 0
     proposer.query_cudagraph_manager = None
+    proposer.draft_attn_layer_names = ["draft"]
+    proposer.draft_cp_size = 1
     proposer.kv_cache_config = None
     proposer._group_causal = False
-    proposer._build_draft_attn_metadata = lambda **kwargs: None
+    proposer.arange = torch.arange(5, dtype=torch.int32)
+    proposer.idx_mapping = batch.idx_mapping
+    proposer.attn_groups = []
+
+    def check_draft_boundaries(**metadata):
+        torch.testing.assert_close(
+            metadata["query_start_loc_cpu"],
+            metadata["query_start_loc_gpu"].cpu(),
+            rtol=0,
+            atol=0,
+        )
+        assert metadata["max_query_len"] == 2
+        return None
+
+    monkeypatch.setattr(base_speculator, "build_attn_metadata", check_draft_boundaries)
     proposer._prepare_eplb_forward = lambda count: None
     proposer._generate_draft = lambda *args, **kwargs: None
     proposer.draft_tokens = torch.zeros((4, 2), device=device, dtype=torch.int64)
@@ -379,6 +399,8 @@ def test_dspark_compact_context_preserves_query_anchor_and_rejections(monkeypatc
         temperature=temperature,
         seeds=seeds,
     )
+    query_capacity = proposer.max_num_reqs * proposer.num_query_per_req
+    slots[query_capacity:].fill_(-3137)
     proposer.propose(**arguments)
     assert combine_rows == [129]
     expected_pool = torch.full_like(context_pool, -7)
@@ -388,6 +410,8 @@ def test_dspark_compact_context_preserves_query_anchor_and_rejections(monkeypatc
     )
     torch.testing.assert_close(context_pool, expected_pool)
     assert buffers.positions[:4].tolist() == [11, 12, 4094, 4095]
+    assert torch.all(slots[4:query_capacity] == PAD_SLOT_ID)
+    assert torch.all(slots[query_capacity:] == -3137)
     proposer.propose(**arguments, context_kv_is_restored=True)
     assert combine_rows == [129]
     torch.testing.assert_close(context_pool, expected_pool)

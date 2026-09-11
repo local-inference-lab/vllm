@@ -16,7 +16,6 @@ from torch import nn
 
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.linear import LinearMethodBase, UnquantizedLinearMethod
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_scale_parameter,
     create_fp8_weight_parameter,
@@ -162,17 +161,6 @@ class B12xLinearMethod(UnquantizedLinearMethod):
         )
         retain_cuda_graph_capture_resource(out)
         return out
-
-
-class B12xLogitsProcessor(LogitsProcessor):
-    def _apply_head(self, lm_head, hidden_states, embedding_bias):
-        if embedding_bias is not None:
-            raise ValueError("V4.1 published head has no bias")
-        return bf16_gemv.mm(
-            hidden_states,
-            lm_head.weight,
-            output_dtype=self.head_dtype or hidden_states.dtype,
-        )
 
 
 class B12xFP8LinearMethod(LinearMethodBase):

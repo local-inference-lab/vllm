@@ -123,7 +123,6 @@ def test_v41_dspark_retains_each_markov_embedding_during_graph_replay(
             + torch.arange(rank, device=device)[None, :] / 128
         ).bfloat16()
         default_weight_loader(head.markov_w1.weight, checkpoint)
-        head.process_weights_after_loading()
         token_ids = [
             torch.tensor(values, device=device, dtype=id_dtype)
             for values in ([0, 1, 130], [64, 95, 96], [127, 17, 33])

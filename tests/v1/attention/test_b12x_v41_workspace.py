@@ -968,3 +968,75 @@ def test_global_preparation_dependency_survives_functionalization(
         # Preparation must remain visible to later consumers as well; mutable
         # alias-list functionalization used to copy stale clones back here.
         torch.testing.assert_close(backing, torch.cat((hidden * 2, hidden * 3)))
+
+
+@torch.inference_mode()
+def test_metadata_refresh_preserves_padded_graph_domain_and_addresses():
+    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadataBuilder
+
+    device = torch.device("cuda")
+    builder = DeepseekV41B12xMetadataBuilder.__new__(DeepseekV41B12xMetadataBuilder)
+    builder.tokens, builder.requests = 4096, 4
+    builder.page, builder.ratio, builder.circular = 128, 1, False
+    builder.reorder_batch_threshold = 6
+    builder.starts = torch.empty(5, dtype=torch.int32, device=device)
+    builder.request_positions = torch.empty(4, dtype=torch.int64, device=device)
+    builder.counts = torch.empty(2, dtype=torch.int32, device=device)
+    for name, dtype in (
+        ("positions", torch.int64),
+        ("reqs", torch.int32),
+        ("slots", torch.int64),
+        ("lengths", torch.int32),
+    ):
+        setattr(builder, name, torch.empty(builder.tokens, dtype=dtype, device=device))
+    addresses = [
+        getattr(builder, name).data_ptr()
+        for name in ("positions", "reqs", "slots", "lengths")
+    ]
+    base_page = 2**31 // builder.page + 17
+    table = torch.zeros((2, 16), dtype=torch.int32, device=device)
+    table[0] = torch.arange(base_page, base_page + 16, dtype=torch.int32, device=device)
+    for live, padded in ((257, 320), (5, 10), (129, 160), (0, 5)):
+        seq = torch.tensor([1024, 0], dtype=torch.int32, device=device)
+        slots = torch.full((padded,), -1, dtype=torch.int64, device=device)
+        slots[:live] = 1
+        common = SimpleNamespace(
+            block_table_tensor=table,
+            query_start_loc=torch.tensor(
+                [0, live, live], dtype=torch.int32, device=device
+            ),
+            seq_lens=seq,
+            slot_mapping=slots,
+            num_reqs=2,
+            num_actual_tokens=padded,
+            max_query_len=live,
+            max_seq_len=2048,
+        )
+        builder.build(0, common)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            metadata = builder.build(0, common)
+        seq[0] += 7
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = torch.arange(1031 - live, 1031, dtype=torch.int64, device=device)
+        torch.testing.assert_close(metadata.positions[:live], expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            metadata.slot_mapping[:live],
+            base_page * builder.page + expected,
+            rtol=0,
+            atol=0,
+        )
+        assert bool((metadata.req_id_per_token[:live] == 0).all())
+        for tensor in (
+            metadata.positions,
+            metadata.req_id_per_token,
+            metadata.slot_mapping,
+        ):
+            assert bool((tensor[live:padded] == -1).all())
+        assert bool((metadata.cache_lengths[live:padded] == 0).all())
+        assert metadata.live_counts.tolist() == [padded, 2]
+        assert addresses == [
+            getattr(builder, name).data_ptr()
+            for name in ("positions", "reqs", "slots", "lengths")
+        ]

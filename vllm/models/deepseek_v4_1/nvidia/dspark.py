@@ -18,7 +18,6 @@ import regex as re
 import torch
 import torch.nn as nn
 from b12x.gemm import block_fp8_linear
-from b12x.norm import hyperconnection
 
 import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -33,12 +32,11 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_dspark import (
     DSparkConfidenceHead,
-)
-from vllm.model_executor.models.qwen3_dspark import (
-    DSparkMarkovHead as _SharedDSparkMarkovHead,
+    DSparkMarkovHead,
 )
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.models.common.ops.sequence_parallel import (
@@ -53,14 +51,11 @@ from vllm.v1.worker.workspace import (
     retain_cuda_graph_capture_resource,
 )
 
+from ..b12x_layers import B12xRMSNorm as RMSNorm
 from ..b12x_layers import (
-    B12xEmbeddingMethod,
-    B12xLinearMethod,
     _execution_capacities,
     collapse,
 )
-from ..b12x_layers import B12xLogitsProcessor as LogitsProcessor
-from ..b12x_layers import B12xRMSNorm as RMSNorm
 from .model import (
     DeepseekV4DecoderLayer,
     _linear_scale_param_name,
@@ -73,18 +68,6 @@ logger = init_logger(__name__)
 # MoE expert scale suffix differs by expert dtype (mirrors deepseek_v4 loaders):
 # fp4 experts register ``.weight_scale``; block-fp8 experts ``.weight_scale_inv``.
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
-
-
-class DSparkMarkovHead(_SharedDSparkMarkovHead):
-    """V4.1 row lookup; inherited parameter names and loading stay unchanged."""
-
-    _embedding_method = B12xEmbeddingMethod()
-
-    def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
-        return self._embedding_method.embedding(self.markov_w1, token_ids)
-
-    def process_weights_after_loading(self) -> None:
-        self._embedding_method.process_weights_after_loading(self.markov_w1)
 
 
 class _ContextKVProjection:
@@ -329,18 +312,12 @@ class DSparkDeepseekV4Model(nn.Module):
             config.dspark_markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
         )
-        self.markov_head.markov_w2.quant_method = B12xLinearMethod()
-        self.markov_head.markov_w2.out_dtype = (
-            vllm_config.model_config.head_dtype or vllm_config.model_config.dtype
-        )
         self.confidence_head: DSparkConfidenceHead | None = None
         if getattr(config, "enable_confidence_head", True):
             self.confidence_head = DSparkConfidenceHead(
                 config.hidden_size + config.dspark_markov_rank,
                 prefix=maybe_prefix(prefix, "confidence_head"),
             )
-            self.confidence_head.proj.quant_method = B12xLinearMethod()
-            self.confidence_head.proj.out_dtype = torch.float32
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         assert self.embed_tokens is not None
@@ -540,10 +517,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         """Per-position acceptance probability for each drafted token."""
         assert self.model.confidence_head is not None
-        logits = self.model.confidence_head(head_hidden, markov_embed)
-        out = torch.empty_like(logits)
-        hyperconnection.run_sigmoid(logits, out=out)
-        return out
+        return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
 
     # --- Weight loading ----------------------------------------------------
 
@@ -678,7 +652,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     def process_weights_after_loading(self) -> None:
         self._finalize_moe()
-        self.model.markov_head.process_weights_after_loading()
         self.model._context_kv_projections = [
             _ContextKVProjection(layer.attn, self.model.context_capacity)
             for layer in self.model.layers

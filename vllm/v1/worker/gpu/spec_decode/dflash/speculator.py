@@ -494,7 +494,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.num_query_per_req,
                 self.num_speculative_steps,
                 self.max_num_reqs,
-                self.max_num_tokens,
+                min(self.max_num_tokens, self.max_num_reqs * self.num_query_per_req),
                 self.max_model_len,
                 self.sample_from_anchor,
             )

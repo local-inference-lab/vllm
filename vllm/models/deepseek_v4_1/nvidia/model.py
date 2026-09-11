@@ -20,6 +20,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -51,8 +52,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
-from ..b12x_layers import B12xLinearMethod, B12xMHC, collapse, stream_mean
-from ..b12x_layers import B12xLogitsProcessor as LogitsProcessor
+from ..b12x_layers import B12xMHC, collapse, stream_mean
 from ..b12x_layers import B12xRMSNorm as RMSNorm
 from ..ced import ced_decoder_start, gather_rows, scatter_rows
 from ..common.engram import Engram, EngramLayout, NgramHashState
@@ -922,11 +922,6 @@ class DeepseekV41LLMForCausalLM(
             )
         else:
             self.lm_head = PPMissingLayer()
-        if get_pp_group().is_last_rank:
-            self.lm_head.quant_method = B12xLinearMethod()
-            self.lm_head.out_dtype = (
-                vllm_config.model_config.head_dtype or vllm_config.model_config.dtype
-            )
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.model.make_empty_intermediate_tensors

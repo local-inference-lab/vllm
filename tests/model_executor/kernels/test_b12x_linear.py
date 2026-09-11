@@ -1172,11 +1172,11 @@ def _check_v41_vocab_embedding_and_tied_head(device):
     from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
 
     from vllm.distributed.parallel_state import graph_capture
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         ParallelLMHead,
         VocabParallelEmbedding,
     )
-    from vllm.models.deepseek_v4_1.b12x_layers import B12xLogitsProcessor
     from vllm.models.deepseek_v4_1.quant_config import DeepseekV41FP8Config
     from vllm.v1.worker import workspace
 
@@ -1207,7 +1207,7 @@ def _check_v41_vocab_embedding_and_tied_head(device):
     ids = torch.tensor([0, 1, 63, 64, 95, 96, 127, 130], device=device)
     probe = torch.zeros((1, hidden), dtype=torch.bfloat16, device=device)
     probe[0, 0] = 1
-    processor = B12xLogitsProcessor(vocab)
+    processor = LogitsProcessor(vocab)
 
     def check_head():
         logits = processor(head, probe)
