@@ -21,6 +21,30 @@ from vllm.transformers_utils.config import (
 )
 
 
+def test_deepseek_v41_config_roundtrip_keeps_vision_and_untied_head():
+    from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config
+
+    config = DeepseekV41Config(
+        text_config={
+            "hidden_size": 5120,
+            "num_attention_heads": 64,
+            "tie_word_embeddings": False,
+            "compress_ratios": [1, 2],
+        },
+        vision_config={"num_hidden_layers": 27, "hidden_size": 1024},
+        quantization_config={"quant_method": "fp8", "expert_dtype": "fp4"},
+    )
+    restored = DeepseekV41Config.from_dict(config.to_dict())
+    assert restored.hidden_size == 5120
+    assert restored.vision_n_layers == 27
+    assert restored.vision_dim == 1024
+    assert restored.tie_word_embeddings is False
+    assert restored.expert_dtype == "fp4"
+    assert restored.compress_ratios == [1, 2]
+    assert restored.get_text_config() is restored
+    assert restored.is_mm_prefix_lm is False
+
+
 def test_get_llama3_eos_token():
     model_name = "meta-llama/Llama-3.2-1B-Instruct"
 

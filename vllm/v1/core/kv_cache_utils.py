@@ -23,6 +23,7 @@ from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheConfig,
@@ -703,6 +704,11 @@ def resolve_kv_cache_block_sizes(
     ):
         return scheduler_block_size, scheduler_block_size
 
+    group_block_sizes = [
+        block_size
+        for group, block_size in zip(groups, group_block_sizes)
+        if group.kv_cache_spec.prefix_cacheable
+    ] or group_block_sizes
     requested = cache_config.prefix_match_unit
     hash_block_size = (
         requested if requested is not None else math.gcd(*group_block_sizes)
@@ -1769,7 +1775,7 @@ def group_and_unify_kv_cache_specs(
 ) -> list[UniformTypeKVCacheSpecs] | None:
     """
     Group the KV cache specs and unify each group into one UniformTypeKVCacheSpecs.
-    Currently, this is only used for DeepseekV4.
+    This packs shared global MLA records separately from bounded local states.
     """
     if not any(
         isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()
@@ -1782,21 +1788,27 @@ def group_and_unify_kv_cache_specs(
         return None
 
     mla_specs: dict[str, KVCacheSpec] = {}
-    grouped_swa_mla_specs: dict[tuple[int, int], dict[str, KVCacheSpec]] = defaultdict(
-        dict
+    grouped_swa_mla_specs: dict[tuple[int, int, int], dict[str, KVCacheSpec]] = (
+        defaultdict(dict)
     )
-    # NOTE: Here we group SWA layers by (block_size, sliding_window), which separates
-    # SWA layers, C4I+C4A layers, and C128A layers into three different groups. It can
-    # be fragile with only block_size and sliding_window as keys, but fine for now.
+    circular_specs: dict[int, dict[str, KVCacheSpec]] = defaultdict(dict)
     for name, spec in kv_cache_spec.items():
         if isinstance(spec, SlidingWindowMLASpec):
-            grouped_swa_mla_specs[(spec.block_size, spec.sliding_window)][name] = spec
+            grouped_swa_mla_specs[
+                (spec.block_size, spec.sliding_window, spec.extra_retained_tokens)
+            ][name] = spec
         elif isinstance(spec, MLAAttentionSpec):
             mla_specs[name] = spec
+        elif isinstance(spec, CircularBufferSpec):
+            circular_specs[spec.block_size][name] = spec
+        else:
+            return None
 
-    assert len(mla_specs) > 0
+    if not mla_specs:
+        return None
     mla_uniform_spec = UniformTypeKVCacheSpecs.from_specs(mla_specs)
-    assert mla_uniform_spec is not None
+    if mla_uniform_spec is None:
+        return None
 
     swa_uniform_specs: list[UniformTypeKVCacheSpecs] = []
     for spec_dict in grouped_swa_mla_specs.values():
@@ -1804,7 +1816,12 @@ def group_and_unify_kv_cache_specs(
         assert uniform_spec is not None
         swa_uniform_specs.append(uniform_spec)
 
-    return [mla_uniform_spec, *swa_uniform_specs]
+    local_specs = list(swa_uniform_specs)
+    for spec_dict in circular_specs.values():
+        uniform_spec = UniformTypeKVCacheSpecs.from_specs(spec_dict)
+        assert uniform_spec is not None
+        local_specs.append(uniform_spec)
+    return [mla_uniform_spec, *local_specs]
 
 
 def group_dcp_replicated_draft_kv_cache_specs(
@@ -1922,14 +1939,14 @@ def _get_kv_cache_groups_uniform_groups(
 
     swa_mla_specs = grouped_specs[1:]
     assert all(
-        isinstance(spec, SlidingWindowMLASpec)
+        isinstance(spec, (SlidingWindowMLASpec, CircularBufferSpec))
         for group in swa_mla_specs
         for spec in group.kv_cache_specs.values()
     )
 
-    # Split each SWA UniformKV group into smaller groups to align their
-    # numbers of layer tuples. The packed block planner overlays groups, so
-    # their page sizes do not need to match.
+    # Split local-state groups using the same model-derived tuple pattern.
+    # The packed block planner overlays groups, so their page sizes need not
+    # match the shared global MLA records.
     swa_mla_groups = []
     for sm_spec in swa_mla_specs:
         layers_per_size: dict[int, list[str]] = defaultdict(list)
@@ -1998,15 +2015,22 @@ def _largest_divisor_at_most(value: int, limit: int) -> int:
     return 1
 
 
-def _partition_dflash_draft_specs(
+def _partition_parallel_draft_specs(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> tuple[dict[str, KVCacheSpec], dict[str, KVCacheSpec]]:
-    """Split appended DFlash layers from the target for PP1 grouping."""
+    """Split appended DFlash or GLM DSpark layers for PP1 cache grouping."""
     speculative_config = vllm_config.speculative_config
     if (
         speculative_config is None
-        or speculative_config.method != "dflash"
+        or not (
+            speculative_config.method == "dflash"
+            or (
+                speculative_config.method == "dspark"
+                and speculative_config.draft_model_config.hf_config.model_type
+                == "glm53_dspark"
+            )
+        )
         or vllm_config.parallel_config.pipeline_parallel_size > 1
         or vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
     ):
@@ -2051,14 +2075,14 @@ def get_kv_cache_groups(
         # attention free models.
         return []
 
-    target_specs, draft_specs = _partition_dflash_draft_specs(
+    target_specs, draft_specs = _partition_parallel_draft_specs(
         vllm_config, kv_cache_spec
     )
     if target_specs and draft_specs:
         target_groups = get_kv_cache_groups(vllm_config, target_specs)
         draft_groups = get_kv_cache_groups(vllm_config, draft_specs)
         logger.info(
-            "Keeping %d DFlash draft KV layers in %d independent cache groups",
+            "Keeping %d parallel draft KV layers in %d independent cache groups",
             len(draft_specs),
             len(draft_groups),
         )
@@ -2086,6 +2110,9 @@ def get_kv_cache_groups(
         kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
         _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
         return kv_cache_groups
+
+    if any(isinstance(spec, CircularBufferSpec) for spec in kv_cache_spec.values()):
+        return _get_weighted_shared_pool_kv_cache_groups(vllm_config, kv_cache_spec)
 
     # Pull HiddenStateCacheSpec layers out before the general multi-group
     # path so they don't affect page-size unification or grouping.

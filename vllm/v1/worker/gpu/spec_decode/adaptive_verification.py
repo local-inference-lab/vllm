@@ -478,12 +478,34 @@ def maybe_create_adaptive_verification_manager(
             target_attn_cg_support = target_attn_cg_support.narrow(
                 *additional_attn_cg_support
             )
-    if target_attn_cg_support.min_cg_support != AttentionCGSupport.ALWAYS:
+    varlen_unsupported = []
+    groups_to_check = (
+        attn_groups
+        if target_attn_cg_support.min_cg_support != AttentionCGSupport.ALWAYS
+        else []
+    )
+    for groups in groups_to_check:
+        for group in groups:
+            if target_layer_names is not None and target_layer_names.isdisjoint(
+                group.layer_names
+            ):
+                continue
+            builder = group.get_metadata_builder(0)
+            support = builder.get_cudagraph_support(vllm_config, group.kv_cache_spec)
+            if support != AttentionCGSupport.ALWAYS and not (
+                support == AttentionCGSupport.UNIFORM_BATCH
+                and getattr(builder, "supports_varlen_decode_cudagraph", False)
+            ):
+                varlen_unsupported.append(group.backend.__name__)
+    if (
+        additional_attn_cg_support is not None
+        and additional_attn_cg_support[0] != AttentionCGSupport.ALWAYS
+    ):
+        varlen_unsupported.append(str(additional_attn_cg_support[1]))
+    if varlen_unsupported:
         raise ValueError(
-            "Adaptive verification captures varlen decode cudagraphs, so every"
-            " target attention builder must report AttentionCGSupport.ALWAYS, but "
-            f"{target_attn_cg_support.min_cg_attn_backend} reports "
-            f"{target_attn_cg_support.min_cg_support}. Pass "
+            "Adaptive verification requires variable-length decode CUDA graphs; "
+            f"unsupported target backends: {', '.join(varlen_unsupported)}. Pass "
             "enable_adaptive_verification=false in the speculative config, or "
             "use a backend that does."
         )

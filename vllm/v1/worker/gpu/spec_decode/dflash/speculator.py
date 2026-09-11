@@ -769,7 +769,9 @@ def prepare_dflash_inputs(
     # per-request query length, not the total token count across the batch.
     max_target_query_len = int(input_batch.num_scheduled_tokens.max())
     max_tokens_per_req = max_target_query_len + num_query_per_req
-    BLOCK_SIZE = min(256, triton.next_power_of_2(max(1, max_tokens_per_req)))
+    # Live context/query lengths control the grid, never the compiled tile.
+    # A length-derived constexpr causes first-request JIT after graph warmup.
+    BLOCK_SIZE = 256
     num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)
     _prepare_dflash_inputs_kernel[(num_reqs, num_blocks)](
         input_buffers.input_ids,

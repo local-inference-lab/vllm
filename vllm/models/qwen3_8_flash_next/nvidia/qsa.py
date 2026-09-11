@@ -63,6 +63,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     get_kv_quant_mode,
 )
+from vllm.v1.worker.workspace import retain_cuda_graph_capture_resource
 
 from ..common.qsa_cache import (
     canonical_qsa_rope_positions,
@@ -252,7 +253,9 @@ class _B12xQSAWarmup:
                     )
 
             for context in live_contexts:
-                compile_rows(context, prefill_rows)
+                qsa.prewarm(layer._bind_qsa_context(context), rows=prefill_rows)
+                if layer.overlap_input_projections and prefill_rows <= 16:
+                    compile_rows(context, prefill_rows)
             decode_context = getattr(layer, "_qsa_decode_context", None)
             if decode_context is not None:
                 for rows in sorted(set(token_counts)):
@@ -295,7 +298,7 @@ class Qwen3_8FlashNextQSAMetadataBuilder(B12xPagedMetadataBuilder):
     """Build QSA metadata without introducing another KV-cache owner."""
 
     requires_qsa_metadata: ClassVar[bool] = True
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
     supports_draft_decode_metadata_update = True
 
     def __init__(
@@ -1876,6 +1879,8 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             rows=rows,
             max_seq_len=int(metadata.max_seq_len),
         )
+        retain_cuda_graph_capture_resource(self)
+        retain_cuda_graph_capture_resource(context)
         staged = self._prepare_qsa_metadata(
             metadata,
             rows,

@@ -411,6 +411,8 @@ def test_ple_embedding_uses_query_offsets_for_live_token_count() -> None:
 
 
 def test_ple_mixed_op_uses_query_offsets_for_live_token_count() -> None:
+    from vllm.models.qwen3_8_flash_next.ple_attn import PLEGraphInputs
+
     layer = Qwen3_8FlashNextPLELayer.__new__(Qwen3_8FlashNextPLELayer)
     nn.Module.__init__(layer)
     layer.max_tokens = 8
@@ -423,6 +425,10 @@ def test_ple_mixed_op_uses_query_offsets_for_live_token_count() -> None:
     layer._num_seqs = torch.zeros(1, dtype=torch.int32)
     layer._num_tokens = torch.zeros(1, dtype=torch.int32)
     metadata = SimpleNamespace(num_reqs=4, num_decodes=0, num_prefills=0)
+    metadata.graph_inputs = PLEGraphInputs(4, 8, torch.device("cpu"))
+    metadata.graph_inputs.stage(
+        metadata, torch.tensor([0, 2, 2, 2, 2], dtype=torch.int32)
+    )
 
     layer._prepare_metadata(
         metadata,

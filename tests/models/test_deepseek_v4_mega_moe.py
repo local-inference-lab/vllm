@@ -173,6 +173,95 @@ def test_deepseek_v4_mega_moe_weight_loader_uses_ep_expert_ownership():
     assert torch.count_nonzero(experts.w13_weight[1]) == 0
 
 
+def test_v41_loaded_experts_preserve_gate_up_math_and_replay(monkeypatch):
+    """Checkpoint w1 is the gate; b12x's W13 layout names use a different order."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("native b12x experts require SM12x")
+    from flashinfer.b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+
+    from vllm.models.deepseek_v4_1.nvidia import b12x_moe
+    from vllm.v1.worker import workspace
+
+    device = torch.device("cuda")
+    monkeypatch.setattr(b12x_moe, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(b12x_moe, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    monkeypatch.setattr(workspace, "_manager", workspace.WorkspaceManager(device))
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                hidden_size=256,
+                moe_intermediate_size=128,
+                swiglu_limit=10.0,
+            )
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=3),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    with torch.device(device):
+        experts = b12x_moe.B12xV41Experts(
+            config,
+            num_experts=1,
+            top_k=1,
+            prefix="model.layers.0.ffn.experts",
+        )
+    # FP4 nibbles 2 and C decode to +1 and -2 respectively. These
+    # constant projections make the published K32 contraction exact.
+    for shard, code, exponent, shape in (
+        ("w1", 0x22, 123, (128, 128)),
+        ("w3", 0xCC, 123, (128, 128)),
+        ("w2", 0x22, 120, (256, 64)),
+    ):
+        name = "w2_weight" if shard == "w2" else "w13_weight"
+        for suffix, value, payload_shape in (
+            ("", code, shape),
+            ("_scale", exponent, (shape[0], shape[1] // 16)),
+        ):
+            experts.weight_loader(
+                getattr(experts, name + suffix),
+                torch.full(payload_shape, value, dtype=torch.uint8, device=device),
+                f"experts.{name}{suffix}",
+                shard_id=shard,
+                expert_id=0,
+            )
+    experts.finalize_weights()
+    x = (
+        torch.tensor([1 / 16, -1 / 16, 1 / 32], device=device, dtype=torch.bfloat16)[
+            :, None
+        ]
+        .expand(-1, 256)
+        .contiguous()
+    )
+    weights = torch.tensor([[0.5], [0.25], [1.0]], device=device)
+    ids = torch.zeros((3, 1), dtype=torch.int32, device=device)
+    output = torch.empty(x.shape, dtype=torch.float32, device=device)
+
+    def oracle():
+        gate = (x.float().sum(-1, keepdim=True) / 16).bfloat16().float()
+        up = -2 * gate
+        mid = (torch.nn.functional.silu(gate) * up * weights).bfloat16().float()
+        scale = torch.exp2(torch.ceil(torch.log2(mid.abs().clamp_min(1e-4) / 448)))
+        quantized = (mid / scale).to(torch.float8_e4m3fn).float() * scale
+        # W2 has 128 copies of 1/128, so its contraction is the identity.
+        return quantized.bfloat16().float().expand_as(output)
+
+    experts.run_native(x, weights, ids, output)
+    torch.testing.assert_close(output, oracle(), rtol=0, atol=0)
+    freeze_kernel_resolution("V4.1 loaded expert gate/up replay")
+    try:
+        graph = torch.cuda.CUDAGraph()
+        with workspace.collect_cuda_graph_capture_resources() as retained:
+            with torch.cuda.graph(graph):
+                experts.run_native(x, weights, ids, output)
+        x.neg_()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, oracle(), rtol=0, atol=0)
+        del retained
+    finally:
+        unfreeze_kernel_resolution()
+
+
 def test_deepseek_v4_mega_moe_finalizes_native_shared_expert_weights(monkeypatch):
     class FakeDeepGemm:
         transformed_dims: list[tuple[int, int]] = []

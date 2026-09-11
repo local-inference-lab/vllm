@@ -323,6 +323,7 @@ def _insert_context_kv(
 
 
 class DSparkDeepseekV4ForCausalLM(nn.Module):
+    model_cls = DSparkDeepseekV4Model
     # Draft weights ship in the target checkpoint (mtp.*) without embed/head, so
     # load_dspark_model always aliases the target's.
     has_own_embed_tokens = False
@@ -339,7 +340,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         self.pad_shared_expert = getattr(
             self.quant_config, "weight_block_size", None
         ) is not None and not _use_sequence_parallel(vllm_config)
-        self.model = DSparkDeepseekV4Model(
+        self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         # Shared with the target (aliased by the speculator's load utility).

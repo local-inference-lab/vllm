@@ -20,7 +20,11 @@ from vllm.models.glm5next.nvidia.ops.glm_kpool import (
 )
 from vllm.models.glm5next.nvidia.pooled_indexer import Glm5NextPooledIndexer
 from vllm.platforms import current_platform
-from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseMetadata
+from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
+    B12xGLM5NextMLASparseMetadataBuilder,
+    B12xMLASparseMetadata,
+)
+from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 
@@ -44,6 +48,190 @@ def _hadamard128(x: torch.Tensor) -> torch.Tensor:
         a, b = x[:, 0], x[:, 1]
         x = torch.stack((a + b, a - b), dim=1).reshape(128)
     return x / (128**0.5)
+
+
+@pytest.mark.parametrize("mixed_prefill", [False, True])
+@pytest.mark.parametrize("dcp_size,dcp_rank", [(1, 0), (4, 0), (4, 3)])
+def test_glm53_adaptive_sparse_metadata_replays_device_boundaries(
+    mixed_prefill, dcp_size, dcp_rank
+) -> None:
+    device = _require_glm_gpu()
+    builder = object.__new__(B12xGLM5NextMLASparseMetadataBuilder)
+    builder.use_pcp = False
+    builder.reorder_batch_threshold = 128
+    builder._prefill_backend = None
+    builder.topk_tokens = 2048
+    builder.cp_kv_cache_interleave_size = 4
+    builder.kv_cache_spec = SimpleNamespace(block_size=256)
+    builder.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    builder.requires_glm_next_selector_metadata = True
+    builder._ckv_gather_requested = False
+    builder.dcp_world_size = dcp_size
+    builder.dcp_rank = dcp_rank
+    builder._max_speculative_decode_query_len = 8
+    builder.req_id_per_token_buffer = torch.empty(12, dtype=torch.int32, device=device)
+    builder.cache_seq_lens_per_token_buffer = torch.empty_like(
+        builder.req_id_per_token_buffer
+    )
+    builder._capture_default_state_slot_ids = torch.arange(
+        4, dtype=torch.int32, device=device
+    )
+    builder._capture_state_slot_ids = torch.empty(4, dtype=torch.int32, device=device)
+    builder._capture_state_is_fresh = torch.empty(4, dtype=torch.bool, device=device)
+    builder._capture_num_accepted_tokens = torch.empty_like(
+        builder._capture_state_slot_ids
+    )
+    builder._capture_is_prefilling = torch.empty_like(builder._capture_state_is_fresh)
+    common = SimpleNamespace(
+        num_reqs=4,
+        num_actual_tokens=12,
+        max_query_len=8,
+        max_seq_len=1024,
+        query_start_loc=torch.tensor(
+            [0, 4, 8, 12, 12], dtype=torch.int32, device=device
+        ),
+        query_start_loc_cpu=torch.tensor([0, 4, 8, 12, 12], dtype=torch.int32),
+        seq_lens=torch.tensor([264, 524, 784, 0], dtype=torch.int32, device=device),
+        seq_lens_cpu_upper_bound=torch.tensor([268, 528, 784, 0], dtype=torch.int32),
+        block_table_tensor=torch.tensor(
+            [[5], [7], [9], [0]], dtype=torch.int32, device=device
+        ),
+        slot_mapping=torch.full((12,), -1, dtype=torch.int64, device=device),
+        dcp_local_seq_lens=None,
+        positions=None,
+        is_prefilling=torch.tensor([False, False, mixed_prefill, False]),
+    )
+    captured = builder.build_for_cudagraph_capture(common)
+    observed_ids = torch.empty_like(captured.req_id_per_token)
+    observed_lens = torch.empty_like(captured.cache_seq_lens_per_token)
+    if dcp_size == 1:
+        from b12x.attention import sparse_mla
+
+        from vllm.v1.attention.backends.mla.sparse_utils import (
+            triton_convert_req_index_to_global_index,
+        )
+
+        cache = torch.empty((10, 256, 528), dtype=torch.uint8, device=device)
+        sparse_mla.concat_and_cache_glm_next_mla_fp8(
+            torch.randn((2560, 512), dtype=torch.bfloat16, device=device),
+            cache,
+            torch.arange(2560, dtype=torch.int64, device=device),
+        )
+        query = torch.randn((12, 16, 512), dtype=torch.bfloat16, device=device)
+        indices = torch.full((12, 2051), -1, dtype=torch.int32, device=device)
+        indices[:, :4] = torch.arange(4, dtype=torch.int32, device=device)
+        plan = sparse_mla.plan(
+            sparse_mla.Caps(
+                device=device,
+                num_q_heads=16,
+                max_q_rows=12,
+                max_width=2051,
+                softmax_scale=256**-0.5,
+                kv_dtype=torch.uint8,
+                head_dim=512,
+                v_head_dim=512,
+                model_type=int(sparse_mla.ModelType.GLM_NEXT),
+                mode="extend" if mixed_prefill else "decode",
+                max_batch=12,
+                page_size=256,
+            )
+        )
+        scratch = torch.empty(plan.layout.nbytes, dtype=torch.uint8, device=device)
+
+        def attention(request_ids, lengths):
+            physical, counts = triton_convert_req_index_to_global_index(
+                request_ids,
+                common.block_table_tensor,
+                indices,
+                BLOCK_SIZE=256,
+                NUM_TOPK_TOKENS=2051,
+                return_valid_counts=True,
+            )
+            return sparse_mla.run(
+                sparse_mla.bind(
+                    plan,
+                    scratch=scratch,
+                    q=query,
+                    kv_cache=cache,
+                    selected_indices=physical,
+                    cache_lengths=lengths,
+                    selected_lengths=counts,
+                )
+            )
+
+        observed_attention = attention(
+            captured.req_id_per_token, captured.cache_seq_lens_per_token
+        ).clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        observed_ids.copy_(captured.req_id_per_token)
+        observed_lens.copy_(captured.cache_seq_lens_per_token)
+        if dcp_size == 1:
+            observed_attention.copy_(
+                attention(captured.req_id_per_token, captured.cache_seq_lens_per_token)
+            )
+    query_splits = [[1, 7, 4, 0], [7, 1, 4, 0]]
+    if not mixed_prefill:
+        query_splits += [[4, 1, 7, 0], [1, 1, 1, 0]]
+    for query_lens in query_splits:
+        starts = torch.tensor(
+            [0, *torch.tensor(query_lens).cumsum(0).tolist()], dtype=torch.int32
+        )
+        common.query_start_loc.copy_(starts)
+        if sum(query_lens) == 3:
+            common.query_start_loc_cpu.copy_(starts)
+        seq_lens = torch.tensor(
+            [260 + query_lens[0], 520 + query_lens[1], 780 + query_lens[2], 0],
+            dtype=torch.int32,
+        )
+        common.seq_lens.copy_(seq_lens)
+        metadata = builder.build(
+            0,
+            common,
+            selector_state_slot_ids=torch.tensor(
+                [2, 0, 1, -1], dtype=torch.int32, device=device
+            ),
+            selector_state_is_fresh=torch.zeros(4, dtype=torch.bool, device=device),
+            selector_num_accepted_tokens=torch.tensor(
+                [3, 2, 1, 1], dtype=torch.int32, device=device
+            ),
+            selector_is_prefilling=common.is_prefilling.to(device),
+        )
+        assert (
+            metadata.req_id_per_token.data_ptr() == captured.req_id_per_token.data_ptr()
+        )
+        assert (
+            metadata.cache_seq_lens_per_token.data_ptr()
+            == captured.cache_seq_lens_per_token.data_ptr()
+        )
+        if mixed_prefill:
+            assert metadata.num_decodes == 2
+            assert metadata.num_decode_tokens == 8
+            assert metadata.prefill_query_lens_cpu.tolist() == [4, 0]
+        torch.cuda.synchronize()
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+        expected_ids = torch.zeros(12, dtype=torch.int32)
+        expected_lens = torch.zeros(12, dtype=torch.int32)
+        for request, length in enumerate(query_lens):
+            start = int(starts[request])
+            expected_ids[start : start + length] = request
+            expected_lens[start : start + length] = torch.arange(
+                int(seq_lens[request]) - length + 1, int(seq_lens[request]) + 1
+            )
+        expected_lens = get_dcp_local_seq_lens(expected_lens, dcp_size, dcp_rank, 4)
+        torch.testing.assert_close(observed_ids.cpu(), expected_ids, rtol=0, atol=0)
+        torch.testing.assert_close(observed_lens.cpu(), expected_lens, rtol=0, atol=0)
+        if dcp_size == 1:
+            expected_attention = attention(
+                expected_ids.to(device), expected_lens.to(device)
+            )
+            torch.testing.assert_close(
+                observed_attention, expected_attention, rtol=0, atol=0
+            )
 
 
 def _pool_reference(

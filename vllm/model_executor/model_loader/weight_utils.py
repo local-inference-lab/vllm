@@ -16,13 +16,14 @@ from collections import defaultdict
 from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Literal
 
 import filelock
 import huggingface_hub.constants
 import numpy as np
 import regex as re
 import torch
+from safetensors.torch import _TYPES as _SAFETENSORS_BASE_DTYPES
 from safetensors.torch import load, load_file, safe_open, save_file
 from tqdm.auto import tqdm
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
@@ -43,7 +44,11 @@ from vllm.model_executor.layers.quantization import (
 from vllm.model_executor.model_loader.ep_weight_filter import (
     should_skip_weight,
 )
-from vllm.model_executor.weight_transfer import copy_weight, flush_weight_transfers
+from vllm.model_executor.weight_transfer import (
+    FileTensorSource,
+    copy_weight,
+    flush_weight_transfers,
+)
 from vllm.platforms import current_platform
 from vllm.tracing import instrument
 from vllm.transformers_utils.repo_utils import hf_api, hf_fs
@@ -64,6 +69,13 @@ except ImportError:
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
 
 logger = init_logger(__name__)
+
+# The Rust reader supports E8M0 even in releases whose Python lookup omits it.
+# Extend a local map; do not mutate safetensors' process-global dtype registry.
+_SAFETENSORS_TO_TORCH_DTYPE = {
+    **_SAFETENSORS_BASE_DTYPES,
+    "F8_E8M0": torch.float8_e8m0fnu,
+}
 
 # use system-level temp directory for file locks, so that multiple users
 # can share the same lock without error.
@@ -885,6 +897,91 @@ def _prefetch_all_checkpoints(
         block_size,
     )
     threading.Thread(target=_run_prefetch, daemon=True).start()
+
+
+def safetensors_file_sources(path: str) -> dict[str, FileTensorSource]:
+    """Read exact tensor ranges from a header, never from tensor payloads."""
+    path = os.path.abspath(path)
+    # Unbuffered reads cannot read ahead into the first tensor's payload.
+    with open(path, "rb", buffering=0) as f:
+        size = os.fstat(f.fileno()).st_size
+        length_bytes = f.read(8)
+        if len(length_bytes) != 8:
+            raise ValueError(f"Missing safetensors header in {path}")
+        length = int.from_bytes(length_bytes, "little")
+        if length > 100 << 20 or length > size - 8:
+            raise ValueError(f"Invalid safetensors header length in {path}")
+        header = json.loads(f.read(length))
+    # Let safetensors validate ranges, shapes, duplicate keys and payload bounds.
+    # Opening the file reads metadata only; no get_tensor/get_slice is needed.
+    with safe_open(path, framework="pt"):
+        pass
+    return {
+        name: FileTensorSource(
+            path=path,
+            offset=8 + length + entry["data_offsets"][0],
+            shape=tuple(entry["shape"]),
+            dtype=_SAFETENSORS_TO_TORCH_DTYPE[entry["dtype"]],
+        )
+        for name, entry in header.items()
+        if name != "__metadata__"
+    }
+
+
+def file_source_tensor(source: FileTensorSource) -> torch.Tensor:
+    """Make routing metadata for a checkpoint range without allocating storage."""
+    tensor = torch.empty(source.shape, dtype=source.dtype, device="meta")
+    tensor._vllm_file_tensor_source = source
+    return tensor
+
+
+def file_backed_safetensors_weights_iterator(
+    hf_weights_files: list[str],
+    ordinary_iterator: Callable[
+        [list[str]], Generator[tuple[str, torch.Tensor], None, None]
+    ],
+    file_weight_filter: Callable[[str], bool],
+    *,
+    weight_name_prefixes: Sequence[str] | None = None,
+    local_expert_ids: set[int] | None = None,
+    tensor_order: Literal["name", "offset"] = "name",
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Keep accelerated I/O for ordinary files and descriptors for opted-in ranges.
+
+    Files must arrive in the backend's original order. Only contiguous ordinary
+    runs are batched, so duplicate names and source ordering are not changed.
+    Mixed files use named lazy reads: accelerated backends either read the whole
+    file or reserve a full-file CUDA buffer even with tensor filtering enabled.
+    """
+    ordinary_files: list[str] = []
+    for path in hf_weights_files:
+        sources = safetensors_file_sources(path)
+        file_names = {name for name in sources if file_weight_filter(name)}
+        if not file_names:
+            ordinary_files.append(path)
+            continue
+        if ordinary_files:
+            yield from ordinary_iterator(ordinary_files)
+            ordinary_files = []
+        names = list(sources)
+        if tensor_order == "name":
+            names.sort()
+        elif tensor_order == "offset":
+            names.sort(key=lambda name: sources[name].offset)
+        with safe_open(path, framework="pt") as f:
+            for name in names:
+                if weight_name_prefixes and not _matches_weight_name_prefixes(
+                    name, weight_name_prefixes
+                ):
+                    continue
+                if should_skip_weight(name, local_expert_ids):
+                    continue
+                if name in file_names:
+                    yield name, file_source_tensor(sources[name])
+                else:
+                    yield name, f.get_tensor(name)
+    if ordinary_files:
+        yield from ordinary_iterator(ordinary_files)
 
 
 def safetensors_weights_iterator(
