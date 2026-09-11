@@ -1083,7 +1083,7 @@ def test_v41_block32_adapter_preserves_native_output_view_and_replay(
         pytest.skip("native b12x projection requires SM12x")
     from types import SimpleNamespace
 
-    from flashinfer.b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
 
     from vllm.models.deepseek_v4_1 import b12x_layers
     from vllm.v1.worker import workspace
@@ -1139,7 +1139,7 @@ def test_v41_block32_adapter_preserves_native_output_view_and_replay(
 
 
 def _check_v41_vocab_embedding_and_tied_head(device):
-    from flashinfer.b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
 
     from vllm.distributed.parallel_state import graph_capture
     from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -1263,8 +1263,8 @@ def test_v41_vocab_embedding_sharded_global_ids_and_target_weight_tie(monkeypatc
 def test_v41_mhc_shares_scratch_and_preserves_live_outputs(monkeypatch, broadcast):
     from types import SimpleNamespace
 
-    from flashinfer.b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
-    from flashinfer.b12x.norm import mhc
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x.norm import mhc
 
     from vllm.models.deepseek_v4_1 import b12x_layers
     from vllm.v1.worker import workspace

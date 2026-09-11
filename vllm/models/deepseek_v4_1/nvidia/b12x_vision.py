@@ -13,10 +13,10 @@ from __future__ import annotations
 import itertools
 
 import torch
-from flashinfer.b12x.attention import varlen
-from flashinfer.b12x.gemm import bf16_gemv
-from flashinfer.b12x.norm import hyperconnection
-from flashinfer.b12x.norm.vision import run_gelu, run_rope_qkv, run_spatial_merge
+from b12x.attention import varlen
+from b12x.gemm import bf16_gemv
+from b12x.norm import hyperconnection
+from b12x.norm.vision import run_gelu, run_rope_qkv, run_spatial_merge
 from torch import nn
 
 

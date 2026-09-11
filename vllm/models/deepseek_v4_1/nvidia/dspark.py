@@ -15,7 +15,7 @@ from collections.abc import Iterable
 import regex as re
 import torch
 import torch.nn as nn
-from flashinfer.b12x.norm import hyperconnection
+from b12x.norm import hyperconnection
 
 import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config

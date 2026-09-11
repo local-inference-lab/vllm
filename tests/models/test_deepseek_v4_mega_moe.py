@@ -177,7 +177,7 @@ def test_v41_loaded_experts_preserve_gate_up_math_and_replay(monkeypatch):
     """Checkpoint w1 is the gate; b12x's W13 layout names use a different order."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("native b12x experts require SM12x")
-    from flashinfer.b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
 
     from vllm.models.deepseek_v4_1.nvidia import b12x_moe
     from vllm.v1.worker import workspace

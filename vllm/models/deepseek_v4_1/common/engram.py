@@ -6,8 +6,8 @@ from functools import lru_cache
 from weakref import WeakValueDictionary
 
 import torch
-from flashinfer.b12x.norm import hyperconnection
-from flashinfer.b12x.sequence import engram as native
+from b12x.norm import hyperconnection
+from b12x.sequence import engram as native
 from torch import nn
 
 from vllm.config import get_current_vllm_config
