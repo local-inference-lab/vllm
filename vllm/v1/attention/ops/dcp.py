@@ -18,8 +18,8 @@ from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.cp_common import (
     DirectCPWorkspace,
-    direct_cp_enabled,
     direct_cp_multicast_enabled,
+    direct_cp_peer_access_enabled,
 )
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
@@ -907,7 +907,7 @@ def get_direct_dcp_a2a_workspace(
     dtype: torch.dtype,
     num_ubatches: int,
 ) -> DirectDCPA2AWorkspace | None:
-    if not direct_cp_enabled(
+    if not direct_cp_peer_access_enabled(
         group, dtype, envs.VLLM_USE_DIRECT_DCP_A2A, _A2A_SUPPORTED_DTYPES
     ):
         return None
