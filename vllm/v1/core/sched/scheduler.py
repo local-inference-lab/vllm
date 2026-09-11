@@ -367,6 +367,8 @@ class Scheduler(SchedulerInterface):
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
+            if self.kv_cache_manager.boundary_checkpoints is not None:
+                self.connector.bind_boundary_checkpoint_cache(self.kv_cache_manager)
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
@@ -1280,6 +1282,7 @@ class Scheduler(SchedulerInterface):
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 did_prefix_cache_lookup = False
                 boundary_logits_only = False
+                external_boundary_hit_tokens = 0
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
@@ -1300,6 +1303,18 @@ class Scheduler(SchedulerInterface):
                         request.shared_prefix_boundary,
                         hit_diverged,
                     ) = self._get_local_prefix_cache_hit(request)
+                    if (
+                        self.connector is not None
+                        and self.kv_cache_manager.boundary_checkpoints is not None
+                    ):
+                        external_boundary_hit_tokens = (
+                            self.connector.boundary_checkpoint_external_tokens(request)
+                        )
+                        assert (
+                            0
+                            <= external_boundary_hit_tokens
+                            <= num_new_local_computed_tokens
+                        )
                     boundary_logits_only = (
                         request.boundary_checkpoint is not None
                         and num_new_local_computed_tokens == request.num_tokens
@@ -1365,9 +1380,13 @@ class Scheduler(SchedulerInterface):
                             ) = self.kv_cache_manager.get_computed_blocks(request)
 
                         connector_prefix_cache_queries = (
-                            request.num_tokens - num_new_local_computed_tokens
+                            request.num_tokens
+                            - num_new_local_computed_tokens
+                            + external_boundary_hit_tokens
                         )
-                        connector_prefix_cache_hits = num_external_computed_tokens
+                        connector_prefix_cache_hits = (
+                            num_external_computed_tokens + external_boundary_hit_tokens
+                        )
 
                     # Total computed tokens (local + external).
                     num_computed_tokens = (
@@ -1394,8 +1413,14 @@ class Scheduler(SchedulerInterface):
                         assert num_computed_tokens <= request.num_prompt_tokens
                         request.prefill_stats.set(
                             num_prompt_tokens=request.num_prompt_tokens,
-                            num_local_cached_tokens=num_new_local_computed_tokens,
-                            num_external_cached_tokens=num_external_computed_tokens,
+                            num_local_cached_tokens=(
+                                num_new_local_computed_tokens
+                                - external_boundary_hit_tokens
+                            ),
+                            num_external_cached_tokens=(
+                                num_external_computed_tokens
+                                + external_boundary_hit_tokens
+                            ),
                         )
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
@@ -1617,7 +1642,8 @@ class Scheduler(SchedulerInterface):
                 # Record at admission so unscheduled lookups are not counted.
                 if did_prefix_cache_lookup:
                     self.kv_cache_manager.record_prefix_cache_stats(
-                        request, num_new_local_computed_tokens
+                        request,
+                        num_new_local_computed_tokens - external_boundary_hit_tokens,
                     )
 
                 request_queue.remove_request(request)
@@ -2804,17 +2830,23 @@ class Scheduler(SchedulerInterface):
                     req_index
                 ]
                 if instruction_boundary:
-                    self.kv_cache_manager.publish_boundary_checkpoint(
+                    checkpoint = self.kv_cache_manager.publish_boundary_checkpoint(
                         request, instruction_boundary, kind="instruction"
                     )
+                    if checkpoint is not None and self.connector is not None:
+                        self.connector.store_boundary_checkpoint(request, checkpoint)
                 if prompt_boundary:
-                    self.kv_cache_manager.publish_boundary_checkpoint(
+                    checkpoint = self.kv_cache_manager.publish_boundary_checkpoint(
                         request, prompt_boundary, kind="prompt"
                     )
+                    if checkpoint is not None and self.connector is not None:
+                        self.connector.store_boundary_checkpoint(request, checkpoint)
                 if stopped and response_boundary:
-                    self.kv_cache_manager.publish_boundary_checkpoint(
+                    checkpoint = self.kv_cache_manager.publish_boundary_checkpoint(
                         request, response_boundary, kind="response"
                     )
+                    if checkpoint is not None and self.connector is not None:
+                        self.connector.store_boundary_checkpoint(request, checkpoint)
             if stopped:
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.

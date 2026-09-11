@@ -119,6 +119,81 @@ def test_append_block_ids_rejects_write_past_row_capacity():
     assert block_tables.num_blocks.np[0, 1] == 3
 
 
+def test_boundary_logits_only_dispatches_pending_cache_tasks(monkeypatch):
+    """A restored prompt can share a step with another request's cache store."""
+    checkpoint = SimpleNamespace(num_tokens=4, auxiliary_block_ids=[3])
+    hidden_states = torch.ones(1, 8)
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        **{
+            name: torch.empty(1, dtype=torch.int32)
+            for name in (
+                "positions",
+                "input_ids",
+                "seq_lens",
+                "seq_lens_cpu_upper_bound",
+            )
+        },
+    )
+    dispatched_tasks = []
+    scheduler_output = SimpleNamespace(
+        boundary_logits_only=True,
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                boundary_checkpoint=checkpoint, prefill_token_ids=[1, 2, 3, 4]
+            )
+        ],
+        total_num_scheduled_tokens=1,
+        num_scheduled_tokens={"restored-request": 1},
+        finished_req_ids=set(),
+        kv_connector_metadata=["store-another-request"],
+        resolve_num_spec_tokens_to_schedule=lambda _: 0,
+    )
+    runner = SimpleNamespace(
+        **{
+            name: lambda *args: None
+            for name in (
+                "update_pp_decode_requests",
+                "finish_requests",
+                "free_states",
+                "add_requests",
+                "update_requests",
+            )
+        },
+        block_tables=SimpleNamespace(apply_staged_writes=lambda: None),
+        boundary_checkpoint_state=SimpleNamespace(
+            get_hidden_states=lambda _: hidden_states
+        ),
+        kv_connector=SimpleNamespace(
+            pre_forward=lambda output: dispatched_tasks.extend(
+                output.kv_connector_metadata
+            )
+        ),
+        speculator=None,
+        lora_config=None,
+        is_encoder_decoder=False,
+        dp_size=1,
+        dp_rank=0,
+        num_speculative_steps=0,
+        cudagraph_manager=None,
+        gather_batch_req_state=lambda *args: (SimpleNamespace(num_tokens=1), 1),
+        prepare_inputs=lambda *args: input_batch,
+        prepare_attn=lambda *args: pytest.fail("logits-only must skip attention"),
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "dispatch_cg_and_sync_dp",
+        lambda *args, **kwargs: (SimpleNamespace(num_tokens=1), None),
+    )
+
+    assert GPUModelRunner.execute_model(runner, scheduler_output) is None
+
+    assert dispatched_tasks == ["store-another-request"]
+    assert runner.execute_model_state.boundary_logits_only
+    assert runner.execute_model_state.hidden_states is hidden_states
+    assert input_batch.positions.item() == 3
+
+
 @pytest.mark.parametrize("dummy_run_fails", [False, True])
 def test_glm_dcp_attention_profile_uses_single_request_and_cleans_up(
     monkeypatch: pytest.MonkeyPatch,
