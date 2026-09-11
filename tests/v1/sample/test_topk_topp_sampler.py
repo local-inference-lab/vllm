@@ -9,8 +9,10 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.sample.ops.topk_topp_sampler import (
+    apply_top_k_top_p,
     apply_top_k_top_p_pytorch,
     random_sample,
+    warmup_top_k_top_p,
 )
 from vllm.v1.sample.sampler import Sampler
 
@@ -18,6 +20,35 @@ DEVICE_TYPE = current_platform.device_type
 
 BATCH_SIZE = 1024
 VOCAB_SIZE = 128 * 1024
+
+
+@pytest.mark.skipif(
+    not HAS_TRITON or not current_platform.is_cuda(),
+    reason="requires GPU Triton compilation",
+)
+@pytest.mark.parametrize("vocab_size", [257, 129280])
+def test_filter_warmup_covers_speculative_rows_and_constraint_subsets(
+    monkeypatch: pytest.MonkeyPatch, vocab_size: int
+):
+    """Four K5 requests must not compile top-p-only filtering after warmup."""
+    from triton import knobs
+
+    device = torch.device(DEVICE_TYPE)
+    warmup_top_k_top_p(vocab_size, 24, device)
+    torch.accelerator.synchronize()
+
+    def unexpected_compile(**kwargs):
+        pytest.fail("Filtering compiled a kernel after bounded sampler warmup")
+
+    monkeypatch.setattr(knobs.runtime, "jit_post_compile_hook", unexpected_compile)
+    for num_rows in (8, 9, 15, 16, 17, 24):
+        logits = torch.zeros(num_rows, vocab_size, device=device)
+        top_k = torch.full((num_rows,), 20, dtype=torch.int32, device=device)
+        top_p = torch.full((num_rows,), 0.95, device=device)
+        for k, p in ((top_k, None), (None, top_p), (top_k, top_p)):
+            filtered = apply_top_k_top_p(logits.clone(), k, p)
+            assert torch.isfinite(filtered).any(dim=-1).all()
+    torch.accelerator.synchronize()
 
 
 def _flashinfer_topk_topp_supported() -> bool:

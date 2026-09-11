@@ -497,9 +497,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         self._index_page = self._main_page
         self._index_width = self._main_width
         spec = self.config.speculative_config
-        decode_rows = self.config.scheduler_config.max_num_seqs * (
-            1 + (spec.num_speculative_tokens if spec is not None else 0)
+        # Parallel drafting can admit two draft spans during verifier profiling.
+        query_width = (
+            1 + (2 if spec.parallel_drafting else 1) * spec.num_speculative_tokens
+            if spec is not None
+            else 1
         )
+        decode_rows = self.config.scheduler_config.max_num_seqs * query_width
         # Graph buffers include padding beyond the live decode-token bound.
         decode_rows = max(
             decode_rows,

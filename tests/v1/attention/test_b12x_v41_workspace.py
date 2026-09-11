@@ -39,7 +39,9 @@ def _layer(attention, layer_id=0):
     layer.config = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=64),
         scheduler_config=SimpleNamespace(max_num_seqs=4),
-        speculative_config=SimpleNamespace(num_speculative_tokens=5),
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=5, parallel_drafting=False
+        ),
         compilation_config=SimpleNamespace(max_cudagraph_capture_size=128),
     )
     layer.capacity = 4096
@@ -84,7 +86,8 @@ def test_prepare_memory_is_metadata_not_capacity_activations(native_workspace):
 
 
 @pytest.mark.parametrize(
-    "is_decode,rows,live_rows", [(True, 6, 6), (True, 48, 6), (False, 65, 65)]
+    "is_decode,rows,live_rows",
+    [(True, 6, 6), (True, 36, 36), (True, 48, 6), (False, 65, 65)],
 )
 def test_attention_shared_scratch_graph_replay(
     native_workspace, monkeypatch, is_decode, rows, live_rows
@@ -93,7 +96,12 @@ def test_attention_shared_scratch_graph_replay(
     device = torch.device("cuda", torch.cuda.current_device())
     torch.manual_seed(142)
     layer = _layer(attention)
+    if rows == 36:
+        layer.config.speculative_config.parallel_drafting = True
+        layer.config.compilation_config.max_cudagraph_capture_size = 32
     layer._prepare(device)
+    if rows == 36:
+        assert layer._plans["decode"].caps.max_q_rows == 4 * (1 + 2 * 5)
     length = 1024
     positions = torch.full((rows,), -1, dtype=torch.int64, device=device)
     positions[:live_rows] = torch.arange(
