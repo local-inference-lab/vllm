@@ -8,6 +8,9 @@ Run `pytest tests/quantization/test_register_quantization_config.py`.
 """
 
 import logging
+import subprocess
+import sys
+import textwrap
 from typing import Any
 
 import pytest
@@ -99,6 +102,52 @@ class CustomQuantConfig(QuantizationConfig):
         if isinstance(layer, LinearBase):
             return FakeQuantLinearMethod(num_bits=self.num_bits)
         return None
+
+
+def test_quantization_discovery_does_not_require_optional_model_kernels():
+    """Config discovery must not import model-specific native implementations."""
+    script = textwrap.dedent(
+        """
+        import importlib.abc
+        import sys
+        from unittest.mock import Mock
+
+        class RejectOptionalKernels(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == "vllm.models.deepseek_v4_1.b12x_layers":
+                    raise ModuleNotFoundError("optional model kernels unavailable")
+                return None
+
+        sys.meta_path.insert(0, RejectOptionalKernels())
+        from vllm.model_executor.layers.linear import LinearBase
+        from vllm.model_executor.layers.quantization import get_quantization_config
+        import torch
+
+        for method, expected_class in {
+            "fp8": "Fp8Config",
+            "modelopt_fp4": "ModelOptNvFp4Config",
+            "modelopt_mixed": "ModelOptMixedPrecisionConfig",
+            "modelopt_mxfp8": "ModelOptMxFp8Config",
+            "deepseek_v4_fp8": "DeepseekV4FP8Config",
+            "deepseek_v41_fp8": "DeepseekV41FP8Config",
+        }.items():
+            config = get_quantization_config(method)
+            assert config.__name__ == expected_class
+
+        config = get_quantization_config("deepseek_v41_fp8")()
+        assert config.get_quant_method(torch.nn.Identity(), "experts") is None
+        try:
+            config.get_quant_method(Mock(spec=LinearBase), "projection")
+        except ModuleNotFoundError as error:
+            assert "optional model kernels unavailable" in str(error)
+        else:
+            raise AssertionError("Native dispatch must not hide a missing backend")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_register_quantization_config(caplog_vllm):
