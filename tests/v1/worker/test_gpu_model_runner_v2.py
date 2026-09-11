@@ -171,6 +171,7 @@ def test_boundary_logits_only_dispatches_pending_cache_tasks(monkeypatch):
             )
         ),
         speculator=None,
+        model_state=SimpleNamespace(),
         lora_config=None,
         is_encoder_decoder=False,
         dp_size=1,
