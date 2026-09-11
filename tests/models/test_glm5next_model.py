@@ -23,6 +23,8 @@ from vllm.model_executor.models.glm4_1v import Glm4vForConditionalGeneration
 from vllm.model_executor.models.interfaces import supports_eagle3, supports_pp
 from vllm.models.glm5next.nvidia import attention as glm5next_attention
 from vllm.models.glm5next.nvidia import model as glm5next_model
+from vllm.models.glm5next.nvidia import mtp as glm5next_mtp
+from vllm.models.glm5next.nvidia import mtp_draft_head
 from vllm.models.glm5next.nvidia.kda import Glm5NextLinearAttention
 from vllm.models.glm5next.nvidia.model import (
     GLM5NEXT_PACKED_MODULES_MAPPING,
@@ -193,6 +195,26 @@ def test_glm5next_mtp_selects_only_draft_checkpoint_weights() -> None:
     )
 
 
+def test_glm5next_mtp_reuses_runtime_quantized_draft_head(monkeypatch) -> None:
+    source_head = SimpleNamespace(runtime_lm_head_quantization="nvfp4")
+    predictor = Glm5NextMultiTokenPredictor.__new__(Glm5NextMultiTokenPredictor)
+    torch.nn.Module.__init__(predictor)
+    predictor.quantized_draft_head = torch.nn.Linear(4, 8, bias=False)
+
+    def reject_duplicate_quantization(_source_head):
+        raise AssertionError("runtime-quantized draft head was quantized twice")
+
+    monkeypatch.setattr(
+        glm5next_mtp,
+        "make_quantized_draft_head",
+        reject_duplicate_quantization,
+    )
+
+    predictor.prepare_draft_lm_head(source_head)
+
+    assert predictor.quantized_draft_head is None
+
+
 @pytest.fixture
 def glm_mtp_head_loader(monkeypatch):
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -262,6 +284,41 @@ def test_glm5next_mtp_requires_both_draft_layer_and_head_weights(
     match = "requires an unquantized" if missing_head else "layer 45 weights missing"
     with pytest.raises(ValueError, match=match):
         glm_mtp_head_loader.load_weights(weights)
+
+
+@pytest.mark.parametrize(
+    ("configured", "resolved"), (("bf16", "bf16"), ("NVFP4", "nvfp4"))
+)
+def test_glm5next_mtp_draft_head_mode(
+    monkeypatch, configured: str, resolved: str
+) -> None:
+    monkeypatch.setenv("VLLM_GLM53_MTP_DRAFT_HEAD", configured)
+
+    assert mtp_draft_head.configured_draft_head_mode() == resolved
+
+
+def test_glm5next_mtp_draft_head_rejects_unknown_mode(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_GLM53_MTP_DRAFT_HEAD", "int4")
+
+    with pytest.raises(ValueError, match="must be one of bf16, nvfp4"):
+        mtp_draft_head.configured_draft_head_mode()
+
+
+def test_glm5next_mtp_prepares_configured_draft_head(monkeypatch) -> None:
+    source_head = torch.nn.Linear(4, 8, bias=False)
+    quantized_head = torch.nn.Linear(4, 8, bias=False)
+    predictor = Glm5NextMultiTokenPredictor.__new__(Glm5NextMultiTokenPredictor)
+    torch.nn.Module.__init__(predictor)
+
+    monkeypatch.setattr(
+        glm5next_mtp,
+        "make_quantized_draft_head",
+        lambda actual_head: quantized_head if actual_head is source_head else None,
+    )
+
+    predictor.prepare_draft_lm_head(source_head)
+
+    assert predictor.quantized_draft_head is quantized_head
 
 
 def test_glm5next_mtp_preserves_position_zero_embedding() -> None:
@@ -506,6 +563,7 @@ def test_glm5next_loads_mxfp8_fused_projection_scales(
 def test_glm5next_kda_adapts_shared_out_buffer_forward(monkeypatch) -> None:
     layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
     torch.nn.Module.__init__(layer)
+    layer.use_full_rank_gate = True
     hidden_states = torch.randn(2, 4)
     positions = torch.arange(2)
 
@@ -1065,18 +1123,30 @@ def test_glm5next_b12x_kda_prefill_matches_the_triton_chunk_path() -> None:
 
 
 @pytest.mark.parametrize("request_boundaries", [False, True])
-def test_glm5next_b12x_prefill_requests_a_checkpoint_block(
+@pytest.mark.parametrize("block_size", [256, 2048, 8192])
+def test_glm5next_prefill_checkpoint_capacity_matches_backend(
     request_boundaries: bool,
+    block_size: int,
 ) -> None:
     layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
     torch.nn.Module.__init__(layer)
-    spec = SimpleNamespace(num_prefill_checkpoint_blocks=0)
+    spec = SimpleNamespace(num_prefill_checkpoint_blocks=0, block_size=block_size)
+    layer._flashkda_buffer_specs = (
+        ((1, 4096, 1, 128), torch.bfloat16),
+        ((1, 1, 128, 128), torch.bfloat16),
+        ((1, 1, 128, 128), torch.bfloat16),
+        ((1024,), torch.uint8),
+    )
 
     def fake_super_spec(self, vllm_config):
         del self, vllm_config
         return spec
 
-    for backend, expected in (("b12x", 1), ("flashkda", 1), ("triton", 0)):
+    for backend, expected in (
+        ("b12x", 1),
+        ("flashkda", max(1, 4095 // block_size)),
+        ("triton", 0),
+    ):
         layer.kda_prefill_backend = backend
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(
@@ -1091,11 +1161,18 @@ def test_glm5next_b12x_prefill_requests_a_checkpoint_block(
                 lambda base, **kwargs: SimpleNamespace(**kwargs),
             )
             resolved = layer.get_kv_cache_spec(
-                SimpleNamespace(use_request_boundary_checkpoints=request_boundaries)
+                SimpleNamespace(
+                    use_request_boundary_checkpoints=request_boundaries,
+                    scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
+                )
             )
         assert resolved.num_prefill_checkpoint_blocks == (
             0 if request_boundaries else expected
         ), backend
+        if backend == "flashkda" and not request_boundaries:
+            shape, dtype = layer._flashkda_buffer_specs[2]
+            assert shape == (expected, 1, 128, 128)
+            assert dtype == torch.float32
 
 
 def test_glm5next_alone_opts_into_b12x_kda_decode() -> None:
@@ -1103,6 +1180,180 @@ def test_glm5next_alone_opts_into_b12x_kda_decode() -> None:
     assert Glm5NextLinearAttention.enable_b12x_kda_decode
     assert KimiGatedDeltaNetAttention.b12x_kda_null_state_index is None
     assert Glm5NextLinearAttention.b12x_kda_null_state_index == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dim_first", [False, True])
+@pytest.mark.parametrize("num_spec", [0, 3, 7])
+def test_glm5next_packed_checkpoint_store_preserves_query_ownership(
+    dim_first: bool, num_spec: int
+) -> None:
+    """Each packed checkpoint stores its owner's convolution history and state."""
+    device = torch.device("cuda", 0)
+    width, history = 48, 3
+    mixed = torch.arange(96 * width, device=device).reshape(96, width).float()
+    recurrent = torch.full((6, 2, 128, 128), -1.0, device=device)
+    saved = (
+        torch.arange(3 * 2 * 128 * 128, device=device).reshape(3, 2, 128, 128).float()
+    )
+    capacity = history + num_spec
+    conv_shape = (6, width, capacity) if dim_first else (6, capacity, width)
+    conv = torch.full(conv_shape, -1.0, device=device)
+    view = conv if dim_first else conv.transpose(1, 2)
+    starts = torch.tensor([0, 64, 96], dtype=torch.int32, device=device)
+    offsets = torch.tensor([16, 48, 16], dtype=torch.int32, device=device)
+    slots = torch.tensor([3, 1, 4], dtype=torch.int32, device=device)
+    owners = torch.tensor([0, 0, 1], dtype=torch.int64, device=device)
+
+    def store():
+        kimi_gdn_linear_attn._store_cache_checkpoints_kernel[(3, 32)](
+            mixed,
+            view,
+            saved,
+            recurrent,
+            starts,
+            offsets,
+            slots,
+            *mixed.stride(),
+            *view.stride(),
+            saved.stride(0),
+            recurrent.stride(0),
+            offsets.stride(0),
+            history,
+            width,
+            saved[0].numel(),
+            NULL_BLOCK_ID,
+            1024,
+            True,
+            owners,
+        )
+
+    store()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        store()
+    for delta in (0, 1):
+        mixed.add_(delta)
+        saved.add_(delta)
+        view.fill_(-1)
+        recurrent.fill_(-1)
+        graph.replay()
+        torch.accelerator.synchronize()
+        for row, (slot, endpoint) in enumerate(((3, 16), (1, 48), (4, 80))):
+            assert torch.equal(
+                view[slot, :, :history], mixed[endpoint - history : endpoint].T
+            )
+            assert (view[slot, :, history:] == -1).all()
+            assert torch.equal(recurrent[slot], saved[row])
+        assert (view[[0, 2, 5]] == -1).all()
+        assert (recurrent[[0, 2, 5]] == -1).all()
+
+
+@pytest.mark.parametrize("num_spec", [0, 3, 7])
+def test_glm5next_checkpoint_conv_history_excludes_speculative_capacity(
+    num_spec: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The prefill reader expects recent history at the start of an enlarged row."""
+    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    layer.conv_size = 4
+    history, width, endpoint = 3, 8, 16
+    mixed = torch.arange(32 * width).reshape(32, width).float()
+    conv = torch.full((2, width, history + num_spec), -1.0)
+
+    class StoreContract:
+        def __getitem__(self, grid):
+            def store(*args):
+                values, destination = args[:2]
+                starts, offsets, slots = args[4:7]
+                logical_history = args[15]
+                for row, slot in enumerate(slots.tolist()):
+                    end = int(starts[row] + offsets[row])
+                    destination[slot, :, :logical_history].copy_(
+                        values[end - logical_history : end].T
+                    )
+
+            return store
+
+    monkeypatch.setattr(
+        kimi_gdn_linear_attn, "_store_cache_checkpoints_kernel", StoreContract()
+    )
+    layer._store_kda_conv_checkpoint(
+        mixed_qkv=mixed,
+        conv_state=conv,
+        recurrent_state=torch.empty(2, 1),
+        query_start_loc=torch.tensor([0, 32]),
+        checkpoint=SimpleNamespace(
+            checkpoint_offsets=torch.tensor([endpoint]),
+            state_indices=torch.tensor([1]),
+        ),
+    )
+    assert torch.equal(conv[1, :, :history], mixed[endpoint - history : endpoint].T)
+    assert (conv[1, :, history:] == -1).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dim_first", [False, True])
+@pytest.mark.parametrize("num_spec", [0, 3, 7])
+def test_glm5next_checkpoint_conv_resume_matches_contiguous_prefill(
+    dim_first: bool, num_spec: int
+) -> None:
+    """A checkpoint resumes the same causal convolution with speculative storage."""
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
+
+    device = torch.device("cuda", 0)
+    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    layer.conv_size = 4
+    history, width, endpoint, tokens = 3, 128, 16, 32
+    torch.manual_seed(41)
+    mixed = torch.randn(tokens, width, dtype=torch.bfloat16, device=device)
+    weights = torch.randn(width, 4, dtype=torch.bfloat16, device=device)
+    shape = (
+        (2, width, history + num_spec) if dim_first else (2, history + num_spec, width)
+    )
+    storage = torch.zeros(shape, dtype=mixed.dtype, device=device)
+    conv = storage if dim_first else storage.transpose(1, 2)
+    slots = torch.tensor([1], dtype=torch.int32, device=device)
+    starts = torch.tensor([0, tokens], dtype=torch.int32, device=device)
+    full = causal_conv1d_fn(
+        mixed.T,
+        weights,
+        None,
+        activation="silu",
+        conv_states=conv,
+        has_initial_state=torch.tensor([False], device=device),
+        cache_indices=slots,
+        query_start_loc=starts,
+    )
+    layer._store_kda_conv_checkpoint(
+        mixed_qkv=mixed,
+        conv_state=conv,
+        recurrent_state=torch.empty(2, 1, device=device),
+        query_start_loc=starts,
+        checkpoint=SimpleNamespace(
+            checkpoint_offsets=torch.tensor(
+                [endpoint], dtype=torch.int32, device=device
+            ),
+            state_indices=slots,
+        ),
+    )
+    assert torch.equal(conv[1, :, :history], mixed[endpoint - history : endpoint].T)
+    resumed = causal_conv1d_fn(
+        mixed[endpoint:].T,
+        weights,
+        None,
+        activation="silu",
+        conv_states=conv,
+        has_initial_state=torch.tensor([True], device=device),
+        cache_indices=slots,
+        query_start_loc=torch.tensor(
+            [0, tokens - endpoint], dtype=torch.int32, device=device
+        ),
+    )
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(resumed, full[:, endpoint:], rtol=0, atol=0)
 
 
 def test_glm5next_b12x_mhc_builds_first_layer_broadcast_fn() -> None:

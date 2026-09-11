@@ -216,10 +216,9 @@ class SchedulerStats:
     decode_compute_seconds: float = 0.0
     prefill_compute_seconds: float = 0.0
     prefill_compute_share: float = 0.0
-    scheduled_prefill_tokens: int = 0
-    active_partial_prefills: int = 0
-    decode_only_steps: int = 0
-    fairness_bypasses: int = 0
+    decode_compute_pressure: float = 1.0
+    prefill_compute_pressure: float = 1.0
+    local_prefill_backlog_tokens: int = 0
 
 
 @dataclass

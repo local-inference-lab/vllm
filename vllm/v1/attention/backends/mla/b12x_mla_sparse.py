@@ -34,10 +34,14 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
+    _remap_tiling,
     triton_convert_req_index_to_global_index,
     triton_filter_and_convert_dcp_index,
 )
-from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+from vllm.v1.attention.backends.utils import (
+    get_dcp_local_seq_lens,
+    refresh_dcp_local_seq_lens_,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.worker.workspace import (
@@ -398,7 +402,16 @@ def _map_global_topk_to_gathered_ckv_kernel(
     valid_i32 = valid.to(tl.int32)
     local_offset = tl.cumsum(valid_i32) - valid_i32
     tile_valid_count = tl.sum(valid_i32)
-    output_base = tl.atomic_add(valid_count_ptr + row, tile_valid_count)
+    if tl.constexpr(BLOCK_N >= NUM_TOPK_TOKENS):
+        output_base = 0
+        tl.store(valid_count_ptr + row, tile_valid_count)
+        tl.store(
+            out_ptr + row * out_stride0 + cols * out_stride1,
+            -1,
+            mask=col_mask & (cols >= tile_valid_count),
+        )
+    else:
+        output_base = tl.atomic_add(valid_count_ptr + row, tile_valid_count)
     tl.store(
         out_ptr + row * out_stride0 + (output_base + local_offset) * out_stride1,
         gathered_slot,
@@ -437,12 +450,13 @@ def _map_global_topk_to_gathered_ckv(
     ):
         raise TypeError("CKV gather index metadata must be int32")
 
-    block_n = 128
-    out.fill_(-1)
-    valid_counts.zero_()
-    _map_global_topk_to_gathered_ckv_kernel[
-        (token_indices.shape[0], triton.cdiv(token_indices.shape[1], block_n))
-    ](
+    single_tile, block_n, tiles_per_row, num_warps = _remap_tiling(
+        token_indices.shape[1], 128, True
+    )
+    if not single_tile:
+        out.fill_(-1)
+        valid_counts.zero_()
+    _map_global_topk_to_gathered_ckv_kernel[(token_indices.shape[0], tiles_per_row)](
         req_ids,
         token_indices,
         rank_req_starts,
@@ -462,6 +476,7 @@ def _map_global_topk_to_gathered_ckv(
         DCP_INTERLEAVE=cp_kv_cache_interleave_size,
         NUM_TOPK_TOKENS=token_indices.shape[1],
         BLOCK_N=block_n,
+        num_warps=num_warps,
     )
 
 
@@ -660,6 +675,7 @@ class B12xMLASparseMetadata(AttentionMetadata):
     num_decodes: int
     num_prefills: int
     num_decode_tokens: int
+    dcp_global_seq_lens: torch.Tensor | None = None
     prefill_max_seq_len: int = 0
     prefill: MLACommonPrefillMetadata | None = None
     prefill_query_lens_cpu: torch.Tensor | None = None
@@ -705,9 +721,9 @@ class B12xMLASparseMetadataBuilder(
         ):
             raise ValueError(dcp_error)
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self.supports_draft_decode_metadata_update = (
-            self.requires_glm_next_selector_metadata
-        )
+        # All step-dependent state is persistent. Generic DSA DCP additionally
+        # refreshes its rank-local sequence lengths in place between steps.
+        self.supports_draft_decode_metadata_update = True
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         scheduler_config = vllm_config.scheduler_config
         max_tokens = scheduler_config.max_num_batched_tokens
@@ -885,6 +901,9 @@ class B12xMLASparseMetadataBuilder(
             else common.seq_lens
         )
         metadata.seq_lens = seq_lens
+        metadata.dcp_global_seq_lens = (
+            common.seq_lens[: common.num_reqs] if use_dcp else None
+        )
 
         if self.supports_varlen_decode_cudagraph:
             per_token_lens = self.cache_seq_lens_per_token_buffer[:num_tokens]
@@ -1067,12 +1086,28 @@ class B12xMLASparseMetadataBuilder(
         self,
         metadata: B12xMLASparseMetadata,
     ) -> None:
-        accepted = metadata.selector_num_accepted_tokens
-        if not self.requires_glm_next_selector_metadata or accepted is None:
-            raise RuntimeError(
-                "GLM5Next draft decode metadata requires accepted-token counts"
+        if self.dcp_world_size > 1:
+            global_seq_lens = metadata.dcp_global_seq_lens
+            if global_seq_lens is None:
+                raise RuntimeError(
+                    "B12X fused DCP draft decode requires global sequence lengths"
+                )
+            refresh_dcp_local_seq_lens_(
+                metadata.seq_lens,
+                global_seq_lens,
+                metadata.num_reqs,
+                self.dcp_world_size,
+                self.dcp_rank,
+                self.cp_kv_cache_interleave_size,
             )
-        accepted.fill_(1)
+
+        if self.requires_glm_next_selector_metadata:
+            accepted = metadata.selector_num_accepted_tokens
+            if accepted is None:
+                raise RuntimeError(
+                    "GLM5Next draft decode metadata requires accepted-token counts"
+                )
+            accepted.fill_(1)
 
 
 @triton.jit

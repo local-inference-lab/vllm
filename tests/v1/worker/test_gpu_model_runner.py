@@ -5,6 +5,7 @@ import gc
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
+from weakref import ref
 
 import numpy as np
 import pytest
@@ -1821,6 +1822,133 @@ def test_glm_dcp_attention_profile_skips_non_glm_and_dcp1():
     runner.dcp_world_size = 1
     runner.profile_glm_dcp_attention()
     runner._init_minimal_kv_cache_for_profiling.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ["DeepseekV4ForCausalLM", "DeepseekV4ForConditionalGeneration"],
+)
+@pytest.mark.parametrize(
+    ("init_fails", "dummy_run_fails"),
+    [(False, False), (False, True), (True, False)],
+)
+def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+    architecture: str,
+    init_fails: bool,
+    dummy_run_fails: bool,
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model_config = SimpleNamespace(architecture=architecture)
+    runner.vllm_config = object()
+    runner.max_num_tokens = 4096
+    events: list[object] = []
+
+    def init_kv(*, num_blocks=None):
+        events.append(("init-kv", num_blocks))
+        if init_fails:
+            raise RuntimeError("expected DeepSeek V4 KV initialization failure")
+
+    runner._init_minimal_kv_cache_for_profiling = init_kv
+
+    def dummy_run(*args, **kwargs):
+        events.append(("dummy-run", args, kwargs))
+        if dummy_run_fails:
+            raise RuntimeError("expected DeepSeek V4 profile failure")
+        return torch.empty(1), torch.empty(1)
+
+    runner._dummy_run = dummy_run
+    runner._sync_device = lambda: events.append("sync")
+    runner._cleanup_profiling_kv_cache = lambda: events.append("cleanup")
+
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "set_current_vllm_config",
+        lambda _: nullcontext(),
+    )
+
+    if init_fails:
+        with pytest.raises(
+            RuntimeError, match="expected DeepSeek V4 KV initialization failure"
+        ):
+            runner._profile_deepseek_v4_attention()
+    elif dummy_run_fails:
+        with pytest.raises(RuntimeError, match="expected DeepSeek V4 profile failure"):
+            runner._profile_deepseek_v4_attention()
+    else:
+        runner._profile_deepseek_v4_attention()
+
+    assert events[0] == ("init-kv", 1)
+    if init_fails:
+        assert events == [("init-kv", 1), "cleanup"]
+    else:
+        assert events[1] == (
+            "dummy-run",
+            (4096,),
+            {
+                "force_attention": True,
+                "skip_eplb": True,
+                "is_profile": True,
+                "single_request_prefill": True,
+            },
+        )
+    assert events[-1] == "cleanup"
+    if not init_fails and not dummy_run_fails:
+        assert events[-2] == "sync"
+
+
+def test_deepseek_v4_attention_profile_skips_other_architectures():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model_config = SimpleNamespace(architecture="OtherArchitecture")
+    runner._init_minimal_kv_cache_for_profiling = Mock()
+
+    runner._profile_deepseek_v4_attention()
+
+    runner._init_minimal_kv_cache_for_profiling.assert_not_called()
+
+
+def test_profile_run_releases_generic_outputs_before_deepseek_profile(monkeypatch):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.supports_mm_inputs = False
+    runner.max_num_tokens = 4096
+    runner.is_pooling_model = False
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    events: list[object] = []
+    output_refs: list[ref] = []
+
+    class ProfileOutput:
+        pass
+
+    def dummy_run(*args, **kwargs):
+        events.append(("dummy-run", args, kwargs))
+        outputs = (ProfileOutput(), ProfileOutput())
+        output_refs.extend(ref(output) for output in outputs)
+        return outputs
+
+    def profile_attention():
+        assert all(output_ref() is None for output_ref in output_refs)
+        events.append("profile-attention")
+
+    runner._dummy_run = dummy_run
+    runner._profile_deepseek_v4_attention = profile_attention
+    runner._sync_device = lambda: events.append("sync")
+    runner.encoder_cache = SimpleNamespace(
+        clear=lambda: events.append("clear-encoder-cache")
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=False),
+    )
+
+    runner.profile_run()
+
+    assert events == [
+        ("dummy-run", (4096,), {"is_profile": True}),
+        "sync",
+        "profile-attention",
+        "clear-encoder-cache",
+    ]
 
 
 class TestInitFp8KvScalesHybridModels:

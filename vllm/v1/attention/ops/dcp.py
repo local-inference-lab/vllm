@@ -15,11 +15,12 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_dcp_group
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.cp_common import (
     DirectCPWorkspace,
-    direct_cp_enabled,
     direct_cp_multicast_enabled,
+    direct_cp_peer_access_enabled,
 )
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
@@ -295,7 +296,14 @@ def cp_lse_ag_out_rs(
         seq_lens=seq_lens,
         query_start_loc=query_start_loc,
     )
-    out = cp_group.reduce_scatter(out, dim=1)
+    if current_platform.is_cuda() and current_platform.is_device_capability_family(120):
+        # Preserve the head-major collective output for the following MLA
+        # value GEMM. Its batch matrices are disjoint, avoiding cuBLAS's
+        # SM120/121 overlapping-stride read defect and a redundant transpose copy.
+        out = cp_group.reduce_scatter(out.transpose(0, 1).contiguous(), dim=0)
+        out = out.transpose(0, 1)
+    else:
+        out = cp_group.reduce_scatter(out, dim=1)
 
     if return_lse:
         cp_num_heads = lse.shape[1] // cp_group.world_size
@@ -907,7 +915,7 @@ def get_direct_dcp_a2a_workspace(
     dtype: torch.dtype,
     num_ubatches: int,
 ) -> DirectDCPA2AWorkspace | None:
-    if not direct_cp_enabled(
+    if not direct_cp_peer_access_enabled(
         group, dtype, envs.VLLM_USE_DIRECT_DCP_A2A, _A2A_SUPPORTED_DTYPES
     ):
         return None

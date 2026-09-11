@@ -16,11 +16,26 @@ else()
     GIT_TAG 3b225bf26bb8e218928a1fe14751cb48cf31d11b
     GIT_PROGRESS TRUE
     GIT_SUBMODULES cutlass
+    PATCH_COMMAND
+      "${CMAKE_COMMAND}"
+      "-DSOURCE_DIR=<SOURCE_DIR>"
+      "-DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/flashkda-packed-checkpoints.patch"
+      -P "${CMAKE_CURRENT_LIST_DIR}/apply_flashkda_checkpoint_patch.cmake"
   )
 endif()
 
 FetchContent_MakeAvailable(flashkda)
 message(STATUS "FlashKDA is available at ${flashkda_SOURCE_DIR}")
+
+# Local overrides remain caller-owned. Require the same API as the registered
+# vLLM operator without applying a patch to another checkout.
+file(READ "${flashkda_SOURCE_DIR}/csrc/flash_kda.h" FLASHKDA_API_HEADER)
+string(FIND "${FLASHKDA_API_HEADER}" "checkpoint_indptr" FLASHKDA_PACKED_API)
+if(FLASHKDA_PACKED_API LESS 0)
+  message(FATAL_ERROR
+    "FlashKDA sources lack the packed checkpoint API. Unset FLASH_KDA_SRC_DIR "
+    "to use the pinned patched dependency, or provide compatible sources.")
+endif()
 
 set(FLASH_KDA_SUPPORT_ARCHS)
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.0)

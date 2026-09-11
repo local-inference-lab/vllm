@@ -68,6 +68,14 @@ def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> None:
         *cudagraph_capture_sizes,
         *(size for size in compile_sizes if isinstance(size, int)),
     ]
+    cudagraph_manager = getattr(
+        getattr(worker, "model_runner", None), "cudagraph_manager", None
+    )
+    planned_token_counts = getattr(cudagraph_manager, "planned_token_counts", None)
+    if callable(planned_token_counts):
+        # Speculative decode graphs round scheduler buckets to verifier-row
+        # multiples. Those model shapes must be planned before graph capture.
+        serving_sizes.extend(planned_token_counts())
     max_tokens = max_num_batched_tokens
     max_num_scheduled_tokens = worker.scheduler_config.max_num_scheduled_tokens
     if max_num_scheduled_tokens is not None:

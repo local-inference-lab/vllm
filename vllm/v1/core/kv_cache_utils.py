@@ -2627,7 +2627,7 @@ class BlockHashListWithBlockSize:
 
     def __init__(
         self,
-        block_hashes: list[BlockHash],
+        block_hashes: Sequence[BlockHash],
         hash_block_size: int,
         target_block_size: int,
     ):

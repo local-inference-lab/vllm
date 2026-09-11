@@ -637,9 +637,24 @@ class VllmConfig:
                 or model.hf_text_config.model_type in ("glm5_next_text", "glm5_next")
             )
             and parallel.prefill_context_parallel_size == 1
-            and self.kv_transfer_config is None
+            and self.external_boundary_checkpoint_adapter_available
             and cache.kv_offloading_size is None
         )
+
+    @property
+    def external_boundary_checkpoint_adapter_available(self) -> bool:
+        """Require an explicit atomic target/draft adapter for external storage.
+
+        Aligned connectors must not enable request-boundary retention merely
+        because they can transfer ordinary KV chunks. Worker initialization
+        additionally validates the negotiated server protocol and byte layout.
+        """
+        if self.kv_transfer_config is None:
+            return True
+        from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+        connector = KVConnectorFactory.get_connector_class(self.kv_transfer_config)
+        return connector.supports_request_boundary_checkpoints(self)
 
     @property
     def max_concurrent_batches(self) -> int:
@@ -1133,6 +1148,18 @@ class VllmConfig:
         if self.model_config is not None and (self.model_config.enable_cumem_allocator):
             return
 
+        # Engine-driven LMCache MP transport does not pin or register KV
+        # addresses; GPU gather/scatter remains in the vLLM worker.
+        if (
+            self.kv_transfer_config.kv_connector
+            in ("LMCacheMPConnector", "LMCacheRecurrentCheckpointConnector")
+            and self.kv_transfer_config.kv_connector_extra_config.get(
+                "lmcache.mp.mp_transfer_mode"
+            )
+            == "engine_driven"
+        ):
+            return
+
         raise ValueError(
             f"KV connector {self.kv_transfer_config.kv_connector} is "
             "incompatible with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
@@ -1211,11 +1238,11 @@ class VllmConfig:
         self.parallel_config.set_dcp_defaults()
 
         if (
-            self.scheduler_config.fairness_engine is not None
+            self.scheduler_config.prefill_compute_share is not None
             and self.parallel_config.data_parallel_size > 1
         ):
             raise ValueError(
-                "fairness_engine does not yet support data parallelism; all DP "
+                "prefill_compute_share does not yet support data parallelism; all DP "
                 "ranks must make one synchronized fairness decision"
             )
 

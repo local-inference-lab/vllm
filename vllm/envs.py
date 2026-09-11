@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
+    VLLM_GLM53_MTP_DRAFT_HEAD: Literal["bf16", "nvfp4"] = "bf16"
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -190,6 +191,7 @@ if TYPE_CHECKING:
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
+    VLLM_DEFAULT_MOE_BACKEND: str = "auto"
     VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
     VLLM_B12X_NVFP4_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
     VLLM_B12X_MXFP8_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
@@ -879,6 +881,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         bool(int(os.environ["VLLM_USE_FLASHINFER_SAMPLER"]))
         if "VLLM_USE_FLASHINFER_SAMPLER" in os.environ
         else True
+    ),
+    # Storage and compute format for the independent GLM-5.3 MTP proposal head.
+    # The target vocabulary head and verifier remain BF16 in every mode.
+    "VLLM_GLM53_MTP_DRAFT_HEAD": env_with_choices(
+        "VLLM_GLM53_MTP_DRAFT_HEAD",
+        "bf16",
+        ["bf16", "nvfp4"],
+        case_sensitive=False,
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
@@ -1639,6 +1649,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": lambda: bool(
         int(os.getenv("VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER", "1"))
     ),
+    # Deployment default; explicit kernel configuration or CLI selection wins.
+    "VLLM_DEFAULT_MOE_BACKEND": lambda: os.getenv("VLLM_DEFAULT_MOE_BACKEND", "auto"),
     # Force b12x FP4 MoE to use BF16 activations.
     "VLLM_B12X_MOE_FP4_FORCE_A16": lambda: bool(
         int(os.getenv("VLLM_B12X_MOE_FP4_FORCE_A16", "0"))

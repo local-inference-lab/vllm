@@ -123,14 +123,16 @@ class GateLinear(ReplicatedLinear):
         # Fused bf16 x bf16 -> fp32 GEMM eligibility. torch.mm's out_dtype
         # epilogue folds the fp32 cast into the GEMM, removing the standalone
         # bf16->fp32 copy kernel that otherwise runs before grouped_topk.
-        # cuBLAS on CUDA (SM90+, via allow_specialized_router_gemm); hipBLASLt on
-        # ROCm, which supports the same out_dtype epilogue.
+        # SM120 supports this cuBLAS epilogue, but not the datacenter-only
+        # specialized router kernels above. Preserve FP32 logits when M>16
+        # falls through the low-latency BF16 kernel's range.
         self._router_gemm_no_bias = not bias
+        self._sm120_graph_pool_lifetime_guard = is_blackwell_rtx
+        self._can_use_cublas_bf16_fp32 = self._can_use_ll_bf16 or (
+            current_platform.is_rocm() and self._router_gemm_no_bias
+        )
         self.allow_cublas_router_gemm = (
-            (
-                self.allow_specialized_router_gemm
-                or (current_platform.is_rocm() and self._router_gemm_no_bias)
-            )
+            self._can_use_cublas_bf16_fp32
             and self.weight.dtype == torch.bfloat16
             and self.out_dtype == torch.float32
         )
@@ -162,10 +164,7 @@ class GateLinear(ReplicatedLinear):
 
         if (
             not self.allow_cublas_router_gemm
-            and (
-                self.allow_specialized_router_gemm
-                or (current_platform.is_rocm() and self._router_gemm_no_bias)
-            )
+            and self._can_use_cublas_bf16_fp32
             and out_dtype == torch.float32
         ):
             self.allow_cublas_router_gemm = self.weight.dtype == torch.bfloat16
@@ -226,7 +225,26 @@ class GateLinear(ReplicatedLinear):
 
         # Tier 5: cuBLAS bf16→fp32
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
+            graph_pool_guard = None
+            if self._sm120_graph_pool_lifetime_guard:
+                from vllm.compilation.breakable_cudagraph import (
+                    BreakableCUDAGraphCapture,
+                )
+
+                if (
+                    BreakableCUDAGraphCapture.current() is not None
+                    or torch.cuda.is_current_stream_capturing()
+                ):
+                    # The former linear-plus-cast path reserved a BF16 router
+                    # output before its FP32 result. Preserve that graph-pool
+                    # address layout while using the fused FP32 cuBLAS output;
+                    # auxiliary-stream graph nodes retain addresses across the
+                    # differently sized captures that share this pool.
+                    graph_pool_guard = x.new_empty(
+                        (*x.shape[:-1], self.weight.shape[0])
+                    )
             output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
+            del graph_pool_guard
             return output, None
 
         # Tier 6: F.linear (ReplicatedLinear)

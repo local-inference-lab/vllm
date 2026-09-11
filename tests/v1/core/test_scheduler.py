@@ -89,8 +89,26 @@ def test_full_boundary_hit_preserves_async_speculative_decode_token_count():
 
 
 @pytest.mark.parametrize("admission_blocker", [None, "capacity", "allocation", "pause"])
+@pytest.mark.parametrize(
+    "fairness_options",
+    [
+        {},
+        {"prefill_compute_share": 0.4},
+        {"prefill_compute_share": "auto"},
+        {
+            "prefill_compute_share": 0.4,
+            "max_parallel_prefills": 4,
+            "prefill_policy": "round-robin",
+        },
+        {
+            "prefill_compute_share": "auto",
+            "max_parallel_prefills": 4,
+            "prefill_policy": "decode-aware",
+        },
+    ],
+)
 def test_full_boundary_hit_is_admitted_while_another_request_decodes(
-    admission_blocker, monkeypatch
+    admission_blocker, fairness_options, monkeypatch
 ):
     """A saved-logits hit needs one isolated step, not an empty running queue."""
     scheduler = create_scheduler(
@@ -99,6 +117,7 @@ def test_full_boundary_hit_is_admitted_while_another_request_decodes(
         async_scheduling=True,
         num_speculative_tokens=3,
         speculative_method="ngram_gpu",
+        **fairness_options,
     )
     manager = scheduler.kv_cache_manager
     manager.boundary_checkpoints = BoundaryCheckpointCache(manager.block_pool)
@@ -148,6 +167,40 @@ def test_full_boundary_hit_is_admitted_while_another_request_decodes(
     decode_step = scheduler.schedule()
     assert not decode_step.boundary_logits_only
     assert decode_step.num_scheduled_tokens == {"first": 4, "second": 4}
+
+
+@pytest.mark.parametrize("imported_tokens", [0, 32])
+def test_boundary_restore_preserves_external_cache_attribution(imported_tokens: int):
+    """Imported snapshots count as external hits; later GPU reuse stays local."""
+    scheduler = create_scheduler(enable_prefix_caching=True, use_v2_model_runner=True)
+    manager = scheduler.kv_cache_manager
+    manager.boundary_checkpoints = BoundaryCheckpointCache(manager.block_pool)
+    producer, repeat = create_requests(
+        num_requests=2,
+        num_tokens=32,
+        same_prompt=True,
+        req_ids=["producer", "repeat"],
+    )
+    manager.get_computed_blocks(producer)
+    assert manager.allocate_slots(producer, 32) is not None
+    manager.publish_boundary_checkpoint(producer, 32, kind="prompt")
+    manager.free(producer)
+    scheduler.connector = Mock()
+    scheduler.connector.poll_boundary_checkpoint.return_value = True
+    scheduler.connector.boundary_checkpoint_external_tokens.return_value = (
+        imported_tokens
+    )
+    scheduler.connector.get_num_new_matched_tokens.return_value = (0, False)
+    scheduler.add_request(repeat)
+
+    output = scheduler.schedule()
+
+    assert output.boundary_logits_only
+    assert output.num_scheduled_tokens == {"repeat": 1}
+    assert repeat.num_computed_tokens == 32
+    assert repeat.prefill_stats.num_computed_tokens == 0
+    assert repeat.prefill_stats.num_external_cached_tokens == imported_tokens
+    assert repeat.prefill_stats.num_local_cached_tokens == 32 - imported_tokens
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():
@@ -5060,7 +5113,95 @@ def test_abort_request_finished_recving():
     assert not scheduler.finished_recving_kv_req_ids
 
 
+def test_ignore_late_finished_recving_after_abort_cleanup():
+    """A late receive completion must not revive or crash a cleaned request."""
+    scheduler = create_scheduler(use_kv_connector=True)
+
+    # add a single request
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+
+    # abort after recv completed but before the scheduler promotes the request
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.finished_recving_kv_req_ids.add(request.request_id)
+    scheduler.finish_requests((request.request_id,), RequestStatus.FINISHED_ABORTED)
+
+    assert request.request_id not in scheduler.requests
+
+    # a late worker callback should be ignored rather than crashing
+    scheduler_output = scheduler.schedule()
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        kv_connector_output=KVConnectorOutput(finished_recving={request.request_id}),
+    )
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    assert request.request_id not in scheduler.requests
+    assert not scheduler.finished_recving_kv_req_ids
+
+
+def test_ignore_late_finished_sending_after_request_cleanup():
+    """A late send completion must not crash after request cleanup."""
+    scheduler = create_scheduler(use_kv_connector=True)
+
+    # add and finish a single request so it is fully removed
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+    scheduler.finish_requests((request.request_id,), RequestStatus.FINISHED_ABORTED)
+
+    assert request.request_id not in scheduler.requests
+
+    # a stale async send completion should also be ignored
+    scheduler_output = scheduler.schedule()
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        kv_connector_output=KVConnectorOutput(finished_sending={request.request_id}),
+    )
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    assert request.request_id not in scheduler.requests
+
+
+def test_same_step_recv_and_send_completion_after_abort():
+    """Dual completion frees an aborted request once without crashing."""
+    scheduler = create_scheduler(use_kv_connector=True)
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.finish_requests((request.request_id,), RequestStatus.FINISHED_ABORTED)
+
+    assert request.request_id in scheduler.requests
+
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            finished_recving={request.request_id},
+            finished_sending={request.request_id},
+        )
+    )
+
+    assert request.request_id not in scheduler.requests
+    assert not scheduler.finished_recving_kv_req_ids
+
+
+@pytest.mark.parametrize("direction", ["finished_recving", "finished_sending"])
+def test_unexpected_kv_completion_does_not_free_active_request(direction):
+    """An out-of-order completion must not delete an active request."""
+    scheduler = create_scheduler(use_kv_connector=True)
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(**{direction: {request.request_id}})
+    )
+
+    assert scheduler.requests[request.request_id] is request
+    assert not scheduler.finished_recving_kv_req_ids
+
+
 def test_delayed_kv_connector_free_keeps_scheduler_active():
+    """A delayed send keeps the scheduler active until blocks are freed."""
     scheduler = create_scheduler(use_kv_connector=True)
     queued_request, request = create_requests(
         num_requests=2, req_ids=["queued", "finished"]
