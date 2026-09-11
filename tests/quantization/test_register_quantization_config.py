@@ -105,7 +105,7 @@ class CustomQuantConfig(QuantizationConfig):
 
 
 def test_quantization_discovery_does_not_require_optional_model_kernels():
-    """Registry lookup must work without DeepSeek V4.1's optional CUDA package."""
+    """Config discovery must not import model-specific native implementations."""
     script = textwrap.dedent(
         """
         import importlib.abc
@@ -114,9 +114,7 @@ def test_quantization_discovery_does_not_require_optional_model_kernels():
 
         class RejectOptionalKernels(importlib.abc.MetaPathFinder):
             def find_spec(self, fullname, path=None, target=None):
-                if fullname == "flashinfer.b12x" or fullname.startswith(
-                    "flashinfer.b12x."
-                ):
+                if fullname == "vllm.models.deepseek_v4_1.b12x_layers":
                     raise ModuleNotFoundError("optional model kernels unavailable")
                 return None
 
