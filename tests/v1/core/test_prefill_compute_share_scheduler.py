@@ -1205,6 +1205,7 @@ def test_prefill_fairness_hot_switch_is_atomic(opt_model_path):
     unchanged = scheduler.get_prefill_fairness()
     assert unchanged["prefill_compute_share"] == "auto"
     assert unchanged["prefill_compute_half_life"] == "responsive"
+
 # ---------------------------------------------------------------------------
 # Forward progress at a full KV pool (issue #733).
 #
