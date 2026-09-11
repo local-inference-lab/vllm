@@ -63,6 +63,7 @@ def _mixed_page_groups(n_mla=3, n_idx=3, n_swa=5):
 
 def _mock_vllm_config(layout: str | None):
     config = MagicMock()
+    config.use_request_boundary_checkpoints = False
     config.cache_config = CacheConfig()
     config.cache_config.num_gpu_blocks_override = None
     config.cache_config.kv_cache_layout = layout
@@ -211,7 +212,7 @@ def test_v41_full_context_packs_shared_global_cache_without_page_inflation():
     config.parallel_config.decode_context_parallel_size = 1
     config.parallel_config.prefill_context_parallel_size = 1
     specs = {}
-    global_names = []
+    global_names: list[str] = []
     for layer in range(43):
         prefix = f"model.layers.{layer}.self_attn"
         swa = _Cache(
