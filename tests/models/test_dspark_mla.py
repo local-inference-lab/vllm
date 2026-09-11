@@ -106,7 +106,7 @@ def test_v41_dspark_retains_each_markov_embedding_during_graph_replay(
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("native b12x Markov embedding requires SM12x")
     monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", "0")
-    from flashinfer.b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
 
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
     from vllm.models.deepseek_v4_1.nvidia.dspark import (

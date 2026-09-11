@@ -3,8 +3,8 @@
 """Native ratio-one/two compression with request-owned partial-state rings."""
 
 import torch
-from flashinfer.b12x.attention import mla_compress
-from flashinfer.b12x.gemm import bf16_gemv
+from b12x.attention import mla_compress
+from b12x.gemm import bf16_gemv
 from torch import nn
 
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase

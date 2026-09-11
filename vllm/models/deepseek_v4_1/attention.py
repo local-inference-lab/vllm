@@ -5,13 +5,13 @@
 import re
 
 import torch
-from flashinfer.b12x.attention import compressed_sparse_mla as mla
-from flashinfer.b12x.attention import dsa_indexer
-from flashinfer.b12x.attention.compressed_sparse_mla.preparation import rotate
-from flashinfer.b12x.attention.compressed_sparse_mla.weight_scale import (
+from b12x.attention import compressed_sparse_mla as mla
+from b12x.attention import dsa_indexer
+from b12x.attention.compressed_sparse_mla.preparation import rotate
+from b12x.attention.compressed_sparse_mla.weight_scale import (
     scale_index_weights,
 )
-from flashinfer.b12x.gemm import bf16_gemv
+from b12x.gemm import bf16_gemv
 from torch import nn
 
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group

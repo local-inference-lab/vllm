@@ -3,8 +3,8 @@
 """V4.1 expert-parallel MXFP4 with FP32 local accumulation and BF16 transport."""
 
 import torch
-from flashinfer.b12x.moe import fused_moe
-from flashinfer.b12x.norm import hyperconnection
+from b12x.moe import fused_moe
+from b12x.norm import hyperconnection
 from torch import nn
 
 from vllm.distributed import (
