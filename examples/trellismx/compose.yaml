@@ -1,0 +1,22 @@
+services:
+  trellismx:
+    image: ${TRELLISMX_IMAGE:-local/trellismx-jovian:review}
+    restart: "no"
+    network_mode: host
+    ipc: host
+    gpus: all
+    environment:
+      PORT: ${PORT:-8033}
+      MAX_MODEL_LEN: ${MAX_MODEL_LEN:-1000000}
+      GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.975}
+    volumes:
+      - type: bind
+        source: ${MODEL_ROOT:?Set the pinned NVFP4 carrier directory}
+        target: /model
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${P8_CHECKPOINT_ROOT:?Set the complete HF overlay directory}
+        target: /checkpoint
+        read_only: true
+        bind: {create_host_path: false}

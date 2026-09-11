@@ -603,3 +603,42 @@ def test_distributed_packed_a2a_with_workspace_matches_reference():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_model_parallel_teardown_releases_cached_dcp_workspaces(monkeypatch):
+    import functools
+    import sys
+    import weakref
+    from types import SimpleNamespace
+
+    from vllm.distributed import parallel_state
+
+    class Workspace:
+        pass
+
+    @functools.cache
+    def ag_rs(group):
+        return Workspace()
+
+    @functools.cache
+    def q_gather(group):
+        return Workspace()
+
+    group = object()
+    first, second = ag_rs(group), q_gather(group)
+    assert ag_rs(group) is first and q_gather(group) is second
+    retained = [weakref.ref(first), weakref.ref(second)]
+    del first, second
+    for name in ("_TP", "_DCP", "_PCP", "_PP", "_DP", "_EP", "_EPLB"):
+        monkeypatch.setattr(parallel_state, name, None)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.v1.attention.ops.dcp",
+        SimpleNamespace(
+            get_persistent_nccl_ag_rs_workspace=ag_rs,
+            get_persistent_nccl_q_gather_workspace=q_gather,
+        ),
+    )
+    parallel_state.destroy_model_parallel()
+    assert all(ref() is None for ref in retained)
+    assert ag_rs.cache_info().currsize == q_gather.cache_info().currsize == 0

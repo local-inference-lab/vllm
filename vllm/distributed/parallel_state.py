@@ -2092,6 +2092,13 @@ def get_node_count() -> int:
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    import sys
+
+    dcp_module = sys.modules.get("vllm.v1.attention.ops.dcp")
+    if dcp_module is not None:
+        dcp_module.get_persistent_nccl_ag_rs_workspace.cache_clear()
+        dcp_module.get_persistent_nccl_q_gather_workspace.cache_clear()
+
     global _TP
 
     if _TP:

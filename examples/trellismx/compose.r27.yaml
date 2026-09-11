@@ -1,0 +1,44 @@
+services:
+  trellismx:
+    image: verdictai/trellismx:glm53-flash-p8-r27-reference-20260909@sha256:ca6b80188dce154b91f49108b7d87792d2ba6328935afc71b44d1c0e6f6a1adf
+    restart: "no"
+    network_mode: host
+    ipc: host
+    gpus: all
+    working_dir: /
+    entrypoint: ["/bin/bash", "/release/serve-r27-production.sh"]
+    environment:
+      PORT: "8000"
+      SERVED_MODEL_NAME: "glm53-flash-trellismx-p8-k45"
+      MODEL_ROOT: "/model"
+      VLLM_TRELLISMX_CHECKPOINT: "/checkpoint"
+      TP: "4"
+      DCP: "4"
+      CACHE_MODE: "vram"
+      SPECULATOR: "mtp"
+      NUM_SPECULATIVE_TOKENS: "3"
+      KV_CACHE_DTYPE: "nvfp4_ds_mla"
+      MAX_MODEL_LEN: "1000000"
+      MAX_NUM_SEQS: "24"
+      MAX_NUM_BATCHED_TOKENS: "4096"
+      GPU_MEMORY_UTILIZATION: "0.97"
+      CP_KV_CACHE_INTERLEAVE_SIZE: "4"
+      DCP_CKV_GATHER: "auto"
+      NCCL_MIN_NCHANNELS: "8"
+      NCCL_MAX_NCHANNELS: "8"
+      VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: "131072"
+      VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: "86016"
+      VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: "4096"
+      VLLM_NO_USAGE_STATS: "1"
+    volumes:
+      - ${MODEL_ROOT:?Set MODEL_ROOT to the pinned carrier directory}:/model:ro
+      - ${TRELLISMX_ROOT:-.}:/checkpoint:ro
+      - trellismx-r27-jit:/cache/jit
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30m
+      retries: 10
+volumes:
+  trellismx-r27-jit: {}

@@ -173,6 +173,7 @@ def correct_attn_out(
     cp_rank: int,
     ctx: CPTritonContext,
     is_lse_base_on_e: bool = True,
+    lse_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Correct the attention output using the all-gathered lses.
 
@@ -213,9 +214,27 @@ def correct_attn_out(
 
     # Allocate LSE with the same B/H strides as `lses` so writes land correctly
     # even when `lses` is a non-contiguous view (e.g., 4-D to 3-D squeeze).
-    lse = torch.empty_strided(
-        (B, H), (l_sB, l_sH), device=lses.device, dtype=lses.dtype
-    )
+    # The DCP AG/RS path supplies persistent storage here so this allocation is
+    # visible to GPU memory profiling instead of occurring under load.
+    if lse_out is None:
+        lse = torch.empty_strided(
+            (B, H), (l_sB, l_sH), device=lses.device, dtype=lses.dtype
+        )
+    else:
+        if (
+            lse_out.shape != (B, H)
+            or lse_out.stride() != (l_sB, l_sH)
+            or lse_out.device != lses.device
+            or lse_out.dtype != lses.dtype
+        ):
+            raise ValueError(
+                "Persistent DCP LSE output does not match the gathered LSE "
+                f"layout: expected shape={(B, H)}, stride={(l_sB, l_sH)}, "
+                f"device={lses.device}, dtype={lses.dtype}; got "
+                f"shape={tuple(lse_out.shape)}, stride={lse_out.stride()}, "
+                f"device={lse_out.device}, dtype={lse_out.dtype}"
+            )
+        lse = lse_out
 
     # Kernel launch config
     grid = (B, H, 1)
@@ -246,6 +265,7 @@ def _cp_lse_common(
     is_lse_base_on_e=True,
     seq_lens: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
+    workspace: PersistentNCCLAGRSWorkspace | None = None,
 ):
     """
     cp_attn_out: [ B, H, D ]
@@ -257,17 +277,22 @@ def _cp_lse_common(
     if ctx is None:
         ctx = CPTritonContext()
 
-    cp_attn_lse = cp_attn_lse.contiguous()
-    mask_dcp_empty_shards_(cp_attn_lse, seq_lens, query_start_loc)
-    lses = cp_group.all_gather(cp_attn_lse, dim=0).reshape(
-        (cp_group.world_size,) + cp_attn_lse.shape
-    )
+    if workspace is None:
+        cp_attn_lse = cp_attn_lse.contiguous()
+        mask_dcp_empty_shards_(cp_attn_lse, seq_lens, query_start_loc)
+        lses = cp_group.all_gather(cp_attn_lse, dim=0).reshape(
+            (cp_group.world_size,) + cp_attn_lse.shape
+        )
+        lse_out = None
+    else:
+        lses, lse_out = workspace.gather_lses(cp_attn_lse, seq_lens, query_start_loc)
     out, lse = correct_attn_out(
         cp_attn_out,
         lses,
         cp_group.rank_in_group,
         ctx,
         is_lse_base_on_e=is_lse_base_on_e,
+        lse_out=lse_out,
     )
     return out, lse
 
@@ -281,6 +306,7 @@ def cp_lse_ag_out_rs(
     is_lse_base_on_e=True,
     seq_lens: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
+    workspace: PersistentNCCLAGRSWorkspace | None = None,
 ):
     """
     cp_attn_out: [ B, H, D ]
@@ -294,8 +320,13 @@ def cp_lse_ag_out_rs(
         is_lse_base_on_e=is_lse_base_on_e,
         seq_lens=seq_lens,
         query_start_loc=query_start_loc,
+        workspace=workspace,
     )
-    out = cp_group.reduce_scatter(out, dim=1)
+    out = (
+        cp_group.reduce_scatter(out, dim=1)
+        if workspace is None
+        else workspace.reduce_scatter(out)
+    )
 
     if return_lse:
         cp_num_heads = lse.shape[1] // cp_group.world_size
@@ -922,7 +953,365 @@ def get_direct_dcp_a2a_workspace(
     )
 
 
+# Persistent ordinary-NCCL AG/RS combine
+
+
+class PersistentNCCLAGRSWorkspace:
+    """Persistent buffers for the ordinary NCCL MLA DCP AG/RS combine.
+
+    ``GroupCoordinator.reduce_scatter(..., dim=1)`` materializes a contiguous
+    head-major input, a rank-local NCCL output, and a token-major contiguous
+    result on every invocation. The preceding LSE all-gather also allocates
+    local, gathered, and corrected LSE tensors. At high GPU memory utilization
+    those late allocations can fail even though the KV cache itself fits.
+
+    Reserve every layout during model construction so vLLM's memory profiler
+    accounts for the collective working set before sizing KV cache. One cached
+    workspace is shared by all MLA layers; separate slots preserve DBO ubatch
+    independence.
+    """
+
+    def __init__(
+        self,
+        group: GroupCoordinator,
+        device: torch.device,
+        max_num_tokens: int,
+        num_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        num_ubatches: int = 1,
+        lse_dtype: torch.dtype = torch.float32,
+    ) -> None:
+        if num_ubatches < 1:
+            raise ValueError(
+                "Persistent DCP AG/RS requires at least one ubatch slot, "
+                f"got {num_ubatches}"
+            )
+        if max_num_tokens < 1 or num_heads < 1 or head_dim < 1:
+            raise ValueError(
+                "Persistent DCP AG/RS dimensions must be positive, got "
+                f"T={max_num_tokens}, H={num_heads}, D={head_dim}"
+            )
+        if num_heads % group.world_size != 0:
+            raise ValueError(
+                "Persistent DCP AG/RS requires heads divisible by world size: "
+                f"{num_heads} % {group.world_size} != 0"
+            )
+
+        self.group = group
+        self.world_size = group.world_size
+        self.max_num_tokens = max_num_tokens
+        self.num_heads = num_heads
+        self.local_num_heads = num_heads // self.world_size
+        self.head_dim = head_dim
+        self.dtype = dtype
+        self.lse_dtype = lse_dtype
+        self.num_ubatches = num_ubatches
+
+        input_numel = max_num_tokens * num_heads * head_dim
+        output_numel = max_num_tokens * self.local_num_heads * head_dim
+        lse_numel = max_num_tokens * num_heads
+
+        # Flat backing storage permits an exact contiguous view for every
+        # runtime token count without max-token padding between head rows.
+        self.rs_input_storage = torch.empty(
+            (num_ubatches, input_numel), device=device, dtype=dtype
+        )
+        self.rs_rank_output_storage = torch.empty(
+            (num_ubatches, output_numel), device=device, dtype=dtype
+        )
+        self.rs_token_output_storage = torch.empty(
+            (num_ubatches, output_numel), device=device, dtype=dtype
+        )
+        self.local_lse_storage = torch.empty(
+            (num_ubatches, lse_numel), device=device, dtype=lse_dtype
+        )
+        self.gathered_lse_storage = torch.empty(
+            (num_ubatches, self.world_size * lse_numel),
+            device=device,
+            dtype=lse_dtype,
+        )
+        self.final_lse_storage = torch.empty(
+            (num_ubatches, lse_numel), device=device, dtype=lse_dtype
+        )
+
+    def _ubatch(self) -> int:
+        ubatch = dbo_current_ubatch_id()
+        if not 0 <= ubatch < self.num_ubatches:
+            raise ValueError(
+                f"Persistent DCP AG/RS ubatch {ubatch} exceeds "
+                f"{self.num_ubatches} slots"
+            )
+        return ubatch
+
+    def _validate_tokens(self, num_tokens: int) -> None:
+        if num_tokens > self.max_num_tokens:
+            raise ValueError(
+                "Persistent DCP AG/RS token count exceeds its startup "
+                f"reservation: {num_tokens} > {self.max_num_tokens}"
+            )
+
+    def gather_lses(
+        self,
+        local_lse: torch.Tensor,
+        seq_lens: torch.Tensor | None,
+        query_start_loc: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if local_lse.ndim != 2:
+            raise ValueError(
+                "Persistent DCP AG/RS expected a 2-D LSE tensor, got "
+                f"shape {tuple(local_lse.shape)}"
+            )
+        num_tokens, num_heads = local_lse.shape
+        self._validate_tokens(num_tokens)
+        if num_heads != self.num_heads or local_lse.dtype != self.lse_dtype:
+            raise ValueError(
+                "Persistent DCP AG/RS LSE mismatch: expected "
+                f"[T,{self.num_heads}] {self.lse_dtype}, got "
+                f"{tuple(local_lse.shape)} {local_lse.dtype}"
+            )
+
+        ubatch = self._ubatch()
+        local_numel = num_tokens * self.num_heads
+        local = self.local_lse_storage[ubatch, :local_numel].view(
+            num_tokens, self.num_heads
+        )
+        local.copy_(local_lse)
+        mask_dcp_empty_shards_(local, seq_lens, query_start_loc)
+
+        gathered = self.gathered_lse_storage[
+            ubatch, : self.world_size * local_numel
+        ].view(self.world_size * num_tokens, self.num_heads)
+        dist.all_gather_into_tensor(
+            gathered,
+            local,
+            group=self.group.device_group,
+        )
+        lses = gathered.view(self.world_size, num_tokens, self.num_heads)
+        final_lse = self.final_lse_storage[ubatch, :local_numel].view(
+            num_tokens, self.num_heads
+        )
+        return lses, final_lse
+
+    def reduce_scatter(self, partial_output: torch.Tensor) -> torch.Tensor:
+        if partial_output.ndim != 3:
+            raise ValueError(
+                "Persistent DCP AG/RS expected a 3-D output tensor, got "
+                f"shape {tuple(partial_output.shape)}"
+            )
+        num_tokens, num_heads, head_dim = partial_output.shape
+        self._validate_tokens(num_tokens)
+        if (
+            num_heads != self.num_heads
+            or head_dim != self.head_dim
+            or partial_output.dtype != self.dtype
+        ):
+            raise ValueError(
+                "Persistent DCP AG/RS output mismatch: expected "
+                f"[T,{self.num_heads},{self.head_dim}] {self.dtype}, got "
+                f"{tuple(partial_output.shape)} {partial_output.dtype}"
+            )
+
+        ubatch = self._ubatch()
+        input_numel = num_tokens * self.num_heads * self.head_dim
+        output_numel = num_tokens * self.local_num_heads * self.head_dim
+        rs_input = self.rs_input_storage[ubatch, :input_numel].view(
+            self.num_heads, num_tokens, self.head_dim
+        )
+        rs_input.copy_(partial_output.movedim(0, 1))
+
+        rank_output = self.rs_rank_output_storage[ubatch, :output_numel].view(
+            self.local_num_heads, num_tokens, self.head_dim
+        )
+        dist.reduce_scatter_tensor(
+            rank_output,
+            rs_input,
+            group=self.group.device_group,
+        )
+
+        token_output = self.rs_token_output_storage[ubatch, :output_numel].view(
+            num_tokens, self.local_num_heads, self.head_dim
+        )
+        token_output.copy_(rank_output.movedim(0, 1))
+        return token_output
+
+
+@functools.cache
+def get_persistent_nccl_ag_rs_workspace(
+    group: GroupCoordinator,
+    device: torch.device,
+    max_num_tokens: int,
+    num_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    num_ubatches: int,
+) -> PersistentNCCLAGRSWorkspace:
+    """Return one profiled ordinary-NCCL AG/RS workspace for all MLA layers."""
+    return PersistentNCCLAGRSWorkspace(
+        group,
+        device,
+        max_num_tokens,
+        num_heads,
+        head_dim,
+        dtype,
+        num_ubatches,
+    )
+
+
 # Q gather
+
+
+class PersistentNCCLQGatherWorkspace:
+    """Persistent buffers for the ordinary NCCL DCP query gather.
+
+    The generic ``GroupCoordinator.all_gather(..., dim=1)`` path allocates a
+    rank-major gather buffer and then a token-major contiguous result on every
+    call.  Those allocations are particularly large for mixed MLA prefills and
+    happen after KV-cache sizing.  Keep both layouts (and a contiguous local
+    input fallback) alive from model construction so memory profiling accounts
+    for them before assigning the remainder to KV cache.
+    """
+
+    def __init__(
+        self,
+        group: GroupCoordinator,
+        device: torch.device,
+        max_num_tokens: int,
+        heads_per_rank: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        num_ubatches: int = 1,
+        padded_num_heads: int | None = None,
+    ) -> None:
+        if num_ubatches < 1:
+            raise ValueError(
+                "Persistent DCP q-gather requires at least one ubatch slot, "
+                f"got {num_ubatches}"
+            )
+        if max_num_tokens < 1 or heads_per_rank < 1 or head_dim < 1:
+            raise ValueError(
+                "Persistent DCP q-gather dimensions must be positive, got "
+                f"T={max_num_tokens}, H={heads_per_rank}, D={head_dim}"
+            )
+        self.group = group
+        self.world_size = group.world_size
+        self.max_num_tokens = max_num_tokens
+        self.heads_per_rank = heads_per_rank
+        self.gathered_num_heads = self.world_size * heads_per_rank
+        self.storage_num_heads = (
+            self.gathered_num_heads if padded_num_heads is None else padded_num_heads
+        )
+        if self.storage_num_heads < self.gathered_num_heads:
+            raise ValueError(
+                "Persistent DCP q-gather padded heads must cover gathered heads: "
+                f"{self.storage_num_heads} < {self.gathered_num_heads}"
+            )
+        self.head_dim = head_dim
+        self.num_ubatches = num_ubatches
+
+        # NCCL writes rank-major chunks. The attention consumer requires a
+        # token-major, head-concatenated tensor, hence two persistent layouts.
+        self.rank_major = torch.empty(
+            (
+                num_ubatches,
+                self.world_size * max_num_tokens,
+                heads_per_rank,
+                head_dim,
+            ),
+            device=device,
+            dtype=dtype,
+        )
+        self.token_major_storage = torch.empty(
+            (
+                num_ubatches,
+                max_num_tokens * self.storage_num_heads * head_dim,
+            ),
+            device=device,
+            dtype=dtype,
+        )
+        self.local_contiguous = torch.empty(
+            (num_ubatches, max_num_tokens, heads_per_rank, head_dim),
+            device=device,
+            dtype=dtype,
+        )
+
+    def gather(self, local_query: torch.Tensor) -> torch.Tensor:
+        ubatch = dbo_current_ubatch_id()
+        if not 0 <= ubatch < self.num_ubatches:
+            raise ValueError(
+                f"Persistent DCP q-gather ubatch {ubatch} exceeds "
+                f"{self.num_ubatches} slots"
+            )
+        if local_query.ndim != 3:
+            raise ValueError(
+                "Persistent DCP q-gather expected a 3-D query, got "
+                f"shape {tuple(local_query.shape)}"
+            )
+        num_tokens, num_heads, head_dim = local_query.shape
+        if num_tokens > self.max_num_tokens:
+            raise ValueError(
+                "Persistent DCP q-gather token count exceeds its startup "
+                f"reservation: {num_tokens} > {self.max_num_tokens}"
+            )
+        if num_heads != self.heads_per_rank or head_dim != self.head_dim:
+            raise ValueError(
+                "Persistent DCP q-gather query shape mismatch: expected "
+                f"[T,{self.heads_per_rank},{self.head_dim}], got "
+                f"{tuple(local_query.shape)}"
+            )
+
+        if not local_query.is_contiguous():
+            local_input = self.local_contiguous[ubatch, :num_tokens]
+            local_input.copy_(local_query)
+        else:
+            local_input = local_query
+
+        rank_major = self.rank_major[ubatch, : self.world_size * num_tokens]
+        dist.all_gather_into_tensor(
+            rank_major,
+            local_input,
+            group=self.group.device_group,
+        )
+        output_numel = num_tokens * self.gathered_num_heads * self.head_dim
+        token_major = self.token_major_storage[ubatch, :output_numel].view(
+            num_tokens, self.gathered_num_heads, self.head_dim
+        )
+        token_major.view(
+            num_tokens, self.world_size, self.heads_per_rank, self.head_dim
+        ).copy_(
+            rank_major.view(
+                self.world_size,
+                num_tokens,
+                self.heads_per_rank,
+                self.head_dim,
+            ).movedim(0, 1)
+        )
+        return token_major
+
+
+@functools.cache
+def get_persistent_nccl_q_gather_workspace(
+    group: GroupCoordinator,
+    device: torch.device,
+    max_num_tokens: int,
+    heads_per_rank: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    num_ubatches: int,
+    padded_num_heads: int | None = None,
+) -> PersistentNCCLQGatherWorkspace:
+    """Return one ordinary-NCCL query workspace shared by all MLA layers."""
+    return PersistentNCCLQGatherWorkspace(
+        group,
+        device,
+        max_num_tokens,
+        heads_per_rank,
+        head_dim,
+        dtype,
+        num_ubatches,
+        padded_num_heads,
+    )
+
 
 # Symmetric-memory implementation
 
@@ -1240,6 +1629,9 @@ class MLADCPManager:
         self.device = torch.device(device)
         self.num_ubatches = max(parallel_config.num_ubatches, 1)
         self.max_num_tokens = get_dcp_workspace_max_num_tokens(vllm_config)
+        self.max_num_batched_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
         self.use_a2a = parallel_config.dcp_comm_backend == "a2a"
         self.padded_num_heads = padded_num_heads
 
@@ -1285,6 +1677,34 @@ class MLADCPManager:
                 self._direct_workspace_combine,
                 direct_workspace,
                 is_lse_base_on_e=is_lse_base_on_e,
+            )
+
+        persistent_ag_rs_workspace = None
+        if not self.use_a2a and not use_pcp:
+            # The ordinary AG/RS path combines attention over the DCP-gathered
+            # head axis. ``num_heads`` is rank-local at manager construction;
+            # the reduce-scatter input has one such shard per DCP rank.
+            gathered_num_heads = num_heads * self.group.world_size
+            persistent_ag_rs_workspace = get_persistent_nccl_ag_rs_workspace(
+                self.group,
+                self.device,
+                self.max_num_batched_tokens,
+                gathered_num_heads,
+                head_dim,
+                dtype,
+                self.num_ubatches,
+            )
+            logger.info_once(
+                "Using persistent profiled NCCL DCP AG/RS workspace for MLA."
+            )
+
+        if persistent_ag_rs_workspace is not None:
+            assert not self.use_a2a and not use_pcp
+            return functools.partial(
+                cp_lse_ag_out_rs,
+                cp_group=self.group,
+                is_lse_base_on_e=is_lse_base_on_e,
+                workspace=persistent_ag_rs_workspace,
             )
 
         combine_fn = (
@@ -1351,7 +1771,18 @@ class MLADCPManager:
                 self._direct_workspace_query_gather,
                 direct_workspace,
             )
-        return self._gather_query
+        persistent_workspace = get_persistent_nccl_q_gather_workspace(
+            self.group,
+            self.device,
+            self.max_num_batched_tokens,
+            num_heads,
+            head_dim,
+            dtype,
+            self.num_ubatches,
+            self.padded_num_heads,
+        )
+        logger.info_once("Using persistent NCCL DCP query gather for MLA.")
+        return persistent_workspace.gather
 
     def _gather_query(self, query: torch.Tensor) -> torch.Tensor:
         query = self.group.all_gather(query, dim=1)

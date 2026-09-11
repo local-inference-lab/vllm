@@ -338,7 +338,9 @@ def test_mla_dcp_manager_selects_direct_backends(monkeypatch):
     group = MagicMock(world_size=2)
     monkeypatch.setattr(dcp_manager, "get_dcp_group", lambda: group)
     direct_a2a = MagicMock()
+    direct_a2a.max_num_tokens = 64
     direct_query = MagicMock()
+    direct_query.max_num_tokens = 64
     direct_kv = MagicMock()
     monkeypatch.setattr(
         dcp_manager, "get_direct_dcp_a2a_workspace", MagicMock(return_value=direct_a2a)
@@ -368,7 +370,9 @@ def test_mla_dcp_manager_selects_direct_backends(monkeypatch):
     )
     workspace = torch.empty(96, 8)
 
-    assert manager.query_gather == direct_query.gather
+    query = torch.empty(1, 2, 8)
+    manager.query_gather(query)
+    direct_query.gather.assert_called_once_with(query)
     manager.init_kv_gather(workspace, 64)
     gathered_kv, local_kv = torch.empty(4, 8), torch.empty(2, 8)
     manager.kv_gather(gathered_kv, local_kv)
@@ -385,9 +389,9 @@ def test_mla_dcp_manager_selects_direct_backends(monkeypatch):
     direct_a2a.lse_reduce.assert_called_once_with(
         output,
         lse,
-        seq_lens=seq_lens,
-        query_start_loc=query_start_loc,
-        is_lse_base_on_e=False,
+        False,
+        seq_lens,
+        query_start_loc,
     )
 
 
@@ -403,6 +407,12 @@ def test_mla_dcp_manager_selects_fallback_backends(monkeypatch):
     )
     monkeypatch.setattr(
         dcp_manager, "get_direct_dcp_q_gather_workspace", MagicMock(return_value=None)
+    )
+    persistent_query = MagicMock()
+    monkeypatch.setattr(
+        dcp_manager,
+        "get_persistent_nccl_q_gather_workspace",
+        MagicMock(return_value=persistent_query),
     )
     monkeypatch.setattr(
         dcp_manager, "get_direct_dcp_kv_gather_workspace", MagicMock(return_value=None)
@@ -432,9 +442,9 @@ def test_mla_dcp_manager_selects_fallback_backends(monkeypatch):
     all_gather.assert_called_once_with(output, local, group=group.device_group)
 
     query = torch.empty(1, 2, 8)
-    assert manager.query_gather is not None
-    assert manager.query_gather(query) is gathered_query
-    group.all_gather.assert_called_once_with(query, dim=1)
+    manager.query_gather(query)
+    persistent_query.gather.assert_called_once_with(query)
+    group.all_gather.assert_not_called()
 
     partial_output, partial_lse = torch.empty(1), torch.empty(1)
     seq_lens = torch.ones(1, dtype=torch.int32)
@@ -452,6 +462,173 @@ def test_mla_dcp_manager_selects_fallback_backends(monkeypatch):
         query_start_loc=query_start_loc,
         cp_group=group,
         is_lse_base_on_e=True,
+    )
+
+
+def test_persistent_nccl_query_gather_reuses_buffers(monkeypatch):
+    group = MagicMock(world_size=2)
+
+    def fake_all_gather(output, local, *, group):
+        del group
+        num_tokens = local.shape[0]
+        output.view(2, num_tokens, *local.shape[1:])[0].copy_(local)
+        output.view(2, num_tokens, *local.shape[1:])[1].copy_(local + 100)
+
+    monkeypatch.setattr(dist, "all_gather_into_tensor", fake_all_gather)
+    workspace = dcp.PersistentNCCLQGatherWorkspace(
+        group,
+        torch.device("cpu"),
+        max_num_tokens=8,
+        heads_per_rank=2,
+        head_dim=4,
+        dtype=torch.float32,
+        padded_num_heads=6,
+    )
+
+    local = torch.arange(3 * 2 * 4, dtype=torch.float32).view(3, 2, 4)
+    first = workspace.gather(local)
+    first_ptr = first.data_ptr()
+    expected = torch.cat((local, local + 100), dim=1)
+    torch.testing.assert_close(first, expected)
+
+    second = workspace.gather(local[:2])
+    assert second.data_ptr() == first_ptr
+    torch.testing.assert_close(second, expected[:2])
+
+
+def test_persistent_nccl_query_gather_is_shared_across_layers():
+    group = MagicMock(world_size=2)
+    dcp.get_persistent_nccl_q_gather_workspace.cache_clear()
+    first = dcp.get_persistent_nccl_q_gather_workspace(
+        group, torch.device("cpu"), 8, 2, 4, torch.float32, 1
+    )
+    second = dcp.get_persistent_nccl_q_gather_workspace(
+        group, torch.device("cpu"), 8, 2, 4, torch.float32, 1
+    )
+    assert first is second
+
+
+def test_persistent_nccl_ag_rs_workspace_reuses_all_layouts(monkeypatch):
+    group = MagicMock(world_size=2)
+
+    def fake_all_gather(output, local, *, group):
+        del group
+        num_tokens = local.shape[0]
+        chunks = output.view(2, num_tokens, local.shape[1])
+        chunks[0].copy_(local)
+        chunks[1].copy_(local + 100)
+
+    def fake_reduce_scatter(output, input_, *, group):
+        del group
+        local_heads = output.shape[0]
+        output.copy_(input_[:local_heads] + input_[local_heads:])
+
+    monkeypatch.setattr(dist, "all_gather_into_tensor", fake_all_gather)
+    monkeypatch.setattr(dist, "reduce_scatter_tensor", fake_reduce_scatter)
+    workspace = dcp.PersistentNCCLAGRSWorkspace(
+        group,
+        torch.device("cpu"),
+        max_num_tokens=8,
+        num_heads=4,
+        head_dim=3,
+        dtype=torch.float32,
+    )
+
+    local_lse = torch.arange(3 * 4, dtype=torch.float32).view(3, 4)
+    gathered_lse, final_lse = workspace.gather_lses(local_lse, None, None)
+    assert gathered_lse.shape == (2, 3, 4)
+    torch.testing.assert_close(gathered_lse[0], local_lse)
+    torch.testing.assert_close(gathered_lse[1], local_lse + 100)
+    assert final_lse.shape == local_lse.shape
+
+    partial = torch.arange(3 * 4 * 3, dtype=torch.float32).view(3, 4, 3)
+    first = workspace.reduce_scatter(partial)
+    first_ptr = first.data_ptr()
+    expected = partial[:, :2] + partial[:, 2:]
+    torch.testing.assert_close(first, expected)
+    assert first.is_contiguous()
+
+    second = workspace.reduce_scatter(partial[:2])
+    assert second.data_ptr() == first_ptr
+    torch.testing.assert_close(second, expected[:2])
+
+
+def test_persistent_nccl_ag_rs_workspace_is_shared_across_layers():
+    group = MagicMock(world_size=2)
+    dcp.get_persistent_nccl_ag_rs_workspace.cache_clear()
+    first = dcp.get_persistent_nccl_ag_rs_workspace(
+        group, torch.device("cpu"), 8, 4, 3, torch.float32, 1
+    )
+    second = dcp.get_persistent_nccl_ag_rs_workspace(
+        group, torch.device("cpu"), 8, 4, 3, torch.float32, 1
+    )
+    assert first is second
+
+
+def test_mla_dcp_manager_selects_persistent_ag_rs(monkeypatch):
+    import vllm.v1.attention.ops.dcp as dcp_manager
+
+    group = MagicMock(world_size=2)
+    monkeypatch.setattr(dcp_manager, "get_dcp_group", lambda: group)
+    monkeypatch.setattr(
+        dcp_manager, "get_direct_dcp_q_gather_workspace", MagicMock(return_value=None)
+    )
+    persistent_query = MagicMock()
+    monkeypatch.setattr(
+        dcp_manager,
+        "get_persistent_nccl_q_gather_workspace",
+        MagicMock(return_value=persistent_query),
+    )
+    persistent_ag_rs = MagicMock()
+    get_workspace = MagicMock(return_value=persistent_ag_rs)
+    monkeypatch.setattr(
+        dcp_manager, "get_persistent_nccl_ag_rs_workspace", get_workspace
+    )
+    combine = MagicMock(return_value=torch.empty(1))
+    monkeypatch.setattr(dcp_manager, "cp_lse_ag_out_rs", combine)
+
+    manager = dcp_manager.MLADCPManager(
+        vllm_config=_manager_config(dcp_comm_backend="ag_rs"),
+        device=torch.device("cpu"),
+        num_heads=4,
+        query_head_dim=8,
+        output_head_dim=3,
+        query_dtype=torch.bfloat16,
+        output_dtype=torch.float32,
+        padded_num_heads=None,
+        is_lse_base_on_e=True,
+        use_pcp=False,
+    )
+    partial_output, partial_lse = torch.empty(1), torch.empty(1)
+    seq_lens = torch.ones(1, dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 1], dtype=torch.int32)
+    manager.combine(
+        partial_output,
+        partial_lse,
+        seq_lens=seq_lens,
+        query_start_loc=query_start_loc,
+    )
+    query = torch.empty(1, 4, 8)
+    manager.query_gather(query)
+    persistent_query.gather.assert_called_once_with(query)
+
+    get_workspace.assert_called_once_with(
+        group,
+        torch.device("cpu"),
+        16,
+        8,
+        3,
+        torch.float32,
+        1,
+    )
+    combine.assert_called_once_with(
+        partial_output,
+        partial_lse,
+        seq_lens=seq_lens,
+        query_start_loc=query_start_loc,
+        cp_group=group,
+        is_lse_base_on_e=True,
+        workspace=persistent_ag_rs,
     )
 
 

@@ -638,6 +638,12 @@ class RoutedExperts(PluggableLayer):
             return True if return_success else None
 
         quant_method_name = self.quant_method.__class__.__name__
+        carrier_loader = getattr(
+            self.quant_method, "uses_modelopt_carrier_weight_loader", False
+        )
+        if callable(carrier_loader):
+            carrier_loader = carrier_loader()
+        uses_modelopt_carrier_loader = bool(carrier_loader)
         global_expert_id = expert_id
         expert_id = self._map_global_expert_id_to_local_expert_id(global_expert_id)
 
@@ -711,7 +717,7 @@ class RoutedExperts(PluggableLayer):
             # The generic assignment below would broadcast w1/w3 into the
             # whole expert row, so the second shard would overwrite the first.
             if (
-                "ModelOpt" in quant_method_name
+                ("ModelOpt" in quant_method_name or uses_modelopt_carrier_loader)
                 and param.data.ndim == 2
                 and shard_id in ("w1", "w3")
             ):
@@ -757,7 +763,9 @@ class RoutedExperts(PluggableLayer):
             return True if return_success else None
 
         # TODO @dsikka: ModelOpt should follow the proper MoE loading pattern
-        if "ModelOpt" in quant_method_name:
+        # The capability lets ModelOpt-format subclasses retain this loader ABI
+        # without depending on a class-name spelling convention.
+        if "ModelOpt" in quant_method_name or uses_modelopt_carrier_loader:
             # Determine per-tensor weight scale patterns based on variant
             # Use the dedicated method instead of brittle string matching
             uses_weight_scale_2 = self.quant_method.uses_weight_scale_2_pattern()

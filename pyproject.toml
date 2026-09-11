@@ -155,6 +155,7 @@ view_seperator = "view_seperator"
 inverse_std_variences = "inverse_std_variences"
 
 [tool.typos.default.extend-words]
+suh = "suh" # TrellisMX/EXL3 input-channel scale identifier, not prose.
 Hel = "Hel"
 wether = "wether"
 iy = "iy"
