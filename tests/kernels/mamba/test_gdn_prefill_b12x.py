@@ -117,7 +117,7 @@ def test_group_worklist_copies_update_captured_buffers_without_aliasing():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_prefill_pooled_state_graph_replays_changed_lengths_and_slots():
     from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
-    from b12x.policy.generation.delta_prefill_cases import (
+    from b12x.testing.delta_prefill_cases import (
         PrefillCase,
         assert_close,
         make_inputs,
@@ -209,7 +209,7 @@ def test_mixed_gdn_graph_replays_prefill_decode_verification_and_empty_worklists
     default_vllm_config,
 ):
     from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
-    from b12x.policy.generation.delta_prefill_cases import assert_close
+    from b12x.testing.delta_prefill_cases import assert_close
     from b12x.sequence.gdn_decode.reference import decode
     from b12x.sequence.gdn_prefill.reference import prefill_gdn
 

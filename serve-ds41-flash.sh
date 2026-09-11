@@ -194,7 +194,7 @@ PY
   profiler_args=(--profiler-config "${profiler_config}")
 fi
 
-speculative_config='{"method":"dspark","num_speculative_tokens":5,"draft_tensor_parallel_size":4,"attention_backend":"B12X_MLA_SPARSE_DSV41","draft_sample_method":"greedy","rejection_sample_method":"standard","enable_adaptive_verification":true}'
+speculative_config='{"method":"dspark","num_speculative_tokens":7,"draft_tensor_parallel_size":4,"attention_backend":"B12X_MLA_SPARSE_DSV41","draft_sample_method":"greedy","rejection_sample_method":"standard","enable_adaptive_verification":true}'
 command=(
   "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL_PATH}"
   --served-model-name "${SERVED_MODEL_NAME}"
@@ -202,7 +202,6 @@ command=(
   --dtype bfloat16
   --tensor-parallel-size 4
   --pipeline-parallel-size 1
-  --enable-expert-parallel
   --load-format safetensors
   --safetensors-load-strategy lazy
   --block-size 256
