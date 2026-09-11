@@ -1271,6 +1271,7 @@ def _drain(scheduler, requests, max_steps):
         f"scheduler failed to drain the state within {max_steps} steps"
     )
 
+
 def _drain_async(scheduler, requests, pending_output, max_steps):
     """Run real async schedule/record/update cycles until every request
     finishes, keeping the engine's one-batch overlap: the next batch is
