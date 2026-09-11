@@ -197,6 +197,32 @@ class TestStreaming:
         assert json.loads(collect_tool_arguments(results)) == EXPECTED_ARGS
         assert collect_content(results) == ""
 
+    def test_reopened_tool_markup_inside_unclosed_value_stays_valid_json(
+        self, parser, mock_request, tools
+    ):
+        """A captured malformed-call shape must still finish as valid JSON."""
+        mock_request.tools = tools
+        nested_markup = (
+            f"/workspace/L{THINK_END}{TOOL_CALL_START}record_value"
+            f"{ARG_KEY_START}value{ARG_KEY_END}{ARG_VALUE_START}second"
+        )
+        output = (
+            f"{THINK_END}{TOOL_CALL_START}record_value"
+            f"{ARG_KEY_START}value{ARG_KEY_END}{ARG_VALUE_START}first"
+            f"{ARG_VALUE_END}{ARG_KEY_START}path{ARG_KEY_END}"
+            f"{ARG_VALUE_START}{nested_markup}"
+        )
+
+        results = simulate_tool_streaming(parser, mock_request, _tag_chunks(output))
+        finish = parser.finish_streaming()
+        if finish is not None:
+            results.append((finish, output))
+
+        assert json.loads(collect_tool_arguments(results)) == {
+            "value": "first",
+            "path": nested_markup,
+        }
+
     def test_stop_token_id_without_text_in_final_delta(self, mock_request, tools):
         """Speculative decoding can deliver the whole call plus the stop
         token in one step; serving strips the stop text but keeps its ID.

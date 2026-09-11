@@ -3764,18 +3764,44 @@ class Scheduler(SchedulerInterface):
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
+            req = self.requests.get(req_id)
+            if req is None:
+                logger.warning(
+                    "Ignoring late KV receive completion for unknown request %s",
+                    req_id,
+                )
+                self.finished_recving_kv_req_ids.discard(req_id)
+                continue
             logger.debug("Finished recving KV transfer for request %s", req_id)
-            assert req_id in self.requests
-            req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
+            elif RequestStatus.is_finished(req.status):
+                self._free_blocks(req)
             else:
-                assert RequestStatus.is_finished(req.status)
-                self._free_blocks(self.requests[req_id])
+                logger.warning(
+                    "Ignoring KV receive completion for request %s in "
+                    "unexpected status %s",
+                    req_id,
+                    req.status.name,
+                )
         for req_id in kv_connector_output.finished_sending or ():
+            req = self.requests.get(req_id)
+            if req is None:
+                logger.warning(
+                    "Ignoring late KV send completion for unknown request %s",
+                    req_id,
+                )
+                continue
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            assert req_id in self.requests
-            self._free_blocks(self.requests[req_id])
+            if RequestStatus.is_finished(req.status):
+                self._free_blocks(req)
+            else:
+                logger.warning(
+                    "Ignoring KV send completion for request %s in unexpected "
+                    "status %s",
+                    req_id,
+                    req.status.name,
+                )
 
     def _update_requests_with_invalid_blocks(
         self,
