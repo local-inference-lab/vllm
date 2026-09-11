@@ -456,16 +456,6 @@ class KVConnectorBase_V1(ABC):
         """Bind worker-owned physical pages and their address-free byte layout."""
         raise NotImplementedError("Connector cannot transfer recurrent checkpoints")
 
-    def poll_boundary_checkpoint(self, request: "Request") -> bool:
-        """Return False while an atomic external checkpoint import is pending.
-
-        A True result permits ordinary local lookup. It is not a hit claim;
-        imported bundles must first be published by the allocator after all
-        worker copies complete. Cancellation must retain destinations until
-        every submitted copy drains.
-        """
-        return True
-
     def boundary_checkpoint_external_tokens(self, request: "Request") -> int:
         """Attribute an admitted imported bundle to external, not GPU-cache hits."""
         return 0

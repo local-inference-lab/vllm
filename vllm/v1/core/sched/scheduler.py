@@ -1286,14 +1286,6 @@ class Scheduler(SchedulerInterface):
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
-                    if (
-                        self.connector is not None
-                        and self.kv_cache_manager.boundary_checkpoints is not None
-                        and not self.connector.poll_boundary_checkpoint(request)
-                    ):
-                        request_queue.remove_request(request)
-                        step_skipped_waiting.prepend_request(request)
-                        continue
                     did_prefix_cache_lookup = True
                     (
                         new_computed_blocks,

@@ -184,29 +184,6 @@ def test_boundary_restore_preserves_external_cache_attribution(imported_tokens: 
     assert repeat.prefill_stats.num_local_cached_tokens == 32 - imported_tokens
 
 
-def test_pending_boundary_import_defers_without_blocking_another_request():
-    """Unpublished DMA destinations are never scheduled as reusable cache hits."""
-    scheduler = create_scheduler(enable_prefix_caching=True, use_v2_model_runner=True)
-    manager = scheduler.kv_cache_manager
-    manager.boundary_checkpoints = BoundaryCheckpointCache(manager.block_pool)
-    pending, cold = create_requests(num_requests=2, req_ids=["pending", "cold"])
-    scheduler.connector = Mock()
-    scheduler.connector.poll_boundary_checkpoint.side_effect = lambda request: (
-        request is not pending
-    )
-    scheduler.connector.boundary_checkpoint_external_tokens.return_value = 0
-    scheduler.connector.get_num_new_matched_tokens.return_value = (0, False)
-    scheduler.add_request(pending)
-    scheduler.add_request(cold)
-
-    output = scheduler.schedule()
-
-    assert output.num_scheduled_tokens == {"cold": 10}
-    assert pending.num_computed_tokens == 0
-    assert pending.status == RequestStatus.WAITING
-    assert manager.get_blocks(pending.request_id).get_block_ids() == ([],)
-
-
 def test_make_scheduled_encoder_input_stats_output_embeddings():
     scheduler = create_scheduler()
     mm_features = [
