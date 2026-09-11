@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.tasks import GenerationTask
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.core.sched.output import NewRequestData
@@ -17,6 +18,8 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
+
+logger = init_logger(__name__)
 
 
 class ModelSpecificAttnMetadata:
@@ -123,6 +126,23 @@ class ModelState(ABC):
         num_sampled: torch.Tensor,
         num_computed_tokens: torch.Tensor | None = None,
     ) -> None:
+        return None
+
+    def materialize_request_endpoints(
+        self,
+        copies: list[Any],
+        req_id_to_index: dict[str, int],
+    ) -> None:
+        """Write finished requests' committed recurrent states into the pool
+        blocks named by ``copies`` (``MambaEndpointStateCopy`` records). Runs
+        before the finished requests are removed from the worker. Only hybrid
+        recurrent model states implement it; the scheduler emits copies only
+        when such a model publishes request-endpoint cache entries."""
+        if copies:
+            logger.warning_once(
+                "Request-endpoint copies received by a model state without "
+                "recurrent state; the entries stay unmaterialized."
+            )
         return None
 
     @abstractmethod

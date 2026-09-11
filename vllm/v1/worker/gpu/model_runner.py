@@ -1250,6 +1250,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return True
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
+        # Finished requests' end states are read from their (still mapped)
+        # request slots, so materialize them before the slots are recycled.
+        if scheduler_output.mamba_endpoint_copies:
+            self.model_state.materialize_request_endpoints(
+                scheduler_output.mamba_endpoint_copies,
+                self.req_states.req_id_to_index,
+            )
         finished_req_ids = scheduler_output.finished_req_ids
         if self.pooling_runner is not None:
             # Preempted docs keep their query-use reservation until rescheduled.

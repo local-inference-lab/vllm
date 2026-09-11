@@ -18,12 +18,13 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
-    from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+    from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy, MambaEndpointStateCopy
     from vllm.v1.request import Request
 else:
     ECConnectorMetadata = object
     KVConnectorMetadata = object
     KVCacheBlockCopy = object
+    MambaEndpointStateCopy = object
     LoRARequest = object
     MultiModalFeatureSpec = object
     PoolingParams = object
@@ -257,6 +258,12 @@ class SchedulerOutput:
 
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
+
+    # Finished requests' recurrent states to write into their durable
+    # request-endpoint blocks. The worker applies them while the finished
+    # requests are still mapped, before this step's CoW copies (a consumer
+    # may already copy from a destination block).
+    mamba_endpoint_copies: list[MambaEndpointStateCopy] | None = None
 
     # Producer partial-tail offload hand-off for external KV connectors:
     # {request_id: [(group_id, block_id, boundary_tokens), ...]} pointing at

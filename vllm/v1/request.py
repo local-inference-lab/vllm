@@ -172,6 +172,10 @@ class Request:
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
+        # (scheduled draft tokens, accepted draft tokens) of the step that
+        # finished the request; the request-endpoint cache uses them to locate
+        # the committed recurrent state slot.
+        self.endpoint_final_step: tuple[int, int] = (0, 0)
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related

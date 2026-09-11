@@ -183,6 +183,73 @@ class KVCacheBlockCopy(NamedTuple):
     dst_block_id: int
 
 
+class MambaEndpointStateCopy(NamedTuple):
+    """Materialize a finished request's recurrent state into durable blocks.
+
+    ``dst_block_ids`` holds one pool block per recurrent cache group, in
+    ascending group-id order. A block id names the same physical page in
+    every group (each raw KV tensor is shared by one layer of every group),
+    so groups must not share a destination. Every block receives the state
+    after the request's endpoint token. When ``from_shadow`` is set the
+    state is read from the worker's per-request shadow pages (written before
+    the request's final in-flight step could overwrite its state slots): the
+    unshifted conv window shifted by ``token_bias`` and temporal shadow slot
+    ``token_bias``. Otherwise it is read from the request's own blocks: the
+    temporal state of ``temporal_src_block_ids`` and the convolution window
+    of ``conv_src_block_ids`` shifted by ``token_bias``, one entry per
+    recurrent cache group in ascending group-id order.
+    """
+
+    req_id: str
+    dst_block_ids: tuple[int, ...]
+    from_shadow: bool
+    conv_src_block_ids: tuple[int, ...]
+    temporal_src_block_ids: tuple[int, ...]
+    token_bias: int
+
+
+# Prefix-cache keys of request-endpoint entries reuse the block hash map with
+# the group id lifted into this namespace, so a page can be reachable both at
+# its hash boundaries and at a request's end position.
+ENDPOINT_GROUP_ID_OFFSET = 1 << 24
+
+
+def request_endpoint_cache_enabled() -> bool:
+    """Whether finished requests publish request-endpoint cache entries.
+
+    Gated by ``VLLM_K3_REQUEST_ENDPOINT_CACHE`` and switched off, without a
+    restart, by the file named in
+    ``VLLM_K3_REQUEST_ENDPOINT_CACHE_DISABLE_FILE``.
+
+    An entry restores the end position of every cache group, a speculative
+    draft's sliding window included, so a deployment that hides restored KV
+    from its draft group must keep the flag off.
+    """
+    if not envs.VLLM_K3_REQUEST_ENDPOINT_CACHE:
+        return False
+    disable_file = envs.VLLM_K3_REQUEST_ENDPOINT_CACHE_DISABLE_FILE
+    return not (disable_file and os.path.exists(disable_file))
+
+
+def request_endpoint_cache_debug() -> bool:
+    """Whether endpoint registration, hits and worker copies are logged."""
+    return bool(envs.VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG)
+
+
+def request_endpoint_cache_torch_copy() -> bool:
+    """Whether endpoint states are materialized by torch copies (env flag or
+    the presence of the named file) instead of the fused kernel."""
+    if envs.VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY:
+        return True
+    path = envs.VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY_FILE
+    return bool(path) and os.path.exists(path)
+
+
+def request_endpoint_cache_max_entries() -> int:
+    """Upper bound on live request-endpoint entries (each pins one block)."""
+    return max(int(envs.VLLM_K3_REQUEST_ENDPOINT_CACHE_MAX_ENTRIES), 0)
+
+
 class FreeKVCacheBlockQueue:
     """This class organizes a list of KVCacheBlock objects to a doubly linked
     list of free blocks. We implement this class instead of using Python

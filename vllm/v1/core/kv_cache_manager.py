@@ -14,7 +14,21 @@ from vllm.v1.core.kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    KVCacheBlockCopy,
+    MambaEndpointStateCopy,
+    generate_block_hash_extra_keys,
+    request_endpoint_cache_debug,
+    request_endpoint_cache_enabled,
+    request_endpoint_cache_max_entries,
+)
+from vllm.v1.core.single_type_kv_cache_manager import (
+    FullAttentionManager,
+    MambaManager,
+    RSWAManager,
+    SlidingWindowManager,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -191,6 +205,11 @@ class KVCacheManager:
         # offload; pinned until the request's blocks are freed.
         self._partial_tail_pins: dict[str, list[KVCacheBlock]] = {}
 
+        # Request-endpoint cache: state copies for the worker and the blocks
+        # they read or write, retained until the step that runs them.
+        self._pending_endpoint_copies: list[MambaEndpointStateCopy] = []
+        self._endpoint_retained_blocks: list[KVCacheBlock] = []
+
     @property
     def usage(self) -> float:
         """Get the KV cache usage.
@@ -263,12 +282,19 @@ class KVCacheManager:
                 request.block_hashes, max_cache_hit_length
             )
         )
+        endpoint_hit = self._find_endpoint_hit(
+            request, max_cache_hit_length, num_new_computed_tokens
+        )
+        if endpoint_hit is not None:
+            computed_blocks, num_new_computed_tokens = endpoint_hit
+            num_uncached = 0
 
         # When kv_cache_report_mode is "full", emit BlockStored events
         # for the reused prefix cache blocks so that external consumers
         # (e.g. gateway) can learn about them.
         if (
             num_new_computed_tokens > 0
+            and endpoint_hit is None
             and self.enable_kv_cache_events
             and getattr(request, "kv_cache_report_mode", "incremental") == "full"
         ):
@@ -338,6 +364,12 @@ class KVCacheManager:
             return *self.get_computed_blocks(request), False
 
         num_local = per_group_hits[fa_group_id]
+        endpoint_hit = self._find_endpoint_hit(
+            request, request.num_tokens - 1, num_local
+        )
+        if endpoint_hit is not None:
+            endpoint_blocks, num_endpoint = endpoint_hit
+            return self.create_kv_cache_blocks(endpoint_blocks), num_endpoint, 0, False
         blocks = self.create_kv_cache_blocks(computed)
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, min(per_group_hits) < num_local
@@ -834,6 +866,303 @@ class KVCacheManager:
                 start_idx = start_token // mgr.block_size
                 blocks = mgr.req_to_blocks[request_id]
                 mgr.new_block_ids.extend(blk.block_id for blk in blocks[start_idx:])
+
+    # ------------------------------------------------------------------
+    # Request-endpoint cache
+    #
+    # A finished request publishes its end position: the attention pages and
+    # draft-window blocks holding its last computed token, plus one pool block
+    # that receives every recurrent group's state after that token. A later
+    # prompt that extends the same token sequence resumes at that position
+    # instead of at the last hash boundary.
+    # ------------------------------------------------------------------
+
+    def cache_endpoint(
+        self,
+        request: Request,
+        final_step: tuple[int, int],
+        in_flight: bool,
+    ) -> bool:
+        """Publish a finished request's end position as a prefix-cache entry.
+
+        Args:
+            request: The finished request; its blocks must still be held.
+            final_step: (scheduled draft tokens, accepted draft tokens) of the
+                step that produced the request's last computed token; locates
+                the recurrent-state slot of the endpoint within the request's
+                blocks.
+            in_flight: Whether a later step of the request is still executing.
+                That step overwrites the request's state slots, so the
+                recurrent state is then taken from the worker's shadow pages
+                (written before the step ran) instead of the blocks.
+
+        Returns:
+            True if an entry was registered. The recurrent state is written by
+            the worker from the copy record drained by
+            ``take_mamba_endpoint_copies``; the destination block and the
+            source blocks stay retained until that step completes.
+        """
+        if not self.enable_caching or not request_endpoint_cache_enabled():
+            return False
+        max_entries = request_endpoint_cache_max_entries()
+        if max_entries <= 0:
+            return False
+        unit = self.block_pool.hash_block_size
+        # The endpoint is the last token with KV. A stop inside the accepted
+        # tokens of the final step trims the sequence below the committed
+        # position; the recurrent state of every accepted row is kept, so the
+        # endpoint may sit up to ``num_accepted`` rows before it.
+        num_tokens = request.num_tokens - 1
+        committed = request.num_computed_tokens - request.num_in_flight_tokens
+        num_draft_tokens, num_accepted = final_step
+        num_before = committed - num_accepted - 1
+        accepted_at_endpoint = num_tokens - num_before - 1
+        if (
+            num_tokens < unit
+            or num_tokens > committed
+            or not 0 <= accepted_at_endpoint <= num_accepted
+        ):
+            return False
+        num_units = num_tokens // unit
+        if num_units > len(request.block_hashes):
+            return False
+        parent_hash = request.block_hashes[num_units - 1]
+        tail_start = num_units * unit
+        tail_tokens = tuple(request.all_token_ids[tail_start:num_tokens])
+        extra_keys, _ = generate_block_hash_extra_keys(
+            request, tail_start, num_tokens, 0
+        )
+
+        req_id = request.request_id
+        group_blocks: dict[int, tuple[int, list[KVCacheBlock]]] = {}
+        mamba_managers: list[MambaManager] = []
+        mamba_group_ids: list[int] = []
+        for group_id, (manager, group) in enumerate(
+            zip(
+                self.coordinator.single_type_managers,
+                self.kv_cache_config.kv_cache_groups,
+                strict=True,
+            )
+        ):
+            req_blocks = manager.req_to_blocks.get(req_id)
+            if not req_blocks:
+                return False
+            if isinstance(manager, MambaManager):
+                if manager.mamba_cache_mode != "align":
+                    return False
+                mamba_managers.append(manager)
+                mamba_group_ids.append(group_id)
+                continue
+            block_size = manager.block_size
+            last_idx = (num_tokens - 1) // block_size
+            if isinstance(manager, SlidingWindowManager):
+                window = get_kv_cache_spec_sliding_window(group.kv_cache_spec)
+                if window is None:
+                    return False
+                first_idx = max(0, num_tokens - window + 1) // block_size
+            elif isinstance(manager, FullAttentionManager) and not isinstance(
+                manager, RSWAManager
+            ):
+                first_idx = last_idx
+            else:
+                return False
+            if last_idx >= len(req_blocks):
+                return False
+            blocks = list(req_blocks[first_idx : last_idx + 1])
+            if any(block.is_null for block in blocks):
+                return False
+            group_blocks[group_id] = (first_idx, blocks)
+        if not mamba_managers:
+            return False
+
+        mamba_block_size = mamba_managers[0].block_size
+        retained: list[KVCacheBlock] = []
+        conv_src_ids: list[int] = []
+        temporal_src_ids: list[int] = []
+        # The final step scheduled ``num_draft_tokens + 1`` rows from the
+        # committed position ``num_before`` and wrote row ``j`` of its state
+        # into column ``base + j``; the conv window lives in ``base`` and is
+        # read with the accepted count as its shift. When acceptance landed
+        # exactly on a block boundary inside the running column the post-step
+        # kernel normalized the committed state into slot 0 and shifted the
+        # window in place, which leaves no state for an earlier endpoint.
+        base = (num_before + num_draft_tokens) // mamba_block_size
+        aligned = committed // mamba_block_size * mamba_block_size
+        normalized = (
+            aligned >= num_before + 1 and aligned // mamba_block_size - 1 == base
+        )
+        if normalized and accepted_at_endpoint != num_accepted:
+            return False
+        token_bias = 0 if normalized else accepted_at_endpoint
+        if not in_flight:
+            temporal_idx = base + token_bias
+            for manager in mamba_managers:
+                req_blocks = manager.req_to_blocks[req_id]
+                if temporal_idx >= len(req_blocks) or base >= len(req_blocks):
+                    return False
+                conv_src = req_blocks[base]
+                temporal_src = req_blocks[temporal_idx]
+                if conv_src.is_null or temporal_src.is_null:
+                    return False
+                conv_src_ids.append(conv_src.block_id)
+                temporal_src_ids.append(temporal_src.block_id)
+                retained.append(conv_src)
+                retained.append(temporal_src)
+
+        # One durable block per recurrent group: a block id names the same
+        # physical page in every group (each raw KV tensor is shared by one
+        # layer of every group), so groups must not share a block. Keep one
+        # block spare so publishing never takes the pool's last block.
+        num_dst = len(mamba_managers)
+        if self.block_pool.get_num_free_blocks() < num_dst + 1:
+            return False
+        dsts = self.block_pool.get_new_blocks(num_dst)
+        state_idx = (num_tokens - 1) // mamba_block_size
+        for group_id, dst in zip(mamba_group_ids, dsts):
+            group_blocks[group_id] = (state_idx, [dst])
+        entry = self.block_pool.cache_endpoint(
+            parent_hash, num_tokens, tail_tokens, extra_keys, group_blocks, max_entries
+        )
+        if entry is None:
+            self.block_pool.free_blocks(dsts)
+            return False
+        self.block_pool.touch(retained)
+        self._pending_endpoint_copies.append(
+            MambaEndpointStateCopy(
+                req_id=req_id,
+                dst_block_ids=tuple(dst.block_id for dst in dsts),
+                from_shadow=in_flight,
+                conv_src_block_ids=tuple(conv_src_ids),
+                temporal_src_block_ids=tuple(temporal_src_ids),
+                token_bias=token_bias,
+            )
+        )
+        self._endpoint_retained_blocks.extend(dsts)
+        self._endpoint_retained_blocks.extend(retained)
+        if request_endpoint_cache_debug():
+            logger.info(
+                "[endpoint] register req=%s L=%d committed=%d drafts=%d accepted=%d "
+                "accepted_at_endpoint=%d base=%d normalized=%s in_flight=%s "
+                "bias=%d dst=%s conv_src=%s temporal_src=%s groups=%s",
+                req_id,
+                num_tokens,
+                committed,
+                num_draft_tokens,
+                num_accepted,
+                accepted_at_endpoint,
+                base,
+                normalized,
+                in_flight,
+                token_bias,
+                [dst.block_id for dst in dsts],
+                conv_src_ids,
+                temporal_src_ids,
+                {
+                    gid: (first, [b.block_id for b in blocks])
+                    for gid, (first, blocks) in group_blocks.items()
+                },
+            )
+        return True
+
+    def take_mamba_endpoint_copies(
+        self,
+    ) -> tuple[list[MambaEndpointStateCopy], list[KVCacheBlock]]:
+        """Drain endpoint state copies and the blocks retained for them."""
+        copies = self._pending_endpoint_copies
+        retained = self._endpoint_retained_blocks
+        self._pending_endpoint_copies = []
+        self._endpoint_retained_blocks = []
+        return copies, retained
+
+    def _find_endpoint_hit(
+        self,
+        request: Request,
+        max_cache_hit_length: int,
+        min_hit_length: int,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int] | None:
+        """Find the longest request-endpoint entry the request can resume from.
+
+        Entries hang off the chain hash of their last full hash unit, so the
+        candidate parents are the request's hashes from the longest one whose
+        endpoint could fit under ``max_cache_hit_length`` down to the one whose
+        endpoint could still exceed ``min_hit_length``. An entry matches when
+        its tail tokens and extra keys equal the request's, and every
+        attention page before its endpoint page is still cached.
+
+        Returns:
+            Per-group block lists and the endpoint length, or ``None``.
+        """
+        if not request_endpoint_cache_enabled():
+            return None
+        if self.block_pool.num_endpoint_entries == 0:
+            return None
+        unit = self.block_pool.hash_block_size
+        block_hashes = request.block_hashes
+        token_ids = request.all_token_ids
+        highest = min(len(block_hashes), max_cache_hit_length // unit) - 1
+        lowest = max(0, min_hit_length // unit - 1)
+        for parent_idx in range(highest, lowest - 1, -1):
+            entries = self.block_pool.find_endpoints(block_hashes[parent_idx])
+            if not entries:
+                continue
+            tail_start = (parent_idx + 1) * unit
+            for entry in entries:
+                num_tokens = entry.num_tokens
+                if num_tokens > max_cache_hit_length or num_tokens <= min_hit_length:
+                    continue
+                if tuple(token_ids[tail_start:num_tokens]) != entry.tail_tokens:
+                    continue
+                extra_keys, _ = generate_block_hash_extra_keys(
+                    request, tail_start, num_tokens, 0
+                )
+                if extra_keys != entry.extra_keys:
+                    continue
+                blocks = self._endpoint_hit_blocks(entry, block_hashes)
+                if blocks is not None:
+                    if request_endpoint_cache_debug():
+                        logger.info(
+                            "[endpoint] hit req=%s L=%d parent_idx=%d prompt=%d "
+                            "aligned_hit=%d blocks=%s",
+                            request.request_id,
+                            num_tokens,
+                            parent_idx,
+                            request.num_tokens,
+                            min_hit_length,
+                            [[b.block_id for b in group] for group in blocks],
+                        )
+                    return blocks, num_tokens
+        return None
+
+    def _endpoint_hit_blocks(
+        self, entry, block_hashes
+    ) -> tuple[list[KVCacheBlock], ...] | None:
+        unit = self.block_pool.hash_block_size
+        null_block = self.block_pool.null_block
+        result: list[list[KVCacheBlock]] = []
+        for group_id, manager in enumerate(self.coordinator.single_type_managers):
+            group_entry = entry.group_blocks.get(group_id)
+            if group_entry is None:
+                return None
+            first_idx, blocks = group_entry
+            if isinstance(manager, (MambaManager, SlidingWindowManager)):
+                result.append([null_block] * first_idx + list(blocks))
+                continue
+            # Full attention: every page before the endpoint page must still
+            # be cached under the request's chain.
+            scale = manager.block_size // unit
+            chain: list[KVCacheBlock] = []
+            for page_idx in range(first_idx):
+                hash_idx = (page_idx + 1) * scale - 1
+                if hash_idx >= len(block_hashes):
+                    return None
+                cached = self.block_pool.get_cached_block(
+                    block_hashes[hash_idx], [group_id]
+                )
+                if not cached:
+                    return None
+                chain.append(cached[0])
+            result.append(chain + list(blocks))
+        return tuple(result)
 
     def take_kv_cache_block_copies(
         self,

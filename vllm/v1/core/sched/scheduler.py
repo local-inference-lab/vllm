@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -274,6 +275,22 @@ class Scheduler(SchedulerInterface):
         if hash_block_size is None:
             hash_block_size = block_size
         self.hash_block_size = hash_block_size
+        # Request-endpoint cache: a finished request's recurrent state is read
+        # either from its blocks or from the worker's shadow slot written
+        # before the one step that may still be in flight. More concurrent
+        # batches would leave states neither source covers.
+        self.request_endpoint_cache = (
+            self.kv_cache_config.has_mamba_layers
+            and bool(envs.VLLM_K3_REQUEST_ENDPOINT_CACHE)
+            and self.vllm_config.max_concurrent_batches <= 2
+        )
+        if envs.VLLM_K3_REQUEST_ENDPOINT_CACHE and not self.request_endpoint_cache:
+            logger.warning(
+                "VLLM_K3_REQUEST_ENDPOINT_CACHE is set but unsupported here "
+                "(mamba layers: %s, concurrent batches: %d); disabled.",
+                self.kv_cache_config.has_mamba_layers,
+                self.vllm_config.max_concurrent_batches,
+            )
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -1241,6 +1258,18 @@ class Scheduler(SchedulerInterface):
             self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
         pending_kv_cache_block_copies = kv_cache_block_copies or None
 
+        # Request-endpoint state copies run before this step's CoW copies (a
+        # consumer may already copy from a destination block); the blocks they
+        # read and write stay retained until the step completes.
+        mamba_endpoint_copies, endpoint_retained_blocks = (
+            self.kv_cache_manager.take_mamba_endpoint_copies()
+        )
+        if mamba_endpoint_copies:
+            self._free_cow_retained_blocks(
+                endpoint_retained_blocks, self.sched_step_seq + 1
+            )
+        pending_mamba_endpoint_copies = mamba_endpoint_copies or None
+
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = (
             self.acceptance_length_controller.num_spec_tokens
@@ -1280,6 +1309,7 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             kv_cache_block_copies=pending_kv_cache_block_copies,
+            mamba_endpoint_copies=pending_mamba_endpoint_copies,
             partial_tail_offloads=pending_partial_tail_offloads,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
@@ -1976,6 +2006,10 @@ class Scheduler(SchedulerInterface):
                         self.kv_cache_manager.estimate_cached_tokens(request)
                     )
 
+            # The request-endpoint cache locates the committed recurrent state
+            # from the last step's draft geometry.
+            request.endpoint_final_step = (num_draft_tokens, num_accepted)
+
             finish_reason = None
             if stopped:
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
@@ -2426,6 +2460,7 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
+        self._cache_request_endpoint(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing
@@ -2448,6 +2483,21 @@ class Scheduler(SchedulerInterface):
             self._free_blocks(request)
 
         return kv_xfer_params, ec_xfer_params
+
+    def _cache_request_endpoint(self, request: Request) -> None:
+        """Publish the finished request's end position to the prefix cache.
+
+        Runs at finish time, while the request still holds its blocks: a
+        connector may delay the free, and the worker slot the recurrent state
+        is copied from is recycled once the request is reported finished.
+        """
+        if not self.request_endpoint_cache:
+            return
+        self.kv_cache_manager.cache_endpoint(
+            request,
+            request.endpoint_final_step,
+            in_flight=request.num_in_flight_tokens > 0,
+        )
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
