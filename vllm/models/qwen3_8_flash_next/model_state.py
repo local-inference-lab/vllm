@@ -25,6 +25,8 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
+from .ple_layer import Qwen3_8FlashNextNGramEmbedding
+
 
 @dataclass
 class Qwen3_8FlashNextAttnMetadata(MambaHybridAttnMetadata):
@@ -58,6 +60,8 @@ class Qwen3_8FlashNextAttnMetadata(MambaHybridAttnMetadata):
 
 class Qwen3_8FlashNextModelState(MambaHybridModelState):
     """Add rollback-safe n-gram history and persistent QSA request identity."""
+
+    specialize_full_decode_graphs = True
 
     def __init__(
         self,
@@ -116,6 +120,12 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
             device=self.device,
         )
         self.uses_ngram_embedding = bool(config.ple_layer_ids)
+        self.disk_embeddings = tuple(
+            module
+            for module in model.modules()
+            if isinstance(module, Qwen3_8FlashNextNGramEmbedding)
+            and module.requires_disk_preparation
+        )
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
@@ -442,9 +452,14 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
         num_reqs_padded = input_batch.num_reqs_after_padding
         query_start_loc = self.ple_query_start_loc[: num_reqs_padded + 1]
         query_start_loc.copy_(input_batch.query_start_loc[: num_reqs_padded + 1])
+        ngram_context = self._prepare_ngram_context(input_batch, req_states)
+        for embedding in self.disk_embeddings:
+            embedding.prepare_disk(
+                input_batch.input_ids, query_start_loc, ngram_context
+            )
         model_inputs.update(
             query_start_loc=query_start_loc,
-            ngram_context=self._prepare_ngram_context(input_batch, req_states),
+            ngram_context=ngram_context,
         )
         return model_inputs
 
@@ -472,6 +487,8 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
 
         ngram_context = self.ngram_context[:num_reqs]
         ngram_context.fill_(self.ngram_eos_token_id)
+        for embedding in self.disk_embeddings:
+            embedding.prepare_dummy_output(num_tokens)
         model_inputs.update(
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,

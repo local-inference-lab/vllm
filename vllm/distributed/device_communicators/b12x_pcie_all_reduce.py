@@ -299,6 +299,10 @@ class B12xPcieAllReduce:
 
         assert dma is not None
         dma.min_bytes = min_bytes
+        if dma.wire_mode == "bf16" and capacity >= min_bytes:
+            from vllm.config import get_current_vllm_config
+
+            dma.prepare_eager_replay(get_current_vllm_config().model_config.dtype)
         self._dma = dma
 
     def _initialize_twoshot(self) -> None:

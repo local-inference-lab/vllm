@@ -42,6 +42,7 @@ from vllm.config import (
     DiffusionConfig,
     ECTransferConfig,
     EncoderCacheManagerConfig,
+    EngramConfig,
     EPLBConfig,
     FaultToleranceConfig,
     KernelConfig,
@@ -698,6 +699,7 @@ class EngineArgs:
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
     compilation_config: CompilationConfig = get_field(VllmConfig, "compilation_config")
     attention_config: AttentionConfig = get_field(VllmConfig, "attention_config")
+    engram_config: EngramConfig | None = get_field(VllmConfig, "engram_config")
     mamba_config: MambaConfig = get_field(VllmConfig, "mamba_config")
     kernel_config: KernelConfig = get_field(VllmConfig, "kernel_config")
     enable_flashinfer_autotune: bool = get_field(
@@ -780,7 +782,9 @@ class EngineArgs:
     )
 
     fail_on_environ_validation: bool = False
-    gdn_prefill_backend: Literal["flashinfer", "triton", "cutedsl"] | None = None
+    gdn_prefill_backend: Literal["flashinfer", "triton", "cutedsl", "b12x"] | None = (
+        None
+    )
     gdn_decode_kernel: Literal["b12x", "cuda", "triton"] | None = None
     kda_prefill_backend: Literal["auto", "triton", "flashkda", "b12x"] | None = None
 
@@ -792,6 +796,8 @@ class EngineArgs:
             self.compilation_config = CompilationConfig(**self.compilation_config)
         if isinstance(self.attention_config, dict):
             self.attention_config = AttentionConfig(**self.attention_config)
+        if isinstance(self.engram_config, dict):
+            self.engram_config = EngramConfig(**self.engram_config)
         if isinstance(self.mamba_config, dict):
             self.mamba_config = MambaConfig(**self.mamba_config)
         if isinstance(self.kernel_config, dict):
@@ -1714,6 +1720,7 @@ class EngineArgs:
         vllm_group.add_argument(
             "--attention-config", "-ac", **vllm_kwargs["attention_config"]
         )
+        vllm_group.add_argument("--engram-config", **vllm_kwargs["engram_config"])
         vllm_group.add_argument("--reasoning-config", **vllm_kwargs["reasoning_config"])
         vllm_group.add_argument("--kernel-config", **vllm_kwargs["kernel_config"])
         vllm_group.add_argument(
@@ -1763,16 +1770,22 @@ class EngineArgs:
         parser.add_argument(
             "--gdn-prefill-backend",
             dest="gdn_prefill_backend",
-            choices=["flashinfer", "triton", "cutedsl"],
+            choices=["flashinfer", "triton", "cutedsl", "b12x"],
             default=None,
-            help="Select GDN prefill backend.",
+            help=(
+                "Select GDN prefill backend. Selecting b12x also selects b12x "
+                "decode; conflicting explicit GDN selections are rejected."
+            ),
         )
         parser.add_argument(
             "--gdn-decode-kernel",
             dest="gdn_decode_kernel",
             choices=["b12x", "cuda", "triton"],
             default=None,
-            help="Select GDN decode kernel.",
+            help=(
+                "Select GDN decode kernel. Selecting b12x also selects b12x "
+                "prefill; conflicting explicit GDN selections are rejected."
+            ),
         )
         parser.add_argument(
             "--kda-prefill-backend",
@@ -2601,6 +2614,7 @@ class EngineArgs:
             load_config=load_config,
             offload_config=offload_config,
             attention_config=attention_config,
+            engram_config=copy.deepcopy(self.engram_config),
             mamba_config=mamba_config,
             kernel_config=kernel_config,
             lora_config=lora_config,
