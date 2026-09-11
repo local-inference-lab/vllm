@@ -134,6 +134,10 @@ def native_compressor_runners(monkeypatch):
                 num_reqs=len(identities),
                 num_actual_tokens=n,
                 max_query_len=max(lengths, default=0),
+                max_seq_len=max(
+                    (pos + length for pos, length in zip(positions, lengths)),
+                    default=0,
+                ),
             )
             self.main = self.builders[0].build(0, cm)
             state_cm = SimpleNamespace(**vars(cm))

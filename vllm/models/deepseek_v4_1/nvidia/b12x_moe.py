@@ -144,7 +144,7 @@ class B12xV41Experts(DeepseekV4MegaMoEExperts):
         fused_moe.run(binding=binding)
 
     def forward(self, x, weights, ids):
-        out = torch.empty_like(x)
+        out = torch.empty_like(x, dtype=torch.float32)
         _experts(x, weights, ids, out, self.prefix)
         return out
 

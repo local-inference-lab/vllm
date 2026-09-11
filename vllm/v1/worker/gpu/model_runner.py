@@ -1071,6 +1071,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below
             # with the updated prompt_token_ids and mm_features.
+            if req_id in self.req_states.req_id_to_index:
+                prepare_update = getattr(
+                    self.model_state, "prepare_streaming_update", None
+                )
+                if prepare_update is not None:
+                    prepare_update(req_id)
             self._remove_request(req_id)
 
             prompt_len = new_req_data.prompt_len
@@ -1640,6 +1646,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # when encoder inputs are scheduled, because this step updates
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
+        max_cudagraph_query_len = getattr(
+            self.model_state, "max_cudagraph_query_len", None
+        )
+        exceeds_cudagraph_query_len = (
+            max_cudagraph_query_len is not None
+            and max_query_len > max_cudagraph_query_len
+        )
 
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
@@ -1649,7 +1662,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_size,
             self.dp_rank,
             max_query_len=max_query_len,
-            need_eager=is_profile or skip_compiled,
+            need_eager=is_profile or skip_compiled or exceeds_cudagraph_query_len,
             num_active_loras=num_active_loras,
         )
 

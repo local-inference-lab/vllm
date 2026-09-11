@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from functools import cache
 from weakref import WeakValueDictionary
 
@@ -34,6 +35,42 @@ def _capacity() -> int:
     return get_current_vllm_config().scheduler_config.max_num_batched_tokens
 
 
+def _execution_capacities() -> tuple[int, ...]:
+    config = get_current_vllm_config()
+    capacity = _capacity()
+    spec = config.speculative_config
+    decode_capacity = min(
+        capacity,
+        max(
+            config.scheduler_config.max_num_seqs
+            * (1 + (spec.num_speculative_tokens if spec is not None else 0)),
+            config.compilation_config.max_cudagraph_capture_size or 0,
+        ),
+    )
+    graph_sizes = config.compilation_config.cudagraph_capture_sizes or ()
+    from .ced import ced_decoder_start
+
+    hf = getattr(getattr(config, "model_config", None), "hf_config", None)
+    ced_capacities = ()
+    if hf is not None and ced_decoder_start(hf) is not None:
+        window = hf.sliding_window
+        ced_capacities = range(
+            window,
+            min(capacity, config.scheduler_config.max_num_seqs * window) + 1,
+            window,
+        )
+    return tuple(
+        sorted(
+            {
+                capacity,
+                decode_capacity,
+                *(size for size in graph_sizes if 0 < size <= decode_capacity),
+                *ced_capacities,
+            }
+        )
+    )
+
+
 _LINEARS = WeakValueDictionary()
 
 
@@ -54,11 +91,14 @@ def _mhc_plan(device, capacity, hidden):
 @torch.library.custom_op("vllm::dsv41_block32_linear", mutates_args=("out",))
 def _block32_linear(x: torch.Tensor, out: torch.Tensor, key: int) -> None:
     layer = _LINEARS[key]
-    scratch = current_workspace_manager().get_simultaneous(
-        *layer.b12x_plan.shapes_and_dtypes()
-    )
+    rows = x.numel() // layer.weight.shape[1]
+    index = bisect_left(layer.b12x_capacities, rows)
+    if index == len(layer.b12x_capacities):
+        raise ValueError("V4.1 linear rows exceed planned capacity")
+    plan = layer.b12x_plans[index]
+    scratch = current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
     binding = block_fp8_linear.bind(
-        layer.b12x_plan,
+        plan,
         scratch=scratch,
         source=x,
         packed_weight=layer.b12x_weight,
@@ -180,15 +220,23 @@ class B12xFP8LinearMethod(LinearMethodBase):
         layer.b12x_weight = block_fp8_linear.pack_weight(
             layer.weight, layer.weight_scale_inv, block_size=(32, 32)
         )
-        layer.b12x_plan = block_fp8_linear.plan(
-            block_fp8_linear.Caps(
-                device=layer.weight.device,
-                max_tokens=_capacity(),
-                in_features=layer.weight.shape[1],
-                out_features=layer.weight.shape[0],
-                block_size=(32, 32),
+        layer.b12x_capacities = _execution_capacities()
+        layer.b12x_plans = tuple(
+            block_fp8_linear.plan(
+                block_fp8_linear.Caps(
+                    device=layer.weight.device,
+                    max_tokens=capacity,
+                    in_features=layer.weight.shape[1],
+                    out_features=layer.weight.shape[0],
+                    block_size=(32, 32),
+                )
             )
+            for capacity in layer.b12x_capacities
         )
+        for capacity in layer.b12x_capacities:
+            block_fp8_linear.prewarm(
+                layer.b12x_weight, (1, capacity), expected_m=capacity
+            )
         layer.b12x_key = id(layer)
         _LINEARS[layer.b12x_key] = layer
 
@@ -269,6 +317,9 @@ def _mhc_pre(
     hc_eps: float,
     iterations: int,
     capacity: int,
+    previous_output: torch.Tensor | None = None,
+    previous_post: torch.Tensor | None = None,
+    previous_comb: torch.Tensor | None = None,
 ) -> None:
     plan = _mhc_plan(residual.device, capacity, y.shape[-1])
     (scratch,) = current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
@@ -286,11 +337,22 @@ def _mhc_pre(
     # Outputs are caller-owned tensors with ordinary PyTorch lifetimes.
     # Retain only the shared arena, not every layer's transient activations.
     retain_cuda_graph_capture_resource(scratch)
-    mhc.run_pre(
-        residual,
-        fn,
-        scale,
-        base,
+    if previous_output is None:
+        operation = mhc.run_pre
+        inputs = (residual, fn, scale, base)
+    else:
+        operation = mhc.run_post_pre
+        inputs = (
+            previous_output,
+            residual,
+            previous_post,
+            previous_comb,
+            fn,
+            scale,
+            base,
+        )
+    operation(
+        *inputs,
         rms_eps=rms_eps,
         hc_eps=hc_eps,
         sinkhorn_iters=iterations,
@@ -318,6 +380,9 @@ def _mhc_pre_fake(
     hc_eps,
     iterations,
     capacity,
+    previous_output=None,
+    previous_post=None,
+    previous_comb=None,
 ):
     return None
 
@@ -344,6 +409,7 @@ class B12xMHC(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.capacity = _capacity()
+        self.capacities = _execution_capacities()
         self.hidden_size = config.hidden_size
         self.rms_eps = config.rms_norm_eps
         self.hc_eps = config.hc_eps
@@ -351,8 +417,23 @@ class B12xMHC(nn.Module):
         if config.hc_mult != 4:
             raise ValueError("V4.1 mHC requires four streams")
 
-    def pre(self, residual, fn, scale, base, norm, pre):
+    def pre(
+        self,
+        residual,
+        fn,
+        scale,
+        base,
+        norm,
+        pre,
+        *,
+        previous_output=None,
+        previous_post=None,
+        previous_comb=None,
+    ):
         tokens = residual.shape[0]
+        index = bisect_left(self.capacities, tokens)
+        if index == len(self.capacities):
+            raise ValueError("V4.1 mHC rows exceed planned capacity")
         if pre is None:
             # The read-only initial mix must not share storage with native
             # scratch. Only the first sublayer needs this small live-row input.
@@ -382,9 +463,25 @@ class B12xMHC(nn.Module):
             self.rms_eps,
             self.hc_eps,
             self.iterations,
-            self.capacity,
+            self.capacities[index],
+            previous_output,
+            previous_post,
+            previous_comb,
         )
         return residual_out, post, comb, y, pre_out
+
+    def post_pre(self, x, residual, post, comb, fn, scale, base, norm, pre):
+        return self.pre(
+            residual,
+            fn,
+            scale,
+            base,
+            norm,
+            pre,
+            previous_output=x,
+            previous_post=post,
+            previous_comb=comb,
+        )
 
     def post(self, x, residual, post, comb):
         out = torch.empty_like(residual)

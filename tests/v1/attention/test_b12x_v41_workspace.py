@@ -36,13 +36,19 @@ def _layer(attention, layer_id=0):
     torch.nn.Module.__init__(layer)
     layer.prefix = f"model.layers.{layer_id}.self_attn"
     layer.layer_id = layer_id
-    layer.config = SimpleNamespace(cache_config=SimpleNamespace(block_size=64))
+    layer.config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=64),
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        speculative_config=SimpleNamespace(num_speculative_tokens=5),
+        compilation_config=SimpleNamespace(max_cudagraph_capture_size=128),
+    )
     layer.capacity = 4096
     layer.max_model_len = 1024
     layer.n_local_heads = 16
     layer.swa_width = layer.window_size = 128
     layer.compress_ratio = 1
     layer.is_draft = False
+    layer.is_ced_decoder = False
     layer.is_index_source = True
     layer.kv_source_layer_id = layer.index_source_layer_id = layer_id
     layer.candidate_source_layer = 99
@@ -67,7 +73,7 @@ def test_prepare_memory_is_metadata_not_capacity_activations(native_workspace):
     second = _layer(attention, 1)
     second._prepare(device)
     allocated = torch.cuda.memory_allocated() - before
-    c = second.CHUNK
+    c = second.INDEX_CHUNK
     metadata_bytes = 4 * (
         c * (second.swa_width + second._main_width + second._index_width) + 3 * c + 1
     )
@@ -77,20 +83,26 @@ def test_prepare_memory_is_metadata_not_capacity_activations(native_workspace):
     assert allocated <= metadata_bytes + persistent_topk_bytes + 1024**2
 
 
-@pytest.mark.parametrize("is_decode", [True, False])
+@pytest.mark.parametrize(
+    "is_decode,rows,live_rows", [(True, 6, 6), (True, 48, 6), (False, 65, 65)]
+)
 def test_attention_shared_scratch_graph_replay(
-    native_workspace, monkeypatch, is_decode
+    native_workspace, monkeypatch, is_decode, rows, live_rows
 ):
     attention, manager, workspace = native_workspace
     device = torch.device("cuda", torch.cuda.current_device())
     torch.manual_seed(142)
     layer = _layer(attention)
     layer._prepare(device)
-    rows, length = 65, 1024  # Cross the static 64-row scratch boundary.
-    positions = torch.arange(length - rows, length, dtype=torch.int64, device=device)
-    starts = torch.tensor([0, rows], dtype=torch.int32, device=device)
-    reqs = torch.zeros(rows, dtype=torch.int32, device=device)
-    visible = (positions + 1).int()
+    length = 1024
+    positions = torch.full((rows,), -1, dtype=torch.int64, device=device)
+    positions[:live_rows] = torch.arange(
+        length - live_rows, length, dtype=torch.int64, device=device
+    )
+    starts = torch.tensor([0, live_rows], dtype=torch.int32, device=device)
+    reqs = torch.full((rows,), -1, dtype=torch.int32, device=device)
+    reqs[:live_rows] = 0
+    visible = torch.clamp(positions + 1, min=0).int()
 
     def metadata(page):
         return SimpleNamespace(
@@ -103,6 +115,12 @@ def test_attention_shared_scratch_graph_replay(
             request_positions=positions[:1],
             cache_lengths=visible,
             is_decode=is_decode,
+            max_seq_len=length,
+            decoder=None,
+            # Encoder attention must ignore decoder-only replay metadata.
+            swa_replay_start=torch.full(
+                (1,), length + 1, dtype=torch.int64, device=device
+            ),
         )
 
     context = SimpleNamespace(
@@ -190,9 +208,14 @@ def test_attention_shared_scratch_graph_replay(
         iq[..., 0], iq[..., 1] = (1, -0.25) if step == 0 else (-0.25, 1)
         run()
         expected = out.clone()
-        expected_topk = torch.arange(
-            256 * step, 256 * step + 512, dtype=torch.int32, device=device
-        )[None].expand(rows, -1)
+        expected_topk = (
+            torch.arange(
+                256 * step, 256 * step + 512, dtype=torch.int32, device=device
+            )[None]
+            .expand(rows, -1)
+            .clone()
+        )
+        expected_topk[live_rows:] = -1
         for plan in (*layer._plans.values(), *layer._index_plans.values()):
             for scratch in attention._scratch(plan):
                 scratch.fill_(0xA5)
@@ -263,3 +286,473 @@ def test_grouped_projection_live_storage_survives_workspace_reuse(native_workspa
         graph.replay()
         torch.testing.assert_close(result, expected, rtol=0.01, atol=0.01)
     del graph, resources
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_index_visibility_crosses_old_capacity_cutoff(native_workspace, ratio):
+    """Source and reindex must retain winners beyond the former 64-state cap."""
+    attention, _, _ = native_workspace
+    device = torch.device("cuda", torch.cuda.current_device())
+    layers = [_layer(attention, index) for index in (2, 20, 24)]
+    for layer in layers:
+        layer.config.cache_config.block_size = 256
+        layer.max_model_len = 1 << 20
+        layer.compress_ratio = ratio
+        layer.candidate_source_layer = 20
+        layer._prepare(device)
+    page = 256 // ratio
+    old_cutoff = (1 << 20) // 256 * 64
+    positions = torch.arange(
+        old_cutoff - 256, old_cutoff + 256, dtype=torch.int64, device=device
+    )
+    first_page = (old_cutoff - 256) // page
+    page_count = 512 // page
+    stride = 227840
+    high_pid = 2**31 // stride + 1
+    storage = torch.empty(
+        (high_pid + page_count, stride), dtype=torch.uint8, device=device
+    )
+    pool = storage[:, : attention.dsa_indexer.index_mxfp4_page_bytes(page)]
+    physical_pages = torch.arange(
+        high_pid, high_pid + page_count, dtype=torch.int32, device=device
+    )
+    table = torch.full((1, (1 << 20) // 256), -1, dtype=torch.int32, device=device)
+    table[:, first_page : first_page + page_count] = physical_pages
+    slots = (
+        physical_pages[positions // page - first_page].long() * page + positions % page
+    )
+    keys = torch.zeros((512, 128), dtype=torch.bfloat16, device=device)
+    keys[:, 0] = 1
+    attention.dsa_indexer.quantize_write_index_k_mxfp4(
+        keys, index_k_cache=pool, slot_mapping=slots, page_size=page
+    )
+    q = torch.zeros((1, 8, 128), dtype=torch.bfloat16, device=device)
+    q[..., 0] = 1
+    packed = torch.empty((1, 8, 64), dtype=torch.uint8, device=device)
+    scales = torch.empty((1, 8, 4), dtype=torch.uint8, device=device)
+    attention.dsa_indexer.quantize_q_mxfp4(q, q_mxfp4=packed, q_scales=scales)
+    lengths = torch.tensor([old_cutoff + 256], dtype=torch.int32, device=device)
+    weights = torch.ones((1, 8), dtype=torch.bfloat16, device=device) / 32
+    for mode in ("decode", "prefill"):
+        for layer in layers:
+            candidate_args = {}
+            if layer.layer_id == 20:
+                candidate_args = dict(
+                    candidate_output=layer._candidates[:1],
+                    candidate_output_lengths=layer._candidate_lens[:1],
+                )
+            elif layer.layer_id == 24:
+                candidate_args = dict(
+                    candidate_indices=layers[1]._candidates[:1],
+                    candidate_lengths=layers[1]._candidate_lens[:1],
+                )
+            plan = layer._index_plans[mode]
+            binding = attention.dsa_indexer.bind(
+                plan,
+                scratch=attention._scratch(plan),
+                q_mxfp4=packed,
+                q_scales=scales,
+                query_weights=weights,
+                index_k_cache=pool,
+                page_table=table,
+                cache_lengths=lengths,
+                active_width=layer._active,
+                output_indices=layer.topk_indices_buffer[:1],
+                **candidate_args,
+            )
+            attention.dsa_indexer.run(binding)
+            torch.testing.assert_close(
+                layer.topk_indices_buffer[:1], positions.int()[None], atol=0, rtol=0
+            )
+
+
+@torch.inference_mode()
+def test_ced_global_preparation_preserves_full_row_cache_bytes(
+    native_workspace, monkeypatch
+):
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+    from vllm.models.deepseek_v4_1 import b12x_layers
+    from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
+
+    attention, _, _ = native_workspace
+    for module in (linear, parameter):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(b12x_layers, "_capacity", lambda: 256)
+    torch.manual_seed(712)
+    device = torch.device("cuda")
+    layer = _layer(attention, 20)
+    layer.capacity = 256
+    layer.is_ced_decoder = True
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=256, max_num_seqs=1),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(rms_norm_eps=1e-6)),
+    )
+    layer.compressor = DeepseekCompressor(config, 1, 128, 512).to(device)
+    layer.compressor.fused_wkv_wgate.weight.normal_(0, 0.1)
+    wk = linear.ReplicatedLinear(
+        512, 128, bias=False, return_bias=False, params_dtype=torch.bfloat16
+    ).to(device)
+    wk.quant_method = b12x_layers.B12xLinearMethod()
+    wk.weight.normal_(0, 0.1)
+    layer.indexer.wk = wk
+    layer.indexer.k_norm = b12x_layers.B12xRMSNorm(128).to(device)
+    angles = torch.randn((256, 32), device=device)
+    layer.rotary_emb = SimpleNamespace(
+        cos_sin_cache=torch.cat((angles.cos(), angles.sin()), dim=-1)
+    )
+    layer._prepare(device)
+    layer.kv_cache = torch.zeros(
+        (
+            5,
+            attention.mla.page_nbytes(
+                64, cache_kind="indexed", cache_format="deepseek_v41"
+            ),
+        ),
+        dtype=torch.uint8,
+        device=device,
+    )
+    layer.indexer.k_cache.kv_cache = torch.zeros(
+        (5, attention.dsa_indexer.index_mxfp4_page_bytes(64)),
+        dtype=torch.uint8,
+        device=device,
+    )
+    positions = torch.arange(256, device=device, dtype=torch.int64)
+    positions[192:] = -1
+    slots = torch.arange(256, device=device, dtype=torch.int64) + 64
+    slots[192:] = -1
+    full = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 192], device=device, dtype=torch.int32),
+        request_positions=torch.zeros(1, device=device, dtype=torch.int64),
+        live_counts=torch.tensor([192, 1], device=device, dtype=torch.int32),
+        slot_mapping=slots,
+        decoder=None,
+    )
+    context = SimpleNamespace(
+        attn_metadata={layer.prefix: full, layer.indexer.k_cache.prefix: full},
+        no_compile_layers={layer.prefix: layer},
+    )
+    monkeypatch.setattr(attention, "get_forward_context", lambda: context)
+    hidden = torch.randn((256, 128), device=device, dtype=torch.bfloat16)
+    # Original full-forward computation, with real compressor/projection/writers.
+    latent, emitted_slots = layer.compressor(hidden, full)
+    key = layer.indexer.k_norm(layer.indexer.wk(latent))
+    key = attention._rotated(key, positions, layer.rotary_emb.cos_sin_cache, ratio=1)
+    attention.dsa_indexer.quantize_write_index_k_mxfp4(
+        key,
+        index_k_cache=layer.indexer.k_cache.kv_cache,
+        slot_mapping=slots,
+        page_size=64,
+    )
+    latent = attention._rotated(
+        latent, positions, layer.rotary_emb.cos_sin_cache, ratio=1
+    )
+    attention.mla.write_cache(
+        latent,
+        layer.kv_cache,
+        emitted_slots,
+        page_size=64,
+        cache_kind="indexed",
+        cache_format="deepseek_v41",
+    )
+    expected = (layer.kv_cache.clone(), layer.indexer.k_cache.kv_cache.clone())
+    # The decoder view intentionally lacks early rows. Global preparation must
+    # neither read this view nor leave the discarded encoder prefix unwritten.
+    full.decoder = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 128], device=device, dtype=torch.int32),
+        request_positions=torch.tensor([64], device=device, dtype=torch.int64),
+        live_counts=torch.tensor([128, 1], device=device, dtype=torch.int32),
+        slot_mapping=slots[64:192],
+    )
+    layer.kv_cache.zero_()
+    layer.indexer.k_cache.kv_cache.zero_()
+    layer.prepare_global_kv(positions, hidden)
+    torch.testing.assert_close(layer.kv_cache, expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(
+        layer.indexer.k_cache.kv_cache, expected[1], rtol=0, atol=0
+    )
+
+
+@torch.inference_mode()
+def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
+    native_workspace, monkeypatch
+):
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x.attention._shared.mla.compressed_reference import (
+        unpack_deepseek_v41_cache_reference,
+    )
+
+    attention, manager, workspace = native_workspace
+    torch.manual_seed(713)
+    device = torch.device("cuda")
+    layer = _layer(attention, 20)
+    layer.is_ced_decoder = True
+    layer._prepare(device)
+    rows, length, boundary = 128, 256, 128
+    positions = torch.arange(boundary, length, device=device, dtype=torch.int64)
+    reqs = torch.zeros(rows, device=device, dtype=torch.int32)
+    starts = torch.tensor([0, rows], device=device, dtype=torch.int32)
+    visible = (positions + 1).int()
+    replay_start = torch.tensor([boundary], device=device, dtype=torch.int64)
+
+    def metadata(page):
+        compact = SimpleNamespace(
+            positions=positions,
+            req_id_per_token=reqs,
+            block_table=torch.arange(
+                1, length // page + 1, device=device, dtype=torch.int32
+            )[None],
+            query_start_loc=starts,
+            request_positions=replay_start,
+            cache_lengths=visible,
+            is_decode=False,
+            max_seq_len=length,
+            swa_replay_start=replay_start,
+            decoder=None,
+        )
+        # Full input has different query anchors and must not be used here.
+        return SimpleNamespace(
+            positions=torch.arange(length, device=device, dtype=torch.int64),
+            decoder=compact,
+        )
+
+    context = SimpleNamespace(
+        attn_metadata={
+            layer.swa_cache_layer.prefix: metadata(32),
+            layer.prefix: metadata(64),
+            layer.indexer.k_cache.prefix: metadata(64),
+        }
+    )
+    monkeypatch.setattr(attention, "get_forward_context", lambda: context)
+    kv = torch.randn((length, 512), device=device, dtype=torch.bfloat16)
+    for kind, page in (("swa", 32), ("indexed", 64)):
+        cache = torch.zeros(
+            (
+                length // page + 1,
+                attention.mla.page_nbytes(
+                    page, cache_kind=kind, cache_format="deepseek_v41"
+                ),
+            ),
+            device=device,
+            dtype=torch.uint8,
+        )
+        attention.mla.write_cache(
+            kv,
+            cache,
+            torch.arange(length, device=device) + page,
+            page_size=page,
+            cache_kind=kind,
+            cache_format="deepseek_v41",
+        )
+        if kind == "swa":
+            layer.swa_cache_layer.kv_cache = cache
+            swa_values = unpack_deepseek_v41_cache_reference(
+                cache, page_size=page, cache_kind=kind
+            )[page : page + length].clone()
+            # NaN FP8 payloads in every old SWA row: reading below the
+            # replay boundary cannot accidentally look like a valid zero page.
+            cache[1 : 1 + boundary // page].fill_(0x7F)
+        else:
+            layer.kv_cache = cache
+            main_values = unpack_deepseek_v41_cache_reference(
+                cache, page_size=page, cache_kind=kind
+            )[page : page + length].clone()
+    layer.indexer.k_cache.kv_cache = torch.zeros(
+        (length // 64 + 1, attention.dsa_indexer.index_mxfp4_page_bytes(64)),
+        device=device,
+        dtype=torch.uint8,
+    )
+    keys = torch.zeros((length, 128), device=device, dtype=torch.bfloat16)
+    # Future keys score highest. Any missing causal mask is observable.
+    keys[:, 0] = torch.arange(1, length + 1, device=device)
+    attention.dsa_indexer.quantize_write_index_k_mxfp4(
+        keys,
+        index_k_cache=layer.indexer.k_cache.kv_cache,
+        slot_mapping=torch.arange(length, device=device) + 64,
+        page_size=64,
+    )
+    q = torch.randn((rows, 16, 512), device=device, dtype=torch.bfloat16)
+    iq = torch.zeros((rows, 8, 128), device=device, dtype=torch.bfloat16)
+    iq[..., 0] = 1
+    packed = torch.empty((rows, 8, 64), device=device, dtype=torch.uint8)
+    scales = torch.empty((rows, 8, 4), device=device, dtype=torch.uint8)
+    weights = torch.full((rows, 8), 1 / 64, device=device, dtype=torch.bfloat16)
+    layer.attn_sink = torch.zeros(16, device=device)
+    out = torch.empty_like(q)
+
+    def run():
+        attention.dsa_indexer.quantize_q_mxfp4(iq, q_mxfp4=packed, q_scales=scales)
+        layer.forward_mqa(
+            q, None, positions, out, index_query=(packed, scales, weights)
+        )
+
+    def oracle(live):
+        values = torch.cat((swa_values[boundary:], main_values))
+        logical = torch.cat(
+            (
+                torch.arange(boundary, length, device=device),
+                torch.arange(length, device=device),
+            )
+        )
+        logits = torch.einsum("rhd,kd->rhk", q[:live].float(), values) * 512**-0.5
+        logits.masked_fill_(
+            logical[None, None] > positions[:live, None, None], -torch.inf
+        )
+        logits = torch.cat(
+            (logits, layer.attn_sink[None, :, None].expand(live, -1, -1)), -1
+        )
+        return torch.einsum("rhk,kd->rhd", logits.softmax(-1)[..., :-1], values)
+
+    run()
+    manager.lock()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    freeze_kernel_resolution("CED attention must replay using capacity-planned kernels")
+    try:
+        with workspace.collect_cuda_graph_capture_resources() as resources:
+            with torch.cuda.graph(graph, stream=stream):
+                run()
+        for live in (128, 65, 17):
+            positions.fill_(-1)
+            positions[:live] = torch.arange(boundary, boundary + live, device=device)
+            reqs.fill_(-1)
+            reqs[:live] = 0
+            visible.copy_((positions + 1).clamp_min(0).int())
+            starts[1] = live
+            q.normal_()
+            expected = oracle(live)
+            # Eager under freeze also catches live-count specialization leaks.
+            run()
+            torch.testing.assert_close(
+                out[:live].float(), expected, rtol=0.04, atol=0.025
+            )
+            out.fill_(float("nan"))
+            graph.replay()
+            torch.testing.assert_close(
+                out[:live].float(), expected, rtol=0.04, atol=0.025
+            )
+            torch.testing.assert_close(
+                out[live:], torch.zeros_like(out[live:]), rtol=0, atol=0
+            )
+            selected = layer.topk_indices_buffer[:live]
+            assert torch.all((selected < 0) | (selected <= positions[:live, None]))
+    finally:
+        unfreeze_kernel_resolution()
+    del graph, resources
+
+
+@torch.inference_mode()
+def test_ced_replay_window_high_page_stride_and_invalid_rows(
+    native_workspace, monkeypatch
+):
+    from b12x.attention._shared.mla.compressed_reference import (
+        unpack_deepseek_v41_cache_reference,
+    )
+
+    attention, _, _ = native_workspace
+    device = torch.device("cuda")
+    layer = _layer(attention, 20)
+    layer.is_ced_decoder = True
+    layer.compress_ratio = 0
+    layer.indexer = None
+    layer._prepare(device)
+    stride = 227840
+    high_pid = 2**31 // stride + 1
+    storage = torch.empty((high_pid + 1, stride), device=device, dtype=torch.uint8)
+    cache = storage[
+        :,
+        : attention.mla.page_nbytes(32, cache_kind="swa", cache_format="deepseek_v41"),
+    ]
+    kv = torch.randn((1, 512), device=device, dtype=torch.bfloat16)
+    attention.mla.write_cache(
+        kv,
+        cache,
+        torch.tensor([high_pid * 32], device=device),
+        page_size=32,
+        cache_kind="swa",
+        cache_format="deepseek_v41",
+    )
+    layer.swa_cache_layer.kv_cache = cache
+    positions = torch.tensor([128, -1, 128], device=device, dtype=torch.int64)
+    metadata = SimpleNamespace(
+        positions=positions,
+        req_id_per_token=torch.tensor([0, 0, -1], device=device, dtype=torch.int32),
+        block_table=torch.tensor(
+            [[-1, -1, -1, -1, high_pid]], device=device, dtype=torch.int32
+        ),
+        query_start_loc=torch.tensor([0, 1], device=device, dtype=torch.int32),
+        request_positions=positions[:1],
+        cache_lengths=torch.tensor([129, 99, 99], device=device, dtype=torch.int32),
+        is_decode=False,
+        max_seq_len=129,
+        decoder=None,
+        swa_replay_start=positions[:1],
+    )
+    monkeypatch.setattr(
+        attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={layer.swa_cache_layer.prefix: metadata}),
+    )
+    q = torch.randn((3, 16, 512), device=device, dtype=torch.bfloat16)
+    out = torch.empty_like(q)
+    layer.attn_sink = torch.zeros(16, device=device)
+    layer.forward_mqa(q, None, positions, out)
+    value = unpack_deepseek_v41_cache_reference(
+        cache[high_pid : high_pid + 1].contiguous(), page_size=32, cache_kind="swa"
+    )[0]
+    score = torch.einsum("hd,d->h", q[0].float(), value) * 512**-0.5
+    expected = score.sigmoid()[:, None] * value
+    torch.testing.assert_close(out[0].float(), expected, rtol=0.04, atol=0.025)
+    torch.testing.assert_close(out[1:], torch.zeros_like(out[1:]), rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_global_preparation_dependency_survives_functionalization(
+    native_workspace, monkeypatch
+):
+    attention, _, _ = native_workspace
+    source = torch.arange(16, dtype=torch.float32, device="cuda").view(4, 4)
+    positions = torch.arange(4, device="cuda", dtype=torch.int64)
+    backing = torch.zeros((8, 4), device="cuda")
+
+    class CacheConsumer(torch.nn.Module):
+        prepare_global_kv = attention.DeepseekV4Attention.prepare_global_kv
+        forward = attention.DeepseekV4Attention.forward
+
+        def __init__(self):
+            super().__init__()
+            self.prefix = "functionalized_ced"
+            self.compressor = SimpleNamespace(state_cache=None)
+            self.kv_cache = backing[:4]
+            self.indexer = SimpleNamespace(
+                k_cache=SimpleNamespace(kv_cache=backing[4:])
+            )
+
+        def _prepare_global_kv(self, positions, hidden):
+            self.kv_cache.copy_(hidden * 2)
+            self.indexer.k_cache.kv_cache.copy_(hidden * 3)
+
+        def _forward(self, positions, hidden):
+            return self.kv_cache + self.indexer.k_cache.kv_cache
+
+    layer = CacheConsumer()
+    context = SimpleNamespace(no_compile_layers={layer.prefix: layer})
+    monkeypatch.setattr(attention, "get_forward_context", lambda: context)
+
+    def run(hidden):
+        ready = layer.prepare_global_kv(positions, hidden)
+        return layer(positions, hidden, global_kv_ready=ready)
+
+    compiled = torch.compile(run, backend="aot_eager", fullgraph=True)
+    for factor in (1, -2):
+        hidden = source * factor
+        output = compiled(hidden)
+        torch.testing.assert_close(output, hidden * 5)
+        # Preparation must remain visible to later consumers as well; mutable
+        # alias-list functionalization used to copy stale clones back here.
+        torch.testing.assert_close(backing, torch.cat((hidden * 2, hidden * 3)))

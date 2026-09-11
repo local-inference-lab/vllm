@@ -110,35 +110,43 @@ def _chunk(
     WIDTH: tl.constexpr,
     DRAFT: tl.constexpr,
     BLOCK: tl.constexpr,
+    swa_replay_start=None,
 ):
     row = tl.program_id(0).to(tl.int64)
     col = tl.arange(0, BLOCK)
     req = tl.load(Reqs + offset + row)
-    pos = tl.load(Positions + offset + row)
+    pos = tl.load(Positions + offset + row).to(tl.int64)
+    valid = (req >= 0) & (pos >= 0)
     if DRAFT:
-        first = tl.load(Starts + req, req >= 0, other=0)
-        end = tl.load(Starts + req + 1, req >= 0, other=0)
-        prefix = tl.load(RequestPositions + req, req >= 0, other=0)
+        first = tl.load(Starts + req, valid, other=0).to(tl.int64)
+        end = tl.load(Starts + req + 1, valid, other=0).to(tl.int64)
+        prefix = tl.load(RequestPositions + req, valid, other=0).to(tl.int64)
         start = tl.maximum(prefix - WINDOW, 0)
         length = prefix + end - first - start
-        logical = start + col
     else:
-        length = tl.minimum(pos + 1, WINDOW)
-        logical = pos - length + 1 + col
+        start = tl.maximum(pos + 1 - WINDOW, 0)
+        if swa_replay_start is not None:
+            replay = tl.load(swa_replay_start + req, valid, other=0).to(tl.int64)
+            start = tl.maximum(start, replay)
+        length = pos + 1 - start
+    length = tl.where(valid, tl.minimum(tl.maximum(length, 0), WIDTH), 0)
+    logical = start + col
     page = tl.load(
         Table + req.to(tl.int64) * table_stride + logical // PAGE,
-        (req >= 0) & (col < length),
+        valid & (logical >= 0) & (col < length),
         other=-1,
     ).to(tl.int64)
     physical = page * PAGE + logical % PAGE
     tl.store(
         Swa + row * WIDTH + col,
-        tl.where((page > 0) & (col < length), physical, -1),
+        tl.where((page > 0) & (logical >= 0) & (col < length), physical, -1),
         col < WIDTH,
     )
     tl.store(Lengths + row, tl.maximum(length, 0))
     visible = tl.load(Visible + offset + row)
-    tl.store(TopLengths + row, tl.minimum(visible, 512))
+    tl.store(
+        TopLengths + row, tl.where(valid, tl.minimum(tl.maximum(visible, 0), 512), 0)
+    )
 
 
 @dataclass
@@ -156,6 +164,9 @@ class DeepseekV41B12xMetadata:
     slot_mapping: torch.Tensor
     cache_lengths: torch.Tensor
     is_decode: bool
+    max_seq_len: int
+    decoder: "DeepseekV41B12xMetadata | None" = None
+    swa_replay_start: torch.Tensor | None = None
 
 
 class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
@@ -234,6 +245,7 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
             self.lengths,
             self.reorder_batch_threshold is not None
             and cm.max_query_len <= self.reorder_batch_threshold,
+            cm.max_seq_len,
         )
 
 

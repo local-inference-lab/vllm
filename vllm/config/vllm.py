@@ -1188,7 +1188,9 @@ class VllmConfig:
             and model_config is speculative_config.draft_model_config
         ):
             model_config = speculative_config.target_model_config
-        self.engram_config.verify_model_config(model_config)
+        self.engram_config.verify_model_config(
+            model_config, tp_size=self.parallel_config.tensor_parallel_size
+        )
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""

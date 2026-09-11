@@ -1680,13 +1680,22 @@ def _promote_local_kv_cache_specs(
             if target_cls is None:
                 continue
             assert isinstance(spec, AttentionSpec)
+            if not spec.prefix_cacheable or spec.prefill_replay_tokens:
+                raise ValueError(
+                    "Request-private prefill state requires the hybrid KV cache "
+                    "manager; its prefix policy cannot be promoted to full attention."
+                )
             block_size = full_attention_block_size or spec.block_size
             promoted_specs[layer_name] = replace_as(
                 spec,
                 target_cls,
                 # Promoted specs allocate blocks for all tokens and never free
                 # below the window, so the trailing-edge extension is moot.
-                drop=("extra_retained_tokens",),
+                drop=(
+                    "extra_retained_tokens",
+                    "prefix_cache_enabled",
+                    "prefill_replay_window",
+                ),
                 block_size=block_size,
                 page_size_padded=promoted_page_size_padded(spec, block_size),
             )
@@ -1788,14 +1797,21 @@ def group_and_unify_kv_cache_specs(
         return None
 
     mla_specs: dict[str, KVCacheSpec] = {}
-    grouped_swa_mla_specs: dict[tuple[int, int, int], dict[str, KVCacheSpec]] = (
-        defaultdict(dict)
-    )
+    grouped_swa_mla_specs: dict[
+        tuple[int, int, int, bool, bool, int], dict[str, KVCacheSpec]
+    ] = defaultdict(dict)
     circular_specs: dict[int, dict[str, KVCacheSpec]] = defaultdict(dict)
     for name, spec in kv_cache_spec.items():
         if isinstance(spec, SlidingWindowMLASpec):
             grouped_swa_mla_specs[
-                (spec.block_size, spec.sliding_window, spec.extra_retained_tokens)
+                (
+                    spec.block_size,
+                    spec.sliding_window,
+                    spec.extra_retained_tokens,
+                    spec.dcp_replicated,
+                    spec.prefix_cacheable,
+                    spec.prefill_replay_tokens,
+                )
             ][name] = spec
         elif isinstance(spec, MLAAttentionSpec):
             mla_specs[name] = spec

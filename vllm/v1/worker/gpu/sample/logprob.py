@@ -13,7 +13,7 @@ from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 _MAX_TOPK_BLOCK = 1024
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["topk"])
 def _topk_log_softmax_kernel(
     output_ptr,
     logits_ptr,
@@ -90,9 +90,9 @@ def compute_token_logprobs(
     token_ids = token_ids.to(torch.int64)
     num_logprobs = token_ids.shape[1]
     logprobs = logits.new_empty((batch_size, num_logprobs), dtype=torch.float32)
-    # Cap the kernel's per-iteration width so very large num_logprobs requests
-    # stream the gather in bounded-size chunks, avoiding excessive mem use.
-    topk_block_size = min(triton.next_power_of_2(num_logprobs), _MAX_TOPK_BLOCK)
+    # The requested count is runtime data, including the single selected token
+    # for prompt_logprobs=0. One bounded gather tile covers every count without
+    # creating inference-time JIT specializations.
     _topk_log_softmax_kernel[(batch_size,)](
         logprobs,
         logits,
@@ -101,7 +101,7 @@ def compute_token_logprobs(
         num_logprobs,
         vocab_size,
         BLOCK_SIZE=1024,  # type: ignore
-        TOPK_BLOCK_SIZE=topk_block_size,
+        TOPK_BLOCK_SIZE=_MAX_TOPK_BLOCK,
     )
     return logprobs
 

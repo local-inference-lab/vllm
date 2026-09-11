@@ -241,3 +241,172 @@ def test_context_kv_weights_are_loaded_as_merged_linear_shards():
     assert [weight.shard_id for _, weight in mapped] == [1, 0, 1, 1]
     assert mapped[0][1].data_ptr() == mapped[1][1].data_ptr()
     assert mapped[2][1].data_ptr() == mapped[3][1].data_ptr()
+
+
+@pytest.mark.parametrize("layer_groups", [None, [0, 1, 0]])
+@torch.inference_mode()
+def test_v41_context_graph_replay_matches_checkpoint_projection(
+    default_vllm_config, workspace_init, monkeypatch, layer_groups
+):
+    """Real native projections, rotary and cache writes across shrinking batches."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("native V4.1 context preparation requires SM12x")
+    from contextlib import nullcontext
+
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x.attention import compressed_sparse_mla
+
+    from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
+    from vllm.models.deepseek_v4_1.b12x_layers import (
+        B12xFP8LinearMethod,
+        B12xRMSNorm,
+    )
+    from vllm.models.deepseek_v4_1.nvidia.dspark import (
+        DSparkContextCudaGraphs,
+        DSparkDeepseekV4Model,
+        _ContextKVProjection,
+    )
+    from vllm.v1.worker import workspace
+    from vllm.v1.worker.gpu import cudagraph_utils
+
+    # The exercised context path is replicated and has no collectives. Supply
+    # only the distributed capture envelope, not mock model/compute operations.
+    monkeypatch.setattr(
+        cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(cudagraph_utils, "is_global_first_rank", lambda: False)
+    monkeypatch.setattr(cudagraph_utils, "graph_capture", lambda device: nullcontext())
+    config = default_vllm_config
+    config.scheduler_config.max_num_batched_tokens = 8
+    config.scheduler_config.max_num_seqs = 8
+    config.compilation_config.max_cudagraph_capture_size = 8
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(1831)
+
+    class NativeLinear(nn.Module):
+        def __init__(self, n, k):
+            super().__init__()
+            self.weight = nn.Parameter(
+                torch.randn(n, k, device=device, generator=generator).to(
+                    torch.float8_e4m3fn
+                ),
+                requires_grad=False,
+            )
+            self.weight_scale_inv = torch.randint(
+                122,
+                128,
+                (n // 32, k // 32),
+                dtype=torch.uint8,
+                device=device,
+                generator=generator,
+            ).view(torch.float8_e8m0fnu)
+            self.method = B12xFP8LinearMethod(
+                SimpleNamespace(weight_block_size=[32, 32])
+            )
+            self.method.process_weights_after_loading(self)
+
+        def forward(self, x):
+            return self.method.apply(self, x)
+
+    with torch.device(device):
+        model = DSparkDeepseekV4Model.__new__(DSparkDeepseekV4Model)
+        nn.Module.__init__(model)
+        model.config = SimpleNamespace(hidden_size=128, dspark_target_layer_ids=(0, 1))
+        model.main_proj = NativeLinear(128, 256)
+        model.main_norm = B12xRMSNorm(128)
+        model.layers = nn.ModuleList()
+        model._context_kv_projections = []
+        page_bytes = compressed_sparse_mla.page_nbytes(
+            32, cache_format="deepseek_v41", cache_kind="swa"
+        )
+        phases = (
+            torch.arange(128, dtype=torch.float32)[:, None]
+            * (torch.arange(32, dtype=torch.float32)[None, :] + 1)
+            / 128
+        )
+        for _ in range(3):
+            attn = DeepseekV4Attention.__new__(DeepseekV4Attention)
+            nn.Module.__init__(attn)
+            # Context insertion needs no query-attention plan.
+            attn._ready = True
+            attn.q_lora_rank = 256
+            attn.fused_wqa_wkv = NativeLinear(768, 128)
+            attn.kv_norm = B12xRMSNorm(512)
+            attn.rotary_emb = SimpleNamespace(
+                cos_sin_cache=torch.cat((phases.cos(), phases.sin()), dim=-1)
+            )
+            attn.swa_cache_layer = SimpleNamespace(
+                kv_cache=torch.full((4, page_bytes), 91, dtype=torch.uint8)
+            )
+            layer = nn.Module()
+            layer.attn = attn
+            model.layers.append(layer)
+            model._context_kv_projections.append(_ContextKVProjection(attn, 8))
+
+        hidden = torch.zeros(8, 128, dtype=torch.bfloat16)
+        positions = torch.zeros(8, dtype=torch.int64)
+        slots = torch.full((2, 8), -1, dtype=torch.int64)
+        context = DSparkContextCudaGraphs(
+            model, config, hidden, positions, slots, layer_groups, 8
+        )
+        # Compare KV-only checkpoint packing against the original fused Q|KV
+        # projection (nonuniform UE8M0 scales distinguish every block).
+        x = torch.randn(8, 128, dtype=torch.bfloat16, generator=generator)
+        for layer, projection in zip(model.layers, model._context_kv_projections):
+            full = layer.attn.fused_wqa_wkv(x)
+            torch.testing.assert_close(projection(x), full[:, 256:], rtol=0, atol=0)
+        for capacity in context.manager.compilation_config.cudagraph_capture_sizes:
+            context._forward(capacity)
+        workspace.lock_workspace()
+        freeze_kernel_resolution("DSpark context capacities are prewarmed")
+        try:
+            context.capture()
+            for rows in (7, 3, 6, 1):
+                # New allocations on every call ensure graphs never bind the
+                # target's transient auxiliary outputs.
+                aux = [
+                    torch.randn(rows, 128, dtype=torch.bfloat16, generator=generator)
+                    for _ in range(2)
+                ]
+                positions.fill_(1000000)  # stale padding must not read this RoPE row
+                positions[:rows].copy_(torch.arange(rows, dtype=torch.int64) + rows)
+                slots[0].copy_(torch.arange(8, dtype=torch.int64) + 32)
+                slots[1].copy_(torch.arange(8, dtype=torch.int64) + 64)
+                slots[:, rows - 1] = -1  # rejected suffix
+                if rows > 1:
+                    slots[1, 0] = -1  # group-specific nonresident/PAD row
+                main_x = model.combine_hidden_states(torch.cat(aux, dim=-1))
+                expected = []
+                for i, layer in enumerate(model.layers):
+                    attn = layer.attn
+                    attn.swa_cache_layer.kv_cache.fill_(91)
+                    # Oracle uses the original fused checkpoint projection.
+                    kv = attn.kv_norm(attn.fused_wqa_wkv(main_x)[:, 256:])
+                    group = 0 if layer_groups is None else layer_groups[i]
+                    attn.insert_context_kv(kv, positions[:rows], slots[group, :rows])
+                    expected.append(attn.swa_cache_layer.kv_cache.clone())
+                    attn.swa_cache_layer.kv_cache.fill_(91)
+                context.run(aux, rows)
+                torch.cuda.synchronize()
+                torch.testing.assert_close(hidden[:rows], main_x, rtol=0, atol=0)
+                for layer, cache in zip(model.layers, expected):
+                    torch.testing.assert_close(
+                        layer.attn.swa_cache_layer.kv_cache, cache, rtol=0, atol=0
+                    )
+                # A restored cache must not consume changed sources or metadata.
+                for source in aux:
+                    source.fill_(float("nan"))
+                slots.fill_(0)
+                context.run(aux, rows, context_kv_is_restored=True)
+                for layer, cache in zip(model.layers, expected):
+                    torch.testing.assert_close(
+                        layer.attn.swa_cache_layer.kv_cache, cache, rtol=0, atol=0
+                    )
+            assert not context.can_run(9)
+            with pytest.raises(ValueError):
+                context.run(aux, 9)
+        finally:
+            unfreeze_kernel_resolution()
+            workspace.unlock_workspace()

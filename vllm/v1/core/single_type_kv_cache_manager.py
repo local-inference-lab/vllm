@@ -165,7 +165,10 @@ class SingleTypeKVCacheManager(ABC):
             self.block_size *= dcp_world_size
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
-        self.enable_caching = enable_caching
+        self.enable_caching = enable_caching and kv_cache_spec.prefix_cacheable
+        # The coordinator supplies the maximum across all groups: encoder SWA
+        # must retain the boundary at which private decoder state is rebuilt.
+        self.prefill_replay_tokens = kv_cache_spec.prefill_replay_tokens
         self._max_admission_blocks_per_request = max_admission_blocks_per_request
         # Record newly allocated block ids only when worker-side zeroing will
         # consume them and this manager holds a spec type that gets zeroed.
@@ -576,6 +579,9 @@ class SingleTypeKVCacheManager(ABC):
             alignment_tokens: Cache-hit alignment. Defaults to the scheduler
                 block size for non-hybrid coordinators.
         """
+        if not self.enable_caching:
+            return
+
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
         num_full_blocks = num_tokens // self.block_size
 
@@ -587,9 +593,11 @@ class SingleTypeKVCacheManager(ABC):
         )
 
         # Token boundaries whose reachable tail must be retained under sparse
-        # retention: the replay boundary (``num_prompt - 1``, capped by
-        # ``get_computed_blocks``) and any detected shared-prefix junction.
-        reachable_boundaries: Sequence[int] = (request.num_prompt_tokens - 1,)
+        # retention: the replay boundary capped by ``get_computed_blocks`` and
+        # any detected shared-prefix junction.
+        reachable_boundaries: Sequence[int] = (
+            max(0, request.num_prompt_tokens - max(1, self.prefill_replay_tokens)),
+        )
         if request.shared_prefix_boundary:
             reachable_boundaries = (
                 *reachable_boundaries,
@@ -1371,6 +1379,8 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         retention_interval: int | None = None,
         alignment_tokens: int | None = None,
     ) -> None:
+        if not self.enable_caching:
+            return
         super().cache_blocks(
             request,
             num_tokens,

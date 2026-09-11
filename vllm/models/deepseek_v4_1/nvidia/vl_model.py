@@ -302,6 +302,7 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
         intermediate_tensors=None,
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
+        ced_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         return self.language_model(
@@ -310,6 +311,7 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
             intermediate_tensors,
             inputs_embeds,
             lookback_token_ids=lookback_token_ids,
+            ced_indices=ced_indices,
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:

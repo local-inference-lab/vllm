@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import contextmanager
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call
 
 import pytest
 import torch
@@ -14,6 +15,7 @@ from vllm.distributed.device_communicators import b12x_pcie_all_reduce
 from vllm.distributed.device_communicators.b12x_pcie_all_reduce import (
     B12xPcieAllReduce,
     _allreduce_max_bytes,
+    _dma_capacity_plan,
     _dma_min_bytes,
     _oneshot_limits,
     _parse_byte_size,
@@ -127,6 +129,103 @@ def test_dma_crossover_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
             b12x_pcie_all_reduce.envs, "VLLM_PCIE_DMA_MIN_BYTES", disabled
         )
         assert _dma_min_bytes() is None
+
+
+@pytest.fixture
+def dma_config(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            dtype=torch.bfloat16, get_hidden_size=lambda: 5120
+        ),
+        speculative_config=None,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
+    )
+    monkeypatch.setattr("vllm.config.get_current_vllm_config_or_none", lambda: config)
+    return config
+
+
+@pytest.mark.parametrize("min_bytes", [24 << 20, 48 << 20])
+def test_dma_capacity_includes_fp32_without_inflating_bf16(
+    dma_config: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, min_bytes: int
+) -> None:
+    assert _dma_capacity_plan() == {
+        torch.bfloat16: 20_971_520,
+        torch.float32: 20_971_520,
+    }
+    monkeypatch.setattr(
+        b12x_pcie_all_reduce.envs, "VLLM_PCIE_DMA_MIN_BYTES", str(min_bytes)
+    )
+    monkeypatch.setattr(b12x_pcie_all_reduce.envs, "VLLM_PCIE_DMA_FP8", False)
+    communicator, _ = _make_communicator()
+    communicator.device_group = object()
+    communicator.device = torch.device("cpu")
+    communicator._all_ranks_succeeded = lambda error: error is None
+    dma_cls = MagicMock()
+    dma_cls.return_value.wire_mode = "bf16"
+
+    communicator._initialize_dma(dma_cls)
+
+    assert dma_cls.call_args.kwargs["max_bytes"] == 80 << 20
+    assert communicator._dma is dma_cls.return_value
+    expected = [call(torch.float32, max_elements=20_971_520)]
+    if min_bytes <= 40 << 20:
+        expected.insert(0, call(torch.bfloat16, max_elements=20_971_520))
+    assert communicator._dma.prepare_eager_replay.call_args_list == expected
+
+
+@pytest.mark.parametrize(
+    ("draft_dtype", "draft_hidden", "expected"),
+    [
+        (
+            torch.float16,
+            8192,
+            {
+                torch.bfloat16: 20_971_520,
+                torch.float16: 33_554_432,
+                torch.float32: 33_554_432,
+            },
+        ),
+        (
+            torch.float32,
+            2048,
+            {torch.bfloat16: 20_971_520, torch.float32: 20_971_520},
+        ),
+        (
+            torch.bfloat16,
+            8192,
+            {torch.bfloat16: 33_554_432, torch.float32: 33_554_432},
+        ),
+    ],
+)
+def test_dma_capacity_merges_target_and_draft(
+    dma_config: SimpleNamespace,
+    draft_dtype: torch.dtype,
+    draft_hidden: int,
+    expected: dict[torch.dtype, int],
+) -> None:
+    dma_config.speculative_config = SimpleNamespace(
+        draft_model_config=SimpleNamespace(
+            dtype=draft_dtype, get_hidden_size=lambda: draft_hidden
+        )
+    )
+
+    assert _dma_capacity_plan() == expected
+
+
+@pytest.mark.parametrize("config", [None, SimpleNamespace(model_config=None)])
+def test_dma_without_model_config_stays_optional(
+    monkeypatch: pytest.MonkeyPatch, config: SimpleNamespace | None
+) -> None:
+    monkeypatch.setattr("vllm.config.get_current_vllm_config_or_none", lambda: config)
+    monkeypatch.setattr(b12x_pcie_all_reduce.envs, "VLLM_PCIE_DMA_MIN_BYTES", "24MB")
+    assert _dma_capacity_plan() is None
+    communicator, _ = _make_communicator()
+    dma_cls = MagicMock()
+
+    communicator._initialize_dma(dma_cls)
+
+    assert communicator._dma is None
+    dma_cls.assert_not_called()
 
 
 def test_eager_allreduce_dispatches_oneshot() -> None:

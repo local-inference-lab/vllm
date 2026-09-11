@@ -295,13 +295,12 @@ class KVCacheManager:
                 )
             return self.empty_kv_cache_blocks, 0, 0
 
-        # NOTE: When all tokens hit the cache, we must recompute the last token
-        # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
-        # This can trigger recomputation of an entire block, rather than just
-        # the single last token, because allocate_slots() requires
-        # num_computed_tokens to be block-size aligned. Removing this limitation
-        # could slightly improve performance in the future.
-        max_cache_hit_length = request.num_tokens - 1
+        # Recompute at least one token for logits, or the configured suffix
+        # needed to rebuild request-private decoder state. Lookup may round
+        # this boundary down further to the cache-hit alignment.
+        max_cache_hit_length = max(
+            0, request.num_tokens - max(1, self.coordinator.prefill_replay_tokens)
+        )
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
@@ -371,7 +370,8 @@ class KVCacheManager:
 
         fa_group_id = coordinator.full_attention_group_id
         computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
-            request.block_hashes, request.num_tokens - 1
+            request.block_hashes,
+            max(0, request.num_tokens - max(1, coordinator.prefill_replay_tokens)),
         )
         if any(hit > per_group_hits[fa_group_id] for hit in per_group_hits):
             # A lagging group hit deeper than full attention means its

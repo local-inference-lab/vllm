@@ -736,3 +736,122 @@ def test_deepseek_v4_mega_moe_fused_input_staging_masks_padding():
         fused_topk_weights.view(torch.uint8),
         ref_topk_weights.view(torch.uint8),
     )
+
+
+def _v41_composition_rank(rank, world_size, rendezvous):
+    """Two native routed contributions straddle a BF16 rounding boundary."""
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+
+    from vllm.models.deepseek_v4_1.nvidia import b12x_moe
+    from vllm.v1.worker import workspace
+
+    device = torch.device("cuda", rank)
+    with torch.cuda.device(device), pytest.MonkeyPatch.context() as patch:
+        if world_size > 1:
+            dist.init_process_group(
+                "nccl", init_method=rendezvous, rank=rank, world_size=world_size
+            )
+        patch.setattr(
+            b12x_moe, "get_tensor_model_parallel_world_size", lambda: world_size
+        )
+        patch.setattr(b12x_moe, "get_tensor_model_parallel_rank", lambda: rank)
+        patch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+        patch.setattr(workspace, "_manager", workspace.WorkspaceManager(device))
+        count = max(2, world_size)
+        config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    hidden_size=256, moe_intermediate_size=128, swiglu_limit=10.0
+                )
+            ),
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=1),
+            compilation_config=SimpleNamespace(static_forward_context={}),
+        )
+        with torch.device(device):
+            experts = b12x_moe.B12xV41Experts(
+                config, num_experts=count, top_k=2, prefix="composition.experts"
+            )
+        for expert_id in range(experts.experts_start_idx, experts.experts_end_idx):
+            for shard, code, exponent, shape in (
+                ("w1", 0x22, 123, (128, 128)),
+                ("w3", 0xCC, 123, (128, 128)),
+                ("w2", 0x22, 130 if expert_id == 0 else 120, (256, 64)),
+            ):
+                name = "w2_weight" if shard == "w2" else "w13_weight"
+                for suffix, value, payload_shape in (
+                    ("", code, shape),
+                    ("_scale", exponent, (shape[0], shape[1] // 16)),
+                ):
+                    experts.weight_loader(
+                        getattr(experts, name + suffix),
+                        torch.full(
+                            payload_shape, value, dtype=torch.uint8, device=device
+                        ),
+                        f"experts.{name}{suffix}",
+                        shard_id=shard,
+                        expert_id=expert_id,
+                    )
+        experts.finalize_weights()
+        patch.setattr(
+            b12x_moe,
+            "get_forward_context",
+            lambda: SimpleNamespace(no_compile_layers={experts.prefix: experts}),
+        )
+
+        def reduce_routed(tensor):
+            if world_size > 1:
+                dist.all_reduce(tensor)
+            return tensor
+
+        patch.setattr(b12x_moe, "tensor_model_parallel_all_reduce", reduce_routed)
+
+        class Gate(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.e_score_correction_bias = torch.zeros(count, device=device)
+                self.logits = torch.full((1, count), -100.0, device=device)
+                self.logits[:, 0] = self.logits[:, -1] = 10.0
+
+            def forward(self, x):
+                return self.logits, None
+
+        class Shared(torch.nn.Module):
+            def forward(self, x):
+                return torch.full_like(x, 768)
+
+        model = b12x_moe.DeepseekV4MoE.__new__(b12x_moe.DeepseekV4MoE)
+        torch.nn.Module.__init__(model)
+        model.gate, model.experts, model.shared_experts = Gate(), experts, Shared()
+        model.n_activated_experts = 2
+        model.routed_scaling_factor = 1.0
+        model.is_draft = True
+        x = torch.full((1, 256), 1 / 16, dtype=torch.bfloat16, device=device)
+        with torch.no_grad():
+            result = model(
+                x, input_ids=torch.zeros(1, dtype=torch.int64, device=device)
+            )
+        # Routed values are -768 and -0.75. Rounding their sum to BF16 before
+        # adding the shared +768 yields zero rather than the retained -0.75.
+        torch.testing.assert_close(result, torch.full_like(x, -0.75), rtol=0, atol=0)
+        if world_size > 1:
+            dist.destroy_process_group()
+
+
+def test_v41_moe_composition_preserves_small_routed_contribution():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("native b12x experts require SM12x")
+    _v41_composition_rank(0, 1, None)
+
+
+@pytest.mark.distributed(num_gpus=2)
+def test_v41_moe_composition_preserves_small_tp_contribution(tmp_path):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("two CUDA devices required")
+    torch.multiprocessing.spawn(
+        _v41_composition_rank,
+        args=(2, f"file://{tmp_path / 'composition-rendezvous'}"),
+        nprocs=2,
+        join=True,
+    )

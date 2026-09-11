@@ -155,6 +155,11 @@ class KVCacheSpec:
         return True
 
     @property
+    def prefill_replay_tokens(self) -> int:
+        """Minimum uncached suffix needed to rebuild private prefill state."""
+        return 0
+
+    @property
     def num_heads(self) -> int:
         raise NotImplementedError
 
@@ -781,6 +786,8 @@ class SlidingWindowSpec(AttentionSpec):
             isinstance(spec, SlidingWindowSpec)
             and spec.sliding_window == self.sliding_window
             and spec.dcp_replicated == self.dcp_replicated
+            and spec.prefix_cacheable == self.prefix_cacheable
+            and spec.prefill_replay_tokens == self.prefill_replay_tokens
             for spec in kv_cache_specs.values()
         )
 
@@ -815,11 +822,23 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     # DeepseekV4-only: see MLAAttentionSpec.model_version.
     alignment: int | None = None  # Default to None for no padding.
     model_version: str | None = None
+    # CED decoder/draft rows may be skipped; their SWA is request-private.
+    prefix_cache_enabled: bool = True
+    prefill_replay_window: int = 0
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return self.prefix_cache_enabled
+
+    @property
+    def prefill_replay_tokens(self) -> int:
+        return self.prefill_replay_window
 
     # MLA stores a single latent vector per state; there is no separate V.
     head_size_v: int = 0
 
     def __post_init__(self):
+        assert self.prefill_replay_window >= 0
         assert self.model_version in (None, "deepseek_v4", "deepseek_v41"), (
             f"Unsupported model version: {self.model_version}"
         )
@@ -838,6 +857,9 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         sliding_window_set = set(spec.sliding_window for spec in specs)
         extra_retained_set = set(spec.extra_retained_tokens for spec in specs)
         dcp_replicated_set = {spec.dcp_replicated for spec in specs}
+        prefix_policy_set = {
+            (spec.prefix_cache_enabled, spec.prefill_replay_window) for spec in specs
+        }
         assert (
             len(cache_dtype_str_set) == 1
             and len(tokens_per_state_set) == 1
@@ -845,10 +867,11 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             and len(sliding_window_set) == 1
             and len(extra_retained_set) == 1
             and len(dcp_replicated_set) == 1
+            and len(prefix_policy_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "quantization method, tokens per state, model version, sliding "
-            "window size, retained token count, and DCP replication mode."
+            "window size, retained token count, DCP replication mode, and prefix policy."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -864,6 +887,8 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
             dcp_replicated=dcp_replicated_set.pop(),
+            prefix_cache_enabled=specs[0].prefix_cache_enabled,
+            prefill_replay_window=specs[0].prefill_replay_window,
         )
 
     def is_uniform_with_collection(
@@ -873,6 +898,8 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             isinstance(spec, SlidingWindowMLASpec)
             and spec.sliding_window == self.sliding_window
             and spec.dcp_replicated == self.dcp_replicated
+            and spec.prefix_cacheable == self.prefix_cacheable
+            and spec.prefill_replay_tokens == self.prefill_replay_tokens
             for spec in kv_cache_specs.values()
         )
 
@@ -1040,6 +1067,10 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         return all(spec.prefix_cacheable for spec in self.kv_cache_specs.values())
 
     @property
+    def prefill_replay_tokens(self) -> int:
+        return max(spec.prefill_replay_tokens for spec in self.kv_cache_specs.values())
+
+    @property
     def page_size_bytes(self) -> int:
         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
 
@@ -1084,6 +1115,12 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             # Different block sizes, not uniform.
             return False
         first_spec = next(iter(kv_cache_specs.values()))
+        if any(
+            spec.prefix_cacheable != first_spec.prefix_cacheable
+            or spec.prefill_replay_tokens != first_spec.prefill_replay_tokens
+            for spec in kv_cache_specs.values()
+        ):
+            return False
         return first_spec.is_uniform_with_collection(kv_cache_specs)
 
     @classmethod

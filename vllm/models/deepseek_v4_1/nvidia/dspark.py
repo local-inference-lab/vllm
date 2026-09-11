@@ -10,15 +10,19 @@ To implement non-causal attention, we leverage the sparse attention implementati
 include the future query tokens in the top-k indices for each query token.
 """
 
+import copy
+from bisect import bisect_left
 from collections.abc import Iterable
 
 import regex as re
 import torch
 import torch.nn as nn
+from b12x.gemm import block_fp8_linear
 from b12x.norm import hyperconnection
 
 import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -42,8 +46,19 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_padding_mask,
     sp_shard,
 )
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    retain_cuda_graph_capture_resource,
+)
 
-from ..b12x_layers import B12xEmbeddingMethod, B12xLinearMethod, collapse
+from ..b12x_layers import (
+    B12xEmbeddingMethod,
+    B12xLinearMethod,
+    _execution_capacities,
+    collapse,
+)
 from ..b12x_layers import B12xLogitsProcessor as LogitsProcessor
 from ..b12x_layers import B12xRMSNorm as RMSNorm
 from .model import (
@@ -72,6 +87,179 @@ class DSparkMarkovHead(_SharedDSparkMarkovHead):
         self._embedding_method.process_weights_after_loading(self.markov_w1)
 
 
+class _ContextKVProjection:
+    """KV-only view of checkpoint block32 weights, packed once after loading."""
+
+    def __init__(self, attn: nn.Module, capacity: int) -> None:
+        fused = attn.fused_wqa_wkv
+        start = attn.q_lora_rank
+        if start % 32:
+            raise ValueError("DSpark context KV must start on a checkpoint scale block")
+        self.weight = block_fp8_linear.pack_weight(
+            fused.weight[start:],
+            fused.weight_scale_inv[start // 32 :],
+            block_size=(32, 32),
+        )
+        self.capacities = tuple(
+            sorted(
+                {
+                    capacity,
+                    *(bound for bound in _execution_capacities() if bound <= capacity),
+                }
+            )
+        )
+        self.plans = tuple(
+            block_fp8_linear.plan(
+                block_fp8_linear.Caps(
+                    device=fused.weight.device,
+                    max_tokens=bound,
+                    in_features=fused.weight.shape[1],
+                    out_features=fused.weight.shape[0] - start,
+                    block_size=(32, 32),
+                )
+            )
+            for bound in self.capacities
+        )
+        for bound in self.capacities:
+            block_fp8_linear.prewarm(self.weight, (1, bound), expected_m=bound)
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        index = bisect_left(self.capacities, x.shape[0])
+        if index == len(self.capacities):
+            raise ValueError("DSpark context rows exceed planned capacity")
+        plan = self.plans[index]
+        out = torch.empty(
+            (x.shape[0], self.weight.out_features),
+            dtype=torch.bfloat16,
+            device=x.device,
+        )
+        binding = block_fp8_linear.bind(
+            plan,
+            scratch=current_workspace_manager().get_simultaneous(
+                *plan.shapes_and_dtypes()
+            ),
+            source=x,
+            packed_weight=self.weight,
+            output=out.view(x.shape[0], self.weight.out_features, 1),
+        )
+        retain_cuda_graph_capture_resource(binding)
+        block_fp8_linear.run(binding=binding)
+        return out
+
+
+class DSparkContextCudaGraphs:
+    """Serial, draft-workspace-lane owner for auxiliary projection and KV prep.
+
+    Only bounded decode capacities are captured. Live source tensors are copied,
+    never retained by a graph; rejected rows keep their caller-provided PAD slots.
+    Larger prefills continue through the eager hooks with their actual row count.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        vllm_config: VllmConfig,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        slot_mappings: torch.Tensor,
+        layer_group_idx: list[int] | None,
+        max_decode_tokens: int,
+    ) -> None:
+        self.model = model
+        self.hidden_states = hidden_states
+        self.positions = positions
+        self.slot_mappings = slot_mappings
+        self.layer_group_idx = layer_group_idx
+        self.width = model.config.hidden_size
+        self.num_aux = len(model.config.dspark_target_layer_ids)
+        limit = min(
+            max_decode_tokens,
+            hidden_states.shape[0],
+            vllm_config.compilation_config.max_cudagraph_capture_size,
+        )
+        # Powers of two bound padding to less than 2x, independent of live rows.
+        capacities = []
+        capacity = 1
+        while capacity < limit:
+            capacities.append(capacity)
+            capacity *= 2
+        if limit > 0:
+            capacities.append(limit)
+        self.aux = torch.zeros(
+            (limit, self.width * self.num_aux),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        config = copy.copy(vllm_config)
+        config.compilation_config = copy.copy(vllm_config.compilation_config)
+        config.compilation_config.cudagraph_capture_sizes = capacities
+        config.compilation_config.max_cudagraph_capture_size = limit
+        self.manager = CudaGraphManager(
+            config, hidden_states.device, CUDAGraphMode.FULL, decode_query_len=1
+        )
+
+    def _forward(self, capacity: int) -> None:
+        main_x = self.model.combine_hidden_states(self.aux[:capacity])
+        self.hidden_states[:capacity].copy_(main_x)
+        slots = (
+            self.slot_mappings[0, :capacity]
+            if self.layer_group_idx is None
+            else [self.slot_mappings[i, :capacity] for i in self.layer_group_idx]
+        )
+        self.model.precompute_and_store_context_kv(
+            self.hidden_states[:capacity], self.positions[:capacity], slots
+        )
+
+    def capture(self) -> None:
+        self.positions.zero_()
+        self.slot_mappings.fill_(PAD_SLOT_ID)
+        # Reserve all native scratch and resolve every planned capacity BEFORE
+        # the first graph. Never unlock a serving workspace to make capture fit.
+        for capacity in self.manager.compilation_config.cudagraph_capture_sizes:
+            self._forward(capacity)
+
+        def create_forward_fn(desc, warmup):
+            return lambda mode: self._forward(desc.num_tokens)
+
+        self.manager.capture(
+            create_forward_fn, progress_bar_desc="Capturing DSpark context CUDA graphs"
+        )
+
+    def can_run(self, num_tokens: int) -> bool:
+        desc = self.manager.dispatch(1, num_tokens, None, 0)
+        return desc in self.manager.graphs
+
+    def run(
+        self,
+        aux_hidden_states: list[torch.Tensor],
+        num_tokens: int,
+        *,
+        context_kv_is_restored: bool = False,
+    ) -> None:
+        if context_kv_is_restored:
+            return
+        desc = self.manager.dispatch(1, num_tokens, None, 0)
+        if desc not in self.manager.graphs:
+            raise ValueError("DSpark context rows exceed captured decode capacities")
+        if len(aux_hidden_states) != self.num_aux or any(
+            x.ndim != 2 or x.shape[0] < num_tokens or x.shape[1] != self.width
+            for x in aux_hidden_states
+        ):
+            raise ValueError("DSpark context auxiliary states have invalid dimensions")
+        for i, source in enumerate(aux_hidden_states):
+            self.aux[:num_tokens, i * self.width : (i + 1) * self.width].copy_(
+                source[:num_tokens]
+            )
+        # Context input preparation initializes rejected rows, but not rows
+        # beyond the target batch. Scrub that tail on EVERY replay, including
+        # transitions from a larger batch to a smaller one.
+        capacity = desc.num_tokens
+        self.aux[num_tokens:capacity].zero_()
+        self.positions[num_tokens:capacity].zero_()
+        self.slot_mappings[:, num_tokens:capacity].fill_(PAD_SLOT_ID)
+        self.manager.run_fullgraph(desc)
+
+
 class DSparkDeepseekV4Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -85,6 +273,8 @@ class DSparkDeepseekV4Model(nn.Module):
         self.num_hidden_layers = config.num_hidden_layers
         self.target_layer_ids = tuple(config.dspark_target_layer_ids)
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
+        self.context_capacity = vllm_config.scheduler_config.max_num_batched_tokens
+        self._context_kv_projections: list[_ContextKVProjection] = []
 
         self.num_dspark_layers = (
             getattr(config, "n_mtp_layers", None)
@@ -168,7 +358,7 @@ class DSparkDeepseekV4Model(nn.Module):
         self,
         main_x: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mappings: list[torch.Tensor | None] | None = None,
+        context_slot_mappings: torch.Tensor | list[torch.Tensor | None] | None = None,
     ) -> None:
         """Insert the sliding-window context KV for every draft layer.
 
@@ -177,21 +367,20 @@ class DSparkDeepseekV4Model(nn.Module):
         ``wkv`` + ``kv_norm`` + RoPE + quant, then writes it at the
         layer's context slots.
 
-        ``context_slot_mappings`` is a per-layer list (each entry is the context
-        slot mapping for that layer's kv-cache group, since the hybrid manager may
-        place draft layers in different groups). ``None`` (or a ``None`` entry)
-        runs the projection to reserve workspace but writes nothing (profiling).
+        ``context_slot_mappings`` is either common to all layers or a per-layer
+        list (each entry is the mapping for that layer's kv-cache group).
+        ``None`` (or a ``None`` entry) runs the projection to reserve workspace
+        but writes nothing (profiling).
         """
         for i, layer in enumerate(self.layers):
             slot_mapping = (
-                None if context_slot_mappings is None else context_slot_mappings[i]
+                context_slot_mappings
+                if context_slot_mappings is None
+                or isinstance(context_slot_mappings, torch.Tensor)
+                else context_slot_mappings[i]
             )
             attn = layer.attn
-            # Optimized DSV4 MLA path: wkv part of the fused wq_a|wkv projection
-            # (q_lora part discarded), then RoPE/quant/insert via the fused op.
-            qr_kv, _ = attn.fused_wqa_wkv(main_x)
-            kv = qr_kv[..., attn.q_lora_rank :]
-            kv = attn.kv_norm(kv)
+            kv = attn.kv_norm(self._context_kv_projections[i](main_x))
             if slot_mapping is None:
                 continue
             _insert_context_kv(attn, kv, context_positions, slot_mapping)
@@ -213,8 +402,8 @@ class DSparkDeepseekV4Model(nn.Module):
                 )
             inputs_embeds = sp_shard(inputs_embeds)
             input_ids = sp_shard(input_ids)
-        # Expand to hc_mult copies for hyper-connections ([T, H] -> [T, hc, H]).
-        hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        # The first layer's post-load broadcast weights consume [T, H] directly.
+        hidden_states = inputs_embeds
 
         residual = post_mix = res_mix = pre_mix = None
         for layer in self.layers:
@@ -292,11 +481,32 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mappings: list[torch.Tensor | None] | None = None,
+        context_slot_mappings: torch.Tensor | list[torch.Tensor | None] | None = None,
     ) -> None:
         self.model.precompute_and_store_context_kv(
             context_states, context_positions, context_slot_mappings
         )
+
+    def capture_context_preparation(
+        self,
+        vllm_config: VllmConfig,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        slot_mappings: torch.Tensor,
+        layer_group_idx: list[int] | None,
+        max_decode_tokens: int,
+    ) -> DSparkContextCudaGraphs:
+        context = DSparkContextCudaGraphs(
+            self,
+            vllm_config,
+            hidden_states,
+            positions,
+            slot_mappings,
+            layer_group_idx,
+            max_decode_tokens,
+        )
+        context.capture()
+        return context
 
     def forward(
         self,
@@ -459,7 +669,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
         if self.model.confidence_head is not None and not loaded_confidence_head:
             self.model.confidence_head = None
-        self.process_weights_after_loading()
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
@@ -470,6 +679,20 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def process_weights_after_loading(self) -> None:
         self._finalize_moe()
         self.model.markov_head.process_weights_after_loading()
+        self.model._context_kv_projections = [
+            _ContextKVProjection(layer.attn, self.model.context_capacity)
+            for layer in self.model.layers
+        ]
+        first_layer = self.model.layers[0]
+        broadcast = (
+            first_layer.hc_attn_fn.detach()
+            .view(-1, first_layer.hc_mult, first_layer.hidden_size)
+            .sum(dim=1)
+        )
+        if first_layer.hc_attn_fn_broadcast is None:
+            first_layer.hc_attn_fn_broadcast = broadcast
+        else:
+            first_layer.hc_attn_fn_broadcast.copy_(broadcast)
 
     def _remap_dspark_name(self, name: str) -> str | None:
         """Map a checkpoint ``mtp.{i}.*`` name to this model's parameter path.

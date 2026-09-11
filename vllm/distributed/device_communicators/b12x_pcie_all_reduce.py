@@ -124,7 +124,8 @@ def _dma_min_bytes() -> int | None:
     return value
 
 
-def _dma_capacity_bytes() -> int | None:
+def _dma_capacity_plan() -> dict[torch.dtype, int] | None:
+    """Plan static per-dtype element bounds, including FP32 reductions."""
     from vllm.config import get_current_vllm_config_or_none
 
     config = get_current_vllm_config_or_none()
@@ -141,12 +142,14 @@ def _dma_capacity_bytes() -> int | None:
     if draft_config is not None:
         model_configs.append(draft_config)
 
-    max_row_bytes = max(
-        model_config.get_hidden_size()
-        * torch.empty((), dtype=model_config.dtype).element_size()
-        for model_config in model_configs
-    )
-    return config.scheduler_config.max_num_batched_tokens * max_row_bytes
+    max_tokens = config.scheduler_config.max_num_batched_tokens
+    capacities: dict[torch.dtype, int] = {}
+    for model_config in model_configs:
+        elements = max_tokens * model_config.get_hidden_size()
+        dtype = model_config.dtype
+        capacities[dtype] = max(capacities.get(dtype, 0), elements)
+        capacities[torch.float32] = max(capacities.get(torch.float32, 0), elements)
+    return capacities
 
 
 def _is_piecewise_cudagraph_runtime() -> bool:
@@ -266,13 +269,16 @@ class B12xPcieAllReduce:
         ):
             return
 
-        capacity = _dma_capacity_bytes()
-        if capacity is None:
+        capacity_plan = _dma_capacity_plan()
+        if capacity_plan is None:
             logger.warning(
                 "B12X PCIe DMA all-reduce requires an active vLLM model and "
                 "scheduler configuration; large tensors will use PyNCCL."
             )
             return
+        capacity = max(
+            dtype.itemsize * elements for dtype, elements in capacity_plan.items()
+        )
 
         dma: Any | None = None
         init_error: Exception | None = None
@@ -300,9 +306,9 @@ class B12xPcieAllReduce:
         assert dma is not None
         dma.min_bytes = min_bytes
         if dma.wire_mode == "bf16" and capacity >= min_bytes:
-            from vllm.config import get_current_vllm_config
-
-            dma.prepare_eager_replay(get_current_vllm_config().model_config.dtype)
+            for dtype in sorted(capacity_plan, key=str):
+                if capacity_plan[dtype] * dtype.itemsize >= min_bytes:
+                    dma.prepare_eager_replay(dtype, max_elements=capacity_plan[dtype])
         self._dma = dma
 
     def _initialize_twoshot(self) -> None:

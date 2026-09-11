@@ -1325,3 +1325,34 @@ def test_token_logprobs_large_batch_int64_row_offset():
     assert torch.allclose(logprobs[last, 0], ref, atol=1e-2), (
         f"logprob {logprobs[last, 0].item()} != ref {ref.item()}"
     )
+
+
+def test_token_logprobs_request_counts_reuse_warmed_kernel(monkeypatch):
+    from collections import defaultdict
+
+    from triton import knobs
+
+    from vllm.v1.worker.gpu.sample import logprob
+
+    if not current_platform.is_cuda():
+        pytest.skip("CUDA logprob kernel qualification")
+    kernel = logprob._topk_log_softmax_kernel
+    monkeypatch.setattr(
+        kernel, "device_caches", defaultdict(kernel.device_caches.default_factory)
+    )
+    torch.manual_seed(3041)
+    logits = torch.randn((3, 4096), device="cuda")
+    warm_ids = torch.arange(21, device="cuda").expand(3, -1).contiguous()
+    logprob.compute_token_logprobs(logits, warm_ids)
+
+    def forbid_compile(**kwargs):
+        raise AssertionError("Logprob request count compiled after startup warmup")
+
+    monkeypatch.setattr(knobs.runtime, "jit_post_compile_hook", forbid_compile)
+    reference = torch.log_softmax(logits, dim=-1)
+    for count in (1, 17, 1025):
+        ids = torch.arange(count, device="cuda").expand(3, -1).contiguous()
+        actual = logprob.compute_token_logprobs(logits, ids)
+        torch.testing.assert_close(
+            actual, reference.gather(1, ids), rtol=1e-5, atol=1e-5
+        )

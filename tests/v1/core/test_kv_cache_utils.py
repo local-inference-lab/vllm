@@ -4,6 +4,7 @@ import copy
 import hashlib
 import importlib
 from collections.abc import Callable
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -2255,6 +2256,88 @@ def test_group_and_unify_kv_cache_specs_mixed_page_size_groups():
     assert len(grouped) == 2
     layer_names = {name for g in grouped for name in g.kv_cache_specs}
     assert layer_names == {"mla.0", "mla.1", "swa.0"}
+
+
+@pytest.mark.parametrize(
+    "incompatible",
+    [
+        {"prefix_cache_enabled": True},
+        {"prefill_replay_window": 64},
+    ],
+)
+def test_ced_mla_refuses_incompatible_prefix_policy_merge(incompatible):
+    private = replace(
+        new_swa_mla_spec(),
+        prefix_cache_enabled=False,
+        prefill_replay_window=128,
+    )
+    other = replace(private, **incompatible)
+    with pytest.raises(AssertionError):
+        SlidingWindowMLASpec.merge([private, other])
+    assert UniformTypeKVCacheSpecs.from_specs({"a": private, "b": other}) is None
+    assert UniformTypeKVCacheSpecs.from_specs({"b": other, "a": private}) is None
+
+
+def test_ced_prefix_policy_cannot_be_promoted_to_full_attention():
+    encoder = new_swa_mla_spec()
+    private = replace(encoder, prefix_cache_enabled=False, prefill_replay_window=128)
+    with pytest.raises(ValueError):
+        kv_cache_utils.unify_hybrid_kv_cache_specs(
+            {"global": new_mla_spec(), "decoder": private}
+        )
+    default_specs = {"global": new_mla_spec(), "encoder": encoder}
+    kv_cache_utils.unify_hybrid_kv_cache_specs(default_specs)
+    assert UniformTypeKVCacheSpecs.from_specs(default_specs) is not None
+
+
+def test_ced_packed_groups_preserve_encoder_reuse_and_private_replay():
+    encoder = new_swa_mla_spec(head_size=1024)
+    decoder = replace(encoder, prefix_cache_enabled=False, prefill_replay_window=128)
+    # Merge and pack both private layers before scheduler flattening. The
+    # arbitrary representative must not erase a group's replay policy.
+    decoder = SlidingWindowMLASpec.merge([decoder, decoder])
+    grouped = group_and_unify_kv_cache_specs(
+        {
+            "global": new_mla_spec(),
+            "encoder": encoder,
+            "decoder.0": decoder,
+            "decoder.1": decoder,
+        }
+    )
+    assert grouped is not None
+    worker_groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(grouped)
+    scheduler_config = generate_scheduler_kv_cache_config(
+        [
+            KVCacheConfig(
+                num_blocks=256,
+                kv_cache_tensors=[],
+                kv_cache_groups=worker_groups,
+                prefix_cache_retention_interval=0,
+            )
+        ]
+    )
+    manager = KVCacheManager(
+        scheduler_config,
+        max_model_len=1024,
+        scheduler_block_size=16,
+        hash_block_size=16,
+    )
+    tokens = list(range(512))
+    producer = make_request("producer", tokens, 16, sha256)
+    assert manager.allocate_slots(producer, len(tokens)) is not None
+    manager.free(producer)
+    consumer = make_request("consumer", tokens, 16, sha256)
+    hits, hit_tokens, _ = manager.get_computed_blocks(consumer)
+    assert hit_tokens == 384
+    for group_id, group in enumerate(scheduler_config.kv_cache_groups):
+        if any(name.startswith("decoder.") for name in group.layer_names):
+            assert not hits.blocks[group_id]
+            assert all(
+                manager.block_pool.get_cached_block(block_hash, [group_id]) is None
+                for block_hash in producer.block_hashes
+            )
+        else:
+            assert any(not block.is_null for block in hits.blocks[group_id])
 
 
 def test_group_dcp_replicated_dflash_draft():

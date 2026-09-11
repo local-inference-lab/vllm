@@ -54,6 +54,7 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 from ..b12x_layers import B12xLinearMethod, B12xMHC, collapse, stream_mean
 from ..b12x_layers import B12xLogitsProcessor as LogitsProcessor
 from ..b12x_layers import B12xRMSNorm as RMSNorm
+from ..ced import ced_decoder_start, gather_rows, scatter_rows
 from ..common.engram import Engram, EngramLayout, NgramHashState
 from ..common.mm_preprocess import image_sentinel_mask
 from .b12x_attention import DeepseekV41B12xAttention
@@ -185,12 +186,17 @@ class DeepseekV4DecoderLayer(nn.Module):
         residual: torch.Tensor | None = None,
         engram_hashes: torch.Tensor | None = None,
         engram_mask: torch.Tensor | None = None,
+        ced_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if residual is not None:
-            residual = self._b12x_mhc.post(x, residual, post_mix, res_mix)
-        else:
+        previous_output = x if residual is not None else None
+        apply_engram = self.engram is not None and engram_hashes is not None
+        if residual is None:
             residual = x
-        if self.engram is not None and engram_hashes is not None:
+        elif apply_engram:
+            # Engram mutates the reconstructed residual; do not fuse across it.
+            residual = self._b12x_mhc.post(x, residual, post_mix, res_mix)
+            previous_output = None
+        if apply_engram:
             if residual.ndim == 2:
                 residual = (
                     residual[:, None, :].expand(-1, self.hc_mult, -1).contiguous()
@@ -206,11 +212,29 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_attn_base,
             self.attn_norm.weight,
             pre_mix,
+            previous_output=previous_output,
+            previous_post=post_mix if previous_output is not None else None,
+            previous_comb=res_mix if previous_output is not None else None,
         )
-        x = self.attn(positions, x, None)
-        residual = self._b12x_mhc.post(x, residual, post_mix, res_mix)
-        residual, post_mix, res_mix, x, ffn_pre = self._b12x_mhc.pre(
+        global_kv_ready = None
+        if ced_indices is not None:
+            # Decoder global KV needs every encoder row, but decoder queries,
+            # residual updates and experts only need the selected replay rows.
+            global_kv_ready = self.attn.prepare_global_kv(positions, x)
+            x = gather_rows(x, ced_indices)
+            residual = gather_rows(residual, ced_indices)
+            post_mix = gather_rows(post_mix, ced_indices)
+            res_mix = gather_rows(res_mix, ced_indices)
+            attn_pre = gather_rows(attn_pre, ced_indices)
+            positions = gather_rows(positions, ced_indices)
+            if input_ids is not None:
+                input_ids = gather_rows(input_ids, ced_indices)
+        x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
+        residual, post_mix, res_mix, x, ffn_pre = self._b12x_mhc.post_pre(
+            x,
             residual,
+            post_mix,
+            res_mix,
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
@@ -228,6 +252,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config
+        self.ced_decoder_start = ced_decoder_start(config)
         self.quant_config = quant_config
         self.parallel_config = vllm_config.parallel_config
         self.use_mega_moe = False
@@ -314,6 +339,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 self.engram_swa_prefix = swa_cache_module.prefix
         self.disk_engram = (
             self.engram_layout is not None and self.engram_layout.table_memory == "disk"
+        )
+        self.file_backed_engram = (
+            self.engram_layout is not None
+            and self.engram_layout.table_memory in ("ram", "disk")
         )
         if self.disk_engram:
             plan = self.engram_layout.plans[0]
@@ -422,6 +451,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
+        ced_indices: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -492,12 +522,27 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if not get_pp_group().is_first_rank:
             assert intermediate_tensors is not None
             pre_mix = intermediate_tensors["pre_mix"]
+        decoder_compacted = False
+        if (
+            ced_indices is not None
+            and self.ced_decoder_start is not None
+            and self.start_layer > self.ced_decoder_start
+        ):
+            # Pipeline transport keeps its original full-row ABI. A decoder
+            # stage gathers only the rows materialized by the preceding stage.
+            hidden_states = gather_rows(hidden_states, ced_indices)
+            pre_mix = gather_rows(pre_mix, ced_indices)
+            positions = gather_rows(positions, ced_indices)
+            if input_ids is not None:
+                input_ids = gather_rows(input_ids, ced_indices)
+            decoder_compacted = True
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
+            boundary_indices = ced_indices if idx == self.ced_decoder_start else None
             hidden_states, residual, post_mix, res_mix, pre_mix = layer(
                 hidden_states,
                 positions,
@@ -508,7 +553,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 residual,
                 engram_hashes,
                 engram_mask,
+                ced_indices=boundary_indices,
             )
+            if boundary_indices is not None:
+                positions = gather_rows(positions, ced_indices)
+                if input_ids is not None:
+                    input_ids = gather_rows(input_ids, ced_indices)
+                decoder_compacted = True
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the aux hidden state for draft models
                 aux_recon = layer._b12x_mhc.post(
@@ -517,6 +568,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 aux_hidden_state = stream_mean(aux_recon)
                 if self.use_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
+                if decoder_compacted:
+                    aux_hidden_state = scatter_rows(
+                        aux_hidden_state, ced_indices, full_num_tokens
+                    )
                 aux_hidden_states.append(aux_hidden_state)
                 final_aux_recon = aux_recon
         if layer is not None:
@@ -529,6 +584,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
 
         if not get_pp_group().is_last_rank:
+            if decoder_compacted:
+                hidden_states = scatter_rows(
+                    hidden_states, ced_indices, full_num_tokens
+                )
+                pre_mix = scatter_rows(pre_mix, ced_indices, full_num_tokens)
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "pre_mix": pre_mix}
             )
@@ -539,8 +599,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if self.use_sequence_parallel:
                 hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
                 pre_mix = sp_all_gather(pre_mix)[:full_num_tokens]
-            num_tokens = hidden_states.shape[0]
-            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+            buffer_states = (
+                scatter_rows(hidden_states, ced_indices, full_num_tokens)
+                if decoder_compacted
+                else hidden_states
+            )
+            self._mtp_hidden_buffer[:full_num_tokens].copy_(buffer_states.flatten(1))
 
         # Collapse the hc copies with the pre-mix from the last layer's FFN
         # mixes — the mix the reference applies via
@@ -551,6 +615,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+        if decoder_compacted:
+            hidden_states = scatter_rows(hidden_states, ced_indices, full_num_tokens)
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -889,7 +955,7 @@ class DeepseekV41LLMForCausalLM(
 
     def checkpoint_file_weight_filter(self, name: str) -> bool:
         return (
-            self.model.disk_engram
+            self.model.file_backed_engram
             and re.fullmatch(r"layers\.\d+\.engram\.embed\.(?:weight|scale)", name)
             is not None
         )
@@ -930,6 +996,7 @@ class DeepseekV41LLMForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
+        ced_indices: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
             input_ids,
@@ -937,6 +1004,7 @@ class DeepseekV41LLMForCausalLM(
             intermediate_tensors,
             inputs_embeds,
             lookback_token_ids=lookback_token_ids,
+            ced_indices=ced_indices,
         )
         return hidden_states
 

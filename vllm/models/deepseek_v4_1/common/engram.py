@@ -8,6 +8,7 @@ from weakref import WeakValueDictionary
 import torch
 from b12x.norm import hyperconnection
 from b12x.sequence import engram as native
+from b12x.sequence._shared.disk_table import MappedHostAllocation
 from torch import nn
 
 from vllm.config import get_current_vllm_config
@@ -16,11 +17,14 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.weight_transfer import get_file_tensor_source
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.workspace import retain_cuda_graph_capture_resource
+
+logger = init_logger(__name__)
 
 DEAD_ID = -1
 _STATES = WeakValueDictionary()
@@ -235,7 +239,7 @@ class NgramHashState(nn.Module):
             256,
         )
         for i, binding in enumerate(self.bindings):
-            native.run(binding)
+            native.run(binding, token_count=ids.numel())
             out[:, i].copy_(binding.hash_ids[: ids.numel()])
 
     def forward(
@@ -258,17 +262,52 @@ class NgramHashState(nn.Module):
         return out
 
 
+def _read_table_rows(destination, source, start):
+    """Read only this shard, straight into its final mapped CPU allocation."""
+    if destination.device.type != "cpu" or not destination.is_contiguous():
+        raise ValueError("File-backed Engram loading requires contiguous CPU storage")
+    row_bytes = destination.shape[1] * destination.element_size()
+    data = memoryview(destination.view(torch.uint8).numpy()).cast("B")
+    # Unbuffered readinto has no payload-sized Python/NumPy allocation, and a
+    # bounded syscall size also handles tables larger than Linux's read limit.
+    with open(source.path, "rb", buffering=0) as checkpoint:
+        checkpoint.seek(source.offset + start * row_bytes)
+        offset = 0
+        while offset < len(data):
+            count = checkpoint.readinto(data[offset : offset + (8 << 20)])
+            if not count:
+                raise OSError(
+                    f"Short read loading Engram table from {source.path}: "
+                    f"{offset} of {len(data)} local bytes"
+                )
+            offset += count
+
+
 def _load_table(param, loaded_weight):
-    if loaded_weight.shape != (param.global_rows, *param.shape[1:]):
+    source = get_file_tensor_source(loaded_weight)
+    shape = source.shape if source is not None else loaded_weight.shape
+    dtype = source.dtype if source is not None else loaded_weight.dtype
+    if shape != (param.global_rows, *param.shape[1:]):
         raise ValueError("Engram source must be the unpadded global checkpoint table")
-    if loaded_weight.dtype == torch.float8_e8m0fnu:
-        loaded_weight = loaded_weight.view(torch.uint8)
+    dtypes = (
+        (torch.uint8, torch.float8_e8m0fnu)
+        if param.dtype == torch.uint8
+        else (torch.float8_e4m3fn,)
+    )
+    if dtype not in dtypes:
+        raise TypeError(f"Invalid Engram table dtype: {dtype}")
+    destination = getattr(param, "load_view", param.data)
     start = param.shard_start
     count = max(0, min(param.shape[0], param.global_rows - start))
     if count < param.shape[0]:
-        param.data[count:].zero_()
+        destination[count:].zero_()
     if count:
-        param.data[:count].copy_(loaded_weight[start : start + count])
+        if source is not None:
+            _read_table_rows(destination[:count], source, start)
+        else:
+            destination[:count].view(torch.uint8).copy_(
+                loaded_weight[start : start + count].view(torch.uint8)
+            )
 
 
 @torch.library.custom_op("vllm::dsv41_engram_lookup", mutates_args=("out",))
@@ -288,10 +327,54 @@ class ParallelEngramEmbedding(nn.Module):
         self.key = id(self)
         _TABLES[self.key] = self
         self.tp_size = plan.caps.tp_size
-        if table_memory not in ("device", "disk"):
-            raise ValueError("Engram table_memory must be device or disk")
+        if table_memory not in ("device", "ram", "disk"):
+            raise ValueError("Engram table_memory must be device, ram or disk")
         self.disk_table = native.DiskTable(plan) if table_memory == "disk" else None
-        if self.disk_table is None:
+        self._disk_binding = None
+        self._disk_prepared_rows = 0
+        self.mapped_host_nbytes = 0
+        if table_memory == "ram":
+            nbytes = (
+                plan.weight_shape[0] * plan.weight_shape[1]
+                + plan.scale_shape[0] * plan.scale_shape[1]
+            )
+            logger.info(
+                "Engram layer %d TP rank %d: allocating %.2f GiB mapped-host "
+                "RAM (packed E4M3 weights and E8M0 scales)",
+                plan.caps.layer_id,
+                plan.caps.tp_rank,
+                nbytes / (1 << 30),
+            )
+            self._weight_allocation = None
+            try:
+                self._weight_allocation = MappedHostAllocation(
+                    plan.weight_shape, torch.float8_e4m3fn, plan.caps.device
+                )
+                self._scale_allocation = MappedHostAllocation(
+                    plan.scale_shape, torch.uint8, plan.caps.device
+                )
+            except Exception as exc:
+                if self._weight_allocation is not None:
+                    self._weight_allocation.close()
+                raise RuntimeError(
+                    f"Engram mapped-host RAM allocation failed for "
+                    f"{nbytes / (1 << 30):.2f} GiB on {plan.caps.device}; "
+                    "no disk or device fallback is permitted"
+                ) from exc
+            self.mapped_host_nbytes = nbytes
+            self.weight_load_view = self._weight_allocation.host_view
+            self.weight_scale_load_view = self._scale_allocation.host_view
+            self.weight = nn.Parameter(
+                self._weight_allocation.device_view, requires_grad=False
+            )
+            self.weight_scale_inv = nn.Parameter(
+                self._scale_allocation.device_view, requires_grad=False
+            )
+            set_weight_attrs(self.weight, {"load_view": self.weight_load_view})
+            set_weight_attrs(
+                self.weight_scale_inv, {"load_view": self.weight_scale_load_view}
+            )
+        elif self.disk_table is None:
             self.weight = nn.Parameter(
                 torch.empty(
                     plan.weight_shape,
@@ -306,6 +389,10 @@ class ParallelEngramEmbedding(nn.Module):
                 ),
                 requires_grad=False,
             )
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("weight_scale_inv", None)
+        if self.disk_table is None:
             for param in (self.weight, self.weight_scale_inv):
                 set_weight_attrs(
                     param,
@@ -315,9 +402,6 @@ class ParallelEngramEmbedding(nn.Module):
                         "shard_start": plan.shard_start,
                     },
                 )
-        else:
-            self.register_parameter("weight", None)
-            self.register_parameter("weight_scale_inv", None)
         self.register_buffer(
             "hashes",
             torch.empty(
@@ -368,16 +452,24 @@ class ParallelEngramEmbedding(nn.Module):
             )
         self.hashes[: indices.shape[0]].copy_(indices)
         self.num_tokens.copy_(num_tokens)
-        binding = native.bind_lookup(
-            self.plan,
-            weight=None,
-            scales=None,
-            hash_ids=self.hashes,
-            num_tokens=self.num_tokens,
-            out=out,
-            disk_table=self.disk_table,
+        if self._disk_binding is None or self._disk_binding.out is not out:
+            self._disk_binding = native.bind_lookup(
+                self.plan,
+                weight=None,
+                scales=None,
+                hash_ids=self.hashes,
+                num_tokens=self.num_tokens,
+                out=out,
+                disk_table=self.disk_table,
+            )
+            out.zero_()
+            self._disk_prepared_rows = 0
+        if indices.shape[0] < self._disk_prepared_rows:
+            out[indices.shape[0] : self._disk_prepared_rows].zero_()
+        native.run_lookup(
+            self._disk_binding, token_count=indices.shape[0], clear_tail=False
         )
-        native.run_lookup(binding, token_count=indices.shape[0])
+        self._disk_prepared_rows = indices.shape[0]
 
     def lookup_native(self, indices, out):
         self.hashes[: indices.shape[0]].copy_(indices)
@@ -391,6 +483,10 @@ class ParallelEngramEmbedding(nn.Module):
             out=out,
         )
         retain_cuda_graph_capture_resource(binding)
+        if self.mapped_host_nbytes:
+            # CUDA tensor aliases do not own cudaHostAlloc storage. Captured
+            # graphs must retain both mapped owners along with their binding.
+            retain_cuda_graph_capture_resource(self)
         native.run_lookup(binding)
 
     def lookup(self, indices, out):

@@ -1073,6 +1073,27 @@ def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, recipe, mode):
         assert relative < 0.005
 
 
+def test_v41_execution_regimes_cover_padded_capture_sizes(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.models.deepseek_v4_1 import b12x_layers
+
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4096, max_num_seqs=3),
+        speculative_config=SimpleNamespace(num_speculative_tokens=2),
+        compilation_config=SimpleNamespace(
+            cudagraph_capture_sizes=[1, 8, 16, 32],
+            max_cudagraph_capture_size=32,
+        ),
+    )
+    monkeypatch.setattr(b12x_layers, "get_current_vllm_config", lambda: config)
+    capacities = b12x_layers._execution_capacities()
+    # Nine live rows can occupy a larger graph; do not route its padding to
+    # the scheduler-capacity prefill regime.
+    assert min(capacity for capacity in capacities if capacity >= 32) == 32
+    assert max(capacities) == 4096
+
+
 @pytest.mark.parametrize("leading_shape", [(17,), (1, 17)])
 def test_v41_block32_adapter_preserves_native_output_view_and_replay(
     monkeypatch,
@@ -1090,6 +1111,7 @@ def test_v41_block32_adapter_preserves_native_output_view_and_replay(
 
     device = torch.device("cuda")
     monkeypatch.setattr(b12x_layers, "_capacity", lambda: 17)
+    monkeypatch.setattr(b12x_layers, "_execution_capacities", lambda: (1, 8, 17))
     monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
     monkeypatch.setattr(workspace, "_manager", workspace.WorkspaceManager(device))
     torch.manual_seed(41107)
@@ -1125,6 +1147,14 @@ def test_v41_block32_adapter_preserves_native_output_view_and_replay(
     torch.testing.assert_close(actual, oracle(), rtol=0.01, atol=0.01)
     freeze_kernel_resolution("V4.1 vLLM block32 output-view replay")
     try:
+        for rows in (1, 3, 8, 9, 17):
+            live = source.reshape(-1, 128)[:rows]
+            torch.testing.assert_close(
+                method.apply(layer, live),
+                oracle().reshape(-1, 96)[:rows],
+                rtol=0.01,
+                atol=0.01,
+            )
         graph = torch.cuda.CUDAGraph()
         with workspace.collect_cuda_graph_capture_resources() as retained:
             with torch.cuda.graph(graph):
@@ -1260,7 +1290,10 @@ def test_v41_vocab_embedding_sharded_global_ids_and_target_weight_tie(monkeypatc
 
 @torch.inference_mode()
 @pytest.mark.parametrize("broadcast", [False, True])
-def test_v41_mhc_shares_scratch_and_preserves_live_outputs(monkeypatch, broadcast):
+@pytest.mark.parametrize("tokens", [3, 129])
+def test_v41_mhc_shares_scratch_and_preserves_live_outputs(
+    monkeypatch, broadcast, tokens
+):
     from types import SimpleNamespace
 
     from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
@@ -1272,8 +1305,11 @@ def test_v41_mhc_shares_scratch_and_preserves_live_outputs(monkeypatch, broadcas
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("native b12x mHC requires SM12x")
     device = torch.device("cuda", torch.cuda.current_device())
-    capacity, hidden, tokens = 4096, 5120, 3
+    capacity, hidden = 4096, 5120
     monkeypatch.setattr(b12x_layers, "_capacity", lambda: capacity)
+    monkeypatch.setattr(
+        b12x_layers, "_execution_capacities", lambda: (1, 8, 24, capacity)
+    )
     monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
     manager = workspace.WorkspaceManager(device)
     monkeypatch.setattr(workspace, "_manager", manager)
@@ -1302,9 +1338,8 @@ def test_v41_mhc_shares_scratch_and_preserves_live_outputs(monkeypatch, broadcas
 
     def run():
         a = first.pre(residual, first_fn, scale, bias, norm, None)
-        reconstructed = first.post(a[3] * 0.125, a[0], a[1], a[2])
-        b = second.pre(reconstructed, fn, scale, bias, norm, a[4])
-        return (*a, reconstructed, *b)
+        b = second.post_pre(a[3] * 0.125, a[0], a[1], a[2], fn, scale, bias, norm, a[4])
+        return (*a, b[0], *b)
 
     def expected():
         incoming = identity

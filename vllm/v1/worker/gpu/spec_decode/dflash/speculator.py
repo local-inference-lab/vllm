@@ -71,9 +71,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
         self.sample_from_anchor = False
 
-        # Context positions for the K/V precompute. Populated by
-        # prepare_dflash_inputs, and processed by the model's
-        # precompute_and_store_context_kv method. NOT captured by CUDA graphs.
+        # Context positions for K/V precompute, populated by prepare_dflash_inputs.
+        # V4.1 DSpark can also read this fixed owner buffer in a context graph.
         self.context_positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=device
         )
@@ -100,6 +99,7 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
+        self._context_preparer = None
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -154,6 +154,18 @@ class DFlashSpeculator(DraftModelSpeculator):
             causal=self._group_causal,
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
+        # Only V4.1 DSpark supplies this hook. Other draft models retain their
+        # existing eager context path and graph policy.
+        capture_context = getattr(self.model, "capture_context_preparation", None)
+        if capture_context is not None and self.query_cudagraph_manager.needs_capture():
+            self._context_preparer = capture_context(
+                self.vllm_config,
+                self.hidden_states,
+                self.context_positions,
+                self._context_slot_mappings,
+                self._layer_group_idx,
+                self.max_num_reqs * (1 + self.num_speculative_steps),
+            )
 
     def load_draft_model(
         self,
@@ -230,6 +242,8 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     def reset_attn(self) -> None:
         """Release DFlash state derived from the target KV-cache layout."""
+        # Drop graphs before detaching the KV cache tensors they reference.
+        self._context_preparer = None
         for name in (
             "draft_kv_cache_group_ids",
             "draft_kv_cache_group_id",
@@ -382,19 +396,47 @@ class DFlashSpeculator(DraftModelSpeculator):
             max_seq_len + self.num_query_per_req, self.max_model_len
         )
 
+        get_ced_indices = getattr(
+            getattr(self, "model_state", None), "get_ced_indices", None
+        )
+        ced_indices = get_ced_indices() if get_ced_indices is not None else None
+        num_context_tokens = (
+            num_target_tokens if ced_indices is None else ced_indices.numel()
+        )
+        if ced_indices is not None:
+            from vllm.models.deepseek_v4_1.ced import gather_rows
+
         # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
-        if not context_kv_is_restored:
+        use_context_graph = (
+            not dummy_run
+            and ced_indices is None
+            and not is_profile
+            and not context_kv_is_restored
+            and bool(aux_hidden_states)
+            and self._context_preparer is not None
+            and self._context_preparer.can_run(num_target_tokens)
+        )
+        if not context_kv_is_restored and not use_context_graph:
+            if ced_indices is not None:
+                # Target aux keeps the original-row ABI. Pack before the expensive
+                # combine projection; discarded decoder rows have no context KV.
+                if aux_hidden_states:
+                    aux_hidden_states = [
+                        gather_rows(hidden, ced_indices) for hidden in aux_hidden_states
+                    ]
+                else:
+                    last_hidden_states = gather_rows(last_hidden_states, ced_indices)
             if aux_hidden_states:
                 hidden_states = self.model.combine_hidden_states(
                     torch.cat(aux_hidden_states, dim=-1)
                 )
             else:
                 hidden_states = last_hidden_states
-            self.hidden_states[:num_target_tokens].copy_(
-                hidden_states[:num_target_tokens]
+            self.hidden_states[:num_context_tokens].copy_(
+                hidden_states[:num_context_tokens]
             )
 
         if dummy_run and skip_attn_for_dummy_run:
@@ -402,8 +444,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             # Since DFlash needs to build its own attention metadata, we must skip the
             # preparation in this path and run a minimal forward pass.
             self.model.precompute_and_store_context_kv(
-                self.hidden_states[:num_target_tokens],
-                self.context_positions[:num_target_tokens],
+                self.hidden_states[:num_context_tokens],
+                self.context_positions[:num_context_tokens],
             )
             # DFlash processes all speculative tokens in one forward pass,
             # so the real token count is num_query_tokens.
@@ -457,23 +499,41 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.sample_from_anchor,
             )
 
-        # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
-        # because the context shape varies per step. During dummy runs the block tables
-        # are placeholders, so we skip the cache write to avoid clobbering real entries.
-        # Each layer uses the context slots of its own kv-cache group.
+        context_positions = self.context_positions[:num_target_tokens]
+        packed_context_slots = None
+        if ced_indices is not None:
+            # Keep query anchors and rejection masking in the ORIGINAL target
+            # coordinates. Only the prepared context inputs are packed afterward.
+            context_positions = gather_rows(self.context_positions, ced_indices)
+            packed_context_slots = [
+                gather_rows(slots, ced_indices).masked_fill(
+                    ced_indices < 0, PAD_SLOT_ID
+                )
+                for slots in self._context_slot_mappings
+            ]
+        # Each layer uses the context slots of its own KV-cache group. V4.1 can
+        # replay bounded decode context graphs; compact prefills use eager projection.
+        # Dummy runs reserve workspace without clobbering real cache entries.
         if dummy_run:
             context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
-        elif self._layer_group_idx is not None:
-            context_slots = [
-                self._context_slot_mappings[gidx][:num_target_tokens]
-                for gidx in self._layer_group_idx
-            ]
         else:
-            context_slots = self._context_slot_mappings[0][:num_target_tokens]
-        if not context_kv_is_restored:
+            group_slots = (
+                packed_context_slots
+                if packed_context_slots is not None
+                else [
+                    slots[:num_context_tokens] for slots in self._context_slot_mappings
+                ]
+            )
+            if self._layer_group_idx is not None:
+                context_slots = [group_slots[gidx] for gidx in self._layer_group_idx]
+            else:
+                context_slots = group_slots[0]
+        if use_context_graph:
+            self._context_preparer.run(aux_hidden_states, num_target_tokens)
+        elif not context_kv_is_restored:
             self.model.precompute_and_store_context_kv(
-                self.hidden_states[:num_target_tokens],
-                self.context_positions[:num_target_tokens],
+                self.hidden_states[:num_context_tokens],
+                context_positions,
                 context_slots,
             )
 
