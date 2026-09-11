@@ -14,6 +14,8 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
     RejectionSampler,
+    apply_sampling_constraints,
+    rejection_sample,
     sample_recovered_tokens,
 )
 from vllm.v1.sample.sampler import Sampler, SamplerOutput
@@ -127,6 +129,105 @@ def create_sampling_metadata(
         bad_words_token_ids={} if bad_words_token_ids is None else bad_words_token_ids,
         logitsprocs=LogitsProcessors(),
     )
+
+
+def test_apply_sampling_constraints_can_return_normalized_probabilities():
+    num_draft_tokens = 5
+    vocab_size = 257
+    generator = torch.Generator(device=DEVICE_TYPE).manual_seed(53)
+    logits = torch.randn(
+        num_draft_tokens,
+        vocab_size,
+        dtype=torch.float32,
+        device=DEVICE_TYPE,
+        generator=generator,
+    )
+    cu_num_draft_tokens = torch.tensor([3, 5], device=DEVICE_TYPE)
+    sampling_metadata = create_sampling_metadata(
+        all_greedy=False,
+        temperature=torch.tensor([0.7, 1.2], device=DEVICE_TYPE),
+        top_k=torch.tensor([19, 37], dtype=torch.int32, device=DEVICE_TYPE),
+        top_p=torch.tensor([0.6, 0.92], device=DEVICE_TYPE),
+    )
+
+    processed_logits = apply_sampling_constraints(
+        logits.clone(),
+        cu_num_draft_tokens,
+        sampling_metadata,
+    )
+    expected = processed_logits.softmax(dim=-1, dtype=torch.float32)
+    actual = apply_sampling_constraints(
+        logits.clone(),
+        cu_num_draft_tokens,
+        sampling_metadata,
+        return_probs=True,
+    )
+
+    assert torch.equal(actual != 0, expected != 0)
+    assert torch.allclose(actual, expected, atol=2e-7, rtol=2e-6)
+
+
+def test_rejection_sample_accepts_precomputed_target_probabilities():
+    batch_size = 2
+    max_spec_len = 3
+    vocab_size = 64
+    num_tokens = batch_size * max_spec_len
+    generator = torch.Generator(device=DEVICE_TYPE).manual_seed(59)
+    draft_logits = torch.randn(
+        num_tokens,
+        vocab_size,
+        dtype=torch.float32,
+        device=DEVICE_TYPE,
+        generator=generator,
+    )
+    target_logits = torch.randn(
+        num_tokens,
+        vocab_size,
+        dtype=torch.float32,
+        device=DEVICE_TYPE,
+        generator=generator,
+    )
+    draft_probs = draft_logits.softmax(dim=-1)
+    target_probs = target_logits.softmax(dim=-1)
+    draft_token_ids = draft_probs.argmax(dim=-1).to(torch.int32).contiguous()
+    bonus_token_ids = torch.tensor([[3], [7]], device=DEVICE_TYPE)
+    cu_num_draft_tokens = torch.tensor([3, 6], device=DEVICE_TYPE)
+
+    def make_metadata() -> SamplingMetadata:
+        return create_sampling_metadata(
+            all_greedy=False,
+            temperature=torch.ones(batch_size, device=DEVICE_TYPE),
+            generators={
+                request_id: torch.Generator(device=DEVICE_TYPE).manual_seed(
+                    67 + request_id
+                )
+                for request_id in range(batch_size)
+            },
+        )
+
+    from_logits = rejection_sample(
+        draft_token_ids,
+        [max_spec_len] * batch_size,
+        max_spec_len,
+        cu_num_draft_tokens,
+        draft_probs,
+        target_logits,
+        bonus_token_ids,
+        make_metadata(),
+    )
+    from_probs = rejection_sample(
+        draft_token_ids,
+        [max_spec_len] * batch_size,
+        max_spec_len,
+        cu_num_draft_tokens,
+        draft_probs,
+        target_probs,
+        bonus_token_ids,
+        make_metadata(),
+        target_is_probs=True,
+    )
+
+    assert torch.equal(from_probs, from_logits)
 
 
 ########################### Tests for Greedy Sampling ###################
