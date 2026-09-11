@@ -1251,8 +1251,7 @@ def test_split_indexer_prefill_chunks_single_request_overflow():
     assert out == expected
 
 
-# 384 and 2051 count via tiled atomic accumulation rather than the single-tile
-# path 128 takes. 2051 also exercises a masked final tile.
+# Width 384 exercises tiled counting; 2051 exercises a masked single-row tile.
 @pytest.mark.parametrize("num_topk_tokens", [128, 384, 2051])
 def test_triton_convert_returns_valid_counts(num_topk_tokens: int):
     """Test that return_valid_counts correctly counts non-negative indices."""
