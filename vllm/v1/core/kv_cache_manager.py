@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
@@ -142,6 +142,8 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
         enable_boundary_checkpoints: bool = False,
+        max_concurrent_batches: int = 2,
+        num_lookahead_tokens: int = 0,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -207,6 +209,21 @@ class KVCacheManager:
         self._boundary_imports: set[int] = set()
         self._boundary_allocations: dict[str, list[KVCacheBlock]] = {}
         self._boundary_readers: dict[str, BoundaryCheckpoint] = {}
+        self._boundary_reader_horizons: dict[str, int] = {}
+        assert max_concurrent_batches > 0 and num_lookahead_tokens >= 0
+        self._boundary_restore_max_concurrent_batches = max_concurrent_batches
+        self._boundary_restore_lookahead = max(
+            num_lookahead_tokens,
+            # Include the extra DFlash drafter slot for direct manager callers.
+            max(
+                (
+                    manager.kv_cache_spec.num_speculative_blocks + 1
+                    for manager in self.coordinator.single_type_managers
+                    if isinstance(manager.kv_cache_spec, MambaSpec)
+                ),
+                default=0,
+            ),
+        )
         if self.boundary_checkpoints is not None:
             logger.info(
                 "Request-boundary recurrent checkpoint caching is enabled. "
@@ -385,6 +402,26 @@ class KVCacheManager:
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, min(per_group_hits) < num_local
 
+    def _pending_boundary_blocks(self, requests: Iterable[Request]) -> set[int]:
+        """Find queued reuse dependencies without acquiring reader pins."""
+        protected: set[int] = set()
+        cache = self.boundary_checkpoints
+        if cache is None:
+            return protected
+        for request in requests:
+            if (
+                request.num_computed_tokens != 0
+                or request.request_id in self._boundary_readers
+                or request.status
+                not in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                or not self.prefix_cache_lookup_enabled(request)
+            ):
+                continue
+            checkpoint = cache.find(request, request.num_tokens)
+            if checkpoint is not None:
+                protected.update(checkpoint.dependencies)
+        return protected
+
     def allocate_slots(
         self,
         request: Request,
@@ -398,6 +435,8 @@ class KVCacheManager:
         full_sequence_must_fit: bool = False,
         reserved_blocks: int = 0,
         has_scheduled_reqs: bool = True,
+        can_defer_boundary_restore: bool = False,
+        pending_boundary_requests: Iterable[Request] = (),
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -430,6 +469,12 @@ class KVCacheManager:
                 blocks an already in-flight (prefilling) sequence is relying on.
             has_scheduled_reqs: Whether any requests are already scheduled to run
                 this step, controls whether watermark is applied.
+
+            can_defer_boundary_restore: Whether scheduled work or eligible
+                decode can progress while a local boundary restore waits.
+            pending_boundary_requests: Bounded queued requests whose cached
+                prefixes should survive admission. Unrelated old checkpoints
+                remain eligible for normal eviction.
 
         Blocks layout:
         ```
@@ -600,6 +645,77 @@ class KVCacheManager:
             # Cannot allocate new blocks
             return None
 
+        checkpoint = request.boundary_checkpoint
+        lookahead = max(self._boundary_restore_lookahead, num_lookahead_tokens)
+        # Outstanding batches can hold optimistic spec tokens at the output
+        # limit. The drafter also writes beyond the target query range.
+        boundary_horizon = min(
+            self.max_model_len,
+            request.num_prompt_tokens
+            + request.max_tokens
+            + self._boundary_restore_max_concurrent_batches * (lookahead + 1)
+            + lookahead,
+        )
+        if (
+            checkpoint is not None
+            and 0 < checkpoint.num_tokens <= request.num_tokens
+            and request.num_computed_tokens == 0
+            and request.request_id not in self._boundary_readers
+            and self._boundary_readers
+            and can_defer_boundary_restore
+            and num_new_computed_tokens == checkpoint.num_tokens
+            and new_computed_blocks is not None
+            and num_external_computed_tokens == 0
+            and (
+                protected_blocks := self._pending_boundary_blocks(
+                    pending_boundary_requests
+                )
+            )
+        ):
+            # Existing warm readers can finish while this restore waits.
+            # Predict FIFO after acquiring the incoming reader's dependencies.
+            dependencies = checkpoint.dependencies
+            free_hits = sum(
+                self.block_pool.blocks[i].ref_cnt == 0 for i in dependencies
+            )
+            new_ids = num_blocks_to_allocate + boundary_blocks - free_hits
+            assert new_ids >= 0
+            for manager in self.coordinator.single_type_managers:
+                spec = manager.kv_cache_spec
+                for rid in (*self._boundary_readers, request.request_id):
+                    blocks = manager.req_to_blocks.get(rid, ())
+                    if isinstance(spec, MambaSpec):
+                        target = spec.num_speculative_blocks + 3
+                        # Initial allocation already pays for cached-source
+                        # CoW and checkpoint states. Budget growth conservatively.
+                        live = (
+                            spec.num_speculative_blocks + 1
+                            if rid == request.request_id
+                            else sum(not block.is_null for block in blocks)
+                        )
+                    else:
+                        horizon = (
+                            boundary_horizon
+                            if rid == request.request_id
+                            else self._boundary_reader_horizons[rid]
+                        )
+                        target = cdiv(horizon, manager.block_size)
+                        live = (
+                            cdiv(num_tokens_need_slot, manager.block_size)
+                            if rid == request.request_id
+                            else len(blocks)
+                        )
+                    new_ids += max(0, target - live)
+            assert self.boundary_checkpoints is not None
+            for block in self.block_pool.free_block_queue.iter_blocks_after(None):
+                if new_ids == 0:
+                    break
+                if block.block_id in dependencies:
+                    continue
+                if block.block_id in protected_blocks:
+                    return None
+                new_ids -= 1
+
         if (
             request.boundary_checkpoint is not None
             and request.request_id not in self._boundary_readers
@@ -612,6 +728,7 @@ class KVCacheManager:
                 request.boundary_checkpoint = None
                 return None
             self._boundary_readers[request.request_id] = checkpoint
+            self._boundary_reader_horizons[request.request_id] = boundary_horizon
 
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
@@ -683,6 +800,7 @@ class KVCacheManager:
     def _pop_boundary_blocks(self, request: Request) -> list[KVCacheBlock]:
         blocks = self._boundary_allocations.pop(request.request_id, [])
         reader = self._boundary_readers.pop(request.request_id, None)
+        self._boundary_reader_horizons.pop(request.request_id, None)
         if reader is not None:
             blocks.extend(self.block_pool.blocks[i] for i in reader.dependencies)
         request.boundary_checkpoint = None
