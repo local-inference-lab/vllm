@@ -4,6 +4,7 @@
 
 import inspect
 from dataclasses import replace
+from typing import Any
 
 import pytest
 import torch
@@ -20,6 +21,21 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import RequestStatus
 
 pytestmark = pytest.mark.cpu_test
+
+
+def compute_share_fixture_options(share: float | None) -> dict[str, Any]:
+    """Select the fixture's supported fairness API and exercise its controller.
+
+    JJ exposes an explicit engine selector; the compute-sharing PR makes a
+    configured share sufficient. Both interfaces must test enabled fairness,
+    rather than silently dropping the coverage in the composed tree.
+    """
+    from tests.v1.core.utils import create_scheduler
+
+    options: dict[str, Any] = {"prefill_compute_share": share}
+    if "fairness_engine" in inspect.signature(create_scheduler).parameters:
+        options["fairness_engine"] = "compute_share" if share is not None else None
+    return options
 
 
 def manager():
@@ -265,9 +281,9 @@ def test_actual_scheduler_runs_decode_after_guard_defers_restore(fairness, relea
         async_scheduling=True,
         num_speculative_tokens=3,
         speculative_method="ngram_gpu",
-        fairness_engine="compute_share" if fairness is not None else None,
-        prefill_compute_share=fairness,
+        **compute_share_fixture_options(fairness),
     )
+    assert (scheduler.compute_share_controller is not None) == (fairness is not None)
     cache = scheduler.kv_cache_manager
     cache.boundary_checkpoints = BoundaryCheckpointCache(cache.block_pool)
     producer, first, second = create_requests(

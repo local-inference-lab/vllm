@@ -229,6 +229,7 @@ def test_scheduler_deferral_requires_local_progress(case, monkeypatch):
         connector = Mock()
         connector.get_num_new_matched_tokens.return_value = (0, False)
         connector.build_connector_meta.return_value = None
+        connector.boundary_checkpoint_external_tokens.return_value = 0
         monkeypatch.setattr(scheduler, "connector", connector)
     elif case == "idle":
         scheduler.finish_requests([first.request_id], RequestStatus.FINISHED_ABORTED)

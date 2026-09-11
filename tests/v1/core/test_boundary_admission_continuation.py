@@ -7,6 +7,7 @@ import torch
 
 from tests.v1.core import test_boundary_admission as base
 from tests.v1.core.test_boundary_admission import initialize_hash as initialize_hash
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -76,9 +77,9 @@ def test_nonisolated_continuation_deferral_serves_existing_decoder(
         async_scheduling=True,
         num_speculative_tokens=3,
         speculative_method="ngram_gpu",
-        fairness_engine="compute_share" if fairness is not None else None,
-        prefill_compute_share=fairness,
+        **base.compute_share_fixture_options(fairness),
     )
+    assert (scheduler.compute_share_controller is not None) == (fairness is not None)
     cache = scheduler.kv_cache_manager
     cache.boundary_checkpoints = base.BoundaryCheckpointCache(cache.block_pool)
     producer, first = create_requests(
@@ -174,7 +175,7 @@ def test_continuation_prefill_source_and_two_batch_state_bound(
         cache.new_step_starts()
         start = req.num_computed_tokens or hit
         count = min(4096, req.num_prompt_tokens - start)
-        protected = []
+        protected: list[KVCacheBlock] = []
         if req.num_computed_tokens:
             processed = req.num_computed_tokens - req.num_in_flight_tokens
             for manager in cache.coordinator.single_type_managers[1:]:
