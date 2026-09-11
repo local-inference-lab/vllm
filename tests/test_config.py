@@ -41,6 +41,29 @@ from vllm.v1.attention.backend import AttentionCGSupport
 DEVICE_TYPE = current_platform.device_type
 
 
+@pytest.mark.parametrize(
+    "configured,expected",
+    [(None, "auto"), ("b12x", "b12x"), ("FLASHINFER-CUTLASS", "flashinfer_cutlass")],
+)
+def test_moe_backend_deployment_default(monkeypatch, configured, expected):
+    monkeypatch.delenv("VLLM_DEFAULT_MOE_BACKEND", raising=False)
+    if configured is not None:
+        monkeypatch.setenv("VLLM_DEFAULT_MOE_BACKEND", configured)
+    assert KernelConfig().moe_backend == expected
+
+
+@pytest.mark.parametrize("backend", ["auto", "b12x", "flashinfer_cutlass"])
+def test_explicit_moe_backend_overrides_deployment_default(monkeypatch, backend):
+    monkeypatch.setenv("VLLM_DEFAULT_MOE_BACKEND", "b12x")
+    assert KernelConfig(moe_backend=backend).moe_backend == backend
+
+
+def test_invalid_moe_backend_deployment_default_fails_validation(monkeypatch):
+    monkeypatch.setenv("VLLM_DEFAULT_MOE_BACKEND", "not_a_backend")
+    with pytest.raises(ValidationError, match="moe_backend"):
+        KernelConfig()
+
+
 def test_kda_recoverssm_derivation_is_revalidated():
     config = SimpleNamespace(
         cache_config=SimpleNamespace(

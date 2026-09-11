@@ -502,7 +502,7 @@ class EngineArgs:
         ParallelConfig.enable_batch_sharded_sampling
     )
     enable_ep_weight_filter: bool = ParallelConfig.enable_ep_weight_filter
-    moe_backend: MoEBackend = KernelConfig.moe_backend
+    moe_backend: MoEBackend | None = None
     linear_backend: LinearBackend = KernelConfig.linear_backend
     all2all_backend: All2AllBackend = ParallelConfig.all2all_backend
     enable_elastic_ep: bool = ParallelConfig.enable_elastic_ep
@@ -1675,6 +1675,9 @@ class EngineArgs:
             **kernel_kwargs["enable_bf16x3_router_gemm"],
         )
         moe_backend_kwargs = kernel_kwargs["moe_backend"]
+        # Omission preserves nested configuration and its deployment default;
+        # an explicit "auto" must still override a pinned deployment backend.
+        moe_backend_kwargs["default"] = None
         moe_backend_kwargs["type"] = lambda s: s.lower().replace("-", "_")
         kernel_group.add_argument("--moe-backend", **moe_backend_kwargs)
         linear_backend_kwargs = kernel_kwargs["linear_backend"]
@@ -2531,7 +2534,7 @@ class EngineArgs:
             kernel_config.enable_flashinfer_autotune = self.enable_flashinfer_autotune
         if self.enable_bf16x3_router_gemm is not None:
             kernel_config.enable_bf16x3_router_gemm = self.enable_bf16x3_router_gemm
-        if self.moe_backend != "auto":
+        if self.moe_backend is not None:
             kernel_config.moe_backend = self.moe_backend
         if self.linear_backend != "auto":
             kernel_config.linear_backend = self.linear_backend
