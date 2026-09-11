@@ -71,7 +71,7 @@ def _execution_capacities() -> tuple[int, ...]:
     )
 
 
-_LINEARS = WeakValueDictionary()
+_LINEARS: WeakValueDictionary[int, nn.Module] = WeakValueDictionary()
 
 
 @cache
@@ -321,6 +321,11 @@ def _mhc_pre(
     previous_post: torch.Tensor | None = None,
     previous_comb: torch.Tensor | None = None,
 ) -> None:
+    # Use fixed capacity buckets so B12X can plan decode and prefill separately.
+    # Live row counts never become compilation or plan-cache keys.
+    decode_capacity = min(capacity, 64)
+    if residual.shape[0] <= decode_capacity:
+        capacity = decode_capacity
     plan = _mhc_plan(residual.device, capacity, y.shape[-1])
     (scratch,) = current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
     binding = mhc.bind(

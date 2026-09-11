@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """V4.1 Full/Reindex/Reuse topology with native b12x compute only."""
 
-import re
+from typing import cast
 
+import regex as re
 import torch
 from b12x.attention import compressed_sparse_mla as mla
 from b12x.attention import dsa_indexer
@@ -11,9 +12,10 @@ from b12x.attention.compressed_sparse_mla.preparation import rotate
 from b12x.attention.compressed_sparse_mla.weight_scale import (
     scale_index_weights,
 )
-from b12x.gemm import bf16_gemv
+from b12x.gemm import bf16_gemv, blockscaled
 from torch import nn
 
+from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -33,7 +35,11 @@ from vllm.models.deepseek_v4_1.b12x_layers import (
 from vllm.models.deepseek_v4_1.ced import ced_decoder_start
 from vllm.models.deepseek_v4_1.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
-from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xBackend, _chunk
+from vllm.models.deepseek_v4_1.sparse_mla import (
+    DeepseekV41B12xBackend,
+    DeepseekV41B12xMetadata,
+    _chunk,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
 from vllm.v1.worker.workspace import (
@@ -149,7 +155,7 @@ def _unpack_wo_a(Weight, Scale, Out, N: tl.constexpr, K: tl.constexpr, B: tl.con
 
 
 class _GroupedLinearMethod(LinearMethodBase):
-    """Reference WO-A: unpack weights once; never quantize inverse-RoPE output."""
+    """WO-A with BF16 activations in both GEMV and weight-only tensor-core paths."""
 
     def __init__(self, original, groups):
         if type(original) is UnquantizedLinearMethod:
@@ -162,10 +168,32 @@ class _GroupedLinearMethod(LinearMethodBase):
         return self.original.create_weights(*args, **kwargs)
 
     def process_weights_after_loading(self, layer):
+        self.prefill_weights = []
         if layer.weight.dtype == torch.float8_e4m3fn:
             scales = layer.weight_scale_inv
             if scales.dtype != torch.float8_e8m0fnu:
                 raise ValueError("V4.1 WO-A requires UE8M0 checkpoint scales")
+            width = layer.weight.shape[0] // self.groups
+            if width % 32:
+                raise ValueError("V4.1 WO-A groups must preserve block32 scale rows")
+            for group in range(self.groups):
+                start, end = group * width, (group + 1) * width
+                # Replicating a block-row exponent changes storage, not values.
+                # A16 dequantizes these exact checkpoint weights to BF16 and
+                # never quantizes the inverse-RoPE activation.
+                scale_rows = scales[start // 32 : end // 32].view(torch.uint8)
+                packed = blockscaled.pack_weight(
+                    layer.weight[start:end],
+                    scale_rows.repeat_interleave(32, dim=0),
+                    recipe="mxfp8",
+                )
+                blockscaled.prewarm(packed, (1, 8, 64), mode="a16")
+                self.prefill_weights.append(packed)
+            capacity = get_current_vllm_config().scheduler_config.max_num_batched_tokens
+            self.prefill_workspace_bytes = max(
+                blockscaled.workspace_size(packed, capacity)
+                for packed in self.prefill_weights
+            )
             dense = torch.empty(
                 layer.weight.shape, dtype=torch.bfloat16, device=layer.weight.device
             )
@@ -186,7 +214,7 @@ class _GroupedLinearMethod(LinearMethodBase):
             bf16_gemv.precompile(weight)
             self.weights.append(weight)
 
-    def apply(self, layer, x, bias=None):
+    def apply(self, layer, x, bias=None, *, is_prefill=False):
         if bias is not None:
             raise ValueError("V4.1 WO-A must be bias free")
         rows = x.shape[0]
@@ -195,11 +223,19 @@ class _GroupedLinearMethod(LinearMethodBase):
         )
         width = layer.weight.shape[0] // self.groups
         for group in range(self.groups):
-            bf16_gemv.mm(
-                x[:, group],
-                self.weights[group],
-                out=result[:, group * width : (group + 1) * width],
-            )
+            target = result[:, group * width : (group + 1) * width]
+            if is_prefill and self.prefill_weights:
+                (scratch,) = current_workspace_manager().get_simultaneous(
+                    ((self.prefill_workspace_bytes,), torch.uint8)
+                )
+                source = x[:, group].contiguous()
+                projected = blockscaled.mm(
+                    source, self.prefill_weights[group], mode="a16", workspace=scratch
+                )
+                target.copy_(projected)
+                retain_cuda_graph_capture_resource((source, projected))
+            else:
+                bf16_gemv.mm(x[:, group], self.weights[group], out=target)
         retain_cuda_graph_capture_resource((x, result))
         return result
 
@@ -209,8 +245,10 @@ class DeepseekV4Indexer(nn.Module):
         super().__init__()
         hf = config.model_config.hf_config
         self.prefix, self.owns_k, self.k_cache = prefix, owns_k, k_cache
-        self.heads = hf.index_n_heads // get_tensor_model_parallel_world_size()
-        self.wq_b = ColumnParallelLinear(
+        # Replicating the small indexer avoids reducing a rows-by-context score
+        # matrix across TP ranks. Every rank selects from all index heads.
+        self.heads = hf.index_n_heads
+        self.wq_b = ReplicatedLinear(
             hf.q_lora_rank,
             hf.index_n_heads * 128,
             bias=False,
@@ -219,7 +257,7 @@ class DeepseekV4Indexer(nn.Module):
             prefix=f"{prefix}.wq_b",
         )
         _native_linear(self.wq_b)
-        self.weights_proj = ColumnParallelLinear(
+        self.weights_proj = ReplicatedLinear(
             hf.hidden_size,
             hf.index_n_heads,
             bias=False,
@@ -280,7 +318,9 @@ def _prepare_global_kv_fake(hidden, positions, prefix):
 
 class DeepseekV4Attention(nn.Module, AttentionLayerBase):
     backend_cls = DeepseekV41B12xBackend
-    INDEX_CHUNK = 64
+    # Index scores need bounded row scratch; attention handles the whole batch.
+    INDEX_CHUNK = 256
+    DECODE_CHUNK = 64
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads):
@@ -298,7 +338,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         self.config = vllm_config
         hf = vllm_config.model_config.hf_config
         self.prefix = prefix
-        self.layer_id = int(re.search(r"layers\.(\d+)", prefix).group(1))
+        layer_match = re.search(r"layers\.(\d+)", prefix)
+        if layer_match is None:
+            raise ValueError("V4.1 attention prefix must contain a layer index")
+        self.layer_id = int(layer_match.group(1))
         self.hidden_size, self.head_dim = hf.hidden_size, hf.head_dim
         self.rope_head_dim = hf.qk_rope_head_dim
         tp = get_tensor_model_parallel_world_size()
@@ -555,11 +598,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             h = self.indexer.heads
             self._index_plans = {}
             for mode in ("decode", "prefill"):
+                plan_rows = self.DECODE_CHUNK if mode == "decode" else c
                 plan = dsa_indexer.plan(
                     dsa_indexer.Caps(
                         device=device,
                         num_q_heads=h,
-                        max_q_rows=c,
+                        max_q_rows=plan_rows,
                         max_page_table_width=self._index_width,
                         topk=512,
                         mode=mode,
@@ -668,13 +712,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         q = _rotated(q, positions, self.rotary_emb.cos_sin_cache)
         output = torch.empty_like(q)
         retain_cuda_graph_capture_resource(output)
-        metadata = get_forward_context().attn_metadata
+        metadata = cast(
+            dict[str, DeepseekV41B12xMetadata] | None,
+            get_forward_context().attn_metadata,
+        )
+        is_prefill = True
         if not isinstance(metadata, dict):
-            # vLLM memory profiling has no cache pages; no serving call uses this branch.
+            # Memory profiling has no cache pages; serving does not use this branch.
             output.zero_()
         else:
             original_swa = metadata[self.swa_cache_layer.prefix]
             swa = self._query_metadata(original_swa)
+            is_prefill = not swa.is_decode
             self.insert_context_kv(kv, positions, swa.slot_mapping[:rows])
             if swa is original_swa:
                 self._prepare_global_kv(positions, hidden_states)
@@ -692,7 +741,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 index_query = (iq_data, iq_scale, iw)
                 retain_cuda_graph_capture_resource((weights, index_query))
             self.forward_mqa(q, kv, positions, output, index_query=index_query)
-        return self._o_proj(output, positions)
+        return self._o_proj(output, positions, is_prefill=is_prefill)
 
     def forward_mqa(self, q, kv, positions, output, *, index_query=None):
         metadata = get_forward_context().attn_metadata
@@ -707,12 +756,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         plan = self._plans[mode]
         if rows > plan.caps.max_q_rows:
             raise ValueError(
-                f"V4.1 {mode} rows {rows} exceed planned capacity {plan.caps.max_q_rows}"
+                f"V4.1 {mode} rows {rows} exceed planned capacity "
+                f"{plan.caps.max_q_rows}"
             )
         owner = (
             self._context[_source(self.prefix, self.index_source_layer_id)]
             if self.compress_ratio
-            else None
+            else self
         )
 
         # Only the score matrix needs row chunking. All selected positions
@@ -732,8 +782,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     self._index_width * self._index_page,
                     max(1, triton.cdiv(im.max_seq_len, self.compress_ratio)),
                 )
-            for offset in range(0, rows, self.INDEX_CHUNK):
-                end = min(offset + self.INDEX_CHUNK, rows)
+            chunk_rows = self.DECODE_CHUNK if mode == "decode" else self.INDEX_CHUNK
+            for offset in range(0, rows, chunk_rows):
+                end = min(offset + chunk_rows, rows)
                 count = end - offset
                 _pages[(count, triton.cdiv(self._index_width, 128))](
                     im.req_id_per_token,
@@ -759,7 +810,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                         candidate_indices=source._candidates[offset:end],
                         candidate_lengths=source._candidate_lens[offset:end],
                     )
-                # One borrow spans score -> TP reduction -> select.
+                # All replicated heads are ranked locally in one scratch borrow.
                 binding = dsa_indexer.bind(
                     index_plan,
                     scratch=_scratch(index_plan),
@@ -775,12 +826,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     **candidate_args,
                 )
                 retain_cuda_graph_capture_resource(binding)
-                scores = dsa_indexer.score(binding)
-                if get_tensor_model_parallel_world_size() > 1:
-                    reduced = get_tp_group().all_reduce(scores)
-                    retain_cuda_graph_capture_resource(reduced)
-                    if reduced.data_ptr() != scores.data_ptr():
-                        scores.copy_(reduced)
+                dsa_indexer.score(binding)
                 dsa_indexer.select(binding)
 
         # Reuse the shared arena only after indexing completes. Keep full-batch
@@ -850,11 +896,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             cache_format="deepseek_v41",
         )
 
-    def _o_proj(self, o, positions):
+    def _o_proj(self, o, positions, *, is_prefill=False):
         rows = o.shape[0]
         inverse = _rotated(o, positions, self.rotary_emb.cos_sin_cache, inverse=True)
         grouped = inverse.view(rows, self.n_local_groups, -1)
-        local = self.wo_b(self.wo_a.quant_method.apply(self.wo_a, grouped))
+        local = self.wo_b(
+            self.wo_a.quant_method.apply(self.wo_a, grouped, is_prefill=is_prefill)
+        )
         if local.dtype != torch.bfloat16:
             raise TypeError("V4.1 WO-B must round the local projection to BF16")
         if get_tensor_model_parallel_world_size() > 1:
