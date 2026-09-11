@@ -72,6 +72,7 @@ def _mixed_page_groups(n_mla=3, n_idx=3, n_swa=5):
 
 def _mock_vllm_config(layout: str | None):
     config = MagicMock()
+    config.use_request_boundary_checkpoints = False
     config.cache_config = CacheConfig()
     config.cache_config.num_gpu_blocks_override = None
     config.cache_config.kv_cache_layout = layout
