@@ -10,6 +10,7 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.model_executor.layers import l2_prefetch
 from vllm.model_executor.layers.fused_embed_norm import (
     fused_embed_norm,
     has_full_vocab_on_rank,
@@ -48,13 +49,15 @@ from vllm.models.deepseek_v32.attention import DeepseekV32Attention
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-from .b12x import DeepseekV32B12xAttention
+from .b12x import DeepseekV32B12xAttention, DeepseekV32B12xIndexerAttention
 from .glm52_low_latency_gemm import enable_glm52_low_latency_gemm
 
 
 def _get_attention_cls(vllm_config: VllmConfig) -> type[DeepseekV32Attention]:
     if vllm_config.attention_config.backend == AttentionBackendEnum.B12X:
         return DeepseekV32B12xAttention
+    if envs.VLLM_USE_B12X_SPARSE_INDEXER:
+        return DeepseekV32B12xIndexerAttention
     return DeepseekV32Attention
 
 
@@ -143,12 +146,24 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
         else:
             # The previous layer's MLP/MoE output is left un-reduced; fuse its
             # all-reduce into this input_layernorm.
+            l2_prefetch.issue(
+                hidden_states,
+                getattr(self, "_l2_prefetch_weights", None),
+                l2_prefetch.MOE_WINDOW,
+            )
             hidden_states, residual = fused_allreduce_rms_norm(
                 hidden_states, residual, self.input_layernorm
             )
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
+        # Load this layer's attention output projection into L2 beside the
+        # attention kernels; ordered on the normalised block input.
+        l2_prefetch.issue(
+            hidden_states,
+            getattr(self, "_l2_prefetch_attn_weights", None),
+            l2_prefetch.ATTN_WINDOW,
+        )
         # self_attn's o_proj runs reduce_results=False; reduce before RMSNorm.
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
         if self.use_sequence_parallel:
@@ -161,7 +176,11 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
                 hidden_states, residual, self.post_attention_layernorm
             )
 
-        if self.use_sequence_parallel and isinstance(self.mlp, DeepseekV2MoE):
+        if isinstance(self.mlp, DeepseekV2MoE) and self.mlp.can_reuse_input_as_output(
+            hidden_states
+        ):
+            hidden_states = self.mlp(hidden_states, output_buffer=hidden_states)
+        elif self.use_sequence_parallel and isinstance(self.mlp, DeepseekV2MoE):
             hidden_states = self.mlp(hidden_states, already_sequence_parallel=True)
         else:
             hidden_states = self.mlp(hidden_states)
@@ -219,6 +238,10 @@ class DeepseekV32Model(torch.nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        if getattr(config, "model_type", None) == "glm_moe_dsa":
+            l2_prefetch.register_attention_layers(
+                self.layers, self.start_layer, self.end_layer
+            )
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -293,6 +316,7 @@ class DeepseekV32Model(torch.nn.Module):
             assert not self.use_sequence_parallel, (
                 "Currently, SP is not supported with PP"
             )
+            l2_prefetch.join(hidden_states)
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
@@ -312,6 +336,7 @@ class DeepseekV32Model(torch.nn.Module):
             else:
                 hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         else:
+            l2_prefetch.join(hidden_states)
             hidden_states, _ = fused_allreduce_rms_norm(
                 hidden_states, residual, self.norm
             )

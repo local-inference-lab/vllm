@@ -45,6 +45,7 @@ def _make_communicator(
 
     communicator = object.__new__(B12xPcieAllReduce)
     communicator.disabled = False
+    communicator.rank = 0
     communicator._runtime = runtime
     communicator._dma = None
     communicator._is_capturing = False
@@ -289,6 +290,46 @@ def test_fused_allreduce_has_an_independent_cutoff() -> None:
         residual_out=residual,
         stream=None,
     )
+
+
+@pytest.mark.parametrize("rows", [4, 8, 16])
+def test_fused_allreduce_accepts_split_view_residual(rows: int) -> None:
+    communicator, runtime = _make_communicator(fused_max_bytes=1024)
+    hidden_size = 4
+    combined = torch.randn(rows, hidden_size * 2)
+    _, residual = combined.split(hidden_size, dim=-1)
+    inp = torch.randn(rows, hidden_size)
+    weight = torch.randn(hidden_size)
+
+    assert residual.stride() == (hidden_size * 2, 1)
+    assert (
+        communicator.fused_add_rms_norm_dispatch_reason(inp, residual, weight, 1e-6)
+        == "fused"
+    )
+    assert communicator.try_fused_add_rms_norm(inp, residual, weight, 1e-6)
+    runtime.all_reduce_fused_add_rms_norm.assert_called_once_with(
+        inp,
+        residual,
+        weight,
+        1e-6,
+        out=inp,
+        residual_out=residual,
+        stream=None,
+    )
+
+
+def test_fused_allreduce_reports_residual_layout_rejection() -> None:
+    communicator, runtime = _make_communicator(fused_max_bytes=1024)
+    inp = torch.randn(4, 4)
+    residual = torch.randn(4, 8)[:, ::2]
+    weight = torch.randn(4)
+
+    assert (
+        communicator.fused_add_rms_norm_dispatch_reason(inp, residual, weight, 1e-6)
+        == "residual-layout"
+    )
+    assert not communicator.try_fused_add_rms_norm(inp, residual, weight, 1e-6)
+    runtime.all_reduce_fused_add_rms_norm.assert_not_called()
 
 
 def test_capture_forwards_the_vllm_stream() -> None:

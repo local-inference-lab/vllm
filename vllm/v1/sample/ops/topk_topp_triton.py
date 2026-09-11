@@ -19,6 +19,63 @@ from vllm.utils.platform_utils import num_compute_units
 _TRITON_TABLE_CACHE: dict[tuple[torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
 _TRITON_BUFFER_CACHE: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
 
+
+def _workspace_program_counts(device: torch.device, batch_size: int) -> tuple[int, int]:
+    """Return active and allocated Triton program rows for a batch.
+
+    Args:
+        device: CUDA device whose streaming-multiprocessor count bounds the
+            program grid.
+        batch_size: Number of logits rows the sampler processes.
+
+    Returns:
+        ``(num_programs, allocated_rows)``: the programs launched for the batch
+        and the workspace rows allocated for them (the next power of two,
+        capped at the multiprocessor count). Both are zero for an empty batch.
+    """
+    if batch_size <= 0:
+        return 0, 0
+    num_sm = num_compute_units(device.index)
+    num_programs = min(num_sm, batch_size)
+    allocated_rows = min(next_power_of_2(num_programs), num_sm)
+    return num_programs, allocated_rows
+
+
+def reserve_top_k_top_p_workspace(
+    device: torch.device,
+    dtype: torch.dtype,
+    vocab_size: int,
+    max_batch_size: int,
+) -> int:
+    """Reserve the persistent Triton scratch buffer for a serving capacity.
+
+    The buffer is indexed by Triton program rather than request. Reserving the
+    maximum reachable logits batch before KV-cache sizing prevents a larger
+    seeded, processed-logprobs, or speculative-sampling request from growing
+    the process-wide cache after the remaining device memory belongs to KV.
+
+    Args:
+        device: CUDA device that owns the scratch buffer.
+        dtype: Element type of the sorted logits scratch.
+        vocab_size: Number of logits per row.
+        max_batch_size: Largest logits batch one sampling call can see.
+
+    Returns:
+        Total reserved buffer size in bytes; zero when no program row is
+        needed.
+    """
+    _, allocated_rows = _workspace_program_counts(device, max_batch_size)
+    if allocated_rows == 0:
+        return 0
+
+    buf_key = (device, dtype, vocab_size)
+    buffer = _TRITON_BUFFER_CACHE.get(buf_key)
+    if buffer is None or buffer.shape[0] < allocated_rows:
+        buffer = torch.empty((allocated_rows, vocab_size), dtype=dtype, device=device)
+        _TRITON_BUFFER_CACHE[buf_key] = buffer
+    return buffer.numel() * buffer.element_size()
+
+
 # fmt: off
 _NORMAL_CDF_TO_SIGMA_TABLE = [
   3.656,  3.650,  3.650,  3.650,  3.626,  3.626,  3.626,  3.514,  3.514,  3.503, 
@@ -904,15 +961,13 @@ def apply_top_k_top_p_triton(
     else:
         p_ptr = logits  # Dummy pointer (won't be read)
 
-    num_sm = num_compute_units(logits.device.index)
-    NUM_PROGRAMS = min(num_sm, batch_size)
+    NUM_PROGRAMS, allocated_rows = _workspace_program_counts(logits.device, batch_size)
 
-    # Cache per-Triton Program buffer on each device.
+    # Cache per-Triton program buffer on each device.
     buf_key = (logits.device, logits.dtype, vocab_size)
     buffer = _TRITON_BUFFER_CACHE.get(buf_key)
     if buffer is None or buffer.shape[0] < NUM_PROGRAMS:
-        size = min(next_power_of_2(NUM_PROGRAMS), num_sm)
-        buffer = logits.new_empty((size, vocab_size))
+        buffer = logits.new_empty((allocated_rows, vocab_size))
         _TRITON_BUFFER_CACHE[buf_key] = buffer
     if buffer.shape[0] > NUM_PROGRAMS:
         buffer = buffer[:NUM_PROGRAMS]

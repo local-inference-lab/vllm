@@ -78,8 +78,15 @@ class DeepseekV32B12xAttention(DeepseekV32Attention):
         )
 
 
+class DeepseekV32B12xIndexerAttention(DeepseekV32Attention):
+    """Use the B12X DSA indexer with the configured sparse-MLA backend."""
+
+    indexer_cls = B12xDSAIndexer
+
+
 __all__ = [
     "B12xDSAIndexer",
     "DeepseekV32B12xAttention",
+    "DeepseekV32B12xIndexerAttention",
     "_get_sparse_mla_backend",
 ]

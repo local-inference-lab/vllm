@@ -23,6 +23,7 @@ from vllm.models.deepseek_v4.nvidia import b12x_indexer
 from vllm.models.deepseek_v32.nvidia.b12x import (
     B12xDSAIndexer,
     DeepseekV32B12xAttention,
+    DeepseekV32B12xIndexerAttention,
     _get_sparse_mla_backend,
 )
 from vllm.models.deepseek_v32.nvidia.model import _get_attention_cls
@@ -60,7 +61,8 @@ class _Workspace:
         return [torch.empty(shape, dtype=dtype) for shape, dtype in shapes_and_dtypes]
 
 
-def test_b12x_selector_routes_supported_attention_families() -> None:
+def test_b12x_selector_routes_supported_attention_families(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_USE_B12X_SPARSE_INDEXER", "0")
     assert AttentionConfig(backend="b12x").backend == AttentionBackendEnum.B12X
     assert AttentionBackendEnum.B12X.get_class() is B12xPagedAttentionBackend
     assert B12xMLASparseBackend.get_name() == "B12X"
@@ -78,6 +80,27 @@ def test_b12x_selector_routes_supported_attention_families() -> None:
         hf_text_config=SimpleNamespace(model_type="glm_moe_dsa")
     )
     assert _get_sparse_mla_backend(config) is B12xGLMDSAMLASparseBackend
+
+
+def test_b12x_indexer_selector_preserves_sparse_mla_backend(monkeypatch) -> None:
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(
+            backend=AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120
+        )
+    )
+
+    monkeypatch.setenv("VLLM_USE_B12X_SPARSE_INDEXER", "0")
+    assert _get_attention_cls(config) is not DeepseekV32B12xIndexerAttention
+
+    monkeypatch.setenv("VLLM_USE_B12X_SPARSE_INDEXER", "1")
+    attention_cls = _get_attention_cls(config)
+    assert attention_cls is DeepseekV32B12xIndexerAttention
+    assert attention_cls.indexer_cls is B12xDSAIndexer
+    assert "__init__" not in attention_cls.__dict__
+    assert (
+        config.attention_config.backend
+        == AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120
+    )
 
 
 def test_b12x_sparse_mla_accepts_glm_dsa_contract(monkeypatch) -> None:

@@ -217,7 +217,9 @@ def test_b12x_tensor_fp8_warmup_unit(monkeypatch) -> None:
     assert calls[0][1]["out_dtype"] == torch.bfloat16
 
 
-def test_b12x_warmup_deduplicates_registered_signatures(monkeypatch) -> None:
+def test_b12x_warmup_deduplicates_registered_and_completed_signatures(
+    monkeypatch,
+) -> None:
     import vllm.model_executor.warmup.b12x_warmup as warmup_mod
 
     calls: list[tuple[str, tuple[int, ...], torch.dtype]] = []
@@ -270,14 +272,33 @@ def test_b12x_warmup_deduplicates_registered_signatures(monkeypatch) -> None:
         lambda: synchronized.append(True),
     )
 
-    b12x_warmup(worker, [1, 2])
+    # The return value reports whether the call resolved kernels: a repeated
+    # signature resolves nothing.
+    assert b12x_warmup(worker, [1, 2]) is True
+    assert b12x_warmup(worker, [1, 2]) is False
+    assert b12x_warmup(worker, [1, 2, 3]) is True
 
-    assert scans == 1
+    assert scans == 2
     assert calls == [
         ("first", (1, 2, 4, 8, 16, 29, 32), torch.bfloat16),
         ("second", (1, 2, 4, 8, 16, 29, 32), torch.bfloat16),
+        ("first", (1, 2, 3, 4, 8, 16, 29, 32), torch.bfloat16),
+        ("second", (1, 2, 3, 4, 8, 16, 29, 32), torch.bfloat16),
     ]
-    assert synchronized == [True]
+    assert synchronized == [True, True]
+
+    # Off SM120-class CUDA devices, and with a model that holds no warm-up
+    # units, nothing is resolved.
+    other_platform = SimpleNamespace(
+        is_cuda=lambda: True,
+        is_device_capability_family=lambda family: family == 100,
+    )
+    monkeypatch.setattr(warmup_mod, "current_platform", other_platform)
+    assert b12x_warmup(worker, [5]) is False
+    monkeypatch.setattr(warmup_mod, "current_platform", platform)
+    layers[:] = [SimpleNamespace()]
+    assert b12x_warmup(worker, [5]) is False
+    assert len(calls) == 4
 
 
 def test_b12x_dsa_indexer_warmup_unit_compiles_before_the_index_cache(
@@ -311,7 +332,9 @@ def test_b12x_dsa_indexer_warmup_unit_compiles_before_the_index_cache(
         active_width_cap=torch.zeros(1, dtype=torch.int32),
         topk_indices_buffer=torch.zeros((4, 512), dtype=torch.int32),
         output_physical_slots=False,
+        sort_selection=False,
     )
+    indexer._sorts = lambda plan: indexer_mod.B12xSparseIndexer._sorts(indexer, plan)
     unit = indexer_mod.B12xSparseIndexer.get_b12x_warmup_unit(
         indexer, None, (1,), torch.bfloat16
     )

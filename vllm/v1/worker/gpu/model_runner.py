@@ -70,6 +70,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     RoutedExpertsTensors,
 )
+from vllm.v1.sample.ops.topk_topp_sampler import reserve_top_k_top_p_workspace
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
@@ -865,6 +866,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # during actual execution.
         assert self.sampler is not None
         self.sampler(logits, dummy_input_batch)
+
+    @torch.inference_mode()
+    def reserve_sampler_workspace(self) -> int:
+        """Reserve native sampling scratch before the KV cache is sized.
+
+        One speculative decode step can produce ``decode_query_len`` target
+        logits per request. Native top-k/top-p processing must therefore cover
+        that expanded batch even when ordinary sampling uses FlashInfer.
+
+        Returns:
+            Reserved scratch size in bytes; zero without a sampler or when the
+            native Triton path is not selectable.
+        """
+        if self.sampler is None:
+            return 0
+        max_num_reqs = min(
+            self.max_num_reqs,
+            self.max_num_tokens // max(self.decode_query_len, 1),
+        )
+        return reserve_top_k_top_p_workspace(
+            device=self.device,
+            vocab_size=self.vocab_size,
+            max_batch_size=max_num_reqs * self.decode_query_len,
+        )
 
     @torch.inference_mode()
     def _dummy_pooler_run(self, hidden_states: torch.Tensor) -> None:

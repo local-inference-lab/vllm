@@ -33,6 +33,7 @@ from vllm.v1.attention.backend import (
     MLAAttentionImpl,
     MultipleOf,
 )
+from vllm.v1.attention.backends.mla import b12x_topk_sort
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
     triton_filter_and_convert_dcp_index,
@@ -1839,6 +1840,11 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             )
 
         assert self.topk_indices_buffer is not None
+        # Inside full CUDA graphs the indexer sorts its selection on a side
+        # stream (b12x_topk_sort) while the latent query projection and the
+        # query concatenation above run on this stream; the selection is read
+        # from this point on.
+        b12x_topk_sort.join(self.topk_indices_buffer.device)
         topk_indices = self.topk_indices_buffer[:num_tokens]
         kv_cache_for_run = kv_c_and_k_pe_cache
         if use_ckv_gather:

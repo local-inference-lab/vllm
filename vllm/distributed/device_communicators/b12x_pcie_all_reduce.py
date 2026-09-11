@@ -13,10 +13,33 @@ from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
 from vllm.distributed.parallel_state import in_the_same_node_as
-from vllm.distributed.utils import is_weak_contiguous
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _fused_residual_row_stride(tensor: torch.Tensor) -> int | None:
+    """Return a regular pack-aligned row stride accepted by B12X."""
+
+    if tensor.ndim == 0 or int(tensor.shape[-1]) <= 0 or int(tensor.stride(-1)) != 1:
+        return None
+    hidden_size = int(tensor.shape[-1])
+    if tensor.is_contiguous() or tensor.ndim == 1:
+        row_stride = hidden_size
+    else:
+        row_stride = int(tensor.stride(-2))
+        expected_stride = row_stride
+        for axis in range(tensor.ndim - 3, -1, -1):
+            expected_stride *= int(tensor.shape[axis + 1])
+            if int(tensor.stride(axis)) != expected_stride:
+                return None
+    if (
+        row_stride < hidden_size
+        or row_stride * tensor.element_size() % 16 != 0
+        or tensor.data_ptr() % 16 != 0
+    ):
+        return None
+    return row_stride
 
 
 def _parse_byte_size(value: str) -> int:
@@ -435,6 +458,68 @@ class B12xPcieAllReduce:
             and hasattr(self._runtime, "all_reduce_fused_add_rms_norm")
         )
 
+    def fused_add_rms_norm_dispatch_reason(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> str:
+        """Return the fused dispatch decision for the supplied operands."""
+
+        if not self.supports_fused_add_rms_norm():
+            return "runtime-unavailable"
+        if inp.nbytes > self.fused_max_bytes:
+            return "size-limit"
+        if inp.ndim == 0:
+            return "scalar-input"
+        if residual.shape != inp.shape:
+            return "residual-shape"
+        if residual.dtype != inp.dtype:
+            return "residual-dtype"
+        if residual.device != inp.device:
+            return "residual-device"
+        if _fused_residual_row_stride(residual) is None:
+            return "residual-layout"
+        if weight.shape != (inp.shape[-1],):
+            return "weight-shape"
+        if weight.dtype != inp.dtype:
+            return "weight-dtype"
+        if weight.device != inp.device:
+            return "weight-device"
+        if not weight.is_contiguous():
+            return "weight-layout"
+        if inp.shape[-1] * inp.element_size() % 16 != 0:
+            return "row-alignment"
+        if inp.data_ptr() == residual.data_ptr():
+            return "input-residual-alias"
+        if epsilon < 0:
+            return "negative-epsilon"
+
+        runtime = self._runtime
+        assert runtime is not None
+        if not runtime.for_stream(self._runtime_stream()).should_allreduce(inp):
+            return "input-runtime-rejected"
+        return "fused"
+
+    def _record_fused_add_rms_norm_dispatch(
+        self,
+        reason: str,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> None:
+        if getattr(self, "rank", 0) != 0:
+            return
+        logger.info_once(
+            "B12X PCIe fused all-reduce + RMSNorm dispatch: reason=%s "
+            "shape=%s input_stride=%s residual_stride=%s.",
+            reason,
+            tuple(inp.shape),
+            tuple(inp.stride()),
+            tuple(residual.stride()),
+            scope="process",
+        )
+
     def try_fused_add_rms_norm(
         self,
         inp: torch.Tensor,
@@ -442,29 +527,14 @@ class B12xPcieAllReduce:
         weight: torch.Tensor,
         epsilon: float,
     ) -> bool:
-        if (
-            not self.supports_fused_add_rms_norm()
-            or inp.nbytes > self.fused_max_bytes
-            or inp.ndim == 0
-            or residual.shape != inp.shape
-            or residual.dtype != inp.dtype
-            or residual.device != inp.device
-            or not is_weak_contiguous(residual)
-            or weight.shape != (inp.shape[-1],)
-            or weight.dtype != inp.dtype
-            or weight.device != inp.device
-            or not weight.is_contiguous()
-            or inp.shape[-1] * inp.element_size() % 16 != 0
-            or inp.data_ptr() == residual.data_ptr()
-            or epsilon < 0
-        ):
+        reason = self.fused_add_rms_norm_dispatch_reason(inp, residual, weight, epsilon)
+        self._record_fused_add_rms_norm_dispatch(reason, inp, residual)
+        if reason != "fused":
             return False
 
         runtime = self._runtime
         assert runtime is not None
         stream = self._runtime_stream()
-        if not runtime.for_stream(stream).should_allreduce(inp):
-            return False
         if self._is_capturing and not torch.cuda.is_current_stream_capturing():
             prepare = getattr(runtime, "prepare_graph_fused_add_rms_norm", None)
             if prepare is not None:

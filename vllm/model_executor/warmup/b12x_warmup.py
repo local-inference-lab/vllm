@@ -17,6 +17,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_WarmupSignature = tuple[tuple[int, ...], torch.dtype]
+
 
 def _collect_warmup_units(
     model: torch.nn.Module,
@@ -48,11 +50,24 @@ def _compile_warmup_units(
     return warmed
 
 
-def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> None:
+def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> bool:
+    """Resolve the B12X kernels the loaded model will launch when serving.
+
+    Args:
+        worker: The worker holding the loaded model and its configuration.
+        cudagraph_capture_sizes: The CUDA-graph capture sizes; with the
+            batched-token limit and the compile sizes they define the
+            capacities to resolve.
+
+    Returns:
+        Whether this call resolved kernels: ``False`` off CUDA SM120-class
+        devices, when the model holds no B12X warm-up units, or when the
+        same capacities and dtype were already resolved in this worker.
+    """
     if not current_platform.is_cuda():
-        return
+        return False
     if not current_platform.is_device_capability_family(120):
-        return
+        return False
 
     output_dtype = getattr(
         getattr(worker, "model_config", None),
@@ -81,14 +96,41 @@ def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> None:
         max_tokens=max_tokens,
         cudagraph_capture_sizes=serving_sizes,
     )
-    units = _collect_warmup_units(
-        worker.get_model(),
-        token_counts,
-        output_dtype,
+    # Memory profiling resolves B12X kernels before sizing the KV cache. The
+    # regular pre-capture warmup later requests the same static capacities in
+    # the same worker. Repeating those launches after KV allocation can require
+    # cold-start scratch that was intentionally excluded from the repeatable
+    # serving peak. The model is fully loaded before either call, so its exact
+    # capacity set and output dtype identify the worker-local request even when
+    # a provider resolves internal kernel state during the first warmup.
+    signature: _WarmupSignature = (token_counts, output_dtype)
+    completed: set[_WarmupSignature] = getattr(
+        worker, "_b12x_completed_warmup_signatures", set()
     )
+    if signature in completed:
+        logger.info_once(
+            "Skipping repeated B12X warmup for capacities=%s and dtype=%s.",
+            token_counts,
+            output_dtype,
+        )
+        return False
+
+    units = tuple(
+        _collect_warmup_units(
+            worker.get_model(),
+            token_counts,
+            output_dtype,
+        )
+    )
+    if not units:
+        return False
+
     for name, count in _compile_warmup_units(units).items():
         logger.info_once(
             "Warmed up %d b12x %s kernel signature(s).",
             count,
             name,
         )
+    completed.add(signature)
+    vars(worker)["_b12x_completed_warmup_signatures"] = completed
+    return True

@@ -7,6 +7,7 @@ from vllm.config import VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.models.utils import get_draft_quant_config
 
 
 def _make_eagle_draft_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
@@ -36,6 +37,11 @@ def _make_eagle_draft_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
                 cache_dtype=speculative_config.kv_cache_dtype,
             ),
         )
+    # Model loading reads VllmConfig.quant_config even when model_config is
+    # overridden with the speculative model. Rebuild the matcher from the
+    # speculative checkpoint metadata so draft-only layers use their declared
+    # precision instead of the target model's quantization rules.
+    vllm_config.quant_config = get_draft_quant_config(vllm_config)
     return vllm_config
 
 

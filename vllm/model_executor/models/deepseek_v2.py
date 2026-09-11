@@ -286,6 +286,8 @@ class DeepseekV2MLP(nn.Module):
 
 
 class DeepseekV2MoE(nn.Module):
+    _OUTPUT_REUSE_MIN_TOKENS = 1024
+
     def __init__(
         self,
         config: DeepseekV2Config | DeepseekV3Config,
@@ -410,18 +412,47 @@ class DeepseekV2MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         already_sequence_parallel: bool = False,
+        output_buffer: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+
+        if output_buffer is not None:
+            if not self.can_reuse_input_as_output(hidden_states):
+                raise ValueError(
+                    "DeepSeek MoE input storage is not eligible for output reuse"
+                )
+            if (
+                output_buffer.shape != hidden_states.shape
+                or output_buffer.stride() != hidden_states.stride()
+                or output_buffer.untyped_storage().data_ptr()
+                != hidden_states.untyped_storage().data_ptr()
+            ):
+                raise ValueError(
+                    "DeepSeek MoE output storage must be the consumed input tensor"
+                )
+            logger.info_once(
+                "DeepSeek MoE is writing large prefill expert sums into "
+                "consumed input storage (shape=%s).",
+                tuple(hidden_states.shape),
+            )
 
         # Chunk the hidden states so they aren't replicated across TP ranks.
         # This avoids duplicate computation in self.experts.
         if self.is_sequence_parallel and not already_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=hidden_states
-        )
+        if output_buffer is None:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=hidden_states,
+            )
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=hidden_states,
+                output_buffer=output_buffer,
+            )
 
         if self.is_sequence_parallel and not already_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
@@ -430,6 +461,30 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = final_hidden_states[:num_tokens]
 
         return final_hidden_states.view(num_tokens, hidden_dim)
+
+    def can_reuse_input_as_output(self, hidden_states: torch.Tensor) -> bool:
+        """Return whether a large consumed MoE input can hold its output.
+
+        Args:
+            hidden_states: MoE input whose storage the caller no longer needs
+                after the routed and shared experts have consumed it.
+
+        Returns:
+            True when the layer runs in inference mode without sequence
+            parallelism, has shared experts, skips the final all-reduce, has
+            no routed-output transform, and ``hidden_states`` is a contiguous
+            2-D tensor of at least ``_OUTPUT_REUSE_MIN_TOKENS`` rows.
+        """
+        return bool(
+            not torch.is_grad_enabled()
+            and not self.is_sequence_parallel
+            and self.shared_experts is not None
+            and hidden_states.ndim == 2
+            and hidden_states.shape[0] >= self._OUTPUT_REUSE_MIN_TOKENS
+            and hidden_states.is_contiguous()
+            and self.experts.moe_config.skip_final_all_reduce
+            and self.experts.routed_output_transform is None
+        )
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:

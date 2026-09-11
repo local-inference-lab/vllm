@@ -12,6 +12,9 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from vllm.distributed.device_communicators.b12x_pcie_all_reduce import (
+    get_b12x_pcie_allreduce,
+)
 from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
     _AR_RESIDUAL_RMS_NORM,
     _can_use_flashinfer,
@@ -25,17 +28,35 @@ def fused_allreduce_rms_norm(
     residual: torch.Tensor,
     norm: RMSNorm,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """All-reduce + add residual + (standard) RMSNorm, fused via flashinfer.
+    """All-reduce + add residual + standard RMSNorm with available fusion.
 
-    ``hidden_states`` is the per-rank *partial* output of a row-parallel linear
-    run with ``reduce_results=False``; ``norm`` is the RMSNorm applied right
-    after. Returns ``(normed_output, new_residual)``, equivalent to
-    ``norm(all_reduce(hidden_states), residual)``. Falls back to an explicit
-    all-reduce + RMSNorm when the flashinfer fast path is unavailable.
+    An active B12X PCIe communicator gets the first opportunity to execute the
+    fused operation; FlashInfer is used for shapes B12X rejects. The final
+    fallback is an explicit all-reduce followed by RMSNorm.
+
+    Args:
+        hidden_states: Per-rank partial output of a row-parallel linear run
+            with ``reduce_results=False``. The B12X and FlashInfer paths
+            overwrite it with the new residual.
+        residual: Residual stream added after the reduction.
+        norm: RMSNorm applied to the reduced sum.
+
+    Returns:
+        ``(normed_output, new_residual)``, equivalent to
+        ``norm(all_reduce(hidden_states), residual)``.
     """
     tp_size = get_tensor_model_parallel_world_size()
     if tp_size == 1:
         return norm(hidden_states, residual)
+
+    b12x_communicator = get_b12x_pcie_allreduce()
+    if b12x_communicator is not None and b12x_communicator.try_fused_add_rms_norm(
+        hidden_states,
+        residual,
+        norm.weight,
+        norm.variance_epsilon,
+    ):
+        return hidden_states, residual
 
     if flashinfer_trtllm_fused_allreduce_norm is not None:
         ok, max_token_num = _can_use_flashinfer(hidden_states, tp_size)

@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_USE_B12X_SPARSE_INDEXER: bool = False
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -1642,6 +1643,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Force b12x FP4 MoE to use BF16 activations.
     "VLLM_B12X_MOE_FP4_FORCE_A16": lambda: bool(
         int(os.getenv("VLLM_B12X_MOE_FP4_FORCE_A16", "0"))
+    ),
+    # Use the bounded B12X DSA indexer independently of the sparse-MLA backend.
+    "VLLM_USE_B12X_SPARSE_INDEXER": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_SPARSE_INDEXER", "0"))
     ),
     # Dense activation precision; recipe overrides take precedence.
     "VLLM_B12X_DENSE_ACTIVATION_MODE": env_with_choices(

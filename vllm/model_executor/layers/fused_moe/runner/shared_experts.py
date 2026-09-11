@@ -36,6 +36,42 @@ class SharedExpertsOrder(IntEnum):
     MULTI_STREAM_OVERLAPPED = (3,)
 
 
+class SharedExpertsFromGateUp(torch.nn.Module):
+    """Shared-expert MLP whose gate_up projection may be supplied by the MoE
+    runner.
+
+    The runner's weight-first projection (b12x ``gemm.weight_first_gemv``)
+    computes the router logits and the shared expert's gate_up activation in
+    one kernel at decode row counts. When the runner has stored that
+    activation in ``gate_up``, ``forward`` applies the activation function and
+    the down projection to it and clears it; otherwise it runs the wrapped MLP
+    on its input. Attributes the wrapper does not define resolve on the
+    wrapped MLP (``shard_sequence_parallel`` and the like).
+    """
+
+    def __init__(self, mlp: torch.nn.Module):
+        super().__init__()
+        self.mlp = mlp
+        self.gate_up: torch.Tensor | None = None
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            if name in ("mlp", "gate_up"):
+                raise
+            return getattr(super().__getattr__("mlp"), name)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up = self.gate_up
+        if gate_up is None:
+            return self.mlp(x)
+        self.gate_up = None
+        hidden = self.mlp.act_fn(gate_up)
+        out, _ = self.mlp.down_proj(hidden)
+        return out
+
+
 class SharedExperts(torch.nn.Module):
     def __init__(
         self,

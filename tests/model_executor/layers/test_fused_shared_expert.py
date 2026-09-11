@@ -15,6 +15,7 @@ import vllm.config as vllm_config_module
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import utils as fused_moe_utils
 from vllm.model_executor.layers.fused_moe.layer import determine_expert_counts
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
 from vllm.model_executor.layers.quantization.utils.config_utils import (
     is_shared_expert_quant_fse_compatible,
@@ -275,6 +276,51 @@ def test_determine_expert_counts_fuse_shared_experts_override(
     common_args = (8, 0, 2)
     assert determine_expert_counts(*common_args, True)[2] == 2
     assert determine_expert_counts(*common_args, False)[2] == 0
+
+
+def test_modular_runner_joins_shared_experts_before_routed_launch() -> None:
+    events: list[str] = []
+    topk_weights = torch.ones(1, 1)
+    topk_ids = torch.zeros(1, 1, dtype=torch.int32)
+
+    runner = SimpleNamespace(
+        _shared_experts=None,
+        _quant_method=SimpleNamespace(topk_indices_dtype=torch.int32),
+    )
+
+    def apply_shared_experts(_input, order) -> None:
+        events.append(f"shared:{order.name}")
+
+    def select_experts(**_kwargs):
+        events.append("route")
+        return topk_weights, topk_ids
+
+    def forward_modular(**_kwargs):
+        events.append("routed")
+        return torch.ones(1)
+
+    runner._maybe_apply_shared_experts = apply_shared_experts
+    runner.router = SimpleNamespace(
+        select_experts=select_experts,
+    )
+    runner.routed_experts = SimpleNamespace(
+        quant_method=SimpleNamespace(is_monolithic=False),
+        forward_modular=forward_modular,
+    )
+
+    MoERunner._apply_quant_method(
+        runner,
+        hidden_states=torch.ones(1, 1),
+        router_logits=torch.ones(1, 1),
+        shared_experts_input=torch.ones(1, 1),
+    )
+
+    assert events == [
+        "shared:NO_OVERLAP",
+        "route",
+        "shared:MULTI_STREAM_OVERLAPPED",
+        "routed",
+    ]
 
 
 def test_resolve_layer_fused_shared_expert_skips_compatibility_when_disabled(

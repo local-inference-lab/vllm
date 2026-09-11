@@ -238,6 +238,7 @@ def test_b12x_sparse_mla_prefill_binds_request_sequence_lengths(
     impl._q_head_dim = 576
     impl._topk_tokens = 4
     impl._ckv_local_capacity = 0
+    impl._cache_record_bytes = 656
     impl.topk_indices_buffer = torch.zeros((8, 4), dtype=torch.int32)
     impl.dcp_world_size = 1
     impl.kv_lora_rank = 512

@@ -18,6 +18,37 @@ if HAS_TRITON:
 logger = init_logger(__name__)
 
 
+def reserve_top_k_top_p_workspace(
+    device: torch.device,
+    vocab_size: int,
+    max_batch_size: int,
+) -> int:
+    """Reserve native top-k/top-p scratch for the maximum serving batch.
+
+    Args:
+        device: Device the sampler runs on.
+        vocab_size: Number of logits per row.
+        max_batch_size: Largest logits batch one sampling call can see.
+
+    Returns:
+        Reserved scratch size in bytes; zero when the Triton path cannot be
+        selected (fewer than eight rows, no Triton, or a non-CUDA platform).
+    """
+    # CUDA batches below eight rows use the PyTorch sort implementation.
+    if max_batch_size < 8 or not HAS_TRITON or not current_platform.is_cuda():
+        return 0
+    from vllm.v1.sample.ops.topk_topp_triton import (
+        reserve_top_k_top_p_workspace as reserve_triton_workspace,
+    )
+
+    return reserve_triton_workspace(
+        device=device,
+        dtype=torch.float32,
+        vocab_size=vocab_size,
+        max_batch_size=max_batch_size,
+    )
+
+
 def _skip_aiter_sampler_on_gfx1250() -> bool:
     # Lazy ROCm-only import; keeps arch detection out of import time on CUDA/CPU.
     from vllm.platforms.rocm import on_gfx1250

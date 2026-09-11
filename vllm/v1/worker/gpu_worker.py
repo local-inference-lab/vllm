@@ -516,6 +516,19 @@ class Worker(WorkerBase):
         """
         maybe_apply_startup_plan(self)
 
+        reserve_sampler_workspace = getattr(
+            self.model_runner, "reserve_sampler_workspace", None
+        )
+        sampler_workspace_bytes = (
+            reserve_sampler_workspace() if callable(reserve_sampler_workspace) else 0
+        )
+        if sampler_workspace_bytes:
+            logger.info_once(
+                "Reserved %s GiB of persistent native top-k/top-p sampler "
+                "workspace before KV cache sizing.",
+                format_gib(sampler_workspace_bytes),
+            )
+
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
@@ -540,6 +553,16 @@ class Worker(WorkerBase):
                 getattr(self.parallel_config, "_api_process_count", 1),
             )
 
+        compilation_config = self.vllm_config.compilation_config
+        profile_cudagraphs = (
+            current_platform.is_cuda_alike()
+            and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        )
+        capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
+        first_profile_snapshot: MemorySnapshot | None = None
+        b12x_warmup_snapshot: MemorySnapshot | None = None
+        repeatable_profile_snapshot: MemorySnapshot | None = None
+
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         with memory_profiling(
@@ -548,6 +571,21 @@ class Worker(WorkerBase):
         ) as profile_result:
             self.model_runner.profile_run()
             self.model_runner.profile_glm_dcp_attention()
+            first_profile_snapshot = MemorySnapshot(device=self.device)
+            # Resolve persistent B12X modules before the graph-memory profiler
+            # enters its descriptor capture loop (a disk-cache miss can run
+            # CUDA module initialization on first use, which is not a valid
+            # operation between breakable graph descriptors). When kernels
+            # were resolved, KV sizing must use a repeatable serving peak:
+            # discard the cold-start high-water and measure the same model
+            # profile again. Deployments without B12X kernels keep the single
+            # profile.
+            if profile_cudagraphs and b12x_warmup(self, capture_sizes):
+                b12x_warmup_snapshot = MemorySnapshot(device=self.device)
+                torch.accelerator.reset_peak_memory_stats(self.device)
+                self.model_runner.profile_run()
+                self.model_runner.profile_glm_dcp_attention()
+                repeatable_profile_snapshot = MemorySnapshot(device=self.device)
 
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
@@ -556,18 +594,7 @@ class Worker(WorkerBase):
         # torch.cuda handle the live capture path already uses on ROCm.
         # XPU stays excluded (see #39977).
         cudagraph_memory_estimate = 0
-        if (
-            current_platform.is_cuda_alike()
-            and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-        ):
-            # Resolve B12X launch modules before the graph-memory profiler
-            # enters its descriptor capture loop. A disk-cache miss can run
-            # CUDA module initialization on first use, which is not a valid
-            # operation to introduce between breakable graph descriptors.
-            capture_sizes = list(
-                self.vllm_config.compilation_config.cudagraph_capture_sizes or []
-            )
-            b12x_warmup(self, capture_sizes)
+        if profile_cudagraphs:
             cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
         # Respect the opt-in flag as originally designed.
@@ -580,7 +607,14 @@ class Worker(WorkerBase):
         # Backend and CUDA-graph profiling can initialize communication pools,
         # compiled modules, and other persistent device allocations after the
         # main activation profile. Include their retained footprint before the
-        # remaining memory is assigned to production KV cache storage.
+        # remaining memory is assigned to production KV cache storage. The
+        # activation profile measured ``after_profile`` after releasing the
+        # allocator's cached blocks; measure the final snapshot the same way,
+        # so that blocks the graph-memory profile left cached but free (its
+        # temporary graph pools) are not charged as persistent memory on top
+        # of the CUDA-graph estimate.
+        gc.collect()
+        torch.accelerator.empty_cache()
         final_profile_snapshot = MemorySnapshot(device=self.device)
         late_persistent_memory = max(
             profile_result.after_profile.free_memory
@@ -588,9 +622,30 @@ class Worker(WorkerBase):
             0,
         )
         self.total_consumed = profile_result.total_consumed + late_persistent_memory
+        # The CUDA-graph estimate is the free-memory drop across the profiling
+        # capture, so it already contains the allocations that capture left
+        # behind; when it is applied, charge only the retained memory beyond
+        # it, otherwise the retained memory would be deducted twice.
+        late_persistent_charge = max(
+            late_persistent_memory - cudagraph_memory_estimate_applied, 0
+        )
+        repeatable_allocator_headroom = profile_result.transient_peak_headroom
+        if repeatable_profile_snapshot is not None:
+            # KV allocation must leave enough physical capacity for the warmed
+            # eager profile to recreate its allocator-reserved high-water. Live
+            # allocations alone can understate that requirement when serving
+            # runs beside CUDA-graph private pools or fragmented free blocks.
+            repeatable_allocator_headroom = max(
+                repeatable_allocator_headroom,
+                repeatable_profile_snapshot.torch_memory
+                - profile_result.after_profile.torch_memory,
+            )
+        allocator_headroom_correction = (
+            repeatable_allocator_headroom - profile_result.transient_peak_headroom
+        )
         # KV admission subtracts the graph estimate separately. Post-capture
         # recommendations add measured graph memory to this activation peak.
-        self.peak_activation_memory = profile_result.transient_peak_headroom
+        self.peak_activation_memory = repeatable_allocator_headroom
         self.cudagraph_memory_estimate = cudagraph_memory_estimate
 
         free_gpu_memory = final_profile_snapshot.free_memory
@@ -608,8 +663,9 @@ class Worker(WorkerBase):
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
             - profile_result.non_kv_cache_memory
-            - late_persistent_memory
+            - late_persistent_charge
             - cudagraph_memory_estimate_applied
+            - allocator_headroom_correction
         )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
@@ -625,6 +681,86 @@ class Worker(WorkerBase):
             format_gib(free_gpu_memory - unrequested_memory),
         )
         logger.debug(profile_result)
+        initialized_before_profile = (
+            self.init_snapshot.free_memory - profile_result.before_profile.free_memory
+        )
+        retained_by_profile = (
+            profile_result.before_profile.free_memory
+            - profile_result.after_profile.free_memory
+        )
+        torch_allocated_since_worker_init = (
+            profile_result.after_profile.torch_allocated
+            - self.init_snapshot.torch_allocated
+        )
+        torch_reserved_since_worker_init = (
+            profile_result.after_profile.torch_memory - self.init_snapshot.torch_memory
+        )
+        non_torch_since_worker_init = (
+            profile_result.after_profile.non_torch_memory
+            - self.init_snapshot.non_torch_memory
+        )
+        logger.info_once(
+            "KV cache memory budget components: requested=%s GiB, weights=%s GiB, "
+            "persistent_total=%s GiB, late_persistent=%s GiB, "
+            "transient_peak=%s GiB, repeatable_allocator_headroom=%s GiB, "
+            "cudagraph=%s GiB",
+            format_gib(self.requested_memory),
+            format_gib(profile_result.weights_memory),
+            format_gib(profile_result.total_consumed),
+            format_gib(late_persistent_memory),
+            format_gib(profile_result.transient_peak_headroom),
+            format_gib(repeatable_allocator_headroom),
+            format_gib(cudagraph_memory_estimate_applied),
+        )
+        logger.info_once(
+            "KV cache persistent memory detail: initialized_before_profile=%s GiB, "
+            "retained_by_profile=%s GiB, torch_allocated_since_worker_init=%s "
+            "GiB, torch_reserved_since_worker_init=%s GiB, "
+            "non_torch_since_worker_init=%s GiB",
+            format_gib(initialized_before_profile),
+            format_gib(retained_by_profile),
+            format_gib(torch_allocated_since_worker_init),
+            format_gib(torch_reserved_since_worker_init),
+            format_gib(non_torch_since_worker_init),
+        )
+        if (
+            first_profile_snapshot is not None
+            and b12x_warmup_snapshot is not None
+            and repeatable_profile_snapshot is not None
+        ):
+            stage_values: list[str] = []
+            for snapshot in (
+                first_profile_snapshot,
+                b12x_warmup_snapshot,
+                repeatable_profile_snapshot,
+                profile_result.after_profile,
+                final_profile_snapshot,
+            ):
+                stage_values.extend(
+                    (
+                        format_gib(
+                            self.init_snapshot.free_memory - snapshot.free_memory
+                        ),
+                        format_gib(
+                            snapshot.torch_allocated
+                            - self.init_snapshot.torch_allocated
+                        ),
+                        format_gib(
+                            snapshot.torch_memory - self.init_snapshot.torch_memory
+                        ),
+                        format_gib(
+                            snapshot.non_torch_memory
+                            - self.init_snapshot.non_torch_memory
+                        ),
+                    )
+                )
+            logger.info_once(
+                "KV cache profiling stages (total/torch_allocated/torch_reserved/"
+                "non_torch GiB): first_profile=%s/%s/%s/%s, "
+                "b12x_warmup=%s/%s/%s/%s, repeatable_profile=%s/%s/%s/%s, "
+                "post_cleanup=%s/%s/%s/%s, post_cudagraph_profile=%s/%s/%s/%s",
+                *stage_values,
+            )
         logger.info_once(
             "Available KV cache memory: %s GiB",
             format_gib(self.available_kv_cache_memory_bytes),

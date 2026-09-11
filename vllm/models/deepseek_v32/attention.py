@@ -438,7 +438,18 @@ class DeepseekV32Attention(MLAAttention):
 
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        ql_nope = torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
+        if self._fp8_query:
+            # The fp8 query packs [ql_nope; q_pe] inside fused_q, so the latent
+            # query projection precedes it.
+            ql_nope: torch.Tensor | None = self._latent_query(q_nope)
+        else:
+            # The bf16 query keeps ql_nope separate and fused_q does not read
+            # it. The projection runs after the indexer launch instead
+            # (_sparse_indexer_and_attn): the indexer's selection sort runs on
+            # a side stream from the indexer to the attention kernels, and the
+            # projection and the query concatenation are the main-stream work
+            # that hides it.
+            ql_nope = None
 
         if self.indexer is not None and not self.skip_topk:
             index_q = self.indexer.wq_b(q_c)[0]
@@ -470,10 +481,15 @@ class DeepseekV32Attention(MLAAttention):
             kv_c_out,
             k_pe_out,
             ql_nope,
+            q_nope,
             mqa_q,
             output,
         )
         return self.o_proj(output)[0]
+
+    def _latent_query(self, q_nope: torch.Tensor) -> torch.Tensor:
+        """Project the query's NoPE part into the KV latent space (W_UK)."""
+        return torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
 
     @eager_break_during_capture
     def _sparse_indexer_and_attn(
@@ -484,7 +500,8 @@ class DeepseekV32Attention(MLAAttention):
         index_weights_out: torch.Tensor | None,
         kv_c: torch.Tensor | None,
         k_pe: torch.Tensor | None,
-        ql_nope: torch.Tensor,
+        ql_nope: torch.Tensor | None,
+        q_nope: torch.Tensor,
         mqa_q: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
@@ -512,6 +529,11 @@ class DeepseekV32Attention(MLAAttention):
                     self._vllm_config.parallel_config.cp_kv_cache_interleave_size
                 ),
             )
+
+        if ql_nope is None:
+            # bf16 query path: issued after the indexer so the selection sort
+            # on the side stream overlaps this projection.
+            ql_nope = self._latent_query(q_nope)
 
         attn_metadata, _, kv_cache, layer_slot_mapping = get_attention_context(
             self.layer_name

@@ -756,9 +756,11 @@ def test_fused_q_no_indexer(num_tokens: int):
 
 @pytest.mark.parametrize("num_tokens", [1, 17, 512])
 @pytest.mark.parametrize("has_indexer", [True, False])
-def test_fused_q_bf16_query(num_tokens: int, has_indexer: bool):
+@pytest.mark.parametrize("pass_ql_nope", [True, False])
+def test_fused_q_bf16_query(num_tokens: int, has_indexer: bool, pass_ql_nope: bool):
     """bf16-query path (FlashMLA sparse, SM90/SM100): only the RoPE'd q_pe is
-    produced (bf16, unquantized); ql_nope is consumed directly by the caller."""
+    produced (bf16, unquantized); ql_nope is consumed directly by the caller
+    and may be omitted (``None``) because the kernel never reads it."""
     torch.manual_seed(6)
     dev = "cuda"
     max_pos = 8192
@@ -787,7 +789,7 @@ def test_fused_q_bf16_query(num_tokens: int, has_indexer: bool):
         q_cos_sin,
         index_q,
         idx_cos_sin,
-        ql_nope,
+        ql_nope if pass_ql_nope else None,
         q_scale,
         index_w,
         INDEX_HEAD_DIM**-0.5,

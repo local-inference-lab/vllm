@@ -1843,7 +1843,9 @@ def test_glm5next_loads_separate_conv1d_shards() -> None:
     )
 
 
-def test_glm5next_mtp_uses_draft_kernel_overrides() -> None:
+def test_glm5next_mtp_uses_draft_model_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     @dataclass
     class KernelConfig:
         moe_backend: str
@@ -1862,6 +1864,13 @@ def test_glm5next_mtp_uses_draft_kernel_overrides() -> None:
         attention_config: AttentionConfig
         cache_config: CacheConfig
         speculative_config: SimpleNamespace
+        quant_config: object
+
+    draft_quant_config = object()
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.spec_decode.eagle.utils.get_draft_quant_config",
+        lambda _config: draft_quant_config,
+    )
 
     target_config = VllmConfig(
         kernel_config=KernelConfig(moe_backend="b12x"),
@@ -1872,14 +1881,17 @@ def test_glm5next_mtp_uses_draft_kernel_overrides() -> None:
             attention_backend=AttentionBackendEnum.B12X,
             kv_cache_dtype=None,
         ),
+        quant_config=object(),
     )
 
     draft_config = _make_eagle_draft_vllm_config(target_config)  # type: ignore[arg-type]
 
     assert draft_config.kernel_config.moe_backend == "humming"
     assert draft_config.attention_config.backend == AttentionBackendEnum.B12X
+    assert draft_config.quant_config is draft_quant_config
     assert target_config.kernel_config.moe_backend == "b12x"
     assert target_config.attention_config.backend == AttentionBackendEnum.FLASH_ATTN
+    assert target_config.quant_config is not draft_quant_config
 
 
 def test_glm5next_mtp_maps_multimodal_quantization_prefix() -> None:

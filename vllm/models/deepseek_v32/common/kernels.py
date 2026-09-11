@@ -818,7 +818,7 @@ def fused_q(
     q_pe_cos_sin_cache: torch.Tensor,
     index_q: torch.Tensor | None,
     index_q_cos_sin_cache: torch.Tensor | None,
-    ql_nope: torch.Tensor,
+    ql_nope: torch.Tensor | None,
     q_scale: torch.Tensor,
     # Index weights
     index_weights: torch.Tensor | None,
@@ -834,14 +834,21 @@ def fused_q(
     is True (FlashInfer sparse, fp8 query) ``mqa_q`` is a single fp8 tensor
     packing ``[ql_nope; q_pe]``. When False (FlashMLA sparse, bf16 query) it is
     the RoPE'd ``q_pe`` in bf16; the caller pairs it with ``ql_nope`` as the
-    ``(ql_nope, q_pe)`` tuple the backend expects.
+    ``(ql_nope, q_pe)`` tuple the backend expects. On that path the kernel
+    never reads ``ql_nope``, and ``None`` may be passed so the caller can
+    compute the latent query after this call.
     """
     assert positions.ndim == 1
     assert positions.dtype == torch.int64
     assert q_pe.ndim == 3
     assert q_pe_cos_sin_cache.ndim == 2
-    assert ql_nope.ndim == 3
-    assert ql_nope.shape[:2] == q_pe.shape[:2]
+    if ql_nope is None:
+        assert not quantize_mqa, "the fp8 query pack reads ql_nope"
+        # Placeholder for the pack pointer of a program that returns at once.
+        ql_nope = _dummy((1, 1, 1), q_pe.dtype, q_pe.device)
+    else:
+        assert ql_nope.ndim == 3
+        assert ql_nope.shape[:2] == q_pe.shape[:2]
     assert q_scale.dtype == torch.float32 and q_scale.numel() == 1
     num_tokens = positions.shape[0]
     num_q_heads = q_pe.shape[1]
