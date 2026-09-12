@@ -801,9 +801,15 @@ def test_b12x_glm5_next_full_ckv_workspaces_follow_cache_format(
     impl._ckv_local_capacity = 128
     impl.dcp_world_size = 4
     impl._cache_record_bytes = record_bytes
+    impl._plans = {
+        ("ckv_extend", 32): SimpleNamespace(
+            scratch_specs=lambda: (SimpleNamespace(nbytes=8),)
+        )
+    }
     specs = impl._workspace_specs(input_num_heads=8, include_ckv=True)
 
     assert len(specs) == 3
+    assert specs[1] == ((8,), torch.uint8)
     assert specs[-1] == ((512, record_bytes), torch.uint8)
 
 
