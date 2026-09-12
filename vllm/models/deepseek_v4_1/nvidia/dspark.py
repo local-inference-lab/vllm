@@ -60,7 +60,6 @@ from .model import (
     DeepseekV4DecoderLayer,
     _linear_scale_param_name,
     _use_sequence_parallel,
-    make_deepseek_v4_expert_params_mapping,
 )
 
 logger = init_logger(__name__)
@@ -527,8 +526,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         Non-mtp weights (embed/head/main layers) belong to the target model and
         are skipped here. ``embed_tokens``/``lm_head`` are aliased from the target.
         """
-        first_layer = self.model.layers[0]
-        use_mega_moe = first_layer.ffn.use_mega_moe
         # Draft MoE layers use the dspark_* expert counts, not the
         # backbone's (see DeepseekV4MoE and the reference
         # ModelArgs.get_moe_config).
@@ -536,16 +533,13 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             getattr(self.config, "dspark_n_routed_experts", 0)
             or self.config.n_routed_experts
         )
-        if use_mega_moe:
-            expert_mapping = make_deepseek_v4_expert_params_mapping(n_draft_experts)
-        else:
-            expert_mapping = fused_moe_make_expert_params_mapping(
-                self,
-                ckpt_gate_proj_name="w1",
-                ckpt_down_proj_name="w2",
-                ckpt_up_proj_name="w3",
-                num_experts=n_draft_experts,
-            )
+        expert_mapping = fused_moe_make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name="w1",
+            ckpt_down_proj_name="w2",
+            ckpt_up_proj_name="w3",
+            num_experts=n_draft_experts,
+        )
         expert_scale_suffix = (
             ".weight_scale"
             if getattr(self.config, "expert_dtype", "fp4") == "fp4"
@@ -646,12 +640,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
-    def _finalize_moe(self) -> None:
-        for layer in self.model.layers:
-            layer.ffn.finalize_mega_moe_weights()
-
     def process_weights_after_loading(self) -> None:
-        self._finalize_moe()
         self.model._context_kv_projections = [
             _ContextKVProjection(layer.attn, self.model.context_capacity)
             for layer in self.model.layers

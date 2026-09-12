@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -20,6 +21,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -47,18 +49,17 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_padding_mask,
     sp_shard,
 )
-from vllm.models.deepseek_v4.nvidia.model import make_deepseek_v4_expert_params_mapping
+from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MoE
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
-from ..b12x_layers import B12xMHC, collapse, stream_mean
+from ..b12x_layers import B12xLinearMethod, B12xMHC, collapse, stream_mean
 from ..b12x_layers import B12xRMSNorm as RMSNorm
 from ..ced import ced_decoder_start, gather_rows, scatter_rows
 from ..common.engram import Engram, EngramLayout, NgramHashState
 from ..common.mm_preprocess import image_sentinel_mask
 from .b12x_attention import DeepseekV41B12xAttention
-from .b12x_moe import DeepseekV4MoE
 
 if typing.TYPE_CHECKING:
     pass
@@ -116,10 +117,38 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         if self.use_sequence_parallel:
             self.attn.wo_b.reduce_results = False
+        if config.scoring_func != "sqrtsoftplus" or not config.norm_topk_prob:
+            raise ValueError("V4.1 requires normalized sqrtsoftplus routing")
+        if getattr(config, "gate_temp", 1.0) != 1.0:
+            raise ValueError("V4.1 requires gate_temp=1")
+        is_draft = extract_layer_index(prefix) >= config.num_hidden_layers
+        moe_config = vllm_config
+        if is_draft:
+            # Only the expert counts differ; use the same DSV4 TP implementation.
+            moe_config = copy.copy(vllm_config)
+            moe_config.model_config = copy.copy(vllm_config.model_config)
+            moe_config.model_config.hf_config = copy.copy(config)
+            moe_config.model_config.hf_config.n_routed_experts = (
+                config.dspark_n_routed_experts
+            )
+            moe_config.model_config.hf_config.num_experts_per_tok = (
+                config.dspark_num_experts_per_tok
+            )
+        gate = ReplicatedLinear(
+            config.hidden_size,
+            moe_config.model_config.hf_config.n_routed_experts,
+            bias=False,
+            prefix=f"{prefix}.ffn.gate",
+        )
+        gate.quant_method = B12xLinearMethod()
+        gate.out_dtype = torch.float32
         self.ffn = DeepseekV4MoE(
-            vllm_config,
+            moe_config,
             prefix=f"{prefix}.ffn",
             use_sequence_parallel=self.use_sequence_parallel,
+            gate=gate,
+            image_sentinel_lo=0 if is_draft else 129264,
+            image_sentinel_count=1,
         )
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -747,11 +776,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        first_layer = next(iter(islice(self.layers, self.start_layer, self.end_layer)))
-        if first_layer.ffn.use_mega_moe:
-            return make_deepseek_v4_expert_params_mapping(self.config.n_routed_experts)
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
         return fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="w1",
@@ -759,10 +783,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ckpt_up_proj_name="w3",
             num_experts=self.config.n_routed_experts,
         )
-
-    def finalize_mega_moe_weights(self) -> None:
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
-            layer.ffn.finalize_mega_moe_weights()
 
     def finalize_mhc_broadcast_weights(self) -> None:
         if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:
@@ -1016,7 +1036,6 @@ class DeepseekV41LLMForCausalLM(
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def process_weights_after_loading(self) -> None:
-        self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
         for module in self.modules():
             if isinstance(module, Engram):

@@ -765,6 +765,10 @@ class DeepseekV4MoE(nn.Module):
         vllm_config: VllmConfig,
         prefix: str = "",
         use_sequence_parallel: bool = False,
+        *,
+        gate: nn.Module | None = None,
+        image_sentinel_lo: int | None = None,
+        image_sentinel_count: int = 5,
     ):
         super().__init__()
 
@@ -804,17 +808,21 @@ class DeepseekV4MoE(nn.Module):
                 f"{moe_backend} for this checkpoint."
             )
 
-        self.gate = GateLinear(
-            input_size=config.hidden_size,
-            output_size=config.n_routed_experts,
-            bias=False,
-            out_dtype=torch.float32,
-            params_dtype=(
-                torch.float32
-                if getattr(config, "router_dtype", None) == "float32"
-                else None
-            ),
-            prefix=f"{prefix}.gate",
+        self.gate = (
+            gate
+            if gate is not None
+            else GateLinear(
+                input_size=config.hidden_size,
+                output_size=config.n_routed_experts,
+                bias=False,
+                out_dtype=torch.float32,
+                params_dtype=(
+                    torch.float32
+                    if getattr(config, "router_dtype", None) == "float32"
+                    else None
+                ),
+                prefix=f"{prefix}.gate",
+            )
         )
 
         self.gate.e_score_correction_bias = None
@@ -823,9 +831,16 @@ class DeepseekV4MoE(nn.Module):
         # Image tokens borrow five consecutive reserved in-vocab ids starting
         # at IMAGE_SENTINEL_BASE_ID; 0 disables vision routing (text model).
         self.image_sentinel_lo = (
-            IMAGE_SENTINEL_BASE_ID if getattr(config, "vision_n_layers", 0) > 0 else 0
+            image_sentinel_lo
+            if image_sentinel_lo is not None
+            else IMAGE_SENTINEL_BASE_ID
+            if getattr(config, "vision_n_layers", 0) > 0
+            else 0
         )
-        is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
+        self.image_sentinel_count = image_sentinel_count
+        is_hash_moe = extract_layer_index(prefix) < getattr(
+            config, "num_hash_layers", 0
+        )
         self.hash_indices_dtype = torch.int64 if self.use_mega_moe else torch.int32
         if is_hash_moe:
             # hash MoE doesn't use e_score_correction_bias
@@ -842,7 +857,7 @@ class DeepseekV4MoE(nn.Module):
                 requires_grad=False,
             )
         if getattr(config, "topk_method", None) == "noaux_tc" and (
-            not is_hash_moe or getattr(config, "vision_n_layers", 0) > 0
+            not is_hash_moe or self.image_sentinel_lo > 0
         ):
             # Vision checkpoints ship a gate bias on hash layers too (it is
             # unused for routing there; image tokens use bias_vl instead).
@@ -968,16 +983,6 @@ class DeepseekV4MoE(nn.Module):
         self.n_shared_experts = config.n_shared_experts or 0
         self.n_logical_experts = self.n_routed_experts
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
-        assert self.n_physical_experts % self.tp_size == 0, (
-            f"n_physical_experts={self.n_physical_experts} must be divisible by "
-            f"tp_size={self.tp_size}. Adjust num_redundant_experts."
-        )
-        self.n_local_physical_experts = self.n_physical_experts // self.tp_size
-        self.n_local_experts = self.n_local_physical_experts
-        self.experts_start_idx = self.tp_rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        self.physical_expert_start = self.experts_start_idx
-        self.physical_expert_end = self.experts_end_idx
 
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
@@ -995,12 +1000,15 @@ class DeepseekV4MoE(nn.Module):
             hash_indices_table=self.gate.tid2eid,
             bias_vl=getattr(self.gate, "bias_vl", None),
             image_sentinel_lo=self.image_sentinel_lo,
+            image_sentinel_count=self.image_sentinel_count,
             swiglu_limit=self.swiglu_limit,
             router_logits_dtype=torch.float32,
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=eplb_config.num_redundant_experts,
             is_sequence_parallel=self.use_sequence_parallel,
         )
+        self.n_local_physical_experts = self.experts.routed_experts.local_num_experts
+        self.n_local_experts = self.n_local_physical_experts
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
@@ -1062,7 +1070,7 @@ class DeepseekV4MoE(nn.Module):
             input_ids=input_ids,
         )
 
-        return final_hidden_states.view(org_shape)
+        return final_hidden_states.to(hidden_states.dtype).view(org_shape)
 
     def finalize_mega_moe_weights(self) -> None:
         if self.use_mega_moe:

@@ -466,6 +466,50 @@ def test_dsv4_vision_routing_graph_replay_with_padding(use_hash):
         assert torch.count_nonzero(weights[-1]).item() == 0
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA-only routing.")
+def test_v41_router_only_applies_vision_bias_to_image_token():
+    from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+        FusedTopKBiasRouter,
+    )
+
+    logits = (
+        torch.arange(8, device="cuda", dtype=torch.float32).expand(4, -1).contiguous()
+    )
+    text_bias = torch.tensor([20.0, 20.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], device="cuda")
+    image_bias = text_bias.flip(0).contiguous()
+    input_ids = torch.tensor([129263, 129264, 129265, 129268], device="cuda")
+    router = FusedTopKBiasRouter(
+        top_k=2,
+        global_num_experts=8,
+        scoring_func="sqrtsoftplus",
+        e_score_correction_bias=text_bias,
+        bias_vl=image_bias,
+        image_sentinel_lo=129264,
+        image_sentinel_count=1,
+        routed_scaling_factor=1.5,
+    )
+
+    def route():
+        return router.select_experts(logits, logits, input_ids=input_ids)
+
+    route()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        weights, ids = route()
+    for token_ids in (
+        [129263, 129264, 129265, 129268],
+        [129264, 129265, 129264, 129263],
+    ):
+        input_ids.copy_(torch.tensor(token_ids, device="cuda"))
+        graph.replay()
+        scores = F.softplus(logits).sqrt()
+        bias = torch.where((input_ids == 129264)[:, None], image_bias, text_bias)
+        expected_ids = (scores + bias).topk(2, dim=-1).indices
+        expected_weights = scores.gather(1, expected_ids)
+        expected_weights *= 1.5 / expected_weights.sum(-1, keepdim=True)
+        _assert_topk_matches(weights, ids, expected_weights, expected_ids)
+
+
 def _assert_topk_matches(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,

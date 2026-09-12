@@ -261,6 +261,10 @@ class FusedMoEQuantConfig:
 
     mx_alignment: int = 0
 
+    # Checkpoint-specific numerical behavior. Backends use this only when a
+    # quantization format needs a model-family contract beyond its dtypes.
+    numerical_recipe: str = "default"
+
     def __post_init__(self):
         assert not self.per_act_token_quant or self.block_shape is None, (
             "illegal quantization"
@@ -511,6 +515,7 @@ class FusedMoEQuantConfig:
         gemm1_alpha: float | None = None,
         gemm1_beta: float | None = None,
         gemm1_clamp_limit: float | None = None,
+        numerical_recipe: str = "default",
     ) -> "FusedMoEQuantConfig":
         """
         General builder function for a FusedMoEQuantConfig.
@@ -543,6 +548,7 @@ class FusedMoEQuantConfig:
         - is_scale_swizzled: Whether the activation scale-factor layout is
           swizzled. Pass through to the underlying quantization kernel for
           dtypes that distinguish layouts (nvfp4, mxfp8). Defaults to True.
+        - numerical_recipe: Optional checkpoint-specific numerical contract.
         - gemm1_alpha: Optional MXFP4 TRTLLM SwiGLU alpha parameter.
         - gemm1_beta: Optional MXFP4 TRTLLM SwiGLU beta parameter.
         - gemm1_clamp_limit: Optional MXFP4 TRTLLM SwiGLU clamp limit.
@@ -578,6 +584,7 @@ class FusedMoEQuantConfig:
             _w2=FusedMoEQuantDesc(
                 weight_dtype, w_shape, w2_scale, g2_alphas, w2_zp, w2_bias
             ),
+            numerical_recipe=numerical_recipe,
             is_scale_swizzled=is_scale_swizzled,
             gemm1_alpha=gemm1_alpha,
             gemm1_beta=gemm1_beta,
@@ -729,6 +736,7 @@ def mxfp4_mxfp8_moe_quant_config(
     gemm1_clamp_limit: float | None = None,
     mx_alignment: int = 0,
     is_scale_swizzled: bool = True,
+    numerical_recipe: str = "default",
 ) -> FusedMoEQuantConfig:
     """
     Construct a quant config for mxfp4 activations and mxfp4 weights.
@@ -743,6 +751,7 @@ def mxfp4_mxfp8_moe_quant_config(
         gemm1_clamp_limit=gemm1_clamp_limit,
         mx_alignment=mx_alignment,
         is_scale_swizzled=is_scale_swizzled,
+        numerical_recipe=numerical_recipe,
     )
 
 

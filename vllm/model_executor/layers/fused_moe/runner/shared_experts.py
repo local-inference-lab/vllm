@@ -18,6 +18,7 @@ from vllm.utils.torch_utils import (
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
 )
+from vllm.v1.worker.workspace import use_preallocated_workspace
 
 logger = init_logger(__name__)
 
@@ -54,6 +55,15 @@ class SharedExperts(torch.nn.Module):
         self._output: list[torch.Tensor | None] = [None, None]
         self._layer = layer
         self._moe_config = moe_config
+        self._workspace_layers = tuple(
+            module
+            for module in layer.modules()
+            if callable(
+                getattr(
+                    getattr(module, "quant_method", None), "get_workspace_size", None
+                )
+            )
+        )
 
         self._mk_can_overlap_shared_experts = mk_can_overlap_shared_experts
 
@@ -74,6 +84,17 @@ class SharedExperts(torch.nn.Module):
     # TODO(bnell): Hack for elastic_ep. Get rid of this
     def _set_moe_config(self, new_moe_config: FusedMoEConfig):
         self.moe_config = new_moe_config
+
+    def workspace_size(self, hidden_states: torch.Tensor) -> int:
+        """Peak shared scratch: the MLP's linear operations run sequentially."""
+        rows = hidden_states.numel() // hidden_states.shape[-1]
+        return max(
+            (
+                module.quant_method.get_workspace_size(module, rows)
+                for module in self._workspace_layers
+            ),
+            default=0,
+        )
 
     @property
     def _disable_shared_experts_overlap(self) -> bool:
@@ -167,6 +188,7 @@ class SharedExperts(torch.nn.Module):
         self,
         shared_experts_input: torch.Tensor,
         order: SharedExpertsOrder,
+        workspace: torch.Tensor | None = None,
     ):
         experts_order = self._determine_shared_experts_order(shared_experts_input)
 
@@ -175,11 +197,12 @@ class SharedExperts(torch.nn.Module):
 
         assert self._output[self._output_idx] is None
 
-        if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
-            self._output[self._output_idx] = self._run_in_aux_stream(
-                shared_experts_input
-            )
-        else:
-            self._output[self._output_idx] = self._layer(shared_experts_input)
+        with use_preallocated_workspace(workspace):
+            if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
+                self._output[self._output_idx] = self._run_in_aux_stream(
+                    shared_experts_input
+                )
+            else:
+                self._output[self._output_idx] = self._layer(shared_experts_input)
 
         assert self._output[self._output_idx] is not None

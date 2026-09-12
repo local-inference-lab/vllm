@@ -25,6 +25,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.parameter import BlockQuantScaleParameter
 from vllm.v1.worker.workspace import (
+    current_preallocated_workspace,
     current_workspace_manager,
     retain_cuda_graph_capture_resource,
 )
@@ -87,18 +88,24 @@ def _mhc_plan(device, capacity, hidden):
     return mhc.plan(mhc.Caps(device=device, max_tokens=capacity, hidden_size=hidden))
 
 
-@torch.library.custom_op("vllm::dsv41_block32_linear", mutates_args=("out",))
-def _block32_linear(x: torch.Tensor, out: torch.Tensor, key: int) -> None:
+@torch.library.custom_op("vllm::dsv41_block32_linear", mutates_args=("out", "scratch"))
+def _block32_linear(
+    x: torch.Tensor, out: torch.Tensor, key: int, scratch: torch.Tensor | None
+) -> None:
     layer = _LINEARS[key]
     rows = x.numel() // layer.weight.shape[1]
     index = bisect_left(layer.b12x_capacities, rows)
     if index == len(layer.b12x_capacities):
         raise ValueError("V4.1 linear rows exceed planned capacity")
     plan = layer.b12x_plans[index]
-    scratch = current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
+    buffers = (
+        scratch
+        if scratch is not None
+        else current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
+    )
     binding = block_fp8_linear.bind(
         plan,
-        scratch=scratch,
+        scratch=buffers,
         source=x,
         packed_weight=layer.b12x_weight,
         output=out.view(-1, layer.weight.shape[0], 1),
@@ -108,7 +115,7 @@ def _block32_linear(x: torch.Tensor, out: torch.Tensor, key: int) -> None:
 
 
 @_block32_linear.register_fake
-def _block32_linear_fake(x, out, key):
+def _block32_linear_fake(x, out, key, scratch):
     return None
 
 
@@ -228,6 +235,13 @@ class B12xFP8LinearMethod(LinearMethodBase):
         layer.b12x_key = id(layer)
         _LINEARS[layer.b12x_key] = layer
 
+    def get_workspace_size(self, layer, num_tokens: int) -> int:
+        index = bisect_left(layer.b12x_capacities, num_tokens)
+        if index == len(layer.b12x_capacities):
+            raise ValueError("V4.1 linear rows exceed planned capacity")
+        (spec,) = layer.b12x_plans[index].scratch_specs()
+        return spec.shape[0] * spec.dtype.itemsize
+
     def apply(self, layer, x, bias=None):
         if bias is not None:
             raise ValueError("V4.1 block32 projections require bias-free weights")
@@ -236,7 +250,7 @@ class B12xFP8LinearMethod(LinearMethodBase):
             dtype=torch.bfloat16,
             device=x.device,
         )
-        _block32_linear(x, out, layer.b12x_key)
+        _block32_linear(x, out, layer.b12x_key, current_preallocated_workspace())
         return out
 
 

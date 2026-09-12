@@ -31,6 +31,9 @@ _GiB = 1024**3
 # Global workspace manager instance
 _manager: "WorkspaceManager | None" = None
 _workspace_lane: ContextVar[int] = ContextVar("vllm_workspace_lane", default=0)
+_preallocated_workspace: ContextVar[torch.Tensor | None] = ContextVar(
+    "vllm_preallocated_workspace", default=None
+)
 _cuda_graph_capture_resources: ContextVar[list[Any] | None] = ContextVar(
     "vllm_cuda_graph_capture_resources", default=None
 )
@@ -46,6 +49,20 @@ def use_workspace_lane(lane: int) -> Iterator[None]:
         yield
     finally:
         _workspace_lane.reset(token)
+
+
+@contextmanager
+def use_preallocated_workspace(scratch: torch.Tensor | None) -> Iterator[None]:
+    """Bind a caller-reserved scratch view; this scope never allocates storage."""
+    token = _preallocated_workspace.set(scratch)
+    try:
+        yield
+    finally:
+        _preallocated_workspace.reset(token)
+
+
+def current_preallocated_workspace() -> torch.Tensor | None:
+    return _preallocated_workspace.get()
 
 
 @contextmanager

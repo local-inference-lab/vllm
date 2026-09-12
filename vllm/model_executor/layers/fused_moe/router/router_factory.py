@@ -63,6 +63,7 @@ def create_fused_moe_router(
     # Deepseek V4 vision routing bias parameters
     bias_vl: torch.Tensor | None = None,
     image_sentinel_lo: int = 0,
+    image_sentinel_count: int = 5,
 ) -> FusedMoERouter:
     """
     Factory function to create the appropriate FusedMoERouter subclass based on
@@ -216,6 +217,7 @@ def create_fused_moe_router(
             shared_expert_weight=shared_expert_weight,
             bias_vl=bias_vl,
             image_sentinel_lo=image_sentinel_lo,
+            image_sentinel_count=image_sentinel_count,
         )
 
     if (

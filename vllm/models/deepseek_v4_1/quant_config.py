@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4.1 checkpoint quantization with fail-closed native dispatch."""
 
+from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
@@ -40,6 +42,6 @@ class DeepseekV41FP8Config(Fp8Config):
             from .b12x_layers import B12xEmbeddingMethod
 
             return B12xEmbeddingMethod()
-        # Routed experts own their checkpoint loader and native recipe rather
-        # than delegating to a generic MoE provider.
+        if isinstance(layer, RoutedExperts):
+            return Mxfp4MoEMethod(layer.moe_config, numerical_recipe="deepseek_v41")
         return None

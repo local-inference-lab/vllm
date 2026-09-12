@@ -46,6 +46,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             self.moe_kernel is not None and self.moe_kernel.can_overlap_shared_experts
         )
 
+    @property
+    def output_dtype(self) -> torch.dtype:
+        """Dtype produced by the routed experts."""
+        return self.moe.in_dtype
+
     @abstractmethod
     def create_weights(
         self,
@@ -141,6 +146,26 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             else:
                 return False
         return self.moe_kernel.is_monolithic
+
+    def prepare_workspace(
+        self, hidden_states: torch.Tensor, shared_workspace_size: int
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+        """Reserve disjoint routed/shared scratch before either branch runs."""
+        raise NotImplementedError(
+            "This MoE backend cannot coordinate arena-backed shared-expert scratch"
+        )
+
+    def apply_with_workspace(
+        self,
+        layer: "RoutedExperts",
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts: "SharedExperts | None",
+        shared_experts_input: torch.Tensor | None,
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        raise NotImplementedError("This MoE backend cannot consume reserved scratch")
 
     def apply(
         self,

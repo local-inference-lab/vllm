@@ -222,6 +222,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self._prefill_capacity = max(int(moe_config.max_num_tokens), 1)
         self._plan_capacities = {1, self._prefill_capacity}
         self._apply_router_weight_on_input = False
+        self._numerical_recipe = quant_config.numerical_recipe
 
     def _unit_scale(self, device: torch.device, num_experts: int) -> torch.Tensor:
         scale = self._unit_scales.get(device)
@@ -229,6 +230,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             scale = torch.ones(num_experts, dtype=torch.float32, device=device)
             self._unit_scales[device] = scale
         return scale
+
+    @property
+    def output_dtype(self) -> torch.dtype:
+        if self._numerical_recipe == "deepseek_v41":
+            return torch.float32
+        return self.moe_config.in_dtype
 
     def _weight_global_scale(
         self,
@@ -321,6 +328,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             w13_layout=self._w13_layout,
+            numerical_recipe=self._numerical_recipe,
         )
         return fused_moe.prepare_weights(
             plan=weight_plan,
@@ -440,8 +448,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             ):
                 return (
                     False,
-                    "MXFP4 W4A8 requires hidden size divisible by 256 and "
-                    "per-rank intermediate size divisible by 32",
+                    (
+                        "MXFP4 W4A8 requires hidden size divisible by 256 and "
+                        "per-rank intermediate size divisible by 32"
+                    ),
                 )
         return mk.FusedMoEExperts.is_supported_config(
             cls, moe_config, weight_key, activation_key, activation_format
@@ -619,8 +629,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 type(self),
                 prepared.w1_fp4.device,
                 output_dtype,
+                self.output_dtype,
                 self._quant_mode,
                 self._source_format,
+                self._numerical_recipe,
                 self._w13_layout,
                 int(prepared.num_experts),
                 int(prepared.hidden_size),
@@ -646,7 +658,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         token_counts = tuple(int(count) for count in token_counts if int(count) > 0)
         self._register_plan_capacities(token_counts)
         activation = layer.activation
-        dtype = self.moe_config.in_dtype
+        input_dtype = self.moe_config.in_dtype
         topk = int(self.moe_config.experts_per_token)
         apply_router_weight_on_input = bool(layer.apply_router_weight_on_input)
         limit, alpha, beta = self._swiglu_params(activation)
@@ -664,7 +676,19 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 swiglu_alpha=alpha,
                 swiglu_beta=beta,
             )
-            signature = (execution_plan.implementation, execution_plan.execution)
+            # V4.1 micro callables specialize on their planned row capacity,
+            # even when their execution descriptors otherwise compare equal.
+            capacity = (
+                tokens
+                if self._numerical_recipe == "deepseek_v41"
+                and execution_plan.implementation == "micro"
+                else None
+            )
+            signature = (
+                execution_plan.implementation,
+                execution_plan.execution,
+                capacity,
+            )
             launch_tokens.setdefault(signature, tokens)
 
         launch_resources: list[tuple[torch.Tensor, ...]] = []
@@ -689,10 +713,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             )
             hidden_states = torch.zeros(
                 (tokens, int(prepared.hidden_size)),
-                dtype=dtype,
+                dtype=input_dtype,
                 device=device,
             )
-            output = torch.empty_like(hidden_states)
+            output = torch.empty(
+                hidden_states.shape, dtype=self.output_dtype, device=device
+            )
             topk_weights = torch.full(
                 (tokens, topk),
                 1.0 / topk,
@@ -722,7 +748,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
                     output=output,
-                    unit_scale_contract=self._quant_mode == "w4a16",
+                    unit_scale_contract=self._numerical_recipe == "deepseek_v41"
+                    or self._quant_mode == "w4a16",
                 )
         if launch_resources:
             torch.accelerator.synchronize()
@@ -797,7 +824,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             output=output,
-            unit_scale_contract=self._quant_mode == "w4a16",
+            unit_scale_contract=self._numerical_recipe == "deepseek_v41"
+            or self._quant_mode == "w4a16",
         )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
