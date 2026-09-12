@@ -1553,7 +1553,35 @@ def _run_deepseek_v41_factory_tp(rank: int, port: int) -> None:
                 assert torch.all(
                     routed.w2_weight_scale[expert_id] == 120 + rank + expert_id
                 )
+            source_prepared_storage = tuple(
+                (
+                    tensor.untyped_storage().data_ptr(),
+                    tensor.untyped_storage().nbytes(),
+                    tensor.numel() * tensor.element_size(),
+                )
+                for tensor in (
+                    routed.w13_weight,
+                    routed.w13_weight_scale,
+                    routed.w2_weight,
+                    routed.w2_weight_scale,
+                )
+            )
             routed.quant_method.process_weights_after_loading(routed)
+            prepared = routed._b12x_prepared_experts.representation.value
+            assert prepared.n64_repack
+            for packed, (source_ptr, source_storage_bytes, source_bytes) in zip(
+                (
+                    prepared.w13_rp,
+                    prepared.w13_sfb,
+                    prepared.w2_rp,
+                    prepared.w2_sfb,
+                ),
+                source_prepared_storage,
+                strict=True,
+            ):
+                assert packed.untyped_storage().data_ptr() == source_ptr
+                assert packed.untyped_storage().nbytes() == source_storage_bytes
+                assert packed.numel() * packed.element_size() == source_bytes
             x = (
                 torch.tensor(
                     [1 / 16, -1 / 16, 1 / 32, -1 / 32],
