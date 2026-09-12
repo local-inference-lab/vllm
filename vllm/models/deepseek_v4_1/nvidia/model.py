@@ -1038,6 +1038,8 @@ class DeepseekV41LLMForCausalLM(
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mhc_broadcast_weights()
         for module in self.modules():
+            if isinstance(module, DeepseekV41B12xAttention):
+                module.setup_wo_projection()
             if isinstance(module, Engram):
                 module.process_weights_after_loading()
 

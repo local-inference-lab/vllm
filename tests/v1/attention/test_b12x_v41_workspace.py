@@ -358,142 +358,136 @@ def test_attention_shared_scratch_graph_replay(
     del graph, resources
 
 
-def test_grouped_projection_live_storage_survives_workspace_reuse(native_workspace):
-    attention, manager, workspace = native_workspace
-    device = torch.device("cuda", torch.accelerator.current_device_index())
-    torch.manual_seed(145)
-    rows, groups, width, rank = 3, 2, 512, 64
-    layer = SimpleNamespace(
-        weight=torch.randn((groups * rank, width), device=device, dtype=torch.bfloat16)
-        / 16
-    )
-    method = attention._GroupedLinearMethod(attention.B12xLinearMethod(), groups)
-    method.process_weights_after_loading(layer)
-    source = torch.randn((rows, groups, width), dtype=torch.bfloat16, device=device)
-    positions = torch.zeros(rows, dtype=torch.int64, device=device)
-    # Identity RoPE makes an independent torch matmul oracle straightforward.
-    cs = torch.cat(
-        (torch.ones((1, 32), device=device), torch.zeros((1, 32), device=device)),
-        dim=-1,
-    )
-    (scratch,) = manager.get_simultaneous((source.shape, source.dtype))
-    manager.lock()
-    result = torch.empty((rows, groups * rank), device=device, dtype=torch.bfloat16)
+def test_output_projection_uses_fused_block32_path(native_workspace, monkeypatch):
+    attention, _, _ = native_workspace
+    calls = {}
 
-    def run():
-        inverse = attention._rotated(source, positions, cs, inverse=True)
-        # A nested GEMM may reuse every arena byte while inverse is still live.
-        scratch.fill_(float("nan"))
-        local = method.apply(layer, inverse)
-        scratch.zero_()
-        result.copy_(local)
+    def pack_weights(*args, **kwargs):
+        calls["pack"] = (args, kwargs)
+        return object()
 
-    run()
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        run()
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with (
-        workspace.collect_cuda_graph_capture_resources() as resources,
-        torch.cuda.graph(graph, stream=stream),
-    ):
-        run()
-    for seed in (146, 147):
-        torch.manual_seed(seed)
-        source.normal_()
-        expected = torch.cat(
-            [
-                (
-                    source[:, g].float()
-                    @ layer.weight[g * rank : (g + 1) * rank].float().T
-                ).to(torch.bfloat16)
-                for g in range(groups)
-            ],
-            dim=-1,
+    def run_inv_rope(*args, **kwargs):
+        calls["run"] = (args, kwargs)
+        return torch.full(
+            (args[0].shape[0], 256),
+            7,
+            dtype=torch.bfloat16,
+            device=args[0].device,
         )
-        graph.replay()
-        torch.testing.assert_close(result, expected, rtol=0.01, atol=0.01)
-    del graph, resources
 
-
-@pytest.mark.parametrize("width,k", [(128, 512), (1024, 4096)])
-def test_grouped_fp8_weight_only_prefill_preserves_bf16_contract(
-    native_workspace, monkeypatch, width, k
-):
-    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
-    from b12x.gemm import bf16_gemv
-
-    attention, manager, workspace = native_workspace
+    monkeypatch.setattr(attention.wo_projection, "pack_weights", pack_weights)
+    monkeypatch.setattr(attention.wo_projection, "run_inv_rope", run_inv_rope)
     monkeypatch.setattr(
         attention,
-        "get_current_vllm_config",
-        lambda: SimpleNamespace(
-            scheduler_config=SimpleNamespace(max_num_batched_tokens=4096)
-        ),
+        "current_stream",
+        lambda: SimpleNamespace(cuda_stream=123),
     )
-    torch.manual_seed(41003)
-    groups = 2
-    layer = torch.nn.Module()
-    value = torch.randn((groups * width, k), device="cuda").to(torch.float8_e4m3fn)
-    exponent = torch.randint(121, 128, (groups * width // 32, k // 32), device="cuda")
-    scale = exponent.byte().view(torch.float8_e8m0fnu)
-    layer.weight = torch.nn.Parameter(value, requires_grad=False)
-    layer.weight_scale_inv = torch.nn.Parameter(scale, requires_grad=False)
-    method = attention._GroupedLinearMethod(
-        attention.B12xFP8LinearMethod(SimpleNamespace(weight_block_size=[32, 32])),
-        groups,
+    layer = attention.DeepseekV4Attention.__new__(attention.DeepseekV4Attention)
+    torch.nn.Module.__init__(layer)
+    layer.n_local_groups = 2
+    layer.n_local_heads = 4
+    layer.head_dim = 128
+    layer.rope_head_dim = 32
+    layer.o_lora_rank = 128
+    layer.hidden_size = 256
+    layer.rotary_emb = SimpleNamespace(cos_sin_cache=torch.empty((1, 64)))
+    layer.wo_a = SimpleNamespace(
+        weight=torch.empty((256, 256), dtype=torch.float8_e4m3fn, device="cuda"),
+        weight_scale_inv=torch.empty((8, 8), dtype=torch.float8_e8m0fnu, device="cuda"),
     )
-    method.process_weights_after_loading(layer)
-    dense = (
-        value.float()
-        * torch.exp2(exponent.float() - 127)
-        .repeat_interleave(32, 0)
-        .repeat_interleave(32, 1)
-    ).bfloat16()
-    torch.testing.assert_close(layer.weight, dense, rtol=0, atol=0)
-    source = torch.randn((1025, groups, k), device="cuda").bfloat16()
-    method.apply(layer, source, is_prefill=True)
-    manager.lock()
-    freeze_kernel_resolution("V4.1 weight-only prefill with BF16 activations")
-    try:
-        for rows in (1, 6, 64, 257, 1025):
-            x = source[:rows]
-            expected = torch.cat(
-                [
-                    x[:, g].float() @ dense[g * width : (g + 1) * width].float().T
-                    for g in range(groups)
-                ],
-                dim=1,
+    layer.wo_b = SimpleNamespace(
+        weight=torch.empty((256, 256), dtype=torch.float8_e4m3fn, device="cuda"),
+        weight_scale_inv=torch.empty((8, 8), dtype=torch.float8_e8m0fnu, device="cuda"),
+    )
+    layer._wo_projection_weights = None
+
+    layer.setup_wo_projection()
+    output = layer._o_proj(
+        torch.empty((3, 4, 128), dtype=torch.bfloat16, device="cuda"),
+        torch.arange(3, device="cuda"),
+    )
+
+    assert calls["pack"][1] == {
+        "groups": 2,
+        "group_width": 256,
+        "rank": 128,
+        "hidden": 256,
+        "block_size": (32, 32),
+    }
+    assert calls["run"][1]["heads_per_group"] == 2
+    assert calls["run"][1]["nope_dim"] == 96
+    assert calls["run"][1]["rope_dim"] == 32
+    assert calls["run"][1]["stream"] == 123
+    assert output.shape == (3, 256)
+    assert torch.count_nonzero(output != 7) == 0
+
+
+def test_model_post_load_packs_output_projections(native_workspace):
+    from vllm.models.deepseek_v4_1.nvidia import model
+
+    _, _, _ = native_workspace
+    calls = []
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = model.DeepseekV41B12xAttention.__new__(
+                model.DeepseekV41B12xAttention
             )
-            gemv = torch.cat(
-                [
-                    bf16_gemv.mm(x[:, g], dense[g * width : (g + 1) * width])
-                    for g in range(groups)
-                ],
-                dim=1,
-            )
-            actual = method.apply(layer, x, is_prefill=True)
-            actual_rmse = (actual.float() - expected).square().mean().sqrt()
-            gemv_rmse = (gemv.float() - expected).square().mean().sqrt()
-            assert actual_rmse <= gemv_rmse * 1.01 + 1e-7
-            torch.testing.assert_close(actual.float(), expected, rtol=0.01, atol=0.1)
-            torch.testing.assert_close(method.apply(layer, x), gemv, rtol=0, atol=0)
-            graph = torch.cuda.CUDAGraph()
-            with (
-                workspace.collect_cuda_graph_capture_resources() as resources,
-                torch.cuda.graph(graph),
-            ):
-                result = method.apply(layer, x, is_prefill=True)
-            source.normal_()
-            expected = method.apply(layer, x, is_prefill=True)
-            result.fill_(float("nan"))
-            graph.replay()
-            torch.testing.assert_close(result, expected, rtol=0, atol=0)
-            del graph, resources
-    finally:
-        unfreeze_kernel_resolution()
+            torch.nn.Module.__init__(self.attn)
+            self.attn.setup_wo_projection = lambda: calls.append("wo")
+
+        def finalize_mhc_broadcast_weights(self):
+            calls.append("mhc")
+
+    root = model.DeepseekV41LLMForCausalLM.__new__(model.DeepseekV41LLMForCausalLM)
+    torch.nn.Module.__init__(root)
+    root.model = Model()
+    root.process_weights_after_loading()
+
+    assert calls == ["mhc", "wo"]
+
+
+def test_dspark_post_load_packs_output_projections(native_workspace, monkeypatch):
+    from vllm.models.deepseek_v4_1.nvidia import dspark
+
+    _, _, _ = native_workspace
+    calls = []
+
+    class Attention(torch.nn.Module):
+        def setup_wo_projection(self):
+            calls.append("wo")
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = Attention()
+            self.hc_mult = 1
+            self.hidden_size = 1
+            self.hc_attn_fn = torch.ones((1, 1))
+            self.hc_attn_fn_broadcast = None
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList((Layer(), Layer()))
+            self.context_capacity = 8
+            self._context_kv_projections = []
+
+    monkeypatch.setattr(
+        dspark,
+        "_ContextKVProjection",
+        lambda attention, capacity: (attention, capacity),
+    )
+    root = dspark.DSparkDeepseekV4ForCausalLM.__new__(
+        dspark.DSparkDeepseekV4ForCausalLM
+    )
+    torch.nn.Module.__init__(root)
+    root.model = Model()
+    root.process_weights_after_loading()
+
+    assert calls == ["wo", "wo"]
+    assert len(root.model._context_kv_projections) == 2
 
 
 @pytest.mark.parametrize("ratio", [1, 2])

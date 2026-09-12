@@ -12,10 +12,9 @@ from b12x.attention.compressed_sparse_mla.preparation import rotate
 from b12x.attention.compressed_sparse_mla.weight_scale import (
     scale_index_weights,
 )
-from b12x.gemm import bf16_gemv, blockscaled
+from b12x.gemm import wo_projection
 from torch import nn
 
-from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -41,6 +40,7 @@ from vllm.models.deepseek_v4_1.sparse_mla import (
     _chunk,
 )
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import current_stream
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
@@ -140,104 +140,27 @@ class _Cache(nn.Module, AttentionLayerBase):
         raise RuntimeError("V4.1 caches are consumed by their owning attention layer")
 
 
-@triton.jit
-def _unpack_wo_a(Weight, Scale, Out, N: tl.constexpr, K: tl.constexpr, B: tl.constexpr):
-    i = tl.program_id(0) * B + tl.arange(0, B)
-    row, col = i // K, i % K
-    value = tl.load(Weight + i, i < N * K, other=0.0).to(tl.float32)
-    exponent = tl.load(
-        Scale + (row // 32) * tl.cdiv(K, 32) + col // 32, i < N * K, other=0
-    ).to(tl.uint32)
-    scale = (exponent << 23).to(tl.float32, bitcast=True)
-    scale = tl.where(exponent == 0, 2.0**-127, scale)
-    scale = tl.where(exponent == 255, float("nan"), scale)
-    tl.store(Out + i, value * scale, i < N * K)
+class _WOProjectionWeightMethod(LinearMethodBase):
+    """Keep checkpoint FP8 tensors unmodified for the fused WO projection."""
 
-
-class _GroupedLinearMethod(LinearMethodBase):
-    """WO-A with BF16 activations in both GEMV and weight-only tensor-core paths."""
-
-    def __init__(self, original, groups):
-        if type(original) is UnquantizedLinearMethod:
-            original = B12xLinearMethod()
-        if not isinstance(original, (B12xFP8LinearMethod, B12xLinearMethod)):
-            raise ValueError("V4.1 grouped output requires native b12x weights")
-        self.original, self.groups = original, groups
+    def __init__(self, original):
+        if not isinstance(original, B12xFP8LinearMethod):
+            raise ValueError("V4.1 output projection requires block32 FP8 weights")
+        self.original = original
 
     def create_weights(self, *args, **kwargs):
         return self.original.create_weights(*args, **kwargs)
 
     def process_weights_after_loading(self, layer):
-        self.prefill_weights = []
-        if layer.weight.dtype == torch.float8_e4m3fn:
-            scales = layer.weight_scale_inv
-            if scales.dtype != torch.float8_e8m0fnu:
-                raise ValueError("V4.1 WO-A requires UE8M0 checkpoint scales")
-            width = layer.weight.shape[0] // self.groups
-            if width % 32:
-                raise ValueError("V4.1 WO-A groups must preserve block32 scale rows")
-            for group in range(self.groups):
-                start, end = group * width, (group + 1) * width
-                # Replicating a block-row exponent changes storage, not values.
-                # A16 dequantizes these exact checkpoint weights to BF16 and
-                # never quantizes the inverse-RoPE activation.
-                scale_rows = scales[start // 32 : end // 32].view(torch.uint8)
-                packed = blockscaled.pack_weight(
-                    layer.weight[start:end],
-                    scale_rows.repeat_interleave(32, dim=0),
-                    recipe="mxfp8",
-                )
-                blockscaled.prewarm(packed, (1, 8, 64), mode="a16")
-                self.prefill_weights.append(packed)
-            capacity = get_current_vllm_config().scheduler_config.max_num_batched_tokens
-            self.prefill_workspace_bytes = max(
-                blockscaled.workspace_size(packed, capacity)
-                for packed in self.prefill_weights
-            )
-            dense = torch.empty(
-                layer.weight.shape, dtype=torch.bfloat16, device=layer.weight.device
-            )
-            _unpack_wo_a[(triton.cdiv(layer.weight.numel(), 256),)](
-                layer.weight,
-                scales.view(torch.uint8),
-                dense,
-                layer.weight.shape[0],
-                layer.weight.shape[1],
-                256,
-            )
-            layer.weight = nn.Parameter(dense, requires_grad=False)
-            del layer.weight_scale_inv
-        width = layer.weight.shape[0] // self.groups
-        self.weights = []
-        for group in range(self.groups):
-            weight = layer.weight[group * width : (group + 1) * width]
-            bf16_gemv.precompile(weight)
-            self.weights.append(weight)
+        if layer.weight.dtype != torch.float8_e4m3fn:
+            raise ValueError("V4.1 output projection requires FP8 checkpoint weights")
+        if not hasattr(layer, "weight_scale_inv"):
+            raise ValueError("V4.1 output projection requires checkpoint scales")
+        if layer.weight_scale_inv.dtype != torch.float8_e8m0fnu:
+            raise ValueError("V4.1 output projection requires UE8M0 checkpoint scales")
 
-    def apply(self, layer, x, bias=None, *, is_prefill=False):
-        if bias is not None:
-            raise ValueError("V4.1 WO-A must be bias free")
-        rows = x.shape[0]
-        result = torch.empty(
-            (rows, layer.weight.shape[0]), dtype=x.dtype, device=x.device
-        )
-        width = layer.weight.shape[0] // self.groups
-        for group in range(self.groups):
-            target = result[:, group * width : (group + 1) * width]
-            if is_prefill and self.prefill_weights:
-                (scratch,) = current_workspace_manager().get_simultaneous(
-                    ((self.prefill_workspace_bytes,), torch.uint8)
-                )
-                source = x[:, group].contiguous()
-                projected = blockscaled.mm(
-                    source, self.prefill_weights[group], mode="a16", workspace=scratch
-                )
-                target.copy_(projected)
-                retain_cuda_graph_capture_resource((source, projected))
-            else:
-                bf16_gemv.mm(x[:, group], self.weights[group], out=target)
-        retain_cuda_graph_capture_resource((x, result))
-        return result
+    def apply(self, layer, x, bias=None):
+        raise RuntimeError("V4.1 WO weights are consumed only by the fused projection")
 
 
 class DeepseekV4Indexer(nn.Module):
@@ -436,9 +359,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             prefix=f"{prefix}.wo_a",
         )
         self.wo_a.is_bmm, self.wo_a.bmm_batch_size = True, self.n_local_groups
-        self.wo_a.quant_method = _GroupedLinearMethod(
-            self.wo_a.quant_method, self.n_local_groups
-        )
+        self.wo_a.quant_method = _WOProjectionWeightMethod(self.wo_a.quant_method)
         self.wo_b = RowParallelLinear(
             hf.o_groups * hf.o_lora_rank,
             hf.hidden_size,
@@ -448,7 +369,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             prefix=f"{prefix}.wo_b",
             reduce_results=False,
         )
-        for linear in (self.fused_wqa_wkv, self.wq_b, self.wo_b):
+        self.wo_b.quant_method = _WOProjectionWeightMethod(self.wo_b.quant_method)
+        self._wo_projection_weights = None
+        for linear in (self.fused_wqa_wkv, self.wq_b):
             _native_linear(linear)
         self.rotary_emb = build_deepseek_v4_rope(
             hf,
@@ -896,15 +819,60 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             cache_format="deepseek_v41",
         )
 
+    def setup_wo_projection(self):
+        groups = self.n_local_groups
+        heads_per_group = self.n_local_heads // groups
+        group_width = heads_per_group * self.head_dim
+        rank = self.o_lora_rank
+        hidden = self.hidden_size
+        expected = (
+            ("WO-A weight", self.wo_a.weight, (groups * rank, group_width)),
+            (
+                "WO-A scale",
+                self.wo_a.weight_scale_inv,
+                (groups * (rank // 32), group_width // 32),
+            ),
+            ("WO-B weight", self.wo_b.weight, (hidden, groups * rank)),
+            (
+                "WO-B scale",
+                self.wo_b.weight_scale_inv,
+                (hidden // 32, groups * rank // 32),
+            ),
+        )
+        for name, tensor, shape in expected:
+            if tuple(tensor.shape) != shape:
+                raise RuntimeError(
+                    f"V4.1 {name} shape mismatch: expected {shape}, "
+                    f"got {tuple(tensor.shape)}"
+                )
+        self._wo_projection_weights = wo_projection.pack_weights(
+            self.wo_a.weight.detach(),
+            self.wo_a.weight_scale_inv.detach(),
+            self.wo_b.weight.detach(),
+            self.wo_b.weight_scale_inv.detach(),
+            groups=groups,
+            group_width=group_width,
+            rank=rank,
+            hidden=hidden,
+            block_size=(32, 32),
+        )
+
     def _o_proj(self, o, positions, *, is_prefill=False):
-        rows = o.shape[0]
-        inverse = _rotated(o, positions, self.rotary_emb.cos_sin_cache, inverse=True)
-        grouped = inverse.view(rows, self.n_local_groups, -1)
-        local = self.wo_b(
-            self.wo_a.quant_method.apply(self.wo_a, grouped, is_prefill=is_prefill)
+        del is_prefill
+        if self._wo_projection_weights is None:
+            raise RuntimeError("V4.1 WO-A/WO-B weights were not packed after loading")
+        local = wo_projection.run_inv_rope(
+            o,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            self._wo_projection_weights,
+            heads_per_group=self.n_local_heads // self.n_local_groups,
+            nope_dim=self.head_dim - self.rope_head_dim,
+            rope_dim=self.rope_head_dim,
+            stream=current_stream().cuda_stream,
         )
         if local.dtype != torch.bfloat16:
-            raise TypeError("V4.1 WO-B must round the local projection to BF16")
+            raise TypeError("V4.1 WO projection must return BF16")
         if get_tensor_model_parallel_world_size() > 1:
             local = get_tp_group().all_reduce(local)
         retain_cuda_graph_capture_resource(local)

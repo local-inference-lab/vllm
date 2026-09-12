@@ -641,6 +641,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         return loaded_params
 
     def process_weights_after_loading(self) -> None:
+        for layer in self.model.layers:
+            layer.attn.setup_wo_projection()
         self.model._context_kv_projections = [
             _ContextKVProjection(layer.attn, self.model.context_capacity)
             for layer in self.model.layers

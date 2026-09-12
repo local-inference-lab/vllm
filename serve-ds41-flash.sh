@@ -16,6 +16,7 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-auto}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
+LOAD_FORMAT="${LOAD_FORMAT:-instanttensor}"
 ENGRAM_TABLE_MEMORY="${ENGRAM_TABLE_MEMORY:-disk}"
 TORCH_PROFILE_DIR="${TORCH_PROFILE_DIR:-}"
 TORCH_PROFILE_RECORD_SHAPES="${TORCH_PROFILE_RECORD_SHAPES:-0}"
@@ -129,7 +130,7 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
   exit 1
 fi
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export CUDA_HOME="${CUDA_HOME:-/opt/cuda}"
 export CUTE_DSL_ARCH=sm_120a
 export PYTHONDONTWRITEBYTECODE=1
@@ -202,7 +203,7 @@ command=(
   --dtype bfloat16
   --tensor-parallel-size 4
   --pipeline-parallel-size 1
-  --load-format safetensors
+  --load-format "${LOAD_FORMAT}"
   --safetensors-load-strategy lazy
   --block-size 256
   --enable-prefix-caching
