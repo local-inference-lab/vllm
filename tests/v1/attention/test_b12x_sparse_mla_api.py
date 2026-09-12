@@ -820,11 +820,12 @@ def test_b12x_glm5_next_full_ckv_workspaces_follow_cache_format(
     impl._ckv_local_capacity = 128
     impl.dcp_world_size = 4
     impl._cache_record_bytes = record_bytes
-    plan = object()
+    plan = SimpleNamespace(layout=SimpleNamespace(nbytes=8))
 
     specs = impl._workspace_specs(plan, input_num_heads=8, include_ckv=True)
 
     assert len(specs) == 3
+    assert specs[1] == ((8,), torch.uint8)
     assert specs[-1] == ((512, record_bytes), torch.uint8)
 
 
@@ -1256,7 +1257,7 @@ def test_b12x_glm5_next_cache_geometry_is_finalized_before_bind(monkeypatch) -> 
     )
     assert reservations[2] == (
         ((4096, 16, 512), torch.bfloat16),
-        ((query_stage_bytes,), torch.uint8),
+        ((256,), torch.uint8),
         ((525312, 528), torch.uint8),
     )
 

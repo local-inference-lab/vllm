@@ -1465,12 +1465,17 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         input_num_heads: int,
         include_ckv: bool,
     ) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
-        del plan
         q_spec = (
             (self._max_tokens, input_num_heads, self._q_head_dim),
             torch.bfloat16,
         )
-        scratch_spec = ((self._scratch_nbytes,), torch.uint8)
+        # Full-CKV attention has only local query heads and does not gather
+        # queries. Its cache receive buffer need not coexist with global-head
+        # query-gather scratch or the decode plan's split-K intermediates.
+        scratch_nbytes = (
+            int(plan.layout.nbytes) if include_ckv else self._scratch_nbytes
+        )
+        scratch_spec = ((scratch_nbytes,), torch.uint8)
         ckv_specs = (
             (
                 (
