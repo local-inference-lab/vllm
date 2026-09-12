@@ -222,7 +222,6 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self._prefill_capacity = max(int(moe_config.max_num_tokens), 1)
         self._plan_capacities = {1, self._prefill_capacity}
         self._apply_router_weight_on_input = False
-        self._numerical_recipe = quant_config.numerical_recipe
 
     def _unit_scale(self, device: torch.device, num_experts: int) -> torch.Tensor:
         scale = self._unit_scales.get(device)
@@ -230,12 +229,6 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             scale = torch.ones(num_experts, dtype=torch.float32, device=device)
             self._unit_scales[device] = scale
         return scale
-
-    @property
-    def output_dtype(self) -> torch.dtype:
-        if self._numerical_recipe == "deepseek_v41":
-            return torch.float32
-        return self.moe_config.in_dtype
 
     def _weight_global_scale(
         self,
@@ -328,7 +321,6 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             w13_layout=self._w13_layout,
-            numerical_recipe=self._numerical_recipe,
         )
         return fused_moe.prepare_weights(
             plan=weight_plan,
@@ -632,7 +624,6 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 self.output_dtype,
                 self._quant_mode,
                 self._source_format,
-                self._numerical_recipe,
                 self._w13_layout,
                 int(prepared.num_experts),
                 int(prepared.hidden_size),
@@ -676,18 +667,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 swiglu_alpha=alpha,
                 swiglu_beta=beta,
             )
-            # V4.1 micro callables specialize on their planned row capacity,
-            # even when their execution descriptors otherwise compare equal.
-            capacity = (
-                tokens
-                if self._numerical_recipe == "deepseek_v41"
-                and execution_plan.implementation == "micro"
-                else None
-            )
             signature = (
                 execution_plan.implementation,
                 execution_plan.execution,
-                capacity,
             )
             launch_tokens.setdefault(signature, tokens)
 
@@ -748,8 +730,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
                     output=output,
-                    unit_scale_contract=self._numerical_recipe == "deepseek_v41"
-                    or self._quant_mode == "w4a16",
+                    unit_scale_contract=self._quant_mode == "w4a16",
                 )
         if launch_resources:
             torch.accelerator.synchronize()
@@ -824,8 +805,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             output=output,
-            unit_scale_contract=self._numerical_recipe == "deepseek_v41"
-            or self._quant_mode == "w4a16",
+            unit_scale_contract=self._quant_mode == "w4a16",
         )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:

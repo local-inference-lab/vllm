@@ -474,23 +474,10 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
 class Mxfp4MoEMethod(FusedMoEMethodBase):
     """MXFP4 MoE quantization method."""
 
-    def __init__(
-        self,
-        moe: FusedMoEConfig,
-        *,
-        numerical_recipe: str = "default",
-    ):
+    def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
-        if numerical_recipe not in ("default", "deepseek_v41"):
-            raise ValueError(
-                f"unsupported MXFP4 MoE numerical recipe: {numerical_recipe}"
-            )
-
-        self.numerical_recipe = numerical_recipe
         self.weight_dtype = "mxfp4"
-        self.mxfp4_backend, self.experts_cls = select_deepseek_v4_mxfp4_moe_backend(
-            moe, numerical_recipe=numerical_recipe
-        )
+        self.mxfp4_backend, self.experts_cls = select_deepseek_v4_mxfp4_moe_backend(moe)
 
         self.max_capture_size = moe.max_capture_size
 
@@ -504,12 +491,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     @property
     def supports_eplb(self) -> bool:
         return True
-
-    @property
-    def output_dtype(self) -> torch.dtype:
-        if self.numerical_recipe == "deepseek_v41":
-            return torch.float32
-        return super().output_dtype
 
     @property
     def skip_forward_padding(self) -> bool:
@@ -613,13 +594,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w13_weight, {"weight_loader": weight_loader})
 
         w13_weight_scale = torch.nn.Parameter(
-            torch.full(
+            torch.zeros(
                 (
                     num_experts,
                     self.moe.w13_num_shards * intermediate_size_per_partition,
                     hidden_size // mxfp4_block,
                 ),
-                127 if self.numerical_recipe == "deepseek_v41" else 0,
                 dtype=scale_dtype,
             ),
             requires_grad=False,
@@ -644,13 +624,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight, {"weight_loader": weight_loader})
 
         w2_weight_scale = torch.nn.Parameter(
-            torch.full(
+            torch.zeros(
                 (
                     num_experts,
                     hidden_size,
                     intermediate_size_per_partition // mxfp4_block,
                 ),
-                127 if self.numerical_recipe == "deepseek_v41" else 0,
                 dtype=scale_dtype,
             ),
             requires_grad=False,
@@ -857,7 +836,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_bias=w2_bias,
             swiglu_limit=swiglu_limit,
             layer=layer,
-            numerical_recipe=self.numerical_recipe,
         )
 
     def prepare_workspace(

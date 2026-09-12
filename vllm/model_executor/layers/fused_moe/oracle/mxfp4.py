@@ -595,8 +595,6 @@ def select_mxfp4_moe_backend(
 
 def select_deepseek_v4_mxfp4_moe_backend(
     config: FusedMoEConfig,
-    *,
-    numerical_recipe: str = "default",
 ) -> tuple[Mxfp4MoeBackend, type[mk.FusedMoEExperts] | None]:
     """
     Select the MXFP4 MoE backend with MXFP8 activation as top priority.
@@ -607,20 +605,6 @@ def select_deepseek_v4_mxfp4_moe_backend(
         if config.moe_parallel_config.use_batched_activation_format
         else mk.FusedMoEActivationFormat.Standard
     )
-
-    if numerical_recipe == "deepseek_v41":
-        if config.moe_backend not in ("auto", "b12x"):
-            raise ValueError(
-                "deepseek_v41 MXFP4 MoE requires the b12x W4A8 backend; "
-                f"got moe_backend={config.moe_backend!r}"
-            )
-        return _return_or_raise(
-            Mxfp4MoeBackend.B12X_MXFP4_MXFP8,
-            config,
-            kMxfp4Static,
-            kMxfp8Dynamic,
-            activation_format,
-        )
 
     # Honor explicit moe_backend (e.g. "marlin", "triton_unfused") before
     # falling back to the auto priority list.
@@ -1772,7 +1756,6 @@ def make_mxfp4_moe_quant_config(
     a1_scale: torch.Tensor | None = None,
     a2_scale: torch.Tensor | None = None,
     layer: "RoutedExperts | None" = None,
-    numerical_recipe: str = "default",
 ) -> FusedMoEQuantConfig | None:
     """Create a FusedMoEQuantConfig for the given MXFP4 backend."""
     if mxfp4_backend == Mxfp4MoeBackend.B12X_MXFP4_MXFP8:
@@ -1784,7 +1767,6 @@ def make_mxfp4_moe_quant_config(
             gemm1_alpha=gemm1_alpha,
             gemm1_beta=gemm1_beta,
             gemm1_clamp_limit=swiglu_limit,
-            numerical_recipe=numerical_recipe,
         )
     if mxfp4_backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
         from vllm.model_executor.layers.quantization.utils.quant_utils import (

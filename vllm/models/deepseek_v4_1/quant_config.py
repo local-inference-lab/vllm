@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DeepSeek V4.1 checkpoint quantization with fail-closed native dispatch."""
+"""DeepSeek V4.1 checkpoint quantization configuration."""
 
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import LinearBase
@@ -43,5 +43,5 @@ class DeepseekV41FP8Config(Fp8Config):
 
             return B12xEmbeddingMethod()
         if isinstance(layer, RoutedExperts):
-            return Mxfp4MoEMethod(layer.moe_config, numerical_recipe="deepseek_v41")
+            return Mxfp4MoEMethod(layer.moe_config)
         return None
