@@ -46,6 +46,8 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
+_DENSE_VARLEN_DECODE_MAX_REQS = 2
+
 
 _DEBUG_GRAPH_MEMORY_ACCOUNTING = (
     os.getenv("VLLM_DEBUG_GRAPH_MEMORY_ACCOUNTING", "0") == "1"
@@ -411,6 +413,28 @@ class CudaGraphManager:
         capture_varlen_decode = (
             separate_decode_routine and bool(decode_mode) and self.varlen_decode
         )
+        if capture_varlen_decode:
+            # Keep exact low-concurrency FULL graphs for every possible
+            # per-request speculative width. The ordinary token ladder below
+            # remains as the padded fallback for larger request counts and
+            # heterogeneous low-concurrency totals.
+            dense_max_reqs = min(_DENSE_VARLEN_DECODE_MAX_REQS, self.max_num_reqs)
+            for num_active_loras, dense_num_reqs, query_len in product(
+                self.lora_capture_cases,
+                range(1, dense_max_reqs + 1),
+                range(1, self.decode_query_len + 1),
+            ):
+                num_tokens = dense_num_reqs * query_len
+                if num_tokens > max_cg_capture_size:
+                    continue
+                desc = BatchExecutionDescriptor(
+                    cg_mode=decode_mode,
+                    num_tokens=num_tokens,
+                    num_reqs=dense_num_reqs,
+                    max_query_len=self.decode_query_len,
+                    num_active_loras=num_active_loras,
+                )
+                descs_by_mode[decode_mode].append(desc)
         for num_tokens, num_active_loras in product(
             capture_sizes, self.lora_capture_cases
         ):
@@ -424,7 +448,8 @@ class CudaGraphManager:
                     max_query_len=self.decode_query_len,
                     num_active_loras=num_active_loras,
                 )
-                descs_by_mode[decode_mode].append(desc)
+                if desc not in descs_by_mode[decode_mode]:
+                    descs_by_mode[decode_mode].append(desc)
             # Capture uniform decode specfifc graphs if required
             #  (i.e. separate decode routine)
             elif separate_decode_routine and decode_mode and not self.varlen_decode:
@@ -492,6 +517,8 @@ class CudaGraphManager:
                         key=lambda d: (
                             d.uniform_token_count is None,
                             d.max_query_len is None,
+                            d.num_reqs is None,
+                            d.num_reqs or 0,
                         )
                     )
                     for i in range(current_range_start, num_tokens + 1):
@@ -513,6 +540,18 @@ class CudaGraphManager:
                 desc.num_tokens
                 for descs in self._capture_descs.values()
                 for desc in descs
+            }
+        )
+
+    def captured_full_batch_shapes(self) -> list[tuple[int, int]]:
+        """Sorted ``(num_tokens, num_reqs)`` shapes retained for FULL replay."""
+        return sorted(
+            {
+                (desc.num_tokens, desc.num_reqs)
+                for desc in self.graphs
+                if desc.cg_mode == CUDAGraphMode.FULL
+                and desc.num_reqs is not None
+                and desc.num_active_loras == 0
             }
         )
 

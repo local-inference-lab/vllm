@@ -238,9 +238,13 @@ def test_profiled_batches_seed_cost_curves_via_consumer():
     manager.req_states = SimpleNamespace(max_num_batched_tokens=4096, max_num_reqs=64)
     manager.num_speculative_steps = 7
     manager.num_bonus_tokens = 1
-    curves: dict[str, list[tuple[int, float]]] = {}
-    manager.set_cost_curves = lambda draft, verify: curves.update(
-        draft=draft, verify=verify
+    curves: dict[str, object] = {}
+    manager.set_cost_curves = (
+        lambda draft, verify, *, verify_curves_by_num_reqs=None: curves.update(
+            draft=draft,
+            verify=verify,
+            verify_by_reqs=verify_curves_by_num_reqs,
+        )
     )
 
     timings = [
@@ -268,6 +272,19 @@ def test_profiled_batches_seed_cost_curves_via_consumer():
     # count they would land inside the captured range and, once made monotonic,
     # smear that eager cost across every larger request count.
     assert curves["draft"] == [(1, 1.0), (128, 1.0)]
+    assert curves["verify_by_reqs"] == {1: [(8, 8.0)], 128: [(1024, 1024.0)]}
+
+
+def test_budget_uses_request_specific_full_graph_costs():
+    manager = make_manager(
+        np.array([[0.9, 0.9]], dtype=np.float32),
+        np.array([1.0, 1.0, 100.0, 100.0]),
+    )
+    manager.verify_cost_tables_by_num_reqs = {1: np.ones(4)}
+
+    assert manager.get_num_tokens({"low": 3}, {"low": [1, 2]}) == 3
+    assert manager._batch_budget is not None
+    assert manager._batch_budget[2] == 2
 
 
 def test_compact_batch_preserves_totals_and_bounds():
@@ -415,7 +432,7 @@ def _run_tp_confidence_consistency(rank, port):
     )
 
     device = torch.device("cuda", rank)
-    torch.cuda.set_device(device)
+    torch.accelerator.set_device_index(rank)
     with set_current_vllm_config(VllmConfig()), torch.no_grad():
         try:
             init_test_distributed_environment(2, 1, rank, str(port), local_rank=rank)
@@ -457,7 +474,7 @@ def _run_tp_confidence_consistency(rank, port):
             dist.all_gather_object(counts, tokens, group=get_tp_group().cpu_group)
             assert counts == [4, 4], counts
             manager.reallocate_drafts(["r"], batch.idx_mapping)
-            torch.cuda.synchronize(device)
+            torch.accelerator.synchronize(device)
             assert manager.query_start_loc[:2].tolist() == [0, 4]
 
             # A shared total is insufficient: each request's GPU allocation
@@ -485,7 +502,7 @@ def _run_tp_confidence_consistency(rank, port):
                 == 3
             )
             manager.reallocate_drafts(["r", "s"], batch.idx_mapping)
-            torch.cuda.synchronize(device)
+            torch.accelerator.synchronize(device)
             boundaries = [None, None]
             dist.all_gather_object(
                 boundaries,
@@ -494,7 +511,7 @@ def _run_tp_confidence_consistency(rank, port):
             )
             assert boundaries == [[0, 2, 3], [0, 2, 3]]
         finally:
-            torch.cuda.synchronize(device)
+            torch.accelerator.synchronize(device)
             destroy_model_parallel()
             destroy_distributed_environment()
 
@@ -505,7 +522,7 @@ def test_tp_confidence_publication_keeps_graph_and_request_budgets_consistent():
 
     from tests.utils import get_open_port
 
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+    if not torch.accelerator.is_available() or torch.accelerator.device_count() < 2:
         pytest.skip("requires two CUDA devices")
     torch.multiprocessing.spawn(
         _run_tp_confidence_consistency, args=(get_open_port(),), nprocs=2, join=True

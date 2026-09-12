@@ -292,6 +292,7 @@ def _make_spec_decode_manager(
     capture_sizes: list[int] | None = None,
     num_speculative_tokens: int = 0,
     dynamic_spec_num_tokens: list[int] | None = None,
+    varlen_decode: bool = False,
 ) -> gpu_cudagraph_utils.CudaGraphManager:
     monkeypatch.setattr(
         gpu_cudagraph_utils,
@@ -312,6 +313,7 @@ def _make_spec_decode_manager(
         device=torch.device("cpu"),
         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
         decode_query_len=decode_query_len,
+        varlen_decode=varlen_decode,
     )
     manager._graphs_captured = True
     return manager
@@ -370,6 +372,41 @@ def test_planned_token_counts_include_speculative_decode_rows(monkeypatch):
 
     assert manager.planned_token_counts() == [1, 2, 4, 6, 8, 12, 16, 18, 24]
     assert 12 not in target_only.planned_token_counts()
+
+
+def test_varlen_decode_captures_dense_low_concurrency_product(monkeypatch):
+    decode_query_len = 8
+    manager = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=decode_query_len,
+        capture_sizes=[1, 2, 4, 8, 16, 24, 32],
+        num_speculative_tokens=7,
+        varlen_decode=True,
+    )
+
+    full_descs = manager._capture_descs[CUDAGraphMode.FULL]
+    assert len(full_descs) == 21
+    dense_shapes = {
+        (num_reqs, num_reqs * query_len)
+        for num_reqs in (1, 2)
+        for query_len in range(1, decode_query_len + 1)
+    }
+    captured_shapes = {(desc.num_reqs, desc.num_tokens) for desc in full_descs}
+    assert dense_shapes <= captured_shapes
+
+    for num_reqs, num_tokens in dense_shapes:
+        desc = manager.dispatch(
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            uniform_token_count=None,
+            num_active_loras=0,
+            max_query_len=decode_query_len,
+        )
+        assert desc.cg_mode == CUDAGraphMode.FULL
+        assert (desc.num_reqs, desc.num_tokens) == (num_reqs, num_tokens)
+
+    # Preserve the ordinary padded schedule for higher concurrency.
+    assert any(desc.num_reqs == 8 and desc.num_tokens == 8 for desc in full_descs)
 
 
 def test_mixed_batch_never_selects_a_uniform_decode_graph(monkeypatch):

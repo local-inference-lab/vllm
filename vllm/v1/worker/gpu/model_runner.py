@@ -721,6 +721,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _dummy_run(
         self,
         num_tokens: int,
+        profile_num_reqs: int | None = None,
         *args,
         skip_attn: bool = False,
         uniform_decode: bool = False,
@@ -737,7 +738,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Create a dummy scheduler output.
-        num_reqs = 1 if single_request_prefill else min(num_tokens, self.max_num_reqs)
+        num_reqs = (
+            1
+            if single_request_prefill
+            else (
+                profile_num_reqs
+                if profile_num_reqs is not None
+                else min(num_tokens, self.max_num_reqs)
+            )
+        )
+        if not 1 <= num_reqs <= min(num_tokens, self.max_num_reqs):
+            raise ValueError(
+                f"Invalid dummy batch shape: {num_tokens=} {profile_num_reqs=}"
+            )
         if uniform_decode:
             assert not single_request_prefill
             # HACK(lucas): for now since the worker is shared between MRV1 and MRV2,
@@ -1051,7 +1064,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if self.adaptive_verification is not None:
                     with self.step_timing.collect() as timings:
                         for batch in self.adaptive_verification.batches_to_profile(
-                            self.cudagraph_manager.captured_token_counts()
+                            self.cudagraph_manager.captured_token_counts(),
+                            self.cudagraph_manager.captured_full_batch_shapes(),
                         ):
                             self._dummy_run(**batch)
                     self.adaptive_verification.set_initial_cost_curves(timings)
