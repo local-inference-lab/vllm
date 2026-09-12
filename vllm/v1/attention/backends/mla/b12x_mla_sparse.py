@@ -1395,6 +1395,16 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         if self._ckv_extend_plan is not None:
             plans.append(self._ckv_extend_plan)
         self._scratch_nbytes = max(int(plan.layout.nbytes) for plan in plans)
+        if self._is_glm_next and self.dcp_world_size > 1:
+            # Query gathering finishes before attention consumes scratch. Its
+            # rank-major receive storage can therefore reuse the kernel arena.
+            self._scratch_nbytes = max(
+                self._scratch_nbytes,
+                self._max_tokens
+                * self._input_num_heads
+                * self._q_head_dim
+                * torch.bfloat16.itemsize,
+            )
         self._ckv_local_capacity = _round_up_ckv_rank_tokens(
             self._ckv_capacity_tokens,
             page_size=kernel_page_size,
@@ -1521,6 +1531,40 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             and num_heads == self._input_num_heads
             and self._q_head_dim == 576
         )
+
+    def gather_dcp_query(self, query: torch.Tensor) -> torch.Tensor:
+        """Gather GLM prefill heads into caller-owned attention query storage.
+
+        The rank-major receive view borrows kernel scratch only until the
+        layout copy completes on the execution stream. The attention call
+        rebinds that scratch while retaining the final query at the same address.
+        Decode and transport-specific all-gathers keep their established path.
+        """
+        group = get_dcp_group()
+        if not self._is_glm_next or query.shape[0] <= self._decode_max_rows:
+            return group.all_gather(query, dim=1)
+        communicator = getattr(group, "device_communicator", None)
+        b12x_comm = getattr(communicator, "b12x_ar_comm", None)
+        if (
+            b12x_comm is not None
+            and not b12x_comm.disabled
+            and getattr(b12x_comm, "should_all_gather", None) is not None
+            and b12x_comm.should_all_gather(query, 1)
+        ):
+            return group.all_gather(query, dim=1)
+
+        rows, local_heads, head_dim = query.shape
+        q_buffer, scratch = self._borrow_workspaces()[:2]
+        output = q_buffer[:rows]
+        receive = scratch[: output.numel() * output.element_size()].view(query.dtype)
+        receive = receive.view(self.dcp_world_size, rows, local_heads, head_dim)
+        local = receive[group.rank_in_group]
+        local.copy_(query)
+        _dcp_all_gather_current_stream(group, local.view(-1), receive.view(-1))
+        output.view(rows, self.dcp_world_size, local_heads, head_dim).copy_(
+            receive.movedim(0, 1)
+        )
+        return output
 
     def get_fused_mla_query_output(
         self,

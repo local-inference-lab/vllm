@@ -789,6 +789,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 padded_num_heads=self.q_pad_num_heads,
                 is_lse_base_on_e=self.impl.lse_base_on_e,
                 use_pcp=self.use_pcp,
+                query_gather_fallback=getattr(self.impl, "gather_dcp_query", None),
             )
 
         self.is_aiter_triton_fp8_bmm_enabled = rocm_aiter_ops.is_fp8bmm_enabled()
@@ -1200,6 +1201,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     )
                 else:
                     mqa_q = (mqa_ql_nope, mqa_q_pe)
+                # The input tuple owns the projection until query preparation
+                # finishes; no extra reference must retain it through attention.
+                del mqa_ql_nope
             # concatenate nope + pe -> (B, N, L + P) (fp8 op above may have fused)
             if self.impl.dcp_world_size > 1:
                 assert self.dcp_manager is not None
@@ -1211,7 +1215,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 else:
                     if isinstance(mqa_q, tuple):
                         # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
-                        mqa_q = torch.cat(mqa_q, dim=-1)
+                        mqa_q = (
+                            mqa_q[0]
+                            if self.qk_rope_head_dim == 0
+                            else torch.cat(mqa_q, dim=-1)
+                        )
                     if not qrep_decode and not full_ckv_dcp:
                         assert self.dcp_manager.query_gather is not None
                         mqa_q = self.dcp_manager.query_gather(mqa_q)

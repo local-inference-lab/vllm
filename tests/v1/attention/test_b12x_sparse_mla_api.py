@@ -828,6 +828,78 @@ def test_b12x_glm5_next_full_ckv_workspaces_follow_cache_format(
     assert specs[-1] == ((512, record_bytes), torch.uint8)
 
 
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_glm_dcp_prefill_query_reuses_scratch_without_aliasing_output(
+    monkeypatch, world_size: int, transposed: bool
+) -> None:
+    from vllm.v1.worker.workspace import WorkspaceManager
+
+    manager = WorkspaceManager(torch.device("cpu"))
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = True
+    impl._decode_max_rows = 4
+    impl._max_tokens = 32
+    impl._input_num_heads = world_size * 4
+    impl._q_head_dim = 8
+    impl._scratch_nbytes = 32 * impl._input_num_heads * 8 * 2
+    impl._decode_plan = object()
+    impl._ckv_local_capacity = 0
+    impl._cache_record_bytes = 528
+    impl.dcp_world_size = world_size
+    monkeypatch.setattr(b12x_mla_sparse, "current_workspace_manager", lambda: manager)
+    q_buffer, scratch = impl._borrow_workspaces()
+    manager.lock()
+    for rank in range(world_size):
+        group = SimpleNamespace(world_size=world_size, rank_in_group=rank)
+        monkeypatch.setattr(b12x_mla_sparse, "get_dcp_group", lambda group=group: group)
+        for rows in (19, 7, 23):
+            local_queries = []
+            for source in range(world_size):
+                values = (torch.arange(rows * 4 * 8) % 127 + source).to(torch.bfloat16)
+                local_queries.append(
+                    values.view(4, rows, 8).transpose(0, 1)
+                    if transposed
+                    else values.view(rows, 4, 8)
+                )
+
+            def gather(
+                _group, send, receive, rank=rank, rows=rows, local_queries=local_queries
+            ):
+                assert send.data_ptr() == receive.data_ptr() + rank * send.nbytes
+                assert torch.equal(send.view(rows, 4, 8), local_queries[rank])
+                receive.view(world_size, rows, 4, 8).copy_(torch.stack(local_queries))
+
+            monkeypatch.setattr(
+                b12x_mla_sparse, "_dcp_all_gather_current_stream", gather
+            )
+            actual = impl.gather_dcp_query(local_queries[rank])
+            assert actual.data_ptr() == q_buffer.data_ptr()
+            expected = torch.cat(local_queries, dim=1)
+            assert torch.equal(actual, expected)
+            scratch.fill_(255)
+            assert torch.equal(actual, expected)
+
+
+def test_glm_dcp_decode_keeps_the_transport_collective(monkeypatch) -> None:
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = True
+    impl._decode_max_rows = 16
+    query = torch.empty((16, 4, 8), dtype=torch.bfloat16)
+    expected = torch.empty((16, 8, 8), dtype=torch.bfloat16)
+    calls = []
+
+    def gather(value, dim):
+        calls.append((value, dim))
+        return expected
+
+    monkeypatch.setattr(
+        b12x_mla_sparse, "get_dcp_group", lambda: SimpleNamespace(all_gather=gather)
+    )
+    assert impl.gather_dcp_query(query) is expected
+    assert calls == [(query, 1)]
+
+
 @pytest.mark.parametrize("record_bytes", [528, 304])
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("padded_tokens", [2, 4])
@@ -1172,17 +1244,19 @@ def test_b12x_glm5_next_cache_geometry_is_finalized_before_bind(monkeypatch) -> 
         (16, 4096, 4096),
     ]
     assert len(reservations) == 3
+    query_stage_bytes = 4096 * 64 * 512 * torch.bfloat16.itemsize
+    assert impl._scratch_nbytes == query_stage_bytes
     assert reservations[0] == (
         ((4096, 64, 512), torch.bfloat16),
-        ((256,), torch.uint8),
+        ((query_stage_bytes,), torch.uint8),
     )
     assert reservations[1] == (
         ((4096, 64, 512), torch.bfloat16),
-        ((256,), torch.uint8),
+        ((query_stage_bytes,), torch.uint8),
     )
     assert reservations[2] == (
         ((4096, 16, 512), torch.bfloat16),
-        ((256,), torch.uint8),
+        ((query_stage_bytes,), torch.uint8),
         ((525312, 528), torch.uint8),
     )
 
