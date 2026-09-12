@@ -272,10 +272,11 @@ def glm_dcp_query_scratch_worker_fn():
     impl = object.__new__(b12x_mla_sparse.B12xMLASparseImpl)
     impl._is_glm_next = True
     impl._decode_max_rows = 16
-    impl._max_tokens = 512
-    impl._input_num_heads = size * 4
+    impl._max_tokens = 2048
+    local_heads = 32
+    impl._input_num_heads = size * local_heads
     impl._q_head_dim = 512
-    impl._scratch_nbytes = 512 * impl._input_num_heads * 512 * 2
+    impl._scratch_nbytes = impl._max_tokens * impl._input_num_heads * 512 * 2
     impl._decode_plan = object()
     impl._ckv_local_capacity = 0
     impl._cache_record_bytes = 528
@@ -286,10 +287,15 @@ def glm_dcp_query_scratch_worker_fn():
     manager.lock()
     for transport in ("pynccl", "torch"):
         group.device_communicator.pynccl_comm = comm if transport == "pynccl" else None
-        for rows in (32, 512, 64):
-            base = torch.arange(rows * 4 * 512, device=world.device).remainder(127)
+        for rows in (32, 2048, 64):
+            base = torch.arange(
+                rows * local_heads * 512, device=world.device
+            ).remainder(127)
             parts = [
-                (base + source).to(torch.bfloat16).view(4, rows, 512).transpose(0, 1)
+                (base + source)
+                .to(torch.bfloat16)
+                .view(local_heads, rows, 512)
+                .transpose(0, 1)
                 for source in range(size)
             ]
             actual = impl.gather_dcp_query(parts[rank])
@@ -300,7 +306,9 @@ def glm_dcp_query_scratch_worker_fn():
             assert torch.equal(actual, expected)
 
     group.device_communicator.pynccl_comm = comm
-    local = torch.empty((4, 64, 512), dtype=torch.bfloat16, device=world.device)
+    local = torch.empty(
+        (local_heads, 64, 512), dtype=torch.bfloat16, device=world.device
+    )
     local.fill_(rank)
     query = local.transpose(0, 1)
     impl.gather_dcp_query(query)
@@ -333,7 +341,7 @@ def glm_dcp_query_scratch_worker_fn():
 
     group.all_gather = gather_lse
     group.reduce_scatter = reduce_output
-    for rows in (32, 512, 64):
+    for rows in (32, 2048, 64):
         shape = (rows, impl._input_num_heads, 512)
         partial = (
             scratch[: rows * impl._input_num_heads * 512 * 2]
