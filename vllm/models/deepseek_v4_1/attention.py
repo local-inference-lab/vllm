@@ -493,6 +493,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     indexed_page_size=self._main_page,
                     max_page_table_width=self._main_width,
                     mode=mode,
+                    # DSpark's two-span reservation can exceed the generic
+                    # 256-row cutoff even when replaying a six-row C1 graph.
+                    # Keep the entire reserved decode capacity on its decode
+                    # split contract; prefill retains its separate plan.
+                    decode_row_capacity=capacity if mode == "decode" else None,
                     cache_format="deepseek_v41",
                     use_cuda_graph=True,
                 )
