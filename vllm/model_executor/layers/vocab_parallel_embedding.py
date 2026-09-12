@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -305,7 +306,9 @@ class VocabParallelEmbedding(PluggableLayer):
             self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = tp_rank
         self.num_embeddings = num_embeddings
-        self.padding_size = padding_size
+        # The global padded vocabulary must satisfy both the requested storage
+        # alignment and the TP partitioning constraint for every world size.
+        self.padding_size = math.lcm(padding_size, self.tp_size)
         self.org_vocab_size = org_num_embeddings or num_embeddings
         num_added_embeddings = num_embeddings - self.org_vocab_size
         self.org_vocab_size_padded = pad_vocab_size(

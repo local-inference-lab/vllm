@@ -18,8 +18,14 @@ from vllm.model_executor.layers.attention.mla_attention import (
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonMetadataBuilder,
 )
+from vllm.model_executor.models.config import DeepseekV41ForCausalLMConfig
 from vllm.models.deepseek_v4.nvidia import b12x as b12x_mla
 from vllm.models.deepseek_v4.nvidia import b12x_indexer
+from vllm.models.deepseek_v4_1.nvidia.b12x_attention import (
+    DeepseekV41B12xAttention,
+)
+from vllm.models.deepseek_v4_1.nvidia.model import _select_dsv4_attn_cls
+from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xBackend
 from vllm.models.deepseek_v32.nvidia.b12x import (
     B12xDSAIndexer,
     DeepseekV32B12xAttention,
@@ -78,6 +84,20 @@ def test_b12x_selector_routes_supported_attention_families() -> None:
         hf_text_config=SimpleNamespace(model_type="glm_moe_dsa")
     )
     assert _get_sparse_mla_backend(config) is B12xGLMDSAMLASparseBackend
+
+
+def test_b12x_selector_routes_deepseek_v41() -> None:
+    config = SimpleNamespace(attention_config=SimpleNamespace(backend=None))
+
+    DeepseekV41ForCausalLMConfig.verify_and_update_config(config)
+
+    assert config.attention_config.backend is AttentionBackendEnum.B12X
+    assert _select_dsv4_attn_cls(config) is DeepseekV41B12xAttention
+    assert DeepseekV41B12xBackend.get_name() == "B12X"
+
+    config.attention_config.backend = AttentionBackendEnum.FLASH_ATTN
+    with pytest.raises(ValueError, match="requires B12X"):
+        DeepseekV41ForCausalLMConfig.verify_and_update_config(config)
 
 
 def test_b12x_sparse_mla_accepts_glm_dsa_contract(monkeypatch) -> None:

@@ -163,7 +163,7 @@ fi
 load_format=${LOAD_FORMAT:-fastsafetensors}
 enable_flashinfer_autotune=${ENABLE_FLASHINFER_AUTOTUNE:-1}
 enable_prefix_caching=${ENABLE_PREFIX_CACHING:-1}
-dspark_draft_attention_backend=${DSPARK_DRAFT_ATTENTION_BACKEND:-B12X_MLA_SPARSE}
+dspark_draft_attention_backend=${DSPARK_DRAFT_ATTENTION_BACKEND:-B12X}
 # DSpark confidence verification gating (all inert when empty). SPS curve is
 # either the string "auto" or a raw JSON breakpoint list like [[8,900],[32,600]].
 dspark_sps_curve=${DSPARK_SPS_CURVE:-}
@@ -204,10 +204,10 @@ if [[ ! "${num_speculative_tokens}" =~ ^[0-9]+$ ]]; then
 fi
 if [[ "${enable_dspark}" == 1 ]]; then
   case "${dspark_draft_attention_backend}" in
-    auto|B12X_MLA_SPARSE|FLASHINFER_MLA_SPARSE_DSV4|FLASHMLA_SPARSE_DSV4) ;;
+    auto|B12X|FLASHINFER_MLA_SPARSE_DSV4|FLASHMLA_SPARSE_DSV4) ;;
     *)
       printf '%s\n' \
-        'DSPARK_DRAFT_ATTENTION_BACKEND must be auto, B12X_MLA_SPARSE,' \
+        'DSPARK_DRAFT_ATTENTION_BACKEND must be auto, B12X,' \
         'FLASHINFER_MLA_SPARSE_DSV4, or FLASHMLA_SPARSE_DSV4' >&2
       exit 2
       ;;
@@ -404,7 +404,7 @@ exec .venv/bin/python -m vllm.entrypoints.cli.main serve \
   --max-num-seqs "${max_num_seqs}" \
   --max-num-batched-tokens "${max_num_batched_tokens}" \
   --max-cudagraph-capture-size "${max_cudagraph_capture_size}" \
-  --attention-backend "${ATTN_BACKEND:-B12X_MLA_SPARSE}" \
+  --attention-backend "${ATTN_BACKEND:-B12X}" \
   --async-scheduling \
   --no-scheduler-reserve-full-isl \
   --enable-chunked-prefill \

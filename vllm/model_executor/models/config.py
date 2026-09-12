@@ -368,9 +368,9 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-        backend = AttentionBackendEnum.B12X_MLA_SPARSE_DSV41
+        backend = AttentionBackendEnum.B12X
         if vllm_config.attention_config.backend not in (None, backend):
-            raise ValueError("DeepSeek V4.1 requires B12X_MLA_SPARSE_DSV41.")
+            raise ValueError("DeepSeek V4.1 requires B12X.")
         vllm_config.attention_config.backend = backend
 
 

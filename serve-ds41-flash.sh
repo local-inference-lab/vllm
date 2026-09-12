@@ -26,6 +26,7 @@ TORCH_PROFILE_WITH_FLOPS="${TORCH_PROFILE_WITH_FLOPS:-0}"
 TORCH_PROFILE_USE_GZIP="${TORCH_PROFILE_USE_GZIP:-1}"
 TORCH_PROFILE_DEFAULT_DIR=/tmp/vllm-ds4-decode
 TORCH_PROFILE_MAX_ITERATIONS=4
+TP_SIZE="${TP_SIZE:-4}"
 
 bool_value() {
   local name=$1 value=${2,,}
@@ -199,13 +200,13 @@ PY
   profiler_args=(--profiler-config "${profiler_config}")
 fi
 
-speculative_config='{"method":"dspark","num_speculative_tokens":7,"draft_tensor_parallel_size":4,"attention_backend":"B12X_MLA_SPARSE_DSV41","draft_sample_method":"greedy","rejection_sample_method":"standard","enable_adaptive_verification":true}'
+speculative_config="{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"draft_tensor_parallel_size\":${TP_SIZE},\"attention_backend\":\"B12X\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"standard\",\"enable_adaptive_verification\":true}"
 command=(
   "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL_PATH}"
   --served-model-name "${SERVED_MODEL_NAME}"
   --host "${HOST}" --port "${PORT}"
   --dtype bfloat16
-  --tensor-parallel-size 4
+  --tensor-parallel-size "${TP_SIZE}"
   --load-format "${LOAD_FORMAT}"
   --safetensors-load-strategy lazy
   --block-size 256
@@ -214,6 +215,7 @@ command=(
   --max-model-len "${MAX_MODEL_LEN}"
   --max-num-seqs "${MAX_NUM_SEQS}"
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
+  --max_cudagraph_capture_size 128
   --generation-config vllm
   --limit-mm-per-prompt '{"image":2}'
   --engram-config "{\"cpu_offload\":false,\"table_memory\":\"${ENGRAM_TABLE_MEMORY}\"}"

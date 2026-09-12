@@ -69,8 +69,8 @@ logger = init_logger(__name__)
 
 def _select_dsv4_attn_cls(vllm_config):
     backend = vllm_config.attention_config.backend
-    if backend not in (None, AttentionBackendEnum.B12X_MLA_SPARSE_DSV41):
-        raise ValueError("DeepSeek V4.1 requires B12X_MLA_SPARSE_DSV41")
+    if backend not in (None, AttentionBackendEnum.B12X):
+        raise ValueError("DeepSeek V4.1 requires B12X")
     return DeepseekV41B12xAttention
 
 

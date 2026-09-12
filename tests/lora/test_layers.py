@@ -1082,7 +1082,7 @@ def test_merged_column_parallel_variable_slice(
         torch.testing.assert_close(lora_result, expected_result, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("tp_size", [1, 2, 3, 4, 8])
 @pytest.mark.parametrize(
     "seed", list(range(VOCAB_PARALLEL_EMBEDDING_TEST_NUM_RANDOM_SEEDS))
 )
