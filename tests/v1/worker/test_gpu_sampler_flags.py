@@ -10,6 +10,7 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA required for sampler flag tests", allow_module_level=True)
 
 from vllm.sampling_params import SamplingParams
+from vllm.v1.worker.gpu.sample.gumbel import warmup_processed_gumbel
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.states import RequestState
 
@@ -88,3 +89,39 @@ def test_logits_processing_cache_only_checks_active_requests():
 
     assert not np.any(sampler.needs_logits_processing[sampling_only])
     assert np.any(sampler.needs_logits_processing[with_processing])
+
+
+def test_seeded_filtered_sampler_uses_precompiled_target_kernel(monkeypatch):
+    """Exercise real UVA sampling states and the InputBatch int64 mapping ABI."""
+    from triton import knobs
+
+    sampler = _make_sampler()
+    warmup_processed_gumbel(VOCAB_SIZE, DEVICE)
+
+    def unexpected_compile(**kwargs):
+        pytest.fail("Seeded filtered sampling compiled after target warmup")
+
+    monkeypatch.setattr(knobs.runtime, "jit_post_compile_hook", unexpected_compile)
+    for req_idx in (0, 3):
+        sampler.add_request(
+            req_idx, 1, SamplingParams(temperature=1, top_p=0.95, seed=43)
+        )
+        sampler.apply_staged_writes()
+        mapping_np = np.array([req_idx], dtype=np.intp)
+        mapping = torch.from_numpy(mapping_np).to(DEVICE)
+        logits = torch.zeros((1, VOCAB_SIZE), dtype=torch.bfloat16, device=DEVICE)
+        position = torch.ones(1, dtype=torch.int64, device=DEVICE)
+        input_ids = torch.ones(1, dtype=torch.int32, device=DEVICE)
+        local_position = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+        sampled, processed = sampler.sample(
+            logits,
+            mapping,
+            mapping,
+            mapping_np,
+            position,
+            input_ids,
+            local_position,
+        )
+        assert processed.dtype == torch.float32
+        assert sampled.shape == (1,)
+    torch.accelerator.synchronize()

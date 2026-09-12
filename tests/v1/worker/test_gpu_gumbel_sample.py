@@ -21,7 +21,7 @@ pytest.importorskip("triton")
 if not torch.cuda.is_available():
     pytest.skip("CUDA required for Gumbel sampler tests", allow_module_level=True)
 
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample, warmup_processed_gumbel
 
 DEVICE = "cuda"
 VOCAB_SIZE = 200_000
@@ -31,6 +31,44 @@ NUM_SAMPLES = 500_000
 HEAD_LOG_GAP = 18.0
 # 10-sigma band: a correct sampler effectively never trips it.
 Z_TOLERANCE = 10.0
+
+
+@pytest.mark.parametrize("vocab_size", [257, 129280])
+@pytest.mark.parametrize("use_fp64", [False, True])
+def test_processed_gumbel_warmup_covers_seeded_target_sampling(
+    monkeypatch, vocab_size, use_fp64
+):
+    """Explicitly seeded FP32 requests must not JIT after server warmup."""
+    from triton import knobs
+
+    device = torch.device(DEVICE)
+    warmup_processed_gumbel(vocab_size, device, use_fp64=use_fp64)
+    torch.accelerator.synchronize()
+
+    def unexpected_compile(**kwargs):
+        pytest.fail("Seeded target sampling compiled after sampler warmup")
+
+    monkeypatch.setattr(knobs.runtime, "jit_post_compile_hook", unexpected_compile)
+    for rows in (1, 2, 7, 8, 16, 31):
+        logits = torch.zeros(rows, vocab_size, device=device)
+        # InputBatch uses np.intp / torch.int64 request mappings.
+        mapping = torch.zeros(rows, dtype=torch.int64, device=device)
+        temperature = torch.ones(1, device=device)
+        seed = torch.tensor([43], dtype=torch.int64, device=device)
+        position = torch.arange(rows, dtype=torch.int64, device=device)
+        sampled = gumbel_sample(
+            logits,
+            mapping,
+            temperature,
+            seed,
+            position,
+            apply_temperature=False,
+            is_drafting=False,
+            use_fp64=use_fp64,
+        )
+        assert sampled.shape == (rows,)
+        assert ((sampled >= 0) & (sampled < vocab_size)).all()
+    torch.accelerator.synchronize()
 
 
 def _make_heavy_tailed_counts(seed: int = 1234) -> torch.Tensor:
