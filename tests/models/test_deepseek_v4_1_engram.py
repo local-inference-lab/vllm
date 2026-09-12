@@ -576,7 +576,7 @@ def test_ram_engram_budget_reserves_memory_and_survives_worker_serialization(
         ),
     )
     # TP4 rounds the two global tables to 20 and 32 packed 264-byte rows.
-    available = (16 << 30) + (20 + 32) * 264 - 1
+    available = (4 << 30) + (20 + 32) * 264 - 1
     monkeypatch.setattr(weight_utils, "_get_available_ram_bytes", lambda: available)
     config = EngramConfig(table_memory="ram")
     graph_hash = config.compute_hash()

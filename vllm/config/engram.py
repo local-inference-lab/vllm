@@ -18,6 +18,9 @@ _NGRAM_LAYER_FIELDS = {
     "DeepseekV41ForCausalLM": "engram_layer_ids",
 }
 
+_RAM_RESERVE_GIB = 4
+_RAM_RESERVE_BYTES = _RAM_RESERVE_GIB << 30
+
 
 def _ram_table_nbytes(hf_config, tp_size: int = 1) -> int:
     """Full-model packed E4M3/E8M0 storage, including ceil-row TP padding."""
@@ -77,7 +80,7 @@ class EngramConfig:
         planned = _ram_table_nbytes(hf_config, tp_size)
         if self._ram_budget_checked_nbytes == planned:
             return
-        reserve = 16 << 30
+        reserve = _RAM_RESERVE_BYTES
         try:
             available = _get_available_ram_bytes()
         except (OSError, ValueError) as exc:
@@ -85,15 +88,17 @@ class EngramConfig:
         else:
             logger.info(
                 "Engram mapped-host RAM: %.2f GiB packed tables across TP%d, "
-                "%.2f GiB available, 16 GiB reserve",
+                "%.2f GiB available, %d GiB reserve",
                 planned / (1 << 30),
                 tp_size,
                 available / (1 << 30),
+                _RAM_RESERVE_GIB,
             )
             if planned + reserve > available:
                 raise ValueError(
                     "Insufficient RAM for Engram mapped-host tables: "
-                    f"{planned / (1 << 30):.2f} GiB packed tables + 16 GiB "
+                    f"{planned / (1 << 30):.2f} GiB packed tables + "
+                    f"{_RAM_RESERVE_GIB} GiB "
                     f"reserve required, {available / (1 << 30):.2f} GiB available. "
                     "RAM mode never falls back to disk or device storage."
                 )
