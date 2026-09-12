@@ -106,6 +106,7 @@ def _chunk(
     PAGE: tl.constexpr,
     WINDOW: tl.constexpr,
     WIDTH: tl.constexpr,
+    TOP_WIDTH: tl.constexpr,
     DRAFT: tl.constexpr,
     BLOCK: tl.constexpr,
     swa_replay_start=None,
@@ -143,7 +144,8 @@ def _chunk(
     tl.store(Lengths + row, tl.maximum(length, 0))
     visible = tl.load(Visible + offset + row)
     tl.store(
-        TopLengths + row, tl.where(valid, tl.minimum(tl.maximum(visible, 0), 512), 0)
+        TopLengths + row,
+            tl.where(valid, tl.minimum(tl.maximum(visible, 0), TOP_WIDTH), 0)
     )
 
 
