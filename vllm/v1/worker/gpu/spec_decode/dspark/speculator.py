@@ -89,9 +89,9 @@ class DSparkSpeculator(DFlashSpeculator):
         self.enable_adaptive_verification = (
             self.speculative_config.enable_adaptive_verification
         )
-        draft_vocab = (
-            getattr(self.draft_model_config.hf_config, "draft_vocab_size", None)
-            or self.draft_model_config.hf_config.vocab_size
+        draft_vocab = max(
+            self.draft_model_config.hf_config.vocab_size,
+            getattr(self.draft_model_config.hf_config, "draft_vocab_size", None) or 0,
         )
         shape = scratch_shape(self.max_num_reqs, draft_vocab)
         self._greedy_partial_values = torch.empty(

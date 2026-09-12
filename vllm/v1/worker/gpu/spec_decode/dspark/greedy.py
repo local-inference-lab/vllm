@@ -82,9 +82,26 @@ def sample_greedy_markov(
     scratch of ``scratch_shape(capacity, vocabulary_size)`` and int32/int64
     output, which may be a strided speculative-token column. Ties, NaNs, and
     addition rounding follow PyTorch argmax. No proposal truncation is used.
+
+    Args:
+        base_logits: Per-request full-vocabulary base logits.
+        markov_bias: Transition bias with the same shape and dtype as base_logits.
+        output: Caller-owned column receiving one token ID per request.
+        partial_values: Contiguous FP32 scratch for the partial maxima.
+        partial_indices: Contiguous int32 scratch for the partial token indices.
+
+    Raises:
+        ValueError: Input shapes differ or scratch cannot hold every partial.
     """
+    if base_logits.shape != markov_bias.shape:
+        raise ValueError(
+            "DSpark greedy base logits and Markov bias must have identical shapes: "
+            f"{tuple(base_logits.shape)} != {tuple(markov_bias.shape)}"
+        )
     rows, vocab = base_logits.shape
     parts = triton.cdiv(vocab, _BLOCK)
+    if min(partial_values.numel(), partial_indices.numel()) < rows * parts:
+        raise ValueError("DSpark greedy scratch is smaller than the logits require")
     _partial_argmax[(rows, parts)](
         base_logits,
         markov_bias,

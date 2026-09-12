@@ -11,6 +11,36 @@ from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
 )
 
 
+@pytest.mark.parametrize("base_vocab,bias_vocab", [(2049, 2048), (2048, 2049)])
+def test_greedy_markov_rejects_mismatched_vocabulary_before_dispatch(
+    base_vocab, bias_vocab
+):
+    """An invalid model head must fail before any GPU buffer is accessed."""
+    base = torch.empty((2, base_vocab))
+    bias = torch.empty((2, bias_vocab))
+    output = torch.empty(2, dtype=torch.int64)
+    shape = scratch_shape(2, max(base_vocab, bias_vocab))
+    with pytest.raises(ValueError, match="identical shapes"):
+        sample_greedy_markov(
+            base,
+            bias,
+            output,
+            torch.empty(shape),
+            torch.empty(shape, dtype=torch.int32),
+        )
+
+
+@pytest.mark.parametrize("short_values", [False, True])
+def test_greedy_markov_rejects_insufficient_scratch_before_dispatch(short_values):
+    base = torch.empty((2, 2049))
+    bias = torch.empty_like(base)
+    output = torch.empty(2, dtype=torch.int64)
+    values = torch.empty(3 if short_values else 4)
+    indices = torch.empty(4 if short_values else 3, dtype=torch.int32)
+    with pytest.raises(ValueError, match="scratch is smaller"):
+        sample_greedy_markov(base, bias, output, values, indices)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("vocab", [1, 2047, 2048, 2049, 129280])
