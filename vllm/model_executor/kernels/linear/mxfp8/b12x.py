@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
 
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
@@ -113,6 +115,11 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
         packed_weight = mxfp8.pack_weight(
             weight[:out_features, :in_features].detach(),
             weight_scale[:out_features, :scale_k].detach(),
+        )
+        # Both B12X activation-precision paths read the MMA-layout scales.
+        # The row-layout copy is packaging metadata, not an execution input.
+        packed_weight = replace(
+            packed_weight, weight=replace(packed_weight.weight, scale_rows=None)
         )
         layer.b12x_mxfp8_packed_weight = reuse_packed_weight_storage(
             getattr(layer, "b12x_mxfp8_packed_weight", None),

@@ -3,6 +3,7 @@
 
 import json
 import math
+import weakref
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -193,6 +194,41 @@ def test_glm5next_mtp_selects_only_draft_checkpoint_weights() -> None:
         "model.layers.45.",
         "layers.45.",
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_glm5next_draft_head_preserves_target_and_quantized_weight() -> None:
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("NVFP4 draft vocabulary head requires SM120")
+    import flashinfer
+
+    from vllm.models.glm5next.nvidia.mtp_draft_head import QuantizedDraftHead
+
+    weight = torch.randn(1024, 256, device="cuda", dtype=torch.bfloat16)
+    original = weight.clone()
+    scale = (448.0 * 6.0) / weight.float().abs().nan_to_num().max()
+    values, scales = flashinfer.nvfp4_quantize(
+        weight,
+        scale,
+        sfLayout=flashinfer.SfLayout.layout_128x4,
+        do_shuffle=False,
+        backend="cuda",
+    )
+    expected = flashinfer.prepare_bf16_fp4_weights(
+        values.view(torch.uint8),
+        scales,
+        scale.reciprocal().reshape(1),
+        backend="cute-dsl",
+    )
+    head = QuantizedDraftHead(
+        SimpleNamespace(weight=weight, tp_size=1, shard_indices=object()), "nvfp4"
+    )
+    torch.testing.assert_close(weight, original, rtol=0, atol=0)
+    for actual, reference in zip(
+        (head.weight, head.weight_scale, head.weight_global_scale), expected
+    ):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
 def test_glm5next_mtp_reuses_runtime_quantized_draft_head(monkeypatch) -> None:
@@ -1704,11 +1740,12 @@ def test_glm_adaptive_kda_graph_matches_independent_request_states(monkeypatch, 
         context.attn_metadata[layer.prefix] = metadata
         layer.kv_cache[0].copy_(initial_conv)
         layer.kv_cache[1].copy_(initial_state)
-        allocations = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+        allocations = torch.accelerator.memory_stats(device)["allocation.all.allocated"]
         graph.replay()
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
         assert (
-            torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocations
+            torch.accelerator.memory_stats(device)["allocation.all.allocated"]
+            == allocations
         )
         graph_output = output.clone()
         graph_states = tuple(state.clone() for state in layer.kv_cache)
@@ -2018,6 +2055,154 @@ def test_glm5next_processing_info_pins_processor_revision(monkeypatch) -> None:
             {"revision": "checkpoint-commit"},
         )
     ]
+
+
+def test_glm5next_vision_attention_releases_projection_and_norm_inputs(monkeypatch):
+    from vllm.models.glm5next.nvidia import multimodal
+
+    owners = {}
+
+    def project(value):
+        packed = value.repeat(1, 1, 3)
+        owners["packed"] = weakref.ref(packed)
+        return packed, None
+
+    def normalize(q, k, *args):
+        owners["q_norm_input"] = weakref.ref(q)
+        owners["k_norm_input"] = weakref.ref(k)
+        return q.clone(), k.clone()
+
+    def attention(query, key, value, **kwargs):
+        assert all(owner() is None for owner in owners.values())
+        owners.update(q=weakref.ref(query), k=weakref.ref(key), v=weakref.ref(value))
+        return value.clone()
+
+    def output_project(value):
+        assert all(owner() is None for owner in owners.values())
+        return value, None
+
+    layer = SimpleNamespace(
+        head_dim=2,
+        num_attention_heads_per_partition=2,
+        hidden_size_per_attention_head=2,
+        qkv=project,
+        q_norm=SimpleNamespace(weight=torch.ones(2), variance_epsilon=1e-5),
+        k_norm=SimpleNamespace(weight=torch.ones(2)),
+        apply_rotary_emb=lambda value, cos, sin: value.clone(),
+        attn=attention,
+        proj=output_project,
+    )
+    layer.split_qkv = lambda value: multimodal.Glm5NextVisionAttention.split_qkv(
+        layer, value
+    )
+    layer._project_qkv = lambda *args: multimodal.Glm5NextVisionAttention._project_qkv(
+        layer, *args
+    )
+    monkeypatch.setattr(multimodal, "fused_q_kv_rmsnorm", normalize)
+    x = torch.arange(28, dtype=torch.float32).view(7, 1, 4)
+    original = x.clone()
+    output = multimodal.Glm5NextVisionAttention.forward(
+        layer, x, torch.tensor([0, 7]), torch.ones(7, 1), torch.zeros(7, 1), 7
+    )
+    torch.testing.assert_close(output, original, rtol=0, atol=0)
+    torch.testing.assert_close(x, original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("reserved_bytes", [0, 256, 4096])
+def test_glm5next_chunked_projection_keeps_whole_image_attention(
+    monkeypatch, reserved_bytes
+):
+    from vllm.models.glm5next.nvidia import multimodal
+    from vllm.v1.worker import workspace
+
+    manager = workspace.WorkspaceManager(torch.device("cpu"))
+    manager.reserve_all(((reserved_bytes,), torch.uint8))
+    manager.lock()
+    monkeypatch.setattr(workspace, "_manager", manager)
+    monkeypatch.setattr(multimodal, "_VISION_PROJECTION_CHUNK_ROWS", 4)
+    x = torch.randn(11, 1, 8, generator=torch.Generator().manual_seed(72))
+    cu_seqlens = torch.tensor([0, 3, 11])
+    cos, sin = torch.ones(11, 2), torch.zeros(11, 2)
+    projected_rows = []
+    attention_calls = []
+
+    def project(value, cos, sin):
+        projected_rows.append(len(value))
+        assert cos.shape[0] == sin.shape[0] == len(value)
+        value = value.reshape(1, len(value), 2, 4)
+        return value, value * 0.5, value * 2
+
+    def attention(query, key, value, **metadata):
+        assert metadata["cu_seqlens"] is cu_seqlens
+        attention_calls.append(query.shape[1])
+        outputs = []
+        for start, stop in zip(cu_seqlens[:-1], cu_seqlens[1:]):
+            q, k, v = (t[:, start:stop].transpose(1, 2) for t in (query, key, value))
+            outputs.append(
+                torch.nn.functional.scaled_dot_product_attention(q, k, v).transpose(
+                    1, 2
+                )
+            )
+        return torch.cat(outputs, dim=1)
+
+    layer = SimpleNamespace(
+        num_attention_heads_per_partition=2,
+        hidden_size_per_attention_head=4,
+        _project_qkv=project,
+        _borrow_qkv_workspace=True,
+        attn=attention,
+    )
+    norm = torch.nn.RMSNorm(8)
+    q, k, v = project(norm(x), cos, sin)
+    expected = attention(q, k, v, cu_seqlens=cu_seqlens).reshape_as(x)
+    projected_rows.clear()
+    attention_calls.clear()
+    actual = multimodal.Glm5NextVisionAttention.context_with_chunked_projection(
+        layer, x, norm, cu_seqlens, cos, sin, 8
+    )
+    torch.testing.assert_close(actual, expected)
+    assert projected_rows == [4, 4, 3]
+    assert attention_calls == [11]
+
+
+@pytest.mark.parametrize("token_budget,expand", [(8000, 1), (8192, 1), (8000, 2)])
+def test_glm5next_image_budget_covers_rectangular_canvases(token_budget, expand):
+    from vllm.models.glm5next.nvidia.multimodal import Glm5NextProcessingInfo
+
+    processor = SimpleNamespace(
+        patch_size=14, merge_size=2, temporal_patch_size=2, patch_expand_factor=expand
+    )
+    info = Glm5NextProcessingInfo.__new__(Glm5NextProcessingInfo)
+    info.get_hf_processor = lambda **kwargs: SimpleNamespace(image_processor=processor)
+    info.get_hf_config = lambda: SimpleNamespace(
+        vision_config=SimpleNamespace(
+            patch_size=14, spatial_merge_size=2, temporal_patch_size=2
+        )
+    )
+    info._get_image_max_pixels = lambda: token_budget * 2 * 28**2
+    canvas = info.get_image_size_with_most_features()
+    assert canvas.width % (28 * expand) == 0
+    assert canvas.height % (28 * expand) == 0
+    assert canvas.width * canvas.height // 28**2 == token_budget
+    assert info.get_max_image_tokens() == token_budget
+    assert (
+        info.get_num_image_tokens(image_width=3082, image_height=2048) <= token_budget
+    )
+    if token_budget == 8000 and expand == 1:
+        assert (canvas.width, canvas.height) == (2800, 2240)
+        assert canvas.width * canvas.height // 28**2 > 7957
+
+
+def test_glm5next_image_pixel_budget_respects_token_override():
+    from vllm.models.glm5next.nvidia.multimodal import Glm5NextProcessingInfo
+
+    processor = SimpleNamespace(patch_size=14, merge_size=2, temporal_patch_size=2)
+    info = Glm5NextProcessingInfo.__new__(Glm5NextProcessingInfo)
+    info.get_hf_processor = lambda **kwargs: SimpleNamespace(image_processor=processor)
+    info.ctx = SimpleNamespace(
+        get_merged_mm_kwargs=lambda kwargs: {"max_image_tokens": 2048}
+    )
+    assert info._get_image_max_pixels() == 2048 * 2 * 28**2
 
 
 def test_glm5next_processor_counts_video_only_tokens() -> None:

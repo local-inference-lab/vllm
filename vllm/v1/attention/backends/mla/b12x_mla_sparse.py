@@ -1540,6 +1540,49 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             and self._q_head_dim == 576
         )
 
+    def prepare_projection_input(
+        self, value: torch.Tensor, output: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Reuse idle attention workspace for disjoint MLA projection batches.
+
+        Query projection runs before attention borrows its workspace; value
+        projection runs after attention finishes. A disjoint prefix may receive
+        the layout copy in either case. The projection consumes that prefix
+        before another kernel borrows the worker workspace.
+        """
+        if (
+            not self._is_glm_next
+            or value.shape[1] <= self._decode_max_rows
+            or value.dtype != torch.bfloat16
+            or value.is_contiguous()
+        ):
+            return None
+        manager = current_workspace_manager()
+        nbytes = value.numel() * value.element_size()
+        if manager.available_bytes() < nbytes:
+            return None
+        (packed,) = manager.get_simultaneous((tuple(value.shape), value.dtype))
+        for live in (value, output):
+            if packed.untyped_storage().data_ptr() != live.untyped_storage().data_ptr():
+                continue
+            start = live.storage_offset() * live.element_size()
+            stop = (
+                start
+                + (
+                    1
+                    + sum(
+                        (size - 1) * stride
+                        for size, stride in zip(live.shape, live.stride())
+                    )
+                )
+                * live.element_size()
+            )
+            packed_start = packed.storage_offset() * packed.element_size()
+            if start < packed_start + nbytes and packed_start < stop:
+                return None
+        packed.copy_(value)
+        return packed
+
     def reduce_scatter_dcp_output(self, output: torch.Tensor) -> torch.Tensor | None:
         """Reuse consumed query storage for the prefill output collective.
 

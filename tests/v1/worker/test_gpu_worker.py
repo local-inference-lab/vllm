@@ -80,6 +80,23 @@ def test_startup_plan_apply_gate(plan_env):
     assert explicit.cache_config.kv_cache_memory_bytes == 7 * GiB_bytes
 
 
+def test_explicit_kv_budget_releases_completed_profile_allocations(monkeypatch):
+    events = []
+    worker = _plan_worker(kv_bytes=4 * GiB_bytes)
+    worker.model_config = SimpleNamespace(multimodal_config=None)
+    worker.model_runner = SimpleNamespace(profile_run=lambda: events.append("profile"))
+    monkeypatch.setattr(gpu_worker, "maybe_apply_startup_plan", lambda worker: None)
+    monkeypatch.setattr(
+        gpu_worker.torch.accelerator, "synchronize", lambda: events.append("sync")
+    )
+    monkeypatch.setattr(
+        gpu_worker.torch.accelerator, "empty_cache", lambda: events.append("release")
+    )
+
+    assert gpu_worker.Worker.determine_available_memory(worker) == 4 * GiB_bytes
+    assert events == ["profile", "sync", "release"]
+
+
 @pytest.mark.parametrize(
     "final_free_memory,expected_available_memory",
     [(90, 75), (85, 70)],

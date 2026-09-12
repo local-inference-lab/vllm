@@ -52,11 +52,12 @@ def use_workspace_lane(lane: int) -> Iterator[None]:
 def collect_cuda_graph_capture_resources() -> Iterator[list[Any]]:
     """Collect objects whose storage is referenced by one CUDA graph.
 
-    A CUDA graph records device pointers, but it does not retain the Python
-    objects that own those allocations. Callers that allocate custom-op output
-    or scratch tensors during capture can register their owner with
-    :func:`retain_cuda_graph_capture_resource`. The graph manager keeps the
-    returned list alive for exactly as long as the captured graph.
+    A CUDA graph records device pointers, but does not retain Python owners of
+    external allocations. Register scratch and eager-break outputs allocated
+    outside its pool with :func:`retain_cuda_graph_capture_resource`. Outputs
+    allocated in the graph pool are already tracked by the CUDA allocator;
+    retaining consumed outputs here would prevent its storage reuse. The graph
+    manager keeps this list alive for exactly as long as the captured graph.
     """
     resources: list[Any] = []
     token = _cuda_graph_capture_resources.set(resources)
@@ -150,6 +151,23 @@ class WorkspaceManager:
     def is_locked(self) -> bool:
         """Check if workspace is locked."""
         return self._locked
+
+    def available_bytes(self) -> int:
+        """Capacity of the active execution slot, without allocating storage.
+
+        A borrower must ensure that no nested or concurrent operation consumes
+        this slot while its views are live.
+        """
+        ubatch_id = dbo_current_ubatch_id()
+        lane = _workspace_lane.get()
+        if lane >= self._num_lanes:
+            raise RuntimeError(
+                f"Workspace lane {lane} is not configured; manager has "
+                f"{self._num_lanes} lane(s)."
+            )
+        return self._workspace_size_bytes(
+            self._current_workspaces[ubatch_id * self._num_lanes + lane]
+        )
 
     def get_simultaneous(
         self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]

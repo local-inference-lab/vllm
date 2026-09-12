@@ -188,7 +188,8 @@ if AttentionBackendEnum.TOKENSPEED_MLA in BACKENDS_TO_TEST:
         BACKENDS_TO_TEST.remove(AttentionBackendEnum.TOKENSPEED_MLA)
 
 
-def test_mla_post_load_preserves_runtime_weight_addresses(monkeypatch):
+@pytest.mark.parametrize("has_mha_prefill", [False, True])
+def test_mla_post_load_preserves_runtime_weight_addresses(monkeypatch, has_mha_prefill):
     layer = MLAAttention.__new__(MLAAttention)
     torch.nn.Module.__init__(layer)
     layer.kv_lora_rank = 2
@@ -206,7 +207,14 @@ def test_mla_post_load_preserves_runtime_weight_addresses(monkeypatch):
     layer.dcp_q_replicate = False
     layer.quant_config = None
     layer.layer_name = "test"
-    layer.impl = SimpleNamespace(process_weights_after_loading=lambda act_dtype: None)
+    layer.impl = SimpleNamespace(
+        process_weights_after_loading=lambda act_dtype: None, is_sparse=True
+    )
+    layer.prefill_backend = object() if has_mha_prefill else None
+    packed = object()
+    provider = object()
+    layer.kv_b_proj.b12x_mxfp8_packed_weight = packed
+    layer.kv_b_proj.b12x_warmup_provider = provider
 
     monkeypatch.setattr(
         mla_attention_module, "set_default_quant_scales", lambda *_, **__: None
@@ -221,7 +229,16 @@ def test_mla_post_load_preserves_runtime_weight_addresses(monkeypatch):
         old_w_uv = layer.W_UV.clone()
         old_w_uk_t = layer.W_UK_T.clone()
 
+        assert layer.kv_b_proj.b12x_mxfp8_packed_weight is (
+            packed if has_mha_prefill else None
+        )
+        assert layer.kv_b_proj.b12x_warmup_provider is (
+            provider if has_mha_prefill else None
+        )
+
         layer.kv_b_proj.weight.add_(100)
+        layer.kv_b_proj.b12x_mxfp8_packed_weight = object()
+        layer.kv_b_proj.b12x_warmup_provider = provider
         layer.process_weights_after_loading(torch.float32)
 
     assert layer.W_UV.data_ptr() == w_uv_ptr
@@ -920,6 +937,36 @@ def test_mock_mla_dcp_fp8_decode_gathers_quantized_query(
         num_heads * impl.dcp_world_size,
         kv_lora_rank + qk_rope_head_dim,
     )
+
+
+@pytest.mark.parametrize("has_mha_prefill", [False, True])
+def test_mla_profile_reserves_only_supported_dense_context(
+    monkeypatch, has_mha_prefill
+):
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+
+    layer = SimpleNamespace(
+        prefill_backend=object() if has_mha_prefill else None,
+        chunked_prefill_workspace_size=128,
+        num_heads=2,
+        qk_nope_head_dim=4,
+        v_head_dim=4,
+    )
+    q = torch.ones(3, 2, 8, dtype=torch.bfloat16)
+    kv_c = torch.ones(3, 8, dtype=torch.bfloat16)
+    output = torch.full((3, 8), float("nan"), dtype=torch.bfloat16)
+    allocations = []
+    empty = torch.empty
+
+    def record_empty(shape, **kwargs):
+        allocations.append(shape)
+        return empty(shape, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", record_empty)
+    actual = MLAAttention.forward_impl(layer, q, kv_c, kv_c, kv_c, None, output)
+    assert actual is output
+    assert torch.count_nonzero(output) == 0
+    assert allocations == ([(128, 2, 8)] if has_mha_prefill else [])
 
 
 def test_tokenspeed_mla_noncausal_capability():

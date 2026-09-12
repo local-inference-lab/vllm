@@ -91,8 +91,11 @@ class QuantizedDraftHead(nn.Module):
             )
         import flashinfer
 
+        # The BF16 guard above makes float() an owned temporary. In-place
+        # sanitization avoids two vocabulary-sized FP32 copies without writing
+        # to the target head or changing the quantization scale.
         weight_global_scale = (
-            _NVFP4_GLOBAL_MAX / weight.float().abs().nan_to_num().max()
+            _NVFP4_GLOBAL_MAX / weight.float().abs_().nan_to_num_().max()
         )
         weight_fp4, weight_sf = flashinfer.nvfp4_quantize(
             weight,

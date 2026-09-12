@@ -1000,18 +1000,18 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
 
         if attn_metadata is None:
-            # During the profile run try to simulate to worse case output size
-            # for `self.kv_b_proj(kv_c_normed)` in `_compute_prefill_context`
-            # since this can be large
-            _ = torch.empty(
-                (
-                    self.chunked_prefill_workspace_size,
-                    self.num_heads,
-                    self.qk_nope_head_dim + self.v_head_dim,
-                ),
-                device=k_c_normed.device,
-                dtype=k_c_normed.dtype,
-            )
+            if self.prefill_backend is not None:
+                # Dense MHA expands compressed keys through kv_b_proj. An
+                # MQA-only backend never materializes this context-sized tensor.
+                _ = torch.empty(
+                    (
+                        self.chunked_prefill_workspace_size,
+                        self.num_heads,
+                        self.qk_nope_head_dim + self.v_head_dim,
+                    ),
+                    device=k_c_normed.device,
+                    dtype=k_c_normed.dtype,
+                )
 
             # The zero fill is required when used with DP + EP
             # to ensure all ranks within a DP group compute the
@@ -1190,6 +1190,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
 
                 # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
+                prepare = getattr(self.impl, "prepare_projection_input", None)
+                if prepare is not None:
+                    prepared = prepare(mqa_q_nope, mqa_ql_nope)
+                    if prepared is not None:
+                        mqa_q_nope = prepared
                 _bmm_with_disjoint_batches(mqa_q_nope, W_UK_T, out=mqa_ql_nope)
 
                 # Convert from (N, B, L) to (B, N, L)
@@ -1467,6 +1472,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         ) or callable(impl_warmup):
             object.__setattr__(self, "b12x_warmup_provider", self)
 
+        if (
+            self.impl.is_sparse
+            and self.prefill_backend is None
+            and getattr(self.kv_b_proj, "b12x_mxfp8_packed_weight", None) is not None
+        ):
+            # MQA-only execution reads W_UK_T/W_UV, never the packed linear.
+            # A weight reload repacks the linear before refreshing those owned
+            # matrices. Do not retain an unused copy or schedule its warmup.
+            self.kv_b_proj.b12x_mxfp8_packed_weight = None
+            self.kv_b_proj.b12x_warmup_provider = None
+
     def get_b12x_warmup_unit(
         self,
         layer: torch.nn.Module,
@@ -1568,6 +1584,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
         else:
             # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)
+            prepare = getattr(self.impl, "prepare_projection_input", None)
+            if prepare is not None:
+                prepared = prepare(x, out)
+                if prepared is not None:
+                    x = prepared
             _bmm_with_disjoint_batches(x, self.W_UV, out=out.transpose(0, 1))
 
 

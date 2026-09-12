@@ -3,6 +3,7 @@
 
 from collections.abc import Callable
 from dataclasses import replace
+from math import prod
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -803,7 +804,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
         )
 
-    def _get_b12x_prefill_workspace(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _b12x_prefill_workspace_specs(self):
         plan = self._b12x_prefill_plan
         if plan is None:
             raise RuntimeError("b12x KDA prefill KV cache is not bound")
@@ -811,7 +812,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         if len(scratch_specs) != 1:
             raise RuntimeError("b12x KDA prefill requires exactly one scratch buffer")
         scratch_spec = scratch_specs[0]
-        scratch, output = current_workspace_manager().get_simultaneous(
+        return (
             (scratch_spec.shape, scratch_spec.dtype),
             (
                 (
@@ -822,7 +823,41 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.model_config.dtype,
             ),
         )
+
+    def _get_b12x_prefill_workspace(self) -> tuple[torch.Tensor, torch.Tensor]:
+        scratch, output = current_workspace_manager().get_simultaneous(
+            *self._b12x_prefill_workspace_specs()
+        )
         return scratch, output
+
+    def _borrow_b12x_prefill_transients(
+        self,
+        tokens: int,
+        dtype: torch.dtype,
+        selection_specs: tuple[tuple[tuple[int, ...], torch.dtype], ...] = (),
+    ) -> list[torch.Tensor] | None:
+        """Borrow a suffix disjoint from the subsequent KDA scratch and output.
+
+        Convolution Q/K/V must stay live throughout KDA. The workspace prefix
+        is therefore reserved using the exact KDA plan, and only existing
+        spare capacity after that prefix may hold the three convolution results
+        and optional mixed-batch selection outputs. Indexed selection retains
+        arbitrary request ordering; it does not assume a contiguous spec prefix.
+        """
+        if self.kda_prefill_backend != "b12x" or dtype != self.get_state_dtype()[0]:
+            return None
+        specs = (
+            self._b12x_prefill_workspace_specs()
+            + (((tokens, self.local_projection_size), dtype),) * 3
+            + selection_specs
+        )
+        required = sum(
+            ((prod(shape) * dt.itemsize + 255) // 256) * 256 for shape, dt in specs
+        )
+        manager = current_workspace_manager()
+        if required > manager.available_bytes():
+            return None
+        return manager.get_simultaneous(*specs)[2:]
 
     def _run_b12x_kda_prefill(
         self,
@@ -1167,6 +1202,11 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             beta=beta,
             core_attn_out=core_attn_out,
         )
+        # Recurrence has consumed every projection view. Release their backing
+        # storage before the output GEMM and collective allocate their results.
+        del mixed_qkv, g1, g2, beta, g_proj_states, f_a, projected_qkvgfab
+        if self.use_full_rank_gate:
+            del projected
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         output[:] = self.o_proj(core_attn_out)[0]
 
@@ -1262,9 +1302,35 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
                 g1_spec = g1.index_select(1, spec_token_indx)
                 beta_spec = beta.index_select(1, spec_token_indx)
-                mixed_qkv_ns = mixed_qkv.index_select(0, non_spec_token_indx)
-                g1_ns = g1.index_select(1, non_spec_token_indx)
-                beta_ns = beta.index_select(1, non_spec_token_indx)
+                assert non_spec_token_indx is not None
+                n = non_spec_token_indx.numel()
+                selection = (
+                    self._borrow_b12x_prefill_transients(
+                        n,
+                        mixed_qkv.dtype,
+                        (
+                            ((n, mixed_qkv.shape[1]), mixed_qkv.dtype),
+                            ((g1.shape[0], n, *g1.shape[2:]), g1.dtype),
+                            ((beta.shape[0], n, *beta.shape[2:]), beta.dtype),
+                        ),
+                    )
+                    if m.num_prefills > 0
+                    else None
+                )
+                if selection is None:
+                    mixed_qkv_ns = mixed_qkv.index_select(0, non_spec_token_indx)
+                    g1_ns = g1.index_select(1, non_spec_token_indx)
+                    beta_ns = beta.index_select(1, non_spec_token_indx)
+                else:
+                    # Mixed-batch speculative recurrence uses the allocating
+                    # Triton path, not the shared-workspace decode kernel. These
+                    # suffix views therefore remain live until KDA consumes them.
+                    mixed_qkv_ns, g1_ns, beta_ns = selection[3:]
+                    torch.index_select(
+                        mixed_qkv, 0, non_spec_token_indx, out=mixed_qkv_ns
+                    )
+                    torch.index_select(g1, 1, non_spec_token_indx, out=g1_ns)
+                    torch.index_select(beta, 1, non_spec_token_indx, out=beta_ns)
                 g2_spec = g2_ns = None
         else:
             mixed_qkv_spec = g1_spec = beta_spec = None
@@ -1351,6 +1417,9 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     self.local_projection_size, dim=-1
                 )
                 prefill_mixed_qkv = mixed_qkv_ns
+                conv_outputs = self._borrow_b12x_prefill_transients(
+                    mixed_qkv_ns.shape[0], mixed_qkv_ns.dtype
+                )
 
                 # Packed prefill conv would require copying V solely to make
                 # it dense for KDA. Separate calls accept the strided inputs
@@ -1361,7 +1430,9 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     x: torch.Tensor,
                     state: torch.Tensor,
                     weight: torch.Tensor,
+                    out: torch.Tensor | None,
                 ) -> torch.Tensor:
+                    output_arg = {"out": out.transpose(0, 1)} if out is not None else {}
                     return causal_conv1d_fn(
                         x.transpose(0, 1),
                         weight,
@@ -1372,11 +1443,27 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                         cache_indices=non_spec_state_indices_tensor,
                         query_start_loc=non_spec_query_start_loc,
                         metadata=m,
+                        **output_arg,
                     ).transpose(0, 1)
 
-                q_ns = _prefill_conv(q_ns, q_conv_state, q_conv_weight)
-                k_ns = _prefill_conv(k_ns, k_conv_state, k_conv_weight)
-                v_ns = _prefill_conv(v_ns, v_conv_state, v_conv_weight)
+                q_ns = _prefill_conv(
+                    q_ns,
+                    q_conv_state,
+                    q_conv_weight,
+                    conv_outputs[0] if conv_outputs is not None else None,
+                )
+                k_ns = _prefill_conv(
+                    k_ns,
+                    k_conv_state,
+                    k_conv_weight,
+                    conv_outputs[1] if conv_outputs is not None else None,
+                )
+                v_ns = _prefill_conv(
+                    v_ns,
+                    v_conv_state,
+                    v_conv_weight,
+                    conv_outputs[2] if conv_outputs is not None else None,
+                )
                 q_ns, k_ns, v_ns = (
                     rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim)
                     for x in (q_ns, k_ns, v_ns)
@@ -1653,14 +1740,12 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ---------- merge spec and non-spec outputs ----------
         if core_attn_out_spec is not None and core_attn_out_non_spec is not None:
             # Mixed batches require indexed placement in the original order.
-            merged = torch.empty(
-                (1, num_actual_tokens, *core_attn_out_spec.shape[2:]),
-                dtype=core_attn_out_spec.dtype,
-                device=core_attn_out_spec.device,
-            )
+            # Both mixed-path results have separate storage: speculative
+            # recurrence allocates its result and prefill owns a workspace
+            # result. The caller's destination needs no intermediate copy.
+            merged = core_attn_out[:, :num_actual_tokens]
             merged.index_copy_(1, spec_token_indx, core_attn_out_spec)
             merged.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
-            core_attn_out[0, :num_actual_tokens] = merged[0, :num_actual_tokens]
         elif core_attn_out_non_spec is not None:
             core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
                 0, :num_actual_tokens

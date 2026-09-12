@@ -54,10 +54,10 @@ _INDEX_PAGE_BYTES = _INDEX_PAGE_SIZE * _INDEX_CACHE_WIDTH
 class Glm5NextIndexerScratch(nn.Module):
     """Temporary storage for sequential pooled-indexer calls on one model stream.
 
-    A model owns one instance; its draft model owns another. KV views, recurrent
-    tails and selected token IDs are not scratch and remain separately owned.
-    Bind tables before graph capture; calls must finish consuming the scratch
-    before another layer overwrites it.
+    Target layers and a serial single-layer MTP model can share one instance.
+    KV views and recurrent tails remain layer-owned. Bind tables before graph
+    capture; calls must finish consuming scratch and selection outputs before
+    another layer or model overwrites them.
     """
 
     q_fp8: torch.Tensor
