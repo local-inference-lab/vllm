@@ -128,6 +128,41 @@ def test_prepare_memory_is_metadata_not_capacity_activations(native_workspace):
     assert allocated <= metadata_bytes + persistent_topk_bytes + 1024**2
 
 
+@pytest.mark.parametrize("draft_tokens", [5, 7])
+def test_parallel_draft_reservation_keeps_decode_split_parallelism(
+    native_workspace, draft_tokens
+):
+    from b12x.attention.compressed_sparse_mla import api as mla
+
+    attention, _, _ = native_workspace
+    layer = _layer(attention)
+    layer.config.scheduler_config.max_num_seqs = 32
+    layer.config.speculative_config.num_speculative_tokens = draft_tokens
+    layer.config.speculative_config.parallel_drafting = True
+    layer.config.compilation_config.max_cudagraph_capture_size = 32 * (draft_tokens + 1)
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    layer._prepare(device)
+    decode = layer._plans["decode"].caps
+    prefill = layer._plans["extend"].caps
+    assert decode.max_q_rows > 256
+    assert (
+        mla.split_chunks_for_contract(
+            rows=decode.max_q_rows,
+            width=decode.max_width,
+            decode_row_capacity=decode.decode_row_capacity,
+        )
+        == 54
+    )
+    assert (
+        mla.split_chunks_for_contract(
+            rows=prefill.max_q_rows,
+            width=prefill.max_width,
+            decode_row_capacity=prefill.decode_row_capacity,
+        )
+        == 1
+    )
+
+
 def test_mhc_fixed_capacity_buckets_preserve_decode_policy(
     native_workspace, monkeypatch
 ):

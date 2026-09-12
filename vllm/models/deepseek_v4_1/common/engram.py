@@ -18,7 +18,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.weight_transfer import get_file_tensor_source
 from vllm.triton_utils import tl, triton
@@ -66,6 +66,15 @@ class EngramLayout:
         engram_config = vc.engram_config
         self.table_memory = (
             engram_config.table_memory if engram_config is not None else "device"
+        )
+        self.disk_resident_scales = (
+            engram_config.disk_resident_scales if engram_config is not None else False
+        )
+        self.disk_prefetch_max_tokens = (
+            engram_config.disk_prefetch_max_tokens if engram_config is not None else 0
+        )
+        self.projection_tp = (
+            engram_config.projection_tp if engram_config is not None else False
         )
         if (
             self.table_memory == "disk"
@@ -321,7 +330,9 @@ def _lookup_fake(indices, out, key):
 
 
 class ParallelEngramEmbedding(nn.Module):
-    def __init__(self, plan, table_memory="device"):
+    def __init__(
+        self, plan, table_memory="device", *, resident_scales=False, prefetch=False
+    ):
         super().__init__()
         self.plan = plan
         self.key = id(self)
@@ -329,7 +340,14 @@ class ParallelEngramEmbedding(nn.Module):
         self.tp_size = plan.caps.tp_size
         if table_memory not in ("device", "ram", "disk"):
             raise ValueError("Engram table_memory must be device, ram or disk")
-        self.disk_table = native.DiskTable(plan) if table_memory == "disk" else None
+        self.disk_table = None
+        if table_memory == "disk":
+            # Do not require the optional B12X API on unchanged/default boots.
+            options = {}
+            if resident_scales or prefetch:
+                options = {"resident_scales": resident_scales, "prefetch": prefetch}
+            self.disk_table = native.DiskTable(plan, **options)
+        self._disk_pending_rows = None
         self._disk_binding = None
         self._disk_prepared_rows = 0
         self.mapped_host_nbytes = 0
@@ -443,13 +461,15 @@ class ParallelEngramEmbedding(nn.Module):
             loaded.add(name)
         return loaded
 
-    def prepare_disk(self, indices, out, num_tokens):
+    def prepare_disk(self, indices, out, num_tokens, *, prefetch=False):
         if self.disk_table is None:
             raise RuntimeError("Engram table is not disk-backed")
         if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "Disk Engram preparation must run outside compile/capture"
             )
+        if self._disk_pending_rows is not None:
+            raise RuntimeError("Disk Engram has an unconsumed preparation")
         self.hashes[: indices.shape[0]].copy_(indices)
         self.num_tokens.copy_(num_tokens)
         if self._disk_binding is None or self._disk_binding.out is not out:
@@ -466,10 +486,36 @@ class ParallelEngramEmbedding(nn.Module):
             self._disk_prepared_rows = 0
         if indices.shape[0] < self._disk_prepared_rows:
             out[indices.shape[0] : self._disk_prepared_rows].zero_()
-        native.run_lookup(
-            self._disk_binding, token_count=indices.shape[0], clear_tail=False
-        )
-        self._disk_prepared_rows = indices.shape[0]
+        if prefetch:
+            self.disk_table.prefetch(self._disk_binding, token_count=indices.shape[0])
+            self._disk_pending_rows = indices.shape[0]
+        else:
+            native.run_lookup(
+                self._disk_binding, token_count=indices.shape[0], clear_tail=False
+            )
+            self._disk_prepared_rows = indices.shape[0]
+
+    def finish_disk(self):
+        if self._disk_pending_rows is None:
+            return
+        assert self.disk_table is not None
+        count = self._disk_pending_rows
+        try:
+            native.run_lookup(self._disk_binding, token_count=count, clear_tail=False)
+            self._disk_prepared_rows = count
+        finally:
+            if not self.disk_table.prefetch_pending:
+                self._disk_pending_rows = None
+
+    def abort_disk(self):
+        if self._disk_pending_rows is None:
+            return
+        assert self.disk_table is not None
+        try:
+            self.disk_table.abort_prefetch()
+        finally:
+            if not self.disk_table.prefetch_pending:
+                self._disk_pending_rows = None
 
     def lookup_native(self, indices, out):
         self.hashes[: indices.shape[0]].copy_(indices)
@@ -511,16 +557,25 @@ class Engram(nn.Module):
         self.hc_mult = config.hc_mult
         self.eps = config.rms_norm_eps
         plan = layout.plans[layer_hash_index]
-        self.embed_tokens = ParallelEngramEmbedding(plan, layout.table_memory)
+        self.disk_prefetch_max_tokens = getattr(layout, "disk_prefetch_max_tokens", 0)
+        self.embed_tokens = ParallelEngramEmbedding(
+            plan,
+            layout.table_memory,
+            resident_scales=getattr(layout, "disk_resident_scales", False),
+            prefetch=self.disk_prefetch_max_tokens > 0,
+        )
         self._disk_prepared = False
         self._disk_prepared_tokens = 0
-        self.wkv = ReplicatedLinear(
+        projection_tp = getattr(layout, "projection_tp", False)
+        projection_cls = ColumnParallelLinear if projection_tp else ReplicatedLinear
+        self.wkv = projection_cls(
             6144,
             self.dim * (self.hc_mult + 1),
             bias=False,
             return_bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.wkv",
+            **({"gather_output": True} if projection_tp else {}),
         )
         self.q_weight = nn.Parameter(
             torch.empty(self.hc_mult, self.dim, dtype=torch.bfloat16),
@@ -564,21 +619,31 @@ class Engram(nn.Module):
     def invalidate_disk_output(self, *, clear=False):
         self._disk_prepared = False
         self._disk_prepared_tokens = 0
-        if clear:
-            self.staged_rows.zero_()
+        try:
+            self.embed_tokens.abort_disk()
+        finally:
+            if clear:
+                self.staged_rows.zero_()
 
     def prepare_disk(self, hash_ids, num_tokens):
         self.invalidate_disk_output()
+        prefetch = 0 < hash_ids.shape[0] <= self.disk_prefetch_max_tokens
         try:
-            self.embed_tokens.prepare_disk(hash_ids, self.staged_rows, num_tokens)
+            self.embed_tokens.prepare_disk(
+                hash_ids, self.staged_rows, num_tokens, prefetch=prefetch
+            )
         except BaseException:
             self.invalidate_disk_output(clear=True)
             raise
         self._disk_prepared_tokens = hash_ids.shape[0]
+        self._disk_prepared = not prefetch
+
+    def finish_disk(self):
+        self.embed_tokens.finish_disk()
         self._disk_prepared = True
 
     def prepare_dummy_output(self, num_tokens):
-        self.staged_rows.zero_()
+        self.invalidate_disk_output(clear=True)
         self._disk_prepared_tokens = num_tokens
         self._disk_prepared = True
 

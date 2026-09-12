@@ -90,7 +90,9 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
         paths.append(path)
         weights.update(layer_weights)
 
-    def make_model(memory, *, tp_size=1, tp_rank=0):
+    def make_model(
+        memory, *, tp_size=1, tp_rank=0, resident_scales=False, prefetch_max_tokens=0
+    ):
         local_plans = tuple(
             native.plan(
                 replace(plan.caps, tp_size=tp_size, tp_rank=tp_rank),
@@ -103,6 +105,8 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
             plans=local_plans,
             layer_ids=geometry.layer_ids,
             table_memory=memory,
+            disk_resident_scales=resident_scales,
+            disk_prefetch_max_tokens=prefetch_max_tokens,
         )
         target = DeepseekV4Model.__new__(DeepseekV4Model)
         nn.Module.__init__(target)
@@ -324,9 +328,11 @@ def test_ram_engram_checkpoint_tp4_graph_reads_live_host_aliases(
             stream.synchronize()
             torch.testing.assert_close(out.cpu(), expected_output(), rtol=0, atol=0)
             freeze_kernel_resolution("RAM Engram graph replay")
-            with collect_cuda_graph_capture_resources() as resources:
-                with torch.cuda.graph(graph, stream=stream):
-                    embedding.lookup_native(ids, out)
+            with (
+                collect_cuda_graph_capture_resources() as resources,
+                torch.cuda.graph(graph, stream=stream),
+            ):
+                embedding.lookup_native(ids, out)
             # No checkpoint file or model reference is needed after capture.
             # Only the graph resource collector may retain the mapped owners.
             del embedding, target, root
@@ -362,14 +368,22 @@ def test_ram_engram_checkpoint_tp4_graph_reads_live_host_aliases(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("resident_scales", [False, True])
+@pytest.mark.parametrize("prefetch_max_tokens", [0, 2, 8])
 def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
     tiny_engram_checkpoint,
     tmp_path,
     monkeypatch,
+    resident_scales,
+    prefetch_max_tokens,
 ):
     """Accepted GPU history, images, padding and failures cross the eager boundary."""
     make_model, weights, paths = tiny_engram_checkpoint
-    root, target = make_model("disk")
+    root, target = make_model(
+        "disk",
+        resident_scales=resident_scales,
+        prefetch_max_tokens=prefetch_max_tokens,
+    )
     resident_root, resident = make_model("device")
     _load_checkpoint(root, tmp_path)
     with torch.no_grad():
@@ -561,6 +575,45 @@ def test_engram_storage_selection_changes_graph_configuration(cpu_offload):
     assert len(hashes) == 3
     with pytest.raises(ValueError):
         EngramConfig(table_memory="invalid")
+    disk_hashes = {
+        EngramConfig(table_memory="disk", **options).compute_hash()
+        for options in (
+            {},
+            {"disk_resident_scales": True},
+            {"disk_prefetch_max_tokens": 32},
+            {"projection_tp": True},
+        )
+    }
+    assert len(disk_hashes) == 4
+
+
+def test_disk_resident_scale_budget_charges_only_original_scale_bytes(monkeypatch):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    model = SimpleNamespace(
+        architecture="DeepseekV41ForCausalLM",
+        hf_text_config=SimpleNamespace(
+            engram_layer_ids=(1, 14), engram_num_embeddings=(17, 31)
+        ),
+    )
+    available = (4 << 30) + (20 + 32) * 8
+    monkeypatch.setattr(weight_utils, "_get_available_ram_bytes", lambda: available)
+    config = EngramConfig(table_memory="disk", disk_resident_scales=True)
+    config.verify_model_config(model, tp_size=4)
+    available -= 1
+    with pytest.raises(ValueError, match="Insufficient RAM"):
+        EngramConfig(
+            table_memory="disk", disk_resident_scales=True
+        ).verify_model_config(model, tp_size=4)
+    with pytest.raises(ValueError, match="table_memory"):
+        EngramConfig(
+            table_memory="device", disk_prefetch_max_tokens=32
+        ).verify_model_config(model, tp_size=4)
+    with pytest.raises(ValueError, match="nonnegative"):
+        EngramConfig(
+            table_memory="disk", disk_prefetch_max_tokens=-1
+        ).verify_model_config(model, tp_size=4)
 
 
 def test_ram_engram_budget_reserves_memory_and_survives_worker_serialization(

@@ -302,6 +302,10 @@ def build_attn_metadata(
 
     attn_metadata: dict[str, Any] = {}
     cached_attn_metadata: dict[tuple[KVCacheSpec, type], Any] = {}
+    # Query boundaries are batch-owned, unlike per-group KV pages. Keep the
+    # first builder's persistent buffer as owner in both capture and replay.
+    # This cache must not escape this invocation (including into the drafter).
+    token_to_req_indices: torch.Tensor | None = None
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
     group_slot_mappings = slot_mappings[:num_kv_cache_groups].unbind(0)
     for i in range(num_kv_cache_groups):
@@ -361,6 +365,7 @@ def build_attn_metadata(
                         is_prefilling=group_is_prefilling,
                         mm_req_doc_ranges=mm_req_doc_ranges,
                         rswa_prefix_lens=rswa_prefix_lens,
+                        _token_to_req_indices_cache=token_to_req_indices,
                         **common_attn_metadata_extra_kwargs,
                     )
 
@@ -382,6 +387,7 @@ def build_attn_metadata(
                         common_attn_metadata=common_attn_metadata,
                         **attn_metadata_extra_kwargs,
                     )
+                token_to_req_indices = common_attn_metadata._token_to_req_indices_cache
                 if attn_metadata_builder.supports_update_block_table:
                     cached_attn_metadata[cache_key] = metadata
             for layer_name in attn_group.layer_names:
