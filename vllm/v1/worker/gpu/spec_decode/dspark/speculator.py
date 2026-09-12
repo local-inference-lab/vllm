@@ -32,6 +32,10 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
+    sample_greedy_markov,
+    scratch_shape,
+)
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 
 logger = init_logger(__name__)
@@ -84,6 +88,17 @@ class DSparkSpeculator(DFlashSpeculator):
         )
         self.enable_adaptive_verification = (
             self.speculative_config.enable_adaptive_verification
+        )
+        draft_vocab = max(
+            self.draft_model_config.hf_config.vocab_size,
+            getattr(self.draft_model_config.hf_config, "draft_vocab_size", None) or 0,
+        )
+        shape = scratch_shape(self.max_num_reqs, draft_vocab)
+        self._greedy_partial_values = torch.empty(
+            shape, dtype=torch.float32, device=device
+        )
+        self._greedy_partial_indices = torch.empty(
+            shape, dtype=torch.int32, device=device
         )
 
     @property
@@ -198,11 +213,25 @@ class DSparkSpeculator(DFlashSpeculator):
             if self.enable_adaptive_verification:
                 confidence_markov_embeds.append(markov_embed)
             bias = self.model.markov_bias(markov_embed)
-            logits_i = base_logits[:, i] + bias
-            draft_sampled_i = self._sample_logits(
-                logits_i, idx_map[:, i], sample_pos[:, i], i
-            )
-            self.draft_tokens[:num_reqs, i] = draft_sampled_i
+            if (
+                self.draft_logits is None
+                and self.model.draft_id_to_target_id is None
+                and base_logits.dtype == bias.dtype
+            ):
+                draft_sampled_i = self.draft_tokens[:num_reqs, i]
+                sample_greedy_markov(
+                    base_logits[:, i],
+                    bias,
+                    draft_sampled_i,
+                    self._greedy_partial_values,
+                    self._greedy_partial_indices,
+                )
+            else:
+                logits_i = base_logits[:, i] + bias
+                draft_sampled_i = self._sample_logits(
+                    logits_i, idx_map[:, i], sample_pos[:, i], i
+                )
+                self.draft_tokens[:num_reqs, i] = draft_sampled_i
             prev = draft_sampled_i
 
         if self.enable_adaptive_verification:
