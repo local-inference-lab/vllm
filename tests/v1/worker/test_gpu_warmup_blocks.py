@@ -83,7 +83,7 @@ def _make_runner(
         device=torch.device(current_platform.device_type),
         max_num_reqs=4,
         max_model_len=MAX_MODEL_LEN,
-        model_config=SimpleNamespace(get_vocab_size=lambda: 64),
+        model_config=SimpleNamespace(get_vocab_size=lambda: 64, use_fp64_gumbel=False),
         model_state=SimpleNamespace(max_encoder_len=0),
         scheduler_config=SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=2048),
         kv_cache_config=SimpleNamespace(

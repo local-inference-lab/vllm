@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import CrossAttentionSpec, KVCacheSpec, MambaSpe
 from vllm.v1.request import Request
 from vllm.v1.sample.ops.topk_topp_sampler import warmup_top_k_top_p
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.sample.gumbel import warmup_processed_gumbel
 
 logger = init_logger(__name__)
 
@@ -442,6 +443,11 @@ def warmup_kernels(
     worker_execute_model(cleanup_output)
     model_runner.kv_connector.set_disabled(False)
     if model_runner.is_last_pp_rank and not model_runner.is_pooling_model:
+        warmup_processed_gumbel(
+            model_runner.model_config.get_vocab_size(),
+            model_runner.device,
+            use_fp64=model_runner.model_config.use_fp64_gumbel,
+        )
         warmup_top_k_top_p(
             model_runner.model_config.get_vocab_size(),
             min(
