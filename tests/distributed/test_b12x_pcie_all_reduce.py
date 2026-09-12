@@ -434,13 +434,21 @@ def test_b12x_fused_allreduce_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_twoshot_limit_defaults_to_768kb(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_twoshot_limit_defaults_off(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE", raising=False)
+    assert _twoshot_max_bytes() == 0
+    monkeypatch.setattr(
+        b12x_pcie_all_reduce.envs,
+        "VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE",
+        "768KB",
+    )
     assert _twoshot_max_bytes() == 768 << 10
-    monkeypatch.setenv("VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE", "2MB")
-    assert _twoshot_max_bytes() == 2 << 20
     for disabled in ("0", "off", " NONE ", "", "disabled"):
-        monkeypatch.setenv("VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE", disabled)
+        monkeypatch.setattr(
+            b12x_pcie_all_reduce.envs,
+            "VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE",
+            disabled,
+        )
         assert _twoshot_max_bytes() == 0
 
 

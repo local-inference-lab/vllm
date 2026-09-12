@@ -241,6 +241,7 @@ if TYPE_CHECKING:
     VLLM_ROCE_ALLREDUCE_MAX_SIZE: str = "2MB"
     VLLM_ROCE_ALLGATHER_MAX_SIZE: str = "16MB"
     VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
+    VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE: str = "off"
     VLLM_PCIE_DMA_MIN_BYTES: str = "6MB"
     VLLM_PCIE_DMA_FP8: str | None = None
     VLLM_XGRAMMAR_CACHE_MB: int = 0
@@ -1978,6 +1979,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE": lambda: os.getenv(
         "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE", "84KB"
+    ),
+    # Largest input size for the lossless BF16 two-shot. Set a byte size to
+    # opt in; "off" keeps inputs above the one-shot ceiling on the fallback.
+    "VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+        "VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE", "off"
     ),
     # Minimum input size for the DMA ring. Set to "off" to keep large
     # all-reduces on the normal fallback backend.

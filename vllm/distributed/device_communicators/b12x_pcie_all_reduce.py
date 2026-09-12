@@ -48,14 +48,8 @@ def _parse_byte_size(value: str) -> int:
 
 
 def _twoshot_max_bytes() -> int:
-    """Largest all-reduce routed to the lossless bf16 two-shot (0 disables).
-
-    Measured on four RTX PRO 6000 Blackwell (PCIe, TP4): the pull two-shot
-    beats the NCCL ring from the one-shot ceiling up to 768 KB (128 KB 15.0
-    vs 16.7 us, 512 KB 32.8 vs 41.7, 768 KB 44.5 vs 54.5) and matches it at
-    1 MB and above, so the default stops at 768 KB.
-    """
-    raw = os.getenv("VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE", "768KB").strip().lower()
+    """Largest all-reduce routed to the opt-in lossless BF16 two-shot."""
+    raw = envs.VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE.strip().lower()
     if raw in ("", "0", "off", "none", "disabled"):
         return 0
     return _parse_byte_size(raw)
