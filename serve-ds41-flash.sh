@@ -133,19 +133,23 @@ fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export CUDA_HOME="${CUDA_HOME:-/opt/cuda}"
 export CUTE_DSL_ARCH=sm_120a
-export PYTHONDONTWRITEBYTECODE=1
-export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export OMP_NUM_THREADS=8
-export NCCL_IB_DISABLE=1
-export NCCL_P2P_LEVEL=SYS
-export VLLM_USE_V2_MODEL_RUNNER=1
-export VLLM_USE_BREAKABLE_CUDAGRAPH=1
-export VLLM_ENABLE_PCIE_ALLREDUCE=1
+
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-32}"
+export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
+export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
+export NCCL_PROTO="${NCCL_PROTO:-LL,LL128,Simple}"
+export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
+export VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-1}"
+export VLLM_USE_AOT_COMPILE="${VLLM_USE_AOT_COMPILE:-1}"
+export VLLM_USE_STANDALONE_COMPILE="${VLLM_USE_STANDALONE_COMPILE:-1}"
+export VLLM_USE_MEGA_AOT_ARTIFACT="${VLLM_USE_MEGA_AOT_ARTIFACT:-1}"
+export VLLM_USE_BREAKABLE_CUDAGRAPH="${VLLM_USE_BREAKABLE_CUDAGRAPH:-0}"
+export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-1}"
+export VLLM_ENABLE_PCIE_ALLREDUCE="${VLLM_ENABLE_PCIE_ALLREDUCE:-1}"
 export VLLM_PCIE_ALLREDUCE_BACKEND=b12x
-# Use the qualified TP4 collective policy, not earlier TP8 tuning overrides.
-unset VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE
-# Callable-worker tracing used this flag; a serving endpoint must not inherit it.
-unset VLLM_ALLOW_INSECURE_SERIALIZATION
+export VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE="96KB"
+export VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE="96KB"
 
 profiler_args=()
 if [[ -n "${TORCH_PROFILE_DIR}" ]]; then
@@ -202,7 +206,6 @@ command=(
   --host "${HOST}" --port "${PORT}"
   --dtype bfloat16
   --tensor-parallel-size 4
-  --pipeline-parallel-size 1
   --load-format "${LOAD_FORMAT}"
   --safetensors-load-strategy lazy
   --block-size 256
@@ -226,7 +229,7 @@ command=(
 )
 
 cd "${SCRIPT_DIR}"
-printf 'Launching %s: TP4, GPUs %s, %s Engram, DSpark (5 draft tokens)\n' \
+printf 'Launching %s: TP4, GPUs %s, %s Engram, DSpark (7 draft tokens)\n' \
   "${SERVED_MODEL_NAME}" "${CUDA_VISIBLE_DEVICES}" "${ENGRAM_TABLE_MEMORY}" >&2
 printf 'Endpoint: http://%s:%s/v1  |  GPU memory budget: %s\n' \
   "${HOST}" "${PORT}" "${GPU_MEMORY_UTILIZATION}" >&2
