@@ -584,6 +584,7 @@ def test_b12x_twoshot_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VLLM_ENABLE_PCIE_ALLREDUCE", "1")
     monkeypatch.setenv("VLLM_PCIE_ALLREDUCE_BACKEND", "b12x")
     monkeypatch.setenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "16KB")
+    monkeypatch.setenv("VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE", "768KB")
     monkeypatch.setenv("VLLM_PCIE_DMA_MIN_BYTES", "off")
     torch.multiprocessing.spawn(
         _run_b12x_twoshot_gpu,
