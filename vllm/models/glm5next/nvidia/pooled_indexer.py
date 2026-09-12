@@ -11,9 +11,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig
 from vllm.distributed import get_dcp_group
+from vllm.distributed.parallel_state import get_query_split_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import LayerNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -23,7 +25,11 @@ from vllm.models.deepseek_v4.nvidia.b12x_indexer import (
     B12xC4SparseIndexer,
 )
 from vllm.utils.b12x import get_b12x_sparse_mla
-from vllm.v1.attention.backends.mla.b12x_indexer import _merge_dcp_topk
+from vllm.v1.attention.backends.mla.b12x_indexer import (
+    _gather_indexer_row_ids,
+    _is_current_stream_capturing,
+    _merge_dcp_topk,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
@@ -49,6 +55,7 @@ _SELECTION_WIDTH = 2051
 _INDEX_CACHE_WIDTH = 132
 _INDEX_PAGE_SIZE = 64
 _INDEX_PAGE_BYTES = _INDEX_PAGE_SIZE * _INDEX_CACHE_WIDTH
+_OWNER_MERGE_DIAGNOSTIC_LAYER: str | None = None
 
 
 class Glm5NextPooledIndexer(nn.Module):
@@ -603,29 +610,43 @@ class Glm5NextPooledIndexer(nn.Module):
                     # DCP pool ownership is interleaved across ranks, so a global
                     # sequence length does not define a contiguous local prefix.
                     request_table = self._pool_block_table[request : request + 1]
-                shared_table = request_table.expand(int(query_len), -1)
-                self.indexer_op.run_paged_topk(
+                query_split_size, used_owner_merge = self._run_prefill_topk(
                     q=q_fp8[row_start:row_end],
                     weights=weights[row_start:row_end],
-                    kv_cache=index_cache,
+                    index_cache=index_cache,
                     seq_lens=seq_lens[row_start:row_end],
-                    block_table=shared_table,
-                    output=pool_ids[row_start:row_end],
-                    scores=(
+                    request_table=request_table,
+                    pool_ids=pool_ids[row_start:row_end],
+                    pool_scores=(
                         pool_scores[row_start:row_end]
                         if pool_scores is not None
                         else None
                     ),
-                    shared_page_table=True,
                 )
-                if pool_scores is not None:
-                    _merge_dcp_topk(
-                        pool_ids[row_start:row_end],
-                        pool_scores[row_start:row_end],
-                        self.dcp_rank,
-                        self.dcp_world_size,
-                        self.pool_interleave,
-                    )
+                if (
+                    envs.VLLM_DCP_TOPK_OWNER_MERGE_DIAGNOSTICS
+                    and int(query_len) >= 8192
+                ):
+                    global _OWNER_MERGE_DIAGNOSTIC_LAYER
+                    if _OWNER_MERGE_DIAGNOSTIC_LAYER is None:
+                        _OWNER_MERGE_DIAGNOSTIC_LAYER = self.main_layer_name
+                    if self.main_layer_name == _OWNER_MERGE_DIAGNOSTIC_LAYER:
+                        print(
+                            "GLM_TOPK_OWNER_MERGE",
+                            {
+                                "rank": self.dcp_rank,
+                                "layer": self.main_layer_name,
+                                "rows": int(query_len),
+                                "query_split_size": query_split_size,
+                                "query_rows": int(query_len) // query_split_size,
+                                "owner_rows": int(query_len)
+                                // query_split_size
+                                // self.dcp_world_size,
+                                "topk": _POOL_TOPK,
+                                "used": used_owner_merge,
+                            },
+                            flush=True,
+                        )
                 row_start = row_end
             if row_start != live_rows:
                 raise RuntimeError(
@@ -655,6 +676,56 @@ class Glm5NextPooledIndexer(nn.Module):
                 pool_ids[:live_rows], positions[:live_rows], output[:live_rows]
             )
         return output
+
+    def _run_prefill_topk(
+        self,
+        *,
+        q,
+        weights,
+        index_cache,
+        seq_lens,
+        request_table,
+        pool_ids,
+        pool_scores,
+    ) -> tuple[int, bool]:
+        """Select independent query rows, then restore global pool IDs."""
+        rows = int(q.shape[0])
+        if rows == 0:
+            return 1, False
+        query_group: Any = (
+            get_query_split_group() if envs.VLLM_DCP_QUERY_SPLIT else None
+        )
+        split_size = query_group.world_size if query_group is not None else 1
+        if rows % split_size or _is_current_stream_capturing(q):
+            split_size = 1
+        query_rows = rows // split_size
+        start = query_group.rank_in_group * query_rows if split_size > 1 else 0
+        stop = start + query_rows
+        local_ids = pool_ids[start:stop]
+        local_scores = pool_scores[start:stop] if pool_scores is not None else None
+        self.indexer_op.run_paged_topk(
+            q=q[start:stop],
+            weights=weights[start:stop],
+            kv_cache=index_cache,
+            seq_lens=seq_lens[start:stop],
+            block_table=request_table.expand(query_rows, -1),
+            output=local_ids,
+            scores=local_scores,
+            shared_page_table=True,
+        )
+        used_owner_merge = False
+        if local_scores is not None:
+            used_owner_merge = _merge_dcp_topk(
+                local_ids,
+                local_scores,
+                self.dcp_rank,
+                self.dcp_world_size,
+                self.pool_interleave,
+                use_owner_merge=envs.VLLM_DCP_TOPK_OWNER_MERGE,
+            )
+        if split_size > 1:
+            _gather_indexer_row_ids(query_group, local_ids, pool_ids)
+        return split_size, used_owner_merge
 
     def snapshot_speculative_interval_starts(self) -> None:
         self._tail_snapshot.copy_(self._tail)
