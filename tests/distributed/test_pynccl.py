@@ -317,9 +317,70 @@ def glm_dcp_query_scratch_worker_fn():
         )
         assert torch.equal(actual, expected)
 
+    from vllm.v1.attention.ops.dcp import cp_lse_ag_out_rs
+
+    def gather_lse(value, dim):
+        assert dim == 0
+        result = value.new_empty((size * value.shape[0], *value.shape[1:]))
+        comm.all_gather(result, value.contiguous())
+        return result
+
+    def reduce_output(value, dim):
+        packed = value.movedim(0, dim).contiguous()
+        result = packed.new_empty((packed.shape[0] // size, *packed.shape[1:]))
+        comm.reduce_scatter(result, packed)
+        return result.movedim(0, dim).contiguous()
+
+    group.all_gather = gather_lse
+    group.reduce_scatter = reduce_output
+    for rows in (32, 512, 64):
+        shape = (rows, impl._input_num_heads, 512)
+        partial = (
+            scratch[: rows * impl._input_num_heads * 512 * 2]
+            .view(torch.bfloat16)
+            .view(shape)
+        )
+        source = torch.arange(partial.numel(), device=world.device).remainder(127)
+        source = (source + rank).to(torch.bfloat16).view(shape)
+        lse = torch.arange(rows * impl._input_num_heads, device=world.device)
+        lse = lse.float().remainder(17).view(shape[:2]) + rank
+        lse[::7].fill_(float("-inf"))
+        for base_e in (True, False):
+            expected, expected_lse = cp_lse_ag_out_rs(
+                source.clone(),
+                lse.clone(),
+                group,
+                return_lse=True,
+                is_lse_base_on_e=base_e,
+            )
+            partial.copy_(source)
+            actual, actual_lse = cp_lse_ag_out_rs(
+                partial,
+                lse.clone(),
+                group,
+                return_lse=True,
+                is_lse_base_on_e=base_e,
+                output_reduce_scatter=impl.reduce_scatter_dcp_output,
+            )
+            assert torch.equal(actual, expected)
+            assert torch.equal(actual_lse, expected_lse)
+            assert actual.transpose(0, 1).is_contiguous()
+
+    partial.fill_(rank)
+    impl.reduce_scatter_dcp_output(partial)
+    torch.accelerator.synchronize()
+    output_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(output_graph):
+        actual = impl.reduce_scatter_dcp_output(partial)
+    for iteration in range(3):
+        partial.fill_(rank + iteration * 8)
+        output_graph.replay()
+        expected_sum = sum(range(size)) + size * iteration * 8
+        assert torch.equal(actual, torch.full_like(actual, expected_sum))
+
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 2, reason="Need two GPUs")
-def test_glm_dcp_query_scratch_preserves_values_and_graph_inputs():
+def test_glm_dcp_query_scratch_preserves_query_output_and_graph_inputs():
     distributed_run(glm_dcp_query_scratch_worker_fn, 2)
 
 
