@@ -22,7 +22,7 @@ from vllm.model_executor.models.deepseek_v2 import (
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-from .pooled_indexer import Glm5NextPooledIndexer
+from .pooled_indexer import Glm5NextIndexerScratch, Glm5NextPooledIndexer
 
 
 def _select_sparse_backend(
@@ -63,6 +63,7 @@ class Glm5NextMLAAttention(nn.Module):
         skip_rope: bool | None = False,
         is_mtp_layer: bool = False,
         attn_backend: type | None = None,
+        indexer_scratch: Glm5NextIndexerScratch | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -171,6 +172,7 @@ class Glm5NextMLAAttention(nn.Module):
                 prefix=f"{prefix}.indexer",
                 # MTP compacts and reuses request-relative selections.
                 emit_physical_selection=not is_mtp_layer,
+                scratch=indexer_scratch,
             )
         else:
             self.indexer = None

@@ -49,12 +49,16 @@ def test_workspace_lanes_do_not_alias_and_restore_context(monkeypatch) -> None:
     )
 
     assert manager._current_workspaces == [None, None, None, None]
+    assert manager.available_bytes() == 0
 
     (target,) = manager.get_simultaneous(((512,), torch.uint8))
+    assert manager.available_bytes() == 512
     with workspace.use_workspace_lane(1):
         (draft,) = manager.get_simultaneous(((256,), torch.uint8))
         (draft_reused,) = manager.get_simultaneous(((8,), torch.uint8))
+        assert manager.available_bytes() == 256
     (target_reused,) = manager.get_simultaneous(((8,), torch.uint8))
+    assert manager.available_bytes() == 512
 
     assert manager._current_workspaces[0].numel() == 512  # type: ignore[union-attr]
     assert manager._current_workspaces[1].numel() == 256  # type: ignore[union-attr]

@@ -4,6 +4,7 @@
 
 from collections.abc import Mapping
 from functools import partial
+from math import isqrt, prod
 
 import numpy as np
 import torch
@@ -24,6 +25,7 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -44,6 +46,12 @@ from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.multimodal.parse import ImageSize, MultiModalDataItems
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    is_workspace_manager_initialized,
+)
+
+_VISION_PROJECTION_CHUNK_ROWS = 4096
 
 
 class Glm5NextVisionPatchEmbed(nn.Module):
@@ -169,6 +177,10 @@ class Glm5NextVisionAttention(nn.Module):
             prefix=f"{prefix}.attn",
         )
         self.apply_rotary_emb = ApplyRotaryEmb(enforce_enable=True)
+        self._borrow_qkv_workspace = (
+            isinstance(self.qkv.quant_method, UnquantizedLinearMethod)
+            and self.attn.attn_backend == AttentionBackendEnum.FLASH_ATTN
+        )
 
     def split_qkv(self, qkv: torch.Tensor) -> tuple[torch.Tensor, ...]:
         seq_len, bs, _ = qkv.shape
@@ -190,6 +202,25 @@ class Glm5NextVisionAttention(nn.Module):
         rotary_pos_emb_sin: torch.Tensor,
         max_seqlen: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        q, k, v = self._project_qkv(x, rotary_pos_emb_cos, rotary_pos_emb_sin)
+        context_layer = self.attn(
+            query=q,
+            key=k,
+            value=v,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+        del q, k, v
+        context_layer = rearrange(context_layer, "b s h d -> s b (h d)").contiguous()
+        output, _ = self.proj(context_layer)
+        return output
+
+    def _project_qkv(
+        self,
+        x: torch.Tensor,
+        rotary_pos_emb_cos: torch.Tensor | None,
+        rotary_pos_emb_sin: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x, _ = self.qkv(x)
         q, k, v = self.split_qkv(x)
 
@@ -204,10 +235,14 @@ class Glm5NextVisionAttention(nn.Module):
             self.k_norm.weight,
             self.q_norm.variance_epsilon,
         )
+        del q_flat, k_flat
         q = q.view(q_shape)
         k = k.view(k_shape)
 
         q, k, v = (rearrange(t, "s b ... -> b s ...").contiguous() for t in (q, k, v))
+        # Contiguous attention inputs own their storage; the packed projection
+        # and norm input copies must not stay live through attention/output GEMM.
+        del x
         if rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
             qk_concat = torch.cat([q, k], dim=0)
             qk_rotated = self.apply_rotary_emb(
@@ -216,18 +251,64 @@ class Glm5NextVisionAttention(nn.Module):
                 rotary_pos_emb_sin,
             )
             q, k = torch.chunk(qk_rotated, 2, dim=0)
+            del qk_concat, qk_rotated
 
-        context_layer = self.attn(
+        return q, k, v
+
+    def context_with_chunked_projection(
+        self,
+        x: torch.Tensor,
+        input_norm: nn.Module,
+        cu_seqlens: torch.Tensor,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+        max_seqlen: int | None,
+    ) -> torch.Tensor:
+        """Bound projection scratch without partitioning image attention.
+
+        Normalization, QKV projection and rotary embedding are token-local.
+        Attention still consumes the complete Q/K/V and original image/frame
+        sequence boundaries. No cache or tensor dtype changes are involved.
+        """
+        rows, batch_size, _ = x.shape
+        shape = (
+            batch_size,
+            rows,
+            self.num_attention_heads_per_partition,
+            self.hidden_size_per_attention_head,
+        )
+        manager = (
+            current_workspace_manager()
+            if self._borrow_qkv_workspace and is_workspace_manager_initialized()
+            else None
+        )
+        qkv_bytes = 3 * ((prod(shape) * x.element_size() + 255) // 256) * 256
+        if manager is not None and manager.available_bytes() >= qkv_bytes:
+            # The BF16 projections, rotary operation and FlashAttention do not
+            # borrow worker scratch. These Q/K/V views expire before the output
+            # projection; the text model executes after the encoder returns.
+            q, k, v = manager.get_simultaneous(*((shape, x.dtype),) * 3)
+        else:
+            q, k, v = (x.new_empty(shape) for _ in range(3))
+        for start in range(0, rows, _VISION_PROJECTION_CHUNK_ROWS):
+            stop = min(start + _VISION_PROJECTION_CHUNK_ROWS, rows)
+            cq, ck, cv = self._project_qkv(
+                input_norm(x[start:stop]),
+                rotary_pos_emb_cos[start:stop],
+                rotary_pos_emb_sin[start:stop],
+            )
+            q[:, start:stop].copy_(cq)
+            k[:, start:stop].copy_(ck)
+            v[:, start:stop].copy_(cv)
+            del cq, ck, cv
+        context = self.attn(
             query=q,
             key=k,
             value=v,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
         )
-        context_layer = rearrange(context_layer, "b s h d -> s b (h d)").contiguous()
-
-        output, _ = self.proj(context_layer)
-        return output
+        return rearrange(context, "b s h d -> s b (h d)").contiguous()
 
 
 class Glm5NextVisionBlock(nn.Module):
@@ -270,6 +351,24 @@ class Glm5NextVisionBlock(nn.Module):
         rotary_pos_emb_sin: torch.Tensor,
         max_seqlen: int | None = None,
     ) -> torch.Tensor:
+        if x.shape[0] > _VISION_PROJECTION_CHUNK_ROWS:
+            context = self.attn.context_with_chunked_projection(
+                x,
+                self.norm1,
+                cu_seqlens,
+                rotary_pos_emb_cos,
+                rotary_pos_emb_sin,
+                max_seqlen,
+            )
+            for start in range(0, x.shape[0], _VISION_PROJECTION_CHUNK_ROWS):
+                stop = min(start + _VISION_PROJECTION_CHUNK_ROWS, x.shape[0])
+                x_attn, _ = self.attn.proj(context[start:stop])
+                normalized, residual = self.norm2(x[start:stop], residual=x_attn)
+                # Each token's residual is consumed before its owned input
+                # storage is reused. Attention has already read the full image.
+                x[start:stop].copy_(residual + self.mlp(normalized))
+                del normalized, residual, x_attn
+            return x
         x_attn = self.attn(
             self.norm1(x),
             cu_seqlens=cu_seqlens,
@@ -330,6 +429,7 @@ class Glm5NextPatchMerger(nn.Module):
         x = self.extra_activation_func(self.post_projection_norm(x))
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
+        del gate_up
         x, _ = self.down_proj(x)
         return x
 
@@ -600,6 +700,38 @@ class Glm5NextVisionTransformer(nn.Module):
                 max_seqlen=max_seqlen,
             )
 
+        # The GLM merger preserves the number of elements in each spatial
+        # group. Reuse the owned transformer output only after that group's
+        # normalization, convolution and merger have consumed its values.
+        if (
+            x.shape[0] > _VISION_PROJECTION_CHUNK_ROWS
+            and self.out_hidden_size == self.spatial_merge_size**2 * x.shape[-1]
+        ):
+            hidden_size = x.shape[-1]
+            for start in range(0, x.shape[0], _VISION_PROJECTION_CHUNK_ROWS):
+                stop = min(start + _VISION_PROJECTION_CHUNK_ROWS, x.shape[0])
+                x[start:stop].copy_(self.post_layernorm(x[start:stop]))
+            x = x.view(-1, self.out_hidden_size)
+            groups_per_chunk = max(
+                1, _VISION_PROJECTION_CHUNK_ROWS // self.spatial_merge_size**2
+            )
+            for start in range(0, x.shape[0], groups_per_chunk):
+                stop = min(start + groups_per_chunk, x.shape[0])
+                patches = (
+                    x[start:stop]
+                    .view(
+                        -1,
+                        self.spatial_merge_size,
+                        self.spatial_merge_size,
+                        hidden_size,
+                    )
+                    .permute(0, 3, 1, 2)
+                )
+                merged = self.downsample(patches).view(-1, self.out_hidden_size)
+                x[start:stop].copy_(self.merger(merged))
+                del patches, merged
+            return x
+
         # adapter
         x = self.post_layernorm(x)
         x = x.view(-1, self.spatial_merge_size, self.spatial_merge_size, x.shape[-1])
@@ -653,7 +785,35 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
         mm_kwargs = self.ctx.get_merged_mm_kwargs({})
         if (override := mm_kwargs.get("max_pixels")) is not None:
             return int(override)
-        return self._processor_pixel_budget(self.get_hf_processor().image_processor)[1]
+        processor = self.get_hf_processor().image_processor
+        if (tokens := mm_kwargs.get("max_image_tokens")) is not None:
+            return (
+                int(tokens)
+                * processor.temporal_patch_size
+                * (processor.patch_size * processor.merge_size) ** 2
+            )
+        return self._processor_pixel_budget(processor)[1]
+
+    def get_image_size_with_most_features(self) -> ImageSize:
+        """Choose an aligned canvas that exhausts the image-token budget.
+
+        A square canvas can underfill the budget: 89 by 89 merged patches
+        produce 7921 features, while a valid 80 by 100 canvas produces 8000.
+        Encoder admission and profiling must cover the rectangular maximum.
+        """
+        processor = self.get_hf_processor().image_processor
+        factor = (
+            processor.patch_size * processor.merge_size * processor.patch_expand_factor
+        )
+        cells = self._get_image_max_pixels() // (
+            processor.temporal_patch_size * factor**2
+        )
+        if cells < 1:
+            raise ValueError("Image budget must fit at least one aligned canvas cell")
+        height = isqrt(cells)
+        while cells % height:
+            height -= 1
+        return ImageSize(width=(cells // height) * factor, height=height * factor)
 
     def _get_video_max_pixels(self) -> int:
         mm_kwargs = self.ctx.get_merged_mm_kwargs({})

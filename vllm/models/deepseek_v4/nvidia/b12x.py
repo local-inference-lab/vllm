@@ -188,7 +188,12 @@ class B12xMHCResidual:
             out=out,
             expected_m=expected_m,
         )
-        retain_cuda_graph_capture_resource(binding)
+        # Captured allocations belong to the graph pool and may be reused
+        # after their consumers finish. Retaining every bound output would pin
+        # every layer's activations. Only scratch predates the capture; eager
+        # breaks still require the complete binding to own their outputs.
+        owner = (plan, scratch) if torch.cuda.is_current_stream_capturing() else binding
+        retain_cuda_graph_capture_resource(owner)
         return binding
 
     def run_pre(

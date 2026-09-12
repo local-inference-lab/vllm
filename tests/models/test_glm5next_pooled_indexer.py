@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 from vllm.models.deepseek_v4.nvidia.b12x_indexer import _flatten_index_cache
+from vllm.models.glm5next.nvidia import pooled_indexer as indexer_module
 from vllm.models.glm5next.nvidia.ops import glm_kpool
 from vllm.models.glm5next.nvidia.ops.glm_kpool import (
     expand_c4_block_table,
@@ -19,7 +20,10 @@ from vllm.models.glm5next.nvidia.ops.glm_kpool import (
     prepare_c4_decode_metadata,
     update_decode_pools,
 )
-from vllm.models.glm5next.nvidia.pooled_indexer import Glm5NextPooledIndexer
+from vllm.models.glm5next.nvidia.pooled_indexer import (
+    Glm5NextIndexerScratch,
+    Glm5NextPooledIndexer,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import triton
 from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
@@ -655,7 +659,7 @@ def test_glm53_physical_selection_provider_is_explicit() -> None:
     indexer.dcp_world_size = 1
     indexer._emit_physical_selection = True
     indexer.topk_indices_buffer = torch.empty((8, 2051), dtype=torch.int32)
-    indexer._physical_active_counts = torch.empty(8, dtype=torch.int32)
+    indexer.scratch = Glm5NextIndexerScratch(8, 1, torch.device("cpu"))
 
     selected = indexer.get_b12x_physical_selection(
         num_tokens=3,
@@ -738,11 +742,14 @@ def test_glm53_decode_table_capacity_uses_batched_token_limit() -> None:
     indexer.max_model_len = 4096
     indexer.dcp_world_size = 1
     indexer.indexer_op = SimpleNamespace(max_model_len=4096 // 4)
+    indexer.scratch = Glm5NextIndexerScratch(
+        indexer.max_tokens, indexer.max_seqs, device
+    )
 
     indexer.bind_main_kv_cache(main)
 
-    assert indexer._decode_block_table.shape[0] == indexer.max_tokens
-    assert indexer._decode_block_table.shape[0] > indexer.max_seqs * (5 + 1)
+    assert indexer.scratch.decode_block_table.shape[0] == indexer.max_tokens
+    assert indexer.scratch.decode_block_table.shape[0] > indexer.max_seqs * (5 + 1)
     assert indexer.indexer_op.max_model_len == 4096 // 4
 
 
@@ -757,6 +764,133 @@ def test_glm53_selector_capacity_tracks_auto_fit_max_model_len() -> None:
     indexer.update_max_model_len(1_985)
     assert indexer._aligned_max_seq_len == 1_988
     assert indexer.indexer_op.max_model_len == 497
+
+
+def test_glm53_indexer_scratch_rebind_preserves_same_geometry_storage() -> None:
+    scratch = Glm5NextIndexerScratch(128, 4, torch.device("cpu"))
+    scratch.bind_tables(32, torch.device("cpu"))
+    pointers = {name: buffer.data_ptr() for name, buffer in scratch.named_buffers()}
+    scratch.decode_block_table.fill_(53)
+    scratch.bind_tables(32, torch.device("cpu"))
+    assert {
+        name: buffer.data_ptr() for name, buffer in scratch.named_buffers()
+    } == pointers
+    assert torch.all(scratch.decode_block_table == 53)
+    scratch.bind_tables(16, torch.device("cpu"))
+    assert scratch.decode_block_table.shape == (128, 16)
+    assert scratch.pool_block_table.shape == (4, 16)
+    assert scratch.q_fp8.data_ptr() == pointers["q_fp8"]
+    assert not scratch.state_dict()
+
+
+def test_glm53_shared_scratch_keeps_layer_checkpoints_and_draft_selection_private(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        indexer_module, "ReplicatedLinear", lambda *a, **k: nn.Identity()
+    )
+    monkeypatch.setattr(
+        indexer_module, "B12xC4SparseIndexer", lambda *a, **k: SimpleNamespace()
+    )
+    monkeypatch.setattr(
+        indexer_module,
+        "get_b12x_sparse_mla",
+        lambda: SimpleNamespace(expand_pooled_topk_to_physical_slots=lambda *a: None),
+    )
+    config = SimpleNamespace(
+        index_topk=2048,
+        index_n_heads=32,
+        index_head_dim=128,
+        index_kpool=4,
+        qk_rope_head_dim=0,
+    )
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=128, max_num_seqs=4),
+        model_config=SimpleNamespace(max_model_len=4096),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1, cp_kv_cache_interleave_size=4
+        ),
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+    )
+    scratch = Glm5NextIndexerScratch(128, 4, torch.device("cpu"))
+    target_ids = torch.zeros((128, 2051), dtype=torch.int32)
+    target_pools = torch.zeros((128, 512), dtype=torch.int32)
+
+    def make(name, shared):
+        return Glm5NextPooledIndexer(
+            vllm_config,
+            config,
+            8,
+            8,
+            None,
+            SimpleNamespace(block_size=2048),
+            target_ids if shared else torch.full_like(target_ids, 42),
+            target_pools if shared else torch.full_like(target_pools, 42),
+            main_layer_name=name,
+            prefix=name,
+            scratch=scratch if shared else None,
+        )
+
+    first, second, draft = (
+        make("target.0", True),
+        make("target.1", True),
+        make("mtp", False),
+    )
+    assert first.scratch is second.scratch
+    assert draft.scratch is not scratch
+    for indexer, value in ((first, 1), (second, 2), (draft, 3)):
+        indexer._tail.fill_(value)
+        indexer.snapshot_speculative_interval_starts()
+    scratch.q_fp8.view(torch.uint8).fill_(255)
+    target_ids.fill_(-1)
+    first._tail.zero_()
+    first.restore_speculative_interval_starts()
+    for indexer, value in ((first, 1), (second, 2), (draft, 3)):
+        assert torch.all(indexer._tail == value)
+        assert torch.all(indexer._tail_snapshot == value)
+    assert torch.all(draft.topk_indices_buffer == 42)
+    assert torch.all(draft.pool_topk_indices_buffer == 42)
+
+
+def test_glm53_shared_indexer_scratch_graph_consumes_each_live_query() -> None:
+    device = _require_glm_gpu()
+    scratch = Glm5NextIndexerScratch(8, 1, device)
+    inputs = [
+        torch.randn((8, 32, 128), device=device, dtype=torch.bfloat16) for _ in range(2)
+    ]
+    outputs = [torch.empty_like(scratch.q_fp8) for _ in range(2)]
+    scales = [torch.empty_like(scratch.q_scale) for _ in range(2)]
+
+    def run() -> None:
+        for query, output, scale in zip(inputs, outputs, scales):
+            glm_kpool.fwht128_quant_fp8(
+                query.view(-1, 128),
+                scratch.q_fp8.view(-1, 128),
+                scratch.q_scale.view(-1),
+            )
+            output.copy_(scratch.q_fp8)
+            scale.copy_(scratch.q_scale)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(3):
+        for query in inputs:
+            query.normal_()
+        scratch.q_fp8.view(torch.uint8).fill_(255)
+        scratch.q_scale.fill_(float("nan"))
+        graph.replay()
+        for query, output, scale in zip(inputs, outputs, scales):
+            reference_q = torch.empty_like(output)
+            reference_scale = torch.empty_like(scale)
+            glm_kpool.fwht128_quant_fp8(
+                query.view(-1, 128),
+                reference_q.view(-1, 128),
+                reference_scale.view(-1),
+            )
+            torch.testing.assert_close(output, reference_q, rtol=0, atol=0)
+            torch.testing.assert_close(scale, reference_scale, rtol=0, atol=0)
 
 
 def test_glm53_parent_table_width_tracks_dcp_sharding() -> None:
@@ -1292,9 +1426,7 @@ def test_glm53_pool_expansion_appends_only_the_incomplete_tail() -> None:
     expand_pool_ids(pool_ids, positions, output)
 
     assert torch.all(output[0, 3:] == -1)
-    assert torch.equal(
-        output[0, :3].cpu(), torch.tensor([0, 1, 2], dtype=torch.int32)
-    )
+    assert torch.equal(output[0, :3].cpu(), torch.tensor([0, 1, 2], dtype=torch.int32))
     assert torch.equal(output[1, :8].cpu(), torch.tensor([4, 5, 6, 7, 0, 1, 2, 3]))
     assert torch.all(output[1, 8:] == -1)
     assert torch.equal(output[2, :2048].cpu(), torch.arange(2048, dtype=torch.int32))

@@ -15,6 +15,9 @@ from vllm import envs
 from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_dcp_group
+from vllm.distributed.device_communicators.all_reduce_utils import (
+    should_nccl_symm_mem_ag_rs,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonPrefillMetadata
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
@@ -1395,6 +1398,16 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         if self._ckv_extend_plan is not None:
             plans.append(self._ckv_extend_plan)
         self._scratch_nbytes = max(int(plan.layout.nbytes) for plan in plans)
+        if self._is_glm_next and self.dcp_world_size > 1:
+            # Query gathering finishes before attention consumes scratch. Its
+            # rank-major receive storage can therefore reuse the kernel arena.
+            self._scratch_nbytes = max(
+                self._scratch_nbytes,
+                self._max_tokens
+                * self._input_num_heads
+                * self._q_head_dim
+                * torch.bfloat16.itemsize,
+            )
         self._ckv_local_capacity = _round_up_ckv_rank_tokens(
             self._ckv_capacity_tokens,
             page_size=kernel_page_size,
@@ -1455,17 +1468,18 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         input_num_heads: int,
         include_ckv: bool,
     ) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
-        del plan
         q_spec = (
             (self._max_tokens, input_num_heads, self._q_head_dim),
             torch.bfloat16,
         )
-        scratch_spec = ((self._scratch_nbytes,), torch.uint8)
+        # Full-CKV attention has only local query heads and does not gather
+        # queries. Its cache receive buffer need not coexist with global-head
+        # query-gather scratch or the decode plan's split-K intermediates.
+        scratch_nbytes = (
+            int(plan.layout.nbytes) if include_ckv else self._scratch_nbytes
+        )
+        scratch_spec = ((scratch_nbytes,), torch.uint8)
         ckv_specs = (
-            (
-                (self._ckv_local_capacity, self._cache_record_bytes),
-                torch.uint8,
-            ),
             (
                 (
                     self.dcp_world_size * self._ckv_local_capacity,
@@ -1525,6 +1539,110 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             and num_heads == self._input_num_heads
             and self._q_head_dim == 576
         )
+
+    def prepare_projection_input(
+        self, value: torch.Tensor, output: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Reuse idle attention workspace for disjoint MLA projection batches.
+
+        Query projection runs before attention borrows its workspace; value
+        projection runs after attention finishes. A disjoint prefix may receive
+        the layout copy in either case. The projection consumes that prefix
+        before another kernel borrows the worker workspace.
+        """
+        if (
+            not self._is_glm_next
+            or value.shape[1] <= self._decode_max_rows
+            or value.dtype != torch.bfloat16
+            or value.is_contiguous()
+        ):
+            return None
+        manager = current_workspace_manager()
+        nbytes = value.numel() * value.element_size()
+        if manager.available_bytes() < nbytes:
+            return None
+        (packed,) = manager.get_simultaneous((tuple(value.shape), value.dtype))
+        for live in (value, output):
+            if packed.untyped_storage().data_ptr() != live.untyped_storage().data_ptr():
+                continue
+            start = live.storage_offset() * live.element_size()
+            stop = (
+                start
+                + (
+                    1
+                    + sum(
+                        (size - 1) * stride
+                        for size, stride in zip(live.shape, live.stride())
+                    )
+                )
+                * live.element_size()
+            )
+            packed_start = packed.storage_offset() * packed.element_size()
+            if start < packed_start + nbytes and packed_start < stop:
+                return None
+        packed.copy_(value)
+        return packed
+
+    def reduce_scatter_dcp_output(self, output: torch.Tensor) -> torch.Tensor | None:
+        """Reuse consumed query storage for the prefill output collective.
+
+        The corrected attention output remains in disjoint kernel scratch.
+        Pack it into the query buffer in head-major order, then let NCCL write
+        each rank's reduction at its in-place receive offset. The resulting
+        head-major matrices stay live until the following value projection.
+        Decode and symmetric-memory transports retain their existing path.
+        """
+        if not self._is_glm_next or output.shape[0] <= self._decode_max_rows:
+            return None
+        group = get_dcp_group()
+        communicator = getattr(group, "device_communicator", None)
+        comm = getattr(communicator, "pynccl_comm", None)
+        if comm is None or comm.disabled or should_nccl_symm_mem_ag_rs():
+            return None
+
+        rows, heads, head_dim = output.shape
+        q_buffer = self._borrow_workspaces()[0]
+        assert output.dtype == q_buffer.dtype
+        packed = q_buffer.view(-1)[: output.numel()].view(heads, rows, head_dim)
+        packed.copy_(output.transpose(0, 1))
+        local_heads = heads // self.dcp_world_size
+        local = packed.narrow(0, group.rank_in_group * local_heads, local_heads)
+        comm.reduce_scatter(local, packed)
+        return local.transpose(0, 1)
+
+    def gather_dcp_query(self, query: torch.Tensor) -> torch.Tensor:
+        """Gather GLM prefill heads into caller-owned attention query storage.
+
+        The rank-major receive view borrows kernel scratch only until the
+        layout copy completes on the execution stream. The attention call
+        rebinds that scratch while retaining the final query at the same address.
+        Decode and transport-specific all-gathers keep their established path.
+        """
+        group = get_dcp_group()
+        if not self._is_glm_next or query.shape[0] <= self._decode_max_rows:
+            return group.all_gather(query, dim=1)
+        communicator = getattr(group, "device_communicator", None)
+        b12x_comm = getattr(communicator, "b12x_ar_comm", None)
+        if (
+            b12x_comm is not None
+            and not b12x_comm.disabled
+            and getattr(b12x_comm, "should_all_gather", None) is not None
+            and b12x_comm.should_all_gather(query, 1)
+        ):
+            return group.all_gather(query, dim=1)
+
+        rows, local_heads, head_dim = query.shape
+        q_buffer, scratch = self._borrow_workspaces()[:2]
+        output = q_buffer[:rows]
+        receive = scratch[: output.numel() * output.element_size()].view(query.dtype)
+        receive = receive.view(self.dcp_world_size, rows, local_heads, head_dim)
+        local = receive[group.rank_in_group]
+        local.copy_(query)
+        _dcp_all_gather_current_stream(group, local.view(-1), receive.view(-1))
+        output.view(rows, self.dcp_world_size, local_heads, head_dim).copy_(
+            receive.movedim(0, 1)
+        )
+        return output
 
     def get_fused_mla_query_output(
         self,
@@ -1756,7 +1874,6 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         self,
         kv_cache: torch.Tensor,
         attn_metadata: B12xMLASparseMetadata,
-        local_buffer: torch.Tensor,
         gathered_buffer: torch.Tensor,
     ) -> torch.Tensor:
         if not self.uses_full_ckv_dcp(attn_metadata, attn_metadata.num_actual_tokens):
@@ -1771,22 +1888,22 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 f"{self._cache_record_bytes}-byte records; "
                 f"got shape={tuple(kv_cache.shape)}, stride={kv_cache.stride()}"
             )
-        expected_local_shape = (
-            self._ckv_local_capacity,
-            self._cache_record_bytes,
-        )
         expected_gathered_shape = (
             self.dcp_world_size * self._ckv_local_capacity,
             self._cache_record_bytes,
         )
-        if tuple(local_buffer.shape) != expected_local_shape:
-            raise RuntimeError("CKV local workspace has an invalid shape")
         if tuple(gathered_buffer.shape) != expected_gathered_shape:
             raise RuntimeError("CKV gathered workspace has an invalid shape")
 
         assert attn_metadata.dcp_local_cu_seq_lens is not None
         local_tokens = attn_metadata.dcp_local_total_tokens
         padded_tokens = attn_metadata.dcp_padded_total_tokens
+        group = get_dcp_group()
+        # NCCL in-place all-gather reads each rank's contribution from its
+        # receive slice. The stride is this call's padded count, not capacity.
+        local_buffer = gathered_buffer.narrow(
+            0, group.rank_in_group * padded_tokens, padded_tokens
+        )
         if local_tokens:
             ops.cp_gather_cache(
                 src_cache=kv_cache,
@@ -1798,7 +1915,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         if local_tokens < padded_tokens:
             local_buffer[local_tokens:padded_tokens].zero_()
         _dcp_all_gather_current_stream(
-            get_dcp_group(),
+            group,
             local_buffer[:padded_tokens].view(-1),
             gathered_buffer[: self.dcp_world_size * padded_tokens].view(-1),
         )
@@ -1877,11 +1994,10 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         topk_indices = self.topk_indices_buffer[:num_tokens]
         kv_cache_for_run = kv_c_and_k_pe_cache
         if use_ckv_gather:
-            local_buffer, gathered_buffer = workspaces[2:]
+            gathered_buffer = workspaces[2]
             kv_cache_for_run = self._gather_full_ckv(
                 kv_c_and_k_pe_cache,
                 attn_metadata,
-                local_buffer,
                 gathered_buffer,
             )
             assert attn_metadata.ckv_selected_indices is not None

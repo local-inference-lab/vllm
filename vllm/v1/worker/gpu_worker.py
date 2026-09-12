@@ -520,6 +520,10 @@ class Worker(WorkerBase):
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
             self.model_runner.profile_run()
+            # Retired profiling allocations must be reusable by the contiguous
+            # KV pool even when automatic memory sizing is bypassed.
+            torch.accelerator.synchronize()
+            torch.accelerator.empty_cache()
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
