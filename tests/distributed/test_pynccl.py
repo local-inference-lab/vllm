@@ -255,6 +255,75 @@ def test_ckv_inplace_all_gather_preserves_padded_rank_records(world_size):
 
 
 @worker_fn_wrapper
+def glm_dcp_query_scratch_worker_fn():
+    from vllm.v1.attention.backends.mla import b12x_mla_sparse
+    from vllm.v1.worker.workspace import WorkspaceManager
+
+    world = get_world_group()
+    comm = PyNcclCommunicator(world.cpu_group, device=world.device)
+    rank, size = comm.rank, comm.world_size
+    group = SimpleNamespace(
+        world_size=size,
+        rank_in_group=rank,
+        device_communicator=SimpleNamespace(pynccl_comm=comm),
+        device_group=world.device_group,
+    )
+    manager = WorkspaceManager(world.device)
+    impl = object.__new__(b12x_mla_sparse.B12xMLASparseImpl)
+    impl._is_glm_next = True
+    impl._decode_max_rows = 16
+    impl._max_tokens = 512
+    impl._input_num_heads = size * 4
+    impl._q_head_dim = 512
+    impl._scratch_nbytes = 512 * impl._input_num_heads * 512 * 2
+    impl._decode_plan = object()
+    impl._ckv_local_capacity = 0
+    impl._cache_record_bytes = 528
+    impl.dcp_world_size = size
+    b12x_mla_sparse.current_workspace_manager = lambda: manager
+    b12x_mla_sparse.get_dcp_group = lambda: group
+    q_buffer, scratch = impl._borrow_workspaces()
+    manager.lock()
+    for transport in ("pynccl", "torch"):
+        group.device_communicator.pynccl_comm = comm if transport == "pynccl" else None
+        for rows in (32, 512, 64):
+            base = torch.arange(rows * 4 * 512, device=world.device).remainder(127)
+            parts = [
+                (base + source).to(torch.bfloat16).view(4, rows, 512).transpose(0, 1)
+                for source in range(size)
+            ]
+            actual = impl.gather_dcp_query(parts[rank])
+            assert actual.data_ptr() == q_buffer.data_ptr()
+            expected = torch.cat(parts, dim=1)
+            assert torch.equal(actual, expected)
+            scratch.fill_(255)
+            assert torch.equal(actual, expected)
+
+    group.device_communicator.pynccl_comm = comm
+    local = torch.empty((4, 64, 512), dtype=torch.bfloat16, device=world.device)
+    local.fill_(rank)
+    query = local.transpose(0, 1)
+    impl.gather_dcp_query(query)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = impl.gather_dcp_query(query)
+    for iteration in range(3):
+        local.fill_(rank + iteration * 8)
+        graph.replay()
+        expected = torch.cat(
+            [torch.full_like(query, source + iteration * 8) for source in range(size)],
+            dim=1,
+        )
+        assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 2, reason="Need two GPUs")
+def test_glm_dcp_query_scratch_preserves_values_and_graph_inputs():
+    distributed_run(glm_dcp_query_scratch_worker_fn, 2)
+
+
+@worker_fn_wrapper
 def cuda_communicator_all_gather_dim_worker_fn():
     with ensure_current_vllm_config():
         ensure_model_parallel_initialized(2, 1)
