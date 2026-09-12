@@ -679,7 +679,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             self._owns_topk_indices = self.topk_indices_buffer is None and self.is_index_source
         specs = []
         if self._owns_topk_indices:
-            specs.append(("topk_indices_buffer", (self.capacity, 512), torch.int32))
+            specs.append(
+                ("topk_indices_buffer", (self.capacity, self._index_topk), torch.int32)
+            )
         if self.indexer is not None:
             specs.extend((
                 ("_index_pages", (self.INDEX_CHUNK, self._index_width), torch.int32),
@@ -970,7 +972,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         return dsa_indexer.plan(dsa_indexer.Caps(
             device=self.rotary_emb.cos_sin_cache.device,
             num_q_heads=self.indexer.heads, max_q_rows=rows,
-            max_page_table_width=width, topk=512,
+            max_page_table_width=width, topk=self._index_topk,
             mode="decode" if mode == "decode" else "prefill",
             cache_format="mxfp4", page_size=self._index_page,
             max_candidates=16384 if self.layer_id > self.candidate_source_layer else 0,
