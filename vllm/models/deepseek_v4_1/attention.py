@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""V4.1 Full/Reindex/Reuse topology with native b12x compute only."""
+"""Native V4.1 Full/Reindex/Reuse attention with BF16 grouped projection."""
 
 from typing import cast
 
@@ -12,10 +12,8 @@ from b12x.attention.compressed_sparse_mla.preparation import rotate
 from b12x.attention.compressed_sparse_mla.weight_scale import (
     scale_index_weights,
 )
-from b12x.gemm import bf16_gemv, blockscaled
 from torch import nn
 
-from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -155,7 +153,7 @@ def _unpack_wo_a(Weight, Scale, Out, N: tl.constexpr, K: tl.constexpr, B: tl.con
 
 
 class _GroupedLinearMethod(LinearMethodBase):
-    """WO-A with BF16 activations in both GEMV and weight-only tensor-core paths."""
+    """Exact checkpoint weights, BF16 activations, and direct cuBLAS output."""
 
     def __init__(self, original, groups):
         if type(original) is UnquantizedLinearMethod:
@@ -163,12 +161,13 @@ class _GroupedLinearMethod(LinearMethodBase):
         if not isinstance(original, (B12xFP8LinearMethod, B12xLinearMethod)):
             raise ValueError("V4.1 grouped output requires native b12x weights")
         self.original, self.groups = original, groups
+        # Preserve FP32 reduction of BF16 products, as in the native kernels.
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 
     def create_weights(self, *args, **kwargs):
         return self.original.create_weights(*args, **kwargs)
 
     def process_weights_after_loading(self, layer):
-        self.prefill_weights = []
         if layer.weight.dtype == torch.float8_e4m3fn:
             scales = layer.weight_scale_inv
             if scales.dtype != torch.float8_e8m0fnu:
@@ -176,24 +175,6 @@ class _GroupedLinearMethod(LinearMethodBase):
             width = layer.weight.shape[0] // self.groups
             if width % 32:
                 raise ValueError("V4.1 WO-A groups must preserve block32 scale rows")
-            for group in range(self.groups):
-                start, end = group * width, (group + 1) * width
-                # Replicating a block-row exponent changes storage, not values.
-                # A16 dequantizes these exact checkpoint weights to BF16 and
-                # never quantizes the inverse-RoPE activation.
-                scale_rows = scales[start // 32 : end // 32].view(torch.uint8)
-                packed = blockscaled.pack_weight(
-                    layer.weight[start:end],
-                    scale_rows.repeat_interleave(32, dim=0),
-                    recipe="mxfp8",
-                )
-                blockscaled.prewarm(packed, (1, 8, 64), mode="a16")
-                self.prefill_weights.append(packed)
-            capacity = get_current_vllm_config().scheduler_config.max_num_batched_tokens
-            self.prefill_workspace_bytes = max(
-                blockscaled.workspace_size(packed, capacity)
-                for packed in self.prefill_weights
-            )
             dense = torch.empty(
                 layer.weight.shape, dtype=torch.bfloat16, device=layer.weight.device
             )
@@ -207,14 +188,15 @@ class _GroupedLinearMethod(LinearMethodBase):
             )
             layer.weight = nn.Parameter(dense, requires_grad=False)
             del layer.weight_scale_inv
+        if layer.weight.dtype != torch.bfloat16:
+            raise TypeError("V4.1 WO-A requires BF16 decoded weights")
         width = layer.weight.shape[0] // self.groups
-        self.weights = []
-        for group in range(self.groups):
-            weight = layer.weight[group * width : (group + 1) * width]
-            bf16_gemv.precompile(weight)
-            self.weights.append(weight)
+        self.weights = [
+            layer.weight[group * width : (group + 1) * width].t()
+            for group in range(self.groups)
+        ]
 
-    def apply(self, layer, x, bias=None, *, is_prefill=False):
+    def apply(self, layer, x, bias=None):
         if bias is not None:
             raise ValueError("V4.1 WO-A must be bias free")
         rows = x.shape[0]
@@ -224,18 +206,7 @@ class _GroupedLinearMethod(LinearMethodBase):
         width = layer.weight.shape[0] // self.groups
         for group in range(self.groups):
             target = result[:, group * width : (group + 1) * width]
-            if is_prefill and self.prefill_weights:
-                (scratch,) = current_workspace_manager().get_simultaneous(
-                    ((self.prefill_workspace_bytes,), torch.uint8)
-                )
-                source = x[:, group].contiguous()
-                projected = blockscaled.mm(
-                    source, self.prefill_weights[group], mode="a16", workspace=scratch
-                )
-                target.copy_(projected)
-                retain_cuda_graph_capture_resource((source, projected))
-            else:
-                bf16_gemv.mm(x[:, group], self.weights[group], out=target)
+            torch.matmul(x[:, group], self.weights[group], out=target)
         retain_cuda_graph_capture_resource((x, result))
         return result
 
@@ -716,14 +687,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             dict[str, DeepseekV41B12xMetadata] | None,
             get_forward_context().attn_metadata,
         )
-        is_prefill = True
         if not isinstance(metadata, dict):
             # Memory profiling has no cache pages; serving does not use this branch.
             output.zero_()
         else:
             original_swa = metadata[self.swa_cache_layer.prefix]
             swa = self._query_metadata(original_swa)
-            is_prefill = not swa.is_decode
             self.insert_context_kv(kv, positions, swa.slot_mapping[:rows])
             if swa is original_swa:
                 self._prepare_global_kv(positions, hidden_states)
@@ -741,7 +710,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 index_query = (iq_data, iq_scale, iw)
                 retain_cuda_graph_capture_resource((weights, index_query))
             self.forward_mqa(q, kv, positions, output, index_query=index_query)
-        return self._o_proj(output, positions, is_prefill=is_prefill)
+        return self._o_proj(output, positions)
 
     def forward_mqa(self, q, kv, positions, output, *, index_query=None):
         metadata = get_forward_context().attn_metadata
@@ -896,13 +865,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             cache_format="deepseek_v41",
         )
 
-    def _o_proj(self, o, positions, *, is_prefill=False):
+    def _o_proj(self, o, positions):
         rows = o.shape[0]
         inverse = _rotated(o, positions, self.rotary_emb.cos_sin_cache, inverse=True)
         grouped = inverse.view(rows, self.n_local_groups, -1)
-        local = self.wo_b(
-            self.wo_a.quant_method.apply(self.wo_a, grouped, is_prefill=is_prefill)
-        )
+        local = self.wo_b(self.wo_a.quant_method.apply(self.wo_a, grouped))
         if local.dtype != torch.bfloat16:
             raise TypeError("V4.1 WO-B must round the local projection to BF16")
         if get_tensor_model_parallel_world_size() > 1:

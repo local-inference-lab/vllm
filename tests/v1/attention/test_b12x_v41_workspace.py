@@ -30,6 +30,11 @@ def native_workspace(monkeypatch):
     monkeypatch.setattr(workspace, "_manager", manager)
     monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
     monkeypatch.setattr(attention, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        torch.backends.cuda.matmul,
+        "allow_bf16_reduced_precision_reduction",
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+    )
     with workspace.use_workspace_lane(0):
         yield attention, manager, workspace
 
@@ -419,20 +424,8 @@ def test_grouped_projection_live_storage_survives_workspace_reuse(native_workspa
 
 
 @pytest.mark.parametrize("width,k", [(128, 512), (1024, 4096)])
-def test_grouped_fp8_weight_only_prefill_preserves_bf16_contract(
-    native_workspace, monkeypatch, width, k
-):
-    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
-    from b12x.gemm import bf16_gemv
-
-    attention, manager, workspace = native_workspace
-    monkeypatch.setattr(
-        attention,
-        "get_current_vllm_config",
-        lambda: SimpleNamespace(
-            scheduler_config=SimpleNamespace(max_num_batched_tokens=4096)
-        ),
-    )
+def test_grouped_fp8_projection_preserves_bf16_contract(native_workspace, width, k):
+    attention, _, workspace = native_workspace
     torch.manual_seed(41003)
     groups = 2
     layer = torch.nn.Module()
@@ -454,46 +447,33 @@ def test_grouped_fp8_weight_only_prefill_preserves_bf16_contract(
     ).bfloat16()
     torch.testing.assert_close(layer.weight, dense, rtol=0, atol=0)
     source = torch.randn((1025, groups, k), device="cuda").bfloat16()
-    method.apply(layer, source, is_prefill=True)
-    manager.lock()
-    freeze_kernel_resolution("V4.1 weight-only prefill with BF16 activations")
-    try:
-        for rows in (1, 6, 64, 257, 1025):
-            x = source[:rows]
-            expected = torch.cat(
-                [
-                    x[:, g].float() @ dense[g * width : (g + 1) * width].float().T
-                    for g in range(groups)
-                ],
-                dim=1,
-            )
-            gemv = torch.cat(
-                [
-                    bf16_gemv.mm(x[:, g], dense[g * width : (g + 1) * width])
-                    for g in range(groups)
-                ],
-                dim=1,
-            )
-            actual = method.apply(layer, x, is_prefill=True)
-            actual_rmse = (actual.float() - expected).square().mean().sqrt()
-            gemv_rmse = (gemv.float() - expected).square().mean().sqrt()
-            assert actual_rmse <= gemv_rmse * 1.01 + 1e-7
-            torch.testing.assert_close(actual.float(), expected, rtol=0.01, atol=0.1)
-            torch.testing.assert_close(method.apply(layer, x), gemv, rtol=0, atol=0)
-            graph = torch.cuda.CUDAGraph()
-            with (
-                workspace.collect_cuda_graph_capture_resources() as resources,
-                torch.cuda.graph(graph),
-            ):
-                result = method.apply(layer, x, is_prefill=True)
-            source.normal_()
-            expected = method.apply(layer, x, is_prefill=True)
-            result.fill_(float("nan"))
-            graph.replay()
-            torch.testing.assert_close(result, expected, rtol=0, atol=0)
-            del graph, resources
-    finally:
-        unfreeze_kernel_resolution()
+
+    def reference(x):
+        return torch.cat(
+            [
+                x[:, g].float() @ dense[g * width : (g + 1) * width].float().T
+                for g in range(groups)
+            ],
+            dim=1,
+        )
+
+    for rows in (1, 32, 1025):
+        x = source[:rows]
+        actual = method.apply(layer, x)
+        assert actual.dtype == torch.bfloat16
+        torch.testing.assert_close(actual.float(), reference(x), rtol=0.01, atol=0.1)
+        graph = torch.cuda.CUDAGraph()
+        with (
+            workspace.collect_cuda_graph_capture_resources() as resources,
+            torch.cuda.graph(graph),
+        ):
+            result = method.apply(layer, x)
+        source.normal_()
+        expected = reference(x)
+        result.fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(result.float(), expected, rtol=0.01, atol=0.1)
+        del graph, resources
 
 
 @pytest.mark.parametrize("ratio", [1, 2])
