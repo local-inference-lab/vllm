@@ -15,6 +15,9 @@ from vllm import envs
 from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_dcp_group
+from vllm.distributed.device_communicators.all_reduce_utils import (
+    should_nccl_symm_mem_ag_rs,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonPrefillMetadata
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
@@ -1536,6 +1539,33 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             and num_heads == self._input_num_heads
             and self._q_head_dim == 576
         )
+
+    def reduce_scatter_dcp_output(self, output: torch.Tensor) -> torch.Tensor | None:
+        """Reuse consumed query storage for the prefill output collective.
+
+        The corrected attention output remains in disjoint kernel scratch.
+        Pack it into the query buffer in head-major order, then let NCCL write
+        each rank's reduction at its in-place receive offset. The resulting
+        head-major matrices stay live until the following value projection.
+        Decode and symmetric-memory transports retain their existing path.
+        """
+        if not self._is_glm_next or output.shape[0] <= self._decode_max_rows:
+            return None
+        group = get_dcp_group()
+        communicator = getattr(group, "device_communicator", None)
+        comm = getattr(communicator, "pynccl_comm", None)
+        if comm is None or comm.disabled or should_nccl_symm_mem_ag_rs():
+            return None
+
+        rows, heads, head_dim = output.shape
+        q_buffer = self._borrow_workspaces()[0]
+        assert output.dtype == q_buffer.dtype
+        packed = q_buffer.view(-1)[: output.numel()].view(heads, rows, head_dim)
+        packed.copy_(output.transpose(0, 1))
+        local_heads = heads // self.dcp_world_size
+        local = packed.narrow(0, group.rank_in_group * local_heads, local_heads)
+        comm.reduce_scatter(local, packed)
+        return local.transpose(0, 1)
 
     def gather_dcp_query(self, query: torch.Tensor) -> torch.Tensor:
         """Gather GLM prefill heads into caller-owned attention query storage.

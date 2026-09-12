@@ -790,6 +790,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 is_lse_base_on_e=self.impl.lse_base_on_e,
                 use_pcp=self.use_pcp,
                 query_gather_fallback=getattr(self.impl, "gather_dcp_query", None),
+                output_reduce_scatter=getattr(
+                    self.impl, "reduce_scatter_dcp_output", None
+                ),
             )
 
         self.is_aiter_triton_fp8_bmm_enabled = rocm_aiter_ops.is_fp8bmm_enabled()

@@ -901,6 +901,83 @@ def test_glm_dcp_decode_keeps_the_transport_collective(monkeypatch) -> None:
     assert calls == [(query, 1)]
 
 
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_glm_dcp_output_reuses_query_storage_with_head_major_rank_slices(
+    monkeypatch, world_size: int
+) -> None:
+    from vllm.v1.worker.workspace import WorkspaceManager
+
+    manager = WorkspaceManager(torch.device("cpu"))
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = True
+    impl._decode_max_rows = 4
+    impl._max_tokens = 32
+    impl._input_num_heads = world_size * 4
+    impl._q_head_dim = 8
+    impl._scratch_nbytes = 32 * impl._input_num_heads * 8 * 2
+    impl._decode_plan = object()
+    impl._ckv_local_capacity = 0
+    impl._cache_record_bytes = 528
+    impl.dcp_world_size = world_size
+    monkeypatch.setattr(b12x_mla_sparse, "current_workspace_manager", lambda: manager)
+    monkeypatch.setattr(b12x_mla_sparse, "should_nccl_symm_mem_ag_rs", lambda: False)
+    q_buffer, scratch = impl._borrow_workspaces()
+    manager.lock()
+    for rank in range(world_size):
+        for rows in (19, 7, 23):
+            partial = (
+                scratch[: rows * impl._input_num_heads * 8 * 2]
+                .view(torch.bfloat16)
+                .view(rows, impl._input_num_heads, 8)
+            )
+            partial.copy_(torch.arange(partial.numel()).view_as(partial) % 127)
+            original = partial.clone()
+
+            def reduce_scatter(local, packed, rank=rank, original=original):
+                assert packed.data_ptr() == q_buffer.data_ptr()
+                assert local.data_ptr() == packed.data_ptr() + rank * local.nbytes
+                assert local.is_contiguous() and packed.is_contiguous()
+                assert torch.equal(packed, original.transpose(0, 1))
+                local.mul_(world_size)
+
+            comm = SimpleNamespace(disabled=False, reduce_scatter=reduce_scatter)
+            group = SimpleNamespace(
+                rank_in_group=rank,
+                device_communicator=SimpleNamespace(pynccl_comm=comm),
+            )
+            monkeypatch.setattr(
+                b12x_mla_sparse, "get_dcp_group", lambda group=group: group
+            )
+            actual = impl.reduce_scatter_dcp_output(partial)
+            expected = original[:, rank * 4 : (rank + 1) * 4] * world_size
+            assert torch.equal(actual, expected)
+            assert torch.equal(partial, original)
+            assert actual.transpose(0, 1).is_contiguous()
+            scratch.fill_(255)
+            assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "rows,disabled,symmetric", [(4, False, False), (8, True, False), (8, False, True)]
+)
+def test_glm_dcp_output_preserves_decode_and_special_transport_paths(
+    monkeypatch, rows, disabled, symmetric
+) -> None:
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = True
+    impl._decode_max_rows = 4
+    comm = SimpleNamespace(disabled=disabled)
+    monkeypatch.setattr(
+        b12x_mla_sparse,
+        "get_dcp_group",
+        lambda: SimpleNamespace(device_communicator=SimpleNamespace(pynccl_comm=comm)),
+    )
+    monkeypatch.setattr(
+        b12x_mla_sparse, "should_nccl_symm_mem_ag_rs", lambda: symmetric
+    )
+    assert impl.reduce_scatter_dcp_output(torch.empty(rows, 8, 8)) is None
+
+
 @pytest.mark.parametrize("record_bytes", [528, 304])
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("padded_tokens", [2, 4])

@@ -282,6 +282,7 @@ def cp_lse_ag_out_rs(
     is_lse_base_on_e=True,
     seq_lens: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
+    output_reduce_scatter: Callable[[torch.Tensor], torch.Tensor | None] | None = None,
 ):
     """
     cp_attn_out: [ B, H, D ]
@@ -296,7 +297,12 @@ def cp_lse_ag_out_rs(
         seq_lens=seq_lens,
         query_start_loc=query_start_loc,
     )
-    if current_platform.is_cuda() and current_platform.is_device_capability_family(120):
+    reduced = output_reduce_scatter(out) if output_reduce_scatter is not None else None
+    if reduced is not None:
+        out = reduced
+    elif current_platform.is_cuda() and current_platform.is_device_capability_family(
+        120
+    ):
         # Preserve the head-major collective output for the following MLA
         # value GEMM. Its batch matrices are disjoint, avoiding cuBLAS's
         # SM120/121 overlapping-stride read defect and a redundant transpose copy.
@@ -1243,6 +1249,8 @@ class MLADCPManager:
         is_lse_base_on_e: bool,
         use_pcp: bool,
         query_gather_fallback: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        output_reduce_scatter: Callable[[torch.Tensor], torch.Tensor | None]
+        | None = None,
     ) -> None:
         parallel_config = vllm_config.parallel_config
         self.group = get_dcp_group()
@@ -1252,6 +1260,7 @@ class MLADCPManager:
         self.use_a2a = parallel_config.dcp_comm_backend == "a2a"
         self.padded_num_heads = padded_num_heads
         self._query_gather_fallback = query_gather_fallback
+        self._output_reduce_scatter = output_reduce_scatter
 
         self.combine = self._init_combine(
             num_heads,
@@ -1304,6 +1313,13 @@ class MLADCPManager:
             if use_pcp
             else cp_lse_ag_out_rs
         )
+        if combine_fn is cp_lse_ag_out_rs and self._output_reduce_scatter is not None:
+            return functools.partial(
+                cp_lse_ag_out_rs,
+                cp_group=self.group,
+                is_lse_base_on_e=is_lse_base_on_e,
+                output_reduce_scatter=self._output_reduce_scatter,
+            )
         return functools.partial(
             combine_fn,
             cp_group=self.group,

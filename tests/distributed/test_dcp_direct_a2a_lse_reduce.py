@@ -583,6 +583,33 @@ def test_mla_dcp_manager_selects_pcp_combine(monkeypatch):
     assert manager.query_gather is None
 
 
+@pytest.mark.parametrize(
+    "backend,use_pcp", [("ag_rs", False), ("ag_rs", True), ("a2a", False)]
+)
+def test_mla_output_workspace_hook_only_applies_to_head_reduce_scatter(
+    monkeypatch, backend, use_pcp
+):
+    monkeypatch.setattr(dcp, "get_dcp_group", lambda: MagicMock(world_size=2))
+    monkeypatch.setattr(dcp, "get_direct_dcp_q_gather_workspace", lambda *args: None)
+    monkeypatch.setattr(dcp, "get_direct_dcp_a2a_workspace", lambda *args: None)
+    callback = MagicMock()
+    manager = dcp.MLADCPManager(
+        vllm_config=_manager_config(dcp_comm_backend=backend),
+        device=torch.device("cpu"),
+        num_heads=2,
+        query_head_dim=8,
+        output_head_dim=4,
+        query_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        padded_num_heads=None,
+        is_lse_base_on_e=True,
+        use_pcp=use_pcp,
+        output_reduce_scatter=callback,
+    )
+    expected = callback if backend == "ag_rs" and not use_pcp else None
+    assert manager.combine.keywords.get("output_reduce_scatter") is expected
+
+
 def test_dcp_chunk_workspace_alignment_covers_interleave():
     from vllm.model_executor.layers.attention.mla_attention import (
         align_mla_chunked_context_workspace_size,
