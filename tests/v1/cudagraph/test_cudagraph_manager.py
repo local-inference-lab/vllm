@@ -321,12 +321,6 @@ def _make_spec_decode_manager(
 
 def test_uniform_decode_pads_up_to_full_graph(monkeypatch):
     manager = _make_spec_decode_manager(monkeypatch)
-    assert [
-        (desc.cg_mode, desc.num_tokens) for desc in manager._candidates[(12, 0)]
-    ] == [
-        (CUDAGraphMode.FULL, 18),
-        (CUDAGraphMode.PIECEWISE, 16),
-    ]
 
     desc = manager.dispatch(
         num_reqs=4,
@@ -407,6 +401,36 @@ def test_varlen_decode_captures_dense_low_concurrency_product(monkeypatch):
 
     # Preserve the ordinary padded schedule for higher concurrency.
     assert any(desc.num_reqs == 8 and desc.num_tokens == 8 for desc in full_descs)
+
+
+@pytest.mark.parametrize(
+    ("num_reqs", "num_tokens", "expected_shape"),
+    [
+        (2, 3, (2, 4)),
+        (3, 6, (8, 8)),
+    ],
+)
+def test_varlen_dense_rejection_keeps_larger_full_fallback(
+    monkeypatch, num_reqs, num_tokens, expected_shape
+):
+    manager = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=8,
+        capture_sizes=[1, 2, 4, 8, 16, 24, 32],
+        num_speculative_tokens=7,
+        varlen_decode=True,
+    )
+
+    desc = manager.dispatch(
+        num_reqs=num_reqs,
+        num_tokens=num_tokens,
+        uniform_token_count=None,
+        num_active_loras=0,
+        max_query_len=2,
+    )
+
+    assert desc.cg_mode == CUDAGraphMode.FULL
+    assert (desc.num_reqs, desc.num_tokens) == expected_shape
 
 
 def test_mixed_batch_never_selects_a_uniform_decode_graph(monkeypatch):

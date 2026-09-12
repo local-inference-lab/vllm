@@ -508,23 +508,23 @@ class CudaGraphManager:
                 lora_descs = [
                     d for d in mode_descs if d.num_active_loras == num_active_loras
                 ]
-                current_range_start = 0
-                # Dynamic speculative decoding can produce multiple graphs with the same
-                # num_tokens. Group them so each graph covers the same candidate range.
+                # Keep every graph large enough for a token count. A denser
+                # descriptor at the nearest size can still reject the runtime
+                # request count, in which case dispatch must continue to the
+                # ordinary larger padded graph rather than fall to PIECEWISE.
                 for num_tokens, group in groupby(lora_descs, lambda d: d.num_tokens):
-                    matching = list(group)
-                    matching.sort(
+                    matching = sorted(
+                        group,
                         key=lambda d: (
                             d.uniform_token_count is None,
                             d.max_query_len is None,
                             d.num_reqs is None,
                             d.num_reqs or 0,
-                        )
+                        ),
                     )
-                    for i in range(current_range_start, num_tokens + 1):
+                    for i in range(1, num_tokens + 1):
                         key = (i, num_active_loras)
                         self._candidates.setdefault(key, []).extend(matching)
-                    current_range_start = num_tokens + 1
 
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
