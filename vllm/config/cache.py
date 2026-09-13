@@ -83,6 +83,11 @@ class CacheConfig:
     block_size: int = Field(default=None, gt=0)  # type: ignore[assignment]
     """Size of a contiguous cache block in number of tokens.
     Accepts None (meaning "use default"). After construction, always int."""
+    swa_block_size: Literal[32, 64, 128] | None = None
+    """Tokens per sliding-window cache page for native DeepSeek V4.1 B12X.
+    None uses 64 tokens. Independent of the logical attention window and
+    the main/index cache's block_size. Requires a server restart; supported
+    values are 32, 64 and 128. Other models do not support this override."""
     user_specified_block_size: bool = field(default=False, init=False)
     """Whether block_size was explicitly provided. Derived automatically."""
     user_specified_mamba_block_size: bool = field(default=False, init=False)

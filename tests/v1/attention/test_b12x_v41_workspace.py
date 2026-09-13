@@ -114,7 +114,7 @@ def _layer(attention, layer_id=0, swa_page=32):
     return layer
 
 
-@pytest.mark.parametrize("swa_page", [32, 64])
+@pytest.mark.parametrize("swa_page", [32, 64, 128])
 def test_context_cache_write_preserves_page_boundaries_and_padding(
     native_workspace, swa_page
 ):
@@ -337,7 +337,7 @@ def test_mhc_fixed_capacity_buckets_preserve_decode_policy(
         assert bool(torch.isfinite(y).all())
 
 
-@pytest.mark.parametrize("main_page,swa_page", [(64, 32), (128, 64)])
+@pytest.mark.parametrize("main_page,swa_page", [(64, 32), (128, 64), (256, 128)])
 @pytest.mark.parametrize(
     "is_decode,rows,live_rows",
     [
@@ -836,7 +836,7 @@ def test_ced_global_preparation_preserves_full_row_cache_bytes(
     )
 
 
-@pytest.mark.parametrize("main_page,swa_page", [(64, 32), (128, 64)])
+@pytest.mark.parametrize("main_page,swa_page", [(64, 32), (128, 64), (256, 128)])
 @torch.inference_mode()
 def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
     native_workspace, monkeypatch, main_page, swa_page
@@ -1016,7 +1016,7 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
     del graph, resources
 
 
-@pytest.mark.parametrize("swa_page", [32, 64])
+@pytest.mark.parametrize("swa_page", [32, 64, 128])
 @torch.inference_mode()
 def test_ced_replay_window_high_page_stride_and_invalid_rows(
     native_workspace, monkeypatch, swa_page

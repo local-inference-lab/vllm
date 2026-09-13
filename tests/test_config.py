@@ -17,6 +17,7 @@ import vllm.config.vllm as vllm_config_module
 import vllm.envs as envs
 from vllm.compilation.backends import VllmBackend
 from vllm.config import (
+    CacheConfig,
     CompilationConfig,
     KernelConfig,
     ModelConfig,
@@ -39,6 +40,39 @@ from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionCGSupport
 
 DEVICE_TYPE = current_platform.device_type
+
+
+@pytest.mark.parametrize("swa_size,prefix_unit", [(None, 128), (32, 64), (128, 96)])
+def test_swa_page_size_rejects_incompatible_prefix_matching(swa_size, prefix_unit):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architecture="DeepseekV41ForCausalLM"),
+        speculative_config=None,
+        cache_config=CacheConfig(
+            swa_block_size=swa_size, prefix_match_unit=prefix_unit
+        ),
+    )
+    with pytest.raises(ValueError, match="must be divisible by --prefix-match-unit"):
+        VllmConfig.validate_swa_block_size(config)
+    config.cache_config.prefix_match_unit = 32
+    VllmConfig.validate_swa_block_size(config)
+
+
+def test_swa_page_size_is_scoped_to_v41_target_and_draft():
+    target = SimpleNamespace(architecture="DeepseekV41ForCausalLM")
+    draft = SimpleNamespace(architecture="DSparkDeepseekV4ForCausalLM")
+    config = SimpleNamespace(
+        model_config=draft,
+        speculative_config=SimpleNamespace(
+            target_model_config=target, draft_model_config=draft
+        ),
+        cache_config=CacheConfig(swa_block_size=128, prefix_match_unit=32),
+    )
+    VllmConfig.validate_swa_block_size(config)
+    target.architecture = "DeepseekV4ForCausalLM"
+    with pytest.raises(ValueError, match="only supported by native DeepSeek V4.1"):
+        VllmConfig.validate_swa_block_size(config)
+    config.cache_config.swa_block_size = None
+    VllmConfig.validate_swa_block_size(config)
 
 
 @pytest.mark.parametrize(

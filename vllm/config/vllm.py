@@ -2802,6 +2802,34 @@ class VllmConfig:
         return self
 
     @model_validator(mode="after")
+    def validate_swa_block_size(self) -> "VllmConfig":
+        model_config = self.model_config
+        if model_config is None:
+            return self
+        speculative = self.speculative_config
+        if speculative is not None and model_config is speculative.draft_model_config:
+            model_config = speculative.target_model_config
+        cache_config = self.cache_config
+        if model_config.architecture != "DeepseekV41ForCausalLM":
+            if cache_config.swa_block_size is not None:
+                raise ValueError(
+                    "--swa-block-size is only supported by native DeepSeek V4.1 B12X"
+                )
+            return self
+        swa_block_size = cache_config.swa_block_size or 64
+        prefix_unit = cache_config.prefix_match_unit
+        if (
+            cache_config.enable_prefix_caching
+            and prefix_unit is not None
+            and swa_block_size % prefix_unit != 0
+        ):
+            raise ValueError(
+                f"SWA block size ({swa_block_size}) must be divisible by "
+                f"--prefix-match-unit ({prefix_unit})"
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_mamba_block_size(self) -> "VllmConfig":
         if self.model_config is None:
             return self

@@ -97,7 +97,11 @@ class _Cache(nn.Module, AttentionLayerBase):
         super().__init__()
         self.prefix, self.kind, self.ratio, self.window = prefix, kind, ratio, window
         self.draft = draft
-        self.block_size = 64 if kind == "swa" else config.cache_config.block_size
+        self.block_size = (
+            config.cache_config.swa_block_size or 64
+            if kind == "swa"
+            else config.cache_config.block_size
+        )
         self.kv_cache = torch.tensor([])
         context = config.compilation_config.static_forward_context
         if prefix in context:
