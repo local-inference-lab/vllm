@@ -96,7 +96,7 @@ class _Cache(nn.Module, AttentionLayerBase):
         super().__init__()
         self.prefix, self.kind, self.ratio, self.window = prefix, kind, ratio, window
         self.draft = draft
-        self.block_size = 32 if kind == "swa" else config.cache_config.block_size
+        self.block_size = 64 if kind == "swa" else config.cache_config.block_size
         self.kv_cache = torch.tensor([])
         context = config.compilation_config.static_forward_context
         if prefix in context:
@@ -489,7 +489,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     max_width=self.swa_width + (512 if self.compress_ratio else 0),
                     swa_width=self.swa_width,
                     indexed_width=512 if self.compress_ratio else 0,
-                    swa_page_size=32,
+                    swa_page_size=self.swa_cache_layer.block_size,
                     indexed_page_size=self._main_page,
                     max_page_table_width=self._main_width,
                     mode=mode,
@@ -498,7 +498,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 )
             )
             self._plans[mode] = plan
-            metadata_specs = (
+            metadata_specs: tuple[tuple[tuple[int, ...], torch.dtype], ...] = (
                 ((capacity, self.swa_width), torch.int32),
                 ((capacity,), torch.int32),
                 ((capacity,), torch.int32),
@@ -556,7 +556,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             rotated,
             self.swa_cache_layer.kv_cache,
             slot_mapping,
-            page_size=32,
+            page_size=self.swa_cache_layer.block_size,
             cache_kind="swa",
             cache_format="deepseek_v41",
         )
@@ -574,9 +574,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
 
     def _prepare_global_kv(self, positions, hidden_states):
         self._prepare(hidden_states.device)
-        metadata = get_forward_context().attn_metadata
-        if not isinstance(metadata, dict) or self.compressor is None:
+        raw_metadata = get_forward_context().attn_metadata
+        if not isinstance(raw_metadata, dict) or self.compressor is None:
             return
+        metadata = cast(dict[str, DeepseekV41B12xMetadata], raw_metadata)
+        assert self.indexer is not None
         rows = hidden_states.shape[0]
         # These are deliberately original metadata, never the decoder views.
         main = metadata[self._owner().prefix]
@@ -771,7 +773,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             swa.request_positions,
             0,
             swa.block_table.stride(0),
-            32,
+            self.swa_cache_layer.block_size,
             self.window_size,
             self.swa_width,
             self.is_draft,
@@ -811,7 +813,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             binding=binding,
             swa_k_cache=self.swa_cache_layer.kv_cache,
             indexed_k_cache=self._owner().kv_cache if main is not None else None,
-            swa_page_size=32,
+            swa_page_size=self.swa_cache_layer.block_size,
             indexed_page_size=self._main_page,
             sm_scale=512**-0.5,
             attn_sink=self.attn_sink,

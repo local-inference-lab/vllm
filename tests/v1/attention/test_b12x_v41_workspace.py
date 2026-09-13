@@ -74,7 +74,7 @@ def test_indexer_loads_complete_projections_on_tp_rank(native_workspace, monkeyp
         torch.testing.assert_close(projection.weight, source, rtol=0, atol=0)
 
 
-def _layer(attention, layer_id=0):
+def _layer(attention, layer_id=0, swa_page=32):
     # Avoid checkpoint/model construction: exercise the real planning and
     # attention methods with the same TP4 head geometry and serving capacity.
     layer = attention.DeepseekV4Attention.__new__(attention.DeepseekV4Attention)
@@ -103,11 +103,61 @@ def _layer(attention, layer_id=0):
     layer.indexer = SimpleNamespace(
         heads=32, k_cache=SimpleNamespace(prefix=layer.prefix + ".indexer.k_cache")
     )
-    layer.swa_cache_layer = SimpleNamespace(prefix=layer.prefix + ".swa_cache")
+    layer.swa_cache_layer = SimpleNamespace(
+        prefix=layer.prefix + ".swa_cache", block_size=swa_page
+    )
     layer.compressor = None
     layer._context = {layer.prefix: layer}
     layer._ready = False
     return layer
+
+
+@pytest.mark.parametrize("swa_page", [32, 64])
+def test_context_cache_write_preserves_page_boundaries_and_padding(
+    native_workspace, swa_page
+):
+    from b12x.attention._shared.mla.compressed_reference import (
+        pack_deepseek_v41_cache_reference,
+    )
+
+    attention, _, _ = native_workspace
+    device = torch.device("cuda")
+    torch.manual_seed(145)
+    layer = _layer(attention, swa_page=swa_page)
+    rows = 2 * swa_page + 3
+    layer.rotary_emb = SimpleNamespace(
+        cos_sin_cache=torch.cat(
+            (
+                torch.ones((rows, 32), device=device),
+                torch.zeros((rows, 32), device=device),
+            ),
+            dim=-1,
+        )
+    )
+    page_bytes = attention.mla.page_nbytes(
+        swa_page, cache_kind="swa", cache_format="deepseek_v41"
+    )
+    storage = torch.full((6, 113920), 0xA5, dtype=torch.uint8, device=device)
+    layer.swa_cache_layer.kv_cache = storage[:, :page_bytes]
+    expected = storage.clone()
+    logical = torch.arange(rows, device=device) + swa_page - 1
+    pages = torch.tensor([3, 1, 4, 2], device=device)
+    slots = pages[logical // swa_page] * swa_page + logical % swa_page
+    slots[-2:] = -1
+    positions = torch.arange(rows, device=device)
+    kv = torch.randn((rows, 512), device=device, dtype=torch.bfloat16)
+    records = pack_deepseek_v41_cache_reference(
+        kv, page_size=swa_page, cache_kind="swa"
+    ).view(-1, 528)
+    valid = slots >= 0
+    columns = (slots[valid] % swa_page)[:, None] * 528 + torch.arange(
+        528, device=device
+    )
+    expected[(slots[valid] // swa_page)[:, None], columns] = records[:rows][valid]
+
+    layer.insert_context_kv(kv, positions, slots)
+
+    torch.testing.assert_close(storage, expected, rtol=0, atol=0)
 
 
 def test_prepare_memory_is_metadata_not_capacity_activations(native_workspace):
@@ -184,6 +234,7 @@ def test_mhc_fixed_capacity_buckets_preserve_decode_policy(
         assert bool(torch.isfinite(y).all())
 
 
+@pytest.mark.parametrize("main_page,swa_page", [(64, 32), (128, 64)])
 @pytest.mark.parametrize(
     "is_decode,rows,live_rows",
     [
@@ -196,14 +247,15 @@ def test_mhc_fixed_capacity_buckets_preserve_decode_policy(
     ],
 )
 def test_attention_shared_scratch_graph_replay(
-    native_workspace, monkeypatch, is_decode, rows, live_rows
+    native_workspace, monkeypatch, is_decode, rows, live_rows, main_page, swa_page
 ):
     attention, manager, workspace = native_workspace
     # A TP4 rank must score all replicated heads without obtaining a TP group.
     monkeypatch.setattr(attention, "get_tensor_model_parallel_world_size", lambda: 4)
     device = torch.device("cuda", torch.accelerator.current_device_index())
     torch.manual_seed(142)
-    layer = _layer(attention)
+    layer = _layer(attention, swa_page=swa_page)
+    layer.config.cache_config.block_size = main_page
     layer.max_model_len = 4096
     if rows == 36:
         layer.config.speculative_config.parallel_drafting = True
@@ -243,14 +295,14 @@ def test_attention_shared_scratch_graph_replay(
     context = SimpleNamespace(
         cudagraph_runtime_mode=CUDAGraphMode.NONE,
         attn_metadata={
-            layer.swa_cache_layer.prefix: metadata(32),
-            layer.prefix: metadata(64),
-            layer.indexer.k_cache.prefix: metadata(64),
+            layer.swa_cache_layer.prefix: metadata(swa_page),
+            layer.prefix: metadata(main_page),
+            layer.indexer.k_cache.prefix: metadata(main_page),
         },
     )
     monkeypatch.setattr(attention, "get_forward_context", lambda: context)
     kv = torch.randn((length, 512), device=device, dtype=torch.bfloat16)
-    for kind, page in (("swa", 32), ("indexed", 64)):
+    for kind, page in (("swa", swa_page), ("indexed", main_page)):
         cache = torch.empty(
             (
                 length // page + 1,
@@ -274,7 +326,10 @@ def test_attention_shared_scratch_graph_replay(
         else:
             layer.kv_cache = cache
     layer.indexer.k_cache.kv_cache = torch.empty(
-        (length // 64 + 1, attention.dsa_indexer.MXFP4_INDEX_PAGE_BYTES),
+        (
+            length // main_page + 1,
+            attention.dsa_indexer.index_mxfp4_page_bytes(main_page),
+        ),
         dtype=torch.uint8,
         device=device,
     )
@@ -288,7 +343,8 @@ def test_attention_shared_scratch_graph_replay(
     attention.dsa_indexer.quantize_write_index_k_mxfp4(
         index_keys,
         index_k_cache=layer.indexer.k_cache.kv_cache,
-        slot_mapping=torch.arange(length, device=device) + 64,
+        slot_mapping=torch.arange(length, device=device) + main_page,
+        page_size=main_page,
     )
     layer.attn_sink = torch.zeros(layer.n_local_heads, device=device)
     q = torch.randn(
@@ -677,9 +733,10 @@ def test_ced_global_preparation_preserves_full_row_cache_bytes(
     )
 
 
+@pytest.mark.parametrize("main_page,swa_page", [(64, 32), (128, 64)])
 @torch.inference_mode()
 def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
-    native_workspace, monkeypatch
+    native_workspace, monkeypatch, main_page, swa_page
 ):
     from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
     from b12x.attention._shared.mla.compressed_reference import (
@@ -689,7 +746,8 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
     attention, manager, workspace = native_workspace
     torch.manual_seed(713)
     device = torch.device("cuda")
-    layer = _layer(attention, 20)
+    layer = _layer(attention, 20, swa_page=swa_page)
+    layer.config.cache_config.block_size = main_page
     layer.is_ced_decoder = True
     layer._prepare(device)
     rows, length, boundary = 128, 256, 128
@@ -722,14 +780,14 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
 
     context = SimpleNamespace(
         attn_metadata={
-            layer.swa_cache_layer.prefix: metadata(32),
-            layer.prefix: metadata(64),
-            layer.indexer.k_cache.prefix: metadata(64),
+            layer.swa_cache_layer.prefix: metadata(swa_page),
+            layer.prefix: metadata(main_page),
+            layer.indexer.k_cache.prefix: metadata(main_page),
         }
     )
     monkeypatch.setattr(attention, "get_forward_context", lambda: context)
     kv = torch.randn((length, 512), device=device, dtype=torch.bfloat16)
-    for kind, page in (("swa", 32), ("indexed", 64)):
+    for kind, page in (("swa", swa_page), ("indexed", main_page)):
         cache = torch.zeros(
             (
                 length // page + 1,
@@ -762,7 +820,10 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
                 cache, page_size=page, cache_kind=kind
             )[page : page + length].clone()
     layer.indexer.k_cache.kv_cache = torch.zeros(
-        (length // 64 + 1, attention.dsa_indexer.index_mxfp4_page_bytes(64)),
+        (
+            length // main_page + 1,
+            attention.dsa_indexer.index_mxfp4_page_bytes(main_page),
+        ),
         device=device,
         dtype=torch.uint8,
     )
@@ -772,8 +833,8 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
     attention.dsa_indexer.quantize_write_index_k_mxfp4(
         keys,
         index_k_cache=layer.indexer.k_cache.kv_cache,
-        slot_mapping=torch.arange(length, device=device) + 64,
-        page_size=64,
+        slot_mapping=torch.arange(length, device=device) + main_page,
+        page_size=main_page,
     )
     q = torch.randn((rows, 16, 512), device=device, dtype=torch.bfloat16)
     heads = layer.indexer.heads
@@ -852,9 +913,10 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
     del graph, resources
 
 
+@pytest.mark.parametrize("swa_page", [32, 64])
 @torch.inference_mode()
 def test_ced_replay_window_high_page_stride_and_invalid_rows(
-    native_workspace, monkeypatch
+    native_workspace, monkeypatch, swa_page
 ):
     from b12x.attention._shared.mla.compressed_reference import (
         unpack_deepseek_v41_cache_reference,
@@ -862,7 +924,7 @@ def test_ced_replay_window_high_page_stride_and_invalid_rows(
 
     attention, _, _ = native_workspace
     device = torch.device("cuda")
-    layer = _layer(attention, 20)
+    layer = _layer(attention, 20, swa_page=swa_page)
     layer.is_ced_decoder = True
     layer.compress_ratio = 0
     layer.indexer = None
@@ -872,14 +934,16 @@ def test_ced_replay_window_high_page_stride_and_invalid_rows(
     storage = torch.empty((high_pid + 1, stride), device=device, dtype=torch.uint8)
     cache = storage[
         :,
-        : attention.mla.page_nbytes(32, cache_kind="swa", cache_format="deepseek_v41"),
+        : attention.mla.page_nbytes(
+            swa_page, cache_kind="swa", cache_format="deepseek_v41"
+        ),
     ]
     kv = torch.randn((1, 512), device=device, dtype=torch.bfloat16)
     attention.mla.write_cache(
         kv,
         cache,
-        torch.tensor([high_pid * 32], device=device),
-        page_size=32,
+        torch.tensor([high_pid * swa_page], device=device),
+        page_size=swa_page,
         cache_kind="swa",
         cache_format="deepseek_v41",
     )
@@ -889,7 +953,7 @@ def test_ced_replay_window_high_page_stride_and_invalid_rows(
         positions=positions,
         req_id_per_token=torch.tensor([0, 0, -1], device=device, dtype=torch.int32),
         block_table=torch.tensor(
-            [[-1, -1, -1, -1, high_pid]], device=device, dtype=torch.int32
+            [[-1] * (128 // swa_page) + [high_pid]], device=device, dtype=torch.int32
         ),
         query_start_loc=torch.tensor([0, 1], device=device, dtype=torch.int32),
         request_positions=positions[:1],
@@ -909,7 +973,9 @@ def test_ced_replay_window_high_page_stride_and_invalid_rows(
     layer.attn_sink = torch.zeros(16, device=device)
     layer.forward_mqa(q, None, positions, out)
     value = unpack_deepseek_v41_cache_reference(
-        cache[high_pid : high_pid + 1].contiguous(), page_size=32, cache_kind="swa"
+        cache[high_pid : high_pid + 1].contiguous(),
+        page_size=swa_page,
+        cache_kind="swa",
     )[0]
     score = torch.einsum("hd,d->h", q[0].float(), value) * 512**-0.5
     expected = score.sigmoid()[:, None] * value
@@ -1012,7 +1078,7 @@ def test_metadata_refresh_preserves_padded_graph_domain_and_addresses():
             metadata = builder.build(0, common)
         seq[0] += 7
         graph.replay()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         expected = torch.arange(1031 - live, 1031, dtype=torch.int64, device=device)
         torch.testing.assert_close(metadata.positions[:live], expected, rtol=0, atol=0)
         torch.testing.assert_close(
