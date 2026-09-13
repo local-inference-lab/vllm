@@ -181,6 +181,7 @@ def test_indexer_short_scan_reservation_preserves_long_scan_and_decode(
         capacity=4096,
         n_local_heads=16,
         swa_width=128,
+        swa_cache_layer=SimpleNamespace(block_size=64),
         is_ced_decoder=ced,
         layer_id=2,
         candidate_source_layer=20,
@@ -306,7 +307,8 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
     positions = torch.arange(100, 108)
     inputs = torch.arange(16, dtype=torch.float32).reshape(8, 2) / 8
     indices = torch.tensor([2, 3, 6, 7, -1, -1]) if compact else None
-    shared, row_work = {}, []
+    shared: dict[str, torch.Tensor | int] = {}
+    row_work: list[tuple[str, int, int]] = []
     buffer = torch.empty(8, 8)
     target = SimpleNamespace(
         embed_input_ids=lambda _: inputs,
@@ -345,6 +347,7 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
         if index >= 2:
             expected_aux.append(expected.clone())
     if compact:
+        assert indices is not None
         keep = torch.zeros(8, dtype=torch.bool)
         keep[indices[indices >= 0]] = True
         expected[~keep] = 0
@@ -360,7 +363,7 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
         atol=1e-6,
     )
     assert shared["global_rows"] == 8
-    decoder_rows = len(indices) if compact else 8
+    decoder_rows = len(indices) if indices is not None else 8
     assert row_work == [
         (kind, i, 8 if i < 2 else decoder_rows)
         for i in range(4)
