@@ -408,17 +408,28 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     if(TORCH_STABLE_STRING_CONTENTS MATCHES "auto strptr = new std::string")
       set(TORCH_SHADOW_INCLUDE_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/torch_patched_headers")
+      set(TORCH_SHADOW_STAGING_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/torch_patched_headers_staging")
 
       file(MAKE_DIRECTORY "${TORCH_SHADOW_INCLUDE_DIR}/torch/csrc/stable")
+      file(REMOVE_RECURSE "${TORCH_SHADOW_STAGING_DIR}")
+      file(MAKE_DIRECTORY "${TORCH_SHADOW_STAGING_DIR}/torch/csrc/stable")
       file(COPY_FILE
         "${TORCH_INCLUDE_DIR}/${_stable_hdr_rel}"
-        "${TORCH_SHADOW_INCLUDE_DIR}/${_stable_hdr_rel}")
+        "${TORCH_SHADOW_STAGING_DIR}/${_stable_hdr_rel}")
 
       execute_process(
         COMMAND patch --batch --forward -p1
           "--input=${CMAKE_CURRENT_LIST_DIR}/cmake/patches/pytorch_stable_string.patch"
-        WORKING_DIRECTORY "${TORCH_SHADOW_INCLUDE_DIR}"
+        WORKING_DIRECTORY "${TORCH_SHADOW_STAGING_DIR}"
         COMMAND_ERROR_IS_FATAL ANY)
+
+      # Header timestamps participate in Ninja dependency checks. Preserve the
+      # destination timestamp when the patched content has not changed.
+      file(COPY_FILE
+        "${TORCH_SHADOW_STAGING_DIR}/${_stable_hdr_rel}"
+        "${TORCH_SHADOW_INCLUDE_DIR}/${_stable_hdr_rel}"
+        ONLY_IF_DIFFERENT)
 
       include_directories(BEFORE "${TORCH_SHADOW_INCLUDE_DIR}")
     endif()
