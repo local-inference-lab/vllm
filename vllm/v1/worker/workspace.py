@@ -83,6 +83,16 @@ def collect_cuda_graph_capture_resources() -> Iterator[list[Any]]:
         _cuda_graph_capture_resources.reset(token)
 
 
+@contextmanager
+def suspend_cuda_graph_capture_resources() -> Iterator[None]:
+    """Do not retain temporary owners from an uncaptured, in-place operation."""
+    token = _cuda_graph_capture_resources.set(None)
+    try:
+        yield
+    finally:
+        _cuda_graph_capture_resources.reset(token)
+
+
 def retain_cuda_graph_capture_resource(resource: Any) -> bool:
     """Retain an object whose storage is referenced by a CUDA graph.
 

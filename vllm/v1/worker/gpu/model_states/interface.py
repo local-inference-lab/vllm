@@ -43,6 +43,16 @@ class ModelSpecificAttnMetadata:
 
 
 class ModelState(ABC):
+    single_request_prefill_cudagraph_tokens: int = 0
+    """Optional exact-row, single-request piecewise capture outside decode sizes."""
+
+    def can_use_single_request_prefill_graph(self, num_reqs, num_tokens, req_ids):
+        return False
+
+    def finalize_cudagraph_inputs(self, model_inputs, cg_mode):
+        """Refresh model-owned inputs after capture attention metadata is staged."""
+        return None
+
     specialize_full_decode_graphs: ClassVar[bool] = False
     """Capture decode-specific graphs alongside general full-model graphs."""
     supports_prompt_embeds: ClassVar[bool] = False

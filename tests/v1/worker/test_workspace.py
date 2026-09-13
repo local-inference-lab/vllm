@@ -159,3 +159,16 @@ def test_cuda_graph_capture_resources_are_scoped_to_collector() -> None:
     assert resources == [first, second]
     assert nested_resources == [nested]
     assert not workspace.retain_cuda_graph_capture_resource(outside)
+
+
+def test_suspended_graph_resources_restore_collector_after_failure() -> None:
+    owner = object()
+    with workspace.collect_cuda_graph_capture_resources() as resources:
+        with (
+            pytest.raises(ValueError),
+            workspace.suspend_cuda_graph_capture_resources(),
+        ):
+            assert not workspace.retain_cuda_graph_capture_resource(object())
+            raise ValueError("eager operation failed")
+        assert workspace.retain_cuda_graph_capture_resource(owner)
+    assert resources == [owner]

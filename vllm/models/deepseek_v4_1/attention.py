@@ -15,6 +15,7 @@ from b12x.attention.compressed_sparse_mla.weight_scale import (
 from b12x.gemm import wo_projection
 from torch import nn
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -72,7 +73,6 @@ def _rotated(x, positions, cos_sin_cache, **kwargs):
     # This result can span nested GEMMs, which reuse the workspace arena.
     out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     rotate(x, positions, cos_sin_cache, out=out, **kwargs)
-    retain_cuda_graph_capture_resource((x, out))
     return out
 
 
@@ -593,12 +593,21 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             return metadata.decoder
         return metadata
 
+    @eager_break_during_capture
+    def _cache_context_kv(self, kv, positions):
+        # Resolve live request metadata inside the eager segment. A captured
+        # slot-mapping argument could refer to a previous request's cache pages.
+        metadata = get_forward_context().attn_metadata
+        swa = self._query_metadata(metadata[self.swa_cache_layer.prefix])
+        self.insert_context_kv(kv, positions, swa.slot_mapping[: kv.shape[0]])
+
     def prepare_global_kv(self, positions, hidden_states):
         """Build full-row global KV before the CED boundary gathers decoder rows."""
         if self.compressor is None or hidden_states.shape[0] == 0:
             return
         return _prepare_global_kv(hidden_states, positions, self.prefix)
 
+    @eager_break_during_capture
     def _prepare_global_kv(self, positions, hidden_states):
         self._prepare(hidden_states.device)
         metadata = get_forward_context().attn_metadata
@@ -659,7 +668,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
         q = _rotated(q, positions, self.rotary_emb.cos_sin_cache)
         output = torch.empty_like(q)
-        retain_cuda_graph_capture_resource(output)
         metadata = cast(
             dict[str, DeepseekV41B12xMetadata] | None,
             get_forward_context().attn_metadata,
@@ -672,7 +680,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             original_swa = metadata[self.swa_cache_layer.prefix]
             swa = self._query_metadata(original_swa)
             is_prefill = not swa.is_decode
-            self.insert_context_kv(kv, positions, swa.slot_mapping[:rows])
+            self._cache_context_kv(kv, positions)
             if swa is original_swa:
                 self._prepare_global_kv(positions, hidden_states)
             index_query = None
@@ -687,10 +695,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 iw = torch.empty_like(weights)
                 scale_index_weights(weights, out=iw)
                 index_query = (iq_data, iq_scale, iw)
-                retain_cuda_graph_capture_resource((weights, index_query))
             self.forward_mqa(q, kv, positions, output, index_query=index_query)
         return self._o_proj(output, positions, is_prefill=is_prefill)
 
+    @eager_break_during_capture
     def forward_mqa(self, q, kv, positions, output, *, index_query=None):
         metadata = get_forward_context().attn_metadata
         swa = self._query_metadata(metadata[self.swa_cache_layer.prefix])
@@ -911,5 +919,4 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             raise TypeError("V4.1 WO projection must return BF16")
         if get_tensor_model_parallel_world_size() > 1:
             local = get_tp_group().all_reduce(local)
-        retain_cuda_graph_capture_resource(local)
         return local

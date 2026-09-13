@@ -219,6 +219,7 @@ class BatchExecutionDescriptor:
     # uniform_token_count unset, so this is what keeps a prefill batch out of one.
     max_query_len: int | None = None
     num_active_loras: int = 0
+    exact_num_tokens: bool = False
 
 
 class CreateForwardFn(Protocol):
@@ -246,7 +247,8 @@ def _is_compatible(
     # desc.max_query_len=None means the graph does not constrain query length; a
     # caller that does not track max_query_len must not match one that does
     return (
-        (
+        (not desc.exact_num_tokens or num_tokens == desc.num_tokens)
+        and (
             desc.uniform_token_count is None
             or desc.uniform_token_count == uniform_token_count
         )
@@ -271,6 +273,7 @@ class CudaGraphManager:
         varlen_decode: bool = False,
         full_capture_request_sizes: frozenset[int] | None = None,
         specialize_full_decode: bool = False,
+        single_request_prefill_tokens: int = 0,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -282,6 +285,7 @@ class CudaGraphManager:
         self.varlen_decode = varlen_decode
         self.full_capture_request_sizes = full_capture_request_sizes
         self.specialize_full_decode = specialize_full_decode
+        self.single_request_prefill_tokens = single_request_prefill_tokens
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -497,6 +501,17 @@ class CudaGraphManager:
                     num_active_loras=num_active_loras,
                 )
                 descs_by_mode[mixed_mode].append(desc)
+
+        if self.single_request_prefill_tokens and self.use_breakable_cg:
+            descs_by_mode[CUDAGraphMode.PIECEWISE].append(
+                BatchExecutionDescriptor(
+                    cg_mode=CUDAGraphMode.PIECEWISE,
+                    num_tokens=self.single_request_prefill_tokens,
+                    num_reqs=1,
+                    max_query_len=self.single_request_prefill_tokens,
+                    exact_num_tokens=True,
+                )
+            )
 
         for mode, descs in descs_by_mode.items():
             descs.sort(key=lambda d: d.num_tokens, reverse=True)
@@ -737,6 +752,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
         specialize_full_decode: bool = False,
+        single_request_prefill_tokens: int = 0,
     ):
         super().__init__(
             vllm_config,
@@ -746,6 +762,7 @@ class ModelCudaGraphManager(CudaGraphManager):
             lora_capture_cases=lora_capture_cases,
             varlen_decode=varlen_decode,
             specialize_full_decode=specialize_full_decode,
+            single_request_prefill_tokens=single_request_prefill_tokens,
         )
         self.hidden_states: torch.Tensor | None = None
         self.aux_hidden_states: list[torch.Tensor] = []
@@ -812,6 +829,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
                 max_query_len=desc.max_query_len,
             )
+            model_state.finalize_cudagraph_inputs(model_inputs, desc.cg_mode)
 
             # Capture with dummy rows marked as padding.
             input_buffers.is_padding.fill_(True)

@@ -15,6 +15,32 @@ from torch import nn
 from vllm.models.deepseek_v4_1.nvidia import model as native
 
 
+def test_compacted_prefill_graph_excludes_prompt_logprobs_and_other_batch_shapes():
+    from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
+
+    state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
+    state.single_request_prefill_cudagraph_tokens = 4096
+    state._ced_prompt_logprobs = {"full-output"}
+    assert state.can_use_single_request_prefill_graph(1, 4096, ["compact"])
+    assert not state.can_use_single_request_prefill_graph(1, 4096, ["full-output"])
+    assert not state.can_use_single_request_prefill_graph(1, 2048, ["compact"])
+    assert not state.can_use_single_request_prefill_graph(2, 4096, ["a", "b"])
+
+
+def test_piecewise_capture_refreshes_compacted_indices_after_metadata_staging():
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
+
+    indices = torch.arange(128)
+    state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
+    state.ced_state = SimpleNamespace(get_indices=lambda: indices)
+    inputs = {"ced_indices": None}
+    state.finalize_cudagraph_inputs(inputs, CUDAGraphMode.FULL)
+    assert inputs["ced_indices"] is None
+    state.finalize_cudagraph_inputs(inputs, CUDAGraphMode.PIECEWISE)
+    assert inputs["ced_indices"] is indices
+
+
 @pytest.mark.parametrize("rows", [1, 8, 19])
 @pytest.mark.parametrize("strided", [False, True])
 def test_attention_returns_owned_projection_without_copy(monkeypatch, rows, strided):

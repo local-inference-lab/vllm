@@ -663,6 +663,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             lora_capture_cases=self.lora_capture_cases,
             varlen_decode=self.adaptive_verification is not None,
             specialize_full_decode=self.model_state.specialize_full_decode_graphs,
+            single_request_prefill_tokens=(
+                self.model_state.single_request_prefill_cudagraph_tokens
+            ),
         )
         check_attention_cp_compatibility(self.vllm_config)
         if isinstance(self.speculator, DraftModelSpeculator):
@@ -1716,6 +1719,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         exceeds_cudagraph_query_len = (
             max_cudagraph_query_len is not None
             and max_query_len > max_cudagraph_query_len
+            and not self.model_state.can_use_single_request_prefill_graph(
+                num_reqs, num_toks, scheduler_output.num_scheduled_tokens
+            )
         )
 
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
@@ -1929,6 +1935,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
                 num_tokens=input_batch.num_tokens_after_padding,
+                num_reqs=(
+                    batch_desc.num_reqs
+                    if batch_desc.num_tokens
+                    == self.model_state.single_request_prefill_cudagraph_tokens
+                    else None
+                ),
                 has_lora=self.lora_config is not None,
                 num_active_loras=batch_desc.num_active_loras,
             )
