@@ -1307,7 +1307,12 @@ class EngineArgs:
             description=CacheConfig.__doc__,
         )
         cache_group.add_argument("--block-size", **cache_kwargs["block_size"])
-        cache_group.add_argument("--swa-block-size", **cache_kwargs["swa_block_size"])
+        swa_kwargs = cache_kwargs["swa_block_size"].copy()
+        # argparse checks choices after optional_type converts "None" to None.
+        swa_kwargs["choices"] = [
+            None if value == "None" else value for value in swa_kwargs["choices"]
+        ]
+        cache_group.add_argument("--swa-block-size", **swa_kwargs)
         cache_group.add_argument(
             "--gpu-memory-utilization", **cache_kwargs["gpu_memory_utilization"]
         )
