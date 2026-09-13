@@ -110,7 +110,9 @@ def _block32_linear(
         packed_weight=layer.b12x_weight,
         output=out.view(-1, layer.weight.shape[0], 1),
     )
-    retain_cuda_graph_capture_resource(binding)
+    # Source and output have ordinary caller-managed Tensor lifetimes. Keep
+    # the borrowed workspace owner, not every layer's activation storage.
+    retain_cuda_graph_capture_resource(buffers)
     block_fp8_linear.run(binding=binding)
 
 
@@ -122,7 +124,6 @@ def _block32_linear_fake(x, out, key, scratch):
 @torch.library.custom_op("vllm::dsv41_embedding_out", mutates_args=("out",))
 def _embedding_out(weight: torch.Tensor, ids: torch.Tensor, out: torch.Tensor) -> None:
     embedding.run(weight, ids, out=out)
-    retain_cuda_graph_capture_resource(out)
 
 
 @_embedding_out.register_fake
@@ -166,7 +167,6 @@ class B12xLinearMethod(UnquantizedLinearMethod):
         out = bf16_gemv.mm(
             x, layer.weight, output_dtype=getattr(layer, "out_dtype", torch.bfloat16)
         )
-        retain_cuda_graph_capture_resource(out)
         return out
 
 

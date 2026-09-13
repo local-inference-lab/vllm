@@ -120,6 +120,7 @@ class AdaptiveVerificationManager:
         query_start_loc: torch.Tensor,
         num_bonus_tokens: int,
         max_total_logits: int,
+        cost_scale: float = 1.0,
     ):
         self.req_states = req_states
         self.num_speculative_steps = req_states.num_speculative_steps
@@ -131,6 +132,7 @@ class AdaptiveVerificationManager:
         # chunked path indexes by scheduled (untrimmed) offsets and cannot
         # address the compacted layout, so the budget must fit one chunk.
         self._max_total_logits = max_total_logits
+        self.cost_scale = cost_scale
         self.query_start_loc = query_start_loc
         self.cost_tables: tuple[np.ndarray, np.ndarray] | None = None
         # Largest cudagraph-captured token count; above it nothing pads.
@@ -371,13 +373,16 @@ class AdaptiveVerificationManager:
         num_tokens_to_estimated_accepted_tokens = np.concatenate(
             ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
         )
+        verify_costs = verify_cost_ms[
+            num_non_draft_tokens_total : num_non_draft_tokens_total
+            + max_draft_budget
+            + 1
+        ]
+        base_verify_cost = verify_costs[0]
         costs = (
             draft_cost_ms[len(req_ids)]
-            + verify_cost_ms[
-                num_non_draft_tokens_total : num_non_draft_tokens_total
-                + max_draft_budget
-                + 1
-            ]
+            + base_verify_cost
+            + self.cost_scale * (verify_costs - base_verify_cost)
         )
         num_drafts_per_req = {
             req_id: int(num_drafts)
@@ -387,7 +392,19 @@ class AdaptiveVerificationManager:
             req_id: int(num_tokens)
             for req_id, num_tokens in zip(req_ids, num_non_draft_tokens, strict=True)
         }
-        draft_budget = int(np.argmax(num_tokens_to_estimated_accepted_tokens / costs))
+        utilities = num_tokens_to_estimated_accepted_tokens / costs
+        draft_budget = int(np.argmax(utilities))
+        logger.debug(
+            "DSpark adaptive verification selected %d/%d draft rows for %d "
+            "requests at cost scale %.3g (selected utility %.4g, full utility "
+            "%.4g)",
+            draft_budget,
+            int(scheduled_drafts.sum()),
+            num_reqs,
+            self.cost_scale,
+            utilities[draft_budget],
+            utilities[-1],
+        )
         self._batch_budget = (
             num_drafts_per_req,
             num_non_draft_tokens_per_req,
@@ -434,6 +451,10 @@ class AdaptiveVerificationManager:
         draft_lens_cpu[:num_verification_reqs] = draft_budget // num_verification_reqs
         draft_lens_cpu[: draft_budget % num_verification_reqs] += 1
         return num_non_draft_tokens + draft_lens_cpu, cu_num_logits_np
+
+    def get_verified_draft_counts(self, num_reqs: int) -> torch.Tensor:
+        """Return the device-selected draft count for each request."""
+        return self._batch_draft_capacity[:num_reqs]
 
     def reallocate_drafts(
         self, req_ids: list[str], idx_mapping: torch.Tensor
@@ -506,6 +527,7 @@ def maybe_create_adaptive_verification_manager(
     num_bonus_tokens: int,
     max_total_logits: int,
     vllm_config: "VllmConfig",
+    adaptive_verification_cost_scale: float = 1.0,
     target_layer_names: set[str] | None = None,
     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
 ) -> AdaptiveVerificationManager | None:
@@ -574,4 +596,5 @@ def maybe_create_adaptive_verification_manager(
         query_start_loc,
         num_bonus_tokens,
         max_total_logits=max_total_logits,
+        cost_scale=adaptive_verification_cost_scale,
     )

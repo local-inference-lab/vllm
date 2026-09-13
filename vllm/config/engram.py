@@ -43,6 +43,19 @@ class EngramConfig:
     """Native V4.1 table storage: resident CUDA rows, mapped pinned host RAM,
     or SSD io_uring staging. Independent of the legacy cpu_offload option."""
 
+    disk_resident_scales: bool = False
+    """Keep original E8M0 scale bytes in mapped host RAM for disk tables.
+    Weights still use io_uring. Requires about 5.72 GiB total host RAM on V4.1."""
+
+    disk_prefetch_max_tokens: int = 0
+    """Opt-in concurrent reads across Engram tables before target execution.
+    Zero disables it. Larger preparation batches retain synchronous reads.
+    This does not overlap host I/O with captured decoder execution."""
+
+    projection_tp: bool = False
+    """Shard Engram WKV output columns over TP and gather the BF16 result.
+    Opt-in pending matched whole-serving performance and precision checks."""
+
     _ram_budget_checked_nbytes: int | None = field(default=None, init=False, repr=False)
     """Preflight state carried to workers; never re-charge allocated TP peers."""
 
@@ -69,15 +82,29 @@ class EngramConfig:
                 f"implementation with non-empty {field or 'engram_layer_ids'} "
                 "is supported."
             )
+        if self.disk_prefetch_max_tokens < 0:
+            raise ValueError("disk_prefetch_max_tokens must be nonnegative")
+        if self.table_memory != "disk" and (
+            self.disk_resident_scales or self.disk_prefetch_max_tokens
+        ):
+            raise ValueError("disk Engram controls require table_memory='disk'")
         if self.table_memory == "ram":
             self._verify_ram_budget(model_config.hf_text_config, tp_size)
+        elif self.disk_resident_scales:
+            self._verify_ram_budget(
+                model_config.hf_text_config, tp_size, scales_only=True
+            )
 
-    def _verify_ram_budget(self, hf_config, tp_size: int) -> None:
+    def _verify_ram_budget(
+        self, hf_config, tp_size: int, *, scales_only: bool = False
+    ) -> None:
         from vllm.model_executor.model_loader.weight_utils import (
             _get_available_ram_bytes,
         )
 
         planned = _ram_table_nbytes(hf_config, tp_size)
+        if scales_only:
+            planned = planned // 264 * 8
         if self._ram_budget_checked_nbytes == planned:
             return
         reserve = _RAM_RESERVE_BYTES

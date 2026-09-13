@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Real-kernel memory and graph-lifetime regressions for V4.1 attention."""
 
+import gc
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -176,6 +178,107 @@ def test_prepare_memory_is_metadata_not_capacity_activations(native_workspace):
     # A second layer must not own Q/O/inverse, indexer activations, or another
     # copy of either mode's planned scratch. Allow CUDA allocator rounding.
     assert allocated <= metadata_bytes + persistent_topk_bytes + 1024**2
+
+
+def test_block_linear_capture_retains_scratch_not_caller_activations(native_workspace):
+    from vllm.models.deepseek_v4_1 import b12x_layers
+
+    _, manager, workspace = native_workspace
+    kernel = b12x_layers.block_fp8_linear
+    torch.manual_seed(89)
+    device = torch.device("cuda")
+    layer = torch.nn.Module()
+    layer.weight = torch.randn(256, 256, device=device).to(torch.float8_e4m3fn)
+    scales = torch.ones(8, 8, device=device).to(torch.float8_e8m0fnu)
+    layer.b12x_weight = kernel.pack_weight(layer.weight, scales, block_size=(32, 32))
+    layer.b12x_capacities = (16,)
+    plan = kernel.plan(
+        kernel.Caps(
+            device=device,
+            max_tokens=16,
+            in_features=256,
+            out_features=256,
+            block_size=(32, 32),
+        )
+    )
+    layer.b12x_plans = (plan,)
+    layer.b12x_key = id(layer)
+    b12x_layers._LINEARS[id(layer)] = layer
+    manager.reserve_all(*plan.shapes_and_dtypes())
+    kernel.prewarm(layer.b12x_weight, (8, 16), expected_m=16)
+    method = b12x_layers.B12xFP8LinearMethod(
+        SimpleNamespace(weight_block_size=[32, 32])
+    )
+    inputs = torch.randn(16, 256, dtype=torch.bfloat16, device=device)
+    outputs = torch.empty_like(inputs)
+    references: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def run(rows):
+        source = inputs[:rows] + 1
+        output = method.apply(layer, source)
+        references.extend((weakref.ref(source), weakref.ref(output)))
+        outputs[:rows].copy_(output)
+
+    pool = torch.cuda.graph_pool_handle()
+    graphs = {}
+    owners = []
+    for rows in (16, 8):
+        run(rows)
+        torch.accelerator.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with (
+            workspace.collect_cuda_graph_capture_resources() as resources,
+            torch.cuda.graph(graph, pool=pool),
+        ):
+            run(rows)
+        owners.append(resources)
+        graphs[rows] = graph
+        gc.collect()
+        assert all(reference() is None for reference in references)
+        assert resources
+
+    for rows in (8, 16, 8, 16):
+        inputs.normal_()
+        run(rows)
+        expected = outputs[:rows].clone()
+        outputs.fill_(float("nan"))
+        graphs[rows].replay()
+        torch.testing.assert_close(outputs[:rows], expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("draft_tokens", [5, 7])
+def test_parallel_draft_reservation_keeps_decode_split_parallelism(
+    native_workspace, draft_tokens
+):
+    from b12x.attention.compressed_sparse_mla import api as mla
+
+    attention, _, _ = native_workspace
+    layer = _layer(attention)
+    layer.config.scheduler_config.max_num_seqs = 32
+    layer.config.speculative_config.num_speculative_tokens = draft_tokens
+    layer.config.speculative_config.parallel_drafting = True
+    layer.config.compilation_config.max_cudagraph_capture_size = 32 * (draft_tokens + 1)
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    layer._prepare(device)
+    decode = layer._plans["decode"].caps
+    prefill = layer._plans["extend"].caps
+    assert decode.max_q_rows > 256
+    assert (
+        mla.split_chunks_for_contract(
+            rows=decode.max_q_rows,
+            width=decode.max_width,
+            decode_row_capacity=decode.decode_row_capacity,
+        )
+        == 54
+    )
+    assert (
+        mla.split_chunks_for_contract(
+            rows=prefill.max_q_rows,
+            width=prefill.max_width,
+            decode_row_capacity=prefill.decode_row_capacity,
+        )
+        == 1
+    )
 
 
 def test_mhc_fixed_capacity_buckets_preserve_decode_policy(

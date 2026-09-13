@@ -1389,6 +1389,19 @@ class ModelConfig:
         if cls is not None:
             cls.verify_and_update_model_config(self)
 
+    def _update_model_config_for_parallelism(
+        self, parallel_config: ParallelConfig
+    ) -> None:
+        architecture = self.architecture
+        if architecture is None:
+            return
+
+        from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+
+        config = MODELS_CONFIG_MAP.get(architecture)
+        if config is not None:
+            config.update_model_config_for_parallelism(self, parallel_config)
+
     def verify_dual_chunk_attention_config(
         self,
         load_config: LoadConfig,
@@ -1416,6 +1429,7 @@ class ModelConfig:
         self,
         parallel_config: ParallelConfig,
     ) -> None:
+        self._update_model_config_for_parallelism(parallel_config)
         total_num_attention_heads = self.model_arch_config.total_num_attention_heads
         tensor_parallel_size = parallel_config.tensor_parallel_size
         if total_num_attention_heads % tensor_parallel_size != 0:

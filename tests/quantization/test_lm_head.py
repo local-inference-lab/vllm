@@ -38,11 +38,18 @@ def mxfp8_head_config(monkeypatch, default_vllm_config):
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("enabled", [False, True])
-def test_runtime_mxfp8_only_selects_lm_head(monkeypatch, mxfp8_head_config, enabled):
+@pytest.mark.parametrize(
+    ("env_value", "enabled"), [(None, False), ("0", False), ("1", True)]
+)
+def test_runtime_mxfp8_only_selects_lm_head(
+    monkeypatch, mxfp8_head_config, env_value, enabled
+):
     from vllm.model_executor.layers.quantization.online import mxfp8
 
-    monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", str(int(enabled)))
+    if env_value is None:
+        monkeypatch.delenv("VLLM_MXFP8_LM_HEAD", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", env_value)
     monkeypatch.setattr(mxfp8, "init_mxfp8_linear_kernel", lambda: None)
     head = ParallelLMHead(256, 128, params_dtype=torch.bfloat16, disable_tp=True)
     embedding = VocabParallelEmbedding(
@@ -135,6 +142,7 @@ def test_draft_nvfp4_head_preserves_verifier_and_dynamic_graph_scales(
             "VLLM_MTP_NVFP4_LM_HEAD",
         ):
             monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", "1")
         use_a16 = True
     else:
         monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", "1")
@@ -234,6 +242,7 @@ def test_runtime_mxfp8_b12x_shard_loading_and_graph(
             "VLLM_MTP_NVFP4_LM_HEAD",
         ):
             monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", "1")
         use_a16 = True
     else:
         monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", "1")

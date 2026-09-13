@@ -32,8 +32,8 @@ class Counter(Metric):
 class Vector(Metric):
     """An ordered array of integer counters.
 
-    This type - which doesn't exist in Prometheus - models one very
-    specific metric, vllm:spec_decode_num_accepted_tokens_per_pos.
+    This type - which doesn't exist in Prometheus - models speculative-decoding
+    counters labeled by draft position.
     """
 
     values: list[int]
@@ -95,16 +95,15 @@ def get_metrics_snapshot() -> list[Metric]:
                 )
         elif metric.type == "counter":
             samples = _get_samples(metric, "_total")
-            if metric.name == "vllm:spec_decode_num_accepted_tokens_per_pos":
+            if metric.name in {
+                "vllm:spec_decode_num_accepted_tokens_per_pos",
+                "vllm:spec_decode_num_draft_tokens_per_pos",
+            }:
                 #
-                # Ugly vllm:num_accepted_tokens_per_pos special case.
+                # Prometheus represents each positional count as a Counter
+                # labeled with "position". Convert each family into a vector.
                 #
-                # This metric is a vector of counters - for each spec
-                # decoding token position, we observe the number of
-                # accepted tokens using a Counter labeled with 'position'.
-                # We convert these into a vector of integer values.
-                #
-                for labels, values in _digest_num_accepted_by_pos_samples(samples):
+                for labels, values in _digest_num_by_pos_samples(samples):
                     collected.append(
                         Vector(name=metric.name, labels=labels, values=values)
                     )
@@ -214,7 +213,7 @@ def _digest_histogram(
     return output
 
 
-def _digest_num_accepted_by_pos_samples(
+def _digest_num_by_pos_samples(
     samples: list[Sample],
 ) -> list[tuple[dict[str, str], list[int]]]:
     #

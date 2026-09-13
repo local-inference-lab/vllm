@@ -184,6 +184,7 @@ class SpecDecodeMetrics:
     num_draft_tokens: int
     num_accepted_tokens: int
     accepted_per_pos: dict[int, int]
+    drafted_per_pos: dict[int, int]
 
 
 async def fetch_spec_decode_metrics(
@@ -204,6 +205,7 @@ async def fetch_spec_decode_metrics(
             num_draft_tokens = 0
             num_accepted_tokens = 0
             accepted_per_pos: dict[int, int] = {}
+            drafted_per_pos: dict[int, int] = {}
             found_spec_decode = False
 
             for line in text.split("\n"):
@@ -220,21 +222,29 @@ async def fetch_spec_decode_metrics(
                         continue
                     found_spec_decode = True
                     with contextlib.suppress(ValueError):
-                        if "num_drafts" in metric_name:
+                        if metric_name == "vllm:spec_decode_num_drafts_total":
                             num_drafts += int(float(parts[-1]))
-                        elif "num_draft_tokens" in metric_name:
+                        elif metric_name == "vllm:spec_decode_num_draft_tokens_total":
                             num_draft_tokens += int(float(parts[-1]))
-                        elif "num_accepted_tokens_per_pos" in metric_name:
+                        elif metric_name in {
+                            "vllm:spec_decode_num_accepted_tokens_per_pos_total",
+                            "vllm:spec_decode_num_draft_tokens_per_pos_total",
+                        }:
                             pos_label = 'position="'
                             if pos_label in line:
                                 start = line.index(pos_label) + len(pos_label)
                                 end = line.index('"', start)
                                 pos = int(line[start:end])
                                 val = int(float(parts[-1]))
-                                accepted_per_pos[pos] = (
-                                    accepted_per_pos.get(pos, 0) + val
+                                counts = (
+                                    accepted_per_pos
+                                    if "accepted" in metric_name
+                                    else drafted_per_pos
                                 )
-                        elif "num_accepted_tokens" in metric_name:
+                                counts[pos] = counts.get(pos, 0) + val
+                        elif metric_name == (
+                            "vllm:spec_decode_num_accepted_tokens_total"
+                        ):
                             num_accepted_tokens += int(float(parts[-1]))
 
             if not found_spec_decode:
@@ -245,9 +255,58 @@ async def fetch_spec_decode_metrics(
                 num_draft_tokens=num_draft_tokens,
                 num_accepted_tokens=num_accepted_tokens,
                 accepted_per_pos=accepted_per_pos,
+                drafted_per_pos=drafted_per_pos,
             )
     except (aiohttp.ClientError, asyncio.TimeoutError):
         return None
+
+
+def calculate_spec_decode_stats(
+    before: SpecDecodeMetrics,
+    after: SpecDecodeMetrics,
+) -> dict[str, Any] | None:
+    """Calculate benchmark-local speculative metrics from counter deltas."""
+    delta_drafts = after.num_drafts - before.num_drafts
+    delta_draft_tokens = after.num_draft_tokens - before.num_draft_tokens
+    delta_accepted = after.num_accepted_tokens - before.num_accepted_tokens
+    per_pos_rates: list[float | None] = []
+    has_per_position_draft_counts = bool(
+        before.drafted_per_pos or after.drafted_per_pos
+    )
+    if delta_drafts > 0:
+        positions = sorted(
+            set(before.accepted_per_pos)
+            | set(after.accepted_per_pos)
+            | set(before.drafted_per_pos)
+            | set(after.drafted_per_pos)
+        )
+        for pos in positions:
+            before_accepted = before.accepted_per_pos.get(pos, 0)
+            after_accepted = after.accepted_per_pos.get(pos, before_accepted)
+            delta_pos = after_accepted - before_accepted
+            if has_per_position_draft_counts:
+                before_drafted = before.drafted_per_pos.get(pos, 0)
+                after_drafted = after.drafted_per_pos.get(pos, before_drafted)
+                delta_drafted = after_drafted - before_drafted
+                per_pos_rates.append(
+                    delta_pos / delta_drafted if delta_drafted > 0 else None
+                )
+            else:
+                # Compatibility with servers that predate per-position
+                # verified-draft counters.
+                per_pos_rates.append(delta_pos / delta_drafts)
+
+    if delta_draft_tokens <= 0:
+        return None
+    acceptance_length = 1 + delta_accepted / delta_drafts if delta_drafts > 0 else 0.0
+    return {
+        "num_drafts": delta_drafts,
+        "draft_tokens": delta_draft_tokens,
+        "accepted_tokens": delta_accepted,
+        "acceptance_rate": (delta_accepted / delta_draft_tokens) * 100,
+        "acceptance_length": acceptance_length,
+        "per_position_acceptance_rates": per_pos_rates,
+    }
 
 
 @dataclass
@@ -1085,44 +1144,10 @@ async def benchmark(
     spec_decode_metrics_after = await fetch_spec_decode_metrics(base_url, session)
     spec_decode_stats: dict[str, Any] | None = None
     if spec_decode_metrics_before is not None and spec_decode_metrics_after is not None:
-        delta_drafts = (
-            spec_decode_metrics_after.num_drafts - spec_decode_metrics_before.num_drafts
+        spec_decode_stats = calculate_spec_decode_stats(
+            spec_decode_metrics_before,
+            spec_decode_metrics_after,
         )
-        delta_draft_tokens = (
-            spec_decode_metrics_after.num_draft_tokens
-            - spec_decode_metrics_before.num_draft_tokens
-        )
-        delta_accepted = (
-            spec_decode_metrics_after.num_accepted_tokens
-            - spec_decode_metrics_before.num_accepted_tokens
-        )
-        per_pos_rates: list[float] = []
-        if delta_drafts > 0:
-            positions = sorted(
-                set(spec_decode_metrics_before.accepted_per_pos.keys())
-                | set(spec_decode_metrics_after.accepted_per_pos.keys())
-            )
-            for pos in positions:
-                before_val = spec_decode_metrics_before.accepted_per_pos.get(pos, 0)
-                after_val = spec_decode_metrics_after.accepted_per_pos.get(
-                    pos, before_val
-                )
-                delta_pos = after_val - before_val
-                per_pos_rates.append(delta_pos / delta_drafts)
-
-        if delta_draft_tokens > 0:
-            acceptance_rate = (delta_accepted / delta_draft_tokens) * 100
-            acceptance_length = (
-                1 + delta_accepted / delta_drafts if delta_drafts > 0 else 0.0
-            )
-            spec_decode_stats = {
-                "num_drafts": delta_drafts,
-                "draft_tokens": delta_draft_tokens,
-                "accepted_tokens": delta_accepted,
-                "acceptance_rate": acceptance_rate,
-                "acceptance_length": acceptance_length,
-                "per_position_acceptance_rates": per_pos_rates,
-            }
 
     diffusion_metrics_after = await fetch_diffusion_metrics(base_url, session)
     diffusion_stats: dict[str, Any] | None = None
@@ -1419,7 +1444,8 @@ async def benchmark(
         if per_pos:
             print("Per-position acceptance (%):")
             for i, rate in enumerate(per_pos):
-                print("{:<40} {:<10.2f}".format(f"  Position {i}:", rate * 100))
+                value = "-----" if rate is None else f"{rate * 100:.2f}"
+                print("{:<40} {:<10}".format(f"  Position {i}:", value))
 
     print("=" * 50)
 

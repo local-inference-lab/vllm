@@ -616,6 +616,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,
             max_total_logits=get_max_chunk_logits(self.vocab_size),
             vllm_config=self.vllm_config,
+            adaptive_verification_cost_scale=(
+                self.speculative_config.adaptive_verification_cost_scale
+                if self.speculative_config is not None
+                else 1.0
+            ),
             target_layer_names=target_attn_layer_names,
             additional_attn_cg_support=additional_attn_cg_support,
         )
@@ -663,6 +668,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             lora_capture_cases=self.lora_capture_cases,
             varlen_decode=self.adaptive_verification is not None,
             specialize_full_decode=self.model_state.specialize_full_decode_graphs,
+            single_request_prefill_tokens=(
+                self.model_state.single_request_prefill_cudagraph_tokens
+            ),
         )
         check_attention_cp_compatibility(self.vllm_config)
         if isinstance(self.speculator, DraftModelSpeculator):
@@ -1716,6 +1724,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         exceeds_cudagraph_query_len = (
             max_cudagraph_query_len is not None
             and max_query_len > max_cudagraph_query_len
+            and not self.model_state.can_use_single_request_prefill_graph(
+                num_reqs, num_toks, scheduler_output.num_scheduled_tokens
+            )
         )
 
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
@@ -1929,6 +1940,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
                 num_tokens=input_batch.num_tokens_after_padding,
+                num_reqs=(
+                    batch_desc.num_reqs
+                    if batch_desc.num_tokens
+                    == self.model_state.single_request_prefill_cudagraph_tokens
+                    else None
+                ),
                 has_lora=self.lora_config is not None,
                 num_active_loras=batch_desc.num_active_loras,
             )
@@ -2080,6 +2097,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
         )
+        num_verified_draft_tokens = (
+            self.adaptive_verification.get_verified_draft_counts(input_batch.num_reqs)
+            if self.adaptive_verification is not None
+            and input_batch.num_draft_tokens_per_req is not None
+            else None
+        )
         # Start async output copy here so that it can overlap with speculator proposal.
         boundary_state = (
             None if boundary_logits_only else self.boundary_checkpoint_state
@@ -2094,6 +2117,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 copy_stream=self.output_copy_stream,
                 check_ep_fault=self.check_ep_fault,
                 routed_experts=routed_experts,
+                num_verified_draft_tokens=num_verified_draft_tokens,
             )
         else:
             boundary_capture = torch.empty(
@@ -2149,6 +2173,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 check_ep_fault=self.check_ep_fault,
                 routed_experts=routed_experts,
                 boundary_checkpoint_tokens=boundary_capture[0],
+                num_verified_draft_tokens=num_verified_draft_tokens,
             )
 
         draft_tokens_for_next_step: torch.Tensor | None = None

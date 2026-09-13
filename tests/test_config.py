@@ -2124,6 +2124,28 @@ def test_draft_sample_method_gumbel_is_rejected():
         )
 
 
+@pytest.mark.parametrize("cost_scale", [0.0, -1.0])
+def test_adaptive_verification_cost_scale_must_be_positive(cost_scale):
+    with pytest.raises(ValidationError):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            adaptive_verification_cost_scale=cost_scale,
+        )
+
+
+def test_adaptive_verification_cost_scale_requires_adaptive_dspark():
+    with pytest.raises(
+        ValueError,
+        match="requires DSpark adaptive verification",
+    ):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            adaptive_verification_cost_scale=2.0,
+        )
+
+
 @patch("vllm.config.speculative.ModelConfig")
 def test_mtp_draft_uses_model_weights_not_local_cache(mock_model_config_cls):
     """Regression test: MTP + runai_streamer should use model_weights (original

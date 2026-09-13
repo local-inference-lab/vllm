@@ -7,6 +7,7 @@ Unit tests for the breakable cudagraph primitives.
 from __future__ import annotations
 
 import threading
+import weakref
 from contextlib import nullcontext
 from unittest.mock import patch
 
@@ -292,6 +293,61 @@ def test_add_eager_creates_alternating_graph_eager_graph(cuda_capture_stream):
     assert cap.segments[1] is eager_step
     assert cap.segments[3] is eager_step
     assert counter["eager_calls"] == 2  # only the in-capture invocation
+
+
+def test_eager_break_does_not_pin_temporary_capture_resources(cuda_capture_stream):
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+    from vllm.v1.worker.workspace import (
+        collect_cuda_graph_capture_resources,
+        retain_cuda_graph_capture_resource,
+    )
+
+    x = torch.zeros(4, device="cuda")
+    retained = []
+
+    def eager_step():
+        retained.append(retain_cuda_graph_capture_resource(object()))
+        x.mul_(2)
+
+    cap = BreakableCUDAGraphCapture()
+    owner = object()
+    with collect_cuda_graph_capture_resources() as resources, cap:
+        x.add_(1)
+        cap.add_eager(eager_step)
+        assert retain_cuda_graph_capture_resource(owner)
+        x.add_(3)
+    assert resources == [owner]
+    for value in (5, 7):
+        x.fill_(value)
+        cap.replay()
+        torch.testing.assert_close(x, torch.full_like(x, (value + 1) * 2 + 3))
+    assert retained == [False, False, False]
+
+
+def test_nested_eager_arguments_do_not_pin_graph_activations(cuda_capture_stream):
+    from vllm.compilation.breakable_cudagraph import (
+        BreakableCUDAGraphCapture,
+        eager_break_during_capture,
+    )
+
+    @eager_break_during_capture
+    def consume(values, *, outputs):
+        outputs["tensor"].copy_(values[0][0] * 2)
+
+    x = torch.ones(8, device="cuda")
+    out = torch.empty_like(x)
+    graph = BreakableCUDAGraphCapture()
+    with graph:
+        activation = x + 3
+        reference = weakref.ref(activation)
+        consume(([activation],), outputs={"tensor": out})
+        del activation
+        out.add_(7)
+    assert reference() is None
+    for value in (9, 12):
+        x.fill_(value)
+        graph.replay()
+        torch.testing.assert_close(out, torch.full_like(out, (value + 3) * 2 + 7))
 
 
 # ---------------------------------------------------------------------------

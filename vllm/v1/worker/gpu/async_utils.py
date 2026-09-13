@@ -123,6 +123,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         check_ep_fault: bool = False,
         routed_experts: RoutedExpertsTensors | None = None,
         boundary_checkpoint_tokens: torch.Tensor | None = None,
+        num_verified_draft_tokens: torch.Tensor | None = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -152,6 +153,11 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.boundary_checkpoint_tokens_np = (
                 async_copy_to_np(boundary_checkpoint_tokens)
                 if boundary_checkpoint_tokens is not None
+                else None
+            )
+            self.num_verified_draft_tokens_np = (
+                async_copy_to_np(num_verified_draft_tokens)
+                if num_verified_draft_tokens is not None
                 else None
             )
             self.sampling_mask_tensors: SamplingMaskTensors | None = None
@@ -187,6 +193,10 @@ class AsyncOutput(AsyncModelRunnerOutput):
             tokens = self.boundary_checkpoint_tokens_np.tolist()
             if any(any(boundary for boundary in row) for row in tokens):
                 self.model_runner_output.boundary_checkpoint_tokens = tokens
+        if self.num_verified_draft_tokens_np is not None:
+            self.model_runner_output.num_verified_draft_tokens = (
+                self.num_verified_draft_tokens_np.tolist()
+            )
 
         if self.sampling_mask_tensors is not None:
             self.model_runner_output.sampling_masks = (

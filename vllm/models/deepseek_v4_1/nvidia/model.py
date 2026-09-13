@@ -413,9 +413,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             for layer in islice(self.layers, self.start_layer, self.end_layer)
             if getattr(layer, "engram", None) is not None
         )
-        for engram in engrams:
-            engram.invalidate_disk_output()
         try:
+            for engram in engrams:
+                engram.invalidate_disk_output()
+            if self.engram_hash is None:
+                raise RuntimeError("Disk Engram requires initialized hash state")
             hashes = self.prepared_engram_hashes[: input_ids.shape[0]]
             self.engram_hash.run_native(
                 input_ids,
@@ -428,9 +430,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 engram.prepare_disk(
                     hashes[:, engram.layer_hash_index], self.engram_hash.num_tokens
                 )
+            # Independent tables can issue concurrent NVMe reads, but all rows
+            # are ready before entering the existing target CUDA graph.
+            if getattr(self.engram_layout, "disk_prefetch_max_tokens", 0):
+                for engram in engrams:
+                    engram.finish_disk()
         except BaseException:
             for engram in engrams:
-                engram.invalidate_disk_output(clear=True)
+                try:
+                    engram.invalidate_disk_output(clear=True)
+                except BaseException:
+                    logger.exception(
+                        "Failed to drain an Engram prefetch during cleanup"
+                    )
             raise
 
     def prepare_dummy_engram(self, num_tokens):

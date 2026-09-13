@@ -542,6 +542,12 @@ class SpeculativeConfig:
     """Whether to adaptively size the draft-verification budget from per-request
     confidence. Currently only supported for method="dspark"."""
 
+    adaptive_verification_cost_scale: float = Field(default=1.0, gt=0.0)
+    """Scale the incremental target-verification cost used by DSpark adaptive
+    verification. Values above 1.0 trim more aggressively; values below 1.0
+    retain more drafts. The unavoidable zero-draft verification cost is not
+    scaled."""
+
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
         """Mean acceptance length to unconditional per-position rates, using
@@ -1551,6 +1557,13 @@ class SpeculativeConfig:
 
         if self.method != "dspark" and self.enable_adaptive_verification:
             raise ValueError("Adaptive verification only supported with DSpark")
+
+        if self.adaptive_verification_cost_scale != 1.0 and (
+            self.method != "dspark" or not self.enable_adaptive_verification
+        ):
+            raise ValueError(
+                "adaptive_verification_cost_scale requires DSpark adaptive verification"
+            )
 
         if (
             self.adaptive_speculative_tokens_initial is not None

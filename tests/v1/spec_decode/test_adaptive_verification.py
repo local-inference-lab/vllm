@@ -35,6 +35,7 @@ def make_manager(
     manager.cost_tables = (np.zeros(num_reqs + 1), verify_cost_ms)
     manager._max_total_logits = 1 << 30
     manager.num_bonus_tokens = 1
+    manager.cost_scale = 1.0
     return manager
 
 
@@ -231,6 +232,18 @@ def test_budget_stops_where_marginal_drafts_stop_paying_for_themselves():
     assert draft_budget == 1
     assert valid_drafts == {"low": 2, "high": 2}
     assert num_non_draft_tokens == {"low": 1, "high": 1}
+
+
+def test_cost_scale_controls_incremental_verification_cost():
+    manager = make_manager(
+        np.array([[0.9, 0.9]], dtype=np.float32),
+        np.array([1.0, 1.0, 1.5, 2.0]),
+    )
+
+    assert manager.get_num_tokens({"low": 3}, {"low": [1, 2]}) == 3
+
+    manager.cost_scale = 3.0
+    assert manager.get_num_tokens({"low": 3}, {"low": [1, 2]}) == 1
 
 
 def test_profiled_batches_seed_cost_curves_via_consumer():

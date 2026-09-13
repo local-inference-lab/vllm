@@ -23,6 +23,38 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 pytestmark = pytest.mark.cpu_test
 
 
+def test_exact_single_request_prefill_descriptor_does_not_pad_other_batches(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform, "get_global_graph_pool", lambda: object()
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils, "is_breakable_cudagraph_enabled", lambda: True
+    )
+    config = _create_vllm_config()
+    manager = gpu_cudagraph_utils.ModelCudaGraphManager(
+        config,
+        torch.device("cpu"),
+        CUDAGraphMode.FULL_AND_PIECEWISE,
+        decode_query_len=1,
+        single_request_prefill_tokens=4096,
+    )
+    manager._graphs_captured = True
+    desc = manager.dispatch(1, 4096, None, 0, max_query_len=4096)
+    assert desc.cg_mode == CUDAGraphMode.PIECEWISE
+    assert desc.num_reqs == 1 and desc.exact_num_tokens
+    for requests, tokens in ((1, 2048), (2, 4096), (1, 4095)):
+        desc = manager.dispatch(requests, tokens, None, 0, max_query_len=tokens)
+        assert desc.cg_mode == CUDAGraphMode.NONE
+    assert manager.dispatch(4, 4, 1, 0, max_query_len=1).cg_mode == CUDAGraphMode.FULL
+
+
 @pytest.fixture(autouse=True)
 def _reset_graph_pool_id():
     pynccl_allocator._graph_pool_id = None
@@ -138,6 +170,7 @@ def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
     with (
         patch.object(gpu_cudagraph_utils, "graph_capture", fake_graph_capture),
         patch.object(gpu_cudagraph_utils, "get_offloader", lambda: fake_offloader),
+        patch.object(gpu_cudagraph_utils.torch.accelerator, "synchronize"),
         patch.object(gpu_cudagraph_utils.torch.cuda, "CUDAGraph"),
         patch.object(
             gpu_cudagraph_utils.torch.cuda,

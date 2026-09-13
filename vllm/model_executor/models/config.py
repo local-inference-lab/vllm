@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 from vllm.utils.math_utils import round_up
@@ -8,7 +8,7 @@ from vllm.utils.math_utils import round_up
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
-    from vllm.config import CacheConfig, ModelConfig, VllmConfig
+    from vllm.config import CacheConfig, ModelConfig, ParallelConfig, VllmConfig
     from vllm.config.cache import MambaDType
 
 
@@ -22,6 +22,12 @@ class VerifyAndUpdateConfig:
 
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+        return
+
+    @staticmethod
+    def update_model_config_for_parallelism(
+        model_config: "ModelConfig", parallel_config: "ParallelConfig"
+    ) -> None:
         return
 
 
@@ -363,6 +369,56 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
                 and quant_config.get("quant_method") == "fp8"
             ):
                 quant_config["quant_method"] = "deepseek_v41_fp8"
+
+    @staticmethod
+    def update_model_config_for_parallelism(
+        model_config: "ModelConfig", parallel_config: "ParallelConfig"
+    ) -> None:
+        text_config = model_config.hf_text_config
+        tp_size = parallel_config.tensor_parallel_size
+        original_heads = getattr(
+            text_config, "original_num_attention_heads", text_config.num_attention_heads
+        )
+        original_groups = getattr(
+            text_config, "original_o_groups", text_config.o_groups
+        )
+        if original_heads % original_groups:
+            raise ValueError(
+                "DeepSeek V4.1 attention heads must be divisible by output groups."
+            )
+
+        padded_groups = round_up(original_groups, tp_size)
+        if padded_groups == original_groups:
+            return
+        padded_heads = padded_groups * (original_heads // original_groups)
+
+        seen: set[int] = set()
+        for config in (
+            model_config.hf_config,
+            model_config.hf_text_config,
+            model_config.model_arch_config,
+        ):
+            if id(config) in seen:
+                continue
+            seen.add(id(config))
+            config_with_originals: Any = config
+            if hasattr(config, "num_attention_heads"):
+                config_with_originals.original_num_attention_heads = original_heads
+                config.num_attention_heads = padded_heads
+            if hasattr(config, "o_groups"):
+                config_with_originals.original_o_groups = original_groups
+                config.o_groups = padded_groups
+
+        model_config.model_arch_config = model_config.get_model_arch_config()
+        logger.warning(
+            "Padded DeepSeek V4.1 attention for TP%d: heads %d -> %d, "
+            "output groups %d -> %d.",
+            tp_size,
+            original_heads,
+            padded_heads,
+            original_groups,
+            padded_groups,
+        )
 
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
