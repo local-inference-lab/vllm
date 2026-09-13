@@ -203,22 +203,23 @@ class DeepseekV4Indexer(nn.Module):
         self.ratio = ratio
 
 
-@torch.library.custom_op("vllm::dsv41_b12x_attention", mutates_args=("out",))
+@torch.library.custom_op("vllm::dsv41_b12x_attention", mutates_args=())
 def _attention(
     hidden: torch.Tensor,
     positions: torch.Tensor,
-    out: torch.Tensor,
     prefix: str,
     global_kv_ready: torch.Tensor | None,
-) -> None:
+) -> torch.Tensor:
     context = get_forward_context()
     layer = context.no_compile_layers[prefix]
-    out.copy_(layer._forward(positions, hidden))
+    # WO projection and TP reduction own this result; it cannot alias the
+    # borrowed attention scratch or the operation's input tensors.
+    return layer._forward(positions, hidden)
 
 
 @_attention.register_fake
-def _attention_fake(hidden, positions, out, prefix, global_kv_ready):
-    return None
+def _attention_fake(hidden, positions, prefix, global_kv_ready):
+    return torch.empty_like(hidden, memory_format=torch.contiguous_format)
 
 
 @torch.library.custom_op("vllm::dsv41_b12x_prepare_global_kv", mutates_args=())
@@ -510,6 +511,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             current_workspace_manager().get_simultaneous(*workspace_specs)
         if self.topk_indices_buffer is None and self.is_index_source:
             self.topk_indices_buffer = alloc((self.capacity, 512), torch.int32)
+        self._short_index_plan = None
         if self.indexer is not None:
             self._index_pages = alloc((c, self._index_width), torch.int32)
             self._active = torch.full(
@@ -542,6 +544,31 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 )
                 self._index_plans[mode] = plan
                 _scratch(plan)
+            if (
+                not self.is_ced_decoder
+                and self.capacity > c
+                and self.layer_id < self.candidate_source_layer
+            ):
+                # Short full scans need only the leading logical page columns.
+                # Bound score scratch independently of the model context limit.
+                short_rows = min(1024, self.capacity)
+                short_width = min(
+                    self._index_width, triton.cdiv(16384, self._index_page)
+                )
+                self._short_index_plan = dsa_indexer.plan(
+                    dsa_indexer.Caps(
+                        device=device,
+                        num_q_heads=h,
+                        max_q_rows=short_rows,
+                        max_page_table_width=short_width,
+                        topk=512,
+                        mode="prefill",
+                        cache_format="mxfp4",
+                        page_size=self._index_page,
+                    )
+                )
+                self._short_index_pages = alloc((short_rows, short_width), torch.int32)
+                _scratch(self._short_index_plan)
             if self.layer_id == self.candidate_source_layer:
                 self._candidates = alloc((self.capacity, 16384), torch.int32)
                 self._candidate_lens = alloc((self.capacity,), torch.int32)
@@ -619,11 +646,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
     def forward(
         self, positions, hidden_states, llama_4_scaling=None, *, global_kv_ready=None
     ):
-        out = torch.empty_like(hidden_states)
         if hidden_states.shape[0] == 0:
-            return out
-        _attention(hidden_states, positions, out, self.prefix, global_kv_ready)
-        return out
+            return torch.empty_like(hidden_states)
+        return _attention(hidden_states, positions, self.prefix, global_kv_ready)
 
     def _forward(self, positions, hidden_states):
         self._prepare(hidden_states.device)
@@ -706,17 +731,28 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     max(1, triton.cdiv(im.max_seq_len, self.compress_ratio)),
                 )
             chunk_rows = self.DECODE_CHUNK if mode == "decode" else self.INDEX_CHUNK
+            index_pages = self._index_pages
+            if (
+                mode == "extend"
+                and score_width is not None
+                and score_width <= 16384
+                and self._short_index_plan is not None
+            ):
+                index_plan = self._short_index_plan
+                chunk_rows = index_plan.caps.max_q_rows
+                index_pages = self._short_index_pages
+            index_width = index_plan.caps.max_page_table_width
             for offset in range(0, rows, chunk_rows):
                 end = min(offset + chunk_rows, rows)
                 count = end - offset
-                _pages[(count, triton.cdiv(self._index_width, 128))](
+                _pages[(count, triton.cdiv(index_width, 128))](
                     im.req_id_per_token,
                     im.block_table,
-                    self._index_pages,
+                    index_pages,
                     offset,
                     im.block_table.stride(0),
-                    im.block_table.shape[1],
-                    self._index_width,
+                    min(im.block_table.shape[1], index_width),
+                    index_width,
                     128,
                 )
                 candidate_args = {}
@@ -741,7 +777,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     q_scales=iq_scale[offset:end],
                     query_weights=iw[offset:end],
                     index_k_cache=self.indexer.k_cache.kv_cache,
-                    page_table=self._index_pages[:count],
+                    page_table=index_pages[:count],
                     cache_lengths=im.cache_lengths[offset:end],
                     active_width=self._active,
                     score_width=score_width,

@@ -15,6 +15,167 @@ from torch import nn
 from vllm.models.deepseek_v4_1.nvidia import model as native
 
 
+@pytest.mark.parametrize("rows", [1, 8, 19])
+@pytest.mark.parametrize("strided", [False, True])
+def test_attention_returns_owned_projection_without_copy(monkeypatch, rows, strided):
+    """The opaque wrapper preserves result ownership and reads each live input."""
+    from vllm.models.deepseek_v4_1 import attention
+
+    results = []
+
+    def project(positions, hidden):
+        output = (hidden.float() * 0.25 + positions[:, None] * 0.5).to(hidden.dtype)
+        results.append(output)
+        return output
+
+    layer = SimpleNamespace(prefix="owned_projection", _forward=project)
+    monkeypatch.setattr(
+        attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(no_compile_layers={layer.prefix: layer}),
+    )
+    hidden = torch.arange(rows * 32, dtype=torch.bfloat16).reshape(rows, 32)
+    if strided:
+        hidden = hidden[:, ::2]
+    positions = torch.arange(rows, dtype=torch.int64)
+    ready = torch.ones(1, dtype=torch.uint8)
+    saved_hidden = hidden.clone()
+    first = attention.DeepseekV4Attention.forward(
+        layer, positions, hidden, global_kv_ready=ready
+    )
+    assert first.data_ptr() == results[-1].data_ptr()
+    assert first.data_ptr() != hidden.data_ptr()
+    torch.testing.assert_close(hidden, saved_hidden, rtol=0, atol=0)
+    saved_first = first.clone()
+    hidden.add_(4)
+    second = attention.DeepseekV4Attention.forward(
+        layer, positions, hidden, global_kv_ready=ready
+    )
+    assert second.data_ptr() == results[-1].data_ptr()
+    assert second.data_ptr() != first.data_ptr()
+    torch.testing.assert_close(first, saved_first, rtol=0, atol=0)
+    torch.testing.assert_close(
+        second,
+        (hidden.float() * 0.25 + positions[:, None] * 0.5).to(hidden.dtype),
+        rtol=0,
+        atol=0,
+    )
+    checks = torch.library.opcheck(
+        attention._attention, (hidden, positions, layer.prefix, ready)
+    )
+    assert all(value == "SUCCESS" for value in checks.values()), checks
+
+
+def test_attention_empty_batch_does_not_enter_cache_or_collectives():
+    from vllm.models.deepseek_v4_1 import attention
+
+    hidden = torch.empty((0, 32), dtype=torch.bfloat16)
+    output = attention.DeepseekV4Attention.forward(
+        SimpleNamespace(), torch.empty(0, dtype=torch.int64), hidden
+    )
+    assert output.shape == hidden.shape
+    assert output.dtype == hidden.dtype
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph requires a GPU")
+def test_attention_owned_output_graph_reads_live_inputs(monkeypatch):
+    from vllm.models.deepseek_v4_1 import attention
+
+    def project(positions, hidden):
+        return (hidden.float() * 0.25 + positions[:, None] * 0.5).to(hidden.dtype)
+
+    layer = SimpleNamespace(prefix="graph_projection", _forward=project)
+    monkeypatch.setattr(
+        attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(no_compile_layers={layer.prefix: layer}),
+    )
+    for rows in (1, 8, 19):
+        hidden = torch.arange(rows * 32, dtype=torch.bfloat16, device="cuda").reshape(
+            rows, 32
+        )
+        positions = torch.arange(rows, dtype=torch.int64, device="cuda")
+        for _ in range(3):
+            attention.DeepseekV4Attention.forward(layer, positions, hidden)
+        torch.accelerator.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = attention.DeepseekV4Attention.forward(layer, positions, hidden)
+        assert output.data_ptr() != hidden.data_ptr()
+        output_pointer = output.data_ptr()
+        for _ in range(3):
+            hidden.add_(4)
+            positions.add_(1)
+            graph.replay()
+            torch.testing.assert_close(
+                output, project(positions, hidden), rtol=0, atol=0
+            )
+            assert output.data_ptr() == output_pointer
+
+
+@pytest.mark.parametrize("ced", [False, True])
+@pytest.mark.parametrize("context", [32768, 131072, 1048576])
+def test_indexer_short_scan_reservation_preserves_long_scan_and_decode(
+    monkeypatch, ced, context
+):
+    from vllm.models.deepseek_v4_1 import attention
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        attention.mla,
+        "plan",
+        lambda caps: SimpleNamespace(
+            caps=caps,
+            shapes_and_dtypes=lambda: (),
+        ),
+    )
+    monkeypatch.setattr(
+        attention.dsa_indexer, "plan", lambda caps: SimpleNamespace(caps=caps)
+    )
+    monkeypatch.setattr(attention, "_scratch", lambda plan: None)
+    monkeypatch.setattr(
+        attention,
+        "current_workspace_manager",
+        lambda: SimpleNamespace(
+            get_simultaneous=lambda *specs: None,
+        ),
+    )
+    state = SimpleNamespace(
+        _ready=False,
+        INDEX_CHUNK=256,
+        DECODE_CHUNK=64,
+        config=SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=256),
+            speculative_config=None,
+            scheduler_config=SimpleNamespace(max_num_seqs=4),
+            compilation_config=SimpleNamespace(max_cudagraph_capture_size=128),
+        ),
+        max_model_len=context,
+        compress_ratio=2,
+        capacity=4096,
+        n_local_heads=16,
+        swa_width=128,
+        is_ced_decoder=ced,
+        layer_id=2,
+        candidate_source_layer=20,
+        topk_indices_buffer=None,
+        is_index_source=True,
+        indexer=SimpleNamespace(heads=32),
+        compressor=None,
+    )
+    attention.DeepseekV4Attention._prepare(state, torch.device("cpu"))
+    assert state._index_plans["decode"].caps.max_q_rows == 64
+    assert state._index_plans["prefill"].caps.max_q_rows == 256
+    assert state._index_plans["prefill"].caps.max_page_table_width == context // 256
+    if ced:
+        assert state._short_index_plan is None
+    else:
+        caps = state._short_index_plan.caps
+        assert caps.max_q_rows == 1024
+        assert caps.max_page_table_width * caps.page_size == 16384
+        assert state._short_index_pages.shape == (1024, 128)
+
+
 def _gather(source, indices):
     result = source[indices.clamp_min(0)].clone()
     result[indices < 0] = 0
