@@ -1,0 +1,48 @@
+name: Jovian Judgement wheel release
+
+on:
+  push:
+    branches:
+      - dev/jovian-judgement
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: jovian-judgement-wheel-release
+  cancel-in-progress: true
+
+jobs:
+  build-and-publish:
+    if: github.repository == 'local-inference-lab/vllm'
+    runs-on: [self-hosted, linux, x64, lil-wheel-builder]
+    timeout-minutes: 360
+    steps:
+      - name: Check out the exact vLLM commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Build and verify the application wheel bundle
+        run: tools/jovian_wheel_release/build_bundle.sh
+
+      - name: Publish the source-pair-addressed prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          manifest=dist/jovian-wheel-release/bundle/manifest.json
+          b12x_commit=$(jq -r '.source.b12x.commit' "${manifest}")
+          tag="jovian-wheels-${GITHUB_SHA}-b12x-${b12x_commit}"
+          archive="dist/jovian-wheel-release/jovian-judgement-wheels-${GITHUB_SHA}-b12x-${b12x_commit}.tar.zst"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            echo "Immutable release ${tag} already exists; no assets were replaced."
+          else
+            gh release create "${tag}" \
+              --target "${GITHUB_SHA}" \
+              --prerelease \
+              --title "Jovian Judgement wheels ${GITHUB_SHA:0:12} / B12X ${b12x_commit:0:12}" \
+              --notes-file dist/jovian-wheel-release/release-notes.md \
+              "${archive}" "${archive}.sha256" \
+              "${manifest}"
+          fi
