@@ -321,6 +321,38 @@ def test_glm5next_mtp_prepares_configured_draft_head(monkeypatch) -> None:
     assert predictor.quantized_draft_head is quantized_head
 
 
+@pytest.mark.parametrize("runtime_quantization", [None, "nvfp4", "mxfp8"])
+def test_glm5next_mtp_registers_b12x_draft_heads(
+    monkeypatch, runtime_quantization: str | None
+) -> None:
+    class PreparationRecorder:
+        def __init__(self) -> None:
+            self.heads = []
+
+        def prepare_b12x_vocab_projection(self, head) -> None:
+            if getattr(head, "runtime_lm_head_quantization", None) is None:
+                self.heads.append(head)
+
+    predictor = Glm5NextMultiTokenPredictor.__new__(Glm5NextMultiTokenPredictor)
+    torch.nn.Module.__init__(predictor)
+    heads = [torch.nn.Linear(4, 8, bias=False) for _ in range(2)]
+    for head in heads:
+        head.runtime_lm_head_quantization = runtime_quantization
+    predictor._mtp_layers = [
+        SimpleNamespace(shared_head=SimpleNamespace(head=head)) for head in heads
+    ]
+    predictor.logits_processor = PreparationRecorder()
+    predictor.quantized_draft_head = None
+    monkeypatch.setattr(glm5next_mtp, "make_quantized_draft_head", lambda _: None)
+
+    predictor.prepare_draft_lm_head(
+        SimpleNamespace(runtime_lm_head_quantization=runtime_quantization)
+    )
+
+    expected = [] if runtime_quantization in ("nvfp4", "mxfp8") else heads
+    assert predictor.logits_processor.heads == expected
+
+
 def test_glm5next_mtp_preserves_position_zero_embedding() -> None:
     class CaptureProjection(torch.nn.Module):
         def __init__(self) -> None:

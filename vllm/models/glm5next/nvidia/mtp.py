@@ -157,6 +157,10 @@ class Glm5NextMultiTokenPredictor(nn.Module):
             self.quantized_draft_head = None
             return
         self.quantized_draft_head = make_quantized_draft_head(source_head)
+        for layer in getattr(self, "_mtp_layers", ()):
+            self.logits_processor.prepare_b12x_vocab_projection(
+                layer.shared_head.head
+            )
 
     def update_max_model_len(self, max_model_len: int) -> None:
         for module in self.modules():
