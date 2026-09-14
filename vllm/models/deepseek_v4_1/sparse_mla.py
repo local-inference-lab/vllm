@@ -7,6 +7,7 @@ from typing import ClassVar
 
 import torch
 
+from vllm.config import CacheConfig
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -271,7 +272,7 @@ class DeepseekV41B12xBackend(AttentionBackend):
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size):
-        return 128
+        return CacheConfig.DEFAULT_DS41_BLOCK_SIZE
 
     @classmethod
     def get_supported_head_sizes(cls):

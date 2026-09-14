@@ -2816,7 +2816,12 @@ class VllmConfig:
                     "--swa-block-size is only supported by native DeepSeek V4.1 B12X"
                 )
             return self
-        swa_block_size = cache_config.swa_block_size or 64
+        # Resolve before model construction: cache layers retain their page sizes.
+        if not cache_config.user_specified_block_size:
+            cache_config.block_size = CacheConfig.DEFAULT_DS41_BLOCK_SIZE
+        swa_block_size = (
+            cache_config.swa_block_size or CacheConfig.DEFAULT_DS41_SWA_BLOCK_SIZE
+        )
         prefix_unit = cache_config.prefix_match_unit
         if (
             cache_config.enable_prefix_caching
@@ -2826,6 +2831,16 @@ class VllmConfig:
             raise ValueError(
                 f"SWA block size ({swa_block_size}) must be divisible by "
                 f"--prefix-match-unit ({prefix_unit})"
+            )
+        if (cache_config.block_size, swa_block_size) not in ((128, 64), (256, 128)):
+            logger.warning_once(
+                "DeepSeek V4.1 cache geometry is %d/%d (main/SWA). "
+                "This is outside the recommended 256/128 and 128/64 layouts "
+                "and may waste KV cache capacity. Consider --block-size 256 "
+                "--swa-block-size 128, or --block-size 128 --swa-block-size 64. "
+                "The configured sizes are preserved.",
+                cache_config.block_size,
+                swa_block_size,
             )
         return self
 

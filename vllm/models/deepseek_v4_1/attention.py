@@ -16,6 +16,7 @@ from b12x.gemm import wo_projection
 from torch import nn
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -98,7 +99,8 @@ class _Cache(nn.Module, AttentionLayerBase):
         self.prefix, self.kind, self.ratio, self.window = prefix, kind, ratio, window
         self.draft = draft
         self.block_size = (
-            config.cache_config.swa_block_size or 64
+            config.cache_config.swa_block_size
+            or CacheConfig.DEFAULT_DS41_SWA_BLOCK_SIZE
             if kind == "swa"
             else config.cache_config.block_size
         )

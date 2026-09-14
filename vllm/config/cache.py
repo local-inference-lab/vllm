@@ -79,13 +79,17 @@ class CacheConfig:
     """Configuration for the KV cache."""
 
     DEFAULT_BLOCK_SIZE: ClassVar[int] = 16
+    DEFAULT_DS41_BLOCK_SIZE: ClassVar[int] = 256
+    DEFAULT_DS41_SWA_BLOCK_SIZE: ClassVar[int] = 128
 
     block_size: int = Field(default=None, gt=0)  # type: ignore[assignment]
     """Size of a contiguous cache block in number of tokens.
     Accepts None (meaning "use default"). After construction, always int."""
     swa_block_size: Literal[32, 64, 128] | None = None
     """Tokens per sliding-window cache page for native DeepSeek V4.1 B12X.
-    None uses 64 tokens. Independent of the logical attention window and
+    None uses 128 tokens, paired with the native 256-token main-page default.
+    Use --block-size 128 --swa-block-size 64 to retain 128/64 geometry.
+    Independent of the logical attention window and
     the main/index cache's block_size. Requires a server restart; supported
     values are 32, 64 and 128. Other models do not support this override."""
     user_specified_block_size: bool = field(default=False, init=False)
