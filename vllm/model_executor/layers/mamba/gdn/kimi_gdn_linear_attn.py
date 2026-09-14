@@ -618,15 +618,41 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             torch.zeros((max_tokens, 3 * width), dtype=self.model_config.dtype, device=device),
             persistent=False,
         )
-        # A full-rank gate arrives as one value per head dimension.
-        raw_g_shape = (
-            (max_tokens, self.local_num_heads, self.head_dim)
+        # KDA consumes one forget-gate value per head dimension in either gate
+        # mode. Keep beta's row stride equal to its fused-projection view.
+        raw_beta_row_width = (
+            4 * self.local_projection_size
+            + self.head_dim
+            + self.local_num_heads
+            + self.in_proj_padding
             if self.use_full_rank_gate
-            else (max_tokens, self.local_num_heads)
+            else 3 * self.local_projection_size
+            + self.local_num_heads
+            + self.head_dim
+        )
+        raw_beta_offset = (
+            4 * self.local_projection_size + self.head_dim
+            if self.use_full_rank_gate
+            else 3 * self.local_projection_size
+        )
+        self.register_buffer(
+            "_b12x_kda_raw_beta_storage",
+            torch.zeros(
+                (max_tokens, raw_beta_row_width),
+                dtype=self.model_config.dtype,
+                device=device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_kda_raw_beta",
+            self._b12x_kda_raw_beta_storage.narrow(
+                1, raw_beta_offset, self.local_num_heads
+            ),
+            persistent=False,
         )
         for name, shape in (
-            ("_b12x_kda_raw_g", raw_g_shape),
-            ("_b12x_kda_raw_beta", (max_tokens, self.local_num_heads)),
+            ("_b12x_kda_raw_g", (max_tokens, self.local_num_heads, self.head_dim)),
             ("_b12x_kda_z", (max_tokens, self.local_num_heads, self.head_dim)),
             ("_b12x_kda_output", (max_tokens, self.local_num_heads, self.head_dim)),
         ):

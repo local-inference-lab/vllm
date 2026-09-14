@@ -1593,6 +1593,64 @@ def test_glm5next_b12x_kda_plan_reserves_null_state_zero(monkeypatch) -> None:
     assert captured_caps["null_state_index"] == 0
 
 
+@pytest.mark.parametrize("use_full_rank_gate", [False, True])
+def test_b12x_kda_decode_buffers_match_live_gate_layout(
+    monkeypatch, use_full_rank_gate: bool
+) -> None:
+    class FakeApi:
+        bind_kda = run_kda = object()
+
+        @staticmethod
+        def is_supported(device):
+            return True
+
+    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    layer.enable_b12x_kda_decode = True
+    layer.gate_lower_bound = -5.0
+    layer.head_dim = 128
+    layer.local_num_heads = 16
+    layer.local_projection_size = 16 * 128
+    layer.use_full_rank_gate = use_full_rank_gate
+    layer.in_proj_padding = 0
+    layer.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    layer.num_spec = 0
+    layer._b12x_kda_api = None
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=16),
+    )
+    monkeypatch.setattr(kimi_gdn_linear_attn, "get_b12x_gdn_decode", lambda: FakeApi())
+    monkeypatch.setattr(
+        kimi_gdn_linear_attn,
+        "current_platform",
+        SimpleNamespace(current_device=lambda: "cpu", is_cuda=lambda: True),
+    )
+    monkeypatch.setattr(
+        KimiGatedDeltaNetAttention,
+        "get_state_dtype",
+        lambda self: (torch.bfloat16, torch.float32),
+    )
+
+    layer._initialize_b12x_kda_decode(vllm_config)
+
+    assert layer._b12x_kda_raw_g.shape == (16, 16, 128)
+    live_width = (
+        4 * layer.local_projection_size + layer.head_dim + layer.local_num_heads
+        if use_full_rank_gate
+        else 3 * layer.local_projection_size + layer.local_num_heads + layer.head_dim
+    )
+    beta_offset = (
+        4 * layer.local_projection_size + layer.head_dim
+        if use_full_rank_gate
+        else 3 * layer.local_projection_size
+    )
+    live_beta = torch.empty(16, live_width).narrow(
+        1, beta_offset, layer.local_num_heads
+    )
+    assert layer._b12x_kda_raw_beta.shape == live_beta.shape
+    assert layer._b12x_kda_raw_beta.stride() == live_beta.stride()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("tokens", [3, 12])
 def test_glm_adaptive_kda_graph_matches_independent_request_states(monkeypatch, tokens):
