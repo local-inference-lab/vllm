@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from contextlib import contextmanager
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -76,7 +77,8 @@ class B12xRoceAllReduce:
         self._announced = False
         self._announced_gather = False
         self.global_ranks = tuple(
-            int(rank) for rank in (
+            int(rank)
+            for rank in (
                 global_ranks if global_ranks is not None else range(self.world_size)
             )
         )
@@ -187,6 +189,7 @@ class B12xRoceAllReduce:
                 + ")"
             )
         return None
+
     def _request_name(self) -> str:
         ranks = "-".join(map(str, self.global_ranks))
         return f"distributed.roce.{ranks}.collectives"
@@ -219,7 +222,9 @@ class B12xRoceAllReduce:
                 torch.zeros(16 // dtype.itemsize, dtype=dtype, device=self.device)
                 for dtype in (torch.float16, torch.bfloat16, torch.float32)
             ]
-            calls = [_preparation.prepared_call(state, inp=buffer) for buffer in buffers]
+            calls = [
+                _preparation.prepared_call(state, inp=buffer) for buffer in buffers
+            ]
             gather = _preparation.prepared_gather_call(state, inp=buffers[1])
             return calls[0].__class__(
                 run=lambda: [call.run() for call in (*calls, gather)],
@@ -256,6 +261,19 @@ class B12xRoceAllReduce:
         if not self.disabled and self._runtime is not None:
             self._runtime.check_health()
 
+    def stats(self) -> dict[str, Any]:
+        """Runtime counters for probes that must attribute RDMA traffic.
+
+        Returns:
+            The runtime's counters, including ``epoch``, ``ops_posted``,
+            ``writes_completed`` and ``bytes_posted_per_hca``; an empty mapping
+            when RoCEnante is disabled or its runtime is gone, so a probe never
+            reaches into the adapter's internals.
+        """
+        if self.disabled or self._runtime is None:
+            return {}
+        return self._runtime.stats()
+
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         return not self.disabled and self._runtime.should_allreduce(inp)
 
@@ -291,9 +309,7 @@ class B12xRoceAllReduce:
                 str(inp.dtype).replace("torch.", ""),
                 dim,
             )
-        return self._runtime.all_gather(
-            inp, dim=dim, plan=self._prepared_plan()
-        )
+        return self._runtime.all_gather(inp, dim=dim, plan=self._prepared_plan())
 
     def supports_fused_add_rms_norm(self) -> bool:
         return False
