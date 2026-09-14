@@ -203,6 +203,22 @@ allocation-stable graph replays, byte-exact against both native pull and an
 independent same-order FP32 sum. No serving speedup is claimed before baking
 and measuring this identical source.
 
+The p19 image includes both posted-write controls and serves successfully.
+One20-second LIL C1 cell measures138.441 tok/s,61.018 verifier steps/s and
+effective acceptance2.269, zero errors. p18 measured123.472/55.260; this is
+not a repeated-median or matched DCP1 speed claim. The same seeded prompt
+passes (finish=stop); the bounded capture contains two6-row target steps.
+Plain-allreduce medians across ranks fall from47.8-56.2us to14.1-21.5us.
+A12.290ms first-collective outlier on rank0 coincides with the other ranks
+entering that first profiled step approximately12ms later. Profiler-entry
+skew is a plausible explanation, not proof of production tail stability.
+The hybrid logical KV pool reports7,724,715 tokens, rank0 budget9.85 GiB.
+No new prefill/quality/context sweep was run for this decode-only change.
+The expanded four-rank oracle also passes mixed small-push/large-pull
+declarations sharing each runtime's graph slots/epochs: exact reference
+outputs and three poisoned/mutated, allocation-stable replays. This targeted
+serving invariant is not a full-model quality or long-running stability pass.
+
 TP4/DCP4, 540672 context, 4096 batch budget, max-seqs 4, main/SWA pages 256/128,
 SSD Engram, native prefix caching, decode graphs enabled, prefill graphs off.
 Initial full-model bring-up disabled speculation to isolate native correctness;

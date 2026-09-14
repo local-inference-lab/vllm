@@ -26,6 +26,7 @@ def check_tp_plain_push(device, session, coordinator):
 
     rank = dist.get_rank()
     cases, runtimes, requests = [], [], []
+    shapes = ((1, 5120), (6, 5120), (8, 1280), (12, 1280))
     for push in (False, True):
         os.environ["B12X_PCIE_TP4_REMOTE_PUSH"] = "1" if push else "0"
         runtime = pcie.OneshotAllReduce.from_process_group(
@@ -33,7 +34,7 @@ def check_tp_plain_push(device, session, coordinator):
             max_input_bytes=84 * 1024, rank_data_bytes=64 * 1024,
         )
         runtimes.append(runtime)
-        for rows, hidden in ((1, 5120), (6, 5120), (8, 1280)):
+        for rows, hidden in shapes:
             torch.manual_seed(927 + rank)
             inp = (torch.randn(rows, hidden, device=device) * 0.125).bfloat16()
             inp.mul_((1e-3, 1.0, 1e3, 1e-6)[rank])
@@ -41,7 +42,8 @@ def check_tp_plain_push(device, session, coordinator):
             query = pcie.query_from_runtime(
                 runtime, surface="OneshotAllReduce.all_reduce", call={"inp": inp},
             )
-            assert query.call["transport"] == ("tp4_remote_push" if push else "pull")
+            expected_route = "tp4_remote_push" if push and rows <= 8 else "pull"
+            assert query.call["transport"] == expected_route
             plan = pcie.plan(query, runtime=runtime)
             requests.append(plan.request(
                 name=f"oracle.tp4.{push}.{rows}.{hidden}",
@@ -56,7 +58,7 @@ def check_tp_plain_push(device, session, coordinator):
     session.prepare(requests, coordinator=coordinator)
 
     def check_pair(index):
-        pull, push = cases[index], cases[index + 3]
+        pull, push = cases[index], cases[index + len(shapes)]
         torch.testing.assert_close(push[3], pull[3], rtol=0, atol=0)
         peers = [None] * 4
         dist.all_gather_object(peers, push[2].cpu())
@@ -67,24 +69,28 @@ def check_tp_plain_push(device, session, coordinator):
         assert push[3].abs().sum() > 0
 
     with session.capture():
-        for index in range(3):
-            for runtime, plan, inp, out in (cases[index], cases[index + 3]):
+        for index in range(len(shapes)):
+            for runtime, plan, inp, out in (cases[index], cases[index + len(shapes)]):
                 runtime.all_reduce(inp, out=out, plan=plan)
             torch.cuda.synchronize()
             check_pair(index)
         graph = torch.cuda.CUDAGraph()
+        # The real TP channel mixes small push and larger pull declarations.
+        # They must safely alternate the same IPC slots and graph epoch.
+        graph_cases = [cases[index] for index in (1, 5, 3, 7)]
         with torch.cuda.graph(graph):
-            for runtime, plan, inp, out in (cases[1], cases[4]):
+            for runtime, plan, inp, out in graph_cases:
                 runtime.all_reduce(inp, out=out, plan=plan)
         allocated = torch.cuda.memory_allocated(device)
         for _ in range(3):
-            for _, _, inp, out in (cases[1], cases[4]):
+            for _, _, inp, out in graph_cases:
                 inp.add_(0.125)
                 out.zero_()
             graph.replay()
             torch.cuda.synchronize()
             assert torch.cuda.memory_allocated(device) == allocated
             check_pair(1)
+            check_pair(3)
         graph.reset()
     for _, plan, _, _ in cases:
         session.release(plan)
