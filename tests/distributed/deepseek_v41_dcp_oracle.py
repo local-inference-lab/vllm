@@ -163,6 +163,45 @@ def main():
         ).bfloat16()
         source.add_(rank / 8)
         gathered = torch.empty(rows, heads, 512, device=device, dtype=torch.bfloat16)
+        if "--head-gather-only" in sys.argv:
+            # Changed wire contract only: no model weights or multi-GiB KV pool.
+            assert exchange.plans["all_gather_heads"].query.call["peer_write"] == (
+                os.getenv("B12X_PCIE_DCP_HEAD_GATHER_PUSH", "0") == "1"
+            )
+            with session.capture():
+                for live in (1, 6, rows):
+                    source.add_(0.125)
+                    exchange.gather(source[:live], gathered[:live])
+                    torch.cuda.synchronize()
+                    peers = [None] * world
+                    dist.all_gather_object(peers, source[:live].cpu())
+                    torch.testing.assert_close(
+                        gathered[:live].cpu(), torch.cat(peers, dim=1), rtol=0, atol=0
+                    )
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    exchange.gather(source[:6], gathered[:6])
+                allocated = torch.cuda.memory_allocated(device)
+                output_ptr = gathered.data_ptr()
+                for _ in range(3):
+                    source.add_(0.25)
+                    gathered.zero_()
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    assert torch.cuda.memory_allocated(device) == allocated
+                    assert gathered.data_ptr() == output_ptr
+                    peers = [None] * world
+                    dist.all_gather_object(peers, source[:6].cpu())
+                    torch.testing.assert_close(
+                        gathered[:6].cpu(), torch.cat(peers, dim=1), rtol=0, atol=0
+                    )
+                graph.reset()
+            for plan in exchange.plans.values():
+                session.release(plan)
+            exchange.runtime.close()
+            dist.destroy_process_group()
+            print(f"rank={rank} head gather live-rows/mutation/frozen-graphs PASS", flush=True)
+            return
         exchange.gather(source, gathered)
         peers = [None] * world
         dist.all_gather_object(peers, source.cpu())

@@ -162,10 +162,29 @@ is added after p15 rejected vLLM's preparation-to-profiling transition.
 The handoff oracle and four attention/workspace declaration cases pass in p16.
 p16 then rejected an incorrect FrozenMapping constructor in the shared-output
 wrapper before model profiling. Its mapping-form correction passes one CPU-only
-constructor/residency regression before loading weights. Full-model serving
-qualification is still pending for the corrected wrapper.
-Serving performance is pending. This is not yet a production-qualified
-optimization.
+constructor/residency regression before loading weights. The corrected p17
+image is healthy on cn4. Two uncached32770-token LIL samples measured6963
+client /7084 server tok/s, TTFT4.706s, versus the p13 single sample1743/1751
+and18.801s. A focused full-history prefix probe returned the final record:
+cold4.102s/cached0, warm0.869s/27648 cached of28724 prompt tokens. One20-second
+C1 cell measured111.131 tok/s,59.8 verifier steps/s and acceptance1.866;
+decode has not established a gain. These are not matched current-dev DCP1
+comparisons or full-model/long-range production qualification.
+
+The p17 bounded trace contains initial67-token prefill plus one6-row decode
+step. The decode timestamp window includes draft/sampling tails, not exact
+CPU/GPU phase correlation. Each rank has38 native head gathers (~3ms summed)
+and88 oneshot all-reduces (~4.6-6.6ms). Target/draft graphs are active. Active
+PCIe links remain Gen4x16 at existing300 W limits; idle Gen1 is normal.
+
+B12X offers an experimental opt-in posted-write head gather using the same
+global-head output layout, IPC slab, per-CTA system barrier and graph epoch.
+The declaration captures the transport mode; bind/replay does not read an
+environment variable. Incoming loads bypass L1. The default remains pull.
+The bounded head-gather-only oracle passes exact bytes at live1/6/32 rows
+and three allocation-stable graph replays with mutated inputs and poisoned
+outputs. Its plan-time CPU guard passes freezing and unsupported-geometry
+rejection. This does not establish a serving speed gain.
 
 TP4/DCP4, 540672 context, 4096 batch budget, max-seqs 4, main/SWA pages 256/128,
 SSD Engram, native prefix caching, decode graphs enabled, prefill graphs off.
