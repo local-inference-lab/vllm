@@ -387,7 +387,8 @@ class Glm5NextPooledIndexer(nn.Module):
         self._main_cache_num_blocks = int(main_cache.shape[0])
         self.indexer_op.set_b12x_index_cache(
             index_cache,
-            num_q_heads=16,
+            num_q_heads=_INDEX_HEADS,
+            max_page_table_width=pool_table_width,
             score_output=self.dcp_world_size > 1,
         )
         self.block_size = block_size
@@ -597,17 +598,8 @@ class Glm5NextPooledIndexer(nn.Module):
                 row_end = row_start + int(query_len)
                 request = num_decodes + local_request
                 if self.dcp_world_size == 1:
-                    active_pages = self._active_index_page_count(
-                        int(request_seq_lens_cpu[local_request])
-                    )
-                    if active_pages > int(self._pool_block_table.shape[1]):
-                        raise RuntimeError(
-                            "GLM selector visible C4 pages exceed table capacity: "
-                            f"active={active_pages}, "
-                            f"capacity={int(self._pool_block_table.shape[1])}"
-                        )
                     request_table = self._pool_block_table[
-                        request : request + 1, :active_pages
+                        request : request + 1
                     ]
                 else:
                     # DCP pool ownership is interleaved across ranks, so a global

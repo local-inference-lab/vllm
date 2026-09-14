@@ -740,8 +740,13 @@ def test_glm53_decode_table_capacity_uses_batched_token_limit() -> None:
     indexer.max_seqs = 16
     indexer.max_model_len = 4096
     indexer.dcp_world_size = 1
+    published = {}
+
+    def publish(*args, **kwargs):
+        published.update(kwargs)
+
     indexer.indexer_op = SimpleNamespace(
-        max_model_len=4096 // 4, set_b12x_index_cache=lambda *args, **kwargs: None
+        max_model_len=4096 // 4, set_b12x_index_cache=publish
     )
 
     indexer.bind_main_kv_cache(main)
@@ -749,6 +754,42 @@ def test_glm53_decode_table_capacity_uses_batched_token_limit() -> None:
     assert indexer._decode_block_table.shape[0] == indexer.max_tokens
     assert indexer._decode_block_table.shape[0] > indexer.max_seqs * (5 + 1)
     assert indexer.indexer_op.max_model_len == 4096 // 4
+    assert published["num_q_heads"] == 32
+    assert published["max_page_table_width"] == indexer._pool_block_table.shape[1]
+
+
+def test_b12x_c4_declaration_matches_glm_query_and_page_table_layout() -> None:
+    from vllm.models.deepseek_v4.nvidia import b12x_indexer as c4
+
+    indexer = c4.B12xC4SparseIndexer.__new__(c4.B12xC4SparseIndexer)
+    nn.Module.__init__(indexer)
+    indexer._index_num_q_heads = 32
+    indexer._index_max_page_table_width = 4104
+    indexer._index_cache = torch.empty((1, 64, 132), dtype=torch.uint8)
+    indexer.topk_tokens = 512
+    fake_module = SimpleNamespace(
+        invocation_from_descriptors=lambda caps, operands: operands
+    )
+    indexer._b12x_indexer = fake_module
+    caps = SimpleNamespace(
+        max_q_rows=8192, max_page_table_width=4104, num_q_heads=32, mode="prefill"
+    )
+
+    invocation = indexer._invocation(caps, scores=False)
+
+    assert invocation["q_fp8"]["shape"][1:] == (32, 128)
+    assert invocation["page_table"]["shape"] == (8192, 4104)
+    assert invocation["page_table"]["strides"] == (0, 1)
+
+
+def test_deepseek_c4_default_page_table_width_is_unchanged() -> None:
+    from vllm.models.deepseek_v4.nvidia import b12x_indexer as c4
+
+    indexer = c4.B12xC4SparseIndexer.__new__(c4.B12xC4SparseIndexer)
+    indexer.max_model_len = 262_144
+    indexer._index_max_page_table_width = None
+
+    assert indexer._max_page_table_width == 4096
 
 
 def test_glm53_selector_capacity_tracks_auto_fit_max_model_len() -> None:
