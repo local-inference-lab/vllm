@@ -154,7 +154,6 @@ def _require_b12x_indexer() -> Any:
         "bind",
         "plan",
         "run",
-        "scratch_specs",
     ):
         getattr(module, name)
     return module
@@ -186,7 +185,7 @@ def _flatten_index_cache(kv_cache: torch.Tensor) -> torch.Tensor:
 def _run_paged_topk(
     *,
     module: Any,
-    plan: object,
+    plan: Any,
     q: torch.Tensor,
     weights: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -199,7 +198,7 @@ def _run_paged_topk(
     if active_width is None:
         raise RuntimeError("B12X DSA requires a device active-width scalar.")
     scratch = current_workspace_manager().get_simultaneous(
-        *((spec.shape, spec.dtype) for spec in module.scratch_specs(plan, device=q.device))
+        *((spec.shape, spec.dtype) for spec in plan.scratch_specs())
     )
     binding = module.bind(
         plan,

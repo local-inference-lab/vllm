@@ -111,7 +111,6 @@ def _require_b12x_indexer() -> Any:
         "bind",
         "plan",
         "run",
-        "scratch_specs",
     ):
         getattr(module, name)
     return module
@@ -156,7 +155,7 @@ def _assert_prefill_route(obj: object) -> None:
 def _run_paged_topk(
     *,
     module: Any,
-    plan: object,
+    plan: Any,
     q: torch.Tensor,
     weights: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -168,7 +167,7 @@ def _run_paged_topk(
     shared_page_table: bool,
 ) -> None:
     scratch = current_workspace_manager().get_simultaneous(
-        *((spec.shape, spec.dtype) for spec in module.scratch_specs(plan, device=q.device))
+        *((spec.shape, spec.dtype) for spec in plan.scratch_specs())
     )
     binding = module.bind(
         plan,

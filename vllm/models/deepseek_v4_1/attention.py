@@ -1231,8 +1231,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     index_plan,
                     scratch=current_workspace_manager().get_simultaneous(
                         *((spec.shape, spec.dtype)
-                          for spec in dsa_indexer.scratch_specs(
-                              index_plan, device=iq_data.device))),
+                          for spec in index_plan.scratch_specs())),
                     q_mxfp4=iq_data[offset:end],
                     q_scales=iq_scale[offset:end],
                     query_weights=iw[offset:end],
