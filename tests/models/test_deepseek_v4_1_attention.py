@@ -54,9 +54,10 @@ def test_dcp_helpers_require_loaded_channel_without_allocating_cuda_memory():
 
 
 @pytest.mark.parametrize("groups,heads_per_group,rank,hidden", [(1, 1, 128, 128), (2, 8, 1024, 5120)])
+@pytest.mark.parametrize("dcp_size", [1, 4])
 @torch.no_grad()
 def test_wo_preparation_exact_rows_owns_output_and_replays(
-    monkeypatch, workspace_init, groups, heads_per_group, rank, hidden,
+    monkeypatch, workspace_init, groups, heads_per_group, rank, hidden, dcp_size,
 ):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("native b12x WO projection requires SM12x")
@@ -64,7 +65,7 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
     from b12x.gemm._shared.wo_mxfp8 import quantize_wo_projection_weights_mxfp8_torch
     from b12x.preparation import PreparationSession
     from vllm.models.deepseek_v4_1 import attention
-    from vllm.utils.b12x import B12xWorkload
+    from vllm.utils.b12x import B12xWorkload, PreparationResourceUnavailableError
     from vllm.v1.worker.workspace import current_workspace_manager
 
     torch.manual_seed(411)
@@ -94,6 +95,7 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
         output_dtype=torch.bfloat16, max_tokens=capacity, max_seqs=8, max_model_len=4096,
     )
     module.capacity, module.max_model_len, module.swa_width = capacity, 4096, 128
+    module.dcp_size = dcp_size
     module.is_ced_decoder = compacted
     module.compress_ratio = 0
     module.indexer = module.compressor = None
@@ -121,19 +123,41 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
         for rows in (3, 17):
             assert rows not in module._wo_plans
             actual = module._o_proj(source[:rows], positions[:rows])
-            plan = module._wo_plans[rows]
-            assert plan.query.max_tokens == rows and plan.prepared is not None
+            plan = module._wo_plan(rows)
+            assert plan.query.max_tokens >= rows and plan.prepared is not None
             assert plan.selection.source in ("default", "fixed")
             assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
             assert module._wo_plan(rows) is plan
         counts = tuple(sorted((*counts, 3, 17)))
+        exact_plans = {}
+        if dcp_size > 1:
+            counts = tuple(sorted((*counts, 5)))
+            for rows in counts:
+                # Independent exact-M declarations check the variable-capacity
+                # binding, including group strides and quantization scale tiles.
+                exact = wo.plan(
+                    wo.Caps(device=device, max_tokens=rows, groups=groups,
+                            group_width=group_width,
+                            rank=rank, hidden=hidden),
+                    invocation={"operation": "inv_rope",
+                                "heads_per_group": heads_per_group,
+                                "nope_dim": 448, "rope_dim": 64},
+                )
+                scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device)
+                                for spec in exact.scratch_specs())
+                wo.bind_inv_rope(
+                    exact, scratch=scratch, o=source[:rows], positions=positions[:rows],
+                    cos_sin_cache=table, weights=module._wo_projection_weights,
+                    heads_per_group=heads_per_group, nope_dim=448, rope_dim=64,
+                )
+                exact_plans[rows] = exact
         for plan in module._wo_plans.values():
             current_workspace_manager().get_simultaneous(
                 *((spec.shape, spec.dtype) for spec in plan.scratch_specs())
             )
         session.freeze()
         for rows in counts:
-            plan = module._wo_plans[rows]
+            plan = exact_plans.get(rows, module._wo_plan(rows))
             scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device) for spec in plan.scratch_specs())
             binding = wo.bind_inv_rope(
                 plan, scratch=scratch, o=source[:rows], positions=positions[:rows],
@@ -167,11 +191,19 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
                 assert torch.isfinite(replayed).all() and torch.count_nonzero(replayed) > 0
             finally:
                 graph.reset()
-        with pytest.raises(RuntimeError, match="frozen"):
+        if dcp_size == 1:
+            with pytest.raises(RuntimeError, match="frozen"):
+                module._o_proj(source[:5], positions[:5])
+        else:
+            declared = tuple(module._wo_plans)
             module._o_proj(source[:5], positions[:5])
+            assert tuple(module._wo_plans) == declared
+            with pytest.raises(PreparationResourceUnavailableError, match="capacity"):
+                module._wo_plan(capacity + 1)
     from b12x.preparation.session import _LAZY_SESSIONS
-    for rows in (3, 17):
-        _LAZY_SESSIONS[device.index].release(module._wo_plans[rows])
+    for plan in (*exact_plans.values(), *(module._wo_plans.get(row) for row in (3, 17))):
+        if plan is not None:
+            _LAZY_SESSIONS[device.index].release(plan)
 
 
 @pytest.mark.parametrize("compacted", [False, True])

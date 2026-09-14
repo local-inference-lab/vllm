@@ -1496,7 +1496,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         requests = []
         token_counts = self._preparation_token_counts(workload)
         for rows in token_counts:
-            requests.append(self._wo_plan(rows).request(
+            requests.append(self._wo_plan(rows, declaration=True).request(
                 name=f"{self.prefix}.wo.m{rows}", prepare_call=prepare, benchmark_call=prepare,
             ))
         return B12xPreparationUnit(
@@ -1504,8 +1504,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             requests=tuple(requests), stage="weights", autotune=not workload.eager_only,
         )
 
-    def _wo_plan(self, rows: int):
+    def _wo_plan(self, rows: int, *, declaration=False):
         if rows not in self._wo_plans:
+            if not declaration and getattr(self, "dcp_size", 1) > 1:
+                capacities = [
+                    count for count, plan in self._wo_plans.items()
+                    if count >= rows and plan.query.variable_tokens
+                    and plan.prepared is not None
+                ]
+                if capacities:
+                    return self._wo_plans[min(capacities)]
+                raise PreparationResourceUnavailableError(
+                    f"DCP WO has no prepared capacity for {rows} live rows"
+                )
             weights = self._wo_projection_weights
             if weights is None:
                 raise PreparationResourceUnavailableError("V4.1 WO weights are not packed")
@@ -1520,6 +1531,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     heads_per_group=self.n_local_heads // self.n_local_groups,
                     nope_dim=self.head_dim - self.rope_head_dim, rope_dim=self.rope_head_dim,
                     positions_dtype="int64", cos_sin_dtype=str(table.dtype).removeprefix("torch."),
+                    variable_tokens=(rows > 16 and getattr(self, "dcp_size", 1) > 1),
                 ),
             )
         return self._wo_plans[rows]
