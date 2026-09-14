@@ -136,13 +136,20 @@ source write. Global index selection and NVFP4 bytes are unchanged. Native
 B12X attention uses the rank's original 16 heads, SWA and sink. CED and decode
 retain the existing owner-sharded gather/partial-attention/reduce path.
 
-Replica storage is declared before memory profiling: three source replicas
-plus one shared local staging slab require approximately 0.94 GiB per rank
+Replica storage is declared before memory profiling. Sources 2/8/14 have
+nonoverlapping encoder-layer intervals (2-7/8-13/14-19), so they share one
+output buffer, accounted once by its transport declaration. One replica
+plus one shared local staging slab require approximately 0.36 GiB per rank
 at max-seqs4/540672 context. No full-model KV pool capacity gain is inferred.
 A standalone one-CTA peer barrier follows completion of previous consumers;
 another follows local staging before peer reads. This avoids unsafe per-block
 reuse when live grid geometry changes, needs no host-patched graph epoch, and
 keeps one stream-ordered channel. Page/record offsets remain Int64.
+Startup preparation and model profiling may use different logical streams;
+handoffs insert a CUDA stream dependency at the previous stream's tail,
+including its attention consumers. No serving-time host synchronization is
+added. Independent overlapping replay and microbatching are unsupported;
+microbatching fails closed. Capture/replay must use the warmed logical stream.
 The source cache's physical page stride is a runtime scalar: pooled/padded
 pages need not be contiguous across page boundaries. Only semantic 288-byte
 records are copied, never allocator padding.
@@ -150,7 +157,10 @@ records are copied, never allocator padding.
 The first native oracle passes byte-exact reconstruction, >2 GiB physical
 pages, multiple live counts and serial graph replay without allocation growth.
 The expanded oracle additionally covers changing CTA grids, cached prefixes
-and recycled nonsequential page mappings. Final-image validation and serving
+and recycled nonsequential page mappings. A serial-stream-handoff regression
+is added after p15 rejected vLLM's preparation-to-profiling transition. The
+new handoff and shared-output source revisions await final-image qualification.
+Final-image validation and serving
 performance are pending. This is not yet a production-qualified optimization.
 
 TP4/DCP4, 540672 context, 4096 batch budget, max-seqs 4, main/SWA pages 256/128,

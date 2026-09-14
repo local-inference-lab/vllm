@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Native head exchange for owner-sharded DS4.1 compressed KV."""
 
+from dataclasses import replace
+
 import torch
 
 from vllm.distributed import get_dcp_group
@@ -182,10 +184,25 @@ class DCPKVReplica:
     def __init__(self, group, attention, device):
         from b12x.comm import pcie
         from b12x.comm.pcie._owner_preparation import prepared_call
-        from b12x.preparation import CollectiveRequirement
+        from b12x.preparation import (
+            CollectiveRequirement,
+            FrozenMapping,
+            MemoryRequirements,
+            PersistentMemory,
+        )
 
+        if attention.config.parallel_config.use_ubatching:
+            raise ValueError("DCP KV replica does not support overlapping microbatches")
         self.max_tokens = (attention.max_model_len + 1) // 2
         self.page_size = attention._main_page
+        # Encoder KV-source intervals are serial and do not overlap. Refresh
+        # after every source write, rather than retaining one replica per source.
+        pages = (self.max_tokens + self.page_size - 1) // self.page_size
+        self.output_shape = (
+            attention.config.scheduler_config.max_num_seqs * pages + 1,
+            self.page_size * 288,
+        )
+        self.output = None
         self.runtime = pcie.PagedKvReplica.from_process_group(
             process_group=group.cpu_group,
             device=device,
@@ -203,7 +220,29 @@ class DCPKVReplica:
                 max_tokens=self.max_tokens,
             ),
         )
-        self.plan = pcie.plan(query, runtime=self.runtime)
+        declaration = pcie.plan(query, runtime=self.runtime)
+        native_memory = declaration._memory_requirements
+
+        def memory(config, detected):
+            requirement = native_memory(config, detected)
+            nbytes = self.output_shape[0] * self.output_shape[1]
+            return MemoryRequirements(
+                scratch=requirement.scratch,
+                persistent=(
+                    *requirement.persistent,
+                    PersistentMemory(
+                        key=(self, "prefill_kv"),
+                        required_nbytes=nbytes,
+                        resident_nbytes=nbytes if self.output is not None else 0,
+                    ),
+                ),
+            )
+
+        self.plan = replace(
+            declaration,
+            _memory_requirements=memory,
+            invocation=FrozenMapping(vllm_prefill_shape=self.output_shape),
+        )
         self._preparation_owner = attention._helpers
 
         def prepare(state):
@@ -221,7 +260,7 @@ class DCPKVReplica:
                 table=table,
                 positions=positions,
                 starts=starts,
-                out=attention._prefill_kv,
+                out=self.output,
                 requests=1,
                 max_tokens=1,
             )
@@ -246,13 +285,23 @@ class DCPKVReplica:
     def preparation_units(self, owner):
         return (self.unit,) if owner is self._preparation_owner else ()
 
+    def prepare_output(self, device):
+        """Allocate the single admitted replica before any graph capture."""
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("DCP KV replica must be prepared before capture")
+        if self.output is None:
+            self.output = torch.empty(
+                self.output_shape, dtype=torch.uint8, device=device
+            )
+        return self.output
+
     def replicate(self, attention, metadata):
         self.runtime.replicate(
             attention.kv_cache,
             metadata.block_table,
             metadata.request_positions,
             metadata.query_start_loc,
-            attention._prefill_kv,
+            self.output,
             plan=self.plan,
             requests=metadata.num_reqs,
             max_tokens=max(1, (metadata.max_seq_len + 1) // 2),

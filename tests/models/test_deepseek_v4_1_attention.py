@@ -277,6 +277,7 @@ def test_indexer_declares_bounded_score_rows_at_model_context_capacity(
             assert not plan.query.return_lse
     assert module._main_width == 4096 // dcp_size
     assert module._index_width == 4096
+    assert "_prefill_kv" not in {name for name, _, _ in module._staging_specs}
     manager = WorkspaceManager(device)
     monkeypatch.setattr(attention, "current_workspace_manager", lambda: manager)
     module.reserve_profile_scratch()

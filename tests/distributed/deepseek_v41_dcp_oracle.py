@@ -86,6 +86,18 @@ def check_kv_replica(device, session, coordinator):
             run(max_tokens)
             torch.cuda.synchronize()
             check()
+        # vLLM preparation and model profiling use different logical streams.
+        # Handoffs must order previous cache producers and replica consumers.
+        default = torch.cuda.current_stream(device)
+        other = torch.cuda.Stream(device=device)
+        other.wait_stream(default)
+        with torch.cuda.stream(other):
+            expected.bitwise_xor_(23)
+            local_records.copy_(expected[:, owned].view(requests, local_width, page, 288))
+            run(1024)
+        run(1024)  # Native handoff back waits for the other stream's tail.
+        torch.cuda.synchronize()
+        check()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             run(1536)

@@ -729,13 +729,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         if not hasattr(self, "_owns_topk_indices"):
             self._owns_topk_indices = self.topk_indices_buffer is None and self.is_index_source
         specs = []
-        if self.dcp_prefill_replica and self.is_kv_source:
-            global_width = triton.cdiv(self.max_model_len, self.config.cache_config.block_size)
-            specs.append((
-                "_prefill_kv",
-                (self.config.scheduler_config.max_num_seqs * global_width + 1,
-                 self._main_page * 288), torch.uint8,
-            ))
         if self._owns_topk_indices:
             specs.append(("topk_indices_buffer", (self.capacity, 512), torch.int32))
         if self.indexer is not None:
@@ -781,6 +774,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             raise RuntimeError("V4.1 metadata must be prepared before graph capture")
         if not hasattr(self, "_staging_specs"):
             self._declare_attention(device)
+        if self.dcp_prefill_replica:
+            # All encoder layers alias one channel-owned output. The native
+            # replica declaration accounts it once, independently of helpers.
+            self._prefill_kv = self._dcp_kv_replica.prepare_output(device)
         for name, shape, dtype in self._staging_specs:
             tensor = getattr(self, name, None)
             if tensor is None or tuple(tensor.shape) != shape or tensor.dtype != dtype:
