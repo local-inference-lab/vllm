@@ -6,7 +6,7 @@ import torch
 
 from vllm.distributed import get_dcp_group
 from vllm.triton_utils import tl, triton
-from vllm.utils.b12x import B12xPreparationUnit
+from vllm.utils.b12x import B12xPreparationUnit, register_b12x_unit_provider
 
 
 @triton.jit
@@ -50,7 +50,11 @@ class DCPExchange:
         key = (group.unique_name, local_heads, device)
         if key not in cls._instances:
             cls._instances[key] = cls(group, local_heads, device)
+            register_b12x_unit_provider(cls._instances[key])
         return cls._instances[key]
+
+    def get_b12x_preparation_units(self, provider, workload):
+        return (self.unit,)
 
     def __init__(self, group, local_heads, device):
         from b12x.comm import pcie

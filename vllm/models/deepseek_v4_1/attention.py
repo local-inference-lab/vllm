@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """V4.1 Full/Reindex/Reuse topology with native b12x compute only."""
 
-from dataclasses import replace
 import math
+from dataclasses import replace
 from typing import cast
 
 import regex as re
@@ -47,11 +47,11 @@ from vllm.models.deepseek_v4_1.sparse_mla import (
 )
 from vllm.triton_utils import tl, triton
 from vllm.utils.b12x import (
-    set_b12x_preparation_provider,
     B12xPreparationUnit,
     B12xWorkload,
     PreparationResourceUnavailableError,
     register_b12x_unit_provider,
+    set_b12x_preparation_provider,
 )
 from vllm.utils.torch_utils import current_stream
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
@@ -187,8 +187,6 @@ class _AttentionHelpers:
             name="V41AttentionHelpers", key=(attn.prefix, attn.capacity),
             requests=tuple(requests), stage="weights", autotune=not workload.eager_only,
         ), attn._wo_preparation_unit(workload))
-        if getattr(attn, "dcp_active", False):
-            units += (attn._dcp_exchange.unit,)
         return units
 
 

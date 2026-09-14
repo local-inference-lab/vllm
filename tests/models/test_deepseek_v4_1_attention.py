@@ -8,6 +8,30 @@ import pytest
 import torch
 
 
+def test_shared_dcp_channel_registers_one_preparation_provider(monkeypatch):
+    """Layer reuse must not produce conflicting collective request names."""
+    from vllm.models.deepseek_v4_1 import dcp
+    from vllm.utils import b12x
+
+    monkeypatch.setattr(dcp.DCPExchange, "_instances", {})
+    monkeypatch.setattr(b12x, "_B12X_UNIT_PROVIDERS", [])
+    monkeypatch.setattr(
+        dcp, "get_dcp_group", lambda: SimpleNamespace(unique_name="test-dcp")
+    )
+    unit = object()
+
+    def init(self, group, heads, device):
+        self.unit = unit
+
+    monkeypatch.setattr(dcp.DCPExchange, "__init__", init)
+    first = dcp.DCPExchange.get(16, torch.device("cuda", 0))
+    for _ in range(40):
+        assert dcp.DCPExchange.get(16, torch.device("cuda", 0)) is first
+    providers = b12x.b12x_unit_providers()
+    assert providers == [first]
+    assert providers[0].get_b12x_preparation_units(first, None) == (unit,)
+
+
 @pytest.mark.parametrize("groups,heads_per_group,rank,hidden", [(1, 1, 128, 128), (2, 8, 1024, 5120)])
 @torch.no_grad()
 def test_wo_preparation_exact_rows_owns_output_and_replays(
