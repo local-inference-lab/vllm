@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Prepared native attention resources and inverse-RoPE WO integration."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -11,7 +12,9 @@ import torch
 def test_dcp_kv_replica_declares_one_shared_output_before_materialization(monkeypatch):
     """Catch wrapper contract errors before loading weights or creating IPC."""
     from b12x.comm import pcie
+    from b12x.preparation import FrozenMapping
     from b12x.preparation import device as preparation_device
+
     from vllm.models.deepseek_v4_1 import dcp
 
     runtime = pcie.PagedKvReplica.__new__(pcie.PagedKvReplica)
@@ -40,6 +43,11 @@ def test_dcp_kv_replica_declares_one_shared_output_before_materialization(monkey
     replica = dcp.DCPKVReplica.get(attention)
     assert replica.output is None
     assert replica.plan.invocation["vllm_prefill_shape"] == (49, 128 * 288)
+    bad_query = replace(replica.plan.query, call=FrozenMapping({
+        "page_size": 256, "stripe": 256, "ratio": 1, "max_tokens": 1536,
+    }))
+    with pytest.raises(ValueError, match="owner capacity"):
+        pcie.plan(bad_query, runtime=runtime)
     memory = replica.plan.memory_requirements()
     assert sum(item.required_nbytes for item in memory.persistent) == (
         runtime.slab_bytes + 49 * 128 * 288
