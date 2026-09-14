@@ -81,19 +81,19 @@ class DCPExchange:
                 if operation == "all_gather_heads"
                 else self.runtime.total_heads
             )
-            source = torch.empty((1, heads, 512), dtype=torch.bfloat16, device=device)
+            source = torch.empty((1, heads, 512), dtype=torch.bfloat16, device="meta")
             out_heads = (
                 self.runtime.total_heads
                 if operation == "all_gather_heads"
                 else local_heads
             )
-            out = torch.empty((1, out_heads, 512), dtype=torch.bfloat16, device=device)
+            out = torch.empty((1, out_heads, 512), dtype=torch.bfloat16, device="meta")
             if operation == "all_gather_heads":
                 call = dict(local_input=source, out=out)
             else:
                 call = dict(
                     partial_output=source,
-                    partial_lse=torch.zeros((1, heads), device=device),
+                    partial_lse=torch.empty((1, heads), device="meta"),
                     out=out,
                     is_lse_base_on_e=True,
                 )
@@ -105,8 +105,22 @@ class DCPExchange:
             plan = pcie.plan(query, runtime=self.runtime)
             self.plans[operation] = plan
 
-            def prepare(state, call=call, source=source):
-                source.fill_(1)
+            def prepare(state, operation=operation, heads=heads, out_heads=out_heads):
+                source = torch.ones(
+                    (1, heads, 512), dtype=torch.bfloat16, device=device
+                )
+                out = torch.empty(
+                    (1, out_heads, 512), dtype=torch.bfloat16, device=device
+                )
+                if operation == "all_gather_heads":
+                    call = dict(local_input=source, out=out)
+                else:
+                    call = dict(
+                        partial_output=source,
+                        partial_lse=torch.zeros((1, heads), device=device),
+                        out=out,
+                        is_lse_base_on_e=True,
+                    )
                 return prepare_call(state, **call)
 
             requests.append(

@@ -110,7 +110,7 @@ class CompressorStateCache(nn.Module, AttentionLayerBase):
             head_size=1024,
             head_size_v=0,
             dtype=torch.float32,
-            dcp_replicated=True,
+            dcp_replicated=config.parallel_config.decode_context_parallel_size > 1,
         )
 
     def get_attn_backend(self):

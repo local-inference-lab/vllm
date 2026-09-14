@@ -103,12 +103,8 @@ class _AttentionHelpers:
         table = attn.rotary_emb.cos_sin_cache
         device = table.device
         if getattr(attn, "dcp_active", False) and not hasattr(attn, "_dcp_exchange"):
-            from vllm.models.deepseek_v4_1.dcp import DCPExchange
-
-            attn._dcp_exchange = DCPExchange.get(attn.n_local_heads, device)
-            sink = get_dcp_group().all_gather(attn.attn_sink.data, dim=0)
-            attn._dcp_sink = (
-                sink if attn.dcp_rank == 0 else torch.full_like(sink, -float("inf"))
+            raise PreparationResourceUnavailableError(
+                "V4.1 DCP channel must be initialized after weight loading"
             )
         attn._declare_attention(device)
         roles = [("kv", 1, 512, 1), ("q", attn.n_local_heads, 512, 1)]
@@ -238,7 +234,7 @@ class _Cache(nn.Module, AttentionLayerBase):
             tokens_per_state=self.ratio,
             cache_dtype_str="b12x_dsv41",
             alignment=None,
-            dcp_replicated=True,
+            dcp_replicated=config.parallel_config.decode_context_parallel_size > 1,
         )
         if self.kind == "swa":
             boundary = ced_decoder_start(config.model_config.hf_config)
@@ -772,6 +768,25 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             counts.add(compact_max)
             counts.update(range(CED_WINDOW, compact_max + 1, CED_WINDOW))
         return tuple(sorted(counts))
+
+    def reserve_profile_scratch(self):
+        """Admit full-context eager scratch before the runner locks its arena."""
+        self._declare_attention(self.rotary_emb.cos_sin_cache.device)
+        declarations = list(self._attention_declarations.values())
+        if self.indexer is not None:
+            regimes = [
+                ("decode", min(self.capacity, self.DECODE_CHUNK)),
+                ("prefill", min(self.capacity, self.INDEX_CHUNK)),
+            ]
+            if self._short_index_shape is not None:
+                regimes.append(("prefill_short", self._short_index_shape[0]))
+            declarations.extend(
+                self._declare_index_plan(mode, rows) for mode, rows in regimes
+            )
+        for declaration in declarations:
+            current_workspace_manager().get_simultaneous(
+                *((spec.shape, spec.dtype) for spec in declaration.scratch_specs())
+            )
 
     def _index_request_name(self, mode: str, rows: int) -> str:
         return f"{self.prefix}.mxfp4_index.{mode}.m{rows}"
@@ -1432,6 +1447,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             hidden=hidden,
             block_size=(32, 32),
         )
+        if getattr(self, "dcp_active", False):
+            from vllm.models.deepseek_v4_1.dcp import DCPExchange
+
+            self._dcp_exchange = DCPExchange.get(
+                self.n_local_heads, self.attn_sink.device
+            )
+            sink = get_dcp_group().all_gather(self.attn_sink.data, dim=0)
+            self._dcp_sink = (
+                sink if self.dcp_rank == 0 else torch.full_like(sink, -float("inf"))
+            )
 
     def _wo_preparation_unit(self, workload):
         from b12x.preparation import PreparedCall

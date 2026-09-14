@@ -34,6 +34,23 @@ def test_shared_dcp_channel_exposes_one_unit_in_each_preparation_stage(monkeypat
         assert collected == [unit]
 
 
+def test_dcp_helpers_require_loaded_channel_without_allocating_cuda_memory():
+    """Declaration cannot initialize an IPC channel behind the planner."""
+    if not torch.cuda.is_available():
+        pytest.skip("allocation guard requires CUDA")
+    from vllm.models.deepseek_v4_1 import attention
+    from vllm.utils.b12x import PreparationResourceUnavailableError
+
+    module = SimpleNamespace(
+        dcp_active=True,
+        rotary_emb=SimpleNamespace(cos_sin_cache=torch.empty(1, device="cuda")),
+    )
+    allocated = torch.cuda.memory_allocated()
+    with pytest.raises(PreparationResourceUnavailableError, match="after weight loading"):
+        attention._AttentionHelpers(module).get_b12x_preparation_units(module, None)
+    assert torch.cuda.memory_allocated() == allocated
+
+
 @pytest.mark.parametrize("groups,heads_per_group,rank,hidden", [(1, 1, 128, 128), (2, 8, 1024, 5120)])
 @torch.no_grad()
 def test_wo_preparation_exact_rows_owns_output_and_replays(
@@ -157,12 +174,13 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
 
 @pytest.mark.parametrize("compacted", [False, True])
 @pytest.mark.parametrize("dcp_size", [1, 4])
-def test_indexer_declares_bounded_score_rows_at_model_context_capacity(compacted, dcp_size):
+def test_indexer_declares_bounded_score_rows_at_model_context_capacity(monkeypatch, compacted, dcp_size):
     if not torch.cuda.is_available():
         pytest.skip("native b12x attention declarations require CUDA")
     from b12x.attention import compressed_sparse_mla as mla, dsa_indexer
     from vllm.models.deepseek_v4_1 import attention
     from vllm.utils.b12x import B12xWorkload
+    from vllm.v1.worker.workspace import WorkspaceManager
 
     device = torch.device("cuda", torch.cuda.current_device())
     module = attention.DeepseekV4Attention.__new__(attention.DeepseekV4Attention)
@@ -170,9 +188,10 @@ def test_indexer_declares_bounded_score_rows_at_model_context_capacity(compacted
     module.prefix = "model.layers.0.attn"
     module.capacity, module.max_model_len, module.swa_width = 4096, 1048576, 128
     module.is_ced_decoder, module.is_index_source = compacted, True
-    module.n_local_heads, module.compress_ratio = 16, 2
+    module.n_local_heads, module.compress_ratio = 16, 1 if compacted else 2
     module.dcp_size, module.dcp_active = dcp_size, dcp_size > 1
-    module.layer_id, module.candidate_source_layer, module.kv_source_layer_id = 0, 12, 0
+    module.layer_id = 12 if compacted else 0
+    module.candidate_source_layer, module.kv_source_layer_id = 12, 0
     module._context = {module.prefix: module}
     module.topk_indices_buffer = None
     module.config = SimpleNamespace(
@@ -185,9 +204,10 @@ def test_indexer_declares_bounded_score_rows_at_model_context_capacity(compacted
         block_size=256,
         kv_cache=torch.empty((1, mla.page_nbytes(256, cache_kind="swa")), dtype=torch.uint8, device=device),
     )
-    module.kv_cache = torch.empty((1, mla.page_nbytes(128, cache_kind="indexed")), dtype=torch.uint8, device=device)
+    main_page = 256 // module.compress_ratio
+    module.kv_cache = torch.empty((1, mla.page_nbytes(main_page, cache_kind="indexed")), dtype=torch.uint8, device=device)
     module.indexer = SimpleNamespace(heads=32, k_cache=SimpleNamespace(
-        kv_cache=torch.empty((1, dsa_indexer.index_mxfp4_page_bytes(128)), dtype=torch.uint8, device=device),
+        kv_cache=torch.empty((1, dsa_indexer.index_mxfp4_page_bytes(main_page)), dtype=torch.uint8, device=device),
     ))
     workload = B12xWorkload(
         stage="state", token_counts=(1, 7, 64, 257, 4089, 4096),
@@ -204,6 +224,20 @@ def test_indexer_declares_bounded_score_rows_at_model_context_capacity(compacted
             assert plan.query.query_rows <= 256
     assert module._main_width == 4096 // dcp_size
     assert module._index_width == 4096
+    manager = WorkspaceManager(device)
+    monkeypatch.setattr(attention, "current_workspace_manager", lambda: manager)
+    module.reserve_profile_scratch()
+    manager.lock()
+    allocated = torch.cuda.memory_allocated(device)
+    regimes = [("decode", 64), ("prefill", 256)]
+    if module._short_index_shape is not None:
+        regimes.append(("prefill_short", module._short_index_shape[0]))
+    for mode, rows in regimes:
+        declaration = module._declare_index_plan(mode, rows)
+        manager.get_simultaneous(
+            *((spec.shape, spec.dtype) for spec in declaration.scratch_specs())
+        )
+    assert torch.cuda.memory_allocated(device) == allocated
     assert unit.requests and all(request.collective is None for request in unit.requests)
     counts = module._preparation_token_counts(workload)
     chunks = {"decode": 64, "prefill": 256}
