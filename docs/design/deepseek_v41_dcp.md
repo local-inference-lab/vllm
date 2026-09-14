@@ -63,16 +63,46 @@ The initial K5 image served arithmetic/history/cold-prefix requests but failed
 warm-prefix replay: a 1078-token suffix caused an undeclared WO packer JIT.
 The native capacity fix passes four singleton/production-grouped geometry
 regressions, including that exact suffix, independent exact-M comparisons and
-frozen graph replay. Full-model K5 readiness is being rerun; the failure is not
-hidden by disabling the JIT guard.
+frozen graph replay. The corrected p12 full-model K5 image passes arithmetic,
+explicit history, vision and cold/warm prefix replay with 27648 cached tokens.
+The failure is not hidden by disabling the JIT guard.
+
+The short LIL v0.6.2 K5 sweep measured C1 121.1 tok/s, C4 208.6 aggregate tok/s
+(20-second cells, requested context zero, temperature 1, reasoning high).
+Effective acceptance lengths were 2.14/1.89; no request errors were reported.
+One uncached 32770-token sample measured 1725 client / 1732 server prefill tok/s
+and 19.002s TTFT. This is a failed performance gate, not a matched DCP1 speedup.
+The engine reports an 8038903-token hybrid pool, 10.25 GiB per rank. Neither
+the estimate nor this unmatched run demonstrates a capacity gain over DCP1.
+
+The generic upstream GSM8K chat stop strings cut off reasoning on `Question`:
+the initial 16-question, 8-shot subset returned 9 correct/seven empty answers;
+a full-response-logged replay returned eight correct/eight empty answers, all
+empty responses explicitly stopped on `Question`. The same fixed subset with
+generic stop strings removed returned 14 correct and zero empty answers.
+This diagnostic does not establish full quality or deterministic DCP1 parity.
+
+A separate 10-second worker-stack profile collected 994 samples, with 42.9%
+inside MoE workspace-shape calculation and 43.9% inside memory requirements
+(overlapping categories). Repeated CPU plan lowering is an optimization target;
+the profile is not a GPU/communication latency breakdown or scored benchmark.
+MoE workspace sizing now reuses only the current prepared family's envelope,
+invalidating on parent/child preparation changes and holding only weak
+references. Its focused CPU contract regression passes; serving performance
+with this change is being measured. No native math or precision is changed.
+
+The p12 K5 instance completed a fresh 525000-token prompt with zero cached
+tokens in 301.41s and returned the final record correctly. This qualifies
+admission/final-record retrieval only, not long-range conversation quality.
 
 ## Serving configuration under qualification
 
 TP4/DCP4, 540672 context, 4096 batch budget, max-seqs 4, main/SWA pages 256/128,
 SSD Engram, native prefix caching, decode graphs enabled, prefill graphs off.
-Initial full-model bring-up disables speculation, LMCache and startup search
-(`enable_b12x_autotune=false`) to isolate native DCP correctness. DSpark K5,
-matched serving benchmarks, long-context qualification and LMCache DCP restore
+Initial full-model bring-up disabled speculation to isolate native correctness;
+the corrected serving instance uses DSpark K5. LMCache and startup search
+(`enable_b12x_autotune=false`) remain disabled. Faster DCP serving, matched
+current-dev DCP1 benchmarks, full model/long-range quality and LMCache DCP restore
 remain required before calling this a production-qualified configuration.
 
 LMCache must use a separate DCP-layout namespace and a chunk divisible by
