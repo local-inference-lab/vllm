@@ -241,7 +241,7 @@ class DCPKVReplica:
         self.plan = replace(
             declaration,
             _memory_requirements=memory,
-            invocation=FrozenMapping(vllm_prefill_shape=self.output_shape),
+            invocation=FrozenMapping({"vllm_prefill_shape": self.output_shape}),
         )
         self._preparation_owner = attention._helpers
 

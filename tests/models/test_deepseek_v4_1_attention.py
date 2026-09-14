@@ -8,6 +8,54 @@ import pytest
 import torch
 
 
+def test_dcp_kv_replica_declares_one_shared_output_before_materialization(monkeypatch):
+    """Catch wrapper contract errors before loading weights or creating IPC."""
+    from b12x.comm import pcie
+    from b12x.preparation import device as preparation_device
+    from vllm.models.deepseek_v4_1 import dcp
+
+    runtime = pcie.PagedKvReplica.__new__(pcie.PagedKvReplica)
+    runtime.device, runtime.rank, runtime.world_size = torch.device("cuda", 0), 0, 4
+    runtime.max_requests, runtime.max_tokens, runtime.local_capacity = 4, 1536, 384
+    runtime.slab_bytes = 4 * 384 * 288 + 4096
+    monkeypatch.setattr(
+        pcie.PagedKvReplica, "from_process_group", lambda **kwargs: runtime
+    )
+    monkeypatch.setattr(dcp.DCPKVReplica, "_instances", {})
+    group = SimpleNamespace(unique_name="test-replica", cpu_group=None, ranks=range(4))
+    monkeypatch.setattr(dcp, "get_dcp_group", lambda: group)
+    monkeypatch.setattr(
+        preparation_device, "detect_device",
+        lambda device: SimpleNamespace(identity=None),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    attention = SimpleNamespace(
+        attn_sink=SimpleNamespace(device=runtime.device),
+        max_model_len=3072, _main_page=128, dcp_stripe=128, _helpers=object(),
+        config=SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_seqs=4),
+            parallel_config=SimpleNamespace(use_ubatching=False),
+        ),
+    )
+    replica = dcp.DCPKVReplica.get(attention)
+    assert replica.output is None
+    assert replica.plan.invocation["vllm_prefill_shape"] == (49, 128 * 288)
+    memory = replica.plan.memory_requirements()
+    assert sum(item.required_nbytes for item in memory.persistent) == (
+        runtime.slab_bytes + 49 * 128 * 288
+    )
+    assert sum(item.resident_nbytes for item in memory.persistent) == runtime.slab_bytes
+    output = replica.prepare_output(torch.device("cpu"))
+    assert replica.prepare_output(torch.device("cpu")) is output
+    other = SimpleNamespace(**{**vars(attention), "_helpers": object()})
+    assert dcp.DCPKVReplica.get(other) is replica
+    assert replica.preparation_units(other._helpers) == ()
+    memory = replica.plan.memory_requirements()
+    assert sum(item.resident_nbytes for item in memory.persistent) == sum(
+        item.required_nbytes for item in memory.persistent
+    )
+
+
 def test_shared_dcp_channel_exposes_one_unit_in_each_preparation_stage(monkeypatch):
     """Layer reuse must not produce conflicting collective request names."""
     from vllm.models.deepseek_v4_1 import dcp

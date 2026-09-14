@@ -159,7 +159,11 @@ pages, multiple live counts and serial graph replay without allocation growth.
 The expanded oracle additionally covers changing CTA grids, cached prefixes
 and recycled nonsequential page mappings. A serial-stream-handoff regression
 is added after p15 rejected vLLM's preparation-to-profiling transition. The
-new handoff and shared-output source revisions await final-image qualification.
+The handoff oracle and four attention/workspace declaration cases pass in p16.
+p16 then rejected an incorrect FrozenMapping constructor in the shared-output
+wrapper before model profiling. Its mapping-form correction passes one CPU-only
+constructor/residency regression before loading weights. Full-model serving
+qualification is still pending for the corrected wrapper.
 Final-image validation and serving
 performance are pending. This is not yet a production-qualified optimization.
 
