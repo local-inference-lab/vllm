@@ -120,7 +120,8 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
         session.prepare(tuple(request for unit in units for request in unit.requests))
         assert module._ready and module._helper_plan("q").prepared is not None
         assert module.swa_cache_layer.kv_cache.numel() == 0
-        for rows in (3, 17):
+        live_suffixes = (3, 17, 1078) if compacted else (3, 17)
+        for rows in live_suffixes:
             assert rows not in module._wo_plans
             actual = module._o_proj(source[:rows], positions[:rows])
             plan = module._wo_plan(rows)
@@ -128,7 +129,7 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
             assert plan.selection.source in ("default", "fixed")
             assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
             assert module._wo_plan(rows) is plan
-        counts = tuple(sorted((*counts, 3, 17)))
+        counts = tuple(sorted((*counts, *live_suffixes)))
         exact_plans = {}
         if dcp_size > 1:
             counts = tuple(sorted((*counts, 5)))
@@ -201,7 +202,10 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
             with pytest.raises(PreparationResourceUnavailableError, match="capacity"):
                 module._wo_plan(capacity + 1)
     from b12x.preparation.session import _LAZY_SESSIONS
-    for plan in (*exact_plans.values(), *(module._wo_plans.get(row) for row in (3, 17))):
+    for plan in (
+        *exact_plans.values(),
+        *(module._wo_plans.get(row) for row in live_suffixes),
+    ):
         if plan is not None:
             _LAZY_SESSIONS[device.index].release(plan)
 

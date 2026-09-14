@@ -2,7 +2,7 @@
 
 This feature branch starts at local-inference-lab `dev/jovian-judgement`
 `ab03e87100efa9536ec87e01994828b459c956ff`. Native DCP exchange preparation
-requires the companion yatesdr/b12x feature branch, commit `3395626b` (based
+requires the companion yatesdr/b12x feature branch, commit `6b299a6b` (based
 on `9e90d60f0cc8f204aa2fd219ed9b6abee32de7d8`). No upstream PR is submitted.
 
 ## Layout and execution
@@ -24,6 +24,9 @@ on `9e90d60f0cc8f204aa2fd219ed9b6abee32de7d8`). No upstream PR is submitted.
 - One serial channel is shared across layers, with a 256-row capacity. Prefill
   attention is chunked within that capacity. This is not a fourfold increase
   in total KV capacity, because the index and SWA remain replicated.
+- Owned selected IDs are compacted in global selection order with true local
+  lengths. DCP WO replay uses opt-in native variable-row capacity declarations;
+  it does not pad rows, change GEMM precision, or create a serving-time plan.
 
 ## Tests performed on cn4
 
@@ -55,6 +58,13 @@ arithmetic, explicit history, vision and repeated-prefix reuse (27648 cached
 tokens of a 28725-token request). Initial no-speculation LIL decode rates are
 C1 100.3 and C4 221.2 aggregate tok/s; these are not DSpark results or a matched
 DCP1 comparison.
+
+The initial K5 image served arithmetic/history/cold-prefix requests but failed
+warm-prefix replay: a 1078-token suffix caused an undeclared WO packer JIT.
+The native capacity fix passes four singleton/production-grouped geometry
+regressions, including that exact suffix, independent exact-M comparisons and
+frozen graph replay. Full-model K5 readiness is being rerun; the failure is not
+hidden by disabling the JIT guard.
 
 ## Serving configuration under qualification
 
