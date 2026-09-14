@@ -2251,3 +2251,79 @@ def test_glm5next_mtp_resolves_mxfp8_quantization(
     quant_config.packed_modules_mapping = {}
 
     assert quant_config._resolve_quant_algo("model.layers.45.mlp.experts") == "MXFP8"
+
+
+def test_glm5next_registers_mhc_preparation_after_broadcast_publication(
+    monkeypatch,
+) -> None:
+    """b12x mHC plans come only from startup preparation.
+
+    Every GLM layer with a b12x mHC must publish it as a provider, and only
+    after the first layer's broadcast projection exists: that projection decides
+    whether the layer declares ``pre``. Layers built without mHC publish nothing
+    and must not break the hook.
+    """
+    layers = []
+    for mhc in (object(), object()):
+        layer = object.__new__(Glm5NextDecoderLayer)
+        torch.nn.Module.__init__(layer)
+        layer._b12x_mhc = mhc
+        layers.append(layer)
+
+    class FakeModule(torch.nn.Module):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(glm5next_model, "Glm5NextMLAAttention", FakeModule)
+    monkeypatch.setattr(glm5next_model, "Glm5NextMLP", FakeModule)
+    monkeypatch.setattr(glm5next_model, "RMSNorm", FakeModule)
+    config = SimpleNamespace(
+        hidden_size=16,
+        is_moe=False,
+        num_hidden_layers=1,
+        rms_norm_eps=1e-5,
+        n_routed_experts=None,
+        mhc=False,
+        is_kda_layer=lambda layer_idx: False,
+        v_head_dim=4,
+        kv_lora_rank=4,
+        num_attention_heads=2,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=0,
+        q_lora_rank=4,
+        max_position_embeddings=128,
+        mla_nope=True,
+        mlp_layer_types=["dense"],
+        intermediate_size=32,
+        hidden_act="silu",
+        swiglu_limit=None,
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=None,
+        quant_config=None,
+        parallel_config=SimpleNamespace(use_sequence_parallel_moe=False),
+    )
+    non_mhc = Glm5NextDecoderLayer(vllm_config, config, 0, prefix="model.layers.2")
+    assert non_mhc._b12x_mhc is None
+    layers.append(non_mhc)
+    model = object.__new__(glm5next_model.Glm5NextModel)
+    torch.nn.Module.__init__(model)
+    model.layers = torch.nn.ModuleList(layers)
+    model.start_layer, model.end_layer = 0, len(layers)
+
+    model.process_b12x_weights_after_loading()
+
+    assert layers[0].b12x_preparation_provider is layers[0]._b12x_mhc
+    assert layers[1].b12x_preparation_provider is layers[1]._b12x_mhc
+    assert not hasattr(layers[2], "b12x_preparation_provider")
+
+    calls: list[str] = []
+    causal_lm = object.__new__(glm5next_model.Glm5NextForCausalLM)
+    torch.nn.Module.__init__(causal_lm)
+    causal_lm.model = SimpleNamespace(
+        finalize_mhc_broadcast_weights=lambda: calls.append("broadcast"),
+        process_b12x_weights_after_loading=lambda: calls.append("providers"),
+    )
+    causal_lm.process_weights_after_loading()
+
+    assert calls == ["broadcast", "providers"]

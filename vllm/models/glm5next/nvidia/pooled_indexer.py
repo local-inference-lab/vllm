@@ -22,6 +22,7 @@ from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.models.deepseek_v4.nvidia.b12x_indexer import (
     B12xC4SparseIndexer,
 )
+from vllm.utils.b12x import get_b12x_sparse_mla
 from vllm.v1.attention.backends.mla.b12x_indexer import _merge_dcp_topk
 
 if TYPE_CHECKING:
@@ -193,6 +194,10 @@ class Glm5NextPooledIndexer(nn.Module):
             skip_k_cache_insert=True,
             use_fp4_cache=False,
             compress_ratio=_POOL_SIZE,
+            # No k_cache carries a prefix here, so name the layer explicitly:
+            # every GLM sparse layer owns one indexer, and preparation request
+            # names must not collide across them.
+            prefix=prefix,
         )
 
         speculative_config = vllm_config.speculative_config

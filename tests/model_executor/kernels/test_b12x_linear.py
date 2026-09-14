@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib
+import sys
 import types
 from dataclasses import dataclass
 
@@ -2132,3 +2133,177 @@ def test_v41_unquantized_prepares_dtypes_and_exact_rows_before_replay(output_dty
     finally:
         graph.reset()
         session.close()
+
+
+class FakePlan:
+    def __init__(self, invocation=None) -> None:
+        self.invocation = invocation
+
+    def request(self, *, name, prepare_call, benchmark_call):
+        return types.SimpleNamespace(name=name)
+
+
+def _stub_b12x_preparation(monkeypatch) -> None:
+    """Let CPU-only tests build preparation units without the b12x package."""
+    try:
+        importlib.import_module("b12x.preparation")
+    except ImportError:
+        package = types.ModuleType("b12x")
+        package.__path__ = []
+        preparation = types.ModuleType("b12x.preparation")
+        preparation.FrozenMapping = dict
+        monkeypatch.setitem(sys.modules, "b12x", package)
+        monkeypatch.setitem(sys.modules, "b12x.preparation", preparation)
+
+
+@pytest.mark.parametrize("first_layer", [True, False])
+@pytest.mark.parametrize("model", ["deepseek_v4", "glm5next"])
+def test_b12x_mhc_declares_the_operations_each_layer_runs(
+    monkeypatch, model: str, first_layer: bool
+) -> None:
+    """Every operation a layer runs is prepared up to the workload capacity.
+
+    Only the first mHC layer holds the broadcast projection and runs ``pre``,
+    and GLM keeps no BF16 FFN projection under its own norm names. A missing
+    declaration surfaces at the first live call as ``prepared capacity 0``.
+    """
+    from vllm.models.deepseek_v4.nvidia import b12x as dsv4_b12x
+
+    hidden, mult = 64, 4
+    fake_mhc = types.SimpleNamespace(
+        MULT=mult,
+        DEFAULT_BLOCK_K=64,
+        DEFAULT_BLOCK_H=64,
+        Caps=lambda **caps: caps,
+        plan=lambda caps, *, invocation: FakePlan(dict(invocation)),
+        run_pre=None,
+        run_post=None,
+        run_post_pre=None,
+    )
+    monkeypatch.setattr(dsv4_b12x, "_require_b12x_mhc", lambda: fake_mhc)
+    _stub_b12x_preparation(monkeypatch)
+
+    fn = torch.zeros(24, mult * hidden)
+    norm = types.SimpleNamespace(weight=torch.ones(hidden), variance_epsilon=1e-6)
+    if model == "deepseek_v4":
+        # DeepSeek V4 constructs with the default operands.
+        extra = {}
+        named = {
+            "attn_norm": norm,
+            "ffn_norm": norm,
+            "hc_ffn_fn_bf16": fn.to(torch.bfloat16),
+        }
+    else:
+        extra = {
+            "operands": dsv4_b12x.MHCOperands(
+                attn_norm="input_layernorm",
+                ffn_norm="post_attention_layernorm",
+                ffn_fn_bf16=None,
+            )
+        }
+        named = {"input_layernorm": norm, "post_attention_layernorm": norm}
+    layer = types.SimpleNamespace(
+        hc_attn_fn=fn,
+        hc_ffn_fn=fn,
+        hc_attn_scale=torch.ones(3),
+        hc_ffn_scale=torch.ones(3),
+        hc_attn_base=torch.zeros(24),
+        hc_ffn_base=torch.zeros(24),
+        hc_attn_fn_broadcast=fn.view(24, mult, hidden).sum(1) if first_layer else None,
+        **named,
+    )
+    mhc = dsv4_b12x.B12xMHCResidual(
+        hidden_size=hidden,
+        hc_mult=mult,
+        rms_eps=1e-6,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+        **extra,
+    )
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(1, 8, 8192),
+        fixed_token_counts=(1, 8),
+        output_dtype=torch.bfloat16,
+        max_tokens=8192,
+        max_seqs=1,
+        max_model_len=8192,
+    )
+
+    (unit,) = mhc.get_b12x_preparation_units(layer, workload)
+
+    expected = (
+        (("pre",) if first_layer else ())
+        + ("post_pre",)
+        + (("post_pre_bf16",) if model == "deepseek_v4" else ())
+        + ("post",)
+    )
+    assert {operation for operation, _ in mhc._plans} == set(expected)
+    assert len(unit.requests) == 3 * len(expected)
+    for operation in expected:
+        assert mhc._plan_for(operation, 5) is mhc._plans[(operation, 8192)]
+        invocation = mhc._plans[(operation, 8)].invocation
+        assert invocation["has_fn_bf16"] == (operation == "post_pre_bf16")
+    if not first_layer:
+        with pytest.raises(RuntimeError, match="prepared capacity 0"):
+            mhc._plan_for("pre", 8)
+
+
+@pytest.mark.parametrize("kind", ["block", "tensor"])
+def test_b12x_fp8_preparation_units_key_on_their_planned_rows(
+    monkeypatch, kind: str
+) -> None:
+    import vllm.model_executor.kernels.linear.scaled_mm.b12x as b12x_mod
+
+    layer = torch.nn.Module()
+    name = f"fp8-{kind}-preparation-key-probe"
+    layer.b12x_layer_name = _encode_layer_name(name)
+    register_b12x_layer(name, layer)
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(1, 8, 64),
+        fixed_token_counts=(),
+        output_dtype=torch.bfloat16,
+        max_tokens=64,
+        max_seqs=1,
+        max_model_len=64,
+    )
+    if kind == "block":
+        layer.weight = torch.nn.Parameter(
+            torch.empty((256, 128), dtype=torch.float8_e4m3fn), requires_grad=False
+        )
+        layer.weight_scale_inv = torch.nn.Parameter(
+            torch.empty((2, 1)), requires_grad=False
+        )
+        layer.b12x_block_fp8_plans = {}
+        monkeypatch.setattr(
+            b12x_mod,
+            "_block_fp8_plan",
+            lambda layer, rows, dtype: layer.b12x_block_fp8_plans.setdefault(
+                rows, FakePlan()
+            ),
+        )
+        kernel = object.__new__(B12xFp8BlockScaledMMKernel)
+    else:
+        layer.b12x_tensor_fp8_packed_weight = types.SimpleNamespace(
+            values=torch.empty((256, 128), dtype=torch.float8_e4m3fn),
+            in_features=128,
+        )
+        layer.b12x_tensor_fp8_plans = {}
+        monkeypatch.setattr(
+            b12x_mod,
+            "_tensor_fp8_plan",
+            lambda layer, rows, dtype: layer.b12x_tensor_fp8_plans.setdefault(
+                rows, FakePlan()
+            ),
+        )
+        kernel = object.__new__(B12xTensorFP8ScaledMMLinearKernel)
+        kernel.config = types.SimpleNamespace(out_dtype=torch.bfloat16)
+
+    (unit,) = kernel.get_b12x_preparation_units(layer, workload)
+
+    assert unit.name == f"{kind.upper()}_FP8"
+    assert unit.key == (name, (1, 8, 64))
+    assert tuple(request.name for request in unit.requests) == tuple(
+        f"linear.{kind}_fp8.{name}.m{rows}" for rows in (1, 8, 64)
+    )

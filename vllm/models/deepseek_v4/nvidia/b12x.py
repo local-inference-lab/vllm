@@ -3,6 +3,7 @@
 """B12x compressed sparse MLA for DeepSeek V4."""
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import cache
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
@@ -126,6 +127,21 @@ def b12x_dsv4_is_supported() -> bool:
     )
 
 
+@dataclass(frozen=True)
+class MHCOperands:
+    """Decoder-layer attribute names that B12xMHCResidual prepares against.
+
+    The defaults are DeepSeek V4's. A model whose layers name their norms
+    differently, or that keeps no BF16 copy of the FFN mixing projection,
+    declares that here so preparation reads the operands the layer really
+    runs with and declares only the operations it executes.
+    """
+
+    attn_norm: str = "attn_norm"
+    ffn_norm: str = "ffn_norm"
+    ffn_fn_bf16: str | None = "hc_ffn_fn_bf16"
+
+
 class B12xMHCResidual:
     def __init__(
         self,
@@ -135,15 +151,17 @@ class B12xMHCResidual:
         rms_eps: float,
         hc_eps: float,
         sinkhorn_iters: int,
+        operands: MHCOperands | None = None,
     ) -> None:
         module = _require_b12x_mhc()
+        self.operands = operands if operands is not None else MHCOperands()
         self._caps = module.Caps
         self._plan_factory = module.plan
         self._run_pre = module.run_pre
         self._run_post = module.run_post
         self._run_post_pre = module.run_post_pre
         self._plans: dict[tuple[str, int], object] = {}
-        self._plan_key: tuple[int, ...] | None = None
+        self._plan_key: tuple[tuple[int, ...], tuple[str, ...]] | None = None
 
         expected_hc_mult = int(module.MULT)
         if hc_mult != expected_hc_mult:
@@ -254,41 +272,74 @@ class B12xMHCResidual:
     def _request_name(self, layer: object, operation: str, tokens: int) -> str:
         return f"deepseek_v4.mhc.{id(layer):x}.{operation}.m{tokens}"
 
+    def _attn_norm(self, layer: object) -> Any:
+        return getattr(layer, self.operands.attn_norm)
+
+    def _ffn_norm(self, layer: object) -> Any:
+        return getattr(layer, self.operands.ffn_norm)
+
+    def _ffn_fn_bf16(self, layer: object) -> torch.Tensor | None:
+        name = self.operands.ffn_fn_bf16
+        return None if name is None else getattr(layer, name)
+
+    def _operations(self, layer: object) -> tuple[str, ...]:
+        """The mHC operations ``layer`` executes, in declaration order.
+
+        Only the first decoder layer holds the published broadcast attention
+        projection and runs ``pre``; every layer runs the fused ``post_pre``
+        and may end the stream with ``post``. ``post_pre_bf16`` exists only
+        when the model keeps a BF16 copy of the FFN mixing projection.
+        """
+        operations = ("pre",) if layer.hc_attn_fn_broadcast is not None else ()
+        operations += ("post_pre",)
+        if self.operands.ffn_fn_bf16 is not None:
+            operations += ("post_pre_bf16",)
+        return operations + ("post",)
+
+    def _operands(
+        self, layer: object, operations: tuple[str, ...]
+    ) -> tuple[torch.Tensor | None, ...]:
+        """Every checkpoint tensor the declared ``operations`` read."""
+        operands = (
+            layer.hc_attn_fn,
+            layer.hc_ffn_fn,
+            layer.hc_attn_scale,
+            layer.hc_ffn_scale,
+            layer.hc_attn_base,
+            layer.hc_ffn_base,
+            self._attn_norm(layer).weight,
+            self._ffn_norm(layer).weight,
+        )
+        if "pre" in operations:
+            operands += (layer.hc_attn_fn_broadcast,)
+        if "post_pre_bf16" in operations:
+            operands += (self._ffn_fn_bf16(layer),)
+        return operands
+
     def get_b12x_preparation_units(
         self, layer: object, workload: B12xWorkload
     ) -> tuple[B12xPreparationUnit, ...]:
         """Declare every real mHC operand after decoder weights are published."""
         from b12x.preparation import FrozenMapping
 
-        parameters = (
-            layer.hc_attn_fn_broadcast,
-            layer.hc_attn_fn,
-            layer.hc_ffn_fn,
-            layer.hc_ffn_fn_bf16,
-            layer.hc_attn_scale,
-            layer.hc_ffn_scale,
-            layer.hc_attn_base,
-            layer.hc_ffn_base,
-            layer.attn_norm.weight,
-            layer.ffn_norm.weight,
-        )
-        if any(parameter is None or parameter.is_meta for parameter in parameters):
+        operations = self._operations(layer)
+        if any(
+            operand is None or operand.is_meta
+            for operand in self._operands(layer, operations)
+        ):
             return ()
 
         key = tuple(sorted({workload.max_tokens, *workload.fixed_token_counts}))
-        if not self._plans or self._plan_key != key:
+        if not self._plans or self._plan_key != (key, operations):
             plans: dict[tuple[str, int], object] = {}
             for tokens in key:
-                for operation, plan_operation, has_fn_bf16 in (
-                    ("pre", "pre", False),
-                    ("post_pre", "post_pre", False),
-                    ("post_pre_bf16", "post_pre", True),
-                    ("post", "post", False),
-                ):
+                for operation in operations:
+                    has_fn_bf16 = operation == "post_pre_bf16"
+                    plan_operation = "post_pre" if has_fn_bf16 else operation
                     norm = (
-                        layer.attn_norm
+                        self._attn_norm(layer)
                         if operation in ("pre", "post_pre")
-                        else layer.ffn_norm
+                        else self._ffn_norm(layer)
                     )
                     invocation = FrozenMapping(
                         {
@@ -318,7 +369,7 @@ class B12xMHCResidual:
                         invocation=invocation,
                     )
             self._plans = plans
-            self._plan_key = key
+            self._plan_key = (key, operations)
 
         requests = [
             self._plans[(operation, tokens)].request(
@@ -327,7 +378,7 @@ class B12xMHCResidual:
                 benchmark_call=self._prepare_call(layer, operation, tokens),
             )
             for tokens in key
-            for operation in ("pre", "post_pre", "post_pre_bf16", "post")
+            for operation in operations
         ]
         return (B12xPreparationUnit(
             name="DeepseekV4MHC", key=(id(layer), self.hidden_size, key),
@@ -361,6 +412,7 @@ class B12xMHCResidual:
                 comb.normal_()
 
             if operation == "pre":
+                attn_norm = self._attn_norm(layer)
                 run = lambda: _impl._b12x_mhc_pre_impl(
                     residual,
                     layer.hc_attn_fn_broadcast,
@@ -369,8 +421,8 @@ class B12xMHCResidual:
                     rms_eps=self.rms_eps,
                     hc_eps=self.hc_eps,
                     sinkhorn_iters=self.sinkhorn_iters,
-                    norm_weight=layer.attn_norm.weight,
-                    norm_eps=float(layer.attn_norm.variance_epsilon),
+                    norm_weight=attn_norm.weight,
+                    norm_eps=float(attn_norm.variance_epsilon),
                     _state=state,
                 )
             elif operation in ("post_pre", "post_pre_bf16"):
@@ -379,7 +431,7 @@ class B12xMHCResidual:
                         layer.hc_attn_fn,
                         layer.hc_attn_scale,
                         layer.hc_attn_base,
-                        layer.attn_norm,
+                        self._attn_norm(layer),
                         None,
                     )
                 else:
@@ -387,8 +439,8 @@ class B12xMHCResidual:
                         layer.hc_ffn_fn,
                         layer.hc_ffn_scale,
                         layer.hc_ffn_base,
-                        layer.ffn_norm,
-                        layer.hc_ffn_fn_bf16,
+                        self._ffn_norm(layer),
+                        self._ffn_fn_bf16(layer),
                     )
                 run = lambda: _impl._b12x_mhc_post_pre_impl(
                     x,
@@ -413,18 +465,7 @@ class B12xMHCResidual:
             return PreparedCall(
                 run=run,
                 produce=produce,
-                owners=(
-                    layer.hc_attn_fn_broadcast,
-                    layer.hc_attn_fn,
-                    layer.hc_ffn_fn,
-                    layer.hc_ffn_fn_bf16,
-                    layer.hc_attn_scale,
-                    layer.hc_ffn_scale,
-                    layer.hc_attn_base,
-                    layer.hc_ffn_base,
-                    layer.attn_norm.weight,
-                    layer.ffn_norm.weight,
-                ),
+                owners=self._operands(layer, self._operations(layer)),
             )
         return prepare
 

@@ -203,6 +203,7 @@ class B12xC4SparseIndexer(nn.Module):
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
         compress_ratio: int = 1,
+        prefix: str | None = None,
     ) -> None:
         super().__init__()
         del quant_block_size, scale_fmt, max_total_seq_len
@@ -230,9 +231,11 @@ class B12xC4SparseIndexer(nn.Module):
         self.max_model_len = int(max_model_len)
         self.topk_indices_buffer = topk_indices_buffer
         self._plans: dict[tuple[str, int], object] = {}
-        self._preparation_prefix = (
-            f"{getattr(k_cache, 'prefix', type(self).__qualname__)}.c4_indexer"
-        )
+        # Request names must be unique across every indexer in the model. A
+        # caller whose k_cache carries no prefix (GLM passes None) names its layer.
+        if prefix is None:
+            prefix = getattr(k_cache, "prefix", type(self).__qualname__)
+        self._preparation_prefix = f"{prefix}.c4_indexer"
         self.register_buffer(
             "_active_width",
             torch.empty((1,), dtype=torch.int32, device=topk_indices_buffer.device),

@@ -1364,3 +1364,44 @@ def test_glm53_pool_expansion_replays_without_allocation() -> None:
     graph.replay()
     torch.accelerator.synchronize()
     assert torch.accelerator.memory_allocated() == allocated
+
+
+def test_b12x_c4_indexers_name_their_preparation_requests_per_layer(
+    monkeypatch,
+) -> None:
+    """GLM builds one C4 indexer per sparse layer without a prefixed k_cache.
+
+    Startup preparation rejects the whole model when two requests share a name,
+    so each indexer must carry its layer's prefix into its request names.
+    """
+    from vllm.models.deepseek_v4.nvidia import b12x_indexer as c4
+
+    monkeypatch.setattr(c4, "_require_b12x_indexer", lambda: SimpleNamespace())
+
+    def make(k_cache, prefix=None):
+        return c4.B12xC4SparseIndexer(
+            k_cache,
+            quant_block_size=128,
+            scale_fmt="ue8m0",
+            topk_tokens=4,
+            head_dim=128,
+            max_model_len=64,
+            max_total_seq_len=64,
+            topk_indices_buffer=torch.empty((8, 4), dtype=torch.int32),
+            skip_k_cache_insert=True,
+            compress_ratio=4,
+            prefix=prefix,
+        )
+
+    first = make(None, prefix="model.layers.3.self_attn.indexer")
+    second = make(None, prefix="model.layers.7.self_attn.indexer")
+
+    assert first._request_name("decode", 1) == (
+        "model.layers.3.self_attn.indexer.c4_indexer.decode.m1"
+    )
+    assert first._request_name("decode", 1) != second._request_name("decode", 1)
+
+    prefixed_cache = make(SimpleNamespace(prefix="layers.1.attn", kv_cache=None))
+    assert prefixed_cache._request_name("prefill", 8) == (
+        "layers.1.attn.c4_indexer.prefill.m8"
+    )

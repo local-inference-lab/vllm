@@ -86,7 +86,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
-from vllm.utils.b12x import get_b12x_mhc
+from vllm.utils.b12x import get_b12x_mhc, set_b12x_preparation_provider
 
 from . import l2_prefetch as _l2pf
 from .attention import Glm5NextMLAAttention
@@ -435,6 +435,9 @@ class Glm5NextDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        # Read by process_b12x_weights_after_loading on every decoder layer,
+        # including the non-mHC and MTP layers that never build one.
+        self._b12x_mhc = None
         if self.mhc and not is_mtp_layer:
             # mhc config
             self.mhc_num_residual_streams = config.mhc_num_residual_streams
@@ -476,14 +479,16 @@ class Glm5NextDecoderLayer(nn.Module):
             self.mhc_pre_op = MHCPreOp()
             self.mhc_post_op = MHCPostOp()
             self.mhc_fused_post_pre_op = MHCFusedPostPreOp()
-            self._b12x_mhc = None
             if (
                 current_platform.is_cuda()
                 and current_platform.is_device_capability_family(120)
             ):
                 b12x_mhc = get_b12x_mhc()
                 if b12x_mhc is not None and b12x_mhc.is_supported():
-                    from vllm.models.deepseek_v4.nvidia.b12x import B12xMHCResidual
+                    from vllm.models.deepseek_v4.nvidia.b12x import (
+                        B12xMHCResidual,
+                        MHCOperands,
+                    )
 
                     self._b12x_mhc = B12xMHCResidual(
                         hidden_size=self.hidden_size,
@@ -491,7 +496,24 @@ class Glm5NextDecoderLayer(nn.Module):
                         rms_eps=self.rms_norm_eps,
                         hc_eps=self.hc_eps,
                         sinkhorn_iters=self.mhc_sinkhorn_iterations,
+                        # GLM runs both fused post-pre kernels without a BF16
+                        # FFN projection, under its own norm names. The one
+                        # post_pre plan serves the attention and FFN sides:
+                        # both norms use config.rms_norm_eps, and b12x rejects
+                        # a runtime eps that differs from the planned one.
+                        operands=MHCOperands(
+                            attn_norm="input_layernorm",
+                            ffn_norm="post_attention_layernorm",
+                            ffn_fn_bf16=None,
+                        ),
                     )
+
+    def process_b12x_weights_after_loading(self) -> None:
+        # Runs after Glm5NextModel.finalize_mhc_broadcast_weights(), so the
+        # first layer's published broadcast projection is visible to
+        # preparation, which declares ``pre`` only where it exists.
+        if self._b12x_mhc is not None:
+            set_b12x_preparation_provider(self, self._b12x_mhc)
 
     def forward(
         self,
@@ -1004,7 +1026,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         first_layer = self.layers[self.start_layer]
         if (
             not isinstance(first_layer, Glm5NextDecoderLayer)
-            or getattr(first_layer, "_b12x_mhc", None) is None
+            or first_layer._b12x_mhc is None
         ):
             return
         broadcast = (
@@ -1016,6 +1038,11 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             first_layer.hc_attn_fn_broadcast = broadcast
         else:
             first_layer.hc_attn_fn_broadcast.copy_(broadcast)
+
+    def process_b12x_weights_after_loading(self) -> None:
+        for layer in self.layers[self.start_layer : self.end_layer]:
+            if isinstance(layer, Glm5NextDecoderLayer):
+                layer.process_b12x_weights_after_loading()
 
     def update_max_model_len(self, max_model_len: int) -> None:
         for module in self.modules():
@@ -1385,6 +1412,8 @@ class Glm5NextForCausalLM(
 
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mhc_broadcast_weights()
+        # Register mHC preparation only after the broadcast projection exists.
+        self.model.process_b12x_weights_after_loading()
 
 
 @MULTIMODAL_REGISTRY.register_processor(
