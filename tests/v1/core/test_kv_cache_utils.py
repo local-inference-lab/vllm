@@ -46,6 +46,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheConfig,
@@ -2256,6 +2257,70 @@ def test_group_and_unify_kv_cache_specs_mixed_page_size_groups():
     assert len(grouped) == 2
     layer_names = {name for g in grouped for name in g.kv_cache_specs}
     assert layer_names == {"mla.0", "mla.1", "swa.0"}
+
+
+@pytest.mark.parametrize("draft", [False, True])
+def test_ds41_dcp_tuple_packing_keeps_replicated_index_separate(draft):
+    """Mixed ownership must retain packed pages rather than force eight groups."""
+    specs = {}
+    for source, ratio in enumerate((2, 2, 2, 1)):
+        specs[f"main.{source}"] = MLAAttentionSpec(
+            block_size=256, num_kv_heads=1, head_size=512,
+            state_content_bytes=288, dtype=torch.uint8,
+            tokens_per_state=ratio, cache_dtype_str="b12x_dsv41",
+        )
+        specs[f"index.{source}"] = MLAAttentionSpec(
+            block_size=256, num_kv_heads=1, head_size=68,
+            state_content_bytes=68, dtype=torch.uint8,
+            tokens_per_state=ratio, cache_dtype_str="b12x_dsv41",
+            dcp_replicated=True,
+        )
+        if ratio == 2:
+            specs[f"state.{source}"] = CircularBufferSpec(
+                block_size=8, num_kv_heads=1, head_size=1024,
+                head_size_v=0, dtype=torch.float32, dcp_replicated=True,
+            )
+    for layer in range(40 + 3 * draft):
+        private = layer >= 20
+        specs[f"swa.{layer}"] = SlidingWindowMLASpec(
+            block_size=128, num_kv_heads=1, head_size=512,
+            state_content_bytes=528, dtype=torch.uint8,
+            tokens_per_state=1, cache_dtype_str="b12x_dsv41",
+            dcp_replicated=True, sliding_window=128,
+            extra_retained_tokens=int(layer >= 40),
+            prefix_cache_enabled=not private,
+            prefill_replay_window=128 if private else 0,
+        )
+    config = _grouping_config()
+    config.model_config = SimpleNamespace(max_model_len=540672)
+    config.parallel_config = SimpleNamespace(decode_context_parallel_size=4)
+    config.max_in_flight_tokens = 4096
+    groups = get_kv_cache_groups(config, specs)
+    full_groups = [
+        group for group in groups
+        if any(name.startswith("main.") or name.startswith("index.")
+               for name in group.layer_names)
+    ]
+    assert len(full_groups) == 2
+    assert {frozenset(group.layer_names) for group in full_groups} == {
+        frozenset(name for name in specs if name.startswith("main.")),
+        frozenset(name for name in specs if name.startswith("index.")),
+    }
+    assert {name for group in groups for name in group.layer_names} == set(specs)
+    scheduler = generate_scheduler_kv_cache_config([
+        KVCacheConfig(num_blocks=100000, kv_cache_tensors=[], kv_cache_groups=groups,
+                      prefix_cache_retention_interval=0)
+    ])
+    for group in scheduler.kv_cache_groups:
+        if group.layer_names[0].startswith("main."):
+            assert not group.kv_cache_spec.dcp_replicated
+            assert group.kv_cache_spec.max_num_blocks_per_req(config, 540672) == 528
+        elif group.layer_names[0].startswith("index."):
+            assert group.kv_cache_spec.dcp_replicated
+            assert group.kv_cache_spec.max_num_blocks_per_req(config, 540672) == 2112
+    packed_cost = kv_cache_utils._get_kv_cache_group_allocation_cost(config, groups)
+    forced_groups = kv_cache_utils._get_weighted_shared_pool_kv_cache_groups(config, specs)
+    assert packed_cost < kv_cache_utils._get_kv_cache_group_allocation_cost(config, forced_groups)
 
 
 @pytest.mark.parametrize(

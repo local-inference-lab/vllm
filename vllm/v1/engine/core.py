@@ -347,7 +347,7 @@ class EngineCore:
             )
             update_kv_cache_capacity(vllm_config, scheduler_kv_cache_config)
 
-        vllm_config.validate_block_size()
+        vllm_config.validate_block_size(kv_cache_groups)
 
         self.model_executor.initialize_from_config(kv_cache_configs)
         if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:

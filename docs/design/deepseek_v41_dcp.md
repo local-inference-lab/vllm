@@ -11,6 +11,10 @@ on `9e90d60f0cc8f204aa2fd219ed9b6abee32de7d8`). No upstream PR is submitted.
   divisible by the compression ratio; the tested stripe is 128 tokens.
 - Index KV, SWA and private compressor state are replicated. Existing native
   global Full/Reindex/Reuse candidate selection is unchanged.
+- Tuple packing keeps replicated index and sharded main MLA in distinct full
+  groups. Stripe validation uses physical sharded pages, not the replicated
+  compressor ring's scheduling granularity. Shared exchange preparation is
+  exposed by one stable layer helper in both preparation stages.
 - Global selected IDs are masked/remapped into each owner's local main cache.
 - Native B12X PCIe head gather expands TP-local queries within the DCP group.
   Native compressed MLA returns partial output and natural-log LSE. B12X LSE
@@ -40,6 +44,10 @@ attention semantics, includes empty owners and a physical address span above
 2 GiB, and asserts stable allocated memory during replay. Maximum observed
 absolute output difference was 0.007812 (BF16 output, rtol 0.03/atol 0.01).
 This does not qualify full-model output, long-context quality or performance.
+
+Additional regression gates: 15 ownership/metadata graph tests, five shared
+channel/declaration tests, and 12 allocator/configuration tests passed. The
+allocator suite includes target-plus-draft layouts and existing GLM cases.
 
 ## Serving configuration under qualification
 

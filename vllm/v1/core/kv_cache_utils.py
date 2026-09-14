@@ -1796,7 +1796,7 @@ def group_and_unify_kv_cache_specs(
     if len(page_sizes) <= 1:
         return None
 
-    mla_specs: dict[str, KVCacheSpec] = {}
+    mla_specs: dict[bool, dict[str, KVCacheSpec]] = defaultdict(dict)
     grouped_swa_mla_specs: dict[
         tuple[int, int, int, bool, bool, int], dict[str, KVCacheSpec]
     ] = defaultdict(dict)
@@ -1814,7 +1814,7 @@ def group_and_unify_kv_cache_specs(
                 )
             ][name] = spec
         elif isinstance(spec, MLAAttentionSpec):
-            mla_specs[name] = spec
+            mla_specs[spec.dcp_replicated][name] = spec
         elif isinstance(spec, CircularBufferSpec):
             circular_specs[spec.block_size][name] = spec
         else:
@@ -1822,9 +1822,12 @@ def group_and_unify_kv_cache_specs(
 
     if not mla_specs:
         return None
-    mla_uniform_spec = UniformTypeKVCacheSpecs.from_specs(mla_specs)
-    if mla_uniform_spec is None:
-        return None
+    mla_uniform_specs = []
+    for spec_dict in mla_specs.values():
+        uniform_spec = UniformTypeKVCacheSpecs.from_specs(spec_dict)
+        if uniform_spec is None:
+            return None
+        mla_uniform_specs.append(uniform_spec)
 
     swa_uniform_specs: list[UniformTypeKVCacheSpecs] = []
     for spec_dict in grouped_swa_mla_specs.values():
@@ -1837,7 +1840,7 @@ def group_and_unify_kv_cache_specs(
         uniform_spec = UniformTypeKVCacheSpecs.from_specs(spec_dict)
         assert uniform_spec is not None
         local_specs.append(uniform_spec)
-    return [mla_uniform_spec, *local_specs]
+    return [*mla_uniform_specs, *local_specs]
 
 
 def group_dcp_replicated_draft_kv_cache_specs(
@@ -1922,17 +1925,22 @@ def _get_kv_cache_groups_uniform_groups(
     assert len(grouped_specs) > 0 and all(
         isinstance(spec, UniformTypeKVCacheSpecs) for spec in grouped_specs
     )
-    # For now, we restrict the first grouped_spec to be UniformTypeKVCacheSpecs
-    # containing only MLAAttentionSpec.
-    full_mla_spec = grouped_specs[0]
-    assert all(
-        isinstance(spec, MLAAttentionSpec)
-        for spec in full_mla_spec.kv_cache_specs.values()
-    )
-    full_mla_group = KVCacheGroupSpec(
-        layer_names=list(full_mla_spec.kv_cache_specs.keys()),
-        kv_cache_spec=full_mla_spec,
-    )
+    num_full_groups = 0
+    for group in grouped_specs:
+        if not all(
+            isinstance(spec, MLAAttentionSpec)
+            and not isinstance(spec, SlidingWindowMLASpec)
+            for spec in group.kv_cache_specs.values()
+        ):
+            break
+        num_full_groups += 1
+    assert num_full_groups > 0
+    full_mla_groups = [
+        KVCacheGroupSpec(
+            layer_names=list(spec.kv_cache_specs), kv_cache_spec=spec
+        )
+        for spec in grouped_specs[:num_full_groups]
+    ]
 
     # We define a layer tuple as a group of layers with different page sizes, and
     # one UniformTypeKVCacheSpecs contains a list of layer tuples.
@@ -1946,14 +1954,15 @@ def _get_kv_cache_groups_uniform_groups(
     ]
     # Choose `num_layer_tuples` to minimize total padding across groups.
     num_layer_tuples = _approximate_gcd(
-        num_layer_tuples_per_group, lower_bound=num_layer_tuples_per_group[0]
+        num_layer_tuples_per_group,
+        lower_bound=max(num_layer_tuples_per_group[:num_full_groups]),
     )
     # Round up to the nearest multiple of `num_layer_tuples` (i.e., padding)
     num_layer_tuples_per_group = [
         round_up(x, num_layer_tuples) for x in num_layer_tuples_per_group
     ]
 
-    swa_mla_specs = grouped_specs[1:]
+    swa_mla_specs = grouped_specs[num_full_groups:]
     assert all(
         isinstance(spec, (SlidingWindowMLASpec, CircularBufferSpec))
         for group in swa_mla_specs
@@ -1997,7 +2006,7 @@ def _get_kv_cache_groups_uniform_groups(
                 )
             )
 
-    return [full_mla_group, *swa_mla_groups]
+    return [*full_mla_groups, *swa_mla_groups]
 
 
 def _annotate_eagle_groups_deepseek_v4(
