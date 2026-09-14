@@ -77,17 +77,25 @@ def test_dcp_nonowner_queries_survive_compressed_slot_ownership(
 @cuda
 @pytest.mark.parametrize("world", [2, 4])
 def test_dcp_global_topk_partitions_without_duplicates(world):
-    """Global candidate order is retained, with foreign owners masked out."""
+    """Compact owned IDs in selected order and honor each global live length."""
     from vllm.models.deepseek_v4_1.dcp import local_indices
 
-    selected = torch.arange(512, dtype=torch.int32, device="cuda").view(1, 512)
-    selected[0, -1] = -1
+    selected = torch.arange(511, -1, -1, dtype=torch.int32, device="cuda")
+    selected = selected.repeat(4, 1)
+    selected[:, 13] = -1
+    global_lengths = torch.tensor([0, 17, 511, 512], device="cuda", dtype=torch.int32)
     for rank in range(world):
         out = torch.empty_like(selected)
-        local_indices(selected, out, world_size=world, rank=rank, stripe=64)
+        lengths = global_lengths.clone()
+        local_indices(selected, out, lengths, world_size=world, rank=rank, stripe=64)
         owned = (selected >= 0) & (selected // 64 % world == rank)
-        expected = torch.where(owned, selected // (world * 64) * 64 + selected % 64, -1)
+        owned &= torch.arange(512, device="cuda") < global_lengths[:, None]
+        expected = torch.full_like(selected, -1)
+        for row in range(4):
+            ids = selected[row, owned[row]]
+            expected[row, :ids.numel()] = ids // (world * 64) * 64 + ids % 64
         torch.testing.assert_close(out, expected)
+        torch.testing.assert_close(lengths, owned.sum(1).int())
 
 
 def test_boundary_is_full_resolution_source_after_encoder():

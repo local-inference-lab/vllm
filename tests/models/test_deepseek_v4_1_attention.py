@@ -46,7 +46,9 @@ def test_dcp_helpers_require_loaded_channel_without_allocating_cuda_memory():
         rotary_emb=SimpleNamespace(cos_sin_cache=torch.empty(1, device="cuda")),
     )
     allocated = torch.cuda.memory_allocated()
-    with pytest.raises(PreparationResourceUnavailableError, match="after weight loading"):
+    with pytest.raises(
+        PreparationResourceUnavailableError, match="after weight loading"
+    ):
         attention._AttentionHelpers(module).get_b12x_preparation_units(module, None)
     assert torch.cuda.memory_allocated() == allocated
 
@@ -174,7 +176,9 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
 
 @pytest.mark.parametrize("compacted", [False, True])
 @pytest.mark.parametrize("dcp_size", [1, 4])
-def test_indexer_declares_bounded_score_rows_at_model_context_capacity(monkeypatch, compacted, dcp_size):
+def test_indexer_declares_bounded_score_rows_at_model_context_capacity(
+    monkeypatch, compacted, dcp_size
+):
     if not torch.cuda.is_available():
         pytest.skip("native b12x attention declarations require CUDA")
     from b12x.attention import compressed_sparse_mla as mla, dsa_indexer
@@ -205,9 +209,15 @@ def test_indexer_declares_bounded_score_rows_at_model_context_capacity(monkeypat
         kv_cache=torch.empty((1, mla.page_nbytes(256, cache_kind="swa")), dtype=torch.uint8, device=device),
     )
     main_page = 256 // module.compress_ratio
-    module.kv_cache = torch.empty((1, mla.page_nbytes(main_page, cache_kind="indexed")), dtype=torch.uint8, device=device)
+    module.kv_cache = torch.empty(
+        (1, mla.page_nbytes(main_page, cache_kind="indexed")),
+        dtype=torch.uint8, device=device,
+    )
     module.indexer = SimpleNamespace(heads=32, k_cache=SimpleNamespace(
-        kv_cache=torch.empty((1, dsa_indexer.index_mxfp4_page_bytes(main_page)), dtype=torch.uint8, device=device),
+        kv_cache=torch.empty(
+            (1, dsa_indexer.index_mxfp4_page_bytes(main_page)),
+            dtype=torch.uint8, device=device,
+        ),
     ))
     workload = B12xWorkload(
         stage="state", token_counts=(1, 7, 64, 257, 4089, 4096),

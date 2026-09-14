@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Four-rank native DS4.1 attention oracle, run with torch.distributed.run."""
 
 import os
@@ -76,8 +78,10 @@ def main():
         selected[0, 64:] = -1
         selected[1] = -1
         local = torch.empty_like(selected)
-        dcp.local_indices(selected, local, world_size=world, rank=rank, stripe=64)
+        global_lengths = torch.full((rows,), 512, device=device, dtype=torch.int32)
         lengths = torch.full((rows,), 512, device=device, dtype=torch.int32)
+        dcp.local_indices(selected, local, lengths,
+                          world_size=world, rank=rank, stripe=64)
         swa_ids = torch.arange(128, device=device, dtype=torch.int32).repeat(rows, 1)
         swa_lens = torch.full(
             (rows,), 128 if rank == 0 else 0, device=device, dtype=torch.int32
@@ -162,7 +166,7 @@ def main():
                     attn_sink=torch.full_like(sink, 5.0),
                     extra_k_cache=full,
                     extra_indices=selected,
-                    extra_topk_lengths=lengths,
+                    extra_topk_lengths=global_lengths,
                     swa_page_size=128,
                     extra_page_size=128,
                     cache_format="deepseek_v41",
@@ -174,8 +178,9 @@ def main():
                     result.float(), expected.float(), rtol=0.03, atol=0.01
                 )
                 assert torch.isfinite(result).all()
+                max_abs = (result.float() - expected.float()).abs().max().item()
                 print(
-                    f"rank={rank} {mode} {label} PASS max_abs={(result.float() - expected.float()).abs().max().item():.6f}",
+                    f"rank={rank} {mode} {label} PASS max_abs={max_abs:.6f}",
                     flush=True,
                 )
 

@@ -13,6 +13,7 @@ from vllm.utils.b12x import B12xPreparationUnit
 def _local_indices(
     Indices,
     Out,
+    Lengths,
     DCP: tl.constexpr,
     RANK: tl.constexpr,
     STRIPE: tl.constexpr,
@@ -20,17 +21,24 @@ def _local_indices(
 ):
     row = tl.program_id(0).to(tl.int64)
     col = tl.arange(0, B)
+    length = tl.load(Lengths + row)
     pos = tl.load(Indices + row * 512 + col, col < 512, other=-1)
-    owned = (pos >= 0) & ((pos // STRIPE) % DCP == RANK)
+    owned = (col < length) & (pos >= 0) & ((pos // STRIPE) % DCP == RANK)
+    # Compact in the global selection's order, not local numerical-ID order.
+    order = tl.sort(tl.where(owned, col, 512 + col), descending=False)
+    pos = tl.load(Indices + row * 512 + tl.minimum(order, 511), order < 512,
+                  other=-1)
     local = pos // (STRIPE * DCP) * STRIPE + pos % STRIPE
-    tl.store(Out + row * 512 + col, tl.where(owned, local, -1), col < 512)
+    tl.store(Out + row * 512 + col, tl.where(order < 512, local, -1), col < 512)
+    tl.store(Lengths + row, tl.sum(owned.to(tl.int32), axis=0))
 
 
-def local_indices(indices, out, *, world_size, rank, stripe):
-    """Preserve selected order, masking positions owned by other ranks."""
+def local_indices(indices, out, lengths, *, world_size, rank, stripe):
+    """Compact owned selections and replace global lengths with local counts."""
     _local_indices[(indices.shape[0],)](
         indices,
         out,
+        lengths,
         world_size,
         rank,
         stripe,

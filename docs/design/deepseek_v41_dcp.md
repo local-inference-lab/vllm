@@ -27,7 +27,8 @@ on `9e90d60f0cc8f204aa2fd219ed9b6abee32de7d8`). No upstream PR is submitted.
 
 ## Tests performed on cn4
 
-Four RTX PRO 6000 Max-Q, SM120, stock operating settings; cn3 was untouched.
+Four RTX PRO 6000 Workstation GPUs, SM120, existing 300 W power limits and
+13365 MHz memory clocks preserved; cn3 was untouched.
 
 ```bash
 /opt/venv/bin/python -m pytest \
@@ -48,6 +49,12 @@ This does not qualify full-model output, long-context quality or performance.
 Additional regression gates: 15 ownership/metadata graph tests, five shared
 channel/declaration tests, and 12 allocator/configuration tests passed. The
 allocator suite includes target-plus-draft layouts and existing GLM cases.
+The final startup-reservation regression run passes 18 focused cases, including
+all declared index regimes after workspace locking. Full-model API checks pass
+arithmetic, explicit history, vision and repeated-prefix reuse (27648 cached
+tokens of a 28725-token request). Initial no-speculation LIL decode rates are
+C1 100.3 and C4 221.2 aggregate tok/s; these are not DSpark results or a matched
+DCP1 comparison.
 
 ## Serving configuration under qualification
 

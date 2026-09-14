@@ -1373,6 +1373,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             local_indices(
                 kwargs["indexed_indices"],
                 indices[:rows],
+                top_lengths[:rows],
                 world_size=self.dcp_size,
                 rank=self.dcp_rank,
                 stripe=self.dcp_stripe // self.compress_ratio,

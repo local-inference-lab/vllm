@@ -2319,8 +2319,13 @@ def test_ds41_dcp_tuple_packing_keeps_replicated_index_separate(draft):
             assert group.kv_cache_spec.dcp_replicated
             assert group.kv_cache_spec.max_num_blocks_per_req(config, 540672) == 2112
     packed_cost = kv_cache_utils._get_kv_cache_group_allocation_cost(config, groups)
-    forced_groups = kv_cache_utils._get_weighted_shared_pool_kv_cache_groups(config, specs)
-    assert packed_cost < kv_cache_utils._get_kv_cache_group_allocation_cost(config, forced_groups)
+    forced_groups = kv_cache_utils._get_weighted_shared_pool_kv_cache_groups(
+        config, specs
+    )
+    forced_cost = kv_cache_utils._get_kv_cache_group_allocation_cost(
+        config, forced_groups
+    )
+    assert packed_cost < forced_cost
 
 
 @pytest.mark.parametrize(

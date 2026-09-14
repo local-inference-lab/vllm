@@ -1802,7 +1802,9 @@ def test_validate_mamba_align_subblock_prefill():
 
 
 @pytest.mark.parametrize("sharded_block_size,valid", [(256, True), (64, False)])
-def test_validate_dcp_stripes_ignore_replicated_compressor_ring(sharded_block_size, valid):
+def test_validate_dcp_stripes_ignore_replicated_compressor_ring(
+    sharded_block_size, valid
+):
     """Scheduling granularity is not the physical sharded attention page."""
     config = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=8, mamba_cache_mode="none"),
@@ -1813,7 +1815,9 @@ def test_validate_dcp_stripes_ignore_replicated_compressor_ring(sharded_block_si
         ),
     )
     groups = [
-        SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=8, dcp_replicated=True)),
+        SimpleNamespace(kv_cache_spec=SimpleNamespace(
+            block_size=8, dcp_replicated=True
+        )),
         SimpleNamespace(kv_cache_spec=SimpleNamespace(
             block_size=sharded_block_size, dcp_replicated=False
         )),
