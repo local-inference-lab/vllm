@@ -8,13 +8,11 @@ import pytest
 import torch
 
 
-def test_shared_dcp_channel_registers_one_preparation_provider(monkeypatch):
+def test_shared_dcp_channel_exposes_one_unit_in_each_preparation_stage(monkeypatch):
     """Layer reuse must not produce conflicting collective request names."""
     from vllm.models.deepseek_v4_1 import dcp
-    from vllm.utils import b12x
 
     monkeypatch.setattr(dcp.DCPExchange, "_instances", {})
-    monkeypatch.setattr(b12x, "_B12X_UNIT_PROVIDERS", [])
     monkeypatch.setattr(
         dcp, "get_dcp_group", lambda: SimpleNamespace(unique_name="test-dcp")
     )
@@ -22,14 +20,18 @@ def test_shared_dcp_channel_registers_one_preparation_provider(monkeypatch):
 
     def init(self, group, heads, device):
         self.unit = unit
+        self._preparation_owner = None
 
     monkeypatch.setattr(dcp.DCPExchange, "__init__", init)
     first = dcp.DCPExchange.get(16, torch.device("cuda", 0))
-    for _ in range(40):
-        assert dcp.DCPExchange.get(16, torch.device("cuda", 0)) is first
-    providers = b12x.b12x_unit_providers()
-    assert providers == [first]
-    assert providers[0].get_b12x_preparation_units(first, None) == (unit,)
+    helpers = [object() for _ in range(40)]
+    for _stage in ("weights", "state", "weights"):
+        collected = []
+        for helper in helpers:
+            exchange = dcp.DCPExchange.get(16, torch.device("cuda", 0))
+            assert exchange is first
+            collected.extend(exchange.preparation_units(helper))
+        assert collected == [unit]
 
 
 @pytest.mark.parametrize("groups,heads_per_group,rank,hidden", [(1, 1, 128, 128), (2, 8, 1024, 5120)])

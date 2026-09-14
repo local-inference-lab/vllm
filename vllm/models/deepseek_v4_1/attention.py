@@ -187,6 +187,8 @@ class _AttentionHelpers:
             name="V41AttentionHelpers", key=(attn.prefix, attn.capacity),
             requests=tuple(requests), stage="weights", autotune=not workload.eager_only,
         ), attn._wo_preparation_unit(workload))
+        if getattr(attn, "dcp_active", False):
+            units += attn._dcp_exchange.preparation_units(self)
         return units
 
 

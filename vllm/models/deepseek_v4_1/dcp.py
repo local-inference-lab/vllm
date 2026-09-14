@@ -6,7 +6,7 @@ import torch
 
 from vllm.distributed import get_dcp_group
 from vllm.triton_utils import tl, triton
-from vllm.utils.b12x import B12xPreparationUnit, register_b12x_unit_provider
+from vllm.utils.b12x import B12xPreparationUnit
 
 
 @triton.jit
@@ -50,11 +50,13 @@ class DCPExchange:
         key = (group.unique_name, local_heads, device)
         if key not in cls._instances:
             cls._instances[key] = cls(group, local_heads, device)
-            register_b12x_unit_provider(cls._instances[key])
         return cls._instances[key]
 
-    def get_b12x_preparation_units(self, provider, workload):
-        return (self.unit,)
+    def preparation_units(self, owner):
+        """The first layer helper exposes the shared unit in every stage."""
+        if self._preparation_owner is None:
+            self._preparation_owner = owner
+        return (self.unit,) if self._preparation_owner is owner else ()
 
     def __init__(self, group, local_heads, device):
         from b12x.comm import pcie
@@ -70,6 +72,7 @@ class DCPExchange:
             stream_affine=False,
         )
         self.plans = {}
+        self._preparation_owner = None
         requests = []
         # The channel owns maximum-capacity storage; priming runs one row.
         for operation in ("all_gather_heads", "lse_reduce_scatter"):
