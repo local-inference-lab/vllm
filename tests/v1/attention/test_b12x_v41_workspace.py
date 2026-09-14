@@ -1192,6 +1192,7 @@ def test_metadata_refresh_preserves_padded_graph_domain_and_addresses():
     builder = DeepseekV41B12xMetadataBuilder.__new__(DeepseekV41B12xMetadataBuilder)
     builder.tokens, builder.requests = 4096, 4
     builder.page, builder.ratio, builder.circular = 128, 1, False
+    builder.dcp, builder.rank, builder.stripe, builder.replicated = 1, 0, 1, False
     builder.reorder_batch_threshold = 6
     builder.starts = torch.empty(5, dtype=torch.int32, device=device)
     builder.request_positions = torch.empty(4, dtype=torch.int64, device=device)

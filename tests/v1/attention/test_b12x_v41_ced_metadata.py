@@ -20,6 +20,76 @@ from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+@cuda
+@pytest.mark.parametrize("world,rank", [(2, 0), (2, 1), *[(4, r) for r in range(4)]])
+@pytest.mark.parametrize("replicated", [False, True])
+def test_dcp_nonowner_queries_survive_compressed_slot_ownership(
+    world, rank, replicated
+):
+    """Queries remain global while only complete, owned states are written."""
+    from vllm.models.deepseek_v4_1.sparse_mla import _tokens
+
+    starts = torch.tensor([0, 10], dtype=torch.int32, device="cuda")
+    seq = torch.tensor([135], dtype=torch.int32, device="cuda")
+    table = torch.tensor([[7, 9]], dtype=torch.int32, device="cuda")
+    inputs = torch.full((16,), -1, dtype=torch.int64, device="cuda")
+    outputs = [
+        torch.empty(16, dtype=dtype, device="cuda")
+        for dtype in (torch.int64, torch.int32, torch.int64, torch.int32)
+    ]
+    _tokens[(1,)](
+        starts,
+        seq,
+        table,
+        inputs,
+        *outputs,
+        1,
+        16,
+        2,
+        2,
+        16,
+        128,
+        2,
+        128,
+        False,
+        world,
+        rank,
+        128,
+        replicated,
+    )
+    pos = torch.arange(125, 135, device="cuda")
+    local = pos if replicated else pos // (world * 128) * 128 + pos % 128
+    owned = (
+        torch.ones_like(pos, dtype=torch.bool)
+        if replicated
+        else pos // 128 % world == rank
+    )
+    slots = 7 * 128 + local // 2
+    slots = torch.where(owned & ((pos + 1) % 2 == 0), slots, -1)
+    torch.testing.assert_close(outputs[0][:10], pos)
+    torch.testing.assert_close(outputs[2][:10], slots)
+    assert outputs[1][:10].tolist() == [0] * 10
+    torch.testing.assert_close(outputs[3][:10], ((pos + 1) // 2).int())
+    assert outputs[0][10:].tolist() == [-1] * 6
+    assert outputs[2][10:].tolist() == [-1] * 6
+
+
+@cuda
+@pytest.mark.parametrize("world", [2, 4])
+def test_dcp_global_topk_partitions_without_duplicates(world):
+    """Global candidate order is retained, with foreign owners masked out."""
+    from vllm.models.deepseek_v4_1.dcp import local_indices
+
+    selected = torch.arange(512, dtype=torch.int32, device="cuda").view(1, 512)
+    selected[0, -1] = -1
+    for rank in range(world):
+        out = torch.empty_like(selected)
+        local_indices(selected, out, world_size=world, rank=rank, stripe=64)
+        owned = (selected >= 0) & (selected // 64 % world == rank)
+        expected = torch.where(owned, selected // (world * 64) * 64 + selected % 64, -1)
+        torch.testing.assert_close(out, expected)
+
+
 def test_boundary_is_full_resolution_source_after_encoder():
     config = SimpleNamespace(
         num_hidden_layers=40,

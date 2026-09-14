@@ -8,6 +8,7 @@ from typing import ClassVar
 import torch
 
 from vllm.config import CacheConfig
+from vllm.distributed import get_dcp_group
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -53,6 +54,10 @@ def _tokens(
     RATIO: tl.constexpr,
     B: tl.constexpr,
     CIRCULAR: tl.constexpr = False,
+    DCP: tl.constexpr = 1,
+    RANK: tl.constexpr = 0,
+    STRIPE: tl.constexpr = 1,
+    REPLICATED: tl.constexpr = False,
 ):
     t = tl.program_id(0) * B + tl.arange(0, B)
     lo = tl.full((B,), 0, tl.int32)
@@ -70,16 +75,24 @@ def _tokens(
     seq = tl.load(Seq + lo, valid, other=0)
     pos = seq.to(tl.int64) - (end - start) + t - start
     input_slot = tl.load(InputSlots + t, t < nt, other=-1)
-    valid = valid & (pos >= 0) & (input_slot >= 0)
+    valid = valid & (pos >= 0)
+    if DCP == 1:
+        valid = valid & (input_slot >= 0)
     logical = pos // RATIO
+    if DCP > 1 and not REPLICATED:
+        logical = (pos // (DCP * STRIPE) * STRIPE + pos % STRIPE) // RATIO
     page_col = tl.full((B,), 0, tl.int64) if CIRCULAR else logical // PAGE
-    valid = valid & (page_col < table_width)
-    block = tl.load(Table + lo.to(tl.int64) * stride + page_col, valid, other=0).to(
-        tl.int64
-    )
-    valid = valid & (block > 0)
+    addressable = valid & (page_col < table_width)
+    block = tl.load(
+        Table + lo.to(tl.int64) * stride + page_col, addressable, other=0
+    ).to(tl.int64)
+    addressable = addressable & (block > 0)
+    if DCP == 1 or REPLICATED:
+        valid = addressable
     slot = block * PAGE + logical % PAGE
-    emit = valid & ((pos + 1) % RATIO == 0)
+    emit = addressable & ((pos + 1) % RATIO == 0)
+    if DCP > 1 and not REPLICATED:
+        emit = emit & ((pos // STRIPE) % DCP == RANK)
     if CIRCULAR:
         # Only the final capacity rows may write: earlier rows would race
         # later writers to the same ring slots during a long prefill.
@@ -172,12 +185,20 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        self._init_reorder_batch_threshold(
+            1, supports_spec_as_decode=True, supports_dcp_with_varlen=True
+        )
         self.tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.requests = vllm_config.scheduler_config.max_num_seqs
         self.ratio = int(kv_cache_spec.tokens_per_state)
         self.page = int(kv_cache_spec.num_states)
         self.circular = isinstance(kv_cache_spec, CircularBufferSpec)
+        self.dcp = vllm_config.parallel_config.decode_context_parallel_size
+        self.rank = get_dcp_group().rank_in_group if self.dcp > 1 else 0
+        self.stripe = vllm_config.parallel_config.cp_kv_cache_interleave_size
+        self.replicated = kv_cache_spec.dcp_replicated
+        if self.dcp > 1 and self.stripe % self.ratio:
+            raise ValueError("DS4.1 DCP stripes must contain whole compressed states")
 
         def alloc(shape, dtype):
             return torch.empty(shape, dtype=dtype, device=device)
@@ -229,6 +250,10 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
             self.ratio,
             128,
             self.circular,
+            self.dcp,
+            self.rank,
+            self.stripe,
+            self.replicated,
         )
         return DeepseekV41B12xMetadata(
             cm.num_actual_tokens,
@@ -250,6 +275,7 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
 
 
 class DeepseekV41B12xBackend(AttentionBackend):
+    supports_dcp_replicated: ClassVar[bool] = True
     supported_dtypes = [torch.bfloat16]
     supported_kv_cache_dtypes = ["auto", "fp8", "fp8_ds_mla"]
 
