@@ -2249,6 +2249,67 @@ def test_b12x_mhc_declares_the_operations_each_layer_runs(
             mhc._plan_for("pre", 8)
 
 
+def test_b12x_mhc_keeps_plans_across_workloads(monkeypatch) -> None:
+    from vllm.models.deepseek_v4.nvidia import b12x as dsv4_b12x
+
+    hidden, mult = 64, 4
+    fake_mhc = types.SimpleNamespace(
+        MULT=mult,
+        DEFAULT_BLOCK_K=64,
+        DEFAULT_BLOCK_H=64,
+        Caps=lambda **caps: caps,
+        plan=lambda caps, *, invocation: FakePlan(dict(invocation)),
+        run_pre=None,
+        run_post=None,
+        run_post_pre=None,
+    )
+    monkeypatch.setattr(dsv4_b12x, "_require_b12x_mhc", lambda: fake_mhc)
+    _stub_b12x_preparation(monkeypatch)
+
+    fn = torch.zeros(24, mult * hidden)
+    norm = types.SimpleNamespace(weight=torch.ones(hidden), variance_epsilon=1e-6)
+    layer = types.SimpleNamespace(
+        hc_attn_fn=fn,
+        hc_ffn_fn=fn,
+        hc_attn_scale=torch.ones(3),
+        hc_ffn_scale=torch.ones(3),
+        hc_attn_base=torch.zeros(24),
+        hc_ffn_base=torch.zeros(24),
+        hc_attn_fn_broadcast=fn.view(24, mult, hidden).sum(1),
+        attn_norm=norm,
+        ffn_norm=norm,
+        hc_ffn_fn_bf16=fn.to(torch.bfloat16),
+    )
+    mhc = dsv4_b12x.B12xMHCResidual(
+        hidden_size=hidden,
+        hc_mult=mult,
+        rms_eps=1e-6,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+    )
+
+    def workload(max_tokens: int, fixed: tuple[int, ...]) -> B12xWorkload:
+        return B12xWorkload(
+            stage="weights",
+            token_counts=fixed + (max_tokens,),
+            fixed_token_counts=fixed,
+            output_dtype=torch.bfloat16,
+            max_tokens=max_tokens,
+            max_seqs=1,
+            max_model_len=max_tokens,
+        )
+
+    mhc.get_b12x_preparation_units(layer, workload(64, (8,)))
+    shared = mhc._plans[("post", 8)]
+    mhc.get_b12x_preparation_units(layer, workload(128, (16,)))
+
+    assert mhc._plans[("post", 8)] is shared
+    assert ("post", 16) in mhc._plans
+    assert ("post", 128) in mhc._plans
+    assert mhc._plan_for("post", 16) is mhc._plans[("post", 16)]
+    assert mhc._plan_for("post", 100) is mhc._plans[("post", 128)]
+
+
 @pytest.mark.parametrize("kind", ["block", "tensor"])
 def test_b12x_fp8_preparation_units_key_on_their_planned_rows(
     monkeypatch, kind: str

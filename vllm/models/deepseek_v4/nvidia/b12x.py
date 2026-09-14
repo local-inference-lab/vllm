@@ -161,7 +161,6 @@ class B12xMHCResidual:
         self._run_post = module.run_post
         self._run_post_pre = module.run_post_pre
         self._plans: dict[tuple[str, int], object] = {}
-        self._plan_key: tuple[tuple[int, ...], tuple[str, ...]] | None = None
 
         expected_hc_mult = int(module.MULT)
         if hc_mult != expected_hc_mult:
@@ -330,46 +329,44 @@ class B12xMHCResidual:
             return ()
 
         key = tuple(sorted({workload.max_tokens, *workload.fixed_token_counts}))
-        if not self._plans or self._plan_key != (key, operations):
-            plans: dict[tuple[str, int], object] = {}
-            for tokens in key:
-                for operation in operations:
-                    has_fn_bf16 = operation == "post_pre_bf16"
-                    plan_operation = "post_pre" if has_fn_bf16 else operation
-                    norm = (
-                        self._attn_norm(layer)
-                        if operation in ("pre", "post_pre")
-                        else self._ffn_norm(layer)
-                    )
-                    invocation = FrozenMapping(
-                        {
-                            "operation": plan_operation,
-                            "has_norm_weight": plan_operation != "post",
-                            "norm_weight_dtype": "bfloat16",
-                            "has_fn_bf16": has_fn_bf16,
-                            "lagged_mix": False,
-                            "bf16x2_eligible": True,
-                            "output_mode": "functional",
-                            "rms_eps": self.rms_eps,
-                            "hc_eps": self.hc_eps,
-                            "sinkhorn_iters": self.sinkhorn_iters,
-                            "norm_eps": float(norm.variance_epsilon),
-                            "block_k": self.block_k,
-                            "block_h": self.block_h,
-                        }
-                    )
-                    plans[(operation, tokens)] = self._plan_factory(
-                        self._caps(
-                            device=layer.hc_attn_fn.device,
-                            dtype=torch.bfloat16,
-                            max_tokens=tokens,
-                            hidden_size=self.hidden_size,
-                            split_k=self.split_k,
-                        ),
-                        invocation=invocation,
-                    )
-            self._plans = plans
-            self._plan_key = (key, operations)
+        for tokens in key:
+            for operation in operations:
+                if (operation, tokens) in self._plans:
+                    continue
+                has_fn_bf16 = operation == "post_pre_bf16"
+                plan_operation = "post_pre" if has_fn_bf16 else operation
+                norm = (
+                    self._attn_norm(layer)
+                    if operation in ("pre", "post_pre")
+                    else self._ffn_norm(layer)
+                )
+                invocation = FrozenMapping(
+                    {
+                        "operation": plan_operation,
+                        "has_norm_weight": plan_operation != "post",
+                        "norm_weight_dtype": "bfloat16",
+                        "has_fn_bf16": has_fn_bf16,
+                        "lagged_mix": False,
+                        "bf16x2_eligible": True,
+                        "output_mode": "functional",
+                        "rms_eps": self.rms_eps,
+                        "hc_eps": self.hc_eps,
+                        "sinkhorn_iters": self.sinkhorn_iters,
+                        "norm_eps": float(norm.variance_epsilon),
+                        "block_k": self.block_k,
+                        "block_h": self.block_h,
+                    }
+                )
+                self._plans[(operation, tokens)] = self._plan_factory(
+                    self._caps(
+                        device=layer.hc_attn_fn.device,
+                        dtype=torch.bfloat16,
+                        max_tokens=tokens,
+                        hidden_size=self.hidden_size,
+                        split_k=self.split_k,
+                    ),
+                    invocation=invocation,
+                )
 
         requests = [
             self._plans[(operation, tokens)].request(
