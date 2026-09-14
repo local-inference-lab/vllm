@@ -26,8 +26,7 @@ def _local_indices(
     owned = (col < length) & (pos >= 0) & ((pos // STRIPE) % DCP == RANK)
     # Compact in the global selection's order, not local numerical-ID order.
     order = tl.sort(tl.where(owned, col, 512 + col), descending=False)
-    pos = tl.load(Indices + row * 512 + tl.minimum(order, 511), order < 512,
-                  other=-1)
+    pos = tl.load(Indices + row * 512 + tl.minimum(order, 511), order < 512, other=-1)
     local = pos // (STRIPE * DCP) * STRIPE + pos % STRIPE
     tl.store(Out + row * 512 + col, tl.where(order < 512, local, -1), col < 512)
     tl.store(Lengths + row, tl.sum(owned.to(tl.int32), axis=0))
@@ -163,4 +162,98 @@ class DCPExchange:
             out=out,
             plan=self.plans["lse_reduce_scatter"],
             is_lse_base_on_e=True,
+        )
+
+
+class DCPKVReplica:
+    """One packed-KV transport for the full-row encoder's shared cache sources."""
+
+    _instances = {}
+
+    @classmethod
+    def get(cls, attention):
+        group = get_dcp_group()
+        device = attention.attn_sink.device
+        key = (group.unique_name, device)
+        if key not in cls._instances:
+            cls._instances[key] = cls(group, attention, device)
+        return cls._instances[key]
+
+    def __init__(self, group, attention, device):
+        from b12x.comm import pcie
+        from b12x.comm.pcie._owner_preparation import prepared_call
+        from b12x.preparation import CollectiveRequirement
+
+        self.max_tokens = (attention.max_model_len + 1) // 2
+        self.page_size = attention._main_page
+        self.runtime = pcie.PagedKvReplica.from_process_group(
+            process_group=group.cpu_group,
+            device=device,
+            max_requests=attention.config.scheduler_config.max_num_seqs,
+            max_tokens=self.max_tokens,
+            stripe_alignment=attention.dcp_stripe // 2,
+        )
+        query = pcie.query_from_runtime(
+            self.runtime,
+            surface="PagedKvReplica.replicate",
+            call=dict(
+                page_size=self.page_size,
+                stripe=attention.dcp_stripe // 2,
+                ratio=2,
+                max_tokens=self.max_tokens,
+            ),
+        )
+        self.plan = pcie.plan(query, runtime=self.runtime)
+        self._preparation_owner = attention._helpers
+
+        def prepare(state):
+            attention._prepare(device)
+            cache = torch.ones(
+                (2, self.page_size * 288), dtype=torch.uint8, device=device
+            )
+            width = (self.runtime.local_capacity + self.page_size - 1) // self.page_size
+            table = torch.ones((1, width), dtype=torch.int32, device=device)
+            positions = torch.zeros(1, dtype=torch.int64, device=device)
+            starts = torch.tensor([0, 2], dtype=torch.int32, device=device)
+            return prepared_call(
+                state,
+                cache=cache,
+                table=table,
+                positions=positions,
+                starts=starts,
+                out=attention._prefill_kv,
+                requests=1,
+                max_tokens=1,
+            )
+
+        self.unit = B12xPreparationUnit(
+            name="DS41DCPKVReplica",
+            key=(group.unique_name, self.max_tokens),
+            requests=(
+                self.plan.request(
+                    name="ds41.dcp.prefill_kv_replica",
+                    prepare_call=prepare,
+                    collective=CollectiveRequirement(
+                        key="ds41.dcp.prefill_kv_replica",
+                        ranks=tuple(group.ranks),
+                    ),
+                ),
+            ),
+            stage="weights",
+            autotune=False,
+        )
+
+    def preparation_units(self, owner):
+        return (self.unit,) if owner is self._preparation_owner else ()
+
+    def replicate(self, attention, metadata):
+        self.runtime.replicate(
+            attention.kv_cache,
+            metadata.block_table,
+            metadata.request_positions,
+            metadata.query_start_loc,
+            attention._prefill_kv,
+            plan=self.plan,
+            requests=metadata.num_reqs,
+            max_tokens=max(1, (metadata.max_seq_len + 1) // 2),
         )

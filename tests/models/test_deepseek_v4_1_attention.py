@@ -230,6 +230,8 @@ def test_indexer_declares_bounded_score_rows_at_model_context_capacity(
     module.is_ced_decoder, module.is_index_source = compacted, True
     module.n_local_heads, module.compress_ratio = 16, 1 if compacted else 2
     module.dcp_size, module.dcp_active = dcp_size, dcp_size > 1
+    module.dcp_prefill_replica = dcp_size == 4 and not compacted
+    module.is_kv_source = True
     module.layer_id = 12 if compacted else 0
     module.candidate_source_layer, module.kv_source_layer_id = 12, 0
     module._context = {module.prefix: module}
@@ -265,9 +267,14 @@ def test_indexer_declares_bounded_score_rows_at_model_context_capacity(
     assert torch.cuda.memory_allocated(device) == allocated
     assert not hasattr(module, "_dcp_exchange")
     for plan in module._attention_plans.values():
-        assert plan.query.num_q_heads == 16 * dcp_size
-        if dcp_size > 1:
+        replica = module.dcp_prefill_replica and plan.query.mode == "extend"
+        assert plan.query.num_q_heads == (16 if replica else 16 * dcp_size)
+        if dcp_size > 1 and not replica:
             assert plan.query.query_rows <= 256
+        if replica:
+            assert plan.query.query_rows == module.capacity
+            assert plan.query.max_page_table_width == 4096
+            assert not plan.query.return_lse
     assert module._main_width == 4096 // dcp_size
     assert module._index_width == 4096
     manager = WorkspaceManager(device)

@@ -3,6 +3,7 @@
 """Four-rank native DS4.1 attention oracle, run with torch.distributed.run."""
 
 import os
+import sys
 from types import SimpleNamespace
 
 import torch
@@ -15,6 +16,97 @@ from b12x.attention.compressed_sparse_mla.reference import (
 )
 from b12x.preparation import PreparationSession, PreparedCall
 from vllm.models.deepseek_v4_1 import dcp
+
+
+def check_kv_replica(device, session, coordinator):
+    """Packed bytes, recycled high pages, changing grids and serial graph reuse."""
+    from b12x.comm import pcie
+    from b12x.comm.pcie._owner_preparation import prepared_call
+    from b12x.preparation import CollectiveRequirement
+
+    rank = dist.get_rank()
+    capacity, requests, page, stripe = 1536, 2, 128, 64
+    runtime = pcie.PagedKvReplica.from_process_group(
+        process_group=dist.group.WORLD, device=device,
+        max_requests=requests, max_tokens=capacity, stripe_alignment=stripe,
+    )
+    query = pcie.query_from_runtime(
+        runtime, surface="PagedKvReplica.replicate",
+        call=dict(page_size=page, stripe=stripe, ratio=2, max_tokens=capacity),
+    )
+    plan = pcie.plan(query, runtime=runtime)
+    width = (capacity + page - 1) // page
+    out = torch.empty((requests * width + 1, page * 288), device=device, dtype=torch.uint8)
+    local_width = (runtime.local_capacity + page - 1) // page
+    base = 2**31 // (page * 288) + 3
+    cache = torch.empty((base + requests * local_width, page * 288),
+                        device=device, dtype=torch.uint8)
+    table = torch.arange(base, base + requests * local_width, device=device,
+                         dtype=torch.int32).view(requests, local_width)
+    positions = torch.zeros(requests, device=device, dtype=torch.int64)
+    starts = torch.tensor([0, 2048, 3072], device=device, dtype=torch.int32)
+    torch.manual_seed(947)
+    expected = torch.randint(0, 256, (requests, capacity, 288),
+                             device=device, dtype=torch.uint8)
+    tokens = torch.arange(capacity, device=device)
+    owned = tokens // stripe % 4 == rank
+    cache[base:].view(requests, -1, 288).copy_(expected[:, owned])
+    actual = dict(cache=cache, table=table, positions=positions, starts=starts,
+                  out=out, requests=requests, max_tokens=1024)
+    session.prepare((plan.request(
+        name="oracle.prefill_kv_replica",
+        prepare_call=lambda state: prepared_call(state, **actual),
+        collective=CollectiveRequirement(
+            key="oracle.prefill_kv_replica", ranks=tuple(range(4)),
+        ),
+    ),), coordinator=coordinator)
+
+    def run(max_tokens):
+        runtime.replicate(**{**actual, "max_tokens": max_tokens}, plan=plan)
+
+    def check(lengths=(1024, 512)):
+        records = out.view(requests * width + 1, page, 288)
+        for req, length in enumerate(lengths):
+            live = records[1 + req * width:1 + (req + 1) * width].flatten(0, 1)
+            torch.testing.assert_close(live[:length], expected[req, :length], rtol=0, atol=0)
+
+    with session.capture():
+        starts.copy_(torch.tensor([0, 126, 192], device=device, dtype=torch.int32))
+        run(64)  # 16 CTAs, then return to the 64-CTA live domain.
+        torch.cuda.synchronize()
+        check((63, 33))
+        positions.copy_(torch.tensor([2046, 0], device=device, dtype=torch.int64))
+        starts.copy_(torch.tensor([0, 2, 1026], device=device, dtype=torch.int32))
+        for max_tokens in (1024, 1280, 1536):
+            expected.bitwise_xor_(19)
+            cache[base:].view(requests, -1, 288).copy_(expected[:, owned])
+            run(max_tokens)
+            torch.cuda.synchronize()
+            check()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run(1536)
+        allocated = torch.cuda.memory_allocated(device)
+        for _ in range(3):
+            expected.bitwise_xor_(71)
+            cache[base:].view(requests, -1, 288).copy_(expected[:, owned])
+            graph.replay()
+            torch.cuda.synchronize()
+            check()
+            assert allocated == torch.cuda.memory_allocated(device)
+        graph.reset()
+        # The same physical high pages are recycled with a different logical
+        # mapping. Graphs must consume the updated table, not a prior chat's IDs.
+        table.copy_(table.flip(1))
+        cache[base:].view(requests, local_width, page, 288).copy_(
+            expected[:, owned].view(requests, local_width, page, 288).flip(1)
+        )
+        run(1024)
+        torch.cuda.synchronize()
+        check()
+    session.release(plan)
+    runtime.close()
+    print(f"rank={rank} KV replica byte-exact/high-PID/live-grids/graphs PASS", flush=True)
 
 
 def main():
@@ -42,6 +134,11 @@ def main():
     with PreparationSession(
         device=device, autotune=False, compile_workers=2
     ) as session:
+        if "--kv-replica-only" in sys.argv:
+            check_kv_replica(device, session, coordinator)
+            exchange.runtime.close()
+            dist.destroy_process_group()
+            return
         session.prepare(exchange.unit.requests, coordinator=coordinator)
         torch.manual_seed(414)
         rows, heads = 32, 64

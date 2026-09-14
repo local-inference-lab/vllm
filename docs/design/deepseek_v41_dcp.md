@@ -117,6 +117,39 @@ admission/final-record retrieval only, not long-range conversation quality.
 
 ## Serving configuration under qualification
 
+### Profile-driven packed-KV encoder prefill
+
+A bounded Kineto capture of two 4096-token worker iterations records 616 head
+gathers and 616 LSE reductions on each rank. Their combined durations are
+85-87% of summed kernel work; the kernel union is approximately 4.31s across
+a 4.42s span. Sparse prefill attention is 2.8-4.3% of summed kernel work.
+Instrumented durations are not uninstrumented benchmark results.
+
+CED changes the traffic estimate: only 18 compressed encoder layers process
+all prompt rows; the later 20 layers process compact queries. At 32K, encoder
+head exchange alone reads 54 GiB of peer data per rank. The all-38-layer
+estimate of 114 GiB is an upper bound, not the actual CED serving layout.
+
+The new DCP4 encoder-extend path replicates packed 288-byte indexed records
+after each KV-source write. Sources 2/8/14 reuse their replica until the next
+source write. Global index selection and NVFP4 bytes are unchanged. Native
+B12X attention uses the rank's original 16 heads, SWA and sink. CED and decode
+retain the existing owner-sharded gather/partial-attention/reduce path.
+
+Replica storage is declared before memory profiling: three source replicas
+plus one shared local staging slab require approximately 0.94 GiB per rank
+at max-seqs4/540672 context. No full-model KV pool capacity gain is inferred.
+A standalone one-CTA peer barrier follows completion of previous consumers;
+another follows local staging before peer reads. This avoids unsafe per-block
+reuse when live grid geometry changes, needs no host-patched graph epoch, and
+keeps one stream-ordered channel. Page/record offsets remain Int64.
+
+The first native oracle passes byte-exact reconstruction, >2 GiB physical
+pages, multiple live counts and serial graph replay without allocation growth.
+The expanded oracle additionally covers changing CTA grids, cached prefixes
+and recycled nonsequential page mappings. Final-image validation and serving
+performance are pending. This is not yet a production-qualified optimization.
+
 TP4/DCP4, 540672 context, 4096 batch budget, max-seqs 4, main/SWA pages 256/128,
 SSD Engram, native prefix caching, decode graphs enabled, prefill graphs off.
 Initial full-model bring-up disabled speculation to isolate native correctness;
