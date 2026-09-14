@@ -502,7 +502,8 @@ def test_parallel_draft_counts_reach_owners_and_collectives(monkeypatch, query_l
     target_workload = target.b12x_preparation_provider.record[-1][1]
     draft_workload = draft.b12x_preparation_provider.record[-1][1]
     collective_workload = collective.record[-1][1]
-    assert target_workload.token_counts == workload.token_counts
+    assert target_workload.token_counts == draft_workload.token_counts
+    assert target_workload.fixed_token_counts == draft_workload.fixed_token_counts
     for reqs in range(1, 9):
         for rows in (reqs, reqs * query_len):
             assert rows in draft_workload.token_counts
