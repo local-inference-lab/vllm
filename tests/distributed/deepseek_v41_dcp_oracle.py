@@ -38,9 +38,11 @@ def check_kv_replica(device, session, coordinator):
     width = (capacity + page - 1) // page
     out = torch.empty((requests * width + 1, page * 288), device=device, dtype=torch.uint8)
     local_width = (runtime.local_capacity + page - 1) // page
-    base = 2**31 // (page * 288) + 3
-    cache = torch.empty((base + requests * local_width, page * 288),
-                        device=device, dtype=torch.uint8)
+    page_stride = page * 288 + 256
+    base = 2**31 // page_stride + 3
+    storage = torch.empty((base + requests * local_width, page_stride),
+                          device=device, dtype=torch.uint8)
+    cache = storage[:, :page * 288]
     table = torch.arange(base, base + requests * local_width, device=device,
                          dtype=torch.int32).view(requests, local_width)
     positions = torch.zeros(requests, device=device, dtype=torch.int64)
@@ -50,7 +52,8 @@ def check_kv_replica(device, session, coordinator):
                              device=device, dtype=torch.uint8)
     tokens = torch.arange(capacity, device=device)
     owned = tokens // stripe % 4 == rank
-    cache[base:].view(requests, -1, 288).copy_(expected[:, owned])
+    local_records = cache[base:].view(requests, local_width, page, 288)
+    local_records.copy_(expected[:, owned].view(requests, local_width, page, 288))
     actual = dict(cache=cache, table=table, positions=positions, starts=starts,
                   out=out, requests=requests, max_tokens=1024)
     session.prepare((plan.request(
@@ -79,7 +82,7 @@ def check_kv_replica(device, session, coordinator):
         starts.copy_(torch.tensor([0, 2, 1026], device=device, dtype=torch.int32))
         for max_tokens in (1024, 1280, 1536):
             expected.bitwise_xor_(19)
-            cache[base:].view(requests, -1, 288).copy_(expected[:, owned])
+            local_records.copy_(expected[:, owned].view(requests, local_width, page, 288))
             run(max_tokens)
             torch.cuda.synchronize()
             check()
@@ -89,7 +92,7 @@ def check_kv_replica(device, session, coordinator):
         allocated = torch.cuda.memory_allocated(device)
         for _ in range(3):
             expected.bitwise_xor_(71)
-            cache[base:].view(requests, -1, 288).copy_(expected[:, owned])
+            local_records.copy_(expected[:, owned].view(requests, local_width, page, 288))
             graph.replay()
             torch.cuda.synchronize()
             check()
@@ -122,7 +125,8 @@ def main():
         ranks=list(range(world)),
     )
     dcp.get_dcp_group = lambda: group
-    exchange = dcp.DCPExchange.get(64 // world, device)
+    replica_only = "--kv-replica-only" in sys.argv
+    exchange = None if replica_only else dcp.DCPExchange.get(64 // world, device)
 
     def coordinator(progress):
         keys = [requirement.key for requirement in progress.ready_collectives]
@@ -134,11 +138,11 @@ def main():
     with PreparationSession(
         device=device, autotune=False, compile_workers=2
     ) as session:
-        if "--kv-replica-only" in sys.argv:
+        if replica_only:
             check_kv_replica(device, session, coordinator)
-            exchange.runtime.close()
             dist.destroy_process_group()
             return
+        assert exchange is not None
         session.prepare(exchange.unit.requests, coordinator=coordinator)
         torch.manual_seed(414)
         rows, heads = 32, 64

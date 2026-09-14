@@ -143,6 +143,9 @@ A standalone one-CTA peer barrier follows completion of previous consumers;
 another follows local staging before peer reads. This avoids unsafe per-block
 reuse when live grid geometry changes, needs no host-patched graph epoch, and
 keeps one stream-ordered channel. Page/record offsets remain Int64.
+The source cache's physical page stride is a runtime scalar: pooled/padded
+pages need not be contiguous across page boundaries. Only semantic 288-byte
+records are copied, never allocator padding.
 
 The first native oracle passes byte-exact reconstruction, >2 GiB physical
 pages, multiple live counts and serial graph replay without allocation growth.
