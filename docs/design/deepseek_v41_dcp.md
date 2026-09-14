@@ -186,6 +186,23 @@ and three allocation-stable graph replays with mutated inputs and poisoned
 outputs. Its plan-time CPU guard passes freezing and unsupported-geometry
 rejection. This does not establish a serving speed gain.
 
+The p18 push-gather image serves successfully. Its two6-row decode steps have
+76 gathers totaling1.675ms on rank0 (~22us/call); the prior mixed-trace decode
+window was ~80us/call. This is a scoped instrumented comparison. One20-second
+C1 cell measured123.472 tok/s,55.260 verifier steps/s, acceptance2.234; verifier
+throughput did not improve over p17. Plain TP all-reduce is now31.7% of rank0
+summed kernel work (176 calls,11.628ms), motivating the next source change.
+
+The opt-in B12X TP4 transport extends to plain DS4.1 BF16 widths5120/1280 at
+1-8 rows. It reuses the existing four-shard IPC allocation and graph epoch,
+uses posted writes/local L1-bypassing reads, and preserves the original
+rotating-rank FP32 accumulation/one BF16 rounding. Other plain routes and the
+default-off behavior are unchanged. A CPU routing/frozen-policy gate passes,
+and the bounded four-rank oracle passes eager1/6/8-row cases and three fresh,
+allocation-stable graph replays, byte-exact against both native pull and an
+independent same-order FP32 sum. No serving speedup is claimed before baking
+and measuring this identical source.
+
 TP4/DCP4, 540672 context, 4096 batch budget, max-seqs 4, main/SWA pages 256/128,
 SSD Engram, native prefix caching, decode graphs enabled, prefill graphs off.
 Initial full-model bring-up disabled speculation to isolate native correctness;

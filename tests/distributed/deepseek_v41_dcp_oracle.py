@@ -18,6 +18,81 @@ from b12x.preparation import PreparationSession, PreparedCall
 from vllm.models.deepseek_v4_1 import dcp
 
 
+def check_tp_plain_push(device, session, coordinator):
+    """Unchanged BF16/FP32 rounding against native pull and an independent sum."""
+    from b12x.comm import pcie
+    from b12x.comm.pcie._oneshot_preparation import _prepare_plain_call
+    from b12x.preparation import CollectiveRequirement
+
+    rank = dist.get_rank()
+    cases, runtimes, requests = [], [], []
+    for push in (False, True):
+        os.environ["B12X_PCIE_TP4_REMOTE_PUSH"] = "1" if push else "0"
+        runtime = pcie.OneshotAllReduce.from_process_group(
+            process_group=dist.group.WORLD, device=device,
+            max_input_bytes=84 * 1024, rank_data_bytes=64 * 1024,
+        )
+        runtimes.append(runtime)
+        for rows, hidden in ((1, 5120), (6, 5120), (8, 1280)):
+            torch.manual_seed(927 + rank)
+            inp = (torch.randn(rows, hidden, device=device) * 0.125).bfloat16()
+            inp.mul_((1e-3, 1.0, 1e3, 1e-6)[rank])
+            out = torch.empty_like(inp)
+            query = pcie.query_from_runtime(
+                runtime, surface="OneshotAllReduce.all_reduce", call={"inp": inp},
+            )
+            assert query.call["transport"] == ("tp4_remote_push" if push else "pull")
+            plan = pcie.plan(query, runtime=runtime)
+            requests.append(plan.request(
+                name=f"oracle.tp4.{push}.{rows}.{hidden}",
+                prepare_call=lambda state, inp=inp, out=out: _prepare_plain_call(
+                    state, inp=inp, out=out,
+                ),
+                collective=CollectiveRequirement(
+                    key=f"oracle.tp4.{push}.{rows}.{hidden}", ranks=tuple(range(4)),
+                ),
+            ))
+            cases.append((runtime, plan, inp, out))
+    session.prepare(requests, coordinator=coordinator)
+
+    def check_pair(index):
+        pull, push = cases[index], cases[index + 3]
+        torch.testing.assert_close(push[3], pull[3], rtol=0, atol=0)
+        peers = [None] * 4
+        dist.all_gather_object(peers, push[2].cpu())
+        expected = peers[rank].float()
+        for peer in range(1, 4):
+            expected.add_(peers[(rank + peer) % 4].float())
+        torch.testing.assert_close(push[3].cpu(), expected.bfloat16(), rtol=0, atol=0)
+        assert push[3].abs().sum() > 0
+
+    with session.capture():
+        for index in range(3):
+            for runtime, plan, inp, out in (cases[index], cases[index + 3]):
+                runtime.all_reduce(inp, out=out, plan=plan)
+            torch.cuda.synchronize()
+            check_pair(index)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for runtime, plan, inp, out in (cases[1], cases[4]):
+                runtime.all_reduce(inp, out=out, plan=plan)
+        allocated = torch.cuda.memory_allocated(device)
+        for _ in range(3):
+            for _, _, inp, out in (cases[1], cases[4]):
+                inp.add_(0.125)
+                out.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated(device) == allocated
+            check_pair(1)
+        graph.reset()
+    for _, plan, _, _ in cases:
+        session.release(plan)
+    for runtime in runtimes:
+        runtime.close()
+    print(f"rank={rank} TP4 plain push native-pull/FP32-rounding/fresh-graphs PASS", flush=True)
+
+
 def check_kv_replica(device, session, coordinator):
     """Packed bytes, recycled high pages, changing grids and serial graph reuse."""
     from b12x.comm import pcie
@@ -138,7 +213,11 @@ def main():
     )
     dcp.get_dcp_group = lambda: group
     replica_only = "--kv-replica-only" in sys.argv
-    exchange = None if replica_only else dcp.DCPExchange.get(64 // world, device)
+    tp_plain_only = "--tp-plain-push-only" in sys.argv
+    exchange = (
+        None if replica_only or tp_plain_only
+        else dcp.DCPExchange.get(64 // world, device)
+    )
 
     def coordinator(progress):
         keys = [requirement.key for requirement in progress.ready_collectives]
@@ -150,6 +229,10 @@ def main():
     with PreparationSession(
         device=device, autotune=False, compile_workers=2
     ) as session:
+        if tp_plain_only:
+            check_tp_plain_push(device, session, coordinator)
+            dist.destroy_process_group()
+            return
         if replica_only:
             check_kv_replica(device, session, coordinator)
             dist.destroy_process_group()
