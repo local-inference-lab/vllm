@@ -44,7 +44,7 @@ def main():
     ) as session:
         session.prepare(exchange.unit.requests, coordinator=coordinator)
         torch.manual_seed(414)
-        rows, heads = 7, 64
+        rows, heads = 32, 64
         source = (
             torch.randn(rows, heads // world, 512, device=device) * 0.25
         ).bfloat16()

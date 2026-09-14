@@ -88,8 +88,28 @@ inside MoE workspace-shape calculation and 43.9% inside memory requirements
 the profile is not a GPU/communication latency breakdown or scored benchmark.
 MoE workspace sizing now reuses only the current prepared family's envelope,
 invalidating on parent/child preparation changes and holding only weak
-references. Its focused CPU contract regression passes; serving performance
-with this change is being measured. No native math or precision is changed.
+references. Its focused CPU contract regression passes. No native math or
+precision is changed.
+
+The post-change profile shows workspace sizing 42.9% -> 0.2% of samples and
+scratch-plan lowering 39.9% -> zero. One uncached prefill sample remained
+essentially unchanged at 1743 client / 1751 server tok/s (18.801s TTFT); this is
+not a throughput gain. Live Nsight counters, filtering samples to GR Active
+>=95% to exclude the idle tail, show SM activity 14.2-15.4%, tensor activity
+1.4-1.6%, DRAM reads 2.3-2.5% and PCIe RX/TX approximately 9.1-9.2% of metric
+peaks. An underfilled/wait-heavy collective is a hypothesis, not a measured
+per-kernel timing attribution.
+
+The existing `B12X_PCIE_DCP_BLOCK_LIMIT=64` setting was compared against
+the default 16-CTA cap. The oracle's 32 rows exercise all 64 CTAs in both
+collectives, eager and three frozen graph replays, preserving the independent
+reference tolerance and 0.007812 maximum BF16 error. This changes launch
+capacity only, not native kernel math or precision. One uncached 32770-token
+sample measured 1767 client / 1775 server tok/s and 18.54s TTFT, versus 1743
+client tok/s at 16 CTAs. The approximately 1.4% difference does not establish a
+gain from single samples. The serving configuration returns to 16 CTAs; no
+additional benchmark sweep was run. Per-kernel gather/attention/reduce timing
+is the next performance investigation, not more model-test coverage.
 
 The p12 K5 instance completed a fresh 525000-token prompt with zero cached
 tokens in 301.41s and returned the final record correctly. This qualifies
