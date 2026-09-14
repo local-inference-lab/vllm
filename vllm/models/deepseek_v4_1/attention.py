@@ -638,7 +638,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             ("extend", self.capacity),
         ):
             if dcp:
-                capacity = min(capacity, self._dcp_exchange.CHUNK)
+                from vllm.models.deepseek_v4_1.dcp import DCPExchange
+
+                capacity = min(capacity, DCPExchange.CHUNK)
             caps = mla.Caps(
                     device=device,
                     num_q_heads=heads,

@@ -130,7 +130,8 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
 
 
 @pytest.mark.parametrize("compacted", [False, True])
-def test_indexer_declares_bounded_score_rows_at_model_context_capacity(compacted):
+@pytest.mark.parametrize("dcp_size", [1, 4])
+def test_indexer_declares_bounded_score_rows_at_model_context_capacity(compacted, dcp_size):
     if not torch.cuda.is_available():
         pytest.skip("native b12x attention declarations require CUDA")
     from b12x.attention import compressed_sparse_mla as mla, dsa_indexer
@@ -144,6 +145,7 @@ def test_indexer_declares_bounded_score_rows_at_model_context_capacity(compacted
     module.capacity, module.max_model_len, module.swa_width = 4096, 1048576, 128
     module.is_ced_decoder, module.is_index_source = compacted, True
     module.n_local_heads, module.compress_ratio = 16, 2
+    module.dcp_size, module.dcp_active = dcp_size, dcp_size > 1
     module.layer_id, module.candidate_source_layer, module.kv_source_layer_id = 0, 12, 0
     module._context = {module.prefix: module}
     module.topk_indices_buffer = None
@@ -169,6 +171,13 @@ def test_indexer_declares_bounded_score_rows_at_model_context_capacity(compacted
     allocated = torch.cuda.memory_allocated(device)
     (unit,) = module.get_b12x_preparation_units(module, workload)
     assert torch.cuda.memory_allocated(device) == allocated
+    assert not hasattr(module, "_dcp_exchange")
+    for plan in module._attention_plans.values():
+        assert plan.query.num_q_heads == 16 * dcp_size
+        if dcp_size > 1:
+            assert plan.query.query_rows <= 256
+    assert module._main_width == 4096 // dcp_size
+    assert module._index_width == 4096
     assert unit.requests and all(request.collective is None for request in unit.requests)
     counts = module._preparation_token_counts(workload)
     chunks = {"decode": 64, "prefill": 256}
