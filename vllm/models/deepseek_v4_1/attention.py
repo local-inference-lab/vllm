@@ -1540,49 +1540,46 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             requests.append(self._wo_plan(rows, declaration=True).request(
                 name=f"{self.prefix}.wo.m{rows}", prepare_call=prepare, benchmark_call=prepare,
             ))
+        requests.append(self._wo_plan(self.capacity, is_prefill=True, declaration=True).request(
+            name=f"{self.prefix}.wo.prefill", prepare_call=prepare, benchmark_call=prepare,
+        ))
         return B12xPreparationUnit(
             name="V41WOProjection", key=(self.prefix, token_counts),
             requests=tuple(requests), stage="weights", autotune=not workload.eager_only,
         )
 
-    def _wo_plan(self, rows: int, *, declaration=False):
-        if rows not in self._wo_plans:
+    def _wo_plan(self, rows: int, *, is_prefill: bool = False, declaration=False):
+        key = "prefill" if is_prefill else rows
+        planned_rows = self.capacity if is_prefill else rows
+        if key not in self._wo_plans:
             if not declaration and getattr(self, "dcp_size", 1) > 1:
-                capacities = [
-                    count for count, plan in self._wo_plans.items()
-                    if count >= rows and plan.query.variable_tokens
-                    and plan.prepared is not None
-                ]
-                if capacities:
-                    return self._wo_plans[min(capacities)]
+                kind = "prefill" if is_prefill else "decode"
                 raise PreparationResourceUnavailableError(
-                    f"DCP WO has no prepared capacity for {rows} live rows"
+                    f"DCP WO has no prepared {kind} capacity for {rows} live rows"
                 )
             weights = self._wo_projection_weights
             if weights is None:
                 raise PreparationResourceUnavailableError("V4.1 WO weights are not packed")
             table = self.rotary_emb.cos_sin_cache
-            self._wo_plans[rows] = wo_projection.plan(
+            self._wo_plans[key] = wo_projection.plan(
                 wo_projection.Caps(
-                    device=table.device, max_tokens=rows, groups=weights.groups,
+                    device=table.device, max_tokens=planned_rows, groups=weights.groups,
                     group_width=weights.group_width, rank=weights.rank, hidden=weights.hidden,
                 ),
                 invocation=dict(
-                    operation="inv_rope",
+                    operation="inv_rope", dynamic_tokens=is_prefill,
                     heads_per_group=self.n_local_heads // self.n_local_groups,
                     nope_dim=self.head_dim - self.rope_head_dim, rope_dim=self.rope_head_dim,
                     positions_dtype="int64", cos_sin_dtype=str(table.dtype).removeprefix("torch."),
-                    variable_tokens=(rows > 16 and getattr(self, "dcp_size", 1) > 1),
                 ),
             )
-        return self._wo_plans[rows]
+        return self._wo_plans[key]
 
     def _o_proj(self, o, positions, *, is_prefill=False):
         from b12x.preparation import require_prepared
 
-        del is_prefill
         rows = o.shape[0]
-        plan = self._wo_plan(rows)
+        plan = self._wo_plan(rows, is_prefill=is_prefill)
         require_prepared(plan, "gemm.wo_projection", o.device)
         weights = self._wo_projection_weights
         binding = wo_projection.bind_inv_rope(

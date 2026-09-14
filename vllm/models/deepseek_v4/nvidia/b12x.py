@@ -449,6 +449,16 @@ def _c128a_topk_width(max_model_len: int, compress_ratio: int) -> int:
     return cdiv(compressed_width, _C128A_TOPK_ALIGNMENT) * _C128A_TOPK_ALIGNMENT
 
 
+def _c128a_profile_widths(max_width: int) -> tuple[int, ...]:
+    """Widths emitted by C128 metadata's power-of-two, capacity-capped views."""
+    widths = {max_width}
+    width = _C128A_TOPK_ALIGNMENT
+    while width < max_width:
+        widths.add(width)
+        width *= 2
+    return tuple(sorted(widths))
+
+
 @cache
 def _max_q_chunks(
     max_rows: int,
@@ -764,6 +774,16 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
             out = tensor_model_parallel_all_reduce(out)
         return out
 
+    def reserve_profile_scratch(self) -> None:
+        super().reserve_profile_scratch()
+        device = self.q_norm.weight.device
+        if device.type == "cuda":
+            # Reserve every layer type before compiled profile execution can
+            # skip its attention body. This tensor describes heads/device only.
+            self._reserve_profile_workspace(
+                torch.empty((0, self.padded_heads, _DSV4_HEAD_DIM), device=device)
+            )
+
     def _get_cache_page_view(
         self,
         cache: torch.Tensor,
@@ -775,7 +795,13 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
         if view is None:
             view = _cache_page_view(cache, page_size, name)
             self._b12x_cache_page_views[key] = view
+        return view
+
     def _reserve_profile_workspace(self, q: torch.Tensor) -> None:
+        from b12x.attention.compressed_sparse_mla._scratch import (
+            plan_compressed_sparse_mla_scratch,
+        )
+
         module = _require_b12x_compressed_sparse_mla()
         indexed_width = 0
         if self.compress_ratio == 4:
@@ -789,16 +815,24 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
                 self.compress_ratio,
             )
 
-        swa_width = int(self.window_size) + self.max_image_tokens
+        indexed_widths = (
+            _c128a_profile_widths(indexed_width)
+            if self.compress_ratio > 4
+            else (indexed_width,)
+        )
+        swa_widths = {
+            int(self.window_size),
+            int(self.window_size) + self.max_image_tokens,
+        }
         speculative_config = self.vllm_config.speculative_config
         if speculative_config is not None and speculative_config.use_dspark():
-            swa_width = max(
-                swa_width,
+            swa_widths.add(
                 get_dspark_swa_index_width(
                     int(self.window_size),
                     speculative_config.num_speculative_tokens or 0,
-                ),
+                )
             )
+        swa_width = max(swa_widths)
         width = max(swa_width + indexed_width, 1)
         rows = max(int(self.max_num_batched_tokens), 1)
         decode_row_capacity = _get_dspark_decode_row_capacity(self.vllm_config)
@@ -807,13 +841,22 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
             width=width,
             decode_row_capacity=decode_row_capacity,
         )
-        max_q_chunks = _max_q_chunks(
-            rows,
-            width,
-            module.split_chunks_for_contract,
-            decode_row_capacity,
+        # Split count is not monotonic in index width: a shorter prefix may
+        # use 12-token chunks while a longer prefix uses 64-token chunks.
+        # Cover every metadata width, not only the longest supported context.
+        max_q_chunks = max(
+            _max_q_chunks(
+                rows,
+                max(swa + indexed, 1),
+                module.split_chunks_for_contract,
+                decode_row_capacity,
+            )
+            for swa in swa_widths
+            for indexed in indexed_widths
         )
-        plan = module.plan(
+        # Allocation profiling needs geometry, not an executable declaration
+        # tied to live cache storage or an autotuning preparation session.
+        plan = plan_compressed_sparse_mla_scratch(
             module.Caps(
                 device=q.device,
                 num_q_heads=int(q.shape[1]),

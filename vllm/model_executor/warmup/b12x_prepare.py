@@ -370,8 +370,8 @@ def _dump_declarations(units: Iterable[B12xPreparationUnit], workload: B12xWorkl
 def b12x_batches(units: Iterable[B12xPreparationUnit], *, autotune: bool = True):
     """Group requests: timed selection first, then default-only preparation.
 
-    With autotune disabled every request is prepared with its default or
-    cached configuration and nothing is timed.
+    With autotune disabled each rank compiles and primes its own defaults
+    or explicit pins in the calling process.
     """
     tuned, defaults = [], []
     for unit in units:
@@ -415,11 +415,12 @@ def get_b12x_session(worker: "Worker"):
         # rank it hosts.
         compile_workers=16,
     )
-    from vllm.distributed.parallel_state import get_tp_group
+    if session.autotune and os.environ.get("B12X_AUTOTUNE", "1") != "0":
+        from vllm.distributed.parallel_state import get_tp_group
 
-    tp_group = get_tp_group()
-    ranks = tuple(sorted(int(rank) for rank in tp_group.ranks))
-    session.configure_tuning_shard(int(worker.rank), ranks)
+        tp_group = get_tp_group()
+        ranks = tuple(sorted(int(rank) for rank in tp_group.ranks))
+        session.configure_tuning_shard(int(worker.rank), ranks)
     worker._b12x_session = session
     return session
 
@@ -434,7 +435,8 @@ def begin_b12x_preparation(worker: "Worker", *, stage: str):
         workload = b12x_workload(worker, stage=stage)
         batches = b12x_batches(
             collect_b12x_units(worker, workload),
-            autotune=bool(worker.vllm_config.kernel_config.enable_b12x_autotune),
+            autotune=(bool(worker.vllm_config.kernel_config.enable_b12x_autotune)
+                      and os.environ.get("B12X_AUTOTUNE", "1") != "0"),
         )
     session = get_b12x_session(worker) if batches else None
     return B12xPreparationCoordinator(

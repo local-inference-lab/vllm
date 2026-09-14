@@ -71,7 +71,6 @@ class ModelState(ABC):
         self.model = model
         self.device = device
 
-        self.max_model_len = self.model_config.max_model_len
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
         self.inputs_embeds_size = self.model_config.get_inputs_embeds_size()
@@ -110,6 +109,11 @@ class ModelState(ABC):
                     and observability_config.enable_mm_processor_stats
                 ),
             )
+
+    @property
+    def max_model_len(self) -> int:
+        """Use the worker's effective context limit, including KV auto-fit."""
+        return self.model_config.max_model_len
 
     def get_supported_generation_tasks(self) -> tuple[GenerationTask, ...]:
         from vllm.model_executor.models.interfaces import (

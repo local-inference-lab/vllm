@@ -133,6 +133,14 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.num_sampled_tokens = num_sampled_tokens
         self.routed_experts = routed_experts
         self.boundary_checkpoint_tokens = boundary_checkpoint_tokens
+        # Adaptive verification reuses its capacity buffer on the model stream.
+        # Snapshot it before handing it to the independent output-copy stream,
+        # and keep that snapshot alive until CPU delivery completes.
+        self.num_verified_draft_tokens = (
+            num_verified_draft_tokens.clone()
+            if num_verified_draft_tokens is not None
+            else None
+        )
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
         self._has_fault: torch.Tensor | None = None
@@ -156,8 +164,8 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 else None
             )
             self.num_verified_draft_tokens_np = (
-                async_copy_to_np(num_verified_draft_tokens)
-                if num_verified_draft_tokens is not None
+                async_copy_to_np(self.num_verified_draft_tokens)
+                if self.num_verified_draft_tokens is not None
                 else None
             )
             self.sampling_mask_tensors: SamplingMaskTensors | None = None

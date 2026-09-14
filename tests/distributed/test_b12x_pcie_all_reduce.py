@@ -57,6 +57,7 @@ def _make_communicator(
     communicator.twoshot_max_bytes = 0
     plan = object()
     communicator._plans = {"prepared": plan}
+    communicator._routes = {}
     communicator._invocations = {}
     communicator._plan_for = MagicMock(return_value=plan)
     return communicator, runtime
@@ -322,6 +323,52 @@ def test_capture_forwards_the_vllm_stream() -> None:
     assert not communicator._is_capturing
 
 
+@pytest.mark.parametrize("raise_inside", [False, True])
+def test_capture_passes_a_declared_twoshot_plan_and_restores_state(raise_inside):
+    communicator, runtime = _make_communicator()
+    twoshot = _attach_twoshot(communicator, max_bytes=1 << 20)
+    selected = object()
+    communicator._plans.update({"two": selected, "two_other": object()})
+    communicator._routes = {
+        "prepared": "oneshot", "two": "twoshot", "two_other": "twoshot",
+    }
+    entered = []
+
+    @contextmanager
+    def capture(*, plan):
+        assert plan is selected
+        entered.append("enter")
+        try:
+            yield
+        finally:
+            entered.append("exit")
+
+    twoshot.capture = capture
+    stream = object()
+    try:
+        with communicator.capture(stream=stream):
+            assert entered == ["enter"]
+            assert communicator._capture_stream is stream
+            assert communicator._is_capturing
+            if raise_inside:
+                raise ValueError("capture body failed")
+    except ValueError as error:
+        assert raise_inside and str(error) == "capture body failed"
+    assert entered == ["enter", "exit"]
+    assert communicator._capture_stream is None
+    assert not communicator._is_capturing
+    runtime.capture.assert_called_once_with(stream=stream)
+
+
+def test_capture_does_not_enter_twoshot_without_a_declared_route():
+    communicator, _ = _make_communicator()
+    twoshot = _attach_twoshot(communicator, max_bytes=1 << 20)
+    communicator._routes = {"prepared": "oneshot"}
+    with communicator.capture():
+        assert communicator._is_capturing
+    twoshot.capture.assert_not_called()
+
+
 def test_fused_custom_op_falls_back_atomically(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -398,34 +445,50 @@ def _run_b12x_fused_allreduce_gpu(rank: int, port: int) -> None:
         weight = torch.linspace(
             0.5, 1.5, 6144, dtype=torch.bfloat16, device=device
         )
+        alternate_weight = weight.flip(0).contiguous()
         inp = torch.full((4, 6144), rank + 1, dtype=torch.bfloat16, device=device)
         residual = torch.linspace(
             -0.5, 0.5, inp.numel(), dtype=torch.bfloat16, device=device
         ).view_as(inp)
         communicator.register_describer(
             communicator,
-            lambda requirements: (
-                b12x_pcie_all_reduce.B12xPcieInvocation(
-                    name="test.fused.4x6144",
-                    operation="all_reduce_fused_add_rms_norm",
-                    shape=(4, 6144),
-                    dtype=torch.bfloat16,
-                    norm_weight=weight,
-                    epsilon=epsilon,
-                ),
-                b12x_pcie_all_reduce.B12xPcieInvocation(
-                    name="test.dma.16x4096",
-                    operation="all_reduce",
-                    shape=(16, 4096),
-                    dtype=torch.bfloat16,
-                ),
+            lambda requirements: tuple(
+                invocation
+                for index in range(40)
+                for invocation in (
+                    b12x_pcie_all_reduce.B12xPcieInvocation(
+                        name=f"test.oneshot.1x6144.layer{index}",
+                        operation="all_reduce",
+                        shape=(1, 6144),
+                        dtype=torch.bfloat16,
+                    ),
+                    b12x_pcie_all_reduce.B12xPcieInvocation(
+                        name=f"test.fused.4x6144.layer{index}",
+                        operation="all_reduce_fused_add_rms_norm",
+                        shape=(4, 6144),
+                        dtype=torch.bfloat16,
+                        norm_weight=weight if index % 2 == 0 else alternate_weight,
+                        epsilon=epsilon,
+                    ),
+                    b12x_pcie_all_reduce.B12xPcieInvocation(
+                        name=f"test.dma.16x4096.layer{index}",
+                        operation="all_reduce",
+                        shape=(16, 4096),
+                        dtype=torch.bfloat16,
+                    ),
+                )
             ),
         )
         workload = B12xWorkload(
-            stage="weights", token_counts=(4, 16), fixed_token_counts=(),
+            stage="weights", token_counts=(1, 4, 16), fixed_token_counts=(),
             output_dtype=torch.bfloat16, max_tokens=16, max_seqs=2, max_model_len=16,
         )
         units = list(communicator.get_b12x_preparation_units(communicator, workload))
+        for prefix in ("test.oneshot.", "test.fused.", "test.dma."):
+            plans = [plan for name, plan in communicator._plans.items()
+                     if name.startswith(prefix)]
+            assert len(plans) == 40
+            assert all(plan is plans[0] for plan in plans)
         batches = b12x_batches(units)
 
         coordinator = B12xPreparationCoordinator(
@@ -448,6 +511,25 @@ def _run_b12x_fused_allreduce_gpu(rank: int, port: int) -> None:
                 reduced = tp_group.device_communicator.all_reduce(value)
                 torch.testing.assert_close(reduced, torch.full_like(value, 3 + 2 * index))
 
+        oneshot_inp = torch.full(
+            (1, 6144), rank + 1, dtype=torch.bfloat16, device=device
+        )
+        oneshot_eager = tp_group.device_communicator.all_reduce(oneshot_inp)
+        torch.testing.assert_close(oneshot_eager, torch.full_like(oneshot_eager, 3))
+        with session.capture(), graph_capture(device=device) as capture_context:
+            oneshot_graph = torch.cuda.CUDAGraph()
+            owned.callback(oneshot_graph.reset)
+            with torch.cuda.graph(oneshot_graph, stream=capture_context.stream):
+                oneshot_out = tp_group.device_communicator.all_reduce(oneshot_inp)
+        oneshot_inp.fill_(rank + 2)
+        oneshot_graph.replay()
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(oneshot_out, torch.full_like(oneshot_out, 5))
+        oneshot_inp.fill_(rank + 3)
+        oneshot_graph.replay()
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(oneshot_out, torch.full_like(oneshot_out, 7))
+
         expected, expected_residual = _reference_fused_add_rms_norm(
             inp, residual, weight, tp_group.device_group, epsilon
         )
@@ -459,6 +541,17 @@ def _run_b12x_fused_allreduce_gpu(rank: int, port: int) -> None:
         )
         torch.testing.assert_close(inp, expected, atol=2e-2, rtol=2e-2)
         torch.testing.assert_close(residual, expected_residual)
+
+        inp.copy_(original_inp)
+        residual.copy_(original_residual)
+        expected_alternate, expected_residual_alternate = _reference_fused_add_rms_norm(
+            inp, residual, alternate_weight, tp_group.device_group, epsilon
+        )
+        assert communicator.try_fused_add_rms_norm(
+            inp, residual, alternate_weight, epsilon
+        )
+        torch.testing.assert_close(inp, expected_alternate, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(residual, expected_residual_alternate)
 
         inp.copy_(original_inp)
         residual.copy_(original_residual)
@@ -619,6 +712,19 @@ def test_twoshot_respects_runtime_acceptance() -> None:
     twoshot.all_reduce.assert_not_called()
 
 
+@pytest.mark.parametrize(("tokens", "expected"), [(12, None), (16, "twoshot")])
+def test_twoshot_metadata_requires_complete_rank_shards(tokens, expected):
+    communicator, _ = _make_communicator(allreduce_max_bytes=96 << 10)
+    communicator.world_size = 4
+    twoshot = _attach_twoshot(communicator, max_bytes=768 << 10)
+    twoshot.row_elems = 4096
+    invocation = b12x_pcie_all_reduce.B12xPcieInvocation(
+        name="embedding.all_reduce",
+        operation="all_reduce",
+        shape=(tokens, 5120),
+        dtype=torch.bfloat16,
+    )
+    assert communicator._route_invocation(invocation) == expected
 
 
 def test_graph_capture_supplies_caller_owned_twoshot_output(
@@ -643,6 +749,10 @@ def test_graph_capture_supplies_caller_owned_twoshot_output(
 def _run_b12x_twoshot_gpu(
     rank: int, port: int, device_indices: tuple[int, ...]
 ) -> None:
+    from b12x.preparation import PreparationSession
+    from vllm.model_executor.warmup.b12x_prepare import b12x_batches
+    from vllm.v1.worker.b12x_startup import B12xPreparationCoordinator
+
     device_index = device_indices[rank]
     device = torch.device(f"cuda:{device_index}")
     torch.accelerator.set_device_index(device)
@@ -650,31 +760,64 @@ def _run_b12x_twoshot_gpu(
     config.model_config = MagicMock()
     config.model_config.dtype = torch.bfloat16
     config.model_config.get_hidden_size.return_value = 4096
-    with set_current_vllm_config(config):
+    with ExitStack() as owned, set_current_vllm_config(config):
         init_test_distributed_environment(
             4, 1, rank, str(port), local_rank=device_index
         )
-    tp_group = get_tp_group()
-    communicator = tp_group.device_communicator.b12x_ar_comm
-    assert communicator is not None and communicator._twoshot is not None
+        owned.callback(destroy_distributed_environment)
+        owned.callback(destroy_model_parallel)
+        session = PreparationSession(device=device, autotune=False)
+        owned.callback(session.close)
+        tp_group = get_tp_group()
+        communicator = tp_group.device_communicator.b12x_ar_comm
+        assert communicator is not None and communicator._twoshot is not None
+        communicator.register_describer(
+            communicator,
+            lambda requirements: tuple(
+                b12x_pcie_all_reduce.B12xPcieInvocation(
+                    name=f"test.twoshot.64x4096.layer{index}",
+                    operation="all_reduce", shape=(64, 4096), dtype=torch.bfloat16,
+                )
+                for index in range(40)
+            ),
+        )
+        workload = B12xWorkload(
+            stage="weights", token_counts=(64,), fixed_token_counts=(),
+            output_dtype=torch.bfloat16, max_tokens=64, max_seqs=2, max_model_len=64,
+        )
+        units = communicator.get_b12x_preparation_units(communicator, workload)
+        plans = tuple(communicator._plans.values())
+        assert len(plans) == 40 and all(plan is plans[0] for plan in plans)
+        coordinator = B12xPreparationCoordinator(
+            session, b12x_batches(units), global_rank=rank, world_group=get_world_group(),
+        )
+        while True:
+            outcome = coordinator.advance()
+            if outcome["done"]:
+                if outcome["error"] is not None:
+                    raise RuntimeError(outcome["error"])
+                break
 
-    inp = torch.full((64, 4096), rank + 1, dtype=torch.bfloat16, device=device)
-    eager_out = tp_group.device_communicator.all_reduce(inp)
-    torch.testing.assert_close(eager_out, torch.full_like(inp, 10))
+        inp = torch.full((64, 4096), rank + 1, dtype=torch.bfloat16, device=device)
+        assert communicator.should_custom_ar(inp)
+        eager_out = tp_group.device_communicator.all_reduce(inp)
+        torch.testing.assert_close(eager_out, torch.full_like(inp, 10))
 
-    with graph_capture(device=device) as capture_context:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=capture_context.stream):
-            graph_out = tp_group.device_communicator.all_reduce(inp)
-    graph_out_ptr = graph_out.data_ptr()
-    inp.fill_(rank + 2)
-    graph.replay()
-    torch.accelerator.synchronize()
-    assert graph_out.data_ptr() == graph_out_ptr
-    torch.testing.assert_close(graph_out, torch.full_like(inp, 14))
-
-    destroy_model_parallel()
-    destroy_distributed_environment()
+        with session.capture(), graph_capture(device=device) as capture_context:
+            graph = torch.cuda.CUDAGraph()
+            owned.callback(graph.reset)
+            with torch.cuda.graph(graph, stream=capture_context.stream):
+                graph_out = tp_group.device_communicator.all_reduce(inp)
+        graph_out_ptr = graph_out.data_ptr()
+        inp.fill_(rank + 2)
+        graph.replay()
+        torch.accelerator.synchronize()
+        assert graph_out.data_ptr() == graph_out_ptr
+        torch.testing.assert_close(graph_out, torch.full_like(inp, 14))
+        inp.fill_(rank + 3)
+        graph.replay()
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(graph_out, torch.full_like(inp, 18))
 
 
 @multi_gpu_test(num_gpus=4)

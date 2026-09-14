@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Cooperative control for b12x preparation before ordinary model warmup.
+"""Local preparation with complete-world exchanges at dependency boundaries.
 
-One coordinator drives one worker's preparation batches through
-complete-world rounds: each ``advance`` performs one bounded local step and
-one all-gather on a store-backed control channel isolated from model
-collectives. Ranks exchange collective readiness and the winners of their
-disjoint candidate shards; tuning keys are scoped by the sharding rank set so
-identical declarations on different pipeline stages never collide.
+Each rank completes its independent candidate shards before rank zero gathers
+all local winners and broadcasts the selected configurations. Fixed collective
+warmups have separate readiness exchanges. Progress reporting does not stop
+local work or enter model collectives.
 """
 
 from __future__ import annotations
 
 import os
+import pickle
 import time
 from contextlib import nullcontext
 
@@ -29,7 +28,7 @@ def _unscoped_key(key: str) -> str:
 
 
 class B12xPreparationCoordinator:
-    """Advance one worker's preparation batches through world-coordinated rounds."""
+    """Run local preparation and consolidate results at required boundaries."""
 
     def __init__(
         self,
@@ -59,6 +58,14 @@ class B12xPreparationCoordinator:
             self._timing = PreparationTiming("coordinator", rank=global_rank)
         self._last_advance_end = None
         self._round = 0
+        self._control = None
+        if not process_local_only and len(self.world_ranks) > 1:
+            group = _get_control_group(world_group)
+            sequence = getattr(group, "_b12x_sequence", 0)
+            group._b12x_sequence = sequence + 1
+            import torch.distributed as dist
+
+            self._control = dist.PrefixStore(f"stage-{sequence}", group.store)
         self._authorized_key: str | None = None
         self._authorized_tuning = None
         self._stop = False
@@ -103,10 +110,17 @@ class B12xPreparationCoordinator:
             self._last_advance_end = time.perf_counter()
 
     def _advance(self, *, cancel_tuning: bool = False) -> dict[str, object]:
-        """Perform one bounded local step and one complete-world exchange."""
+        """Advance locally; exchange metadata only when local work is blocked."""
         if self._closed:
             return self._outcome()
         self._stop |= bool(cancel_tuning)
+        if self._control is not None:
+            if self._stop:
+                self._control.set("stop", b"1")
+            self._stop |= self._control.check(["stop"])
+            if self._control.check(["failed"]):
+                self._error = pickle.loads(self._control.get("failed"))
+                self._safe_close()
         try:
             with (self._timing.span("local") if self._timing else nullcontext()):
                 self._advance_local()
@@ -114,6 +128,9 @@ class B12xPreparationCoordinator:
             self._record_error(error)
             self._stop = True
             self._safe_close()
+            if self._control is not None:
+                self._control.set("failed", pickle.dumps(self._error))
+                self._control.set("stop", b"1")
 
         if self.process_local_only:
             self._global_done = self._local_done or self._error is not None
@@ -123,45 +140,85 @@ class B12xPreparationCoordinator:
             self._round += 1
             return self._outcome()
 
+        if not (self._local_done or self._error or self._ready() or self._ready_tuning()):
+            return self._outcome()
+
         with (self._timing.span("control_exchange") if self._timing else nullcontext()):
-            gathered = _all_gather(self.world_group, self._payload())
-        self._validate_domain(gathered)
-        errors = [entry["error"] for entry in gathered if entry["error"]]
-        if errors:
-            self._error = min(errors, key=lambda item: int(item["rank"]))
+            decision = self._exchange()
+        if self._timing:
+            self._timing.record(
+                "exchange", round=self._round,
+                local_results=len(self._ready_tuning()),
+                selected_results=len(decision["tuning"]),
+                collective=decision["collective"], done=decision["done"],
+            )
+        self._stop |= decision["stop"]
+        if decision["error"] is not None:
+            self._error = decision["error"]
             self._stop = True
-            self._authorized_key = None
             self._safe_close()
         else:
-            self._stop |= any(bool(entry["stop"]) for entry in gathered)
-            authorization = _authorize_ready(gathered, self.world_ranks)
+            authorization = decision["collective"]
             self._authorized_key = (
                 authorization[0]
-                if authorization is not None
-                and self.global_rank in authorization[1]
+                if authorization is not None and self.global_rank in authorization[1]
                 else None
             )
-            tuning = _authorize_tuning(gathered, self.world_ranks)
-            if tuning is not None and self.global_rank in tuning[1]:
+            if self._ready_tuning():
                 from b12x.preparation import TuningRequirement
 
-                key, ranks, assignment, latency_us, candidate_index = tuning
-                self._authorized_tuning = TuningRequirement(
-                    _unscoped_key(key), ranks, assignment, latency_us, candidate_index
+                self._authorized_tuning = tuple(
+                    TuningRequirement(_unscoped_key(key), ranks, assignment, latency, index)
+                    for key, ranks, assignment, latency, index in decision["tuning"]
+                    if self.global_rank in ranks
                 )
-            else:
-                self._authorized_tuning = None
-
-        self._global_done = all(bool(entry["local_done"]) for entry in gathered)
-        if self._error is not None:
-            self._global_done = self._global_done and all(
-                bool(entry["cleanup_complete"]) for entry in gathered
-            )
+        self._global_done = decision["done"]
         if self._global_done:
             self._safe_close()
             self._closed = True
         self._round += 1
         return self._outcome()
+
+    def _exchange(self):
+        payload = self._payload()
+        if self._control is None:
+            return self._decision([payload])
+        prefix = f"round-{self._round}"
+        self._control.set(f"{prefix}/{self.global_rank}", pickle.dumps(payload))
+        if self.global_rank == self.world_ranks[0]:
+            gathered = [
+                pickle.loads(self._control.get(f"{prefix}/{rank}"))
+                for rank in self.world_ranks
+            ]
+            try:
+                decision = self._decision(gathered)
+            except Exception as error:
+                self._record_error(error)
+                decision = dict(stop=True, error=self._error, collective=None, tuning=(), done=False)
+            self._control.set(f"{prefix}/decision", pickle.dumps(decision))
+        return pickle.loads(self._control.get(f"{prefix}/decision"))
+
+    def _decision(self, gathered):
+        self._validate_domain(gathered)
+        errors = [entry["error"] for entry in gathered if entry["error"]]
+        error = min(errors, key=lambda item: int(item["rank"])) if errors else None
+        stop = error is not None or any(entry["stop"] for entry in gathered)
+        if self._control is not None:
+            stop |= self._control.check(["stop"])
+        tuning = () if stop else _authorize_tuning(gathered, self.world_ranks)
+        if not stop:
+            authorized = {item[0] for item in tuning}
+            pending = {item[0] for entry in gathered for item in entry["tuning"]}
+            if authorized != pending:
+                raise RuntimeError("preparation ranks reached incompatible tuning boundaries")
+        return dict(
+            stop=stop,
+            error=error,
+            collective=None if error else _authorize_ready(gathered, self.world_ranks),
+            tuning=tuning,
+            done=all(entry["local_done"] for entry in gathered)
+            and (error is None or all(entry["cleanup_complete"] for entry in gathered)),
+        )
 
     def abort(self) -> dict[str, object]:
         """Stop optional work and close an active local preparation job."""
@@ -318,21 +375,11 @@ def _world_ranks(world_group) -> tuple[int, ...]:
     return tuple(range(size))
 
 
-def _all_gather(
-    world_group, payload: dict[str, object]
-) -> list[dict[str, object]]:
-    if world_group is None:
-        return [payload]
-    tcp_group = getattr(world_group, "tcp_store_group", None)
-    if tcp_group is not None:
-        return list(tcp_group.all_gather_obj(payload))
-
-    control_group = _get_control_group(world_group)
-    return list(control_group.all_gather_obj(payload))
-
-
 def _get_control_group(world_group):
     """Return a store-backed channel isolated from model collectives."""
+    tcp_group = getattr(world_group, "tcp_store_group", None)
+    if tcp_group is not None:
+        return tcp_group
     cpu_group = getattr(world_group, "cpu_group", None)
     get_store = getattr(cpu_group, "get_group_store", None)
     rank = getattr(world_group, "rank_in_group", None)
@@ -404,7 +451,7 @@ def _authorize_ready(
 
 def _authorize_tuning(
     gathered: list[dict[str, object]], world_ranks: tuple[int, ...]
-) -> tuple[object, ...] | None:
+) -> tuple[tuple[object, ...], ...]:
     contributions: dict[str, list[tuple[float, int, int, object]]] = {}
     ready_by_key: dict[str, set[int]] = {}
     participants_by_key: dict[str, tuple[int, ...]] = {}
@@ -435,18 +482,12 @@ def _authorize_tuning(
         for key, ranks in participants_by_key.items()
         if ready_by_key.get(key) == set(ranks) and contributions.get(key)
     ]
-    if not choices:
-        return None
-    key = min(choices)
-    candidates = contributions[key]
-    indices = [candidate[1] for candidate in candidates]
-    if len(indices) != len(set(indices)):
-        raise RuntimeError("preparation tuning shards overlap")
-    latency_us, candidate_index, _, assignment = min(candidates)
-    return (
-        key,
-        participants_by_key[key],
-        assignment,
-        latency_us,
-        candidate_index,
-    )
+    winners = []
+    for key in sorted(choices):
+        candidates = contributions[key]
+        indices = [candidate[1] for candidate in candidates]
+        if len(indices) != len(set(indices)):
+            raise RuntimeError("preparation tuning shards overlap")
+        latency_us, candidate_index, _, assignment = min(candidates)
+        winners.append((key, participants_by_key[key], assignment, latency_us, candidate_index))
+    return tuple(winners)

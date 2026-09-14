@@ -320,7 +320,7 @@ class NgramHashState(nn.Module):
         block_table=None,
     ):
         out = torch.empty(
-            (input_ids.numel(), len(self.bindings), 24),
+            (input_ids.numel(), len(self.layout.hash_plans), 24),
             dtype=torch.int64,
             device=input_ids.device,
         )

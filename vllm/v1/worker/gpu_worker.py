@@ -507,7 +507,7 @@ class Worker(WorkerBase):
             self.model_runner.reload_weights(*args, **kwargs)
 
     def begin_b12x_preparation(self, *, stage: str = "weights") -> dict[str, object]:
-        """Collect this stage's units and start the world-coordinated rounds."""
+        """Collect this stage's units and initialize local preparation."""
         from vllm.model_executor.warmup.b12x_prepare import begin_b12x_preparation
 
         if self._b12x_startup_coordinator is not None:

@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import sys
 import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import Future
+from contextlib import contextmanager
 from dataclasses import replace
 from functools import cached_property
 from typing import TYPE_CHECKING, Literal, TypeVar, overload
@@ -38,7 +40,7 @@ _R = TypeVar("_R")
 FailureCallback = Callable[[], None]
 
 
-def _aggregate_b12x_progress(outcomes):
+def _aggregate_b12x_progress(outcomes, *, expected_ranks=None):
     ranked = sorted(
         (
             (int(outcome.get("global_rank", index)), outcome.get("progress"))
@@ -51,28 +53,19 @@ def _aggregate_b12x_progress(outcomes):
         return None
     progress = [item[1] for item in ranked]
     primary = next((item for item in progress if not item.done), progress[0])
-    same_request = all(
-        item.request_name == primary.request_name
-        and item.component_id == primary.component_id
-        for item in progress
-    )
     updates = {
         "measured_candidates": sum(item.measured_candidates for item in progress),
+        "total_candidates": (
+            sum(item.total_candidates for item in progress)
+            if all(item.total_candidates is not None for item in progress)
+            and (expected_ranks is None or {rank for rank, _ in ranked} == set(expected_ranks))
+            else None
+        ),
         "compilations": sum(item.compilations for item in progress),
         "active_compilations": sum(item.active_compilations for item in progress),
         "done": all(bool(outcome.get("done")) for outcome in outcomes),
         "elapsed_seconds": max(item.elapsed_seconds for item in progress),
     }
-    if (
-        same_request
-        and all(item.candidate_sharded for item in progress)
-        and primary.phase not in ("planning", "selecting")
-        and any(item.candidate_count for item in progress)
-    ):
-        updates.update(
-            candidate_count=sum(item.candidate_count for item in progress),
-            candidates_prepared=sum(item.candidates_prepared for item in progress),
-        )
     return replace(primary, **updates)
 
 
@@ -177,15 +170,56 @@ class Executor(ABC):
                 t.encoder for t in compilation_times
             )
 
+    @contextmanager
+    def b12x_warmup_control(self):
+        """Keep startup cancellation active across both native preparation stages."""
+        from vllm.platforms import current_platform
+        from vllm.utils.b12x import has_b12x
+
+        if not (has_b12x() and current_platform.is_cuda()
+                and current_platform.is_device_capability_family(120)):
+            yield
+            return
+        if (not self.vllm_config.kernel_config.enable_b12x_autotune
+                or os.environ.get("B12X_AUTOTUNE", "1") == "0"):
+            self.cancel_b12x_autotuning()
+            yield
+            return
+        from ._b12x_terminal import EscapeKey
+
+        with EscapeKey(self.cancel_b12x_autotuning) as keyboard:
+            self._b12x_keyboard = keyboard
+            try:
+                yield
+            finally:
+                self._b12x_keyboard = None
+
     def cancel_b12x_autotuning(self) -> None:
         """Request optional native tuning cancellation at the next bounded round."""
         self._b12x_autotuning_cancel.set()
 
     def _run_b12x_preparation(self, *, stage: str) -> None:
-        """Drive one b12x preparation stage through bounded worker rounds."""
-        display = None
+        """Run ranks independently while a host thread reports progress and cancellation."""
+        import pickle
+        from datetime import timedelta
+        from queue import Empty, SimpleQueue
+
+        import torch.distributed as dist
+        from vllm.utils.network_utils import get_ip
+
+        display = output = None
+        local_output = SimpleQueue()
         begun = False
         completed = False
+
+        def drain_local_output():
+            while True:
+                try:
+                    line = local_output.get_nowait()
+                except Empty:
+                    return
+                display.write_output(line)
+
         try:
             begun = True
             outcomes = self.collective_rpc(
@@ -196,21 +230,94 @@ class Executor(ABC):
                 from b12x.preparation import PreparationDisplay
                 from vllm.utils.system_utils import undecorated_log_stream
 
+                stream = undecorated_log_stream(sys.stderr)
+                if stream.isatty():
+                    from ._b12x_output import PreparationOutput
+
+                    output = PreparationOutput(local_output.put).start()
+                    stream = output.stream or stream
+                phase_number = {"weights": 1, "state": 2}[stage]
                 display = PreparationDisplay(
-                    global_rank=0, stream=undecorated_log_stream(sys.stderr),
+                    global_rank=0, stream=stream,
+                    title=f"b12x / one-time kernel autotuning (phase {phase_number}/2)",
+                    cancel_available=bool(
+                        getattr(self, "_b12x_keyboard", None)
+                        and self._b12x_keyboard.active
+                    ),
                 )
                 display.__enter__()
-            while not all(bool(item.get("done")) for item in outcomes):
-                outcomes = self.collective_rpc(
-                    "advance_b12x_preparation",
-                    kwargs={"cancel_tuning": self._b12x_autotuning_cancel.is_set()},
+            if not all(bool(item.get("done")) for item in outcomes):
+                address = get_ip()
+                store = dist.TCPStore(
+                    address, 0, is_master=True, wait_for_workers=False,
+                    timeout=timedelta(seconds=30),
                 )
+                stopped = threading.Event()
+                reporting_errors = []
+                ranks = tuple(item["global_rank"] for item in outcomes)
+                output_seen = dict.fromkeys(ranks, 0)
+
+                def drain_output():
+                    if display is None:
+                        return
+                    drain_local_output()
+                    for rank in ranks:
+                        count_key = f"output_count/{rank}"
+                        if not store.check([count_key]):
+                            continue
+                        count = int(store.get(count_key))
+                        while output_seen[rank] < count:
+                            output_seen[rank] += 1
+                            key = f"output/{rank}/{output_seen[rank]}"
+                            display.write_output(store.get(key).decode("utf-8"))
+                            store.delete_key(key)
+
+                def report_progress():
+                    try:
+                        while not stopped.wait(0.1):
+                            drain_output()
+                            if self._b12x_autotuning_cancel.is_set():
+                                store.set("cancel", b"1")
+                                if display is not None:
+                                    display.tuning_stopped()
+                            if display is not None:
+                                snapshots = [
+                                    pickle.loads(store.get(f"progress/{rank}"))
+                                    for rank in ranks if store.check([f"progress/{rank}"])
+                                ]
+                                progress = _aggregate_b12x_progress(snapshots, expected_ranks=ranks)
+                                if progress is not None and not progress.done:
+                                    display.update(progress)
+                    except BaseException as error:
+                        reporting_errors.append(error)
+
+                reporter = threading.Thread(target=report_progress, name="b12x-progress", daemon=True)
+                reporter.start()
+                try:
+                    if self._b12x_autotuning_cancel.is_set():
+                        store.set("cancel", b"1")
+                    outcomes = self.collective_rpc(
+                        "run_b12x_preparation",
+                        kwargs={
+                            "control_address": (address, store.port),
+                            "capture_output": output is not None,
+                        },
+                    )
+                finally:
+                    stopped.set()
+                    reporter.join()
+                    drain_output()
+                if reporting_errors:
+                    raise reporting_errors[0]
+                if output is not None:
+                    output.stop()
+                    drain_local_output()
                 if display is not None:
                     progress = _aggregate_b12x_progress(outcomes)
                     if progress is not None:
                         display.update(progress)
                 errors = [item["error"] for item in outcomes if item.get("error")]
-                if errors and all(item.get("cleanup_complete") for item in outcomes):
+                if errors:
                     primary = min(errors, key=lambda item: int(item["rank"]))
                     raise RuntimeError(
                         f"b12x preparation failed on rank {primary['rank']}: "
@@ -227,8 +334,18 @@ class Executor(ABC):
                     )
             raise
         finally:
-            if display is not None:
-                display.close(failed=not completed)
+            try:
+                if output is not None:
+                    output.stop()
+                if display is not None:
+                    drain_local_output()
+            finally:
+                try:
+                    if display is not None:
+                        display.close(failed=not completed)
+                finally:
+                    if output is not None:
+                        output.close()
 
     def register_failure_callback(self, callback: FailureCallback):  # noqa: B027
         """

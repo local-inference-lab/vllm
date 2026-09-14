@@ -832,6 +832,38 @@ def test_engram_preparation_covers_masked_and_unmasked_graphs(dist_init):
                     graph.reset()
 
 
+@pytest.mark.parametrize("num_layers", [1, 3])
+@pytest.mark.parametrize("num_tokens", [1, 13])
+def test_engram_hash_first_forward_uses_declared_geometry(
+    monkeypatch, num_layers, num_tokens
+):
+    """Lazy native bindings must not make the first output have zero layers."""
+    module = NgramHashState.__new__(NgramHashState)
+    nn.Module.__init__(module)
+    module.layout = SimpleNamespace(hash_plans=(None,) * num_layers)
+    module.bindings = []
+
+    def run_native(ids, mask, starts, history, out):
+        if not module.bindings:
+            module.bindings = list(range(num_layers))
+        for layer in module.bindings:
+            out[:, layer].copy_(ids[:, None].expand(-1, 24) + layer)
+
+    monkeypatch.setattr(module, "run_native", run_native)
+    ids = torch.arange(num_tokens, dtype=torch.int64)
+    starts = torch.tensor([0, num_tokens], dtype=torch.int32)
+    dead_mask = torch.zeros(num_tokens, dtype=torch.bool)
+    history = torch.full((1, 3), -1, dtype=torch.int64)
+    for offset in (0, 7):
+        actual = module(ids + offset, ids, starts, dead_mask, history)
+        expected = (
+            ids[:, None, None] + offset + torch.arange(num_layers)[None, :, None]
+        ).expand(-1, -1, 24)
+        assert actual.shape == (num_tokens, num_layers, 24)
+        assert actual.dtype == torch.int64 and actual.device == ids.device
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_disk_engram_model_allocates_hash_buffer_from_declared_caps(monkeypatch):
     from vllm.models.deepseek_v4_1.nvidia import model as model_module
 

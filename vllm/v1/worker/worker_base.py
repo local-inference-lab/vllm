@@ -150,6 +150,42 @@ class WorkerBase:
             self._b12x_startup_coordinator = None
         return outcome
 
+    def run_b12x_preparation(
+        self, *, control_address: tuple[str, int], capture_output: bool = False,
+    ) -> dict[str, object]:
+        """Run preparation on the worker thread with asynchronous host progress."""
+        import pickle
+        import time
+        from datetime import timedelta
+
+        import torch.distributed as dist
+
+        store = dist.TCPStore(
+            *control_address, is_master=False, timeout=timedelta(seconds=30),
+        )
+        from vllm.v1.executor._b12x_output import PreparationOutput
+
+        output_count = 0
+
+        def publish_output(line):
+            nonlocal output_count
+            output_count += 1
+            store.set(f"output/{self.rank}/{output_count}", line)
+            store.set(f"output_count/{self.rank}", str(output_count))
+
+        with PreparationOutput(publish_output, enabled=capture_output):
+            reported = 0.0
+            while True:
+                outcome = self.advance_b12x_preparation(cancel_tuning=store.check(["cancel"]))
+                if outcome["done"]:
+                    break
+                now = time.monotonic()
+                if now - reported >= 0.2:
+                    store.set(f"progress/{self.rank}", pickle.dumps(outcome))
+                    reported = now
+        store.set(f"progress/{self.rank}", pickle.dumps(outcome))
+        return outcome
+
     def abort_b12x_preparation(self) -> dict[str, object]:
         coordinator = self._b12x_startup_coordinator
         if coordinator is None:
