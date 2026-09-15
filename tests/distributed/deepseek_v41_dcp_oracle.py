@@ -238,7 +238,10 @@ def check_tp_plain_push(device, session, coordinator):
         session.release(plan)
     for runtime in runtimes:
         runtime.close()
-    print(f"rank={rank} TP4 plain push native-pull/FP32-rounding/fresh-graphs PASS", flush=True)
+    print(
+        f"rank={rank} TP4 plain push native-pull/FP32-rounding/fresh-graphs PASS",
+        flush=True,
+    )
 
 
 def check_kv_replica(device, session, coordinator):
@@ -259,7 +262,9 @@ def check_kv_replica(device, session, coordinator):
     )
     plan = pcie.plan(query, runtime=runtime)
     width = (capacity + page - 1) // page
-    out = torch.empty((requests * width + 1, page * 288), device=device, dtype=torch.uint8)
+    out = torch.empty(
+        (requests * width + 1, page * 288), device=device, dtype=torch.uint8
+    )
     local_width = (runtime.local_capacity + page - 1) // page
     page_stride = page * 288 + 256
     base = 2**31 // page_stride + 3
@@ -294,7 +299,9 @@ def check_kv_replica(device, session, coordinator):
         records = out.view(requests * width + 1, page, 288)
         for req, length in enumerate(lengths):
             live = records[1 + req * width:1 + (req + 1) * width].flatten(0, 1)
-            torch.testing.assert_close(live[:length], expected[req, :length], rtol=0, atol=0)
+            torch.testing.assert_close(
+                live[:length], expected[req, :length], rtol=0, atol=0
+            )
 
     with session.capture():
         starts.copy_(torch.tensor([0, 126, 192], device=device, dtype=torch.int32))
@@ -305,7 +312,9 @@ def check_kv_replica(device, session, coordinator):
         starts.copy_(torch.tensor([0, 2, 1026], device=device, dtype=torch.int32))
         for max_tokens in (1024, 1280, 1536):
             expected.bitwise_xor_(19)
-            local_records.copy_(expected[:, owned].view(requests, local_width, page, 288))
+            local_records.copy_(
+                expected[:, owned].view(requests, local_width, page, 288)
+            )
             run(max_tokens)
             torch.cuda.synchronize()
             check()
@@ -316,7 +325,9 @@ def check_kv_replica(device, session, coordinator):
         other.wait_stream(default)
         with torch.cuda.stream(other):
             expected.bitwise_xor_(23)
-            local_records.copy_(expected[:, owned].view(requests, local_width, page, 288))
+            local_records.copy_(
+                expected[:, owned].view(requests, local_width, page, 288)
+            )
             run(1024)
         run(1024)  # Native handoff back waits for the other stream's tail.
         torch.cuda.synchronize()
@@ -327,7 +338,9 @@ def check_kv_replica(device, session, coordinator):
         allocated = torch.cuda.memory_allocated(device)
         for _ in range(3):
             expected.bitwise_xor_(71)
-            local_records.copy_(expected[:, owned].view(requests, local_width, page, 288))
+            local_records.copy_(
+                expected[:, owned].view(requests, local_width, page, 288)
+            )
             graph.replay()
             torch.cuda.synchronize()
             check()
@@ -344,7 +357,10 @@ def check_kv_replica(device, session, coordinator):
         check()
     session.release(plan)
     runtime.close()
-    print(f"rank={rank} KV replica byte-exact/high-PID/live-grids/graphs PASS", flush=True)
+    print(
+        f"rank={rank} KV replica byte-exact/high-PID/live-grids/graphs PASS",
+        flush=True,
+    )
 
 
 def main():
@@ -438,7 +454,10 @@ def main():
                 session.release(plan)
             exchange.runtime.close()
             dist.destroy_process_group()
-            print(f"rank={rank} head gather live-rows/mutation/frozen-graphs PASS", flush=True)
+            print(
+                f"rank={rank} head gather live-rows/mutation/frozen-graphs PASS",
+                flush=True,
+            )
             return
         exchange.gather(source, gathered)
         peers = [None] * world
