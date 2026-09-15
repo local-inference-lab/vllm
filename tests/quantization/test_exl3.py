@@ -120,12 +120,13 @@ def test_glm53_unsliced_k4_checkpoint_selects_tp2_native_path():
         "tp": 2,
         "source_layout": "unsliced_tp_stream",
     }
-    assert config.rank_sliced_layer_bitrates(
-        "model.layers.3.mlp.experts"
-    ) == (4,) * 288
-    assert config.normalize_rank_sliced_weight_name(
-        "model.layers.3.mlp.experts.0.gate_proj.trellis"
-    ) == "model.layers.3.mlp.experts.0.gate_proj.trellis"
+    assert config.rank_sliced_layer_bitrates("model.layers.3.mlp.experts") == (4,) * 288
+    assert (
+        config.normalize_rank_sliced_weight_name(
+            "model.layers.3.mlp.experts.0.gate_proj.trellis"
+        )
+        == "model.layers.3.mlp.experts.0.gate_proj.trellis"
+    )
 
 
 def test_glm53_unsliced_k4_checkpoint_fails_closed_on_architecture_drift():
@@ -203,9 +204,7 @@ def test_glm5next_model_applies_exl3_name_normalization():
 
     model = object.__new__(glm5next_model.Glm5NextModel)
     torch.nn.Module.__init__(model)
-    model.quant_config = SimpleNamespace(
-        normalize_rank_sliced_weight_name=normalize
-    )
+    model.quant_config = SimpleNamespace(normalize_rank_sliced_weight_name=normalize)
     model.config = SimpleNamespace(
         is_moe=False,
         mla_nope=False,
@@ -532,9 +531,7 @@ def test_rank_sliced_weights_use_native_trellis_contract(monkeypatch):
 
     native = FakeNativeTrellis()
     monkeypatch.setattr(exl3_module, "_load_b12x_native_trellis", lambda: native)
-    monkeypatch.setattr(
-        exl3_module, "_load_b12x_fused_moe", lambda: SimpleNamespace()
-    )
+    monkeypatch.setattr(exl3_module, "_load_b12x_fused_moe", lambda: SimpleNamespace())
     method = object.__new__(Exl3MoEMethod)
     method.quant_config = SimpleNamespace(bits=float(bits))
     method._rank_sliced_backing = lambda _layer, name: slabs[name]
@@ -572,6 +569,7 @@ def test_rank_sliced_weights_use_native_trellis_contract(monkeypatch):
     assert kwargs["up_suh"].data_ptr() == slabs["w13_suh"][1].data_ptr()
     assert kwargs["down_svh"].data_ptr() == slabs["w2_svh"].data_ptr()
     assert kwargs["intermediate_rotations"].shape == (experts, 3 * intermediate)
+
 
 def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypatch):
     experts = 4

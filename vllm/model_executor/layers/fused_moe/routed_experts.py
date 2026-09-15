@@ -920,8 +920,7 @@ class RoutedExperts(PluggableLayer):
                         break
                     continue
                 is_fused = (
-                    is_fused_rank
-                    and _PER_EXPERT_IDX_RE.search(weight_name) is None
+                    is_fused_rank and _PER_EXPERT_IDX_RE.search(weight_name) is None
                 )
                 matched = True
                 is_per_expert_fused_w13 = (

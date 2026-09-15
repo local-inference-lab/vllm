@@ -16,6 +16,7 @@ The weight payloads are synthetic. This exercises the contract -- preparation,
 compilation, buffer planning, and a captured replay -- not numerical accuracy,
 which belongs to a checkpoint-level test.
 """
+
 import importlib
 
 import pytest

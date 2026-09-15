@@ -973,6 +973,7 @@ def get_draft_quant_config(vllm_config: VllmConfig) -> "QuantizationConfig | Non
 
     return quant_config
 
+
 def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
     """
     Extract the layer index from the module name.

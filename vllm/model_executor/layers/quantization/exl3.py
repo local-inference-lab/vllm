@@ -333,6 +333,23 @@ def _load_b12x_native_trellis() -> Any:
     return api
 
 
+def _trellis_workspace(device: torch.device) -> torch.Tensor:
+    """Per-SM scratch the fused FC1+FC2 launch requires.
+
+    The launch keeps per-SM state here and refuses anything under sms*4 + 2
+    int32 slots, so this must be a real allocation rather than a view borrowed
+    from the weights. Preparation also runs on CPU in unit tests, where there is
+    no device to size against.
+    """
+
+    sm_count = (
+        int(torch.cuda.get_device_properties(device).multi_processor_count)
+        if device.type == "cuda"
+        else 0
+    )
+    return torch.zeros(max(sm_count * 4 + 2, 2), dtype=torch.int32, device=device)
+
+
 def _direct_route_max_m() -> int:
     """Largest row count the kernel will accept with an expert map attached.
 
@@ -503,8 +520,7 @@ class Exl3Config(QuantizationConfig):
             }
             if mismatches:
                 raise ValueError(
-                    "GLM-5.3 routed-only EXL3 metadata is unsupported: "
-                    f"{mismatches}"
+                    f"GLM-5.3 routed-only EXL3 metadata is unsupported: {mismatches}"
                 )
             instance.glm53_unsliced_routed_experts = True
         return instance
@@ -606,8 +622,7 @@ class Exl3Config(QuantizationConfig):
         }
         if mismatches:
             raise ValueError(
-                "GLM-5.3 routed-only EXL3 architecture mismatch: "
-                f"{mismatches}"
+                f"GLM-5.3 routed-only EXL3 architecture mismatch: {mismatches}"
             )
         linear = getattr(text_config, "linear_attn_config", None)
         expected_linear = {
@@ -1546,8 +1561,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer.exl3_params_dtype = params_dtype
         rank_sliced_metadata = self.quant_config.rank_sliced_metadata
         unsliced_stream_tp = (
-            self.quant_config.glm53_unsliced_routed_experts
-            and layer.exl3_tp_size > 1
+            self.quant_config.glm53_unsliced_routed_experts and layer.exl3_tp_size > 1
         )
         stream_slice_start = (
             layer.exl3_tp_rank * layer.exl3_intermediate_size_per_partition
@@ -1970,7 +1984,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     intermediate_rotations=intermediate_rotations,
                     down_svh=tier_down_svh,
                     tile_config=tile_config,
-                    workspace=w13.view(torch.int32).reshape(-1)[:1],
+                    workspace=_trellis_workspace(device),
                 )
             )
             tier_ids.append(expert_ids)
@@ -2086,14 +2100,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # The fused FC1+FC2 launch keeps per-SM state in the prepared
         # workspace and refuses anything under sms*4 + 2 int32 slots. The
         # prepared weights retain it, so it stays alive for the graph's life.
-        sm_count = (
-            int(torch.cuda.get_device_properties(w13.device).multi_processor_count)
-            if w13.device.type == "cuda"
-            else 0
-        )
-        trellis_workspace = torch.zeros(
-            max(sm_count * 4 + 2, 2), dtype=torch.int32, device=w13.device
-        )
+        trellis_workspace = _trellis_workspace(w13.device)
         layer.exl3_trellis_weights = native_api.prepare_weights(
             w13=w13,
             w2=w2,
@@ -2657,6 +2664,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         expert_map = (
             layer.exl3_expert_map if getattr(layer, "exl3_use_ep", False) else None
         )
+        if expert_map is not None and topk_ids.dtype is not torch.int32:
+            # An expert map can only ride the direct-route form, and the kernel
+            # only treats a call as direct when the ids are int32. vLLM routes in
+            # int64 (topk_indices_dtype), so without this the launch is compiled
+            # for a contract the call can never satisfy and every EP forward
+            # raises on the mismatch.
+            topk_ids = topk_ids.to(torch.int32)
         m = int(x.shape[0])
         prepared = layer.exl3_trellis_weights
         trellis = prepared.trellis
