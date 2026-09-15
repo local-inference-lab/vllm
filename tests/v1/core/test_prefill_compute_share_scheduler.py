@@ -1205,3 +1205,325 @@ def test_prefill_fairness_hot_switch_is_atomic(opt_model_path):
     unchanged = scheduler.get_prefill_fairness()
     assert unchanged["prefill_compute_share"] == "auto"
     assert unchanged["prefill_compute_half_life"] == "responsive"
+
+
+# ---------------------------------------------------------------------------
+# Forward progress at a full KV pool (issue #733).
+#
+# The block pool always reserves one null block, so num_blocks=N provides
+# N-1 usable blocks in these scenarios.
+
+
+def _fill_pool_with_boundary_decodes(scheduler):
+    """Drive the real scheduler and fairness controller into the issue-#733
+    state: a completely full block pool, two running decodes whose next token
+    each needs a new block, an unschedulable waiting prefill, and the prefill
+    service class selected for the next quantum.
+
+    The controller is driven only through its real select/dispatch/record API:
+    one measured decode quantum, then a cheaper measured prefill quantum, so
+    prefill is selected again at the full pool. This is the alternation that
+    exposed the defect live.
+
+    Returns (first_decode, second_decode, waiting_prefill).
+    """
+    (first_decode,) = create_requests(
+        num_requests=1, num_tokens=15, req_ids=["first-decode"]
+    )
+    scheduler.add_request(first_decode)
+    # The 15-token prompt leaves one in-block slot, so the decode step below
+    # fits without a new block and the request then sits at a block boundary,
+    # needing a new block for its next token.
+    _update(scheduler, scheduler.schedule())
+
+    second_decode, waiting_prefill = create_requests(
+        num_requests=2, num_tokens=16, req_ids=["second-decode", "waiting-prefill"]
+    )
+    scheduler.add_request(second_decode)
+    scheduler.add_request(waiting_prefill)
+    decode_output = scheduler.schedule()
+    assert decode_output.compute_service_class == "decode"
+    scheduler.record_compute_time("decode", 0.01, contended=True)
+    _update(scheduler, decode_output)
+
+    prefill_output = scheduler.schedule()
+    assert prefill_output.compute_service_class == "prefill"
+    # The prefill turn admits the second decode's prompt into the last free
+    # block. The leftover decode service cannot schedule the first decode
+    # (it needs a new block) and must not evict the admitted prefill work.
+    assert prefill_output.num_scheduled_tokens == {second_decode.request_id: 16}
+    scheduler.record_compute_time("prefill", 0.005, contended=True)
+    _update(scheduler, prefill_output)
+    return first_decode, second_decode, waiting_prefill
+
+
+def _drain(scheduler, requests, max_steps):
+    """Run real schedule/record/update cycles until every request finishes."""
+    for _ in range(max_steps):
+        if all(request.is_finished() for request in requests):
+            return
+        output = scheduler.schedule()
+        if output.compute_service_class is not None:
+            scheduler.record_compute_time(
+                output.compute_service_class, 0.01, contended=True
+            )
+        _update(scheduler, output)
+    assert all(request.is_finished() for request in requests), (
+        f"scheduler failed to drain the state within {max_steps} steps"
+    )
+
+
+def _drain_async(scheduler, requests, pending_output, max_steps):
+    """Run real async schedule/record/update cycles until every request
+    finishes, keeping the engine's one-batch overlap: the next batch is
+    scheduled before the previous batch's output is processed."""
+    for _ in range(max_steps):
+        if all(request.is_finished() for request in requests):
+            return
+        output = scheduler.schedule()
+        if pending_output.compute_service_class is not None:
+            scheduler.record_compute_time(
+                pending_output.compute_service_class, 0.01, contended=True
+            )
+        _update(scheduler, pending_output)
+        pending_output = output
+    _update(scheduler, pending_output)
+    assert all(request.is_finished() for request in requests), (
+        f"scheduler failed to drain the state within {max_steps} steps"
+    )
+
+
+def test_prefill_turn_escape_preempts_to_keep_decode_progress(opt_model_path):
+    scheduler = _create_fair_scheduler(
+        opt_model_path,
+        max_num_seqs=16,
+        max_num_batched_tokens=32,
+        max_model_len=128,
+        num_blocks=3,
+        block_size=16,
+    )
+    first_decode, second_decode, waiting_prefill = _fill_pool_with_boundary_decodes(
+        scheduler
+    )
+
+    output = scheduler.schedule()
+
+    # A prefill quantum that scheduled nothing must not strand runnable
+    # decodes at a full pool: the leftover decode service preempts its way to
+    # forward progress instead of returning an empty batch forever (#733).
+    assert output.num_scheduled_tokens == {first_decode.request_id: 1}
+    # FCFS preemption takes the newest running request as the victim.
+    assert output.preempted_req_ids == {second_decode.request_id}
+    assert second_decode.num_preemptions == 1
+    assert first_decode.num_preemptions == 0
+    # The escape quantum is decode compute and is charged to decode, keeping
+    # fairness accounting tied to work that was actually dispatched.
+    assert output.compute_service_class == "decode"
+    assert output.compute_contention
+    assert waiting_prefill in scheduler.waiting
+
+
+def test_full_pool_fairness_state_drains_within_bounded_steps(opt_model_path):
+    scheduler = _create_fair_scheduler(
+        opt_model_path,
+        max_num_seqs=16,
+        max_num_batched_tokens=32,
+        max_model_len=128,
+        num_blocks=3,
+        block_size=16,
+    )
+    requests = _fill_pool_with_boundary_decodes(scheduler)
+
+    _drain(scheduler, requests, max_steps=100)
+
+    assert not scheduler.running
+    assert not scheduler.waiting
+
+
+def test_prefill_turn_fallback_never_preempts_admitted_prefill_work(opt_model_path):
+    scheduler = _create_fair_scheduler(
+        opt_model_path,
+        max_num_seqs=16,
+        max_num_batched_tokens=32,
+        max_model_len=128,
+        num_blocks=3,
+        block_size=16,
+    )
+    (decode,) = create_requests(num_requests=1, num_tokens=15, req_ids=["decode"])
+    scheduler.add_request(decode)
+    _update(scheduler, scheduler.schedule())
+
+    (prefill,) = create_requests(
+        num_requests=1, num_tokens=16, req_ids=["admitted-prefill"]
+    )
+    scheduler.add_request(prefill)
+    decode_output = scheduler.schedule()
+    assert decode_output.compute_service_class == "decode"
+    scheduler.record_compute_time("decode", 0.01, contended=True)
+    _update(scheduler, decode_output)
+    # The decode now sits at a block boundary; the pool has one free block.
+
+    output = scheduler.schedule()
+
+    # The prefill turn admits the waiting prefill into that last block. The
+    # leftover decode service must not evict admitted prefill work to unblock
+    # the decode: this quantum is not empty, so no escape preemption may run.
+    assert output.compute_service_class == "prefill"
+    assert output.num_scheduled_tokens == {prefill.request_id: 16}
+    assert decode.request_id not in output.num_scheduled_tokens
+    assert not output.preempted_req_ids
+    assert decode.num_preemptions == 0
+    assert prefill.num_preemptions == 0
+    assert decode in scheduler.running
+    assert prefill in scheduler.running
+
+
+def _fill_pool_with_priority_decodes(scheduler):
+    """The full-pool state of _fill_pool_with_boundary_decodes under the
+    priority policy, with three running decodes of distinct priorities.
+
+    Admission order (the running list order) is [low(9), urgent(0),
+    victim(10)], and the waiting prefill has the worst priority (11), so it
+    is only tried after every running decode has been admitted.
+    """
+    (low,) = create_requests(num_requests=1, num_tokens=15, req_ids=["low"])
+    low.priority = 9
+    scheduler.add_request(low)
+    _update(scheduler, scheduler.schedule())
+
+    urgent, victim, waiting_prefill = create_requests(
+        num_requests=3,
+        num_tokens=16,
+        req_ids=["urgent", "victim", "waiting-prefill"],
+    )
+    urgent.priority = 0
+    victim.priority = 10
+    waiting_prefill.priority = 11
+    scheduler.add_request(urgent)
+    scheduler.add_request(victim)
+    scheduler.add_request(waiting_prefill)
+    decode_output = scheduler.schedule()
+    assert decode_output.compute_service_class == "decode"
+    scheduler.record_compute_time("decode", 0.01, contended=True)
+    _update(scheduler, decode_output)
+
+    prefill_output = scheduler.schedule()
+    assert prefill_output.compute_service_class == "prefill"
+    # Priority-ordered admission fills the pool with two more boundary
+    # decodes; the leftover decode service cannot schedule the blocked decode
+    # and must not preempt the admitted prefill work.
+    assert prefill_output.num_scheduled_tokens == {
+        urgent.request_id: 16,
+        victim.request_id: 16,
+    }
+    scheduler.record_compute_time("prefill", 0.005, contended=True)
+    _update(scheduler, prefill_output)
+    return low, urgent, victim, waiting_prefill
+
+
+def test_priority_escape_preserves_decode_scheduled_within_fallback(opt_model_path):
+    scheduler = _create_fair_scheduler(
+        opt_model_path,
+        scheduling_policy="priority",
+        max_num_seqs=16,
+        max_num_batched_tokens=48,
+        max_model_len=128,
+        num_blocks=4,
+        block_size=16,
+    )
+    low, urgent, victim, waiting_prefill = _fill_pool_with_priority_decodes(scheduler)
+
+    output = scheduler.schedule()
+
+    # Empty-quantum escape: the first blocked decode preempts the
+    # lowest-urgency running request (the highest priority value) and is
+    # scheduled, reusing the normal priority-aware preemption unchanged.
+    assert output.num_scheduled_tokens == {low.request_id: 1}
+    assert output.preempted_req_ids == {victim.request_id}
+    assert victim.num_preemptions == 1
+    # Once any work is scheduled, the fallback must stop preempting: the
+    # later blocked decode may neither evict the just-scheduled decode nor
+    # disturb the untouched one.
+    assert low.num_preemptions == 0
+    assert urgent.num_preemptions == 0
+    assert urgent in scheduler.running
+    assert waiting_prefill in scheduler.waiting
+
+    # The escape quantum is decode compute; charge and process it before
+    # further progress, as the engine would.
+    assert output.compute_service_class == "decode"
+    scheduler.record_compute_time("decode", 0.01, contended=True)
+    _update(scheduler, output)
+
+    # The normal priority policy still converges: the urgent decode and the
+    # waiting prefill are served within bounded further progress.
+    _drain(scheduler, [low, urgent, victim, waiting_prefill], max_steps=150)
+
+
+def test_escape_respects_deferred_free_fences(opt_model_path):
+    scheduler = _create_fair_scheduler(
+        opt_model_path,
+        async_scheduling=True,
+        max_num_seqs=16,
+        max_num_batched_tokens=32,
+        max_model_len=128,
+        num_blocks=3,
+        block_size=16,
+    )
+    # Mirror the KV-consumer multi-batch deployment mode (an async
+    # KV-transfer consumer with more than one concurrent batch): a preempted
+    # request whose last scheduled batch is still in flight returns its
+    # blocks only once that batch's output has been processed.
+    scheduler.defer_block_free = True
+
+    (first_decode,) = create_requests(
+        num_requests=1, num_tokens=14, req_ids=["first-decode"]
+    )
+    scheduler.add_request(first_decode)
+    _update(scheduler, scheduler.schedule())
+
+    second_decode, waiting_prefill = create_requests(
+        num_requests=2, num_tokens=16, req_ids=["second-decode", "waiting-prefill"]
+    )
+    scheduler.add_request(second_decode)
+    scheduler.add_request(waiting_prefill)
+    decode_output = scheduler.schedule()
+    assert decode_output.compute_service_class == "decode"
+    scheduler.record_compute_time("decode", 0.01, contended=True)
+    _update(scheduler, decode_output)
+
+    prefill_output = scheduler.schedule()
+    assert prefill_output.compute_service_class == "prefill"
+    scheduler.record_compute_time("prefill", 0.005, contended=True)
+    # The prefill batch stays in flight: the async engine schedules the next
+    # batch before the previous batch's output is processed.
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 0
+
+    output = scheduler.schedule()
+
+    # The escape preempts both blocked decodes, but every freed block is
+    # behind the in-flight fence: the pool must not gain blocks mid-step, so
+    # this step still schedules nothing and no fence is bypassed.
+    assert output.total_num_scheduled_tokens == 0
+    assert output.preempted_req_ids == {
+        first_decode.request_id,
+        second_decode.request_id,
+    }
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 0
+
+    # Once the in-flight batch is processed, the fence drains and the next
+    # quantum resumes the first preempted decode; the rest of the state is
+    # served within bounded further progress.
+    _update(scheduler, prefill_output)
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 2
+
+    resumed_output = scheduler.schedule()
+    assert resumed_output.total_num_scheduled_tokens > 0
+    assert first_decode.request_id in resumed_output.num_scheduled_tokens
+
+    _drain_async(
+        scheduler,
+        [first_decode, second_decode, waiting_prefill],
+        resumed_output,
+        max_steps=100,
+    )
