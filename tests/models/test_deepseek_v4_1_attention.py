@@ -97,6 +97,52 @@ def test_dcp_kv_replica_declares_one_shared_output_before_materialization(monkey
     )
 
 
+def test_dcp_kv_replica_binds_fixed_tensors_once_before_live_launch(monkeypatch):
+    from vllm.models.deepseek_v4_1 import dcp
+
+    calls = []
+
+    class Runtime:
+        def bind(self, *args, **kwargs):
+            calls.append(("bind", args, kwargs))
+            return "binding"
+
+        def replicate(self, *args, **kwargs):
+            calls.append(("replicate", args, kwargs))
+
+    replica = dcp.DCPKVReplica.__new__(dcp.DCPKVReplica)
+    replica.runtime = Runtime()
+    replica.plan = object()
+    replica.output = torch.empty(1)
+    replica.binding = None
+    attention = SimpleNamespace(kv_cache=torch.empty(1))
+    metadata = SimpleNamespace(
+        block_table=torch.empty(1),
+        request_positions=torch.empty(1),
+        query_start_loc=torch.empty(1),
+        num_reqs=1,
+        max_seq_len=7,
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    replica.replicate(attention, metadata)
+    metadata.num_reqs, metadata.max_seq_len = 2, 15
+    replica.replicate(attention, metadata)
+
+    assert [call[0] for call in calls] == ["bind", "replicate", "replicate"]
+    assert calls[0][1] == (
+        attention.kv_cache,
+        metadata.block_table,
+        metadata.request_positions,
+        metadata.query_start_loc,
+        replica.output,
+    )
+    assert calls[1][1] == ("binding",)
+    assert calls[1][2] == {"plan": replica.plan, "requests": 1, "max_tokens": 4}
+    assert calls[2][1] == ("binding",)
+    assert calls[2][2] == {"plan": replica.plan, "requests": 2, "max_tokens": 8}
+
+
 def test_shared_dcp_channel_exposes_one_unit_in_each_preparation_stage(monkeypatch):
     """Layer reuse must not produce conflicting collective request names."""
     from vllm.models.deepseek_v4_1 import dcp

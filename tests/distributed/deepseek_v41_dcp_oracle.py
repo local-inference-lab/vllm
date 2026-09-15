@@ -291,9 +291,22 @@ def check_kv_replica(device, session, coordinator):
             key="oracle.prefill_kv_replica", ranks=tuple(range(4)),
         ),
     ),), coordinator=coordinator)
+    binding = runtime.bind(
+        cache,
+        table,
+        positions,
+        starts,
+        out,
+        plan=plan,
+    )
 
     def run(max_tokens):
-        runtime.replicate(**{**actual, "max_tokens": max_tokens}, plan=plan)
+        runtime.replicate(
+            binding,
+            plan=plan,
+            requests=actual["requests"],
+            max_tokens=max_tokens,
+        )
 
     def check(lengths=(1024, 512)):
         records = out.view(requests * width + 1, page, 288)
