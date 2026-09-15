@@ -422,6 +422,7 @@ class Glm4MoeModel(nn.Module):
         quant_config = vllm_config.quant_config
         enable_eplb = vllm_config.parallel_config.enable_eplb
         self.config = config
+        self.quant_config = quant_config
 
         self.vocab_size = config.vocab_size
 
@@ -491,6 +492,17 @@ class Glm4MoeModel(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        rank_sliced_name = getattr(
+            self.quant_config,
+            "normalize_rank_sliced_weight_name",
+            None,
+        )
+        if rank_sliced_name is not None:
+            weights = (
+                (normalized_name, loaded_weight)
+                for name, loaded_weight in weights
+                if (normalized_name := rank_sliced_name(name)) is not None
+            )
         weights = maybe_fuse_shared_experts(
             skip_spec_layers(weights, self.config),
             n_routed_experts=self.config.n_routed_experts,

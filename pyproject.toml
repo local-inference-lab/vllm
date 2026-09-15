@@ -187,6 +187,8 @@ VALU = "VALU"
 # Walsh-Hadamard Transform
 wht = "wht"
 WHT = "WHT"
+# EXL3 scaled Hadamard vector field.
+suh = "suh"
 # Huawei Compute Architecture for Neural Networks
 CANN = "CANN"
 

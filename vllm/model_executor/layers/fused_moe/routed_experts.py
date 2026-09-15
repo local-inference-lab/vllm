@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import re
 from collections.abc import Callable, Iterable
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
@@ -37,6 +38,10 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__)
+
+# Per-expert checkpoint names carry an explicit expert index ("experts.{i}.");
+# fused pre-fused-checkpoint entries never do (see build_expert_params_mapping).
+_PER_EXPERT_IDX_RE = re.compile(r"experts\.\d+\.")
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -894,10 +899,16 @@ class RoutedExperts(PluggableLayer):
                 per_expert_mapping.setdefault(prefix, []).append(mapping)
         for expert_name, loaded_weight in weights:
             qual_name = f"{self.layer_name}.{expert_name}"
-            # Fused expert weights can be identified by their 3D tensors
-            is_fused = loaded_weight.dim() == 3
+            # Fused expert weights are 3D tensors matched against a *fused*
+            # mapping entry. Rank alone is not decisive: per-expert tensors of
+            # some quantized formats (e.g. EXL3 trellis [K/16, N/16, 16*bpw])
+            # are also rank-3 and must not be routed down the fused
+            # transpose/chunk path. Fused entries are exactly those whose
+            # weight_name carries no per-expert index.
+            is_fused_rank = loaded_weight.dim() == 3
+            is_fused = False
             mappings = expert_mapping
-            if not is_fused:
+            if not is_fused_rank:
                 # Retain every physical replica and both halves of packed gate/up.
                 mappings = per_expert_mapping.get(
                     expert_name.partition(".")[0], expert_mapping
@@ -908,6 +919,9 @@ class RoutedExperts(PluggableLayer):
                     if matched and is_fused:
                         break
                     continue
+                is_fused = (
+                    is_fused_rank and _PER_EXPERT_IDX_RE.search(weight_name) is None
+                )
                 matched = True
                 is_per_expert_fused_w13 = (
                     not is_fused
