@@ -40,6 +40,7 @@ def _glm53_config(**overrides):
     values = {
         "model_type": "glm5_next_text",
         "num_hidden_layers": 45,
+        "num_nextn_predict_layers": 1,
         "first_k_dense_replace": 3,
         "n_routed_experts": 288,
         "hidden_size": 4096,
@@ -111,7 +112,7 @@ def test_glm53_unsliced_k4_checkpoint_selects_tp2_native_path():
         "bits": 4,
         "codebook": "mcg",
         "experts_per_layer": 288,
-        "moe_layers": (3, 44),
+        "moe_layers": (3, 45),
         "tensor_schema": (
             "model.language_model.layers.{L}.mlp.experts.{E}."
             "{proj}.{trellis|suh|svh|mcg}"
@@ -438,6 +439,7 @@ def test_glm_model_normalizes_rank_sliced_weights_before_auto_loading(monkeypatc
         normalize_rank_sliced_weight_name=normalize
     )
     glm_model.config = SimpleNamespace(n_routed_experts=2, n_shared_experts=1)
+    glm_model.is_fused_shared_expert_enabled = False
     local = torch.tensor(1)
     remote = torch.tensor(2)
     ordinary = torch.tensor(3)
@@ -542,7 +544,8 @@ def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
 
     assert api.plan_kwargs == {
         "quant_modes": "w4a16",
-        "source_format": "exl3_trellis_mcg",
+        "source_format": "b12x_trellis",
+        "trellis_codebook": "mcg",
         "activation": "silu",
         "params_dtype": torch.float16,
         "num_experts": experts,

@@ -75,6 +75,50 @@ _RANK_SLICED_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _MIXED_TRELLIS_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _NEXT_RUNTIME_SCOPE_ID = 0
 _MIXED_TRELLIS_ROUTE_BLOCK_SIZE = 8
+_GLM53_UNIFORM_K4_PREFILL_BLOCK_SIZE = 32
+
+
+def _resolve_uniform_trellis_prefill_block_m(
+    *,
+    configured_block_m: int,
+    explicit_override: bool,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    prefill_capacity: int,
+    device_major: int,
+    tile_config: tuple[int, int, int, int],
+) -> int:
+    """Select the measured GLM-5.3 full-K4 TP2 prefill route block.
+
+    The Hugging Face checkpoint stores unsliced 2048-wide experts, but TP2
+    streams a 1024-wide intermediate slice into each rank-local uniform K4
+    slab.  On SM120, that exact 4096x1024/E288/top-k8 geometry is faster with
+    block-32 at a 1024-token scheduler capacity: the average route occupancy is
+    about 28.4 rows per expert, so block-64 pads almost half of every expert
+    tile.  A direct fused-kernel sweep measured block-32 about 17.8% faster
+    than block-64 at m=1024.  At m=2048 the occupancy doubles and block-64
+    remains faster, so keep the established policy for larger capacities.
+
+    Limit the automatic policy to the measured homogeneous K4 geometry.
+    Explicit operator tuning remains authoritative for diagnostics and future
+    kernel qualification.
+    """
+
+    qualified = (
+        not explicit_override
+        and int(device_major) == 12
+        and int(hidden_size) == 4096
+        and int(intermediate_size) == 1024
+        and int(num_experts) == 288
+        and int(topk) == 8
+        and int(prefill_capacity) <= 1024
+        and tuple(int(value) for value in tile_config) == (64, 256, 64, 256)
+    )
+    if qualified:
+        return _GLM53_UNIFORM_K4_PREFILL_BLOCK_SIZE
+    return int(configured_block_m)
 
 
 # Smallest m the Trellis kernel path can service, and therefore the smallest
@@ -211,8 +255,8 @@ def _load_b12x_fused_moe() -> Any:
         from b12x.moe import fused_moe
     except Exception as exc:
         raise RuntimeError(
-            "Rank-sliced EXL3 requires the exl3_trellis_mcg source in "
-            "b12x.moe.fused_moe. Install a matching B12X build."
+            "Rank-sliced EXL3 requires the b12x_trellis source with the mcg "
+            "codebook in b12x.moe.fused_moe. Install a matching B12X build."
         ) from exc
     _B12X_FUSED_MOE_API = fused_moe
     return fused_moe
@@ -482,6 +526,7 @@ class Exl3Config(QuantizationConfig):
         expected = {
             "model_type": "glm5_next_text",
             "num_hidden_layers": 45,
+            "num_nextn_predict_layers": 1,
             "first_k_dense_replace": 3,
             "n_routed_experts": 288,
             "hidden_size": 4096,
@@ -525,7 +570,9 @@ class Exl3Config(QuantizationConfig):
             "bits": 4,
             "codebook": "mcg",
             "experts_per_layer": 288,
-            "moe_layers": (3, 44),
+            # Main routed layers are 3..44 and the checkpoint stores the
+            # single MTP routed layer at 45 in the same unsliced K4 format.
+            "moe_layers": (3, 45),
             "tensor_schema": (
                 "model.language_model.layers.{L}.mlp.experts.{E}."
                 "{proj}.{trellis|suh|svh|mcg}"
@@ -537,7 +584,7 @@ class Exl3Config(QuantizationConfig):
         self.rank_sliced_k_values = None
         logger.info_once(
             "GLM-5.3 routed-only EXL3: streaming unsliced K4 experts into "
-            "TP2 B12X slabs for layers 3..44"
+            "TP2 B12X slabs for main layers 3..44 and MTP layer 45"
         )
 
     def _configure_rank_sliced(self, metadata: dict[str, Any]) -> None:
@@ -1277,8 +1324,9 @@ class Exl3MoEParameter(BasevLLMParameter):
         shard_ids: tuple[str, ...] = (),
         preallocate: bool = False,
         tp_slice: tuple[int, int, int, int] | None = None,
+        global_to_local_expert: tuple[int, ...] | None = None,
     ):
-        del num_experts, shard_ids, preallocate, tp_slice
+        del num_experts, shard_ids, preallocate, tp_slice, global_to_local_expert
         data = torch.empty(0, dtype=torch.uint8)
         return super().__new__(cls, data=data, weight_loader=weight_loader)
 
@@ -1290,6 +1338,7 @@ class Exl3MoEParameter(BasevLLMParameter):
         shard_ids: tuple[str, ...] = (),
         preallocate: bool = False,
         tp_slice: tuple[int, int, int, int] | None = None,
+        global_to_local_expert: tuple[int, ...] | None = None,
     ):
         self.exl3_tensors: dict[tuple[int, str], torch.Tensor] = {}
         self.exl3_backing: torch.Tensor | None = None
@@ -1297,6 +1346,7 @@ class Exl3MoEParameter(BasevLLMParameter):
         self.exl3_shard_ids = tuple(shard_ids)
         self.exl3_preallocate = bool(preallocate)
         self.exl3_tp_slice = tp_slice
+        self.exl3_global_to_local_expert = global_to_local_expert
         super().__init__(data=self.data, weight_loader=weight_loader)
 
     def _slice_loaded_weight(self, loaded_weight: torch.Tensor) -> torch.Tensor:
@@ -1377,6 +1427,15 @@ def _exl3_moe_weight_loader(
     return_success: bool = False,
 ) -> bool | None:
     del weight_name
+    expert_map = param.exl3_global_to_local_expert
+    if expert_map is not None:
+        if not 0 <= int(expert_id) < len(expert_map):
+            raise ValueError(
+                f"EXL3 global expert {expert_id} is outside [0, {len(expert_map)})"
+            )
+        expert_id = int(expert_map[int(expert_id)])
+        if expert_id < 0:
+            return False if return_success else None
     param.load_exl3_weight(
         loaded_weight,
         expert_id=expert_id,
@@ -1411,9 +1470,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             raise ValueError(
                 f"EXL3 MoE requires BF16 or FP16 activations, got {params_dtype}"
             )
-        if self.moe.moe_parallel_config.use_ep:
+        use_ep = bool(self.moe.moe_parallel_config.use_ep)
+        if use_ep and not self.quant_config.glm53_unsliced_routed_experts:
             raise NotImplementedError(
-                "EXL3 correctness MoE currently supports TP but not expert parallelism"
+                "EXL3 expert parallelism requires the GLM-5.3 unsliced K4 layout"
             )
         if self.moe.has_bias:
             raise NotImplementedError(
@@ -1421,6 +1481,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             )
         layer.exl3_tp_rank = self.moe.moe_parallel_config.tp_rank
         layer.exl3_tp_size = self.moe.moe_parallel_config.tp_size
+        layer.exl3_use_ep = use_ep
+        layer.exl3_ep_rank = int(getattr(self.moe.moe_parallel_config, "ep_rank", 0))
+        layer.exl3_ep_size = int(getattr(self.moe.moe_parallel_config, "ep_size", 1))
         layer.exl3_hidden_size = hidden_size
         layer.exl3_intermediate_size_per_partition = intermediate_size_per_partition
         layer.exl3_params_dtype = params_dtype
@@ -1435,18 +1498,40 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         stream_slice_size = layer.exl3_intermediate_size_per_partition
         rank_sliced = rank_sliced_metadata is not None
         layer.exl3_rank_sliced = rank_sliced
+        global_to_local_expert = None
+        if use_ep:
+            expert_map = getattr(layer, "expert_map", None)
+            if not isinstance(expert_map, torch.Tensor):
+                raise RuntimeError("EXL3 EP requires vLLM's materialized expert_map")
+            global_to_local_expert = tuple(
+                int(value) for value in expert_map.detach().cpu().tolist()
+            )
+            if sorted(value for value in global_to_local_expert if value >= 0) != list(
+                range(num_experts)
+            ):
+                raise ValueError(
+                    "EXL3 EP expert_map must assign every local expert exactly once"
+                )
         if rank_sliced_metadata is not None:
             checkpoint_tp = int(rank_sliced_metadata["tp"])
-            if checkpoint_tp != layer.exl3_tp_size:
+            ep_from_unsliced = use_ep and (
+                rank_sliced_metadata.get("source_layout") == "unsliced_tp_stream"
+            )
+            if not ep_from_unsliced and checkpoint_tp != layer.exl3_tp_size:
                 raise ValueError(
                     "rank-sliced EXL3 checkpoint TP does not match runtime: "
                     f"checkpoint={checkpoint_tp}, runtime={layer.exl3_tp_size}"
                 )
             expected_experts = int(rank_sliced_metadata["experts_per_layer"])
-            if expected_experts != num_experts:
+            observed_experts = (
+                len(global_to_local_expert)
+                if global_to_local_expert is not None
+                else num_experts
+            )
+            if expected_experts != observed_experts:
                 raise ValueError(
                     "rank-sliced EXL3 expert count does not match the model: "
-                    f"checkpoint={expected_experts}, model={num_experts}"
+                    f"checkpoint={expected_experts}, model={observed_experts}"
                 )
             vllm_config = get_current_vllm_config_or_none()
             scheduler_config = (
@@ -1480,9 +1565,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             layer.exl3_is_draft = (
                 getattr(vllm_config.model_config, "runner_type", None) == "draft"
             )
-            layer.exl3_layer_bitrates = self.quant_config.rank_sliced_layer_bitrates(
-                str(layer.layer_name)
-            )
+            if ep_from_unsliced:
+                layer.exl3_layer_bitrates = (4,) * num_experts
+            else:
+                layer.exl3_layer_bitrates = (
+                    self.quant_config.rank_sliced_layer_bitrates(str(layer.layer_name))
+                )
             layer.exl3_mixed_bitrate = len(set(layer.exl3_layer_bitrates)) > 1
         for prefix, shard_ids in (("w13", ("w1", "w3")), ("w2", ("w2",))):
             for suffix in ("suh", "svh", "trellis", "mcg", "mul1"):
@@ -1510,6 +1598,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                             else {"suh", "svh", "trellis"}
                         ),
                         tp_slice=tp_slice,
+                        global_to_local_expert=global_to_local_expert,
                     ),
                 )
 
@@ -1907,11 +1996,31 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             up_svh
         )
         intermediate_rotations[:, 2 * intermediate_size :].copy_(down_suh)
-        tile_config = self._trellis_tile_config(hidden_size, intermediate_size)
+        select_tile_config = getattr(
+            api, "select_w4a16_full_rotation_tile_config", None
+        )
+        if callable(select_tile_config):
+            tile_config = select_tile_config(
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_experts=num_experts,
+                topk=int(getattr(layer, "top_k", 0) or 8),
+                route_num_experts=int(
+                    layer.global_num_experts
+                    if getattr(layer, "exl3_use_ep", False)
+                    else 0
+                ),
+                trellis_bits=bits,
+                use_expert_map=bool(getattr(layer, "exl3_use_ep", False)),
+                device=w13.device,
+            )
+        else:
+            tile_config = self._trellis_tile_config(hidden_size, intermediate_size)
         marker = layer.w13_mcg.exl3_tensors[(0, "w1")]
         weight_plan = api.plan_weights(
             quant_modes="w4a16",
-            source_format="exl3_trellis_mcg",
+            source_format="b12x_trellis",
+            trellis_codebook="mcg",
             activation=layer.activation.value,
             params_dtype=layer.exl3_params_dtype,
             num_experts=num_experts,
@@ -1945,11 +2054,19 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             down_svh,
         )
         layer.exl3_pointer_tables = tuple(self._pointer_table(slab) for slab in slabs)
-        layer.exl3_expert_map = torch.arange(
-            num_experts,
-            dtype=torch.int64,
-            device=w13.device,
-        )
+        if getattr(layer, "exl3_use_ep", False):
+            expert_map = getattr(layer, "expert_map", None)
+            if not isinstance(expert_map, torch.Tensor):
+                raise RuntimeError("EXL3 EP lost its materialized expert_map")
+            layer.exl3_expert_map = expert_map.to(
+                device=w13.device, dtype=torch.int32
+            ).contiguous()
+        else:
+            layer.exl3_expert_map = torch.arange(
+                num_experts,
+                dtype=torch.int64,
+                device=w13.device,
+            )
         layer.exl3_trellis_tile_config = tile_config
 
     def get_fused_moe_quant_config(
@@ -2128,6 +2245,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         block_m = _positive_env_int("VLLM_EXL3_TRELLIS_BLOCK_M", 8)
         chunk = _positive_env_int("VLLM_EXL3_PREFILL_CHUNK", 128)
         prefill_trellis = os.environ.get("VLLM_EXL3_PREFILL_TRELLIS", "1") == "1"
+        prefill_block_m_env = os.environ.get("VLLM_EXL3_PREFILL_BLOCK_M")
         prefill_block_m = _positive_env_int("VLLM_EXL3_PREFILL_BLOCK_M", 64)
         if min_trellis_m > max_trellis_m:
             raise ValueError(
@@ -2139,6 +2257,20 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # and making the capacity guard in _apply_rank_sliced unreachable. The
         # planned capacity is a property of the layer, not of one forward pass.
         max_batched_tokens = int(layer.exl3_max_num_batched_tokens)
+        topk = int(topk_ids.shape[1])
+        # The planned capacity on this path is the layer's batch-invariant
+        # max_num_batched_tokens, so the policy keys off it directly.
+        prefill_block_m = _resolve_uniform_trellis_prefill_block_m(
+            configured_block_m=prefill_block_m,
+            explicit_override=prefill_block_m_env is not None,
+            hidden_size=int(layer.exl3_hidden_size),
+            intermediate_size=int(layer.exl3_intermediate_size_per_partition),
+            num_experts=int(layer.local_num_experts),
+            topk=topk,
+            prefill_capacity=max_batched_tokens,
+            device_major=int(torch.cuda.get_device_properties(x.device).major),
+            tile_config=tuple(int(value) for value in layer.exl3_trellis_tile_config),
+        )
         prefill_plan_enabled = prefill_trellis and max_batched_tokens > max_trellis_m
         parity_rows = (
             min(chunk, max_batched_tokens)
@@ -2152,7 +2284,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 f"chunk={chunk}, required_rows={max_parity_batch}. Increase "
                 "VLLM_EXL3_PREFILL_CHUNK or lower VLLM_EXL3_TRELLIS_MIN_M."
             )
-        topk = int(topk_ids.shape[1])
         device_index = x.device.index
         key = (
             # Owning model scope first: the cached runtime holds mutable scratch,
@@ -2164,6 +2295,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             int(layer.exl3_hidden_size),
             int(layer.exl3_intermediate_size_per_partition),
             int(layer.local_num_experts),
+            bool(getattr(layer, "exl3_use_ep", False)),
+            int(getattr(layer, "global_num_experts", layer.local_num_experts)),
             topk,
             max_batched_tokens,
             min_trellis_m,
@@ -2186,13 +2319,18 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         api = _load_b12x_fused_moe()
 
         def _plan_with_scratch(plan_max_tokens: int, plan_block_m: int):
+            route_num_experts = (
+                int(layer.global_num_experts)
+                if getattr(layer, "exl3_use_ep", False)
+                else 0
+            )
             caps = api.Caps(
                 max_tokens=plan_max_tokens,
                 num_topk=topk,
                 # vLLM supplies final top-k IDs/weights to bind(); the fused-MoE
                 # router workspace is unused. A zero route-workspace request
                 # still lets the W4A16 core derive route_E from weight_E.
-                route_num_experts=0,
+                route_num_experts=route_num_experts,
                 device=x.device,
                 weight_plan=layer.exl3_trellis_weights.plan,
                 quant_mode="w4a16",
@@ -2320,8 +2458,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             else prefill_scratch.numel() * prefill_scratch.element_size() / (1 << 20)
         )
         logger.info_once(
-            "EXL3 rank-sliced runtime planned: Trellis m=%d..%d block_m=%d, "
+            "EXL3 %s runtime planned: Trellis m=%d..%d block_m=%d, "
             "prefill %s capacity=%d chunk=%d topk=%d",
+            "full-expert EP" if getattr(layer, "exl3_use_ep", False) else "TP-sliced",
             min_trellis_m,
             max_trellis_m,
             block_m,
@@ -2353,6 +2492,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         runtime = self._rank_sliced_runtime(layer, x, topk_ids)
         m = int(x.shape[0])
         if runtime["min_trellis_m"] <= m <= runtime["max_trellis_m"]:
+            expert_map = (
+                layer.exl3_expert_map if getattr(layer, "exl3_use_ep", False) else None
+            )
             binding = runtime["api"].bind(
                 runtime["trellis_plan"],
                 scratch=runtime["trellis_scratch"],
@@ -2360,6 +2502,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 experts=layer.exl3_trellis_weights,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
+                route_expert_map=expert_map,
+                output_expert_map=expert_map,
             )
             output = runtime["api"].run(binding=binding)
             return output.to(x.dtype)
@@ -2370,6 +2514,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     "EXL3 batch exceeds its planned capacity: "
                     f"m={m}, capacity={runtime['max_batched_tokens']}"
                 )
+            expert_map = (
+                layer.exl3_expert_map if getattr(layer, "exl3_use_ep", False) else None
+            )
             binding = runtime["api"].bind(
                 runtime["prefill_plan"],
                 scratch=runtime["prefill_scratch"],
@@ -2377,10 +2524,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 experts=layer.exl3_trellis_weights,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
+                route_expert_map=expert_map,
+                output_expert_map=expert_map,
             )
             output = runtime["api"].run(binding=binding)
             return output.to(x.dtype)
 
+        if getattr(layer, "exl3_use_ep", False):
+            raise RuntimeError(
+                "EXL3 full-expert EP requires every batch to use the fused "
+                "Trellis plan; unset VLLM_EXL3_TRELLIS_MIN_M or set it to 1"
+            )
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "EXL3 eager parity path entered during CUDA graph capture "
@@ -2492,7 +2646,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             raise NotImplementedError(
                 f"EXL3 correctness MoE supports SiLU only, got {layer.activation}"
             )
-        if layer.expert_map is not None:
+        if layer.expert_map is not None and not getattr(layer, "exl3_use_ep", False):
             raise NotImplementedError("EXL3 MoE expert maps/EPLB are not supported")
         if layer.apply_router_weight_on_input:
             raise NotImplementedError(
