@@ -429,16 +429,37 @@ def begin_b12x_preparation(worker: "Worker", *, stage: str):
     from vllm.distributed.parallel_state import get_world_group
     from vllm.v1.worker.b12x_startup import B12xPreparationCoordinator
 
+    provider_modules = 0
+    walked_modules = 0
     batches = []
     if b12x_native_supported(worker):
         workload = b12x_workload(worker, stage=stage)
+        units = collect_b12x_units(worker, workload)
+        for module in worker.get_model().modules():
+            walked_modules += 1
+            provider = getattr(module, "b12x_preparation_provider", None)
+            if getattr(provider, "get_b12x_preparation_units", None) is not None:
+                provider_modules += 1
+        logger.info(
+            "b12x %s-stage collection on rank %d: %d provider modules "
+            "of %d walked, %d units",
+            stage,
+            int(worker.rank),
+            provider_modules,
+            walked_modules,
+            sum(len(unit.requests) for unit in units),
+        )
         batches = b12x_batches(
-            collect_b12x_units(worker, workload),
+            units,
             autotune=bool(worker.vllm_config.kernel_config.enable_b12x_autotune),
         )
+    native_reason = None
+    if b12x_native_supported(worker) and not batches:
+        native_reason = f"no_units_providers_{provider_modules}_of_{walked_modules}"
     session = get_b12x_session(worker) if batches else None
     return B12xPreparationCoordinator(
-        session, batches, global_rank=int(worker.rank), world_group=get_world_group(),
+        session, batches, global_rank=int(worker.rank),
+        world_group=get_world_group(), native_reason=native_reason,
     )
 
 

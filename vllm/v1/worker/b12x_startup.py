@@ -38,6 +38,7 @@ class B12xPreparationCoordinator:
         *,
         global_rank: int,
         world_group,
+        native_reason: str | None = None,
         process_local_only: bool = False,
     ) -> None:
         if type(global_rank) is not int or global_rank < 0:
@@ -73,7 +74,10 @@ class B12xPreparationCoordinator:
             if requests
         ]
         self._native = bool(self._batches)
-        self._native_reason = "native" if self._native else "no_units"
+        self._native_reason = (
+            native_reason if native_reason is not None
+            else ("native" if self._native else "no_units")
+        )
         self._job = None
         self._local_done = not self._native
         self._global_done = process_local_only and self._local_done
