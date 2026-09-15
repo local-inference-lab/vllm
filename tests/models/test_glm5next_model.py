@@ -3,6 +3,8 @@
 
 import json
 import math
+import sys
+import types
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -1681,6 +1683,122 @@ def test_b12x_kda_decode_buffers_match_live_gate_layout(
     )
     assert layer._b12x_kda_raw_beta.shape == live_beta.shape
     assert layer._b12x_kda_raw_beta.stride() == live_beta.stride()
+
+
+@pytest.mark.parametrize("use_full_rank_gate", [False, True])
+def test_b12x_kda_trial_buffers_preserve_declared_layout(
+    monkeypatch, use_full_rank_gate: bool
+) -> None:
+    class PreparedCall:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    preparation = types.ModuleType("b12x.preparation")
+    preparation.PreparedCall = PreparedCall
+    package = types.ModuleType("b12x")
+    package.__path__ = []
+    monkeypatch.setitem(sys.modules, "b12x", package)
+    monkeypatch.setitem(sys.modules, "b12x.preparation", preparation)
+
+    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    layer.head_dim = 4
+    layer.local_num_heads = 3
+    layer.gate_lower_bound = -5.0
+    layer.A_log = torch.empty(3)
+    layer.dt_bias = torch.empty(12)
+    layer.o_norm = SimpleNamespace(weight=torch.empty(3))
+    layer.kv_cache = (torch.empty(1), torch.empty((2, 3, 4, 4)))
+    layer._b12x_kda_mixed_qkv = torch.empty((2, 9))
+    layer._b12x_kda_raw_g = torch.empty((2, 3, 4))
+    beta_width = 15 if use_full_rank_gate else 12
+    beta_offset = 8 if use_full_rank_gate else 4
+    beta_storage = torch.empty((2, beta_width))
+    layer._b12x_kda_raw_beta = beta_storage.narrow(1, beta_offset, 3)
+    layer._b12x_kda_z = torch.empty((2, 3, 4))
+    layer._b12x_kda_output = torch.empty((2, 3, 4))
+    layer._b12x_kda_query_start_loc = torch.empty(2, dtype=torch.int32)
+    layer._b12x_kda_num_accepted_tokens = torch.empty(1, dtype=torch.int32)
+    layer._b12x_kda_state_indices = torch.empty((1, 1), dtype=torch.int32)
+    layer._b12x_kda_num_seqs = torch.empty(1, dtype=torch.int32)
+    layer._b12x_kda_num_tokens = torch.empty(1, dtype=torch.int32)
+    layer._b12x_prefill_q = torch.empty((2, 3, 4))
+    layer._b12x_prefill_k = torch.empty((2, 3, 4))
+    layer._b12x_prefill_v = torch.empty((2, 3, 4))
+    layer._b12x_prefill_raw_g = torch.empty((2, 3, 4))
+    prefill_beta_storage = torch.empty((2, beta_width))
+    layer._b12x_prefill_raw_beta = prefill_beta_storage.narrow(1, beta_offset, 3)
+    layer._b12x_prefill_output = torch.empty((2, 3, 4))
+    layer._b12x_prefill_cu_seqlens = torch.empty(2, dtype=torch.int32)
+    layer._b12x_prefill_initial_indices = torch.empty(1, dtype=torch.int32)
+    layer._b12x_prefill_null_indices = torch.empty(1, dtype=torch.int32)
+    layer._b12x_prefill_zero_offsets = torch.empty(1, dtype=torch.int32)
+    layer._b12x_prefill_num_seqs = torch.empty(1, dtype=torch.int32)
+    layer._b12x_prefill_num_tokens = torch.empty(1, dtype=torch.int32)
+    layer._b12x_prefill_max_tokens = 2
+
+    class State:
+        layout = SimpleNamespace(
+            scratch_specs=lambda: [
+                SimpleNamespace(shape=(1,), dtype=torch.float32)
+            ]
+        )
+
+        def bind_kda(self, **tensors):
+            self.decode = tensors
+            return tensors
+
+        def bind(self, **tensors):
+            self.prefill = tensors
+            return tensors
+
+        def run(self, binding, **kwargs):
+            return None
+
+    state = State()
+    layer._b12x_kda_decode_call(state, benchmark=True)
+    layer._b12x_kda_prefill_call(state, benchmark=True)
+
+    decode_sources = {
+        "mixed_qkv": layer._b12x_kda_mixed_qkv,
+        "raw_g": layer._b12x_kda_raw_g,
+        "raw_beta": layer._b12x_kda_raw_beta,
+        "z": layer._b12x_kda_z,
+        "output": layer._b12x_kda_output,
+        "query_start_loc": layer._b12x_kda_query_start_loc,
+        "num_accepted_tokens": layer._b12x_kda_num_accepted_tokens,
+        "state_indices": layer._b12x_kda_state_indices,
+        "num_seqs": layer._b12x_kda_num_seqs,
+        "num_tokens": layer._b12x_kda_num_tokens,
+    }
+    prefill_sources = {
+        "q": layer._b12x_prefill_q,
+        "k": layer._b12x_prefill_k,
+        "v": layer._b12x_prefill_v,
+        "raw_g": layer._b12x_prefill_raw_g,
+        "raw_beta": layer._b12x_prefill_raw_beta,
+        "output": layer._b12x_prefill_output,
+        "cu_seqlens": layer._b12x_prefill_cu_seqlens,
+        "initial_state_indices": layer._b12x_prefill_initial_indices,
+        "checkpoint_state_indices": layer._b12x_prefill_null_indices,
+        "checkpoint_offsets": layer._b12x_prefill_zero_offsets,
+        "num_seqs": layer._b12x_prefill_num_seqs,
+        "num_tokens": layer._b12x_prefill_num_tokens,
+    }
+    for binding, sources in (
+        (state.decode, decode_sources),
+        (state.prefill, prefill_sources),
+    ):
+        for name, source in sources.items():
+            trial = binding[name]
+            assert trial.shape == source.shape
+            assert trial.stride() == source.stride()
+            assert trial.dtype == source.dtype
+            source_pointer = source.data_ptr()
+            trial_pointer = trial.data_ptr()
+            source_alignment = min(16, source_pointer & -source_pointer)
+            trial_alignment = min(16, trial_pointer & -trial_pointer)
+            assert trial_alignment == source_alignment
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
