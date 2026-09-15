@@ -18,7 +18,7 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
 import functools
 import json
 import os
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from typing import TYPE_CHECKING, ClassVar
 
 try:
@@ -49,6 +49,7 @@ from vllm.v1.kv_offload.tiering.base import (
     SecondaryTierManager,
     TransferJob,
 )
+from vllm.v1.kv_offload.tiering.fs.gc_manager import FsGCManager
 from vllm.v1.kv_offload.tiering.fs.io import (
     batch_load_block,
     batch_store_block,
@@ -117,6 +118,12 @@ class FileSystemTierManager(SecondaryTierManager):
         n_write_threads: int = 16,
         enable_kv_events: bool = False,
         locality: str | None = None,
+        gc_max_size_gb: float | None = None,
+        gc_low_watermark: float = 0.9,
+        gc_interval_s: float = 60.0,
+        gc_stamp_interval_s: float = 60.0,
+        gc_grace_s: float = 300.0,
+        gc_max_tracked: int = 200_000,
     ):
         """
         Args:
@@ -132,6 +139,28 @@ class FileSystemTierManager(SecondaryTierManager):
                 cache events are enabled globally (kv_events_config).
             locality: Whether this tier's storage is LOCAL or REMOTE relative
                 to the publishing vLLM instance.
+            gc_max_size_gb: On-disk budget for this tier, in GiB. None leaves
+                the tier unbounded. When set, a
+                background sweep evicts least-recently-used blocks to stay under
+                it; see FsGCManager. The budget is per engine rather than per
+                rank: the tier is constructed once on the scheduler side
+                (get_manager), so TP and PP ranks share a single
+                <base_path>_r<rank> subtree and a single budget. Engines sharing
+                a root_dir enforce the budget independently over the same
+                subtree and so evict each other's blocks, and blocks written
+                under a different layout fingerprint (a different <base_path>)
+                are never swept at all. Note that sweeps emit no removed=True KV
+                events (see FsGCManager for why), so with enable_kv_events an
+                external consumer must treat BlockStored as best-effort.
+            gc_low_watermark: Fraction of gc_max_size_gb a sweep evicts down to,
+                so eviction is batched rather than continuous.
+            gc_interval_s: Seconds between sweeps.
+            gc_stamp_interval_s: Minimum seconds between mtime stamps of the
+                same block. Must be less than gc_grace_s.
+            gc_grace_s: Blocks used within this many seconds are never swept,
+                which keeps a sweep from racing a promotion that is about to
+                read the file.
+            gc_max_tracked: Cap on keys tracked for the stamp rate limit.
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
         self.locality = Locality(locality) if locality is not None else None
@@ -147,7 +176,8 @@ class FileSystemTierManager(SecondaryTierManager):
                     "emit events.",
                     tier_type,
                 )
-        # Keys of in-flight store jobs, tracked only when events are enabled.
+        # Keys of in-flight stores, used to refresh lookup state on success and
+        # to emit events when enabled.
         self._store_job_keys: dict[JobId, list[OffloadKey]] = {}
         # Keys of in-flight load (promotion) jobs, so a failed load can mark
         # its own cached lookup verdicts False (see get_finished_jobs).
@@ -203,6 +233,19 @@ class FileSystemTierManager(SecondaryTierManager):
 
         self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
 
+        self._gc_manager: FsGCManager | None = None
+        self._gc_job_keys: dict[JobId, list[OffloadKey]] = {}
+        if gc_max_size_gb is not None:
+            self._gc_manager = FsGCManager(
+                self.file_mapper,
+                max_bytes=int(gc_max_size_gb * 2**30),
+                low_watermark=gc_low_watermark,
+                interval_s=gc_interval_s,
+                stamp_interval_s=gc_stamp_interval_s,
+                grace_s=gc_grace_s,
+                max_tracked=gc_max_tracked,
+            )
+
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()
@@ -217,8 +260,8 @@ class FileSystemTierManager(SecondaryTierManager):
     @override
     def submit_store(self, job_metadata: TransferJob) -> None:
         keys = list(job_metadata.keys)
-        if self.events is not None:
-            self._store_job_keys[job_metadata.job_id] = keys
+        self._store_job_keys[job_metadata.job_id] = keys
+        self._gc_protect(job_metadata)
         task = functools.partial(
             batch_store_block,
             [self.file_mapper.get_file_name(key) for key in keys],
@@ -236,6 +279,7 @@ class FileSystemTierManager(SecondaryTierManager):
         # keys as a miss (see get_finished_jobs).
         keys = list(job_metadata.keys)
         self._load_job_keys[job_id] = keys
+        self._gc_protect(job_metadata)
         paths = [self.file_mapper.get_file_name(key) for key in keys]
         offsets = [int(bid) * self._block_size for bid in job_metadata.block_ids]
 
@@ -274,12 +318,17 @@ class FileSystemTierManager(SecondaryTierManager):
         as a miss here (scheduler thread)."""
         results = []
         for job_id, success, transfer_time in self._pool.get_finished():
-            if self.events is not None:
-                keys = self._store_job_keys.pop(job_id, None)
-                if success and keys:
+            if self._gc_manager is not None:
+                keys = self._gc_job_keys.pop(job_id, None)
+                if keys is not None:
+                    self._gc_manager.release(keys)
+            store_keys = self._store_job_keys.pop(job_id, None)
+            if success and store_keys:
+                self._lookup_manager.mark_present(store_keys)
+                if self.events is not None:
                     self.events.append(
                         OffloadingEvent(
-                            keys=keys,
+                            keys=store_keys,
                             medium=self.medium,
                             removed=False,
                             locality=self.locality,
@@ -332,6 +381,26 @@ class FileSystemTierManager(SecondaryTierManager):
         self._lookup_manager.flush()
 
     @override
+    def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
+        """Refresh on-disk recency so GC evicts least-recently-used blocks.
+
+        Called by TieringOffloadingManager for every tier whenever the scheduler
+        matches a request's blocks -- including blocks served from the DRAM
+        primary tier, which never read this tier's files and would otherwise age
+        out while still hot. No-op unless a GC budget is configured.
+        """
+        if self._gc_manager is not None:
+            self._gc_manager.touch(keys)
+
+    def _gc_protect(self, job_metadata: TransferJob) -> None:
+        """Pin a job's keys for as long as its transfers are in flight."""
+        if self._gc_manager is None:
+            return
+        keys = list(job_metadata.keys)
+        self._gc_job_keys[job_metadata.job_id] = keys
+        self._gc_manager.protect(keys)
+
+    @override
     def shutdown(self) -> None:
         """
         Release resources held by this tier.
@@ -339,5 +408,7 @@ class FileSystemTierManager(SecondaryTierManager):
         Shuts down the lookup manager and the thread pool,
         clearing pending tasks and waiting for active threads to complete.
         """
+        if self._gc_manager is not None:
+            self._gc_manager.shutdown()
         self._lookup_manager.shutdown()
         self._pool.shutdown(wait=True)
