@@ -493,7 +493,10 @@ class DCPKVReplica:
         return self.output
 
     def replicate(self, attention, metadata):
-        key = attention.prefix
+        # A binding retains its cache tensor, so its object identity cannot be
+        # reused while the entry is live. This also separates target and draft
+        # models that may use the same layer prefix.
+        key = id(attention.kv_cache)
         binding = self.bindings.get(key)
         if binding is None:
             if torch.cuda.is_current_stream_capturing():
