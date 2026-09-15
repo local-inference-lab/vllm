@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pooled-state GDN prefill integration and fixed-capacity replay."""
 
+from math import prod
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +25,128 @@ from vllm.model_executor.layers.mamba.ops.b12x_gdn_prefill import (
 )
 def test_prefill_capacity_family_covers_exact_scheduler_limit(capacity, expected):
     assert prefill_capacities(capacity) == expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_prepared_gdn_decode_plan_is_scoped_to_the_bound_recurrent_pool(
+    default_vllm_config,
+):
+    """The decode plan is declared from the bound pool and dropped on rebind."""
+    from b12x.preparation import PreparationSession
+
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention,
+        RMSNormGated,
+    )
+    from vllm.utils.b12x import B12xWorkload
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        init_workspace_manager,
+    )
+
+    if torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("SM12x is required")
+
+    device = torch.device("cuda")
+    max_tokens, max_seqs, key_heads, value_heads = 6, 2, 2, 6
+    state_columns = 3
+    packed_width = (2 * key_heads + value_heads) * 128
+    state_shapes = ((packed_width, 5), (value_heads, 128, 128))
+    state_dtypes = (torch.bfloat16, torch.float32)
+
+    layer = QwenGatedDeltaNetAttention.__new__(QwenGatedDeltaNetAttention)
+    torch.nn.Module.__init__(layer)
+    layer.gqa_interleaved_layout = False
+    layer.gdn_decode_kernel = "b12x"
+    layer.gdn_prefill_backend = "triton"
+    layer.num_spec = state_columns - 1
+    layer.num_k_heads = key_heads
+    layer.num_v_heads = value_heads
+    layer.tp_size = 1
+    layer.head_k_dim = layer.head_v_dim = 128
+    layer.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    layer.get_state_shape = lambda: state_shapes
+    layer.get_state_dtype = lambda: state_dtypes
+    layer.norm = RMSNormGated(
+        128,
+        eps=1e-6,
+        norm_before_gate=True,
+        activation="silu",
+        device=device,
+    )
+    layer.norm.weight.data.fill_(1)
+    layer.A_log = torch.nn.Parameter(torch.full((value_heads,), -1.0, device=device))
+    layer.dt_bias = torch.nn.Parameter(torch.zeros(value_heads, device=device))
+    layer._b12x_gdn_api = None
+    layer._b12x_prefill_api = None
+    layer._b12x_decode_plan = None
+    layer._b12x_decode_staging = None
+    layer._b12x_prefill_plans = {}
+    layer._b12x_prefill_staging = None
+    layer._b12x_prefill = None
+    layer._b12x_preparation_prefix = "test.gdn-publication"
+    layer._initialize_b12x_gdn_decode(
+        SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=max_seqs))
+    )
+
+    init_workspace_manager(device)
+    workspace = current_workspace_manager()
+    # This fixture isolates resource publication. The model profile hook owns
+    # the equivalent serving reservation in a complete worker startup.
+    workspace.reserve_all(((64 << 20,), torch.uint8))
+
+    workload = B12xWorkload(
+        stage="state", token_counts=(1, 2, max_tokens), fixed_token_counts=(),
+        output_dtype=torch.bfloat16, max_tokens=max_tokens, max_seqs=max_seqs,
+        max_model_len=max_tokens, speculative_tokens=state_columns - 1,
+    )
+    # Before any pool is bound, the layer declares no decode plan: preparation
+    # is scoped entirely to the bound pool, not to a registry publication step.
+    assert layer._b12x_decode_plan is None
+    assert layer.get_b12x_preparation_units(layer, workload) == ()
+
+    page_nbytes = sum(
+        prod(shape) * dtype.itemsize
+        for shape, dtype in zip(state_shapes, state_dtypes)
+    )
+
+    def publish_pool() -> torch.Tensor:
+        raw = torch.empty(
+            (4, 1, 1, page_nbytes), dtype=torch.uint8, device=device
+        )
+        layer.bind_kv_cache(raw)
+        return raw
+
+    session = PreparationSession(device=device, autotune=False)
+
+    def prepare() -> None:
+        units = layer.get_b12x_preparation_units(layer, workload)
+        requests = tuple(request for unit in units for request in unit.requests)
+        session.prepare(requests, autotune=False)
+
+    first_pool = publish_pool()
+    first_recurrent = layer.kv_cache[1]
+    assert first_recurrent.untyped_storage().data_ptr() == first_pool.data_ptr()
+    first_plan = layer._b12x_decode_plan
+    assert first_plan is not None and first_plan.prepared is None
+    prepare()
+    assert first_plan.prepared is not None
+
+    session.release(first_plan)
+    assert first_plan.prepared is None
+
+    second_pool = publish_pool()
+    second_recurrent = layer.kv_cache[1]
+    assert second_recurrent.untyped_storage().data_ptr() == second_pool.data_ptr()
+    assert second_recurrent.data_ptr() != first_recurrent.data_ptr()
+    second_plan = layer._b12x_decode_plan
+    assert second_plan is not first_plan
+    assert second_plan.prepared is None
+
+    prepare()
+    assert second_plan.prepared is not None
+    assert first_plan.prepared is None
+    session.close()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -116,12 +239,14 @@ def test_group_worklist_copies_update_captured_buffers_without_aliasing():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_prefill_pooled_state_graph_replays_changed_lengths_and_slots():
-    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
-    from b12x.policy.generation.delta_prefill_cases import (
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.testing.delta_prefill_cases import (
         PrefillCase,
         assert_close,
         make_inputs,
         oracle,
+        prepared_binding,
+        run_binding,
     )
 
     if torch.cuda.get_device_capability()[0] != 12:
@@ -130,88 +255,81 @@ def test_prefill_pooled_state_graph_replays_changed_lengths_and_slots():
     case = PrefillCase("gdn", 2, 6, (33, 16))
     tensors = make_inputs(case, device=device, max_tokens=64, max_seqs=2)
     pool = tensors["recurrent_state"]
-    saved = pool.clone()
-    runner = B12xGdnPrefill(
-        recurrent_state=pool,
-        A_log=tensors["A_log"],
-        dt_bias=tensors["dt_bias"],
+    with prepared_binding(
+        case,
+        tensors,
         max_tokens=64,
         max_seqs=2,
-        key_heads=2,
-        value_heads=6,
         checkpoint_export=True,
-    )
-    packed = torch.cat([tensors[key].flatten(1) for key in ("q", "k", "v")], dim=-1)
-    slots = torch.tensor([1, 2], dtype=torch.int32, device=device)
-    fresh = torch.tensor([True, False], device=device)
-    counts = torch.tensor([2, 49], dtype=torch.int32, device=device)
-    checkpoint = SimpleNamespace(
-        state_indices=torch.tensor([3, 4], dtype=torch.int32, device=device),
-        checkpoint_offsets=torch.tensor([16, 0], dtype=torch.int32, device=device),
-    )
-    args = dict(
-        mixed_qkv=packed,
-        a=tensors["raw_g"],
-        b=tensors["raw_beta"],
-        query_start_loc=tensors["cu_seqlens"],
-        state_indices=slots,
-        has_initial_state=fresh,
-        live_counts=counts,
-        output=tensors["output"],
-        checkpoint=checkpoint,
-    )
-    runner.run(**args)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        runner.run(**args)
-    freeze_kernel_resolution("GDN prefill integration replay")
-    try:
-        for lengths, state_slots in (((33, 16), (1, 2)), ((16, 31), (2, 1))):
-            pool.copy_(saved)
-            slots.copy_(torch.tensor(state_slots, dtype=torch.int32, device=device))
-            counts.copy_(
-                torch.tensor([2, sum(lengths)], dtype=torch.int32, device=device)
-            )
-            tensors["cu_seqlens"].copy_(
-                torch.tensor(
-                    [0, lengths[0], sum(lengths)], dtype=torch.int32, device=device
+        null_state_index=0,
+    ) as binding:
+        graph = torch.cuda.CUDAGraph()
+        run_binding("gdn", binding)
+        with torch.cuda.graph(graph):
+            run_binding("gdn", binding)
+        guard = kernel_resolution_guard("GDN prefill integration replay")
+        guard.__enter__()
+        saved = pool.clone()
+        try:
+            for lengths, state_slots in (((33, 16), (1, 2)), ((16, 31), (2, 1))):
+                pool.copy_(saved)
+                tensors["cu_seqlens"].copy_(
+                    torch.tensor(
+                        [0, lengths[0], sum(lengths)],
+                        dtype=torch.int32,
+                        device=device,
+                    )
                 )
-            )
-            tensors["initial_state_indices"].copy_(slots)
-            tensors["initial_state_indices"][1] = 0
-            tensors["final_state_indices"].copy_(slots)
-            tensors["checkpoint_state_indices"].copy_(checkpoint.state_indices)
-            tensors["checkpoint_offsets"].copy_(checkpoint.checkpoint_offsets)
-            tensors["num_tokens"].copy_(counts[1:])
-            expected, expected_pool = oracle(
-                PrefillCase("gdn", 2, 6, lengths), tensors, null_state_index=0
-            )
-            tensors["output"].fill_(float("nan"))
-            graph.replay()
-            torch.accelerator.synchronize()
-            assert_close(
-                "output",
-                tensors["output"][: sum(lengths)],
-                expected[: sum(lengths)],
-                ratio=1e-2,
-            )
-            for slot in (1, 2, 3):
+                tensors["initial_state_indices"].copy_(
+                    torch.tensor(state_slots, dtype=torch.int32, device=device)
+                )
+                tensors["initial_state_indices"][1] = 0
+                tensors["final_state_indices"].copy_(
+                    torch.tensor(state_slots, dtype=torch.int32, device=device)
+                )
+                tensors["checkpoint_state_indices"].copy_(
+                    torch.tensor((3, 4), dtype=torch.int32, device=device)
+                )
+                tensors["checkpoint_offsets"].copy_(
+                    torch.tensor((16, 0), dtype=torch.int32, device=device)
+                )
+                tensors["num_seqs"].fill_(2)
+                tensors["num_tokens"].fill_(sum(lengths))
+                expected, expected_pool = oracle(
+                    PrefillCase("gdn", 2, 6, lengths),
+                    tensors,
+                    null_state_index=0,
+                )
+                tensors["output"].fill_(float("nan"))
+                graph.replay()
+                torch.accelerator.synchronize()
                 assert_close(
-                    f"state[{slot}]", pool[slot], expected_pool[slot], ratio=5e-3
+                    "output",
+                    tensors["output"][: sum(lengths)],
+                    expected[: sum(lengths)],
+                    ratio=1e-2,
                 )
-            torch.testing.assert_close(pool[0], saved[0], rtol=0, atol=0)
-    finally:
-        unfreeze_kernel_resolution()
+                for slot in (1, 2, 3):
+                    assert_close(
+                        f"state[{slot}]",
+                        pool[slot],
+                        expected_pool[slot],
+                        ratio=5e-3,
+                    )
+                torch.testing.assert_close(pool[0], saved[0], rtol=0, atol=0)
+        finally:
+            guard.__exit__(None, None, None)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_mixed_gdn_graph_replays_prefill_decode_verification_and_empty_worklists(
     default_vllm_config,
 ):
-    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
-    from b12x.policy.generation.delta_prefill_cases import assert_close
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.preparation import PreparationSession
     from b12x.sequence.gdn_decode.reference import decode
     from b12x.sequence.gdn_prefill.reference import prefill_gdn
+    from b12x.testing.delta_prefill_cases import assert_close
 
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
         QwenGatedDeltaNetAttention,
@@ -222,8 +340,13 @@ def test_mixed_gdn_graph_replays_prefill_decode_verification_and_empty_worklists
         causal_conv1d_fn,
         causal_conv1d_update,
     )
+    from vllm.utils.b12x import B12xWorkload
     from vllm.v1.attention.backends.b12x_gdn_metadata import B12xGdnMixedMetadata
     from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        init_workspace_manager,
+    )
 
     if torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("SM12x is required")
@@ -258,23 +381,54 @@ def test_mixed_gdn_graph_replays_prefill_decode_verification_and_empty_worklists
         conv if is_conv_state_dim_first() else conv.transpose(-1, -2),
         pool,
     )
+    layer._b12x_preparation_prefix = "test.mixed-gdn"
+    layer._b12x_prefill_max_tokens = rows
+    layer._b12x_prefill_max_seqs = seqs
+    layer._b12x_prefill_staging = None
+    layer._b12x_decode_plan = None
+    layer._b12x_prefill_plans = {}
     layer._initialize_b12x_gdn_decode(
         SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=seqs))
     )
-    plan = layer._make_b12x_gdn_plan(max_state_slots=pool.shape[0])
-    layer._b12x_plan = plan
-    spec = plan.scratch_specs()[0]
-    layer._b12x_scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+    layer._initialize_b12x_gdn_prefill()
+    init_workspace_manager(device)
+
+    # Declare the decode and prefill plans against the already-bound pool,
+    # exactly as ``QwenGatedDeltaNetAttention.bind_kv_cache`` does for a
+    # published recurrent-state pool.
+    from vllm.model_executor.layers.mamba.ops.b12x_gdn_prefill import (
+        B12xGdnPrefill,
+        prefill_capacities,
+    )
+
+    layer._b12x_decode_plan = layer._make_b12x_gdn_plan(pool.shape[0])
+    layer._b12x_prefill_plans = {
+        capacity: layer._b12x_gdn_prefill_declaration(capacity)
+        for capacity in prefill_capacities(layer._b12x_prefill_max_tokens)
+    }
+    prefill_staging = layer._ensure_b12x_gdn_prefill_staging()
     layer._b12x_prefill = B12xGdnPrefill(
         recurrent_state=pool,
         A_log=layer.A_log,
         dt_bias=layer.dt_bias,
-        max_tokens=rows,
-        max_seqs=seqs,
-        key_heads=key_heads,
-        value_heads=value_heads,
+        max_tokens=layer._b12x_prefill_max_tokens,
+        max_seqs=layer._b12x_prefill_max_seqs,
+        key_heads=layer._b12x_local_key_heads,
+        value_heads=layer._b12x_local_value_heads,
         checkpoint_export=True,
+        plans=layer._b12x_prefill_plans,
+        staging=prefill_staging,
     )
+
+    workload = B12xWorkload(
+        stage="state", token_counts=(1, 2, 4, 16, 32, rows), fixed_token_counts=(),
+        output_dtype=torch.bfloat16, max_tokens=rows, max_seqs=seqs,
+        max_model_len=rows, speculative_tokens=2,
+    )
+    units = layer.get_b12x_preparation_units(layer, workload)
+    requests = tuple(request for unit in units for request in unit.requests)
+    session = PreparationSession(device=device, autotune=False)
+    session.prepare(requests, autotune=False)
     metadata = B12xGdnMixedMetadata(
         max_tokens=rows, max_seqs=seqs, state_columns=3, device=device
     )
@@ -403,35 +557,45 @@ def test_mixed_gdn_graph_replays_prefill_decode_verification_and_empty_worklists
         stage((1, 33, 3), (9, 0, 9), (-1, -1, 2), False)
         layer._forward_core_b12x_mixed(**inputs)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            layer._forward_core_b12x_mixed(**inputs)
-        freeze_kernel_resolution("vLLM mixed GDN replay")
         try:
-            for trial in (
-                ((1, 33, 3), (9, 0, 9), (-1, -1, 2), False),
-                ((17, 1, 2), (0, 9, 9), (-1, -1, 1), True),
-                ((1, 1, 1), (9, 9, 9), (-1, -1, -1), False),
-                ((0, 0, 0), (0, 0, 0), (-1, -1, -1), False),
-            ):
-                stage(*trial)
-                expected, expected_conv, expected_pool = oracle()
-                conv.copy_(saved_conv)
-                pool.copy_(saved_pool)
-                inputs["core_attn_out"].fill_(float("nan"))
-                torch.accelerator.synchronize()
-                before = torch.accelerator.memory_stats()
-                graph.replay()
-                torch.accelerator.synchronize()
-                after = torch.accelerator.memory_stats()
-                for key in (
-                    "allocation.all.allocated",
-                    "allocated_bytes.all.allocated",
+            with session.capture():
+                with torch.cuda.graph(graph):
+                    layer._forward_core_b12x_mixed(**inputs)
+            guard = kernel_resolution_guard("vLLM mixed GDN replay")
+            guard.__enter__()
+            try:
+                for trial in (
+                    ((1, 33, 3), (9, 0, 9), (-1, -1, 2), False),
+                    ((17, 1, 2), (0, 9, 9), (-1, -1, 1), True),
+                    ((1, 1, 1), (9, 9, 9), (-1, -1, -1), False),
+                    ((0, 0, 0), (0, 0, 0), (-1, -1, -1), False),
                 ):
-                    assert after[key] == before[key]
-                assert_close(
-                    "mixed output", inputs["core_attn_out"], expected, ratio=1e-2
-                )
-                assert_close("mixed state", pool, expected_pool, ratio=5e-3)
-                torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
+                    stage(*trial)
+                    expected, expected_conv, expected_pool = oracle()
+                    conv.copy_(saved_conv)
+                    pool.copy_(saved_pool)
+                    inputs["core_attn_out"].fill_(float("nan"))
+                    torch.accelerator.synchronize()
+                    before = torch.accelerator.memory_stats()
+                    graph.replay()
+                    torch.accelerator.synchronize()
+                    after = torch.accelerator.memory_stats()
+                    for key in (
+                        "allocation.all.allocated",
+                        "allocated_bytes.all.allocated",
+                    ):
+                        assert after[key] == before[key]
+                    assert_close(
+                        "mixed output",
+                        inputs["core_attn_out"],
+                        expected,
+                        ratio=1e-2,
+                    )
+                    assert_close("mixed state", pool, expected_pool, ratio=5e-3)
+                    torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
+            finally:
+                guard.__exit__(None, None, None)
         finally:
-            unfreeze_kernel_resolution()
+            del graph
+            torch.accelerator.synchronize()
+            session.close()

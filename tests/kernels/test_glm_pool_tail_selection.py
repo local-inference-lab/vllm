@@ -172,8 +172,9 @@ def test_five_token_tail_changes_b12x_attention():
     keys = torch.zeros((64, 512), dtype=torch.bfloat16, device=device)
     keys[4] = 2
     cache = torch.empty((1, 64, 528), dtype=torch.uint8, device=device)
+    slots = torch.arange(64, dtype=torch.int64, device=device)
     sparse_mla.concat_and_cache_glm_next_mla(
-        keys, cache, torch.arange(64, dtype=torch.int64, device=device)
+        keys, cache, slots, plan=sparse_mla.plan_cache_writer(keys, cache, slots)
     )
     query = torch.zeros((1, 16, 512), dtype=torch.bfloat16, device=device)
     query[..., 0] = 1

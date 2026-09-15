@@ -31,6 +31,8 @@ endif()
 
 # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
 set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
+option(VLLM_BUILD_CUTLASS_SCALED_MM_C2X
+  "Build CUTLASS 2.x scaled-mm kernels for pre-SM90 NVIDIA GPUs" ON)
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
 
@@ -408,17 +410,28 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     if(TORCH_STABLE_STRING_CONTENTS MATCHES "auto strptr = new std::string")
       set(TORCH_SHADOW_INCLUDE_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/torch_patched_headers")
+      set(TORCH_SHADOW_STAGING_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/torch_patched_headers_staging")
 
       file(MAKE_DIRECTORY "${TORCH_SHADOW_INCLUDE_DIR}/torch/csrc/stable")
+      file(REMOVE_RECURSE "${TORCH_SHADOW_STAGING_DIR}")
+      file(MAKE_DIRECTORY "${TORCH_SHADOW_STAGING_DIR}/torch/csrc/stable")
       file(COPY_FILE
         "${TORCH_INCLUDE_DIR}/${_stable_hdr_rel}"
-        "${TORCH_SHADOW_INCLUDE_DIR}/${_stable_hdr_rel}")
+        "${TORCH_SHADOW_STAGING_DIR}/${_stable_hdr_rel}")
 
       execute_process(
         COMMAND patch --batch --forward -p1
           "--input=${CMAKE_CURRENT_LIST_DIR}/cmake/patches/pytorch_stable_string.patch"
-        WORKING_DIRECTORY "${TORCH_SHADOW_INCLUDE_DIR}"
+        WORKING_DIRECTORY "${TORCH_SHADOW_STAGING_DIR}"
         COMMAND_ERROR_IS_FATAL ANY)
+
+      # Header timestamps participate in Ninja dependency checks. Preserve the
+      # destination timestamp when the patched content has not changed.
+      file(COPY_FILE
+        "${TORCH_SHADOW_STAGING_DIR}/${_stable_hdr_rel}"
+        "${TORCH_SHADOW_INCLUDE_DIR}/${_stable_hdr_rel}"
+        ONLY_IF_DIFFERENT)
 
       include_directories(BEFORE "${TORCH_SHADOW_INCLUDE_DIR}")
     endif()
@@ -896,8 +909,14 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   # For the cutlass_scaled_mm kernels we want to build the c2x (CUTLASS 2.x)
   # kernels for the remaining archs that are not already built for 3x.
   # (Build 8.9 for FP8)
-  cuda_archs_loose_intersection(SCALED_MM_2X_ARCHS
-    "7.5;8.0;8.7;8.9+PTX" "${CUDA_ARCHS}")
+  if(VLLM_BUILD_CUTLASS_SCALED_MM_C2X)
+    cuda_archs_loose_intersection(SCALED_MM_2X_ARCHS
+      "7.5;8.0;8.7;8.9+PTX" "${CUDA_ARCHS}")
+  else()
+    set(SCALED_MM_2X_ARCHS)
+    message(STATUS "Not building scaled_mm_c2x because "
+                   "VLLM_BUILD_CUTLASS_SCALED_MM_C2X is OFF")
+  endif()
   # subtract out the archs that are already built for 3x
   list(REMOVE_ITEM SCALED_MM_2X_ARCHS ${SCALED_MM_3X_ARCHS})
   if (SCALED_MM_2X_ARCHS)

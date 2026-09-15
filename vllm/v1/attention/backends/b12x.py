@@ -7,21 +7,22 @@ from __future__ import annotations
 import copy
 import math
 from dataclasses import dataclass, replace
-from functools import partial
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Mapping
 
 import torch
 
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
-from vllm.model_executor.warmup.cutedsl_warmup import (
-    CuTeDSLCompileUnit,
-    register_cutedsl_warmup_provider,
-)
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
-from vllm.utils.b12x import get_b12x_paged_attention
+from vllm.utils.b12x import (
+    B12xPreparationUnit,
+    B12xWorkload,
+    PreparationResourceUnavailableError,
+    get_b12x_paged_attention,
+    get_b12x_scratch_buffers,
+)
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import (
     canonicalize_singleton_dim_strides,
@@ -41,7 +42,6 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout, KVCacheSpec
-from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
@@ -437,405 +437,242 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         )
 
         paged_attention = get_b12x_paged_attention()
-        assert paged_attention is not None and paged_attention.is_supported()
-
-        def _extend_work_items(
-            page_size: int,
-            q_capacity: int,
-            batch_size: int,
-        ) -> int:
-            capacity = paged_attention.extend_graph_capacity(
-                device=self.device,
-                q_dtype=self.dtype,
-                kv_dtype=self.kv_torch_dtype,
-                num_q_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                head_dim_qk=self.head_size,
-                head_dim_vo=self.output_head_size,
-                page_size=page_size,
-                batch=batch_size,
-                total_q_capacity=q_capacity,
-                max_cache_page_count=max_page_table_widths[page_size],
-                window_left=self.window_left,
-            )
-            return capacity.max_work_items
-
+        if paged_attention is None:
+            raise RuntimeError("B12X paged attention requires the b12x package.")
+        if not paged_attention.is_supported(self.device):
+            raise RuntimeError("B12X paged attention is not supported on this device.")
         self._paged_attention = paged_attention
-
-        def _make_plan(
-            page_size: int,
-            mode: str,
-            max_total_q: int,
-            max_batch: int,
-            max_work_items: int,
-            max_partial_rows: int,
-            use_cuda_graph: bool,
-            num_cache_pages: int,
-            copy_runtime_metadata: bool,
-        ) -> Any:
-            return paged_attention.plan(
-                paged_attention.Caps(
-                    device=self.device,
-                    mode=mode,
-                    dtype=self.dtype,
-                    kv_dtype=self.kv_torch_dtype,
-                    num_q_heads=self.num_heads,
-                    num_kv_heads=self.num_kv_heads,
-                    head_dim_qk=self.head_size,
-                    head_dim_vo=self.output_head_size,
-                    page_size=page_size,
-                    max_total_q=max_total_q,
-                    max_batch=max_batch,
-                    max_page_table_width=max_page_table_widths[page_size],
-                    max_work_items=max_work_items,
-                    max_partial_rows=max_partial_rows,
-                    # Shape-only planning tensor; runtime cache shape is
-                    # validated by head/page geometry, not page count.
-                    num_cache_pages=num_cache_pages,
-                    use_cuda_graph=use_cuda_graph,
-                    copy_runtime_metadata=copy_runtime_metadata,
-                )
-            )
-
-        capture_sizes = vllm_config.compilation_config.cudagraph_capture_sizes or []
-        decode_plan_sizes = {
-            int(size) for size in capture_sizes if 0 < int(size) <= max_num_seqs
-        }
-        decode_plan_sizes.add(max_num_seqs)
-
-        def _create_decode_plan(page_size: int, batch_size: int) -> Any:
-            max_page_table_width = max_page_table_widths[page_size]
-            capacity = paged_attention.decode_graph_capacity(
-                device=self.device,
-                q_dtype=self.dtype,
-                kv_dtype=self.kv_torch_dtype,
-                num_q_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                head_dim_qk=self.head_size,
-                head_dim_vo=self.output_head_size,
-                page_size=page_size,
-                batch=batch_size,
-                max_cache_page_count=max_page_table_width,
-                window_left=self.window_left,
-            )
-            plan = _make_plan(
-                page_size,
-                "decode",
-                batch_size,
-                batch_size,
-                capacity.max_work_items,
-                capacity.max_partial_rows,
-                True,
-                max_page_table_width,
-                True,
-            )
-            plan.prepare_decode_graph_replay_state(
-                batch=batch_size,
-                total_q_capacity=batch_size,
-                max_page_table_width=max_page_table_width,
-                max_cache_page_count=max_page_table_width,
-                window_left=self.window_left,
-            )
-            return plan
-
-        self._create_decode_plan = _create_decode_plan
-        self._verify_q_per_req = 0
-        if spec_config is not None:
-            self._verify_q_per_req = 1 + int(
-                getattr(spec_config, "num_speculative_tokens", None) or 0
-            )
+        self._max_batched = max_batched
+        self._max_num_seqs = max_num_seqs
+        self._max_model_len = max_model_len
+        self._max_page_table_widths = max_page_table_widths
+        self._verify_q_per_req = (
+            1 + int(getattr(spec_config, "num_speculative_tokens", None) or 0)
+            if spec_config is not None
+            else 0
+        )
         if self._verify_q_per_req <= 1:
             self._verify_q_per_req = 0
-
-        def _create_verify_plan(page_size: int, batch_size: int) -> Any:
-            if self._verify_q_per_req <= 1:
-                raise RuntimeError("b12x verifier plan requested without speculation")
-            max_page_table_width = max_page_table_widths[page_size]
-            total_q = batch_size * self._verify_q_per_req
-            capacity = paged_attention.verify_graph_capacity(
-                device=self.device,
-                q_dtype=self.dtype,
-                kv_dtype=self.kv_torch_dtype,
-                num_q_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                head_dim_qk=self.head_size,
-                head_dim_vo=self.output_head_size,
-                page_size=page_size,
-                batch=batch_size,
-                query_len=self._verify_q_per_req,
-                max_cache_page_count=max_page_table_width,
-                window_left=self.window_left,
-            )
-            plan = _make_plan(
-                page_size,
-                "verify",
-                total_q,
-                batch_size,
-                capacity.max_work_items,
-                capacity.max_partial_rows,
-                True,
-                max_page_table_width,
-                True,
-            )
-            page_ids = torch.arange(
-                max_page_table_width,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            max_page_table = page_ids.unsqueeze(0).expand(batch_size, -1).contiguous()
-            max_cache_seqlens = torch.full(
-                (batch_size,),
-                capacity.representative_cache_seqlen,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            max_cu_seqlens_q = torch.arange(
-                0,
-                total_q + 1,
-                self._verify_q_per_req,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            plan.prepare_graph_replay_state(
-                page_table=max_page_table,
-                cache_seqlens=max_cache_seqlens,
-                cu_seqlens_q=max_cu_seqlens_q,
-                active_total_q=total_q,
-                window_left=self.window_left,
-            )
-            return plan
-
-        self._create_verify_plan = _create_verify_plan
-
-        def _create_extend_plan(
-            page_size: int,
-            batch_size: int,
-            q_capacity: int,
-        ) -> Any:
-            """Prepare a fixed-capacity extend plan without reading live lengths."""
-            max_page_table_width = max_page_table_widths[page_size]
-            plan = _make_plan(
-                page_size,
-                "extend",
-                q_capacity,
-                batch_size,
-                _extend_work_items(page_size, q_capacity, batch_size),
-                0,
-                True,
-                max_page_table_width,
-                False,
-            )
-            page_ids = torch.arange(
-                max_page_table_width,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            max_page_table = page_ids.unsqueeze(0).expand(batch_size, -1).contiguous()
-            max_cache_seqlens = torch.full(
-                (batch_size,),
-                min(max_model_len, max_page_table_width * page_size),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            # Put one row in every request except the last, which owns the
-            # remainder. This represents the full total-Q capacity while the
-            # replay kernel remains responsible for packing arbitrary live
-            # per-request lengths from device cu_seqlens_q.
-            max_cu_seqlens_q = torch.arange(
-                0,
-                batch_size + 1,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            max_cu_seqlens_q[-1] = q_capacity
-            plan.prepare_graph_replay_state(
-                page_table=max_page_table,
-                cache_seqlens=max_cache_seqlens,
-                cu_seqlens_q=max_cu_seqlens_q,
-                active_total_q=q_capacity,
-                window_left=self.window_left,
-            )
-            return plan
-
-        self._create_extend_plan = _create_extend_plan
-        decode_scratch_envelopes = {
-            page_size: paged_attention.decode_graph_scratch_envelope(
-                device=self.device,
-                q_dtype=self.dtype,
-                kv_dtype=self.kv_torch_dtype,
-                num_q_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                head_dim_qk=self.head_size,
-                head_dim_vo=self.output_head_size,
-                page_size=page_size,
-                max_batch=max_num_seqs,
-                max_page_table_width=max_page_table_widths[page_size],
-                max_cache_page_count=max_page_table_widths[page_size],
-                window_left=self.window_left,
-                copy_runtime_metadata=True,
-            )
-            for page_size in _B12X_SUPPORTED_PAGE_SIZES
-        }
-        self._decode_plans: dict[tuple[int, int], Any] = {}
-        self._verify_plans: dict[tuple[int, int], Any] = {}
-        self._extend_plans: dict[tuple[int, int, int], Any] = {}
-        for page_size in _B12X_SUPPORTED_PAGE_SIZES:
-            for batch_size in sorted(decode_plan_sizes):
-                self._decode_plans[page_size, batch_size] = self._create_decode_plan(
-                    page_size, batch_size
-                )
-            if self._verify_q_per_req > 1:
-                for batch_size in range(1, max_num_seqs + 1):
-                    self._verify_plans[page_size, batch_size] = (
-                        self._create_verify_plan(page_size, batch_size)
-                    )
-            for batch_size in range(1, max_num_seqs + 1):
-                for q_capacity in self._extend_q_capacities:
-                    # Equal capacity is necessarily one query token per
-                    # request, which is handled by the decode plan.
-                    if batch_size >= q_capacity:
-                        continue
-                    self._extend_plans[page_size, batch_size, q_capacity] = (
-                        self._create_extend_plan(
-                            page_size,
-                            batch_size,
-                            q_capacity,
-                        )
-                    )
-        self._scratch_nbytes = max(
-            *(int(envelope.nbytes) for envelope in decode_scratch_envelopes.values()),
-            *(int(plan.layout.nbytes) for plan in self._verify_plans.values()),
-            *(int(plan.layout.nbytes) for plan in self._extend_plans.values()),
-        )
-
-        current_workspace_manager().get_simultaneous(
-            ((self._scratch_nbytes,), torch.uint8),
-        )
-
+        self._extend_q_capacities = tuple(sorted({
+            min(max_batched, capacity)
+            for capacity in (128, 512, 1024, 2048, 4096, max_batched)
+            if capacity > 0
+        }))
+        self._plans: dict[tuple[str, int, int, int], object] = {}
         self.supports_quant_query_input = False
-        register_cutedsl_warmup_provider(self)
 
         logger.info_once(
             "Using b12x with q_heads=%d kv_heads=%d head_dim_qk=%d "
-            "head_dim_vo=%d window_left=%d planned_page_sizes=%s "
-            "verify_q_per_req=%d extend_q_capacities=%s scratch=%d bytes.",
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_size,
-            self.output_head_size,
-            self.window_left,
-            _B12X_SUPPORTED_PAGE_SIZES,
-            self._verify_q_per_req,
+            "head_dim_vo=%d window_left=%d verify_q_per_req=%d "
+            "extend_q_capacities=%s.",
+            self.num_heads, self.num_kv_heads, self.head_size,
+            self.output_head_size, self.window_left, self._verify_q_per_req,
             self._extend_q_capacities,
-            self._scratch_nbytes,
+        )
+    def _request_name(self, owner: object, key: tuple[str, int, int, int]) -> str:
+        mode, page_size, batch, total_q = key
+        return f"attention.paged.{id(owner):x}.{mode}.p{page_size}.b{batch}.q{total_q}"
+
+    def _caps(
+        self, *, page_size: int, mode: str, batch: int, total_q: int,
+        max_work_items: int, max_partial_rows: int, copy_runtime_metadata: bool,
+        num_cache_pages: int,
+    ):
+        return self._paged_attention.Caps(
+            device=self.device, mode=mode, dtype=self.dtype,
+            kv_dtype=self.kv_torch_dtype, num_q_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads, head_dim_qk=self.head_size,
+            head_dim_vo=self.output_head_size, page_size=page_size,
+            max_total_q=total_q, max_batch=batch,
+            max_page_table_width=self._max_page_table_widths[page_size],
+            max_work_items=max_work_items, max_partial_rows=max_partial_rows,
+            num_cache_pages=num_cache_pages,
+            use_cuda_graph=True, copy_runtime_metadata=copy_runtime_metadata,
         )
 
-    def _compile_paged_extend_entry(self, page_size: int) -> None:
-        """Compile fixed-capacity paged-prefill entries without a live plan."""
-        warmup_plans: list[tuple[int, int, Any, bool]] = []
-        for batch_size in range(1, self._max_num_seqs + 1):
-            candidates = sorted(
-                (q_capacity, plan)
-                for (plan_page_size, plan_batch, q_capacity), plan in (
-                    self._extend_plans.items()
-                )
-                if plan_page_size == page_size and plan_batch == batch_size
-            )
-            for index, (q_capacity, plan) in enumerate(candidates):
-                warmup_plans.append((batch_size, q_capacity, plan, index == 0))
-        if not warmup_plans:
-            return
+    @staticmethod
+    def _descriptor(shape, strides, dtype: torch.dtype) -> Mapping[str, object]:
+        return {
+            "shape": tuple(int(value) for value in shape),
+            "strides": tuple(int(value) for value in strides),
+            "dtype": str(dtype).removeprefix("torch."),
+            "alignment": 16,
+        }
 
-        max_q_rows = max(
-            min(q_capacity, max(64, batch_size + 1))
-            for batch_size, q_capacity, _, _ in warmup_plans
-        )
-        q = torch.zeros(
-            (max_q_rows, self.num_heads, self.head_size),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        output = torch.zeros(
-            (max_q_rows, self.num_heads, self.output_head_size),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        kv_cache = torch.zeros(
-            (1, 2, page_size, self.num_kv_heads * self.head_size),
-            dtype=self.kv_torch_dtype,
-            device=self.device,
-        )
-        key_cache, value_cache = self._kv_cache_views(kv_cache)
-        (scratch_storage,) = current_workspace_manager().get_simultaneous(
-            ((self._scratch_nbytes,), torch.uint8),
-        )
-        for batch_size, q_capacity, plan, execute in warmup_plans:
-            q_rows = min(q_capacity, max(64, batch_size + 1))
-            page_table = torch.zeros(
-                (batch_size, plan.caps.max_page_table_width),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            cache_seqlens = torch.full(
-                (batch_size,), page_size, dtype=torch.int32, device=self.device
-            )
-            cu_seqlens_q = torch.arange(
-                0,
-                batch_size + 1,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            cu_seqlens_q[-1] = q_rows
-            k_descale = None
-            v_descale = None
-            if _is_b12x_fp8_kv_cache(self.kv_cache_dtype):
-                k_descale = torch.ones(
-                    (), dtype=torch.float32, device=self.device
-                ).expand(batch_size)
-                v_descale = torch.ones(
-                    (), dtype=torch.float32, device=self.device
-                ).expand(batch_size)
-            binding = plan.bind(
-                scratch=scratch_storage,
-                q=q[:q_rows],
-                k_cache=key_cache,
-                v_cache=value_cache,
-                output=output[:q_rows],
-                page_table=page_table,
-                cache_seqlens=cache_seqlens,
-                cu_seqlens_q=cu_seqlens_q,
+    def _declaration(
+        self, *, page_size: int, mode: str, batch: int, total_q: int,
+        key_cache: torch.Tensor, value_cache: torch.Tensor, owner: object,
+    ):
+        width = self._max_page_table_widths[page_size]
+        if mode == "decode":
+            capacity = self._paged_attention.decode_graph_capacity(
+                device=self.device, q_dtype=self.dtype, kv_dtype=self.kv_torch_dtype,
+                num_q_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
+                head_dim_qk=self.head_size, head_dim_vo=self.output_head_size,
+                page_size=page_size, batch=batch, max_cache_page_count=width,
                 window_left=self.window_left,
-                attention_sink_bias=self.sinks,
-                k_descale=k_descale,
-                v_descale=v_descale,
             )
-            self._paged_attention.compile(binding=binding)
-            if execute:
-                # Compile-only warmup does not launch the device-side compact
-                # scheduler. One execution per batch covers the capture-static
-                # metadata variant shared by its Q-capacity plans.
-                self._paged_attention.run(binding=binding)
-
-    def get_cutedsl_warmup_compile_units(self) -> tuple[CuTeDSLCompileUnit, ...]:
-        common_key = (
-            "b12x_paged_extend",
-            str(self.device),
-            str(self.dtype),
-            str(self.kv_torch_dtype),
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_size,
-            self.output_head_size,
-            self.window_left,
-            self.sinks is not None,
+            max_work_items, max_partial_rows, copy_metadata = (
+                capacity.max_work_items, capacity.max_partial_rows, True)
+        elif mode == "verify":
+            capacity = self._paged_attention.verify_graph_capacity(
+                device=self.device, q_dtype=self.dtype, kv_dtype=self.kv_torch_dtype,
+                num_q_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
+                head_dim_qk=self.head_size, head_dim_vo=self.output_head_size,
+                page_size=page_size, batch=batch, query_len=self._verify_q_per_req,
+                max_cache_page_count=width, window_left=self.window_left,
+            )
+            max_work_items, max_partial_rows, copy_metadata = (
+                capacity.max_work_items, capacity.max_partial_rows, True)
+        else:
+            capacity = self._paged_attention.extend_graph_capacity(
+                device=self.device, q_dtype=self.dtype, kv_dtype=self.kv_torch_dtype,
+                num_q_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
+                head_dim_qk=self.head_size, head_dim_vo=self.output_head_size,
+                page_size=page_size, batch=batch, total_q_capacity=total_q,
+                max_cache_page_count=width, window_left=self.window_left,
+            )
+            max_work_items, max_partial_rows, copy_metadata = (
+                capacity.max_work_items, 0, False)
+        caps = self._caps(
+            page_size=page_size, mode=mode, batch=batch, total_q=total_q,
+            max_work_items=max_work_items, max_partial_rows=max_partial_rows,
+            copy_runtime_metadata=copy_metadata,
+            num_cache_pages=int(key_cache.shape[0]),
         )
-        return tuple(
-            CuTeDSLCompileUnit(
-                name="b12x_paged_extend",
-                key=(*common_key, page_size),
-                compile=partial(self._compile_paged_extend_entry, page_size),
-            )
-            for page_size in _B12X_SUPPORTED_PAGE_SIZES
+        k_descale, v_descale = self._prepare_fp8_descales(owner, batch, self.device)
+        q_shape = (total_q, self.num_heads, self.head_size)
+        out_shape = (total_q, self.num_heads, self.output_head_size)
+        operands = {
+            "q": self._descriptor(q_shape, (self.num_heads * self.head_size, self.head_size, 1), self.dtype),
+            "k_cache": {
+                **self._descriptor(key_cache.shape, key_cache.stride(), key_cache.dtype),
+                "alignment": min(16, int(key_cache.data_ptr()) & -int(key_cache.data_ptr())) if key_cache.data_ptr() else 16,
+            },
+            "v_cache": {
+                **self._descriptor(value_cache.shape, value_cache.stride(), value_cache.dtype),
+                "alignment": min(16, int(value_cache.data_ptr()) & -int(value_cache.data_ptr())) if value_cache.data_ptr() else 16,
+            },
+            "output": self._descriptor(out_shape, (self.num_heads * self.output_head_size, self.output_head_size, 1), self.dtype),
+            "page_table": self._descriptor((batch, width), (width, 1), torch.int32),
+            "cache_seqlens": self._descriptor((batch,), (1,), torch.int32),
+            "cu_seqlens_q": self._descriptor((batch + 1,), (1,), torch.int32),
+            "q2k_indices": None,
+            "k_descale": None if k_descale is None else self._descriptor(
+                k_descale.shape, k_descale.stride(), k_descale.dtype),
+            "v_descale": None if v_descale is None else self._descriptor(
+                v_descale.shape, v_descale.stride(), v_descale.dtype),
+            "attention_sink_bias": None if self.sinks is None else self._descriptor((self.num_heads,), (1,), torch.float32),
+            "relative_attention_bias": None,
+        }
+        invocation = dict(
+            self._paged_attention.invocation_from_descriptors(caps, operands=operands)
+        )
+        # The native route is specialized on the window, so a declaration
+        # carries the same window its bindings request.
+        invocation["window_left"] = self.window_left
+        return self._paged_attention.plan(caps, invocation=invocation)
+
+    def get_b12x_preparation_units(
+        self, layer: torch.nn.Module, workload: B12xWorkload,
+    ) -> tuple[B12xPreparationUnit, ...]:
+        kv_cache = getattr(layer, "kv_cache", None)
+        if not isinstance(kv_cache, torch.Tensor) or kv_cache.numel() == 0:
+            return ()
+        key_cache, value_cache = self._kv_cache_views(kv_cache)
+        page_size = _kv_page_size(key_cache, value_cache)
+        if workload.output_dtype != self.dtype:
+            raise ValueError("b12x paged output dtype differs from its loaded contract")
+        plans: dict[tuple[str, int, int, int], object] = {}
+        requests = []
+        batches = tuple(sorted(set(
+            count for count in workload.token_counts if count <= self._max_num_seqs
+        ) | {self._max_num_seqs}))
+        for batch in batches:
+            key = ("decode", page_size, batch, batch)
+            declaration = self._declaration(
+                page_size=page_size, mode="decode", batch=batch, total_q=batch,
+                key_cache=key_cache, value_cache=value_cache, owner=layer)
+            plans[key] = declaration
+            requests.append(declaration.request(
+                name=self._request_name(layer, key),
+                prepare_call=lambda state, key=key, layer=layer: self._prepared_call(layer, state, key, benchmark=False),
+                benchmark_call=lambda state, key=key, layer=layer: self._prepared_call(layer, state, key, benchmark=True),
+            ))
+            if self._verify_q_per_req > 1:
+                total_q = batch * self._verify_q_per_req
+                key = ("verify", page_size, batch, total_q)
+                declaration = self._declaration(
+                    page_size=page_size, mode="verify", batch=batch, total_q=total_q,
+                    key_cache=key_cache, value_cache=value_cache, owner=layer)
+                plans[key] = declaration
+                requests.append(declaration.request(
+                    name=self._request_name(layer, key),
+                    prepare_call=lambda state, key=key, layer=layer: self._prepared_call(layer, state, key, benchmark=False),
+                    benchmark_call=lambda state, key=key, layer=layer: self._prepared_call(layer, state, key, benchmark=True),
+                ))
+        for batch in range(1, self._max_num_seqs + 1):
+            for total_q in self._extend_q_capacities:
+                if batch >= total_q:
+                    continue
+                key = ("extend", page_size, batch, total_q)
+                declaration = self._declaration(
+                    page_size=page_size, mode="extend", batch=batch, total_q=total_q,
+                    key_cache=key_cache, value_cache=value_cache, owner=layer)
+                plans[key] = declaration
+                requests.append(declaration.request(
+                    name=self._request_name(layer, key),
+                    prepare_call=lambda state, key=key, layer=layer: self._prepared_call(layer, state, key, benchmark=False),
+                    benchmark_call=lambda state, key=key, layer=layer: self._prepared_call(layer, state, key, benchmark=True),
+                ))
+        self._plans = plans
+        if not requests:
+            return ()
+        return (B12xPreparationUnit(
+            name="b12x paged attention",
+            key=(id(layer), page_size),
+            requests=tuple(requests),
+            stage="state",
+            autotune=not workload.eager_only,
+        ),)
+
+    def _prepared_call(
+        self, owner: object, state: object, key, *, benchmark: bool, caches=None,
+    ):
+        from b12x.preparation import PreparedCall
+
+        mode, page_size, batch, total_q = key
+        if caches is None:
+            key_cache, value_cache = self._kv_cache_views(owner.kv_cache)
+        else:
+            key_cache, value_cache = caches
+        if _kv_page_size(key_cache, value_cache) != page_size:
+            raise PreparationResourceUnavailableError("b12x paged cache generation changed")
+        specs = state.scratch_plan.scratch_specs()
+        # Trial and prepare factories own their scratch; the runtime binding
+        # in forward() draws from the workspace manager instead.
+        scratch = tuple(
+            torch.empty(spec.shape, dtype=spec.dtype, device=self.device)
+            for spec in specs
+        )
+        q = torch.empty((total_q, self.num_heads, self.head_size), dtype=self.dtype, device=self.device)
+        output = torch.empty((total_q, self.num_heads, self.output_head_size), dtype=self.dtype, device=self.device)
+        page_table = torch.zeros((batch, self._max_page_table_widths[page_size]), dtype=torch.int32, device=self.device)
+        cache_seqlens = torch.full((batch,), page_size, dtype=torch.int32, device=self.device)
+        cu_seqlens_q = torch.arange(batch + 1, dtype=torch.int32, device=self.device)
+        cu_seqlens_q[-1] = total_q
+        k_descale, v_descale = self._prepare_fp8_descales(owner, batch, self.device)
+        binding = state.bind(
+            scratch=scratch, q=q, k_cache=key_cache, v_cache=value_cache, output=output,
+            page_table=page_table, cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q, window_left=self.window_left,
+            active_total_q=None if mode == "extend" else total_q,
+            attention_sink_bias=self.sinks, k_descale=k_descale, v_descale=v_descale,
+        )
+        return PreparedCall(
+            run=lambda: state.run(binding),
+            produce=lambda: q.zero_(),
+            owners=(scratch, q, output, page_table, cache_seqlens, cu_seqlens_q),
         )
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
@@ -912,68 +749,48 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         q_capacity: int,
         num_reqs: int,
         page_size: int,
-    ) -> Any:
-        if attn_metadata.max_query_len <= 1 and int(total_q) == int(num_reqs):
-            batch_size = int(total_q)
-            plan_key = (page_size, batch_size)
-            plan = self._decode_plans.get(plan_key)
-            if plan is None:
-                if _capture_alloc_forbidden():
-                    raise RuntimeError(
-                        "b12x decode plan was not prepared before CUDA graph "
-                        f"capture for page size {page_size}, batch size "
-                        f"{batch_size}."
-                    )
-                plan = self._create_decode_plan(page_size, batch_size)
-                if int(plan.layout.nbytes) > self._scratch_nbytes:
-                    raise RuntimeError(
-                        "b12x lazily created decode plan exceeds reserved "
-                        f"scratch: {int(plan.layout.nbytes)} > "
-                        f"{self._scratch_nbytes} bytes."
-                    )
-                self._decode_plans[plan_key] = plan
-            return plan
+        *,
+        key_cache: torch.Tensor | None = None,
+        value_cache: torch.Tensor | None = None,
+        layer: object | None = None,
+    ) -> tuple[object, tuple[str, int, int, int]]:
+        if attn_metadata.max_query_len <= 1 and total_q == num_reqs:
+            key = ("decode", page_size, total_q, total_q)
         elif (
             self._verify_q_per_req > 1
             and attn_metadata.max_query_len == self._verify_q_per_req
-            and int(total_q) == int(num_reqs) * self._verify_q_per_req
+            and total_q == num_reqs * self._verify_q_per_req
         ):
-            plan_key = (page_size, int(num_reqs))
-            plan = self._verify_plans.get(plan_key)
-            if plan is None:
-                if _capture_alloc_forbidden():
-                    raise RuntimeError(
-                        "b12x verifier plan was not prepared before CUDA "
-                        f"graph capture for page size {page_size}, batch size "
-                        f"{num_reqs}."
-                    )
-                plan = self._create_verify_plan(page_size, int(num_reqs))
-                if int(plan.layout.nbytes) > self._scratch_nbytes:
-                    raise RuntimeError(
-                        "b12x lazily created verifier plan exceeds reserved "
-                        f"scratch: {int(plan.layout.nbytes)} > "
-                        f"{self._scratch_nbytes} bytes."
-                    )
-                self._verify_plans[plan_key] = plan
-            return plan
-        extend_q_capacity = next(
-            (
-                capacity
-                for capacity in self._extend_q_capacities
-                if q_capacity <= capacity
-            ),
-            None,
-        )
-        if extend_q_capacity is None:
-            raise ValueError(
-                f"b12x extend Q capacity {q_capacity} exceeds prepared "
-                f"maximum {self._extend_q_capacities[-1]}."
+            key = ("verify", page_size, num_reqs, total_q)
+        else:
+            capacity = next(
+                (candidate for candidate in self._extend_q_capacities
+                 if q_capacity <= candidate),
+                None,
             )
-        return self._extend_plans[
-            page_size,
-            int(num_reqs),
-            extend_q_capacity,
-        ]
+            if capacity is None:
+                raise ValueError(
+                    f"b12x extend Q capacity {q_capacity} exceeds prepared "
+                    f"maximum {self._extend_q_capacities[-1]}."
+                )
+            key = ("extend", page_size, num_reqs, capacity)
+        plan = self._plans.get(key)
+        if plan is not None:
+            return plan, key
+        # A variant the preparation pass did not declare is declared here with
+        # its default configuration and materialized on first use.
+        if key_cache is None or value_cache is None:
+            raise PreparationResourceUnavailableError(
+                "b12x paged plan is not prepared for cache generation "
+                f"and variant {key!r}"
+            )
+        mode, _, batch, total = key
+        plan = self._declaration(
+            page_size=page_size, mode=mode, batch=batch, total_q=total,
+            key_cache=key_cache, value_cache=value_cache, owner=layer,
+        )
+        self._plans[key] = plan
+        return plan, key
 
     def forward(
         self,
@@ -1046,18 +863,14 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
             num_reqs,
             q.device,
         )
-        plan = self._select_plan(
-            attn_metadata,
-            num_actual_tokens,
-            q_capacity,
-            num_reqs,
-            page_size,
+        plan, plan_key = self._select_plan(
+            attn_metadata, num_actual_tokens, q_capacity, num_reqs, page_size,
+            key_cache=key_cache, value_cache=value_cache, layer=layer,
         )
-        (scratch_storage,) = current_workspace_manager().get_simultaneous(
-            ((self._scratch_nbytes,), torch.uint8),
-        )
-        binding = plan.bind(
-            scratch=scratch_storage,
+        scratch = tuple(get_b12x_scratch_buffers(plan))
+        binding = self._paged_attention.bind(
+            plan,
+            scratch=scratch,
             q=q,
             k_cache=key_cache,
             v_cache=value_cache,
@@ -1066,12 +879,14 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
             window_left=self.window_left,
-            active_total_q=(None if plan.caps.mode == "extend" else num_actual_tokens),
+            active_total_q=(
+                None if plan_key[0] == "extend" else num_actual_tokens
+            ),
             attention_sink_bias=self.sinks,
             k_descale=k_descale,
             v_descale=v_descale,
         )
-        self._paged_attention.run(binding=binding)
+        self._paged_attention.run(binding=binding, plan=plan)
         return output
 
     def do_kv_cache_update(

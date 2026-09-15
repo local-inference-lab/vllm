@@ -3,6 +3,8 @@
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
 import os
+from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
@@ -60,7 +62,16 @@ from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 from vllm.triton_utils import tl, triton
-from vllm.utils.b12x import get_b12x_gdn_decode, get_b12x_scratch_buffers
+from vllm.utils.b12x import (
+    set_b12x_preparation_provider,
+    B12xPreparationUnit,
+    B12xWorkload,
+    PreparationResourceUnavailableError,
+    get_b12x_gdn_decode,
+    get_b12x_gdn_prefill,
+    get_b12x_projection_workspaces,
+    get_b12x_scratch_buffers,
+)
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -70,10 +81,95 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
-from vllm.v1.worker.workspace import retain_cuda_graph_capture_resource
+from vllm.v1.worker.workspace import (
+    retain_cuda_graph_capture_resource,
+    use_preallocated_workspace,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.mamba.ops.b12x_gdn_prefill import B12xGdnPrefill
+
+
+@dataclass(frozen=True)
+class _B12xGdnDecodeStaging:
+    """Reusable decode buffers independent of a recurrent-state generation."""
+
+    max_tokens: int
+    max_seqs: int
+    state_index_columns: int
+    key_heads: int
+    value_heads: int
+    packed_qkv_width: int
+    head_dim: int
+    mixed_qkv: torch.Tensor
+    a: torch.Tensor
+    b: torch.Tensor
+    z: torch.Tensor
+    output: torch.Tensor
+    query_start_loc: torch.Tensor
+    num_accepted_tokens: torch.Tensor
+    state_indices: torch.Tensor
+    num_seqs: torch.Tensor
+    num_tokens: torch.Tensor
+
+    @classmethod
+    def allocate(
+        cls,
+        *,
+        max_tokens: int,
+        max_seqs: int,
+        state_index_columns: int,
+        key_heads: int,
+        value_heads: int,
+        packed_qkv_width: int,
+        head_dim: int,
+        device: torch.device,
+    ) -> "_B12xGdnDecodeStaging":
+        factory = dict(device=device, dtype=torch.bfloat16)
+        return cls(
+            max_tokens=max_tokens,
+            max_seqs=max_seqs,
+            state_index_columns=state_index_columns,
+            key_heads=key_heads,
+            value_heads=value_heads,
+            packed_qkv_width=packed_qkv_width,
+            head_dim=head_dim,
+            mixed_qkv=torch.empty(max_tokens, packed_qkv_width, **factory),
+            a=torch.empty(max_tokens, value_heads, **factory),
+            b=torch.empty(max_tokens, value_heads, **factory),
+            z=torch.empty(max_tokens, value_heads, head_dim, **factory),
+            output=torch.empty(max_tokens, value_heads, head_dim, **factory),
+            query_start_loc=torch.zeros(max_seqs + 1, dtype=torch.int32, device=device),
+            num_accepted_tokens=torch.ones(max_seqs, dtype=torch.int32, device=device),
+            state_indices=torch.zeros(
+                max_seqs, state_index_columns, dtype=torch.int32, device=device
+            ),
+            num_seqs=torch.zeros(1, dtype=torch.int32, device=device),
+            num_tokens=torch.zeros(1, dtype=torch.int32, device=device),
+        )
+
+    def is_compatible(
+        self,
+        *,
+        max_tokens: int,
+        max_seqs: int,
+        state_index_columns: int,
+        key_heads: int,
+        value_heads: int,
+        packed_qkv_width: int,
+        head_dim: int,
+        device: torch.device,
+    ) -> bool:
+        return (
+            self.max_tokens >= max_tokens
+            and self.max_seqs >= max_seqs
+            and self.state_index_columns >= state_index_columns
+            and self.key_heads == key_heads
+            and self.value_heads == value_heads
+            and self.packed_qkv_width == packed_qkv_width
+            and self.head_dim == head_dim
+            and self.mixed_qkv.device == device
+        )
 
 # Optional ROCm AITER Triton kernels for the GDN decode path.
 # Availability is checked centrally via rocm_aiter_ops; the actual function
@@ -693,9 +789,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.gdn_decode_kernel = "triton"
         self.enable_fused_gdn_decode = self.gdn_decode_kernel in ("b12x", "cuda")
         self._b12x_gdn_api: Any | None = None
-        self._b12x_plan = None
+        self._b12x_prefill_api: Any | None = None
+        self._b12x_decode_plan = None
+        self._b12x_decode_staging: _B12xGdnDecodeStaging | None = None
+        self._b12x_prefill_plans: dict[int, object] = {}
+        self._b12x_prefill_staging = None
+        self._b12x_prefill = None
         if self.gdn_decode_kernel == "b12x":
             self._initialize_b12x_gdn_decode(vllm_config)
+        if self.gdn_prefill_backend == "b12x":
+            self._initialize_b12x_gdn_prefill()
+        self._b12x_preparation_prefix = prefix
+        if self._b12x_gdn_api is not None or self._b12x_prefill_api is not None:
+            if not getattr(self, "b12x_preparation_suppressed", False):
+                set_b12x_preparation_provider(self, self)
         logger.info_once("GDN decode kernel: %s", self.gdn_decode_kernel)
 
         compilation_config = get_current_vllm_config().compilation_config
@@ -713,8 +820,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             raise RuntimeError(
                 "GDN decode kernel 'b12x' requires b12x.sequence.gdn_decode"
             )
-        device = torch.device(current_platform.current_device())
-
         max_seqs = int(vllm_config.scheduler_config.max_num_seqs)
         state_index_columns = max(1, self.num_spec + 1)
         max_tokens = max_seqs * state_index_columns
@@ -727,113 +832,392 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._b12x_state_index_columns = state_index_columns
         self._b12x_local_key_heads = local_key_heads
         self._b12x_local_value_heads = local_value_heads
+        # Caps are immutable declaration metadata.  Inspect geometry directly
+        # instead of constructing an executable declaration.
+        caps = self._make_b12x_gdn_caps(max_state_slots=1)
+        self._b12x_packed_qkv_width = caps.packed_qkv_width
+        self._b12x_decode_staging = None
 
-        provisional = self._make_b12x_gdn_plan(max_state_slots=1)
-        caps = provisional.caps
-        factory = dict(device=device, dtype=torch.bfloat16)
-        self.register_buffer(
-            "_b12x_mixed_qkv",
-            torch.empty(max_tokens, caps.packed_qkv_width, **factory),
-            persistent=False,
+    def _make_b12x_gdn_caps(self, max_state_slots: int):
+        api = self._b12x_gdn_api
+        if api is None:
+            raise RuntimeError("b12x GDN decode was not initialized")
+        return api.Caps(
+            device=current_platform.current_device(),
+            max_tokens=self._b12x_max_tokens,
+            max_seqs=self._b12x_max_seqs,
+            max_state_slots=max_state_slots,
+            key_heads=self._b12x_local_key_heads,
+            value_heads=self._b12x_local_value_heads,
+            key_head_dim=self.head_k_dim,
+            value_head_dim=self.head_v_dim,
+            state_index_columns=self._b12x_state_index_columns,
+            model_dtype=self.model_config.dtype,
+            state_dtype=self.get_state_dtype()[1],
+            gate_activation=self.norm.activation,
+            qk_l2norm=True,
         )
-        self.register_buffer(
-            "_b12x_a",
-            torch.empty(max_tokens, local_value_heads, **factory),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_b12x_b",
-            torch.empty(max_tokens, local_value_heads, **factory),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_b12x_z",
-            torch.empty(max_tokens, local_value_heads, self.head_v_dim, **factory),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_b12x_output",
-            torch.empty(max_tokens, local_value_heads, self.head_v_dim, **factory),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_b12x_query_start_loc",
-            torch.zeros(max_seqs + 1, dtype=torch.int32, device=device),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_b12x_num_accepted_tokens",
-            torch.ones(max_seqs, dtype=torch.int32, device=device),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_b12x_state_indices",
-            torch.zeros(
-                max_seqs,
-                state_index_columns,
-                dtype=torch.int32,
-                device=device,
-            ),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_b12x_num_seqs",
-            torch.zeros(1, dtype=torch.int32, device=device),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_b12x_num_tokens",
-            torch.zeros(1, dtype=torch.int32, device=device),
-            persistent=False,
-        )
-        self.register_buffer("_b12x_scratch", None, persistent=False)
 
     def _make_b12x_gdn_plan(self, max_state_slots: int):
         api = self._b12x_gdn_api
         if api is None:
             raise RuntimeError("b12x GDN decode was not initialized")
         return api.plan(
-            api.Caps(
-                device=current_platform.current_device(),
+            self._make_b12x_gdn_caps(max_state_slots),
+            invocation={
+                "a_log_dtype": str(self.A_log.dtype).removeprefix("torch."),
+                "dt_bias_dtype": str(self.dt_bias.dtype).removeprefix("torch."),
+                "norm_weight_dtype": str(self.norm.weight.dtype).removeprefix("torch."),
+            },
+        )
+
+    def _ensure_b12x_gdn_decode_staging(self) -> _B12xGdnDecodeStaging:
+        device = self.kv_cache[1].device
+        staging = self._b12x_decode_staging
+        if staging is None:
+            staging = _B12xGdnDecodeStaging.allocate(
                 max_tokens=self._b12x_max_tokens,
                 max_seqs=self._b12x_max_seqs,
-                max_state_slots=max_state_slots,
+                state_index_columns=self._b12x_state_index_columns,
                 key_heads=self._b12x_local_key_heads,
                 value_heads=self._b12x_local_value_heads,
-                key_head_dim=self.head_k_dim,
-                value_head_dim=self.head_v_dim,
-                state_index_columns=self._b12x_state_index_columns,
-                model_dtype=self.model_config.dtype,
-                state_dtype=self.get_state_dtype()[1],
-                gate_activation=self.norm.activation,
-                qk_l2norm=True,
+                packed_qkv_width=self._b12x_packed_qkv_width,
+                head_dim=self.head_v_dim,
+                device=device,
             )
+            self._b12x_decode_staging = staging
+        if not staging.is_compatible(
+            max_tokens=self._b12x_max_tokens,
+            max_seqs=self._b12x_max_seqs,
+            state_index_columns=self._b12x_state_index_columns,
+            key_heads=self._b12x_local_key_heads,
+            value_heads=self._b12x_local_value_heads,
+            packed_qkv_width=self._b12x_packed_qkv_width,
+            head_dim=self.head_v_dim,
+            device=device,
+        ):
+            raise PreparationResourceUnavailableError(
+                "GDN decode staging does not cover the published capacity"
+            )
+        return staging
+
+    def _initialize_b12x_gdn_prefill(self) -> None:
+        api = get_b12x_gdn_prefill()
+        if api is None:
+            raise RuntimeError("b12x GDN prefill requires b12x.sequence.gdn_prefill")
+        self._b12x_prefill_api = api
+
+    def _ensure_b12x_gdn_prefill_staging(self):
+        from vllm.model_executor.layers.mamba.ops.b12x_gdn_prefill import (
+            GdnPrefillStaging,
+        )
+
+        device = self.kv_cache[1].device
+        staging = self._b12x_prefill_staging
+        if staging is None:
+            # This permanent owner is independent of the recurrent pool
+            # generation, so rebinding a KV pool does not recreate it.
+            staging = GdnPrefillStaging.allocate(
+                max_tokens=self._b12x_prefill_max_tokens,
+                max_seqs=self._b12x_prefill_max_seqs,
+                key_heads=self._b12x_local_key_heads,
+                value_heads=self._b12x_local_value_heads,
+                device=device,
+            )
+            self._b12x_prefill_staging = staging
+        if not staging.is_compatible(
+            max_tokens=self._b12x_prefill_max_tokens,
+            max_seqs=self._b12x_prefill_max_seqs,
+            key_heads=self._b12x_local_key_heads,
+            value_heads=self._b12x_local_value_heads,
+            device=device,
+        ):
+            raise PreparationResourceUnavailableError(
+                "GDN prefill staging does not cover the published capacity"
+            )
+        return staging
+
+    def _b12x_gdn_prefill_declaration(self, capacity: int):
+        api = self._b12x_prefill_api
+        if api is None:
+            raise RuntimeError("b12x GDN prefill was not initialized")
+        recurrent_state = self.kv_cache[1]
+        staging = self._b12x_prefill_staging
+        resident_nbytes = 0
+        if staging is not None and staging.is_compatible(
+            max_tokens=self._b12x_prefill_max_tokens,
+            max_seqs=self._b12x_prefill_max_seqs,
+            key_heads=self._b12x_local_key_heads,
+            value_heads=self._b12x_local_value_heads,
+            device=recurrent_state.device,
+        ):
+            resident_nbytes = staging.nbytes
+        caps = api.Caps(
+            device=current_platform.current_device(),
+            max_tokens=capacity,
+            max_seqs=self._b12x_prefill_max_seqs,
+            max_state_slots=recurrent_state.shape[0],
+            key_heads=self._b12x_local_key_heads,
+            value_heads=self._b12x_local_value_heads,
+            state_dtype=recurrent_state.dtype,
+            checkpoint_export=True,
+            null_state_index=0,
+            staging_key=(self._b12x_preparation_prefix, "gdn-prefill-staging"),
+            staging_resident_nbytes=resident_nbytes,
+        )
+        return api.plan(
+            caps,
+            invocation=api.invocation_from_tensors(
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                initial_state_indices=SimpleNamespace(dtype=torch.int32),
+            ),
+        )
+
+    def get_b12x_preparation_units(
+        self, layer: torch.nn.Module, workload: B12xWorkload,
+    ) -> tuple[B12xPreparationUnit, ...]:
+        if layer is not self:
+            raise ValueError("GDN preparation owner mismatch")
+        units = []
+        if self._b12x_decode_plan is not None:
+            request = self._b12x_decode_plan.request(
+                name=f"{self._b12x_preparation_prefix}.gdn.decode",
+                prepare_call=self._prepare_b12x_gdn_decode,
+                benchmark_call=self._benchmark_b12x_gdn_decode,
+            )
+            units.append(B12xPreparationUnit(
+                name="GDN decode",
+                key=(self._b12x_preparation_prefix, "gdn-decode"),
+                requests=(request,),
+                stage="state",
+                autotune=not workload.eager_only,
+            ))
+        for capacity, plan in self._b12x_prefill_plans.items():
+            request = plan.request(
+                name=f"{self._b12x_preparation_prefix}.gdn.prefill.{capacity}",
+                prepare_call=lambda state, capacity=capacity:
+                    self._prepare_b12x_gdn_prefill(state, capacity),
+                benchmark_call=lambda state, capacity=capacity:
+                    self._benchmark_b12x_gdn_prefill(state, capacity),
+            )
+            units.append(B12xPreparationUnit(
+                name="GDN prefill",
+                key=(self._b12x_preparation_prefix, "gdn-prefill", capacity),
+                requests=(request,),
+                stage="state",
+                autotune=not workload.eager_only,
+            ))
+        return tuple(units)
+
+    @staticmethod
+    def _benchmark_values(tensor: torch.Tensor) -> None:
+        values = torch.arange(
+            tensor.numel(), dtype=tensor.dtype, device=tensor.device
+        ).reshape_as(tensor)
+        tensor.copy_(values.div_(max(values.numel(), 1)))
+
+    def _prepare_b12x_gdn_decode(self, state):
+        return self._b12x_gdn_decode_call(state, benchmark=False)
+
+    def _benchmark_b12x_gdn_decode(self, state):
+        return self._b12x_gdn_decode_call(state, benchmark=True)
+
+    def _b12x_gdn_decode_call(self, state, *, benchmark: bool):
+        from b12x.preparation import PreparedCall
+
+        slots = self.kv_cache[1]
+        slot = 1 if slots.shape[0] > 1 else 0
+        specs = tuple(state.layout.scratch_specs())
+        if len(specs) != 1:
+            raise RuntimeError("b12x GDN decode requires one scratch buffer")
+        spec = specs[0]
+        # Permanent activation and metadata buffers are materialized only by
+        # this preparation callback.  They remain valid across recurrent-pool
+        # generations; only the binding below borrows the current pool.
+        staging = self._ensure_b12x_gdn_decode_staging()
+        # Trial and prepare factories own their scratch; the runtime binding
+        # in _bind_b12x_gdn_decode draws from the workspace manager instead.
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=slots.device)
+        if benchmark:
+            mixed_qkv = torch.empty_like(staging.mixed_qkv)
+            a = torch.empty_like(staging.a)
+            b = torch.empty_like(staging.b)
+            z = torch.empty_like(staging.z)
+            output = torch.empty_like(staging.output)
+            query_start_loc = torch.empty_like(staging.query_start_loc)
+            accepted = torch.ones_like(staging.num_accepted_tokens)
+            state_indices = torch.full_like(staging.state_indices, slot)
+            num_seqs = torch.empty_like(staging.num_seqs)
+            num_tokens = torch.empty_like(staging.num_tokens)
+            saved_state = slots[slot : slot + 1].clone()
+        else:
+            mixed_qkv, a, b, z, output = (
+                staging.mixed_qkv,
+                staging.a,
+                staging.b,
+                staging.z,
+                staging.output,
+            )
+            query_start_loc = staging.query_start_loc
+            accepted = staging.num_accepted_tokens
+            state_indices = staging.state_indices
+            num_seqs, num_tokens = staging.num_seqs, staging.num_tokens
+            saved_state = None
+
+        def produce():
+            for tensor in (mixed_qkv, a, b, z):
+                self._benchmark_values(tensor)
+            query_start_loc.zero_()
+            query_start_loc[1:].fill_(1)
+            accepted.fill_(1)
+            state_indices.fill_(slot)
+            num_seqs.fill_(1)
+            num_tokens.fill_(1)
+
+        def reset():
+            if saved_state is not None:
+                slots[slot : slot + 1].copy_(saved_state)
+
+        binding = state.bind(
+            scratch=scratch, mixed_qkv=mixed_qkv, a=a, b=b, z=z,
+            A_log=self.A_log, dt_bias=self.dt_bias, norm_weight=self.norm.weight,
+            recurrent_state=slots, query_start_loc=query_start_loc,
+            num_accepted_tokens=accepted, state_indices=state_indices,
+            num_seqs=num_seqs, num_tokens=num_tokens, output=output,
+        )
+        return PreparedCall(
+            run=lambda: state.run(binding), produce=produce, reset=reset,
+            restore=reset if saved_state is not None else None,
+            owners=(scratch, mixed_qkv, a, b, z, output, query_start_loc,
+                    accepted, state_indices, num_seqs, num_tokens),
+        )
+
+    def _prepare_b12x_gdn_prefill(self, state, capacity: int):
+        return self._b12x_gdn_prefill_call(state, capacity, benchmark=False)
+
+    def _benchmark_b12x_gdn_prefill(self, state, capacity: int):
+        return self._b12x_gdn_prefill_call(state, capacity, benchmark=True)
+
+    def _b12x_gdn_prefill_call(self, state, capacity: int, *, benchmark: bool):
+        from b12x.preparation import PreparedCall
+        specs = tuple(state.layout.scratch_specs())
+        if len(specs) != 1:
+            raise RuntimeError("b12x GDN prefill requires one scratch buffer")
+        spec = specs[0]
+        device = self.kv_cache[1].device
+        slot = 1 if self.kv_cache[1].shape[0] > 1 else 0
+        staging = self._ensure_b12x_gdn_prefill_staging()
+        # Trial and prepare factories own their scratch; the runtime path in
+        # B12xGdnPrefill.run draws from the workspace manager instead.
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+        if benchmark:
+            mixed_qkv = torch.empty_like(staging.mixed_qkv[:capacity])
+            a = torch.empty_like(staging.a[:capacity])
+            b = torch.empty_like(staging.b[:capacity])
+            output = torch.empty_like(staging.output[:capacity])
+            cu_seqlens = torch.empty_like(staging.query_start_loc)
+            indices = torch.full_like(staging.initial_indices, slot)
+            final_indices = torch.full_like(staging.final_indices, slot)
+            checkpoint_indices = torch.full_like(staging.checkpoint_indices, slot)
+            offsets = torch.zeros_like(staging.checkpoint_offsets)
+            num_seqs = torch.empty_like(staging.num_seqs)
+            num_tokens = torch.empty_like(staging.num_tokens)
+            saved_state = self.kv_cache[1][slot : slot + 1].clone()
+            owners = (
+                scratch, mixed_qkv, a, b, output, cu_seqlens, indices,
+                final_indices, checkpoint_indices, offsets, num_seqs, num_tokens,
+            )
+        else:
+            mixed_qkv = staging.mixed_qkv[:capacity]
+            a, b, output = staging.a[:capacity], staging.b[:capacity], staging.output[:capacity]
+            cu_seqlens = staging.query_start_loc
+            indices, final_indices = staging.initial_indices, staging.final_indices
+            checkpoint_indices, offsets = staging.checkpoint_indices, staging.checkpoint_offsets
+            num_seqs, num_tokens = staging.num_seqs, staging.num_tokens
+            saved_state = None
+            owners = ()
+        q, k, v = mixed_qkv.split(
+            (
+                self._b12x_local_key_heads * self.head_k_dim,
+                self._b12x_local_key_heads * self.head_k_dim,
+                self._b12x_local_value_heads * self.head_v_dim,
+            ),
+            dim=-1,
+        )
+        q = q.view(capacity, self._b12x_local_key_heads, self.head_k_dim)
+        k = k.view(capacity, self._b12x_local_key_heads, self.head_k_dim)
+        v = v.view(capacity, self._b12x_local_value_heads, self.head_v_dim)
+
+        def produce():
+            for tensor in (q, k, v, a, b):
+                self._benchmark_values(tensor)
+            cu_seqlens.zero_()
+            cu_seqlens[1:].fill_(capacity)
+            indices.fill_(slot)
+            final_indices.fill_(slot)
+            checkpoint_indices.fill_(slot)
+            offsets.zero_()
+            num_seqs.fill_(1)
+            num_tokens.fill_(capacity)
+
+        def reset():
+            if saved_state is not None:
+                self.kv_cache[1][slot : slot + 1].copy_(saved_state)
+
+        binding = state.bind(
+            scratch=scratch, q=q, k=k, v=v, a=a, b=b,
+            A_log=self.A_log, dt_bias=self.dt_bias, recurrent_state=self.kv_cache[1],
+            cu_seqlens=cu_seqlens, initial_state_indices=indices,
+            final_state_indices=final_indices,
+            checkpoint_state_indices=checkpoint_indices,
+            checkpoint_offsets=offsets, num_seqs=num_seqs, num_tokens=num_tokens,
+            output=output,
+        )
+        return PreparedCall(
+            run=lambda: state.run(binding, max_live_tokens=capacity, max_live_seqs=1),
+            produce=produce, reset=reset,
+            restore=reset if saved_state is not None else None, owners=owners,
         )
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         super().bind_kv_cache(kv_cache)
-        if self.gdn_prefill_backend == "b12x":
+        self._b12x_decode_plan = None
+        self._b12x_prefill_plans = {}
+        self._b12x_prefill = None
+        if self._b12x_gdn_api is not None:
+            self._b12x_decode_plan = self._make_b12x_gdn_plan(self.kv_cache[1].shape[0])
+        if self._b12x_prefill_api is not None:
             from vllm.model_executor.layers.mamba.ops.b12x_gdn_prefill import (
                 B12xGdnPrefill,
+                prefill_capacities,
             )
-
+            self._b12x_prefill_plans = {
+                capacity: self._b12x_gdn_prefill_declaration(capacity)
+                for capacity in prefill_capacities(self._b12x_prefill_max_tokens)
+            }
+            staging = self._ensure_b12x_gdn_prefill_staging()
             self._b12x_prefill = B12xGdnPrefill(
                 recurrent_state=self.kv_cache[1],
                 A_log=self.A_log,
                 dt_bias=self.dt_bias,
                 max_tokens=self._b12x_prefill_max_tokens,
                 max_seqs=self._b12x_prefill_max_seqs,
-                key_heads=self.num_k_heads // self.tp_size,
-                value_heads=self.num_v_heads // self.tp_size,
+                key_heads=self._b12x_local_key_heads,
+                value_heads=self._b12x_local_value_heads,
                 checkpoint_export=True,
+                plans=self._b12x_prefill_plans,
+                staging=staging,
             )
-        if self.gdn_decode_kernel != "b12x":
-            return
-        recurrent_state = self.kv_cache[1]
-        plan = self._make_b12x_gdn_plan(max_state_slots=recurrent_state.shape[0])
+
+    def _get_b12x_gdn_workspace(self) -> torch.Tensor:
+        plan = self._b12x_decode_plan
+        if plan is None:
+            raise PreparationResourceUnavailableError(
+                "b12x GDN decode is not prepared for the current KV generation"
+            )
         (scratch,) = get_b12x_scratch_buffers(plan)
-        self._b12x_scratch = scratch
-        self._b12x_plan = plan
+        return scratch
 
     def _bind_b12x_gdn_decode(
         self,
@@ -844,32 +1228,35 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         z: torch.Tensor | None = None,
         output: torch.Tensor | None = None,
     ):
-        plan = self._b12x_plan
-        scratch = self._b12x_scratch
-        if plan is None or scratch is None:
-            raise RuntimeError("b12x GDN KV cache was not bound before inference")
-        return plan.bind(
-            scratch=scratch,
-            mixed_qkv=self._b12x_mixed_qkv if mixed_qkv is None else mixed_qkv,
-            a=self._b12x_a if a is None else a,
-            b=self._b12x_b if b is None else b,
-            z=self._b12x_z if z is None else z,
+        plan = self._b12x_decode_plan
+        staging = self._b12x_decode_staging
+        if plan is None or staging is None:
+            raise PreparationResourceUnavailableError(
+                "b12x GDN decode is not prepared for the current KV generation"
+            )
+        return self._b12x_gdn_api.bind(
+            plan,
+            scratch=self._get_b12x_gdn_workspace(),
+            mixed_qkv=staging.mixed_qkv if mixed_qkv is None else mixed_qkv,
+            a=staging.a if a is None else a,
+            b=staging.b if b is None else b,
+            z=staging.z if z is None else z,
             A_log=self.A_log,
             dt_bias=self.dt_bias,
             norm_weight=self.norm.weight,
             recurrent_state=self.kv_cache[1],
-            query_start_loc=self._b12x_query_start_loc,
-            num_accepted_tokens=self._b12x_num_accepted_tokens,
-            state_indices=self._b12x_state_indices,
-            num_seqs=self._b12x_num_seqs,
-            num_tokens=self._b12x_num_tokens,
-            output=self._b12x_output if output is None else output,
+            query_start_loc=staging.query_start_loc,
+            num_accepted_tokens=staging.num_accepted_tokens,
+            state_indices=staging.state_indices,
+            num_seqs=staging.num_seqs,
+            num_tokens=staging.num_tokens,
+            output=staging.output if output is None else output,
         )
 
     def unbind_kv_cache(self) -> None:
+        self._b12x_decode_plan = None
+        self._b12x_prefill_plans = {}
         self._b12x_prefill = None
-        self._b12x_plan = None
-        self._b12x_scratch = None
         super().unbind_kv_cache()
 
     def _fused_gdn_decode_unsupported_reason(
@@ -2179,8 +2566,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_requests: int,
     ) -> None:
         api = self._b12x_gdn_api
-        if self._b12x_plan is None or api is None:
-            raise RuntimeError("b12x GDN KV cache was not bound before inference")
+        staging = self._b12x_decode_staging
+        if self._b12x_decode_plan is None or api is None or staging is None:
+            raise RuntimeError("b12x GDN KV cache was not prepared before inference")
         num_input_tokens = mixed_qkv.shape[0]
         if (
             num_input_tokens > self._b12x_max_tokens
@@ -2199,11 +2587,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             query_start_loc,
             state_indices,
             num_accepted_tokens,
-            self._b12x_query_start_loc,
-            self._b12x_state_indices,
-            self._b12x_num_accepted_tokens,
-            self._b12x_num_seqs,
-            self._b12x_num_tokens,
+            staging.query_start_loc,
+            staging.state_indices,
+            staging.num_accepted_tokens,
+            staging.num_seqs,
+            staging.num_tokens,
             num_requests,
             query_start_loc.stride(0),
             num_accepted_tokens.stride(0) if num_accepted_tokens is not None else 0,
@@ -2364,7 +2752,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _can_use_b12x_gdn_decode(self, attn_metadata: GDNAttentionMetadata) -> bool:
         if (
             self.gdn_decode_kernel != "b12x"
-            or self._b12x_plan is None
+            or self._b12x_decode_plan is None
             or attn_metadata.num_prefills != 0
         ):
             return False
@@ -2554,6 +2942,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
         if self._b12x_state_index_columns > 1:
+            staging = self._b12x_decode_staging
+            if staging is None:
+                raise PreparationResourceUnavailableError(
+                    "b12x GDN decode staging is not prepared"
+                )
             spec_rows = min(rows, metadata.spec_token_indices.numel())
             spec_indices = metadata.spec_token_indices[:spec_rows]
             spec_packed = mixed_qkv.index_select(0, spec_indices)
@@ -2574,18 +2967,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 a=a.index_select(0, spec_indices),
                 b=b.index_select(0, spec_indices),
                 output_gate=output_gate.index_select(0, spec_indices),
-                core_attn_out=self._b12x_output[:spec_rows],
+                core_attn_out=staging.output[:spec_rows],
                 state_indices=metadata.spec_state_indices,
                 query_start_loc=metadata.spec_query_start_loc,
                 num_accepted_tokens=metadata.spec_accepted,
                 num_requests=metadata.max_seqs,
             )
             _scatter_b12x_gdn_output[(spec_rows, triton.cdiv(width, 256))](
-                self._b12x_output,
+                staging.output,
                 spec_indices,
                 metadata.spec_counts,
                 core_attn_out,
-                SOURCE_STRIDE=self._b12x_output.stride(0),
+                SOURCE_STRIDE=staging.output.stride(0),
                 OUTPUT_STRIDE=core_attn_out.stride(0),
                 WIDTH=width,
                 BLOCK=256,
@@ -2599,9 +2992,14 @@ def qwen_gdn_input_projections(
     layer_name: LayerNameType,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_forward_context().no_compile_layers[_resolve_layer_name(layer_name)]
+    qkvz_scratch, ba_scratch = get_b12x_projection_workspaces(
+        hidden_states.shape[0], layer.in_proj_qkvz, layer.in_proj_ba
+    )
     if hidden_states.shape[0] > 16 or not torch.cuda.is_current_stream_capturing():
-        qkvz, _ = layer.in_proj_qkvz(hidden_states)
-        ba, _ = layer.in_proj_ba(hidden_states)
+        with use_preallocated_workspace(qkvz_scratch):
+            qkvz, _ = layer.in_proj_qkvz(hidden_states)
+        with use_preallocated_workspace(ba_scratch):
+            ba, _ = layer.in_proj_ba(hidden_states)
         return qkvz, ba
 
     stream = aux_stream()
@@ -2609,9 +3007,10 @@ def qwen_gdn_input_projections(
     main_stream = current_stream()
     stream.wait_stream(main_stream)
     hidden_states.record_stream(stream)
-    with torch.cuda.stream(stream):
+    with torch.cuda.stream(stream), use_preallocated_workspace(ba_scratch):
         ba, _ = layer.in_proj_ba(hidden_states)
-    qkvz, _ = layer.in_proj_qkvz(hidden_states)
+    with use_preallocated_workspace(qkvz_scratch):
+        qkvz, _ = layer.in_proj_qkvz(hidden_states)
     main_stream.wait_stream(stream)
     ba.record_stream(main_stream)
     return qkvz, ba

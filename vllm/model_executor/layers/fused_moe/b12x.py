@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """b12x modular tensor-parallel fused MoE backend."""
 
-from collections.abc import Iterable
+import weakref
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -27,7 +29,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.b12x import (
-    B12xWarmupUnit,
+    set_b12x_preparation_provider,
+    B12xPreparationUnit,
+    B12xWorkload,
+    PreparationResourceUnavailableError,
     get_b12x_fused_moe,
     reuse_packed_weight_storage,
 )
@@ -60,67 +65,124 @@ def _b12x_activation_name(activation: MoEActivation) -> str:
     return activation.value
 
 
-def _b12x_scratch_nbytes(plan: Any) -> int:
-    specs = plan.scratch_specs()
-    if len(specs) != 1:
-        raise RuntimeError(f"expected one b12x MoE scratch buffer, got {len(specs)}")
-    spec = specs[0]
-    if spec.dtype != torch.uint8:
-        raise TypeError(f"expected b12x MoE scratch dtype uint8, got {spec.dtype}")
-    return int(spec.shape[0])
+@dataclass(frozen=True)
+class _PreparedMoECall:
+    """Priming tensors for one exact prepared MoE variant.
+
+    These are trial-only bindings over the real loaded expert representation;
+    serving always binds the layer-held prepared plan to caller tensors.
+    """
+
+    state: Any
+    tokens: int
+    topk: int
+    prepared: Any
+    output_dtype: torch.dtype
+
+    def make(self, tensors):
+        from b12x.preparation import PreparedCall
+
+        scratch = tuple(
+            torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+            for spec in self.state.scratch.scratch_specs()
+        )
+        (
+            hidden,
+            activation_source,
+            output,
+            route_ids,
+            route_weights,
+            ids,
+            weights,
+        ) = tensors
+
+        def reset() -> None:
+            output.zero_()
+            for buffer in scratch:
+                buffer.zero_()
+
+        def produce() -> None:
+            hidden.copy_(activation_source)
+            ids.copy_(route_ids)
+            weights.copy_(route_weights)
+
+        def restore() -> None:
+            reset()
+            produce()
+
+        binding = self.state.bind(
+            scratch=scratch,
+            a=hidden,
+            experts=self.prepared,
+            topk_weights=weights,
+            topk_ids=ids,
+            output=output,
+            input_scales_static=True,
+        )
+        return PreparedCall(
+            run=binding.run,
+            output=output,
+            produce=produce,
+            reset=reset,
+            restore=restore,
+            capture_safe=False,
+        )
 
 
-def _b12x_moe_execution_plan(
-    *,
-    tokens: int,
-    topk: int,
-    prepared: Any,
-    quant_mode: str,
-    apply_router_weight_on_input: bool,
-    swiglu_limit: float | None,
-    swiglu_alpha: float | None,
-    swiglu_beta: float | None,
-) -> Any:
-    fused_moe = _require_b12x_fused_moe()
+def _prepared_moe_call_factory(
+    *, tokens: int, topk: int, prepared: Any, output_dtype: torch.dtype
+):
+    shared = None
 
-    return fused_moe.plan_execution(
-        num_tokens=max(int(tokens), 1),
-        num_topk=int(topk),
-        device=prepared.w1_fp4.device,
-        weight_plan=prepared.plan,
-        quant_mode=quant_mode,
-        apply_router_weight_on_input=apply_router_weight_on_input,
-        swiglu_limit=swiglu_limit,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
-    )
+    def factory(state: Any):
+        nonlocal shared
+        tensors = None if shared is None else tuple(ref() for ref in shared)
+        if tensors is None or any(tensor is None for tensor in tensors):
+            device = prepared.device
+            hidden = torch.empty(
+                (tokens, int(prepared.hidden_size)),
+                dtype=prepared.plan.activation.io_dtype,
+                device=device,
+            )
+            activation_source = torch.empty_like(hidden).normal_(
+                mean=0.0, std=0.125
+            )
+            output = torch.empty(hidden.shape, dtype=output_dtype, device=device)
+            route_rows = torch.arange(
+                tokens, dtype=torch.int32, device=device
+            ).unsqueeze(1)
+            route_columns = torch.arange(
+                topk, dtype=torch.int32, device=device
+            ).unsqueeze(0)
+            route_ids = (route_rows + route_columns).remainder_(
+                int(prepared.num_experts)
+            ).contiguous()
+            route_logits = (
+                route_rows.to(dtype=torch.float32) * 0.03125
+                + route_columns.to(dtype=torch.float32) * 0.125
+            )
+            route_weights = torch.softmax(route_logits, dim=-1).contiguous()
+            ids = torch.empty_like(route_ids)
+            weights = torch.empty_like(route_weights)
+            tensors = (
+                hidden,
+                activation_source,
+                output,
+                route_ids,
+                route_weights,
+                ids,
+                weights,
+            )
+            shared = tuple(weakref.ref(tensor) for tensor in tensors)
+        return _PreparedMoECall(
+            state=state,
+            tokens=tokens,
+            topk=topk,
+            prepared=prepared,
+            output_dtype=output_dtype,
+        ).make(tensors)
 
-
-def _run_b12x_moe_plan(
-    *,
-    plan: Any,
-    scratch: torch.Tensor,
-    hidden_states: torch.Tensor,
-    prepared: Any,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    output: torch.Tensor,
-    unit_scale_contract: bool,
-) -> None:
-    fused_moe = _require_b12x_fused_moe()
-
-    binding = fused_moe.bind(
-        plan,
-        scratch=scratch,
-        a=hidden_states,
-        experts=prepared,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        output=output,
-        input_scales_static=True,
-        unit_scale_contract=unit_scale_contract,
-    )
-    fused_moe.run(binding=binding)
+    return factory
 
 
 def _is_current_stream_capturing() -> bool:
@@ -128,14 +190,6 @@ def _is_current_stream_capturing() -> bool:
     return bool(is_capturing is not None and is_capturing())
 
 
-def _normalize_topk_ids(topk_ids: torch.Tensor) -> torch.Tensor:
-    if topk_ids.dtype == torch.int32 and topk_ids.is_contiguous():
-        return topk_ids
-    if _is_current_stream_capturing():
-        raise RuntimeError(
-            "b12x MoE topk_ids normalization would allocate during CUDA capture"
-        )
-    return topk_ids.to(dtype=torch.int32).contiguous()
 
 
 def _normalize_topk_weights(topk_weights: torch.Tensor) -> torch.Tensor:
@@ -148,22 +202,6 @@ def _normalize_topk_weights(topk_weights: torch.Tensor) -> torch.Tensor:
     return topk_weights.to(dtype=torch.float32).contiguous()
 
 
-def _workspace_as_b12x_scratch(
-    workspace: torch.Tensor | None,
-    plan: Any,
-) -> torch.Tensor:
-    if workspace is None:
-        raise RuntimeError("b12x MoE requires workspace2 scratch")
-    if not workspace.is_contiguous():
-        raise ValueError("b12x MoE workspace2 must be contiguous")
-    scratch = workspace.view(-1).view(torch.uint8)
-    required_nbytes = _b12x_scratch_nbytes(plan)
-    if scratch.numel() < required_nbytes:
-        raise ValueError(
-            "b12x MoE workspace2 is too small: "
-            f"have={scratch.numel()} bytes, need={required_nbytes} bytes"
-        )
-    return scratch
 
 
 def _replace_parameter_with_empty(
@@ -218,10 +256,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self._prepared_experts: Any | None = None
         self._source_parameters_released = False
         self._unit_scales: dict[torch.device, torch.Tensor] = {}
-        self._plans: dict[tuple[int, int, MoEActivation, bool], Any] = {}
-        self._prefill_capacity = max(int(moe_config.max_num_tokens), 1)
-        self._plan_capacities = {1, self._prefill_capacity}
         self._apply_router_weight_on_input = False
+        self._plan: Any | None = None
+        self._plan_key: tuple | None = None
+        self._plan_activation: MoEActivation | None = None
+        self._plan_route_on_input: bool | None = None
 
     def _unit_scale(self, device: torch.device, num_experts: int) -> torch.Tensor:
         scale = self._unit_scales.get(device)
@@ -312,30 +351,44 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             a1_gscale = unit_scale
             a2_gscale = unit_scale
 
+        limit, alpha, beta = self._swiglu_params(activation)
+        mode = {
+            "w4a16": fused_moe.ActivationMode.A16,
+            "w4a8_mx": fused_moe.ActivationMode.A8,
+            "w4a8_nvfp4": fused_moe.ActivationMode.A8,
+            "nvfp4": fused_moe.ActivationMode.A4,
+        }[quant_mode]
         weight_plan = fused_moe.plan_weights(
-            quant_modes=quant_mode,
-            source_format=self._source_format,
-            activation=_b12x_activation_name(activation),
-            params_dtype=params_dtype,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            w13_layout=self._w13_layout,
+            source=fused_moe.PackedSource(
+                format=fused_moe.PackedSourceFormat(self._source_format),
+                w13_layout=fused_moe.W13Layout(self._w13_layout),
+            ),
+            activation=fused_moe.ActivationSpec(
+                mode=mode,
+                nonlinearity=_b12x_activation_name(activation),
+                io_dtype=params_dtype,
+                swiglu_limit=limit,
+                swiglu_alpha=alpha,
+                swiglu_beta=beta,
+            ),
+            geometry=fused_moe.MoEGeometry(
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+            ),
         )
         return fused_moe.prepare_weights(
             plan=weight_plan,
-            w1_fp4=w1,
-            w1_blockscale=self.w1_scale,
-            w1_global_scale=w1_global_scale,
-            a1_gscale=a1_gscale,
-            w2_fp4=w2,
-            w2_blockscale=self.w2_scale,
-            w2_global_scale=w2_global_scale,
-            a2_gscale=a2_gscale,
-            params_dtype=params_dtype,
-            # Loaded inference scales remain constant for this prepared owner
-            # and its CUDA graphs; reloading constructs another owner.
-            immutable_input_scales=True,
+            weights=fused_moe.PackedWeights(
+                w13=w1,
+                w2=w2,
+                w13_block_scales=self.w1_scale,
+                w2_block_scales=self.w2_scale,
+                w13_global_scales=w1_global_scale,
+                w2_global_scales=w2_global_scale,
+                input_scale=a1_gscale,
+                intermediate_scale=a2_gscale,
+            ),
         )
 
     def _refresh_quant_config(self, layer: torch.nn.Module) -> None:
@@ -367,7 +420,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         previous = getattr(layer, "_b12x_prepared_experts", None)
         prepared = reuse_packed_weight_storage(previous, prepared)
         if prepared is not previous:
-            self._plans.clear()
+            self._plan = None
+            self._plan_key = None
         self._prepared_experts = prepared
         layer._b12x_prepared_experts = prepared
         return prepared
@@ -387,9 +441,13 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             params_dtype=self.moe_config.in_dtype,
         )
         prepared = self._reuse_prepared_storage(layer, prepared)
-        if prepared.plan.discards_source_parameters:
+        if prepared.plan._impl.discards_source_parameters:
             self._release_source_parameters(layer)
-        layer.b12x_warmup_provider = self
+        if not getattr(layer, "b12x_preparation_suppressed", False):
+            set_b12x_preparation_provider(layer, self)
+        _register_b12x_moe_output_collective(
+            layer, hidden_size=int(prepared.hidden_size)
+        )
 
     @staticmethod
     def is_supported_config(
@@ -440,8 +498,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             ):
                 return (
                     False,
-                    "MXFP4 W4A8 requires hidden size divisible by 256 and "
-                    "per-rank intermediate size divisible by 32",
+                    (
+                        "MXFP4 W4A8 requires hidden size divisible by 256 and "
+                        "per-rank intermediate size divisible by 32"
+                    ),
                 )
         return mk.FusedMoEExperts.is_supported_config(
             cls, moe_config, weight_key, activation_key, activation_format
@@ -517,23 +577,127 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             )
         return self._prepared_experts
 
-    def _register_plan_capacities(self, token_counts: Iterable[int]) -> None:
-        capacities = {int(count) for count in token_counts if int(count) > 0}
-        self._plan_capacities.update(capacities)
-        if capacities:
-            self._prefill_capacity = max(self._prefill_capacity, max(capacities))
-            self._plan_capacities.add(self._prefill_capacity)
+    def _prepared_plan(
+        self, *, activation: MoEActivation, apply_router_weight_on_input: bool
+    ) -> Any:
+        plan = self._plan
+        if (
+            plan is None
+            or activation != self._plan_activation
+            or bool(apply_router_weight_on_input) != self._plan_route_on_input
+        ):
+            raise PreparationResourceUnavailableError(
+                "b12x MoE has no prepared plan for this activation/routing"
+            )
+        return plan
 
-    def _plan_capacity(self, tokens: int) -> int:
-        tokens = max(int(tokens), 1)
-        if tokens > self._prefill_capacity:
+    def _plan_for_tokens(
+        self, tokens: int, *, activation: MoEActivation, apply_router_weight_on_input: bool
+    ) -> Any:
+        """Reuse the declared prefill capacity and exact graph variants."""
+        plan = self._prepared_plan(
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        )
+        assert self._plan_key is not None
+        capacity = max(self._plan_key[0])
+        if int(tokens) > capacity:
             raise ValueError(
                 f"live MoE token count {tokens} exceeds the configured prefill "
-                f"capacity {self._prefill_capacity}"
+                f"capacity {capacity}"
             )
-        if tokens in self._plan_capacities:
-            return tokens
-        return self._prefill_capacity
+        return plan
+
+    def get_b12x_preparation_units(
+        self, layer: torch.nn.Module, workload: B12xWorkload
+    ) -> Sequence[B12xPreparationUnit]:
+        if workload.stage != "weights":
+            return ()
+        if workload.output_dtype != self.moe_config.in_dtype:
+            raise ValueError("b12x MoE output dtype differs from its loaded contract")
+        prepared = self._prepared()
+        counts = tuple(sorted({workload.max_tokens, *workload.fixed_token_counts}))
+        activation = layer.activation
+        topk = int(self.moe_config.experts_per_token)
+        route_on_input = bool(layer.apply_router_weight_on_input)
+        fused_moe = _require_b12x_fused_moe()
+        plan_key = (counts, activation, route_on_input, id(prepared))
+        plan = self._plan if getattr(self, "_plan_key", None) == plan_key else None
+        if plan is None:
+            # The layer holds one plan for its serving shapes; a later call with
+            # the same workload reuses it so the prepared state stays installed.
+            plan = fused_moe.plan_execution(
+                experts=prepared,
+                capacity=fused_moe.ExecutionCapacity(
+                    max_tokens=max(counts),
+                    top_k=topk,
+                    warmup_token_counts=counts,
+                    route_num_experts=0,
+                ),
+                routing=fused_moe.RoutingSpec(
+                    apply_router_weight_on_input=route_on_input,
+                ),
+            )
+            self._plan = plan
+            self._plan_key = plan_key
+            self._plan_activation = activation
+            self._plan_route_on_input = route_on_input
+        name = f"fused_moe:{id(layer)}"
+        if hasattr(plan, "token_counts"):
+            calls = {
+                count: _prepared_moe_call_factory(
+                    tokens=count,
+                    topk=topk,
+                    prepared=prepared,
+                    output_dtype=self.output_dtype,
+                )
+                for count in plan.token_counts
+            }
+            benchmark_calls = {
+                count: _prepared_moe_call_factory(
+                    tokens=count,
+                    topk=topk,
+                    prepared=prepared,
+                    output_dtype=self.output_dtype,
+                )
+                for count in plan.token_counts
+            }
+            request = plan.request(
+                name=name,
+                prepare_calls=calls,
+                benchmark_calls=benchmark_calls,
+            )
+        else:
+            prepare_call = _prepared_moe_call_factory(
+                tokens=counts[0],
+                topk=topk,
+                prepared=prepared,
+                output_dtype=self.output_dtype,
+            )
+            benchmark_call = _prepared_moe_call_factory(
+                tokens=counts[0],
+                topk=topk,
+                prepared=prepared,
+                output_dtype=self.output_dtype,
+            )
+            request = plan.request(
+                name=name,
+                prepare_call=prepare_call,
+                benchmark_call=benchmark_call,
+            )
+        key = (
+            self._quant_mode, self._source_format, self._w13_layout,
+            activation, route_on_input, counts, workload.output_dtype,
+        )
+        return (
+            B12xPreparationUnit(
+                name=self._quant_mode.upper(),
+                key=key,
+                requests=(request,),
+                stage="weights",
+                autotune=not workload.eager_only,
+            ),
+        )
 
     def moe_problem_size(
         self,
@@ -554,180 +718,6 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             int(topk_ids.shape[1]),
         )
 
-    def _plan(
-        self,
-        *,
-        tokens: int,
-        topk: int,
-        activation: MoEActivation,
-        apply_router_weight_on_input: bool = False,
-    ) -> Any:
-        fused_moe = _require_b12x_fused_moe()
-        capacity = self._plan_capacity(tokens)
-
-        key = (
-            capacity,
-            int(topk),
-            activation,
-            bool(apply_router_weight_on_input),
-        )
-        plan = self._plans.get(key)
-        if plan is not None:
-            return plan
-        if _is_current_stream_capturing():
-            raise RuntimeError("b12x MoE plans must be created before CUDA capture")
-
-        limit, alpha, beta = self._swiglu_params(activation)
-        prepared = self._prepared()
-        plan = fused_moe.plan(
-            fused_moe.Caps(
-                max_tokens=key[0],
-                num_topk=key[1],
-                device=prepared.w1_fp4.device,
-                weight_plan=prepared.plan,
-                core_token_counts=(key[0],),
-                route_num_experts=0,
-                quant_mode=self._quant_mode,
-                apply_router_weight_on_input=key[3],
-                swiglu_limit=limit,
-                swiglu_alpha=alpha,
-                swiglu_beta=beta,
-                frozen=True,
-            )
-        )
-        self._plans[key] = plan
-        return plan
-
-    def get_b12x_warmup_unit(
-        self,
-        layer: torch.nn.Module,
-        token_counts: tuple[int, ...],
-        output_dtype: torch.dtype,
-    ) -> B12xWarmupUnit:
-        assert output_dtype == self.moe_config.in_dtype
-        self._register_plan_capacities(token_counts)
-        prepared = self._prepared()
-        activation = layer.activation
-        limit, alpha, beta = self._swiglu_params(activation)
-
-        def compile() -> None:
-            self.warmup_launches(layer, token_counts=token_counts)
-
-        return B12xWarmupUnit(
-            name="MoE",
-            key=(
-                type(self),
-                prepared.w1_fp4.device,
-                output_dtype,
-                self._quant_mode,
-                self._source_format,
-                self._w13_layout,
-                int(prepared.num_experts),
-                int(prepared.hidden_size),
-                int(prepared.intermediate_size),
-                int(self.moe_config.experts_per_token),
-                _b12x_activation_name(activation),
-                bool(layer.apply_router_weight_on_input),
-                limit,
-                alpha,
-                beta,
-            ),
-            compile=compile,
-        )
-
-    @torch.inference_mode()
-    def warmup_launches(
-        self,
-        layer: torch.nn.Module,
-        *,
-        token_counts: Iterable[int],
-    ) -> int:
-        """Compile one representative launch for every planned regime."""
-        token_counts = tuple(int(count) for count in token_counts if int(count) > 0)
-        self._register_plan_capacities(token_counts)
-        activation = layer.activation
-        dtype = self.moe_config.in_dtype
-        topk = int(self.moe_config.experts_per_token)
-        apply_router_weight_on_input = bool(layer.apply_router_weight_on_input)
-        limit, alpha, beta = self._swiglu_params(activation)
-        prepared = self._prepared()
-        device = prepared.w1_fp4.device
-        launch_tokens: dict[tuple[Any, ...], int] = {}
-        for tokens in sorted(set(token_counts)):
-            execution_plan = _b12x_moe_execution_plan(
-                tokens=tokens,
-                topk=topk,
-                prepared=prepared,
-                quant_mode=self._quant_mode,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                swiglu_limit=limit,
-                swiglu_alpha=alpha,
-                swiglu_beta=beta,
-            )
-            signature = (execution_plan.implementation, execution_plan.execution)
-            launch_tokens.setdefault(signature, tokens)
-
-        launch_resources: list[tuple[torch.Tensor, ...]] = []
-        for tokens in launch_tokens.values():
-            plan = self._plan(
-                tokens=tokens,
-                topk=topk,
-                activation=activation,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-            )
-            # One buffer set per token count serves both route-id dtypes: the
-            # launches are stream-ordered, so the second reads the same zero
-            # input and overwrites the same output and scratch after the
-            # first completes. The retained set stays one input, one output
-            # and one scratch per regime instead of doubling with the dtypes;
-            # its allocator footprint bounds the KV budget of launches that
-            # retain the warmed allocator high-water.
-            scratch = torch.empty(
-                (_b12x_scratch_nbytes(plan),),
-                dtype=torch.uint8,
-                device=device,
-            )
-            hidden_states = torch.zeros(
-                (tokens, int(prepared.hidden_size)),
-                dtype=dtype,
-                device=device,
-            )
-            output = torch.empty_like(hidden_states)
-            topk_weights = torch.full(
-                (tokens, topk),
-                1.0 / topk,
-                dtype=torch.float32,
-                device=device,
-            )
-            for route_ids_dtype in (torch.int32, torch.int64):
-                topk_ids = (
-                    torch.arange(topk, device=device, dtype=route_ids_dtype)
-                    .unsqueeze(0)
-                    .expand(tokens, -1)
-                    .contiguous()
-                )
-                topk_ids.remainder_(int(prepared.num_experts))
-                # B12X warmup launches may outlive the Python call that
-                # submits them. Retain every caller-owned input, output, and
-                # scratch tensor until device completion so the allocator
-                # cannot reuse an address while a warmup kernel references it.
-                launch_resources.append(
-                    (hidden_states, output, topk_ids, topk_weights, scratch)
-                )
-                _run_b12x_moe_plan(
-                    plan=plan,
-                    scratch=scratch,
-                    hidden_states=hidden_states,
-                    prepared=prepared,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
-                    output=output,
-                    unit_scale_contract=self._quant_mode == "w4a16",
-                )
-        if launch_resources:
-            torch.accelerator.synchronize()
-        return len(launch_tokens)
-
     def workspace_shapes(
         self,
         M: int,
@@ -740,17 +730,14 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         del N, global_num_experts, local_num_experts, expert_tokens_meta
-        plan = self._plan(
-            tokens=M,
-            topk=topk,
+        plan = self._plan_for_tokens(
+            int(M),
             activation=activation,
             apply_router_weight_on_input=self._apply_router_weight_on_input,
         )
+        required_nbytes = sum(spec.nbytes for spec in plan.scratch_specs())
         itemsize = self.moe_config.in_dtype.itemsize
-        scratch_elements = max(
-            1, (_b12x_scratch_nbytes(plan) + itemsize - 1) // itemsize
-        )
-        return (0,), (scratch_elements,), (M, K)
+        return (0,), (max(1, (required_nbytes + itemsize - 1) // itemsize),), (M, K)
 
     def apply(
         self,
@@ -779,26 +766,56 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 "apply_router_weight_on_input does not match the prepared b12x MoE plan"
             )
         prepared = self._prepared()
-        topk_ids = _normalize_topk_ids(topk_ids)
+        # Native routes are specialized for both int32 and int64 identifiers
+        # during materialization.  Preserve the caller's representation: a
+        # conversion here would allocate during capture and would silently
+        # discard the prepared int64 path.
+        if topk_ids.dtype not in (torch.int32, torch.int64) or not topk_ids.is_contiguous():
+            raise TypeError("b12x MoE topk_ids must be contiguous int32 or int64")
         topk_weights = _normalize_topk_weights(topk_weights)
-        plan = self._plan(
-            tokens=int(hidden_states.shape[0]),
-            topk=int(topk_ids.shape[1]),
+        plan = self._plan_for_tokens(
+            int(hidden_states.shape[0]),
             activation=activation,
             apply_router_weight_on_input=bool(apply_router_weight_on_input),
         )
-        scratch = _workspace_as_b12x_scratch(workspace2, plan)
-
-        _run_b12x_moe_plan(
-            plan=plan,
+        if workspace2 is None or not workspace2.is_contiguous():
+            raise ValueError("b12x MoE requires contiguous caller-owned workspace2")
+        scratch = workspace2.view(-1).view(torch.uint8)
+        binding = _require_b12x_fused_moe().bind(
+            plan,
             scratch=scratch,
-            hidden_states=hidden_states,
-            prepared=prepared,
+            a=hidden_states,
+            experts=prepared,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             output=output,
-            unit_scale_contract=self._quant_mode == "w4a16",
+            input_scales_static=True,
         )
+        _require_b12x_fused_moe().run(binding=binding)
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
         raise NotImplementedError("LoRA is not supported for B12xExperts")
+
+def _register_b12x_moe_output_collective(
+    layer: torch.nn.Module, *, hidden_size: int
+) -> None:
+    """Describe the rank-local routed-MoE output to the existing TP transport."""
+    from vllm.distributed.parallel_state import register_b12x_collective_describer
+    from vllm.distributed.device_communicators.b12x_pcie_all_reduce import (
+        B12xPcieInvocation,
+    )
+
+
+    def describe(workload):
+        prefix = layer.layer_name
+        return tuple(
+            B12xPcieInvocation(
+                name=f"{prefix}.moe_output_all_reduce.m{rows}.lane{workload.lane}",
+                operation="all_reduce",
+                shape=(rows, hidden_size),
+                dtype=workload.output_dtype,
+            )
+            for rows in workload.token_counts
+        )
+
+    register_b12x_collective_describer(layer, describe)

@@ -158,10 +158,27 @@ def native_compressor_runners(monkeypatch):
         candidate.module.fused_wkv_wgate.weight.normal_(0, 0.1)
         candidate.module.norm.weight.uniform_(0.5, 1.5)
         reference.module.load_state_dict(candidate.module.state_dict())
-        for runner in (candidate, reference):
-            runner.stage([0, 1], [0, 0], [10, 10], original)
-            runner.run()
-        yield candidate, reference, original, replacement
+        from b12x.preparation import PreparationSession
+        from vllm.utils.b12x import B12xWorkload
+        workload = B12xWorkload(
+            stage="state", token_counts=(capacity,), fixed_token_counts=(),
+            output_dtype=torch.bfloat16, max_tokens=capacity,
+            max_seqs=requests, max_model_len=64,
+        )
+        with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+            for runner in (candidate, reference):
+                units = runner.module.get_b12x_preparation_units(runner.module, workload)
+                session.prepare(tuple(request for unit in units for request in unit.requests))
+                runner.stage([0, 1], [0, 0], [10, 10], original)
+                runner.run()
+            session.freeze()
+            try:
+                yield candidate, reference, original, replacement
+            finally:
+                for runner in (candidate, reference):
+                    if runner.graph is not None:
+                        runner.graph.reset()
+                        runner.graph = None
 
 
 def test_native_compressor_rejection_reorder_padding_and_page_boundaries(

@@ -374,7 +374,11 @@ class Qwen3_8FlashNextModel(nn.Module):
             if layer_type == "full_attention"
             and getattr(config, "indexer_n_heads", None) is not None
         )
-        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
+        self.embed_tokens = VocabParallelEmbedding(
+            self.vocab_size,
+            config.hidden_size,
+            prefix=maybe_prefix(prefix, "embed_tokens"),
+        )
         hc_config = HyperConnectionConfig(
             hc_count=config.hc_count,
             hidden_size=config.hidden_size,

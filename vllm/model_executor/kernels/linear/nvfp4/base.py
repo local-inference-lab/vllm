@@ -13,12 +13,12 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 class NvFp4LinearLayerConfig:
     """Configuration for an NVFP4 linear layer.
 
-    All NVFP4 layers share the same structure: packed uint8 weights (2 FP4 values per
-    byte), FP8-E4M3 per-block weight scales (group size 16), and scalar global
-    scales for both weights and activations.
+    Weights are packed uint8 NVFP4 with E4M3 block scales and a scalar global
+    weight scale. W4A16 checkpoints consume floating-point activations directly; W4A4
+    checkpoints also carry activation quantization scales.
     """
 
-    pass
+    use_a16: bool = False
 
 
 class NvFp4LinearKernel(ABC):
@@ -64,6 +64,11 @@ class NvFp4LinearKernel(ABC):
         and scales in-place on *layer*.
         """
         raise NotImplementedError
+
+    def get_workspace_size(self, layer: torch.nn.Module, rows: int) -> int:
+        """Scratch bytes one call at ``rows`` needs from a caller-reserved view."""
+        del layer, rows
+        return 0
 
     @abstractmethod
     def apply_weights(

@@ -1008,8 +1008,8 @@ def init_wfp8_a16_linear_kernel(
 def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
     """Select and instantiate the best NVFP4 linear kernel for the
     current platform."""
-    config = NvFp4LinearLayerConfig()
-    a16_kernels = (MarlinNvFp4LinearKernel, HummingNvFp4LinearKernel)
+    config = NvFp4LinearLayerConfig(use_a16=use_a16)
+    a16_kernels = (MarlinNvFp4LinearKernel, HummingNvFp4LinearKernel, B12xNvFp4LinearKernel)
 
     # VLLM_BATCH_INVARIANT forces deterministic execution. Prefer the
     # batch-invariant CUTLASS implementation when available, otherwise fall

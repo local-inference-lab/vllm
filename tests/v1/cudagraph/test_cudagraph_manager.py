@@ -23,6 +23,38 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 pytestmark = pytest.mark.cpu_test
 
 
+def test_exact_single_request_prefill_descriptor_does_not_pad_other_batches(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform, "get_global_graph_pool", lambda: object()
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils, "is_breakable_cudagraph_enabled", lambda: True
+    )
+    config = _create_vllm_config()
+    manager = gpu_cudagraph_utils.ModelCudaGraphManager(
+        config,
+        torch.device("cpu"),
+        CUDAGraphMode.FULL_AND_PIECEWISE,
+        decode_query_len=1,
+        single_request_prefill_tokens=4096,
+    )
+    manager._graphs_captured = True
+    desc = manager.dispatch(1, 4096, None, 0, max_query_len=4096)
+    assert desc.cg_mode == CUDAGraphMode.PIECEWISE
+    assert desc.num_reqs == 1 and desc.exact_num_tokens
+    for requests, tokens in ((1, 2048), (2, 4096), (1, 4095)):
+        desc = manager.dispatch(requests, tokens, None, 0, max_query_len=tokens)
+        assert desc.cg_mode == CUDAGraphMode.NONE
+    assert manager.dispatch(4, 4, 1, 0, max_query_len=1).cg_mode == CUDAGraphMode.FULL
+
+
 @pytest.fixture(autouse=True)
 def _reset_graph_pool_id():
     pynccl_allocator._graph_pool_id = None
@@ -138,6 +170,7 @@ def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
     with (
         patch.object(gpu_cudagraph_utils, "graph_capture", fake_graph_capture),
         patch.object(gpu_cudagraph_utils, "get_offloader", lambda: fake_offloader),
+        patch.object(gpu_cudagraph_utils.torch.accelerator, "synchronize"),
         patch.object(gpu_cudagraph_utils.torch.cuda, "CUDAGraph"),
         patch.object(
             gpu_cudagraph_utils.torch.cuda,
@@ -292,6 +325,7 @@ def _make_spec_decode_manager(
     capture_sizes: list[int] | None = None,
     num_speculative_tokens: int = 0,
     dynamic_spec_num_tokens: list[int] | None = None,
+    varlen_decode: bool = False,
 ) -> gpu_cudagraph_utils.CudaGraphManager:
     monkeypatch.setattr(
         gpu_cudagraph_utils,
@@ -312,6 +346,7 @@ def _make_spec_decode_manager(
         device=torch.device("cpu"),
         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
         decode_query_len=decode_query_len,
+        varlen_decode=varlen_decode,
     )
     manager._graphs_captured = True
     return manager
@@ -319,12 +354,6 @@ def _make_spec_decode_manager(
 
 def test_uniform_decode_pads_up_to_full_graph(monkeypatch):
     manager = _make_spec_decode_manager(monkeypatch)
-    assert [
-        (desc.cg_mode, desc.num_tokens) for desc in manager._candidates[(12, 0)]
-    ] == [
-        (CUDAGraphMode.FULL, 18),
-        (CUDAGraphMode.PIECEWISE, 16),
-    ]
 
     desc = manager.dispatch(
         num_reqs=4,
@@ -370,6 +399,71 @@ def test_planned_token_counts_include_speculative_decode_rows(monkeypatch):
 
     assert manager.planned_token_counts() == [1, 2, 4, 6, 8, 12, 16, 18, 24]
     assert 12 not in target_only.planned_token_counts()
+
+
+def test_varlen_decode_captures_dense_low_concurrency_product(monkeypatch):
+    decode_query_len = 8
+    manager = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=decode_query_len,
+        capture_sizes=[1, 2, 4, 8, 16, 24, 32],
+        num_speculative_tokens=7,
+        varlen_decode=True,
+    )
+
+    full_descs = manager._capture_descs[CUDAGraphMode.FULL]
+    assert len(full_descs) == 21
+    dense_shapes = {
+        (num_reqs, num_reqs * query_len)
+        for num_reqs in (1, 2)
+        for query_len in range(1, decode_query_len + 1)
+    }
+    captured_shapes = {(desc.num_reqs, desc.num_tokens) for desc in full_descs}
+    assert dense_shapes <= captured_shapes
+
+    for num_reqs, num_tokens in dense_shapes:
+        desc = manager.dispatch(
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            uniform_token_count=None,
+            num_active_loras=0,
+            max_query_len=decode_query_len,
+        )
+        assert desc.cg_mode == CUDAGraphMode.FULL
+        assert (desc.num_reqs, desc.num_tokens) == (num_reqs, num_tokens)
+
+    # Preserve the ordinary padded schedule for higher concurrency.
+    assert any(desc.num_reqs == 8 and desc.num_tokens == 8 for desc in full_descs)
+
+
+@pytest.mark.parametrize(
+    ("num_reqs", "num_tokens", "expected_shape"),
+    [
+        (2, 3, (2, 4)),
+        (3, 6, (8, 8)),
+    ],
+)
+def test_varlen_dense_rejection_keeps_larger_full_fallback(
+    monkeypatch, num_reqs, num_tokens, expected_shape
+):
+    manager = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=8,
+        capture_sizes=[1, 2, 4, 8, 16, 24, 32],
+        num_speculative_tokens=7,
+        varlen_decode=True,
+    )
+
+    desc = manager.dispatch(
+        num_reqs=num_reqs,
+        num_tokens=num_tokens,
+        uniform_token_count=None,
+        num_active_loras=0,
+        max_query_len=2,
+    )
+
+    assert desc.cg_mode == CUDAGraphMode.FULL
+    assert (desc.num_reqs, desc.num_tokens) == expected_shape
 
 
 def test_mixed_batch_never_selects_a_uniform_decode_graph(monkeypatch):

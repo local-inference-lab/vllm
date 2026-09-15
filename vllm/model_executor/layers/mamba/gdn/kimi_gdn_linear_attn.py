@@ -29,7 +29,10 @@ from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.triton_utils import tl, triton
 from vllm.utils.b12x import (
-    B12xWarmupUnit,
+    set_b12x_preparation_provider,
+    B12xPreparationUnit,
+    B12xWorkload,
+    PreparationResourceUnavailableError,
     get_b12x_gdn_decode,
     get_b12x_kda_prefill,
     get_b12x_scratch_buffers,
@@ -350,74 +353,6 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
                 param.tp_rank = param_tp_rank
 
 
-class _B12xKdaPrefillWarmup:
-    """Warm-up provider that compiles a layer's b12x KDA prefill kernels."""
-
-    def get_b12x_warmup_unit(
-        self,
-        layer: torch.nn.Module,
-        token_counts: tuple[int, ...],
-        output_dtype: torch.dtype,
-    ) -> B12xWarmupUnit:
-        del token_counts, output_dtype
-
-        def compile() -> None:
-            plan = layer._b12x_prefill_plan
-            api = layer._b12x_prefill_api
-            if plan is None or api is None:
-                # The pool is bound after the memory-profiling pass; the
-                # post-allocation warmup compiles this layer.
-                return
-            scratch_buffers = get_b12x_scratch_buffers(plan)
-            scratch = (
-                scratch_buffers[0] if len(scratch_buffers) == 1 else scratch_buffers
-            )
-            caps = plan.caps
-            device = caps.device
-            heads, head_dim = caps.heads, caps.head_dim
-            tokens = caps.chunk_tokens
-            rows = torch.zeros(
-                (tokens, heads, head_dim), dtype=caps.model_dtype, device=device
-            )
-            indices = torch.zeros(1, dtype=torch.int32, device=device)
-            binding = api.bind(
-                plan,
-                scratch=scratch,
-                q=rows,
-                k=torch.zeros_like(rows),
-                v=torch.zeros_like(rows),
-                raw_g=torch.zeros_like(rows),
-                raw_beta=torch.zeros(
-                    (tokens, heads), dtype=caps.model_dtype, device=device
-                ),
-                A_log=layer.A_log,
-                dt_bias=layer.dt_bias.view(-1, head_dim),
-                recurrent_state=layer.kv_cache[1],
-                cu_seqlens=torch.tensor([0, tokens], dtype=torch.int32, device=device),
-                initial_state_indices=indices,
-                final_state_indices=indices,
-                checkpoint_state_indices=indices,
-                checkpoint_offsets=torch.zeros(1, dtype=torch.int32, device=device),
-                num_seqs=layer._b12x_prefill_num_seqs,
-                num_tokens=layer._b12x_prefill_num_tokens,
-                output=torch.zeros_like(rows),
-            )
-            api.prewarm(binding)
-
-        caps = getattr(layer._b12x_prefill_plan, "caps", None)
-        return B12xWarmupUnit(
-            name="KDA prefill",
-            key=(
-                type(layer),
-                None if caps is None else caps.device,
-                layer.local_num_heads,
-                layer.head_dim,
-                layer._b12x_prefill_max_tokens,
-                layer._b12x_prefill_max_seqs,
-                None if caps is None else caps.max_state_slots,
-            ),
-            compile=compile,
-        )
 
 
 @PluggableLayer.register("kimi_gated_delta_net_attention")
@@ -629,10 +564,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             FusedRMSNormGated, self.head_dim, activation="sigmoid"
         )
         self._b12x_kda_api: Any | None = None
-        self._b12x_kda_plan = None
-        self._initialize_b12x_kda_decode(vllm_config)
         self._b12x_prefill_api: Any | None = None
+        self._b12x_kda_plan = None
         self._b12x_prefill_plan = None
+        self._initialize_b12x_kda_decode(vllm_config)
         self._initialize_b12x_kda_prefill(vllm_config)
         self.o_proj = RowParallelLinear(
             self.projection_size,
@@ -641,7 +576,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             quant_config=self.quant_config,
             prefix=f"{prefix}.o_proj",
         )
-
+        self._b12x_preparation_prefix = prefix
+        if self._b12x_kda_api is not None or self._b12x_prefill_api is not None:
+            if not getattr(self, "b12x_preparation_suppressed", False):
+                set_b12x_preparation_provider(self, self)
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -657,7 +595,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             or not current_platform.is_cuda()
         ):
             return
-
         api = get_b12x_gdn_decode()
         device = torch.device(current_platform.current_device())
         if (
@@ -667,103 +604,168 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             or not api.is_supported(device)
         ):
             return
-
         max_seqs = int(vllm_config.scheduler_config.max_num_seqs)
         state_index_columns = max(1, self.num_spec + 1)
         if state_index_columns > 8:
             return
         max_tokens = max_seqs * state_index_columns
-
         self._b12x_kda_api = api
         self._b12x_kda_max_tokens = max_tokens
         self._b12x_kda_max_seqs = max_seqs
         self._b12x_kda_state_index_columns = state_index_columns
-
+        width = self.local_num_heads * self.head_dim
+        self.register_buffer(
+            "_b12x_kda_mixed_qkv",
+            torch.zeros((max_tokens, 3 * width), dtype=self.model_config.dtype, device=device),
+            persistent=False,
+        )
+        # A full-rank gate arrives as one value per head dimension.
+        raw_g_shape = (
+            (max_tokens, self.local_num_heads, self.head_dim)
+            if self.use_full_rank_gate
+            else (max_tokens, self.local_num_heads)
+        )
+        for name, shape in (
+            ("_b12x_kda_raw_g", raw_g_shape),
+            ("_b12x_kda_raw_beta", (max_tokens, self.local_num_heads)),
+            ("_b12x_kda_z", (max_tokens, self.local_num_heads, self.head_dim)),
+            ("_b12x_kda_output", (max_tokens, self.local_num_heads, self.head_dim)),
+        ):
+            self.register_buffer(
+                name, torch.zeros(shape, dtype=self.model_config.dtype, device=device),
+                persistent=False,
+            )
+        self.register_buffer(
+            "_b12x_kda_query_start_loc",
+            torch.zeros(max_seqs + 1, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_kda_state_indices",
+            torch.zeros((max_seqs, state_index_columns), dtype=torch.int32, device=device),
+            persistent=False,
+        )
         self.register_buffer(
             "_b12x_kda_num_accepted_tokens",
             torch.ones(max_seqs, dtype=torch.int32, device=device),
             persistent=False,
         )
         self.register_buffer(
-            "_b12x_kda_num_seqs",
-            torch.zeros(1, dtype=torch.int32, device=device),
+            "_b12x_kda_num_seqs", torch.zeros(1, dtype=torch.int32, device=device),
             persistent=False,
         )
         self.register_buffer(
-            "_b12x_kda_num_tokens",
-            torch.zeros(1, dtype=torch.int32, device=device),
+            "_b12x_kda_num_tokens", torch.zeros(1, dtype=torch.int32, device=device),
             persistent=False,
         )
-        self.register_buffer("_b12x_kda_scratch", None, persistent=False)
 
-    def _make_b12x_kda_plan(self, max_state_slots: int):
+    def _b12x_kda_decode_declaration(self, max_state_slots: int):
         api = self._b12x_kda_api
         if api is None:
             raise RuntimeError("b12x KDA decode was not initialized")
+        caps = api.Caps(
+            device=current_platform.current_device(),
+            max_tokens=self._b12x_kda_max_tokens,
+            max_seqs=self._b12x_kda_max_seqs,
+            max_state_slots=max_state_slots,
+            key_heads=self.local_num_heads,
+            value_heads=self.local_num_heads,
+            key_head_dim=self.head_dim,
+            value_head_dim=self.head_dim,
+            state_index_columns=self._b12x_kda_state_index_columns,
+            model_dtype=self.model_config.dtype,
+            state_dtype=self.get_state_dtype()[1],
+            gate_activation="sigmoid",
+            qk_l2norm=True,
+            null_state_index=self.b12x_kda_null_state_index,
+        )
         return api.plan(
-            api.Caps(
-                device=current_platform.current_device(),
-                max_tokens=self._b12x_kda_max_tokens,
-                max_seqs=self._b12x_kda_max_seqs,
-                max_state_slots=max_state_slots,
-                key_heads=self.local_num_heads,
-                value_heads=self.local_num_heads,
-                key_head_dim=self.head_dim,
-                value_head_dim=self.head_dim,
-                state_index_columns=self._b12x_kda_state_index_columns,
-                model_dtype=self.model_config.dtype,
-                state_dtype=self.get_state_dtype()[1],
-                gate_activation="sigmoid",
-                qk_l2norm=True,
-                null_state_index=self.b12x_kda_null_state_index,
-                kda_metadata_validation="trusted",
-            )
+            caps,
+            invocation=api.invocation_from_tensors(
+                caps,
+                mixed_qkv=self._b12x_kda_mixed_qkv,
+                raw_g=self._b12x_kda_raw_g,
+                raw_beta=self._b12x_kda_raw_beta,
+                z=self._b12x_kda_z,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias.view(self.local_num_heads, self.head_dim),
+                norm_weight=self.o_norm.weight,
+                recurrent_state=self.kv_cache[1],
+                query_start_loc=self._b12x_kda_query_start_loc,
+                num_accepted_tokens=self._b12x_kda_num_accepted_tokens,
+                state_indices=self._b12x_kda_state_indices,
+                num_seqs=self._b12x_kda_num_seqs,
+                num_tokens=self._b12x_kda_num_tokens,
+                output=self._b12x_kda_output,
+            ),
         )
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         super().bind_kv_cache(kv_cache)
-        if self._b12x_prefill_api is not None:
-            self._b12x_prefill_plan = self._make_b12x_kda_prefill_plan(
-                max_state_slots=int(self.kv_cache[1].shape[0])
-            )
-        api = self._b12x_kda_api
-        if api is None:
-            return
+        self._b12x_kda_plan = None
+        self._b12x_prefill_plan = None
         recurrent_state = self.kv_cache[1]
-        plan = self._make_b12x_kda_plan(max_state_slots=recurrent_state.shape[0])
-        (scratch,) = get_b12x_scratch_buffers(plan)
-        self._b12x_kda_scratch = scratch
-        self._b12x_kda_plan = plan
+        if self._b12x_kda_api is not None:
+            self._b12x_kda_plan = self._b12x_kda_decode_declaration(
+                recurrent_state.shape[0]
+            )
+        if self._b12x_prefill_api is not None:
+            self._b12x_prefill_plan = self._b12x_kda_prefill_declaration(
+                recurrent_state.shape[0]
+            )
 
     def unbind_kv_cache(self) -> None:
+        # Capacity buffers remain reusable; only bindings to this state-pool
+        # generation are invalid once the caller releases it.
         self._b12x_kda_plan = None
-        self._b12x_kda_scratch = None
         self._b12x_prefill_plan = None
         super().unbind_kv_cache()
 
     def _initialize_b12x_kda_prefill(self, vllm_config: VllmConfig) -> None:
-        """Hold the b12x prefill op and its per-request metadata buffers."""
         if self.kda_prefill_backend != "b12x":
             return
         api = get_b12x_kda_prefill()
         if api is None:
-            raise RuntimeError(
-                "The b12x KDA prefill backend requires the b12x package."
-            )
+            raise RuntimeError("The b12x KDA prefill backend requires the b12x package.")
         device = torch.device(current_platform.current_device())
         scheduler_config = vllm_config.scheduler_config
         self._b12x_prefill_api = api
         self._b12x_prefill_max_tokens = int(scheduler_config.max_num_batched_tokens)
         self._b12x_prefill_max_seqs = int(scheduler_config.max_num_seqs)
-        max_seqs = self._b12x_prefill_max_seqs
+        max_tokens, max_seqs = (
+            self._b12x_prefill_max_tokens,
+            self._b12x_prefill_max_seqs,
+        )
+        shape = (max_tokens, self.local_num_heads, self.head_dim)
+        for name, tensor_shape in (
+            ("_b12x_prefill_q", shape),
+            ("_b12x_prefill_k", shape),
+            ("_b12x_prefill_v", shape),
+            ("_b12x_prefill_raw_g", shape),
+            ("_b12x_prefill_raw_beta", (max_tokens, self.local_num_heads)),
+            ("_b12x_prefill_output", shape),
+        ):
+            self.register_buffer(
+                name,
+                torch.zeros(tensor_shape, dtype=self.model_config.dtype, device=device),
+                persistent=False,
+            )
         self.register_buffer(
-            "_b12x_prefill_num_seqs",
-            torch.zeros(1, dtype=torch.int32, device=device),
+            "_b12x_prefill_cu_seqlens",
+            torch.zeros(max_seqs + 1, dtype=torch.int32, device=device),
             persistent=False,
         )
         self.register_buffer(
-            "_b12x_prefill_num_tokens",
-            torch.zeros(1, dtype=torch.int32, device=device),
+            "_b12x_prefill_state_indices",
+            torch.zeros(max_seqs, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_prefill_num_seqs", torch.zeros(1, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_prefill_num_tokens", torch.zeros(1, dtype=torch.int32, device=device),
             persistent=False,
         )
         self.register_buffer(
@@ -781,9 +783,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             torch.zeros(max_seqs, dtype=torch.int32, device=device),
             persistent=False,
         )
-        self.b12x_warmup_provider = _B12xKdaPrefillWarmup()
 
-    def _make_b12x_kda_prefill_plan(self, max_state_slots: int):
+    def _b12x_kda_prefill_declaration(self, max_state_slots: int):
         api = self._b12x_prefill_api
         if api is None:
             raise RuntimeError("b12x KDA prefill was not initialized")
@@ -800,20 +801,39 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 qk_l2norm=True,
                 checkpoint_export=True,
                 null_state_index=NULL_BLOCK_ID,
-                metadata_validation="trusted",
-            )
+            ),
+            invocation=api.invocation_from_tensors(
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                initial_state_indices=self._b12x_prefill_state_indices,
+            ),
         )
+
+    @staticmethod
+    def _scratch_spec(state) -> tuple[tuple[int, ...], torch.dtype]:
+        specs = tuple(state.layout.scratch_specs())
+        if len(specs) != 1:
+            raise RuntimeError("b12x KDA requires exactly one scratch buffer")
+        return specs[0].shape, specs[0].dtype
+
+    def _get_b12x_kda_workspace(self) -> torch.Tensor:
+        plan = self._b12x_kda_plan
+        if plan is None:
+            raise PreparationResourceUnavailableError(
+                "b12x KDA decode is not prepared for the current KV generation"
+            )
+        (scratch,) = get_b12x_scratch_buffers(plan)
+        return scratch
 
     def _b12x_prefill_workspace_specs(self):
         plan = self._b12x_prefill_plan
         if plan is None:
-            raise RuntimeError("b12x KDA prefill KV cache is not bound")
-        scratch_specs = tuple(plan.scratch_specs())
-        if len(scratch_specs) != 1:
-            raise RuntimeError("b12x KDA prefill requires exactly one scratch buffer")
-        scratch_spec = scratch_specs[0]
+            raise PreparationResourceUnavailableError(
+                "b12x KDA prefill is not prepared for the current KV generation"
+            )
+        (spec,) = plan.scratch_specs()
         return (
-            (scratch_spec.shape, scratch_spec.dtype),
+            (spec.shape, spec.dtype),
             (
                 (
                     self._b12x_prefill_max_tokens,
@@ -859,6 +879,206 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             return None
         return manager.get_simultaneous(*specs)[2:]
 
+    def get_b12x_preparation_units(
+        self, layer: torch.nn.Module, workload: B12xWorkload,
+    ) -> tuple[B12xPreparationUnit, ...]:
+        if layer is not self:
+            raise ValueError("KDA preparation owner mismatch")
+        units = []
+        if self._b12x_kda_plan is not None:
+            request = self._b12x_kda_plan.request(
+                name=f"{self._b12x_preparation_prefix}.kda.decode",
+                prepare_call=self._prepare_b12x_kda_decode,
+                benchmark_call=self._benchmark_b12x_kda_decode,
+            )
+            units.append(B12xPreparationUnit(
+                name="KDA decode",
+                key=(self._b12x_preparation_prefix, "kda-decode"),
+                requests=(request,),
+                stage="state",
+                autotune=not workload.eager_only,
+            ))
+        if self._b12x_prefill_plan is not None:
+            request = self._b12x_prefill_plan.request(
+                name=f"{self._b12x_preparation_prefix}.kda.prefill",
+                prepare_call=self._prepare_b12x_kda_prefill,
+                benchmark_call=self._benchmark_b12x_kda_prefill,
+            )
+            units.append(B12xPreparationUnit(
+                name="KDA prefill",
+                key=(self._b12x_preparation_prefix, "kda-prefill"),
+                requests=(request,),
+                stage="state",
+                autotune=not workload.eager_only,
+            ))
+        return tuple(units)
+
+    @staticmethod
+    def _benchmark_values(tensor: torch.Tensor) -> None:
+        values = torch.arange(
+            tensor.numel(), dtype=tensor.dtype, device=tensor.device
+        ).reshape_as(tensor)
+        tensor.copy_(values.div_(max(values.numel(), 1)))
+
+    def _prepare_b12x_kda_decode(self, state):
+        return self._b12x_kda_decode_call(state, benchmark=False)
+
+    def _benchmark_b12x_kda_decode(self, state):
+        return self._b12x_kda_decode_call(state, benchmark=True)
+
+    def _b12x_kda_decode_call(self, state, *, benchmark: bool):
+        from b12x.preparation import PreparedCall
+        slots = self.kv_cache[1]
+        slot = 1 if slots.shape[0] > 1 else 0
+        spec = self._scratch_spec(state)
+        # Trial and prepare factories own their scratch; the runtime binding
+        # in _run_b12x_kda_decode_post_conv draws from the workspace manager.
+        scratch = torch.empty(spec[0], dtype=spec[1], device=slots.device)
+        if benchmark:
+            mixed_qkv = torch.empty_like(self._b12x_kda_mixed_qkv)
+            raw_g = torch.empty_like(self._b12x_kda_raw_g)
+            raw_beta = torch.empty_like(self._b12x_kda_raw_beta)
+            z = torch.empty_like(self._b12x_kda_z)
+            output = torch.empty_like(self._b12x_kda_output)
+            query_start_loc = torch.empty_like(self._b12x_kda_query_start_loc)
+            accepted = torch.ones_like(self._b12x_kda_num_accepted_tokens)
+            state_indices = torch.full_like(self._b12x_kda_state_indices, slot)
+            num_seqs = torch.empty_like(self._b12x_kda_num_seqs)
+            num_tokens = torch.empty_like(self._b12x_kda_num_tokens)
+            saved_state = slots[slot : slot + 1].clone()
+        else:
+            mixed_qkv, raw_g, raw_beta, z, output = (
+                self._b12x_kda_mixed_qkv, self._b12x_kda_raw_g,
+                self._b12x_kda_raw_beta, self._b12x_kda_z, self._b12x_kda_output,
+            )
+            query_start_loc = self._b12x_kda_query_start_loc
+            accepted, state_indices = (
+                self._b12x_kda_num_accepted_tokens, self._b12x_kda_state_indices,
+            )
+            num_seqs, num_tokens = self._b12x_kda_num_seqs, self._b12x_kda_num_tokens
+            saved_state = None
+
+        def produce():
+            for tensor in (mixed_qkv, raw_g, raw_beta, z):
+                self._benchmark_values(tensor)
+            query_start_loc.zero_()
+            query_start_loc[1:].fill_(1)
+            accepted.fill_(1)
+            state_indices.fill_(slot)
+            num_seqs.fill_(1)
+            num_tokens.fill_(1)
+
+        def reset():
+            if saved_state is not None:
+                slots[slot : slot + 1].copy_(saved_state)
+
+        binding = state.bind_kda(
+            scratch=scratch, mixed_qkv=mixed_qkv, raw_g=raw_g, raw_beta=raw_beta,
+            z=z, A_log=self.A_log,
+            dt_bias=self.dt_bias.view(self.local_num_heads, self.head_dim),
+            norm_weight=self.o_norm.weight, recurrent_state=slots,
+            query_start_loc=query_start_loc, num_accepted_tokens=accepted,
+            state_indices=state_indices, num_seqs=num_seqs, num_tokens=num_tokens,
+            output=output,
+        )
+        return PreparedCall(
+            run=lambda: state.run(
+                binding, lower_bound=self.gate_lower_bound, eps=self.o_norm.eps,
+                scale=self.head_dim**-0.5,
+            ),
+            produce=produce, reset=reset,
+            restore=reset if saved_state is not None else None,
+            owners=(scratch, mixed_qkv, raw_g, raw_beta, z, output,
+                    query_start_loc, accepted, state_indices, num_seqs, num_tokens),
+        )
+
+    def _prepare_b12x_kda_prefill(self, state):
+        return self._b12x_kda_prefill_call(state, benchmark=False)
+
+    def _benchmark_b12x_kda_prefill(self, state):
+        return self._b12x_kda_prefill_call(state, benchmark=True)
+
+    def _b12x_kda_prefill_call(self, state, *, benchmark: bool):
+        from b12x.preparation import PreparedCall
+        spec = self._scratch_spec(state)
+        slots = self.kv_cache[1]
+        slot = 1 if slots.shape[0] > 1 else 0
+        # Trial and prepare factories own their scratch; the runtime binding
+        # in _run_b12x_kda_prefill draws from the workspace manager instead.
+        scratch = torch.empty(spec[0], dtype=spec[1], device=slots.device)
+        if benchmark:
+            q = torch.empty_like(self._b12x_prefill_q)
+            k = torch.empty_like(self._b12x_prefill_k)
+            v = torch.empty_like(self._b12x_prefill_v)
+            raw_g = torch.empty_like(self._b12x_prefill_raw_g)
+            raw_beta = torch.empty_like(self._b12x_prefill_raw_beta)
+            output = torch.empty_like(self._b12x_prefill_output)
+            cu_seqlens = torch.empty_like(self._b12x_prefill_cu_seqlens)
+            indices = torch.full_like(self._b12x_prefill_initial_indices, slot)
+            checkpoint_indices = torch.full_like(self._b12x_prefill_null_indices, slot)
+            offsets = torch.zeros_like(self._b12x_prefill_zero_offsets)
+            num_seqs = torch.empty_like(self._b12x_prefill_num_seqs)
+            num_tokens = torch.empty_like(self._b12x_prefill_num_tokens)
+            saved_state = slots[slot : slot + 1].clone()
+            owners = (
+                scratch, q, k, v, raw_g, raw_beta, output, cu_seqlens,
+                indices, checkpoint_indices, offsets, num_seqs, num_tokens,
+            )
+        else:
+            q, k, v = (
+                self._b12x_prefill_q,
+                self._b12x_prefill_k,
+                self._b12x_prefill_v,
+            )
+            raw_g, raw_beta = (
+                self._b12x_prefill_raw_g,
+                self._b12x_prefill_raw_beta,
+            )
+            output = self._b12x_prefill_output
+            cu_seqlens = self._b12x_prefill_cu_seqlens
+            indices = self._b12x_prefill_initial_indices
+            checkpoint_indices = self._b12x_prefill_null_indices
+            offsets = self._b12x_prefill_zero_offsets
+            num_seqs, num_tokens = (
+                self._b12x_prefill_num_seqs,
+                self._b12x_prefill_num_tokens,
+            )
+            saved_state = None
+            owners = (scratch,)
+
+        def produce():
+            for tensor in (q, k, v, raw_g, raw_beta):
+                self._benchmark_values(tensor)
+            cu_seqlens.zero_()
+            cu_seqlens[1:].fill_(self._b12x_prefill_max_tokens)
+            indices.fill_(slot)
+            checkpoint_indices.fill_(slot)
+            offsets.zero_()
+            num_seqs.fill_(1)
+            num_tokens.fill_(self._b12x_prefill_max_tokens)
+
+        def reset():
+            if saved_state is not None:
+                slots[slot : slot + 1].copy_(saved_state)
+
+        binding = state.bind(
+            scratch=scratch, q=q, k=k, v=v, raw_g=raw_g, raw_beta=raw_beta,
+            A_log=self.A_log, dt_bias=self.dt_bias.view(-1, self.head_dim),
+            recurrent_state=slots, cu_seqlens=cu_seqlens,
+            initial_state_indices=indices, final_state_indices=indices,
+            checkpoint_state_indices=checkpoint_indices,
+            checkpoint_offsets=offsets,
+            num_seqs=num_seqs, num_tokens=num_tokens, output=output,
+        )
+        return PreparedCall(
+            run=lambda: state.run(
+                binding, lower_bound=self.gate_lower_bound,
+                max_live_tokens=self._b12x_prefill_max_tokens, max_live_seqs=1,
+            ),
+            produce=produce, reset=reset,
+            restore=reset if saved_state is not None else None, owners=owners,
+        )
+
     def _run_b12x_kda_prefill(
         self,
         *,
@@ -875,39 +1095,13 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         recurrent_state: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        """Run packed KDA prefill straight against the recurrent-state pool.
-
-        The op reads each request's initial state and writes its final state,
-        and any checkpoint, by slot index, so this path neither gathers a
-        dense initial state nor scatters a dense final one. Requests without
-        an initial state name the null slot and start from zero.
-
-        Args:
-            scratch: Caller-owned workspace disjoint from ``output``.
-            q: Live packed query rows, ``[tokens, heads, head_dim]``.
-            k: Live packed key rows.
-            v: Live packed value rows.
-            raw_g: Live unactivated forget gate.
-            raw_beta: Live unactivated update gate, ``[tokens, heads]``.
-            cu_seqlens: Packed request boundaries, ``[requests + 1]``.
-            state_indices: Destination state slot of each request.
-            has_initial_state: Whether each request continues a cached state.
-            checkpoint: Mid-sequence checkpoint metadata, or ``None``.
-            recurrent_state: The caller-owned recurrent-state pool.
-            output: Destination rows, ``[tokens, heads, head_dim]``.
-
-        Raises:
-            RuntimeError: If the KDA prefill plan is unavailable.
-            ValueError: If the live batch exceeds the planned capacity.
-        """
         api = self._b12x_prefill_api
         plan = self._b12x_prefill_plan
         if api is None or plan is None:
-            raise RuntimeError(
-                "b12x KDA prefill KV cache was not bound before inference"
+            raise PreparationResourceUnavailableError(
+                "b12x KDA prefill is not prepared for the current KV generation"
             )
-        num_tokens = int(q.shape[0])
-        num_requests = int(state_indices.shape[0])
+        num_tokens, num_requests = int(q.shape[0]), int(state_indices.shape[0])
         if (
             num_tokens > self._b12x_prefill_max_tokens
             or num_requests > self._b12x_prefill_max_seqs
@@ -917,19 +1111,19 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 f"tokens={num_tokens}/{self._b12x_prefill_max_tokens}, "
                 f"requests={num_requests}/{self._b12x_prefill_max_seqs}"
             )
-
         initial_indices = self._b12x_prefill_initial_indices[:num_requests]
         initial_indices.copy_(state_indices)
         initial_indices.masked_fill_(~has_initial_state[:num_requests], NULL_BLOCK_ID)
-        if checkpoint is None:
-            checkpoint_indices = self._b12x_prefill_null_indices[:num_requests]
-            checkpoint_offsets = self._b12x_prefill_zero_offsets[:num_requests]
-        else:
-            checkpoint_indices = checkpoint.state_indices[:num_requests]
-            checkpoint_offsets = checkpoint.checkpoint_offsets[:num_requests]
+        checkpoint_indices = (
+            self._b12x_prefill_null_indices[:num_requests]
+            if checkpoint is None else checkpoint.state_indices[:num_requests]
+        )
+        checkpoint_offsets = (
+            self._b12x_prefill_zero_offsets[:num_requests]
+            if checkpoint is None else checkpoint.checkpoint_offsets[:num_requests]
+        )
         self._b12x_prefill_num_seqs.fill_(num_requests)
         self._b12x_prefill_num_tokens.fill_(num_tokens)
-
         binding = api.bind(
             plan,
             scratch=scratch,
@@ -1014,7 +1208,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _can_use_b12x_kda_decode(self, m: GDNAttentionMetadata) -> bool:
         if (
             self._b12x_kda_plan is None
-            or self._b12x_kda_scratch is None
             or m.num_prefills != 0
             or (m.num_decodes == 0 and m.num_spec_decodes == 0)
         ):
@@ -1063,14 +1256,17 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_requests: Number of packed requests.
 
         Raises:
-            RuntimeError: If the KDA plan or cache is unavailable.
+            PreparationResourceUnavailableError: If KDA was not prepared for
+                this recurrent-pool generation.
             ValueError: If the live batch exceeds the planned capacity.
         """
         api = self._b12x_kda_api
         plan = self._b12x_kda_plan
-        scratch = self._b12x_kda_scratch
-        if api is None or plan is None or scratch is None:
-            raise RuntimeError("b12x KDA KV cache was not bound before inference")
+        if api is None or plan is None:
+            raise PreparationResourceUnavailableError(
+                "b12x KDA decode is not prepared for the current KV generation"
+            )
+        scratch = self._get_b12x_kda_workspace()
         num_tokens = int(mixed_qkv.shape[0])
         state_columns = int(state_indices.shape[1])
         if (

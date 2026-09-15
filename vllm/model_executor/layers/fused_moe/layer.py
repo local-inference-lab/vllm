@@ -133,6 +133,7 @@ def FusedMoEFactory(
     hash_indices_table: torch.Tensor | None = None,
     bias_vl: torch.Tensor | None = None,
     image_sentinel_lo: int = 0,
+    image_sentinel_count: int = 5,
     runner_cls: type[MoERunner] | None = None,
     runner_args: dict[str, Any] | None = None,
     routed_experts_cls: type[RoutedExperts] | None = None,
@@ -320,6 +321,7 @@ def FusedMoEFactory(
             hash_indices_table=hash_indices_table,
             bias_vl=bias_vl,
             image_sentinel_lo=image_sentinel_lo,
+            image_sentinel_count=image_sentinel_count,
         )
 
     if params_dtype is None:

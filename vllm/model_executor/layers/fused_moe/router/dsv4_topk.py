@@ -47,6 +47,7 @@ if current_platform.is_cuda():
         input_ids_ptr,
         bias_vl_ptr,
         image_sentinel_lo,
+        image_sentinel_count,
         hash_indices_ptr,
         is_padding_ptr,
         NUM_EXPERTS: tl.constexpr,
@@ -82,15 +83,13 @@ if current_platform.is_cuda():
         if HAS_VL or HAS_HASH:
             token_id = tl.load(input_ids_ptr + row).to(tl.int64)
         if HAS_VL:
-            # Image tokens carry five consecutive in-vocab sentinel ids
-            # starting at image_sentinel_lo and use bias_vl for expert
-            # selection instead of the regular correction bias. Ids above the
-            # sentinel block are regular special tokens and must not match.
+            # Image sentinels occupy the model-declared consecutive token range.
+            # Other special tokens must retain the regular correction bias.
             bias_vl = tl.load(
                 bias_vl_ptr + expert_offsets, mask=expert_mask, other=0.0
             ).to(tl.float32)
             is_image = (token_id >= image_sentinel_lo) & (
-                token_id < image_sentinel_lo + 5
+                token_id < image_sentinel_lo + image_sentinel_count
             )
             bias = tl.where(is_image, bias_vl, bias)
 
@@ -165,6 +164,7 @@ def dsv4_topk(
     is_padding: torch.Tensor | None = None,
     topk: int = _TOPK,
     renormalize: bool = True,
+    image_sentinel_count: int = 5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_tokens, num_experts = gating_output.shape
     assert current_platform.is_cuda(), "DeepSeek V4 vision routing requires CUDA"
@@ -193,6 +193,7 @@ def dsv4_topk(
             input_ids,
             bias_vl,
             image_sentinel_lo,
+            image_sentinel_count,
             hash_indices_table,
             is_padding,
             NUM_EXPERTS=num_experts,

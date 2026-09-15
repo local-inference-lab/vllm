@@ -104,6 +104,7 @@ class _CachingMetadataBuilder:
         self.num_builds = 0
         self.num_updates = 0
         self.state = torch.zeros(1, dtype=torch.int32)
+        self.token_mapping = torch.full((2,), -1, dtype=torch.int32)
 
     def build(self, common_prefix_len, common_attn_metadata, **_kwargs):
         self.num_builds += 1
@@ -113,6 +114,7 @@ class _CachingMetadataBuilder:
             slot_mapping=common_attn_metadata.slot_mapping,
             is_prefilling=common_attn_metadata.is_prefilling,
             state=self.state,
+            token_mapping=common_attn_metadata.token_to_req_indices(self.token_mapping),
         )
 
     def build_for_cudagraph_capture(self, common_attn_metadata):
@@ -126,6 +128,7 @@ class _CachingMetadataBuilder:
             reused=metadata,
             is_prefilling=metadata.is_prefilling,
             state=metadata.state,
+            token_mapping=metadata.token_mapping,
         )
 
 
@@ -274,17 +277,20 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
 
 
 @pytest.mark.parametrize("for_capture", [False, True])
-def test_build_attn_metadata_reuses_equivalent_cache_group_builds(for_capture):
-    spec = FullAttentionSpec(
-        block_size=16,
-        num_kv_heads=1,
-        head_size=128,
-        dtype=torch.bfloat16,
-    )
+@pytest.mark.parametrize("same_spec", [False, True])
+def test_build_attn_metadata_reuses_equivalent_cache_group_builds(
+    for_capture, same_spec
+):
     builders = [_CachingMetadataBuilder(), _CachingMetadataBuilder()]
     groups = []
     cache_groups = []
     for group_id, builder in enumerate(builders):
+        spec = FullAttentionSpec(
+            block_size=16 if same_spec or group_id == 0 else 32,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+        )
         layer_name = f"layer.{group_id}"
         group = AttentionGroup(
             _TargetBackend,  # type: ignore[arg-type]
@@ -329,21 +335,33 @@ def test_build_attn_metadata_reuses_equivalent_cache_group_builds(for_capture):
     )
     metadata = build_attn_metadata(**build_kwargs, for_cudagraph_capture=for_capture)
 
-    assert [builder.num_builds for builder in builders] == [1, 0]
-    assert [builder.num_updates for builder in builders] == [0, 1]
-    assert model_metadata.get_extra_common_attn_kwargs.call_count == 1
+    assert [builder.num_builds for builder in builders] == [1, 0 if same_spec else 1]
+    assert [builder.num_updates for builder in builders] == [0, 1 if same_spec else 0]
+    assert model_metadata.get_extra_common_attn_kwargs.call_count == (
+        1 if same_spec else 2
+    )
     assert metadata["layer.0"].block_table is block_tables[0]
     assert metadata["layer.1"].block_table is block_tables[1]
     for group_id in range(2):
         torch.testing.assert_close(
             metadata[f"layer.{group_id}"].slot_mapping, slot_mappings[group_id]
         )
-    assert metadata["layer.1"].reused is metadata["layer.0"]
+    if same_spec:
+        assert metadata["layer.1"].reused is metadata["layer.0"]
+    # Distinct KV geometries still share the batch's query-to-request mapping.
+    for item in metadata.values():
+        assert item.token_mapping.data_ptr() == builders[0].token_mapping.data_ptr()
+        assert item.token_mapping.tolist() == [0, 1]
+    assert builders[1].token_mapping.tolist() == [-1, -1]
     assert all(item.is_prefilling is is_prefilling for item in metadata.values())
     captured_state = metadata["layer.1"].state
+    build_kwargs["query_start_loc_cpu"][1] = 2
+    build_kwargs["query_start_loc_gpu"][1] = 2
+    build_kwargs["max_query_len"] = 2
     runtime = build_attn_metadata(**build_kwargs)
     assert captured_state.data_ptr() == runtime["layer.1"].state.data_ptr()
     assert captured_state.item() == 2
+    assert all(item.token_mapping.tolist() == [0, 0] for item in runtime.values())
 
 
 def test_reshape_padded_kv_cache_strides_by_padded_page():

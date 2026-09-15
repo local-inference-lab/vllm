@@ -16,8 +16,30 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
-
 PROMPT = "On the surface of Mars, we found"
+
+
+def _prepare_heads(layers, *, device, counts, fixed=(), output_dtype=torch.bfloat16,
+                    max_tokens=None, autotune=False, stage="weights"):
+    """Collect preparation units from every layer's provider and prepare them
+    together in one session (mirrors what one worker-wide session would do)."""
+    from b12x.preparation import PreparationSession
+    from vllm.utils.b12x import B12xWorkload
+
+    max_tokens = max_tokens or max(counts)
+    workload = B12xWorkload(
+        stage=stage, token_counts=tuple(sorted(set(counts))),
+        fixed_token_counts=tuple(sorted(set(fixed))), output_dtype=output_dtype,
+        max_tokens=max_tokens, max_seqs=1, max_model_len=max_tokens,
+    )
+    units = []
+    for layer in layers:
+        provider = layer.b12x_preparation_provider
+        units.extend(provider.get_b12x_preparation_units(layer, workload))
+    requests = tuple(request for unit in units for request in unit.requests)
+    session = PreparationSession(device=device, autotune=autotune)
+    session.prepare(requests, autotune=autotune)
+    return session, units
 
 MODELS_QUANT = [
     ("ModelCloud/Qwen1.5-1.8B-Chat-GPTQ-4bits-dynamic-cfg-with-lm_head", True),
@@ -38,11 +60,18 @@ def mxfp8_head_config(monkeypatch, default_vllm_config):
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("enabled", [False, True])
-def test_runtime_mxfp8_only_selects_lm_head(monkeypatch, mxfp8_head_config, enabled):
+@pytest.mark.parametrize(
+    ("env_value", "enabled"), [(None, False), ("0", False), ("1", True)]
+)
+def test_runtime_mxfp8_only_selects_lm_head(
+    monkeypatch, mxfp8_head_config, env_value, enabled
+):
     from vllm.model_executor.layers.quantization.online import mxfp8
 
-    monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", str(int(enabled)))
+    if env_value is None:
+        monkeypatch.delenv("VLLM_MXFP8_LM_HEAD", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", env_value)
     monkeypatch.setattr(mxfp8, "init_mxfp8_linear_kernel", lambda: None)
     head = ParallelLMHead(256, 128, params_dtype=torch.bfloat16, disable_tp=True)
     embedding = VocabParallelEmbedding(
@@ -135,6 +164,7 @@ def test_draft_nvfp4_head_preserves_verifier_and_dynamic_graph_scales(
             "VLLM_MTP_NVFP4_LM_HEAD",
         ):
             monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", "1")
         use_a16 = True
     else:
         monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", "1")
@@ -142,6 +172,7 @@ def test_draft_nvfp4_head_preserves_verifier_and_dynamic_graph_scales(
     mxfp8_head_config.kernel_config.linear_backend = "b12x"
     torch.manual_seed(42)
     weight = torch.randn(256, 128, dtype=torch.bfloat16, device="cuda") * 0.02
+
     with torch.device("cuda"):
         verifier = ParallelLMHead(
             256, 128, params_dtype=torch.bfloat16, disable_tp=True
@@ -162,8 +193,15 @@ def test_draft_nvfp4_head_preserves_verifier_and_dynamic_graph_scales(
         SimpleNamespace(has_own_lm_head=True), "has_own_lm_head", draft, verifier
     )
     packed_ptr = draft.weight.data_ptr()
+    # Simulate an idempotent weight reload: the packed storage is reused, and
+    # the layer's freshly rebuilt holder is what preparation must plan below.
     draft.quant_method.process_weights_after_loading(draft)
     assert draft.weight.data_ptr() == packed_ptr
+
+    session, _ = _prepare_heads(
+        (verifier, draft), device=torch.device("cuda"), counts=(1, 4),
+        fixed=(1,), max_tokens=4,
+    )
     w_inv = 2688.0 / weight.abs().amax().float().clamp_min(1e-8)
     qw, sw = scaled_fp4_quant(weight, w_inv, is_sf_swizzled_layout=False)
     torch.testing.assert_close(draft.weight, qw, rtol=0, atol=0)
@@ -174,9 +212,10 @@ def test_draft_nvfp4_head_preserves_verifier_and_dynamic_graph_scales(
         w_ref = (
             break_fp4_bytes(qw, torch.float32) * sw.float().repeat_interleave(16, 1)
         ).bfloat16().float() / w_inv
-        draft.b12x_warmup_provider.get_b12x_warmup_unit(
-            draft, (1, 4), torch.bfloat16
-        ).compile()
+    from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
+
+    reset_workspace_manager()
+    init_workspace_manager(torch.device("cuda"))
     for tokens in (1, 4):
         x = torch.randn(tokens, 128, dtype=torch.bfloat16, device="cuda")
 
@@ -186,7 +225,7 @@ def test_draft_nvfp4_head_preserves_verifier_and_dynamic_graph_scales(
         for _ in range(3):
             project()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with session.capture(), torch.cuda.graph(graph):
             result = project()
         for amplitude in (0.0, 0.01, 1.0, 32.0):
             x.normal_().mul_(amplitude)
@@ -205,9 +244,11 @@ def test_draft_nvfp4_head_preserves_verifier_and_dynamic_graph_scales(
             expected = (x_ref @ w_ref.T).to(torch.bfloat16)
             torch.testing.assert_close(result, expected, rtol=0.016, atol=0.001)
             assert torch.isfinite(result).all()
+        graph.reset()
     torch.testing.assert_close(
         verifier.b12x_mxfp8_packed_weight.weight.values, verifier_values, rtol=0, atol=0
     )
+    session.close()
 
 
 @pytest.mark.parametrize("use_a16", [False, True, None])
@@ -234,6 +275,7 @@ def test_runtime_mxfp8_b12x_shard_loading_and_graph(
             "VLLM_MTP_NVFP4_LM_HEAD",
         ):
             monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", "1")
         use_a16 = True
     else:
         monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", "1")
@@ -255,18 +297,24 @@ def test_runtime_mxfp8_b12x_shard_loading_and_graph(
     packed = head.b12x_mxfp8_packed_weight
     assert packed.out_features == 128
     assert head.weight.numel() == 0
+    # Simulate an idempotent weight reload: the packed storage is reused, and
+    # the layer's freshly rebuilt holder is what preparation must plan below.
     head.quant_method.process_weights_after_loading(head)
     assert head.b12x_mxfp8_packed_weight is packed
+
+    session, _ = _prepare_heads(
+        (head,), device=torch.device("cuda"), counts=(1, 3), fixed=(1,), max_tokens=3,
+    )
 
     values, scales = mxfp8_e4m3_quantize(weight[128:])
     torch.testing.assert_close(
         packed.weight.values.view(torch.uint8), values.view(torch.uint8)
     )
     reference_weight = dequant_mxfp8_to_bf16(values, scales).float()
-    if use_a16:
-        head.b12x_warmup_provider.get_b12x_warmup_unit(
-            head, (1, 3), torch.bfloat16
-        ).compile()
+    from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
+
+    reset_workspace_manager()
+    init_workspace_manager(torch.device("cuda"))
     for tokens in (1, 3):
         x = torch.randn(tokens, 128, dtype=torch.bfloat16, device="cuda")
 
@@ -276,7 +324,7 @@ def test_runtime_mxfp8_b12x_shard_loading_and_graph(
         for _ in range(2):
             project()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with session.capture(), torch.cuda.graph(graph):
             actual = project()
         for _ in range(2):
             x.normal_()
@@ -287,9 +335,9 @@ def test_runtime_mxfp8_b12x_shard_loading_and_graph(
                 reference_x = x.float()
             expected = torch.nn.functional.linear(reference_x, reference_weight)
             torch.testing.assert_close(actual.float(), expected, atol=0.01, rtol=0.02)
+        graph.reset()
+    session.close()
 
-
-@pytest.mark.parametrize("model_id, lm_head_quantized", MODELS_QUANT)
 def test_lm_head(
     vllm_runner,
     model_id: str,

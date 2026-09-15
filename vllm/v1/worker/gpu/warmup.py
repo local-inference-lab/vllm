@@ -22,8 +22,17 @@ from vllm.v1.kv_cache_interface import CrossAttentionSpec, KVCacheSpec, MambaSpe
 from vllm.v1.request import Request
 from vllm.v1.sample.ops.topk_topp_sampler import warmup_top_k_top_p
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.sample.gumbel import warmup_processed_gumbel
 
 logger = init_logger(__name__)
+
+
+def warmup_prefill_shape(
+    *, max_num_seqs: int, max_num_batched_tokens: int, decode_query_len: int,
+) -> tuple[int, int]:
+    """Prefill query length and request limit used by sampler warmup."""
+    prompt_len = decode_query_len + 1
+    return prompt_len, min(max_num_seqs, max_num_batched_tokens // prompt_len)
 
 
 def _reserved_block_count(
@@ -213,7 +222,11 @@ def warmup_kernels(
     # Use decode_query_len + 1 tokens so the prefill batch's per-request query
     # length exceeds decode_query_len, preventing it from being misclassified as
     # a uniform decode batch.
-    prompt_len = decode_query_len + 1
+    prompt_len, num_reqs = warmup_prefill_shape(
+        max_num_seqs=model_runner.scheduler_config.max_num_seqs,
+        max_num_batched_tokens=model_runner.scheduler_config.max_num_batched_tokens,
+        decode_query_len=decode_query_len,
+    )
     prompt_token_ids = list(range(prompt_len))
     # Upper bound on the decode steps built in `decode_steps` below.
     num_decode_steps = 1
@@ -249,11 +262,6 @@ def warmup_kernels(
     decode_block_counts = [block_count(decode_len, s) for s in kv_cache_specs]
     max_blocks_per_req = sum(decode_block_counts)
 
-    num_reqs = min(
-        model_runner.scheduler_config.max_num_seqs,
-        model_runner.scheduler_config.max_num_batched_tokens
-        // max(prompt_len, decode_query_len),
-    )
     if max_blocks_per_req > 0:
         # Reserve block 0 (null block) and ensure we have enough blocks.
         # Encoder-only models allocate no KV blocks, so this cap doesn't apply.
@@ -442,6 +450,11 @@ def warmup_kernels(
     worker_execute_model(cleanup_output)
     model_runner.kv_connector.set_disabled(False)
     if model_runner.is_last_pp_rank and not model_runner.is_pooling_model:
+        warmup_processed_gumbel(
+            model_runner.model_config.get_vocab_size(),
+            model_runner.device,
+            use_fp64=model_runner.model_config.use_fp64_gumbel,
+        )
         warmup_top_k_top_p(
             model_runner.model_config.get_vocab_size(),
             min(

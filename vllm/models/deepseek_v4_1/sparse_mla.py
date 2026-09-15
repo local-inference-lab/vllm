@@ -7,6 +7,7 @@ from typing import ClassVar
 
 import torch
 
+from vllm.config import CacheConfig
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -71,10 +72,7 @@ def _tokens(
     input_slot = tl.load(InputSlots + t, t < nt, other=-1)
     valid = valid & (pos >= 0) & (input_slot >= 0)
     logical = pos // RATIO
-    if CIRCULAR:
-        page_col = tl.full((B,), 0, tl.int64)
-    else:
-        page_col = logical // PAGE
+    page_col = tl.full((B,), 0, tl.int64) if CIRCULAR else logical // PAGE
     valid = valid & (page_col < table_width)
     block = tl.load(Table + lo.to(tl.int64) * stride + page_col, valid, other=0).to(
         tl.int64
@@ -262,7 +260,7 @@ class DeepseekV41B12xBackend(AttentionBackend):
 
     @staticmethod
     def get_name():
-        return "B12X_MLA_SPARSE_DSV41"
+        return "B12X"
 
     @staticmethod
     def get_builder_cls():
@@ -274,7 +272,7 @@ class DeepseekV41B12xBackend(AttentionBackend):
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size):
-        return 128
+        return CacheConfig.DEFAULT_DS41_BLOCK_SIZE
 
     @classmethod
     def get_supported_head_sizes(cls):

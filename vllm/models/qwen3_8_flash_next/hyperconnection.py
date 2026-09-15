@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,7 +18,13 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.platforms import current_platform
-from vllm.utils.b12x import get_b12x_hyperconnection
+from vllm.utils.b12x import (
+    set_b12x_preparation_provider,
+    B12xPreparationUnit,
+    B12xWorkload,
+    PreparationResourceUnavailableError,
+    get_b12x_hyperconnection,
+)
 
 
 def _hyperconnection_api() -> Any:
@@ -72,20 +79,11 @@ class HyperConnectionWorkspace(nn.Module):
             raise NotImplementedError(
                 "Qwen3.8-Flash-Next requires one RMSNorm group per HC stream"
             )
-        api = _hyperconnection_api()
-        device = current_platform.current_device()
-        self.plan = api.plan(
-            api.Caps(
-                device=device,
-                max_tokens=max_tokens,
-                hidden_size=config.hidden_size,
-                streams=config.hc_count,
-                lowrank=config.hc_lowrank,
-                dtype=config.params_dtype,
-            )
-        )
+        self.config = config
+        self.max_tokens = int(max_tokens)
+        self.device = torch.device(current_platform.current_device())
         width = config.hc_count * config.hidden_size
-        factory = dict(device=device, dtype=config.params_dtype)
+        factory = dict(device=self.device, dtype=config.params_dtype)
         self.register_buffer(
             "normalized", torch.empty(max_tokens, width, **factory), persistent=False
         )
@@ -100,12 +98,20 @@ class HyperConnectionWorkspace(nn.Module):
             persistent=False,
         )
 
-        # Validate the fixed output layout before Dynamo traces live prefix
-        # views. The registered buffers and their addresses do not change.
-        self.bind(max_tokens)
+    def caps(self, max_tokens: int):
+        api = _hyperconnection_api()
+        return api.Caps(
+            device=self.device,
+            max_tokens=max_tokens,
+            hidden_size=self.config.hidden_size,
+            streams=self.config.hc_count,
+            lowrank=self.config.hc_lowrank,
+            dtype=self.config.params_dtype,
+        )
 
-    def bind(self, tokens: int):
-        return self.plan.bind(
+    def bind(self, plan, tokens: int):
+        return _hyperconnection_api().bind(
+            plan,
             normalized=self.normalized,
             bottleneck=self.bottleneck,
             block_input=self.block_input,
@@ -179,6 +185,142 @@ class GatedResidual(nn.Module):
             prefix=maybe_prefix(prefix, "input_mix_weight_up"),
             return_bias=False,
         )
+        self._preparation_prefix = prefix or "qwen3_8_flash_next.hyperconnection"
+        self._plans: dict[str, object] = {}
+        if not getattr(self, "b12x_preparation_suppressed", False):
+            set_b12x_preparation_provider(self, self)
+    def _request_name(self, operation: str, tokens: int) -> str:
+        return f"{self._preparation_prefix}.hc.{operation}.m{tokens}"
+
+    def get_b12x_preparation_units(
+        self, layer: torch.nn.Module, workload: B12xWorkload
+    ) -> Sequence[B12xPreparationUnit]:
+        if layer is not self:
+            raise ValueError("HC preparation owner mismatch")
+        if workload.stage != "weights":
+            return ()
+        if self.hc_norm.weight.is_meta:
+            return ()
+        if workload.max_tokens > self.workspace.max_tokens:
+            raise PreparationResourceUnavailableError(
+                f"{self._preparation_prefix} HC workspace capacity "
+                f"{self.workspace.max_tokens} cannot serve {workload.max_tokens}"
+            )
+        api = _hyperconnection_api()
+        operations = (
+            "grouped_rmsnorm",
+            "scaled_silu",
+            "gate_mean",
+            "combine",
+            "combine_norm",
+        )
+        requests = []
+        tokens = workload.max_tokens
+        plans = {}
+        for operation in operations:
+            plan = api.plan(
+                self.workspace.caps(tokens),
+                invocation={"operation": operation, "eps": self.config.rms_norm_eps},
+            )
+            plans[operation] = plan
+            requests.append(plan.request(
+                name=self._request_name(operation, tokens),
+                prepare_call=self._prepare_call(operation, tokens),
+                benchmark_call=self._benchmark_call(operation, tokens),
+            ))
+        self._plans = plans
+        return (
+            B12xPreparationUnit(
+                name="HYPERCONNECTION",
+                key=(self._preparation_prefix, tokens),
+                requests=tuple(requests),
+                stage="weights",
+                autotune=not workload.eager_only,
+            ),
+        )
+
+    def _prepare_call(self, operation: str, tokens: int):
+        """Prime the installed operation against its durable workspace."""
+        return self._call_factory(operation, tokens, benchmark=False)
+
+    def _benchmark_call(self, operation: str, tokens: int):
+        """Measure an isolated binding; it is never retained for serving."""
+        return self._call_factory(operation, tokens, benchmark=True)
+
+    def _call_factory(self, operation: str, tokens: int, *, benchmark: bool):
+        def prepare(state):
+            from b12x.preparation import PreparedCall
+            from b12x.norm.hyperconnection import _impl
+
+            factory = dict(device=self.workspace.device, dtype=self.config.params_dtype)
+            width = self.hyper_hidden_size
+            activation_inputs = []
+            activation_owners = []
+
+            def activation(shape):
+                value = torch.empty(shape, **factory)
+                template = torch.arange(value.numel(), **factory).reshape(shape)
+                template.div_(max(value.numel(), 1))
+                activation_inputs.append((value, template))
+                activation_owners.extend((value, template))
+                return value
+
+            def produce():
+                for value, template in activation_inputs:
+                    value.copy_(template)
+
+            # Serving priming writes its owned workspace. Trials instead own
+            # independent output storage so no measured binding can escape.
+            def output(shape, serving):
+                return torch.empty(shape, **factory) if benchmark else serving
+
+            if operation == "grouped_rmsnorm":
+                source = activation((tokens, width))
+                out = output((tokens, width), self.workspace.normalized)
+                run = lambda: _impl.run_grouped_rmsnorm_impl(
+                    source, self.hc_norm.weight, eps=self.config.rms_norm_eps,
+                    plan=state, out=out,
+                )
+                owners = (out,)
+            elif operation == "scaled_silu":
+                source = activation((tokens, self.lora_rank))
+                out = output((tokens, self.lora_rank), self.workspace.bottleneck)
+                run = lambda: _impl.run_scaled_silu_impl(source, plan=state, out=out)
+                owners = (out,)
+            elif operation == "gate_mean":
+                source = activation((tokens, width))
+                gates = activation((tokens, width))
+                out = output((tokens, self.hidden_size), self.workspace.block_input)
+                run = lambda: _impl.run_gate_mean_impl(source, gates, plan=state, out=out)
+                owners = (out,)
+            else:
+                hidden = activation((tokens, width))
+                block = activation((tokens, self.hidden_size))
+                injection = activation((tokens, self.hc_count))
+                if operation == "combine":
+                    run = lambda: _impl.run_combine_impl(
+                        hidden, block, injection, plan=state,
+                    )
+                else:
+                    run = lambda: _impl.run_combine_norm_impl(
+                        hidden, block, injection, self.hc_norm.weight,
+                        eps=self.config.rms_norm_eps, plan=state,
+                    )
+                owners = ()
+            return PreparedCall(
+                run=run,
+                produce=produce,
+                owners=(*activation_owners, *owners),
+            )
+        return prepare
+
+    def _plan_for(self, operation: str):
+        try:
+            return self._plans[operation]
+        except KeyError:
+            raise PreparationResourceUnavailableError(
+                f"{self._preparation_prefix} lacks a declared {operation} plan"
+            ) from None
 
     @property
     def hyper_hidden_size(self) -> int:
@@ -188,10 +330,10 @@ class GatedResidual(nn.Module):
     def workspace(self) -> HyperConnectionWorkspace:
         return self._workspace
 
-    def _binding(self, hidden_states: torch.Tensor):
-        return self.workspace.bind(hidden_states.shape[0])
+    def _binding(self, hidden_states: torch.Tensor, operation: str):
+        return self.workspace.bind(self._plan_for(operation), hidden_states.shape[0])
 
-    def _mix_normalized(self, normalized: torch.Tensor, binding):
+    def _mix_normalized(self, normalized: torch.Tensor):
         api = _hyperconnection_api()
         if self.use_combine:
             down_and_injection = self.input_mix_weight_down_block_inject(normalized)
@@ -206,23 +348,29 @@ class GatedResidual(nn.Module):
             projected_down = self.input_mix_weight_down(normalized)
             injection = None
 
-        bottleneck = api.run_scaled_silu(projected_down, binding=binding)
+        bottleneck = api.run_scaled_silu(
+            projected_down, binding=self._binding(normalized, "scaled_silu")
+        )
         gate_logits = self.input_mix_weight_up(bottleneck)
-        block_input = api.run_gate_mean(normalized, gate_logits, binding=binding)
+        block_input = api.run_gate_mean(
+            normalized,
+            gate_logits,
+            binding=self._binding(normalized, "gate_mean"),
+        )
         return block_input, injection
 
     def mix(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         api = _hyperconnection_api()
-        binding = self._binding(hidden_states)
+        binding = self._binding(hidden_states, "grouped_rmsnorm")
         normalized = api.run_grouped_rmsnorm(
             hidden_states,
             self.hc_norm.weight,
             eps=self.config.rms_norm_eps,
             binding=binding,
         )
-        block_input, injection = self._mix_normalized(normalized, binding)
+        block_input, injection = self._mix_normalized(normalized)
         return hidden_states, block_input, injection
 
     def combine_and_mix(
@@ -238,10 +386,9 @@ class GatedResidual(nn.Module):
             prev_injection,
             self.hc_norm.weight,
             eps=self.config.rms_norm_eps,
-            plan=self.workspace.plan,
+            plan=self._plan_for("combine_norm"),
         )
-        binding = self._binding(normalized)
-        block_input, injection = self._mix_normalized(normalized, binding)
+        block_input, injection = self._mix_normalized(normalized)
         return combined, block_input, injection
 
     def combine(
@@ -255,7 +402,7 @@ class GatedResidual(nn.Module):
             hidden_states,
             block_output,
             injection,
-            plan=self.workspace.plan,
+            plan=self._plan_for("combine"),
         )
 
 

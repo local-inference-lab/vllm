@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from torch import nn
 
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker import gpu_worker, startup_plan
@@ -13,6 +14,90 @@ from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
 )
+
+
+def test_mark_b12x_eager_shapes_covers_encoder_and_connector_profile_shapes(
+    monkeypatch,
+) -> None:
+    from vllm.model_executor.warmup.b12x_prepare import mark_b12x_eager_shapes
+    import vllm.multimodal.encoder_budget as encoder_budget
+
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.visual = nn.Module()
+            self.visual.block = nn.Module()
+            self.visual.merger = nn.Sequential(nn.Module())
+            self.visual.deepstack_merger_list = nn.ModuleList([nn.Module()])
+
+        def get_num_mm_encoder_tokens(self, tokens):
+            return tokens * 4
+
+        def get_num_mm_connector_tokens(self, tokens):
+            return tokens // 4
+
+        def get_mm_mapping(self):
+            return SimpleNamespace(
+                connector=("visual.merger", "visual.deepstack_merger_list")
+            )
+
+    class _FakeBudget:
+        def __init__(self, vllm_config, mm_registry, enable_cache):
+            del vllm_config, mm_registry, enable_cache
+
+        def get_encoder_budget(self):
+            return 16_384
+
+    monkeypatch.setattr(encoder_budget, "MultiModalBudget", _FakeBudget)
+    model = _Model()
+    worker = SimpleNamespace(
+        get_model=lambda: model,
+        vllm_config=SimpleNamespace(),
+        model_runner=SimpleNamespace(mm_registry=object()),
+    )
+
+    mark_b12x_eager_shapes(worker)
+
+    assert model.visual.block.b12x_eager_token_counts == (65_536,)
+    assert model.visual.block.b12x_eager_only is True
+    for connector in (model.visual.merger, model.visual.deepstack_merger_list):
+        assert connector.b12x_eager_token_counts == (16_384,)
+        assert all(
+            module.b12x_eager_only
+            for module in connector.modules()
+        )
+
+
+def test_b12x_workload_covers_target_and_draft_profile_shapes() -> None:
+    from vllm.model_executor.warmup.b12x_prepare import b12x_workload
+
+    compilation = SimpleNamespace(
+        cudagraph_capture_sizes=(1, 2, 4, 8),
+        compile_sizes=(),
+        get_compile_ranges=lambda: (SimpleNamespace(end=128),),
+    )
+    worker = SimpleNamespace(
+        get_model=lambda: nn.Module(),
+        model_runner=SimpleNamespace(mm_registry=None),
+        vllm_config=SimpleNamespace(
+            compilation_config=compilation,
+            speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=128,
+            max_num_seqs=1,
+        ),
+        model_config=SimpleNamespace(dtype="bf16", max_model_len=4096),
+    )
+
+    workload = b12x_workload(worker, stage="weights")
+
+    # b12x_preparation_token_counts also reserves the post-speculative decode
+    # regime (max_tokens - speculative_tokens = 128 - 3 = 125).
+    assert workload.token_counts == (1, 2, 4, 8, 125, 128)
+    assert workload.fixed_token_counts == (1, 2, 4, 8)
+    assert workload.max_tokens == 128
+    assert workload.speculative_tokens == 3
 
 # Startup-plan persistence (vllm/v1/worker/startup_plan.py), applied and
 # saved by Worker.determine_available_memory / compile_or_warm_up_model.
@@ -84,7 +169,11 @@ def test_explicit_kv_budget_releases_completed_profile_allocations(monkeypatch):
     events = []
     worker = _plan_worker(kv_bytes=4 * GiB_bytes)
     worker.model_config = SimpleNamespace(multimodal_config=None)
-    worker.model_runner = SimpleNamespace(profile_run=lambda: events.append("profile"))
+    worker._prepare_b12x_profile_state = lambda: events.append("prepare")
+    worker._release_b12x_profile_state = lambda: events.append("state_release")
+    worker.model_runner = SimpleNamespace(
+        profile_run=lambda prepare: (prepare(), events.append("profile"))
+    )
     monkeypatch.setattr(gpu_worker, "maybe_apply_startup_plan", lambda worker: None)
     monkeypatch.setattr(
         gpu_worker.torch.accelerator, "synchronize", lambda: events.append("sync")
@@ -94,7 +183,7 @@ def test_explicit_kv_budget_releases_completed_profile_allocations(monkeypatch):
     )
 
     assert gpu_worker.Worker.determine_available_memory(worker) == 4 * GiB_bytes
-    assert events == ["profile", "sync", "release"]
+    assert events == ["prepare", "profile", "state_release", "sync", "release"]
 
 
 @pytest.mark.parametrize(
@@ -103,23 +192,25 @@ def test_explicit_kv_budget_releases_completed_profile_allocations(monkeypatch):
 )
 @pytest.mark.parametrize("graph_estimate", [0, 4])
 @pytest.mark.parametrize("estimate_graphs", [False, True])
-def test_b12x_warmup_precedes_cudagraph_memory_profile(
+def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
     monkeypatch,
     final_free_memory,
     expected_available_memory,
     graph_estimate,
     estimate_graphs,
 ):
-    """B12X launch modules must be resolved before descriptor capture begins."""
+    """Pool-dependent plans are prepared before, and released after, the
+    throwaway CUDA-graph memory profiling pass."""
     events: list[object] = []
 
-    def profile_cudagraph_memory():
+    def profile_cudagraph_memory(prepare_profile_state):
+        prepare_profile_state()
         events.append("profile_cudagraph_memory")
         return graph_estimate
 
     model_runner = SimpleNamespace(
         model_memory_usage=0,
-        profile_run=lambda: events.append("profile_run"),
+        profile_run=lambda prepare: (prepare(), events.append("profile_run")),
         profile_glm_dcp_attention=lambda: events.append("profile_glm_dcp_attention"),
         profile_cudagraph_memory=profile_cudagraph_memory,
     )
@@ -145,6 +236,12 @@ def test_b12x_warmup_precedes_cudagraph_memory_profile(
         device="cuda:0",
         model_config=SimpleNamespace(multimodal_config=None),
         parallel_config=SimpleNamespace(),
+        _prepare_b12x_profile_state=lambda: events.append(
+            "prepare_b12x_profile_state"
+        ),
+        _release_b12x_profile_state=lambda: events.append(
+            "release_b12x_profile_state"
+        ),
         vllm_config=SimpleNamespace(
             compilation_config=SimpleNamespace(
                 cudagraph_mode=gpu_worker.CUDAGraphMode.PIECEWISE,
@@ -170,11 +267,6 @@ def test_b12x_warmup_precedes_cudagraph_memory_profile(
     )
     monkeypatch.setattr(
         gpu_worker,
-        "b12x_warmup",
-        lambda worker, sizes: events.append(("b12x_warmup", tuple(sizes))),
-    )
-    monkeypatch.setattr(
-        gpu_worker,
         "reserve_mm_ipc_gpu_memory",
         lambda requested, *args: requested,
     )
@@ -182,10 +274,13 @@ def test_b12x_warmup_precedes_cudagraph_memory_profile(
     available = gpu_worker.Worker.determine_available_memory(worker)
 
     assert events == [
+        "prepare_b12x_profile_state",
         "profile_run",
+        "release_b12x_profile_state",
         "profile_glm_dcp_attention",
-        ("b12x_warmup", (8, 4)),
+        "prepare_b12x_profile_state",
         "profile_cudagraph_memory",
+        "release_b12x_profile_state",
     ]
     applied_graph_estimate = graph_estimate if estimate_graphs else 0
     assert available == expected_available_memory - applied_graph_estimate
@@ -229,6 +324,10 @@ def test_post_capture_recommendation_counts_measured_graph_memory_once(
         observability_config=SimpleNamespace(
             jit_monitor_mode="off", jit_monitor_verbose=False
         ),
+    )
+    worker._b12x_session = None
+    worker._compile_or_warm_up_model_after_preparation = lambda: (
+        gpu_worker.Worker._compile_or_warm_up_model_after_preparation(worker)
     )
     saved = []
     monkeypatch.setattr(

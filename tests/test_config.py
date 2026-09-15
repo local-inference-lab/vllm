@@ -17,6 +17,7 @@ import vllm.config.vllm as vllm_config_module
 import vllm.envs as envs
 from vllm.compilation.backends import VllmBackend
 from vllm.config import (
+    CacheConfig,
     CompilationConfig,
     KernelConfig,
     ModelConfig,
@@ -39,6 +40,75 @@ from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionCGSupport
 
 DEVICE_TYPE = current_platform.device_type
+
+
+@pytest.mark.parametrize("swa_size,prefix_unit", [(None, 256), (32, 64), (128, 96)])
+def test_swa_page_size_rejects_incompatible_prefix_matching(swa_size, prefix_unit):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architecture="DeepseekV41ForCausalLM"),
+        speculative_config=None,
+        cache_config=CacheConfig(
+            swa_block_size=swa_size, prefix_match_unit=prefix_unit
+        ),
+    )
+    with pytest.raises(ValueError, match="must be divisible by --prefix-match-unit"):
+        VllmConfig.validate_swa_block_size(config)
+    config.cache_config.prefix_match_unit = 32
+    VllmConfig.validate_swa_block_size(config)
+
+
+def test_swa_page_size_is_scoped_to_v41_target_and_draft():
+    target = SimpleNamespace(architecture="DeepseekV41ForCausalLM")
+    draft = SimpleNamespace(architecture="DSparkDeepseekV4ForCausalLM")
+    config = SimpleNamespace(
+        model_config=draft,
+        speculative_config=SimpleNamespace(
+            target_model_config=target, draft_model_config=draft
+        ),
+        cache_config=CacheConfig(swa_block_size=128, prefix_match_unit=32),
+    )
+    VllmConfig.validate_swa_block_size(config)
+    target.architecture = "DeepseekV4ForCausalLM"
+    with pytest.raises(ValueError, match="only supported by native DeepSeek V4.1"):
+        VllmConfig.validate_swa_block_size(config)
+    config.cache_config.swa_block_size = None
+    VllmConfig.validate_swa_block_size(config)
+
+
+@pytest.mark.parametrize(
+    "main,swa,expected,warning",
+    [
+        (None, None, (256, 128), False),
+        (256, 128, (256, 128), False),
+        (128, 64, (128, 64), False),
+        (128, None, (128, 128), True),
+        (128, 128, (128, 128), True),
+        (256, 64, (256, 64), True),
+        (256, 32, (256, 32), True),
+    ],
+)
+def test_swa_geometry_defaults_and_capacity_warning(main, swa, expected, warning):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architecture="DeepseekV41ForCausalLM"),
+        speculative_config=None,
+        cache_config=CacheConfig(
+            block_size=main, swa_block_size=swa, prefix_match_unit=32
+        ),
+    )
+    with patch.object(vllm_config_module.logger, "warning_once") as warn:
+        VllmConfig.validate_swa_block_size(config)
+    assert config.cache_config.block_size == expected[0]
+    assert (config.cache_config.swa_block_size or 128) == expected[1]
+    assert config.cache_config.swa_block_size == swa
+    assert config.cache_config.user_specified_block_size == (main is not None)
+    if warning:
+        warn.assert_called_once()
+        message, *sizes = warn.call_args.args
+        assert tuple(sizes) == expected
+        assert "--block-size 256 --swa-block-size 128" in message
+        assert "--block-size 128 --swa-block-size 64" in message
+    else:
+        warn.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -2121,6 +2191,28 @@ def test_draft_sample_method_gumbel_is_rejected():
             method="ngram",
             num_speculative_tokens=1,
             draft_sample_method="gumbel",
+        )
+
+
+@pytest.mark.parametrize("cost_scale", [0.0, -1.0])
+def test_adaptive_verification_cost_scale_must_be_positive(cost_scale):
+    with pytest.raises(ValidationError):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            adaptive_verification_cost_scale=cost_scale,
+        )
+
+
+def test_adaptive_verification_cost_scale_requires_adaptive_dspark():
+    with pytest.raises(
+        ValueError,
+        match="requires DSpark adaptive verification",
+    ):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            adaptive_verification_cost_scale=2.0,
         )
 
 

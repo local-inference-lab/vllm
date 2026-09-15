@@ -195,7 +195,8 @@ if TYPE_CHECKING:
     VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
     VLLM_B12X_NVFP4_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
     VLLM_B12X_MXFP8_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
-    VLLM_MXFP8_LM_HEAD: bool = True
+    VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES: int = 2_000_000_000
+    VLLM_MXFP8_LM_HEAD: bool = False
     VLLM_LM_HEAD_A16: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = True
     VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
@@ -241,6 +242,7 @@ if TYPE_CHECKING:
     VLLM_ROCE_ALLREDUCE_MAX_SIZE: str = "2MB"
     VLLM_ROCE_ALLGATHER_MAX_SIZE: str = "16MB"
     VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
+    VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE: str = "off"
     VLLM_PCIE_DMA_MIN_BYTES: str = "6MB"
     VLLM_PCIE_DMA_FP8: str | None = None
     VLLM_XGRAMMAR_CACHE_MB: int = 0
@@ -1665,8 +1667,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_B12X_MXFP8_ACTIVATION_MODE": env_with_choices(
         "VLLM_B12X_MXFP8_ACTIVATION_MODE", None, ["auto", "a16", "quantized"]
     ),
-    # Quantize eligible unquantized LM heads on b12x by default; =0 opts out.
-    "VLLM_MXFP8_LM_HEAD": lambda: bool(int(os.getenv("VLLM_MXFP8_LM_HEAD", "1"))),
+    # Maximum caller-owned scratch available to one block-scaled GEMM.
+    "VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES", "2000000000")
+    ),
+    # Quantize eligible unquantized LM heads on b12x only when explicitly enabled.
+    "VLLM_MXFP8_LM_HEAD": lambda: bool(int(os.getenv("VLLM_MXFP8_LM_HEAD", "0"))),
     # Preserve BF16 activations in runtime-quantized NVFP4/MXFP8 LM heads.
     "VLLM_LM_HEAD_A16": lambda: bool(int(os.getenv("VLLM_LM_HEAD_A16", "1"))),
     "VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT": lambda: bool(
@@ -1978,6 +1984,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE": lambda: os.getenv(
         "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE", "84KB"
+    ),
+    # Largest input size for the lossless BF16 two-shot. Set a byte size to
+    # opt in; "off" keeps inputs above the one-shot ceiling on the fallback.
+    "VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+        "VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE", "off"
     ),
     # Minimum input size for the DMA ring. Set to "off" to keep large
     # all-reduces on the normal fallback backend.

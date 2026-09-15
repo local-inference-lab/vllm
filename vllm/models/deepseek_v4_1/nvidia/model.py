@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -20,6 +21,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -42,23 +44,25 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm.model_executor.weight_transfer import allocate_weights, copy_weight
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
     sp_shard,
 )
-from vllm.models.deepseek_v4.nvidia.model import make_deepseek_v4_expert_params_mapping
+from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MoE
 from vllm.sequence import IntermediateTensors
+from vllm.utils.b12x import b12x_layer_prefix, register_b12x_layer
+from vllm.utils.b12x import set_b12x_preparation_provider
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
-from ..b12x_layers import B12xMHC, collapse, stream_mean
+from ..b12x_layers import B12xLinearMethod, B12xMHC
 from ..b12x_layers import B12xRMSNorm as RMSNorm
 from ..ced import ced_decoder_start, gather_rows, scatter_rows
 from ..common.engram import Engram, EngramLayout, NgramHashState
 from ..common.mm_preprocess import image_sentinel_mask
 from .b12x_attention import DeepseekV41B12xAttention
-from .b12x_moe import DeepseekV4MoE
 
 if typing.TYPE_CHECKING:
     pass
@@ -68,8 +72,8 @@ logger = init_logger(__name__)
 
 def _select_dsv4_attn_cls(vllm_config):
     backend = vllm_config.attention_config.backend
-    if backend not in (None, AttentionBackendEnum.B12X_MLA_SPARSE_DSV41):
-        raise ValueError("DeepSeek V4.1 requires B12X_MLA_SPARSE_DSV41")
+    if backend not in (None, AttentionBackendEnum.B12X):
+        raise ValueError("DeepSeek V4.1 requires B12X")
     return DeepseekV41B12xAttention
 
 
@@ -116,10 +120,38 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         if self.use_sequence_parallel:
             self.attn.wo_b.reduce_results = False
+        if config.scoring_func != "sqrtsoftplus" or not config.norm_topk_prob:
+            raise ValueError("V4.1 requires normalized sqrtsoftplus routing")
+        if getattr(config, "gate_temp", 1.0) != 1.0:
+            raise ValueError("V4.1 requires gate_temp=1")
+        is_draft = extract_layer_index(prefix) >= config.num_hidden_layers
+        moe_config = vllm_config
+        if is_draft:
+            # Only the expert counts differ; use the same DSV4 TP implementation.
+            moe_config = copy.copy(vllm_config)
+            moe_config.model_config = copy.copy(vllm_config.model_config)
+            moe_config.model_config.hf_config = copy.copy(config)
+            moe_config.model_config.hf_config.n_routed_experts = (
+                config.dspark_n_routed_experts
+            )
+            moe_config.model_config.hf_config.num_experts_per_tok = (
+                config.dspark_num_experts_per_tok
+            )
+        gate = ReplicatedLinear(
+            config.hidden_size,
+            moe_config.model_config.hf_config.n_routed_experts,
+            bias=False,
+            prefix=f"{prefix}.ffn.gate",
+        )
+        gate.quant_method = B12xLinearMethod()
+        gate.out_dtype = torch.float32
         self.ffn = DeepseekV4MoE(
-            vllm_config,
+            moe_config,
             prefix=f"{prefix}.ffn",
             use_sequence_parallel=self.use_sequence_parallel,
+            gate=gate,
+            image_sentinel_lo=0 if is_draft else 129264,
+            image_sentinel_count=1,
         )
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -132,7 +164,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         mix_hc = (2 + self.hc_mult) * self.hc_mult
         hc_dim = self.hc_mult * self.hidden_size
         self.hc_attn_fn = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 (mix_hc, hc_dim),
                 dtype=torch.float32,
             ),
@@ -140,35 +173,40 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         self.hc_attn_fn_broadcast: torch.Tensor | None = None
         self.hc_ffn_fn = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 (mix_hc, hc_dim),
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_attn_base = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 mix_hc,
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_ffn_base = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 mix_hc,
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_attn_scale = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 3,
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_ffn_scale = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 3,
                 dtype=torch.float32,
             ),
@@ -345,13 +383,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             and self.engram_layout.table_memory in ("ram", "disk")
         )
         if self.disk_engram:
-            plan = self.engram_layout.plans[0]
+            caps = self.engram_layout.caps[0]
             self.register_buffer(
                 "prepared_engram_hashes",
                 torch.empty(
-                    (plan.caps.max_tokens, len(self.engram_layout.layer_ids), 24),
+                    (caps.max_tokens, len(self.engram_layout.layer_ids), 24),
                     dtype=torch.int64,
-                    device=plan.caps.device,
+                    device=caps.device,
                 ),
                 persistent=False,
             )
@@ -384,9 +422,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             for layer in islice(self.layers, self.start_layer, self.end_layer)
             if getattr(layer, "engram", None) is not None
         )
-        for engram in engrams:
-            engram.invalidate_disk_output()
         try:
+            for engram in engrams:
+                engram.invalidate_disk_output()
+            if self.engram_hash is None:
+                raise RuntimeError("Disk Engram requires initialized hash state")
             hashes = self.prepared_engram_hashes[: input_ids.shape[0]]
             self.engram_hash.run_native(
                 input_ids,
@@ -401,7 +441,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
         except BaseException:
             for engram in engrams:
-                engram.invalidate_disk_output(clear=True)
+                try:
+                    engram.invalidate_disk_output(clear=True)
+                except BaseException:
+                    logger.exception("Failed to clear Engram rows during cleanup")
             raise
 
     def prepare_dummy_engram(self, num_tokens):
@@ -565,7 +608,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 aux_recon = layer._b12x_mhc.post(
                     hidden_states, residual, post_mix, res_mix
                 )
-                aux_hidden_state = stream_mean(aux_recon)
+                aux_hidden_state = layer._b12x_mhc.collapse(aux_recon)
                 if self.use_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
                 if decoder_compacted:
@@ -609,8 +652,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # Collapse the hc copies with the pre-mix from the last layer's FFN
         # mixes — the mix the reference applies via
         # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
-        assert pre_mix is not None
-        hidden_states = collapse(hidden_states, pre_mix)
+        hidden_states = layer._b12x_mhc.collapse(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)
         if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.
@@ -723,7 +765,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         continue
                     narrow_weight = loaded_weight[head_rank_start:head_rank_end]
                     n = narrow_weight.shape[0]
-                    params_dict[name][:n].copy_(narrow_weight)
+                    copy_weight(params_dict[name][:n], narrow_weight)
                     loaded_params.add(name)
                     continue
                 else:
@@ -747,11 +789,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        first_layer = next(iter(islice(self.layers, self.start_layer, self.end_layer)))
-        if first_layer.ffn.use_mega_moe:
-            return make_deepseek_v4_expert_params_mapping(self.config.n_routed_experts)
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
         return fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="w1",
@@ -759,10 +796,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ckpt_up_proj_name="w3",
             num_experts=self.config.n_routed_experts,
         )
-
-    def finalize_mega_moe_weights(self) -> None:
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
-            layer.ffn.finalize_mega_moe_weights()
 
     def finalize_mhc_broadcast_weights(self) -> None:
         if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:
@@ -1016,9 +1049,15 @@ class DeepseekV41LLMForCausalLM(
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def process_weights_after_loading(self) -> None:
-        self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
         for module in self.modules():
+            if isinstance(module, DeepseekV4DecoderLayer):
+                set_b12x_preparation_provider(module, module._b12x_mhc)
+                name = b12x_layer_prefix(module)
+                register_b12x_layer(name, module)
+                module._b12x_mhc.bind_layer_name(name)
+            if isinstance(module, DeepseekV41B12xAttention):
+                module.setup_wo_projection()
             if isinstance(module, Engram):
                 module.process_weights_after_loading()
 

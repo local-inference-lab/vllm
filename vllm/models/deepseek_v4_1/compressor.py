@@ -3,18 +3,25 @@
 """Native ratio-one/two compression with request-owned partial-state rings."""
 
 import torch
+import torch.nn as nn
 from b12x.attention import mla_compress
 from b12x.gemm import bf16_gemv
-from torch import nn
+from b12x.preparation import PreparedCall
 
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.models.deepseek_v4_1.b12x_layers import B12xLinearMethod, B12xRMSNorm
 from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xBackend
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.kv_cache_interface import CircularBufferSpec
-
+from vllm.utils.b12x import (
+    set_b12x_preparation_provider,
+    B12xPreparationUnit,
+    B12xWorkload,
+    PreparationResourceUnavailableError,
+)
 
 @triton.jit(do_not_specialize=["stride", "table_stride"])
 def _load_partial_state(
@@ -146,7 +153,7 @@ class DeepseekCompressor(nn.Module):
         )
         self.norm = B12xRMSNorm(512, vllm_config.model_config.hf_config.rms_norm_eps)
         self.norm.weight = nn.Parameter(
-            torch.ones(512, dtype=torch.float32), requires_grad=False
+            allocate_weights(torch.ones, 512, dtype=torch.float32), requires_grad=False
         )
         self.state_cache = (
             CompressorStateCache(vllm_config, f"{prefix}.state_cache")
@@ -154,59 +161,208 @@ class DeepseekCompressor(nn.Module):
             else None
         )
         self._plan = None
-
-    def prepare(self, device):
-        if self._plan is not None:
+        self._projection_plans = {}
+        self._values = self._latent = self._emitted = self._slots = None
+        self._gates = self._pending_values = self._pending_gates = None
+        self._pending_tags = self._local_ids = self._row_ids = None
+        self._primer_starts = self._primer_positions = self._primer_state_ids = None
+        self._primer_slots = self._primer_counts = None
+        set_b12x_preparation_provider(self, self)
+    def _ensure_capacity_buffers(self, caps) -> None:
+        """Allocate reusable serving/priming storage only during preparation."""
+        if self._values is not None:
+            if self._values.shape[0] != caps.max_tokens:
+                raise PreparationResourceUnavailableError(
+                    "compressor capacity changed after preparation"
+                )
             return
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("compressor must be warmed before graph capture")
-        t, r = self.capacity, self.requests
+        device, t, r = caps.device, caps.max_tokens, caps.max_requests
 
         def alloc(shape, dtype):
             return torch.empty(shape, dtype=dtype, device=device)
 
         self._values = alloc(
-            (t, 512), torch.float32 if self.compress_ratio == 2 else torch.bfloat16
+            (t, 512), torch.float32 if caps.ratio == 2 else torch.bfloat16
         )
         self._latent = alloc((t, 512), torch.bfloat16)
         self._emitted = alloc((t,), torch.bool)
         self._slots = alloc((t,), torch.int64)
-        self._gates = self._pending_values = self._pending_gates = (
-            self._pending_tags
-        ) = None
-        if self.compress_ratio == 2:
+        self._row_ids = torch.arange(r, dtype=torch.int64, device=device)
+        self._primer_starts = torch.empty((r + 1,), dtype=torch.int32, device=device)
+        self._primer_positions = torch.empty((r,), dtype=torch.int64, device=device)
+        self._primer_state_ids = torch.empty((r,), dtype=torch.int64, device=device)
+        self._primer_slots = torch.empty((t,), dtype=torch.int64, device=device)
+        self._primer_counts = torch.empty((2,), dtype=torch.int32, device=device)
+        if caps.ratio == 2:
             self._gates = alloc((t, 512), torch.float32)
             self._pending_values = alloc((r, 512), torch.float32)
             self._pending_gates = alloc((r, 512), torch.float32)
             self._pending_tags = alloc((r,), torch.int64)
             self._local_ids = alloc((r,), torch.int64)
-        self._row_ids = torch.arange(r, dtype=torch.int64, device=device)
-        self._plan = mla_compress.plan(
-            mla_compress.Caps(
-                device=device,
-                max_tokens=t,
-                max_requests=r,
-                max_states=r,
-                ratio=self.compress_ratio,
-            )
+
+    def _reset_primer_state(self) -> None:
+        """Restore all reusable mutable capacity storage after a trial."""
+        self._values.zero_()
+        self._latent.zero_()
+        self._emitted.zero_()
+        self._slots.fill_(-1)
+        self._primer_starts.zero_()
+        self._primer_positions.fill_(-1)
+        self._primer_state_ids.fill_(-1)
+        self._primer_slots.fill_(-1)
+        self._primer_counts.zero_()
+        if self.compress_ratio == 2:
+            self._gates.zero_()
+            self._pending_values.zero_()
+            self._pending_gates.zero_()
+            self._pending_tags.fill_(-1)
+            self._local_ids.fill_(-1)
+
+    def _produce_primer_input(self) -> None:
+        """Prime native code with a real nonzero ratio-one/pair invocation."""
+        self._reset_primer_state()
+        tokens = 2 if self.compress_ratio == 2 else 1
+        self._values[0].fill_(0.25)
+        if tokens == 2:
+            self._values[1].fill_(1.5)
+            self._gates[0].fill_(-0.75)
+            self._gates[1].fill_(0.5)
+        self._primer_starts[1].fill_(tokens)
+        self._primer_positions[0].zero_()
+        self._primer_state_ids[0].zero_()
+        self._primer_slots[0].fill_(5)
+        if tokens == 2:
+            self._primer_slots[1].fill_(6)
+        self._primer_counts[0].fill_(tokens)
+        self._primer_counts[1].fill_(1)
+
+    def _primer_binding(self, state):
+        return state.bind(
+            values=self._values,
+            gates=self._gates,
+            weight=self.norm.weight,
+            query_start_loc=self._primer_starts,
+            positions=self._primer_positions,
+            state_ids=self._primer_state_ids,
+            destination_slots=self._primer_slots,
+            live_counts=self._primer_counts,
+            out=self._latent,
+            emitted=self._emitted,
+            emitted_slots=self._slots,
+            pending_values=self._pending_values,
+            pending_gates=self._pending_gates,
+            pending_position=self._pending_tags,
         )
 
-    def forward(self, hidden_states, metadata, state_metadata=None):
-        self.prepare(hidden_states.device)
-        rows = hidden_states.shape[0]
-        bf16_gemv.mm(
-            hidden_states,
-            self.fused_wkv_wgate.weight[:512],
-            out=self._values[:rows],
-            output_dtype=self._values.dtype,
-        )
-        if self.compress_ratio == 2:
-            bf16_gemv.mm(
-                hidden_states,
-                self.fused_wkv_wgate.weight[512:],
-                out=self._gates[:rows],
-                output_dtype=torch.float32,
+    def _projection_unit(self, workload):
+        weight = self.fused_wkv_wgate.weight
+        capacities = tuple(sorted({workload.max_tokens, *workload.token_counts}))
+        self._projection_capacity = workload.max_tokens
+        dtype = torch.float32 if self.compress_ratio == 2 else torch.bfloat16
+
+        def prepare(state):
+            source = torch.empty(
+                (state.query.max_rows, weight.shape[1]), dtype=torch.bfloat16,
+                device=weight.device,
             )
+            outputs = tuple(torch.empty(
+                (state.query.max_rows, 512), dtype=dtype, device=weight.device,
+            ) for _ in range(self.compress_ratio))
+
+            def run():
+                for index, output in enumerate(outputs):
+                    state.run(source, weight[index * 512:(index + 1) * 512], out=output)
+                return outputs
+
+            return PreparedCall(
+                run=run, output=outputs, produce=lambda: source.normal_(std=0.25),
+                owners=(weight,),
+            )
+
+        requests = []
+        for rows in capacities:
+            if rows not in self._projection_plans:
+                self._projection_plans[rows] = bf16_gemv.plan(bf16_gemv.GemvQuery(
+                    source_dtype="bfloat16", weight_dtype="bfloat16",
+                    output_dtype=str(dtype).removeprefix("torch."),
+                    max_rows=rows, in_features=weight.shape[1], out_features=512,
+                    source_contiguous=True, source_aligned=True,
+                    weight_contiguous=weight.is_contiguous(),
+                    weight_aligned=weight.data_ptr() % 16 == 0,
+                ))
+            requests.append(self._projection_plans[rows].request(
+                name=f"{self.prefix}/projection.m{rows}",
+                prepare_call=prepare, benchmark_call=prepare,
+            ))
+        return B12xPreparationUnit(
+            name="V41CompressorProjection", key=(self.prefix, capacities),
+            requests=tuple(requests), stage="weights", autotune=not workload.eager_only,
+        )
+
+    def _project(self, hidden_states):
+        rows = hidden_states.shape[0]
+        plan = self._projection_plans.get(rows)
+        if plan is None:
+            plan = self._projection_plans[self._projection_capacity]
+        for index, output in enumerate((self._values, self._gates)[:self.compress_ratio]):
+            bf16_gemv.mm(
+                hidden_states, self.fused_wkv_wgate.weight[index * 512:(index + 1) * 512],
+                out=output[:rows], output_dtype=output.dtype, plan=plan,
+            )
+
+    def get_b12x_preparation_units(
+        self, layer: object, workload: B12xWorkload
+    ) -> tuple[B12xPreparationUnit, ...]:
+        if workload.max_tokens > self.capacity:
+            return ()
+        if self.fused_wkv_wgate.weight.is_meta or self.norm.weight.is_meta:
+            return ()
+        if self._plan is None:
+            device = self.fused_wkv_wgate.weight.device
+            self._plan = mla_compress.plan(
+                mla_compress.Caps(
+                    device=device, max_tokens=self.capacity, max_requests=self.requests,
+                    max_states=self.requests, ratio=self.compress_ratio,
+                )
+            )
+        declaration = self._plan
+
+        def make_call(state):
+            self._ensure_capacity_buffers(state.caps)
+            binding = self._primer_binding(state)
+            return PreparedCall(
+                run=lambda: state.run(binding),
+                produce=self._produce_primer_input,
+                reset=self._reset_primer_state,
+                restore=self._reset_primer_state,
+                owners=(
+                    self.norm.weight, self._values, self._gates,
+                    self._primer_starts, self._primer_positions,
+                    self._primer_state_ids, self._primer_slots,
+                    self._primer_counts, self._latent, self._emitted,
+                    self._slots, self._pending_values, self._pending_gates,
+                    self._pending_tags, self._local_ids,
+                ),
+            )
+
+        request = declaration.request(
+            name=f"{self.prefix}/mla-compress",
+            prepare_call=make_call, benchmark_call=make_call,
+        )
+        return (self._projection_unit(workload), B12xPreparationUnit(
+            name="DeepseekCompressor",
+            key=(self.prefix, self.compress_ratio, self.capacity, self.requests),
+            requests=(request,), stage="state", autotune=not workload.eager_only,
+        ),)
+
+    def forward(self, hidden_states, metadata, state_metadata=None):
+        if self._plan is None or self._plan.prepared is None:
+            raise PreparationResourceUnavailableError(
+                "compressor plan must be prepared before forwarding"
+            )
+        rows = hidden_states.shape[0]
+        self._project(hidden_states)
+        if self.compress_ratio == 2:
             if state_metadata is None:
                 raise RuntimeError("ratio2 compression requires request-state metadata")
             pool = self.state_cache.kv_cache

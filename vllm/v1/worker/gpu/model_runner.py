@@ -20,6 +20,7 @@ instead of embedding feature-specific logic directly.
 import functools
 import gc
 import time
+from collections.abc import Callable
 from copy import deepcopy
 from typing import Any, NamedTuple
 
@@ -166,7 +167,11 @@ from vllm.v1.worker.utils import (
     copy_kv_cache_blocks_inplace,
     get_uniform_decode_token_count,
 )
-from vllm.v1.worker.workspace import use_workspace_lane
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    lock_workspace,
+    use_workspace_lane,
+)
 
 logger = init_logger(__name__)
 
@@ -616,6 +621,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,
             max_total_logits=get_max_chunk_logits(self.vocab_size),
             vllm_config=self.vllm_config,
+            adaptive_verification_cost_scale=(
+                self.speculative_config.adaptive_verification_cost_scale
+                if self.speculative_config is not None
+                else 1.0
+            ),
             target_layer_names=target_attn_layer_names,
             additional_attn_cg_support=additional_attn_cg_support,
         )
@@ -663,6 +673,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             lora_capture_cases=self.lora_capture_cases,
             varlen_decode=self.adaptive_verification is not None,
             specialize_full_decode=self.model_state.specialize_full_decode_graphs,
+            single_request_prefill_tokens=(
+                self.model_state.single_request_prefill_cudagraph_tokens
+            ),
         )
         check_attention_cp_compatibility(self.vllm_config)
         if isinstance(self.speculator, DraftModelSpeculator):
@@ -721,6 +734,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _dummy_run(
         self,
         num_tokens: int,
+        profile_num_reqs: int | None = None,
         *args,
         skip_attn: bool = False,
         uniform_decode: bool = False,
@@ -737,7 +751,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Create a dummy scheduler output.
-        num_reqs = 1 if single_request_prefill else min(num_tokens, self.max_num_reqs)
+        num_reqs = (
+            1
+            if single_request_prefill
+            else (
+                profile_num_reqs
+                if profile_num_reqs is not None
+                else min(num_tokens, self.max_num_reqs)
+            )
+        )
+        if not 1 <= num_reqs <= min(num_tokens, self.max_num_reqs):
+            raise ValueError(
+                f"Invalid dummy batch shape: {num_tokens=} {profile_num_reqs=}"
+            )
         if uniform_decode:
             assert not single_request_prefill
             # HACK(lucas): for now since the worker is shared between MRV1 and MRV2,
@@ -884,9 +910,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             reserve = getattr(module, "reserve_profile_scratch", None)
             if reserve is not None:
                 reserve()
+        current_workspace_manager().reserve_all()
 
     @torch.inference_mode()
-    def profile_run(self) -> None:
+    def profile_run(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> None:
         self._reserve_profile_scratch()
 
         if self.supports_mm_inputs and self.is_first_pp_rank:
@@ -922,12 +951,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # transient peak instead of an unreachable sum of both passes.
         torch.accelerator.synchronize()
         del hidden_states, sample_hidden_states
-        self._profile_deepseek_v4_attention()
+        self._profile_deepseek_v4_attention(prepare_profile_state)
+        current_workspace_manager().reserve_all()
         self.reset_encoder_cache()
         gc.collect()
 
     @torch.inference_mode()
-    def _profile_deepseek_v4_attention(self) -> None:
+    def _profile_deepseek_v4_attention(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> None:
         """Include the maximum DeepSeek V4 prefill peak in KV admission.
 
         The generic profile omits attention and distributes its token budget
@@ -940,11 +972,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.model_config.architecture not in {
             "DeepseekV4ForCausalLM",
             "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
         }:
             return
 
         try:
             _init_minimal_kv_cache_for_profiling(self, num_blocks=1)
+            if prepare_profile_state is not None:
+                prepare_profile_state()
             self._dummy_run(
                 self.max_num_tokens,
                 skip_eplb=True,
@@ -1001,9 +1036,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.pooling_runner.clear()
 
     @torch.inference_mode()
-    def profile_cudagraph_memory(self) -> int:
+    def profile_cudagraph_memory(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> int:
         """Estimate the GPU memory required to capture CUDA graphs."""
-        return _profile_cudagraph_memory(self)
+        return _profile_cudagraph_memory(self, prepare_profile_state)
 
     @torch.inference_mode()
     def capture_model(self) -> int:
@@ -1051,10 +1088,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if self.adaptive_verification is not None:
                     with self.step_timing.collect() as timings:
                         for batch in self.adaptive_verification.batches_to_profile(
-                            self.cudagraph_manager.captured_token_counts()
+                            self.cudagraph_manager.captured_token_counts(),
+                            self.cudagraph_manager.captured_full_batch_shapes(),
                         ):
                             self._dummy_run(**batch)
                     self.adaptive_verification.set_initial_cost_curves(timings)
+
+        # Captured graphs replay fixed workspace addresses; growth after this
+        # point is an error rather than a silent pointer change.
+        lock_workspace()
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
@@ -1702,6 +1744,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         exceeds_cudagraph_query_len = (
             max_cudagraph_query_len is not None
             and max_query_len > max_cudagraph_query_len
+            and not self.model_state.can_use_single_request_prefill_graph(
+                num_reqs, num_toks, scheduler_output.num_scheduled_tokens
+            )
         )
 
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
@@ -1915,6 +1960,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
                 num_tokens=input_batch.num_tokens_after_padding,
+                num_reqs=(
+                    batch_desc.num_reqs
+                    if batch_desc.num_tokens
+                    == self.model_state.single_request_prefill_cudagraph_tokens
+                    else None
+                ),
                 has_lora=self.lora_config is not None,
                 num_active_loras=batch_desc.num_active_loras,
             )
@@ -2066,6 +2117,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
         )
+        num_verified_draft_tokens = (
+            self.adaptive_verification.get_verified_draft_counts(input_batch.num_reqs)
+            if self.adaptive_verification is not None
+            and input_batch.num_draft_tokens_per_req is not None
+            else None
+        )
         # Start async output copy here so that it can overlap with speculator proposal.
         boundary_state = (
             None if boundary_logits_only else self.boundary_checkpoint_state
@@ -2080,6 +2137,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 copy_stream=self.output_copy_stream,
                 check_ep_fault=self.check_ep_fault,
                 routed_experts=routed_experts,
+                num_verified_draft_tokens=num_verified_draft_tokens,
             )
         else:
             boundary_capture = torch.empty(
@@ -2135,6 +2193,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 check_ep_fault=self.check_ep_fault,
                 routed_experts=routed_experts,
                 boundary_checkpoint_tokens=boundary_capture[0],
+                num_verified_draft_tokens=num_verified_draft_tokens,
             )
 
         draft_tokens_for_next_step: torch.Tensor | None = None

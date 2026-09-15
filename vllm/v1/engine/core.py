@@ -142,7 +142,8 @@ class EngineCore:
             self._eep_scale_up_before_kv_init()
 
         # Setup KV Caches and update CacheConfig after profiling.
-        kv_cache_config = self._initialize_kv_caches(vllm_config)
+        with self.model_executor.b12x_warmup_control():
+            kv_cache_config = self._initialize_kv_caches(vllm_config)
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
         # Setup scheduler.

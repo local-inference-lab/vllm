@@ -738,7 +738,9 @@ class WorkerProc:
             target=WorkerProc.worker_main,
             kwargs=process_kwargs,
             name=f"VllmWorker-{rank}",
-            daemon=True,
+            # Worker-owned startup compilers may use child processes. The
+            # executor and death pipe already own worker lifetime and cleanup.
+            daemon=False,
         )
 
         # Apply NUMA binding if configured

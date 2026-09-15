@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -35,6 +36,9 @@ from vllm.model_executor.weight_transfer import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.b12x import (
+    set_b12x_preparation_provider,
+    B12xPreparationUnit,
+    B12xWorkload,
     get_b12x_ple,
     get_b12x_ple_embedding,
     get_b12x_scratch_buffers,
@@ -155,28 +159,28 @@ class Qwen3_8FlashNextPLEGroupedNorm(nn.Module):
 
 
 class _NGramEmbeddingStorage(nn.Module):
-    def __init__(self, plan: Any, shard_rows: int) -> None:
+    def __init__(self, layout: Any, shard_rows: int) -> None:
         super().__init__()
         self.disk_table = None
         self._table_storage = None
-        if plan.caps.table_memory == "io_uring":
+        if layout.caps.table_memory == "io_uring":
             api = _b12x_module("ple_embedding")
-            self.disk_table = api.DiskTable(plan, shard_rows)
+            self.disk_table = api.DiskTable(layout, shard_rows)
             tensors: dict[str, torch.Tensor | None] = {"weight": None}
             for name in ("weight_scale", "weight_scale_2"):
-                shape = getattr(plan, f"{name}_shape")
+                shape = getattr(layout, f"{name}_shape")
                 tensors[name] = (
                     allocate_weights(
                         torch.empty,
                         shape,
-                        dtype=getattr(plan, f"{name}_dtype"),
-                        device=plan.caps.device,
+                        dtype=getattr(layout, f"{name}_dtype"),
+                        device=layout.caps.device,
                     )
                     if shape == (1,)
                     else None
                 )
         else:
-            self._table_storage = allocate_weights(plan.allocate_storage)
+            self._table_storage = allocate_weights(layout.allocate_storage)
             tensors = {
                 name: getattr(self._table_storage, name)
                 for name in ("weight", "weight_scale", "weight_scale_2")
@@ -283,39 +287,36 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
             "table_alignment": int(config.make_ngram_vocab_size_divisible_by),
         }
         api = _b12x_module("ple_embedding")
-        self._plan = api.plan(
-            api.Caps(
-                **common_caps,
-                embedding_dim=self.embedding_dim,
-                tp_size=get_tensor_model_parallel_world_size(),
-                tp_rank=get_tensor_model_parallel_rank(),
-                quant_mode=self._quant_mode,
-                table_memory=table_memory,
-                output_dtype=dtype,
-            )
+        self._caps = api.Caps(
+            **common_caps,
+            embedding_dim=self.embedding_dim,
+            tp_size=get_tensor_model_parallel_world_size(),
+            tp_rank=get_tensor_model_parallel_rank(),
+            quant_mode=self._quant_mode,
+            table_memory=table_memory,
+            output_dtype=dtype,
         )
-        # The plan and checkpoint loader share these exact tensors.  Loading a
-        # checkpoint updates the persistent geometry in place without making a
-        # second plan or changing graph-visible addresses.
-        self.register_buffer("layer_multipliers", self._plan.multipliers)
-        self.register_buffer("ngram_heads_offsets", self._plan.table_offsets)
-        self.register_buffer("ngram_heads_vocab_sizes", self._plan.prime_sizes)
-
+        self._geometry = api.compute_geometry(self._caps)
+        geometry_tensors = api.allocate_geometry(self._geometry, device=device)
+        self._table_layout = api.storage_layout(self._caps, geometry=self._geometry)
+        self.register_buffer("layer_multipliers", geometry_tensors.multipliers)
+        self.register_buffer("ngram_heads_offsets", geometry_tensors.table_offsets)
+        self.register_buffer("ngram_heads_vocab_sizes", geometry_tensors.prime_sizes)
+        self._plans: dict[int, object] = {}
         shard_rows = (
-            self._plan.padded_vocab_size + self.split_ngram_parts - 1
+            self._table_layout.padded_vocab_size + self.split_ngram_parts - 1
         ) // self.split_ngram_parts
-        self.ngram_embedding = _NGramEmbeddingStorage(self._plan, shard_rows)
+        self.ngram_embedding = _NGramEmbeddingStorage(self._table_layout, shard_rows)
         if self.ngram_embedding.mapped_host_nbytes:
             logger.info(
                 "Using %.2f GiB of CUDA-mapped host memory for this TP rank's "
                 "PLE table",
                 self.ngram_embedding.mapped_host_nbytes / (1 << 30),
             )
-
-        (scratch,) = get_b12x_scratch_buffers(self._plan)
+        scratch_spec = self._table_layout.scratch_specs()[0]
         self.register_buffer(
             "_scratch",
-            scratch,
+            torch.empty(scratch_spec.shape, dtype=scratch_spec.dtype, device=device),
             persistent=False,
         )
         self.register_buffer(
@@ -351,27 +352,153 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         self.register_buffer(
             "_embedding_out",
             torch.empty(
-                self._plan.output_shape,
-                dtype=self._plan.output_dtype,
+                self._table_layout.output_shape,
+                dtype=self._table_layout.output_dtype,
                 device=device,
             ),
             persistent=False,
         )
+        if not getattr(self, "b12x_preparation_suppressed", False):
+            set_b12x_preparation_provider(self, self)
+    def _declare_embedding_plan(self, token_count: int):
+        api = _b12x_module("ple_embedding")
+        return api.plan(
+            replace(self._caps, max_tokens=token_count),
+            geometry=self._geometry,
+            prime_sizes=self.ngram_heads_vocab_sizes,
+            table_offsets=self.ngram_heads_offsets,
+            multipliers=self.layer_multipliers,
+        )
 
-    def _bind_embedding(self):
-        return self._plan.bind(
+    def _capacity_for(self, token_count: int) -> int:
+        if not 0 <= token_count <= self.max_total_tokens:
+            raise ValueError("PLE embedding token count exceeds capacity")
+        if not self.requires_disk_preparation and token_count in self._plans:
+            return token_count
+        return self.max_total_tokens
+
+    def _plan_for(self, token_count: int):
+        """Resolve a live token count within the declared embedding capacity."""
+        capacity = self._capacity_for(token_count)
+        plan = self._plans.get(capacity)
+        if plan is None:
+            plan = self._declare_embedding_plan(capacity)
+            self._plans[capacity] = plan
+        return plan
+
+    def _bind_embedding(self, token_count: int):
+        capacity = self._capacity_for(token_count)
+        api = _b12x_module("ple_embedding")
+        return api.bind(
+            self._plan_for(token_count),
             scratch=self._scratch,
             weight=self.ngram_embedding.weight,
             weight_scale=self.ngram_embedding.weight_scale,
             weight_scale_2=self.ngram_embedding.weight_scale_2,
-            token_ids=self._token_ids,
+            token_ids=self._token_ids[:capacity],
             query_start_loc=self._query_start_loc,
             committed_history=self._committed_history,
             num_seqs=self._num_seqs,
             num_tokens=self._num_tokens,
-            out=self._embedding_out,
+            out=self._embedding_out[:capacity],
             disk_table=self.ngram_embedding.disk_table,
         )
+
+    def _bind_embedding_state(self, state: object, token_count: int):
+        capacity = self.max_total_tokens if self.requires_disk_preparation else token_count
+        return state.bind(
+            scratch=self._scratch,
+            weight=self.ngram_embedding.weight,
+            weight_scale=self.ngram_embedding.weight_scale,
+            weight_scale_2=self.ngram_embedding.weight_scale_2,
+            token_ids=self._token_ids[:capacity],
+            query_start_loc=self._query_start_loc,
+            committed_history=self._committed_history,
+            num_seqs=self._num_seqs,
+            num_tokens=self._num_tokens,
+            out=self._embedding_out[:capacity],
+            disk_table=self.ngram_embedding.disk_table,
+        )
+
+    def _request_name(self, token_count: int) -> str:
+        return f"{self.owner_prefix}.ple_embedding.m{token_count}"
+
+    def get_b12x_preparation_units(
+        self, layer: torch.nn.Module, workload: B12xWorkload
+    ) -> tuple[B12xPreparationUnit, ...]:
+        if layer is not self:
+            raise ValueError("PLE embedding preparation owner mismatch")
+        self._validate_embedding_loaded()
+        requests = []
+        plans = self._plans
+        token_counts = (
+            (self.max_total_tokens,)
+            if self.requires_disk_preparation
+            else tuple(sorted({self.max_total_tokens, *workload.fixed_token_counts}))
+        )
+        # Plans are declared once per token count; a later collection reuses
+        # them so prepared state stays installed.
+        for token_count in token_counts:
+            plan = plans.get(token_count)
+            if plan is None:
+                plan = self._declare_embedding_plan(token_count)
+                plans[token_count] = plan
+            requests.append(plan.request(
+                name=self._request_name(token_count),
+                prepare_call=self._embedding_prepare_call(token_count),
+            ))
+        if not requests:
+            return ()
+        return (B12xPreparationUnit(
+            name="PLE embedding",
+            key=self.owner_prefix,
+            requests=tuple(requests),
+            stage="weights",
+            autotune=False,
+        ),)
+
+    def _embedding_prepare_call(self, token_count: int):
+        def prepare(state):
+            from b12x.preparation import PreparedCall
+
+            # Prime one real row through the checkpoint-owned table and
+            # geometry.  These are the only mutable staging rows this callback
+            # touches; unlike a pool clone they are restored when the call is
+            # released and never replace checkpoint parameters.
+            capacity = (
+                self.max_total_tokens if self.requires_disk_preparation else token_count
+            )
+            token_ids = self._token_ids[:1].clone()
+            query_start = self._query_start_loc[:2].clone()
+            history = self._committed_history[:1].clone()
+            num_seqs = self._num_seqs.clone()
+            num_tokens = self._num_tokens.clone()
+            output = self._embedding_out[:1].clone()
+
+            def produce() -> None:
+                self._token_ids[0] = self.eos_token_id
+                self._query_start_loc[:2].zero_()
+                self._query_start_loc[1] = 1
+                self._committed_history[0].fill_(self.eos_token_id)
+                self._num_seqs.fill_(1)
+                self._num_tokens.fill_(1)
+
+            def restore() -> None:
+                self._token_ids[:1].copy_(token_ids)
+                self._query_start_loc[:2].copy_(query_start)
+                self._committed_history[:1].copy_(history)
+                self._num_seqs.copy_(num_seqs)
+                self._num_tokens.copy_(num_tokens)
+                self._embedding_out[:1].copy_(output)
+
+            binding = self._bind_embedding_state(state, capacity)
+            return PreparedCall(
+                run=lambda: state.run(binding, token_count=1),
+                produce=produce,
+                restore=restore,
+                owners=(binding,),
+            )
+        return prepare
 
     def _prepare_inputs(
         self,
@@ -410,9 +537,10 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         ngram_context: torch.Tensor,
     ) -> None:
         self._validate_embedding_loaded()
+        self._plan_for(input_ids.numel())
         token_count = self._prepare_inputs(input_ids, query_start_loc, ngram_context)
         _b12x_module("ple_embedding").run(
-            self._bind_embedding(), token_count=token_count
+            self._bind_embedding(token_count), token_count=token_count
         )
 
     def prepare_disk(
@@ -445,6 +573,7 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         self._embedding_out[:num_tokens].zero_()
         self._disk_prepared_tokens = num_tokens
         self._disk_prepared = True
+
 
     def _run_prefetch(
         self,
@@ -485,7 +614,7 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         if self._embedding_validated:
             return
 
-        covered_until = self._plan.shard_start
+        covered_until = self._table_layout.shard_start
         for start, end in sorted(self._embedding_load_ranges):
             if start > covered_until:
                 raise ValueError(
@@ -493,20 +622,20 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                     f"expected row {covered_until}, got {start}"
                 )
             covered_until = max(covered_until, end)
-        if covered_until != self._plan.shard_end:
+        if covered_until != self._table_layout.shard_end:
             raise ValueError(
                 "PLE embedding shards do not cover the local table: "
-                f"stopped at row {covered_until}, expected {self._plan.shard_end}"
+                f"stopped at row {covered_until}, expected {self._table_layout.shard_end}"
             )
 
-        if self._plan.weight_scale_shape is not None:
+        if self._table_layout.weight_scale_shape is not None:
             if self._quant_mode == "fp8_e4m3_per_tensor":
                 if not self._weight_scale_loaded:
                     raise ValueError(
                         "FP8 PLE embedding checkpoint is missing weight_scale"
                     )
             else:
-                scale_covered_until = self._plan.shard_start
+                scale_covered_until = self._table_layout.shard_start
                 for start, end in sorted(self._scale_load_ranges):
                     if start > scale_covered_until:
                         raise ValueError(
@@ -514,14 +643,14 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                             f"expected row {scale_covered_until}, got {start}"
                         )
                     scale_covered_until = max(scale_covered_until, end)
-                if scale_covered_until != self._plan.shard_end:
+                if scale_covered_until != self._table_layout.shard_end:
                     raise ValueError(
                         "NVFP4 PLE scale shards do not cover the local table: "
                         f"stopped at row {scale_covered_until}, expected "
-                        f"{self._plan.shard_end}"
+                        f"{self._table_layout.shard_end}"
                     )
         if (
-            self._plan.weight_scale_2_shape is not None
+            self._table_layout.weight_scale_2_shape is not None
             and not self._weight_scale_2_loaded
         ):
             raise ValueError("NVFP4 PLE embedding checkpoint is missing weight_scale_2")
@@ -574,9 +703,9 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         regular_weights: list[tuple[str, torch.Tensor]] = []
         shard_prefix = "ngram_embedding.shard_"
         embedding = self.ngram_embedding
-        org_vocab_size = self._plan.padded_vocab_size
-        tp_start = self._plan.shard_start
-        tp_end = self._plan.shard_end
+        org_vocab_size = self._table_layout.padded_vocab_size
+        tp_start = self._table_layout.shard_start
+        tp_end = self._table_layout.shard_end
         shard_size = (
             org_vocab_size + self.split_ngram_parts - 1
         ) // self.split_ngram_parts
@@ -605,16 +734,16 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                 if self._quant_mode != "fp8_e4m3_per_tensor":
                     regular_weights.append((name, loaded_weight))
                     continue
-                expected_shape = self._plan.weight_scale_shape
+                expected_shape = self._table_layout.weight_scale_shape
                 if tuple(loaded_weight.shape) != expected_shape:
                     raise ValueError(
                         "shape mismatch for PLE embedding scale: expected "
                         f"{expected_shape}, got {tuple(loaded_weight.shape)}"
                     )
-                if loaded_weight.dtype != self._plan.weight_scale_dtype:
+                if loaded_weight.dtype != self._table_layout.weight_scale_dtype:
                     raise TypeError(
                         "PLE embedding weight_scale must have dtype "
-                        f"{self._plan.weight_scale_dtype}, got {loaded_weight.dtype}"
+                        f"{self._table_layout.weight_scale_dtype}, got {loaded_weight.dtype}"
                     )
                 scale = loaded_weight.float()
                 if not bool(torch.isfinite(scale).all()) or not bool((scale > 0).all()):
@@ -640,7 +769,7 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                 if self._quant_mode != "nvfp4_group16":
                     regular_weights.append((name, loaded_weight))
                     continue
-                expected_shape = self._plan.weight_scale_2_shape
+                expected_shape = self._table_layout.weight_scale_2_shape
                 if loaded_weight.ndim == 0 and expected_shape == (1,):
                     loaded_weight = loaded_weight.reshape(1)
                 if tuple(loaded_weight.shape) != expected_shape:
@@ -648,10 +777,10 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                         "shape mismatch for PLE embedding weight_scale_2: expected "
                         f"{expected_shape}, got {tuple(loaded_weight.shape)}"
                     )
-                if loaded_weight.dtype != self._plan.weight_scale_2_dtype:
+                if loaded_weight.dtype != self._table_layout.weight_scale_2_dtype:
                     raise TypeError(
                         "PLE embedding weight_scale_2 must have dtype "
-                        f"{self._plan.weight_scale_2_dtype}, got "
+                        f"{self._table_layout.weight_scale_2_dtype}, got "
                         f"{loaded_weight.dtype}"
                     )
                 scale_2 = loaded_weight.float()
@@ -696,19 +825,19 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                     regular_weights.append((name, loaded_weight))
                     continue
                 if suffix == "weight":
-                    expected_shape = (expected_rows, self._plan.weight_shape[1])
-                    expected_dtype = self._plan.weight_dtype
+                    expected_shape = (expected_rows, self._table_layout.weight_shape[1])
+                    expected_dtype = self._table_layout.weight_dtype
                 else:
                     if self._quant_mode != "nvfp4_group16":
                         regular_weights.append((name, loaded_weight))
                         continue
-                    assert self._plan.weight_scale_shape is not None
-                    assert self._plan.weight_scale_dtype is not None
+                    assert self._table_layout.weight_scale_shape is not None
+                    assert self._table_layout.weight_scale_dtype is not None
                     expected_shape = (
                         expected_rows,
-                        self._plan.weight_scale_shape[1],
+                        self._table_layout.weight_scale_shape[1],
                     )
-                    expected_dtype = self._plan.weight_scale_dtype
+                    expected_dtype = self._table_layout.weight_scale_dtype
                 if tuple(loaded_weight.shape) != expected_shape:
                     raise ValueError(
                         f"shape mismatch for PLE shard {shard_index} {suffix}: "
@@ -926,28 +1055,29 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             persistent=False,
         )
         self.register_buffer("_scratch", None, persistent=False)
-        self._plan = None
+        self._state_caps = None
+        self._state_plans: dict[int, object] = {}
         self.kv_cache = (torch.tensor([]),)
 
         compilation_config = get_current_vllm_config().compilation_config
         _register_ple_compilation_context(compilation_config, prefix, self)
-
-    def _make_plan(self, max_state_slots: int):
+        self._preparation_prefix = prefix or f"qwen3_8_flash_next.ple.{self.layer_idx}"
+        if not getattr(self, "b12x_preparation_suppressed", False):
+            set_b12x_preparation_provider(self, self)
+    def _make_caps(self, max_state_slots: int):
         api = _b12x_module("ple")
-        return api.plan(
-            api.Caps(
-                device=current_platform.current_device(),
-                mode="mixed",
-                max_tokens=self.max_tokens,
-                max_seqs=self.max_seqs,
-                max_state_slots=max_state_slots,
-                max_speculative_tokens=self.num_spec_tokens,
-                streams=self.hc_count,
-                hidden_size=self.hidden_size,
-                kernel_size=self.conv_kernel_size,
-                dilation=self.short_conv_dilation,
-                dtype=self.model_config.dtype,
-            )
+        return api.Caps(
+            device=current_platform.current_device(),
+            mode="mixed",
+            max_tokens=self.max_tokens,
+            max_seqs=self.max_seqs,
+            max_state_slots=max_state_slots,
+            max_speculative_tokens=self.num_spec_tokens,
+            streams=self.hc_count,
+            hidden_size=self.hidden_size,
+            kernel_size=self.conv_kernel_size,
+            dilation=self.short_conv_dilation,
+            dtype=self.model_config.dtype,
         )
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
@@ -960,19 +1090,41 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
                 f"[slots,{self.hc_hidden_size},{expected_tail}], got "
                 f"{tuple(conv_state.shape)}"
             )
-        plan = self._make_plan(max_state_slots=conv_state.shape[0])
-        (scratch,) = get_b12x_scratch_buffers(plan)
-        self._scratch = scratch
-        self._plan = plan
+        self._state_caps = self._make_caps(max_state_slots=conv_state.shape[0])
+        self._state_plans = {}
 
-    def _bind_ple(self):
-        if self._plan is None:
+    def _declare_state_plan(self, token_count: int):
+        return _b12x_module("ple").plan(
+            replace(self._state_caps, max_tokens=token_count),
+            invocation=self._state_invocation(token_count),
+        )
+
+    def _state_capacity_for(self, token_count: int) -> int:
+        if not 0 <= token_count <= self.max_tokens:
+            raise ValueError("PLE state token count exceeds capacity")
+        return token_count if token_count in self._state_plans else self.max_tokens
+
+    def _state_plan_for(self, token_count: int):
+        """Resolve a live token count within the declared state capacity."""
+        if self._state_caps is None:
             raise RuntimeError("PLE KV cache was not bound before inference")
-        return self._plan.bind(
-            scratch=self._scratch,
-            residual=self._residual,
-            key=self._key,
-            value=self._value,
+        capacity = self._state_capacity_for(token_count)
+        plan = self._state_plans.get(capacity)
+        if plan is None:
+            plan = self._declare_state_plan(capacity)
+            self._state_plans[capacity] = plan
+        return plan
+
+    def _bind_ple(self, token_count: int):
+        capacity = self._state_capacity_for(token_count)
+        plan = self._state_plan_for(token_count)
+        (scratch,) = get_b12x_scratch_buffers(plan)
+        return _b12x_module("ple").bind(
+            plan,
+            scratch=scratch,
+            residual=self._residual[:capacity],
+            key=self._key[:capacity],
+            value=self._value[:capacity],
             k_norm_weight=self.norm_key.weight,
             q_norm_weight=self.norm_query.weight,
             u_norm_weight=self.norm_conv.weight,
@@ -984,13 +1136,141 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             num_seqs=self._num_seqs,
             num_tokens=self._num_tokens,
             conv_state=self.kv_cache[0],
-            out=self._out,
+            out=self._out[:capacity],
             request_is_prefill=self._request_is_prefill,
         )
 
+    def _state_request_name(self, token_count: int) -> str:
+        return f"{self._preparation_prefix}.state.m{token_count}"
+
+    def _state_invocation(self, token_count: int):
+        api = _b12x_module("ple")
+        return api.invocation_from_tensors(
+            residual=self._residual[:token_count],
+            key=self._key[:token_count],
+            value=self._value[:token_count],
+            k_norm_weight=self.norm_key.weight,
+            q_norm_weight=self.norm_query.weight,
+            u_norm_weight=self.norm_conv.weight,
+            conv_weight=self.conv1d.weight.squeeze(1),
+            query_start_loc=self._query_start_loc,
+            state_slot_ids=self._state_slot_ids,
+            state_is_fresh=self._state_is_fresh,
+            num_accepted_tokens=self._num_accepted_tokens,
+            request_is_prefill=self._request_is_prefill,
+            num_seqs=self._num_seqs,
+            num_tokens=self._num_tokens,
+            conv_state=self.kv_cache[0],
+            out=self._out[:token_count],
+        )
+
+    def get_b12x_preparation_units(
+        self, layer: torch.nn.Module, workload: B12xWorkload
+    ) -> tuple[B12xPreparationUnit, ...]:
+        if layer is not self:
+            raise ValueError("PLE state preparation owner mismatch")
+        if self._state_caps is None:
+            return ()
+        requests = []
+        plans: dict[int, object] = {}
+        for token_count in sorted({self.max_tokens, *workload.fixed_token_counts}):
+            if token_count > self.max_tokens:
+                continue
+            plan = self._declare_state_plan(token_count)
+            plans[token_count] = plan
+            requests.append(plan.request(
+                name=self._state_request_name(token_count),
+                prepare_call=self._state_prepare_call(token_count),
+            ))
+        self._state_plans = plans
+        if not requests:
+            return ()
+        return (B12xPreparationUnit(
+            name="PLE state",
+            key=self._preparation_prefix,
+            requests=tuple(requests),
+            stage="state",
+            autotune=False,
+        ),)
+
+    def _state_prepare_call(self, token_count: int):
+        def prepare(state):
+            from b12x.preparation import PreparedCall
+
+            # The prepare factory owns its scratch; the runtime binding in
+            # _bind_ple draws from the workspace manager instead.
+            scratch_spec = state.layout.scratch_specs()[0]
+            scratch = torch.empty(
+                scratch_spec.shape, dtype=scratch_spec.dtype, device=scratch_spec.device
+            )
+            # Exercise the actual mixed recurrent branch on one bounded slot.
+            # The preparation lease owns a snapshot only of that touched region;
+            # every reset/close restores it before production can observe it.
+            state_slot = 0
+            original_conv_state = self.kv_cache[0][state_slot].clone()
+            # The call stages its own inputs in the layer's staging buffers, so
+            # it snapshots and restores everything it overwrites: a plan can be
+            # prepared on demand in the middle of a live forward pass.
+            staging = (
+                self._residual[:token_count], self._key[:token_count],
+                self._value[:token_count], self._out[:token_count],
+                self._query_start_loc, self._state_slot_ids, self._state_is_fresh,
+                self._num_accepted_tokens, self._request_is_prefill,
+                self._num_seqs, self._num_tokens,
+            )
+            snapshot = tuple(buffer.clone() for buffer in staging)
+            binding = state.bind(
+                scratch=scratch,
+                residual=self._residual[:token_count],
+                key=self._key[:token_count],
+                value=self._value[:token_count],
+                k_norm_weight=self.norm_key.weight,
+                q_norm_weight=self.norm_query.weight,
+                u_norm_weight=self.norm_conv.weight,
+                conv_weight=self.conv1d.weight.squeeze(1),
+                query_start_loc=self._query_start_loc,
+                state_slot_ids=self._state_slot_ids,
+                state_is_fresh=self._state_is_fresh,
+                num_accepted_tokens=self._num_accepted_tokens,
+                num_seqs=self._num_seqs,
+                num_tokens=self._num_tokens,
+                conv_state=self.kv_cache[0],
+                out=self._out[:token_count],
+                request_is_prefill=self._request_is_prefill,
+            )
+
+            def restore():
+                self.kv_cache[0][state_slot].copy_(original_conv_state)
+                for buffer, saved in zip(staging, snapshot):
+                    buffer.copy_(saved)
+
+            def reset():
+                self.kv_cache[0][state_slot].copy_(original_conv_state)
+                self._residual[:token_count].fill_(1)
+                self._key[:token_count].fill_(1)
+                self._value[:token_count].fill_(1)
+                self._out[:token_count].zero_()
+                self._query_start_loc.zero_()
+                self._query_start_loc[1] = token_count
+                self._state_slot_ids.fill_(NULL_BLOCK_ID)
+                self._state_slot_ids[0] = state_slot
+                self._state_is_fresh.fill_(True)
+                self._num_accepted_tokens.fill_(1)
+                self._request_is_prefill.zero_()
+                self._num_seqs.fill_(1)
+                self._num_tokens.fill_(token_count)
+
+            return PreparedCall(
+                run=lambda: state.run(binding, eps=self.eps, token_count=token_count),
+                reset=reset,
+                restore=restore,
+                owners=(scratch, original_conv_state),
+            )
+        return prepare
+
     def unbind_kv_cache(self) -> None:
-        self._plan = None
-        self._scratch = None
+        self._state_caps = None
+        self._state_plans = {}
         super().unbind_kv_cache()
 
     @property
@@ -1055,9 +1335,8 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             raw_metadata.get(self.prefix) if isinstance(raw_metadata, dict) else None
         )
         if metadata is None:
-            # Profiling runs before cache allocation and exist only to size the
-            # remaining cache. Preserve a live dataflow without pretending to
-            # mutate serving state.
+            # Initial memory profiling deliberately runs without attention
+            # metadata because the KV cache has not been admitted yet.
             self._out.zero_()
             self._out[:token_count].copy_(value[:, None, :].expand_as(residual))
             return
@@ -1066,14 +1345,15 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
                 f"expected PLEAttentionMetadata for {self.prefix}, got "
                 f"{type(metadata).__name__}"
             )
-        if self._plan is None:
+        if self._state_caps is None:
             raise RuntimeError("PLE KV cache was not bound before inference")
+        self._state_plan_for(token_count)
         self._residual[:token_count].copy_(residual)
         self._key[:token_count].copy_(key)
         self._value[:token_count].copy_(value)
         self._prepare_metadata(metadata, query_start_loc, token_count)
         _b12x_module("ple").run_mixed(
-            self._bind_ple(), eps=self.eps, token_count=token_count
+            self._bind_ple(token_count), eps=self.eps, token_count=token_count
         )
 
     def forward(

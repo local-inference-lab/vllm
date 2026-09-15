@@ -490,6 +490,22 @@ def test_attention_config():
         engine_args.create_engine_config()
 
 
+def test_swa_block_size_cli_choices(tmp_path):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    model_args = ["--model", str(tmp_path)]
+    assert (
+        EngineArgs.from_cli_args(parser.parse_args(model_args)).swa_block_size is None
+    )
+    args = parser.parse_args([*model_args, "--swa-block-size", "None"])
+    assert EngineArgs.from_cli_args(args).swa_block_size is None
+    for size in (32, 64, 128):
+        args = parser.parse_args([*model_args, "--swa-block-size", str(size)])
+        assert EngineArgs.from_cli_args(args).swa_block_size == size
+    parser.exit_on_error = False
+    with pytest.raises(ArgumentError):
+        parser.parse_args(["--swa-block-size", "96"])
+
+
 def test_prefix_cache_default():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     args = parser.parse_args([])

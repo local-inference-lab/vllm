@@ -8,9 +8,13 @@ from typing import Any
 import pytest
 import torch
 
-from vllm.config import AttentionConfig, VllmConfig, set_current_vllm_config
+from vllm.config import (
+    AttentionConfig,
+    ModelConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
 from vllm.model_executor.layers.attention.mla_attention import (
-    MLAAttention,
     _canonicalize_sparse_mla_kv_cache_dtype,
     _maybe_view_mla_cache_as_fp8,
     _uses_packed_sparse_mla_workspace,
@@ -18,8 +22,14 @@ from vllm.model_executor.layers.attention.mla_attention import (
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonMetadataBuilder,
 )
+from vllm.model_executor.models.config import DeepseekV41ForCausalLMConfig
 from vllm.models.deepseek_v4.nvidia import b12x as b12x_mla
 from vllm.models.deepseek_v4.nvidia import b12x_indexer
+from vllm.models.deepseek_v4_1.nvidia.b12x_attention import (
+    DeepseekV41B12xAttention,
+)
+from vllm.models.deepseek_v4_1.nvidia.model import _select_dsv4_attn_cls
+from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xBackend
 from vllm.models.deepseek_v32.nvidia.b12x import (
     B12xDSAIndexer,
     DeepseekV32B12xAttention,
@@ -78,6 +88,43 @@ def test_b12x_selector_routes_supported_attention_families() -> None:
         hf_text_config=SimpleNamespace(model_type="glm_moe_dsa")
     )
     assert _get_sparse_mla_backend(config) is B12xGLMDSAMLASparseBackend
+
+
+def test_b12x_selector_routes_deepseek_v41() -> None:
+    config = SimpleNamespace(attention_config=SimpleNamespace(backend=None))
+
+    DeepseekV41ForCausalLMConfig.verify_and_update_config(config)
+
+    assert config.attention_config.backend is AttentionBackendEnum.B12X
+    assert _select_dsv4_attn_cls(config) is DeepseekV41B12xAttention
+    assert DeepseekV41B12xBackend.get_name() == "B12X"
+
+    config.attention_config.backend = AttentionBackendEnum.FLASH_ATTN
+    with pytest.raises(ValueError, match="requires B12X"):
+        DeepseekV41ForCausalLMConfig.verify_and_update_config(config)
+
+
+def test_deepseek_v41_tp3_padding_uses_generic_parallel_hook() -> None:
+    text_config = SimpleNamespace(num_attention_heads=64, o_groups=8)
+    model_config = SimpleNamespace(
+        architecture="DSparkV41DraftModel",
+        hf_config=text_config,
+        hf_text_config=text_config,
+        model_arch_config=SimpleNamespace(total_num_attention_heads=64),
+    )
+    model_config.get_model_arch_config = lambda: SimpleNamespace(
+        total_num_attention_heads=text_config.num_attention_heads
+    )
+    parallel_config = SimpleNamespace(tensor_parallel_size=3)
+
+    ModelConfig._update_model_config_for_parallelism(model_config, parallel_config)
+    ModelConfig._update_model_config_for_parallelism(model_config, parallel_config)
+
+    assert text_config.original_num_attention_heads == 64
+    assert text_config.original_o_groups == 8
+    assert text_config.num_attention_heads == 72
+    assert text_config.o_groups == 9
+    assert model_config.model_arch_config.total_num_attention_heads == 72
 
 
 def test_b12x_sparse_mla_accepts_glm_dsa_contract(monkeypatch) -> None:
@@ -306,6 +353,8 @@ def test_b12x_glm5_next_nvfp4_cache_spec() -> None:
 def test_b12x_glm5_next_binds_nvfp4_record_width(monkeypatch) -> None:
     impl = object.__new__(B12xMLASparseImpl)
     impl._is_glm_next = True
+    impl._uses_glm_dsa_nvfp4_cache = False
+    impl._kernel_page_size_finalized = False
     impl._cache_record_bytes = 304
     impl._ckv_gather_enabled = False
     planned: list[int] = []
@@ -328,74 +377,6 @@ def test_b12x_glm_dsa_binds_nvfp4_fp8_rope_record() -> None:
     with pytest.raises(ValueError, match="page_size, 368"):
         impl.bind_kv_cache(torch.empty((2, 64, 432), dtype=torch.uint8))
 
-
-@pytest.mark.parametrize(
-    ("model_type", "kv_cache_dtype", "record_bytes"),
-    [
-        ("glm_moe_dsa", "fp8_ds_mla", 656),
-        ("deepseek_v32", "fp8_ds_mla", 656),
-        ("glm5_next_text", "fp8_ds_mla", 528),
-        ("glm_moe_dsa", "nvfp4_ds_mla", 368),
-        ("glm5_next_text", "nvfp4_ds_mla", 304),
-    ],
-)
-def test_b12x_sparse_mla_constructor_uses_planned_cache_width(
-    monkeypatch, model_type: str, kv_cache_dtype: str, record_bytes: int
-) -> None:
-    sparse_mla = pytest.importorskip("b12x.attention.sparse_mla")
-    is_glm_next = model_type == "glm5_next_text"
-    config = _glm5_next_config()
-    hf_config = config.model_config.hf_text_config
-    hf_config.model_type = model_type
-    hf_config.qk_nope_head_dim = 256 if is_glm_next else 192
-    hf_config.qk_rope_head_dim = 0 if is_glm_next else 64
-    config.cache_config.block_size = 64
-    config.scheduler_config = SimpleNamespace(max_num_batched_tokens=16, max_num_seqs=2)
-    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
-    monkeypatch.setattr(
-        "vllm.model_executor.layers.attention.sparse_mla_attention."
-        "get_tensor_model_parallel_world_size",
-        lambda: 8,
-    )
-    monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: sparse_mla)
-    monkeypatch.setattr(
-        b12x_mla_sparse, "is_workspace_manager_initialized", lambda: False
-    )
-    monkeypatch.setattr(sparse_mla, "is_supported", lambda: True)
-    # Resolve the real cache contract without compiling GPU kernels.
-    monkeypatch.setattr(
-        sparse_mla,
-        "plan",
-        lambda caps: SimpleNamespace(caps=caps, layout=SimpleNamespace(nbytes=256)),
-    )
-    topk_width = hf_config.index_topk + (
-        hf_config.index_kpool - 1 if is_glm_next else 0
-    )
-    with set_current_vllm_config(config):
-        impl = B12xMLASparseImpl(
-            num_heads=8,
-            head_size=512 + hf_config.qk_rope_head_dim,
-            scale=256**-0.5,
-            num_kv_heads=1,
-            alibi_slopes=None,
-            sliding_window=None,
-            kv_cache_dtype=kv_cache_dtype,
-            logits_soft_cap=None,
-            attn_type="decoder",
-            kv_sharing_target_layer_name=None,
-            q_lora_rank=2048,
-            kv_lora_rank=512,
-            qk_nope_head_dim=hf_config.qk_nope_head_dim,
-            qk_rope_head_dim=hf_config.qk_rope_head_dim,
-            qk_head_dim=256,
-            v_head_dim=256,
-            kv_b_proj=None,
-            topk_indices_buffer=torch.empty((16, topk_width), dtype=torch.int32),
-        )
-
-    assert impl._cache_record_bytes == record_bytes
-    assert impl._decode_plan.caps.cache_record_bytes == record_bytes
-    assert impl._extend_plan.caps.cache_record_bytes == record_bytes
 
 
 def test_b12x_nvfp4_run_options_match_each_glm_record_abi() -> None:
@@ -820,9 +801,12 @@ def test_b12x_glm5_next_full_ckv_workspaces_follow_cache_format(
     impl._ckv_local_capacity = 128
     impl.dcp_world_size = 4
     impl._cache_record_bytes = record_bytes
-    plan = SimpleNamespace(layout=SimpleNamespace(nbytes=8))
-
-    specs = impl._workspace_specs(plan, input_num_heads=8, include_ckv=True)
+    impl._plans = {
+        ("ckv_extend", 32): SimpleNamespace(
+            scratch_specs=lambda: (SimpleNamespace(nbytes=8),)
+        ),
+    }
+    specs = impl._workspace_specs(input_num_heads=8, include_ckv=True)
 
     assert len(specs) == 3
     assert specs[1] == ((8,), torch.uint8)
@@ -1254,25 +1238,6 @@ def test_glm_dcp_compaction_preserves_tail_order_on_graph_replay(
             assert torch.equal(valid_counts.cpu(), expected_counts)
 
 
-def test_b12x_glm5_next_cache_writer_ignores_empty_rope() -> None:
-    calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-    impl = object.__new__(B12xMLASparseImpl)
-    impl._is_glm_next = True
-    impl._concat_and_cache_glm_next_mla = lambda *args: calls.append(args)
-    kv_c = torch.empty((3, 512), dtype=torch.bfloat16)
-    kv_cache = torch.empty((2, 64, 528), dtype=torch.uint8)
-    slots = torch.tensor([0, 64, -1], dtype=torch.int64)
-
-    impl.do_kv_cache_update(
-        kv_c,
-        torch.empty((3, 1, 0), dtype=torch.bfloat16),
-        kv_cache,
-        slots,
-        "fp8_ds_mla",
-        torch.ones((), dtype=torch.float32),
-    )
-
-    assert calls == [(kv_c, kv_cache, slots)]
 
 
 def test_b12x_glm_dsa_nvfp4_cache_writer_keeps_rope() -> None:
@@ -1305,120 +1270,12 @@ def test_b12x_glm_dsa_nvfp4_cache_writer_keeps_rope() -> None:
     assert actual_scale is scale
 
 
-def test_b12x_glm5_next_cache_geometry_is_finalized_before_bind(monkeypatch) -> None:
-    planned: list[SimpleNamespace] = []
-    reservations: list[tuple[tuple[tuple[int, ...], torch.dtype], ...]] = []
-    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
-    monkeypatch.setattr(
-        b12x_mla_sparse,
-        "is_workspace_manager_initialized",
-        lambda: False,
-    )
-    monkeypatch.setattr(
-        b12x_mla_sparse,
-        "current_workspace_manager",
-        lambda: SimpleNamespace(reserve_all=lambda *specs: reservations.append(specs)),
-    )
-
-    class FakeCaps(SimpleNamespace):
-        def __init__(self, **kwargs):
-            super().__init__(**kwargs)
-            self.cache_record_bytes = 528
-            self.layout = SimpleNamespace(nbytes=256)
-
-        def shapes_and_dtypes(self):
-            return (((self.layout.nbytes,), torch.uint8),)
-
-    class FakeModule:
-        Caps = FakeCaps
-
-        @staticmethod
-        def plan(caps):
-            planned.append(caps)
-            return SimpleNamespace(
-                caps=caps,
-                layout=caps.layout,
-                shapes_and_dtypes=caps.shapes_and_dtypes,
-            )
-
-    impl = object.__new__(B12xMLASparseImpl)
-    impl._is_glm_next = True
-    impl._uses_nvfp4_cache = False
-    impl._cache_record_bytes = 528
-    impl._module = FakeModule
-    impl._kernel_page_size = 64
-    impl._kernel_page_size_finalized = False
-    impl._input_num_heads = 64
-    impl.num_heads = 16
-    impl.dcp_world_size = 4
-    impl._max_tokens = 4096
-    impl._max_seqs = 4
-    impl._max_speculative_decode_query_len = 6
-    impl._decode_max_rows = 24
-    impl._topk_tokens = 2051
-    impl._kv_dtype = torch.uint8
-    impl._q_head_dim = 512
-    impl.kv_lora_rank = 512
-    impl.scale = 256**-0.5
-    impl.need_to_return_lse_for_decode = True
-    impl._model_type = 1
-    impl._ckv_gather_enabled = True
-    impl._ckv_capacity_tokens = 131200
-    impl._ckv_local_capacity = 131200
-    impl._decode_plan = SimpleNamespace()
-    impl._extend_plan = SimpleNamespace()
-    impl._ckv_extend_plan = SimpleNamespace()
-    owner = SimpleNamespace(impl=impl, indexer=None)
-    cache = torch.empty((2, 1, 2304, 528), dtype=torch.uint8)
-
-    MLAAttention.finalize_kv_cache_geometry(
-        owner,
-        SimpleNamespace(cache_config=SimpleNamespace(block_size=2304)),
-    )
-    MLAAttention.bind_kv_cache(owner, cache)
-
-    assert owner.kv_cache.shape == (2, 2304, 528)
-    assert impl._kernel_page_size == 2304
-    assert impl._kernel_page_size_finalized
-    assert [(caps.mode, caps.page_size) for caps in planned] == [
-        ("decode", 2304),
-        ("extend", 2304),
-        ("extend", 2304),
-    ]
-    plan_geometry = [
-        (caps.num_q_heads, caps.max_q_rows, caps.max_batch) for caps in planned
-    ]
-    assert plan_geometry == [
-        (64, 24, 24),
-        (64, 4096, 4096),
-        (16, 4096, 4096),
-    ]
-    assert len(reservations) == 3
-    query_stage_bytes = 4096 * 64 * 512 * torch.bfloat16.itemsize
-    assert impl._scratch_nbytes == query_stage_bytes
-    assert reservations[0] == (
-        ((4096, 64, 512), torch.bfloat16),
-        ((query_stage_bytes,), torch.uint8),
-    )
-    assert reservations[1] == (
-        ((4096, 64, 512), torch.bfloat16),
-        ((query_stage_bytes,), torch.uint8),
-    )
-    assert reservations[2] == (
-        ((4096, 16, 512), torch.bfloat16),
-        ((256,), torch.uint8),
-        ((525312, 528), torch.uint8),
-    )
-
-    with pytest.raises(RuntimeError, match="immutable after finalization"):
-        impl.finalize_kv_cache_geometry(64)
-    with pytest.raises(RuntimeError, match="does not match the finalized"):
-        impl.bind_kv_cache(torch.empty((2, 64, 528), dtype=torch.uint8))
 
 
 def test_b12x_glm5_next_full_ckv_bind_requires_geometry_finalization() -> None:
     impl = object.__new__(B12xMLASparseImpl)
     impl._is_glm_next = True
+    impl._uses_glm_dsa_nvfp4_cache = False
     impl._cache_record_bytes = 528
     impl._ckv_gather_enabled = True
     impl._kernel_page_size_finalized = False
@@ -1493,45 +1350,177 @@ def test_b12x_sparse_mla_routes_only_planned_decode_rows(
         is_spec_decode=is_spec_decode,
     )
 
-    assert impl._use_decode_plan(metadata, num_tokens) is expected_decode
+    assert impl._use_decode_execution(metadata, num_tokens) is expected_decode
 
+def test_b12x_sparse_mla_declares_plans_once_and_prepares_in_place(
+    monkeypatch,
+) -> None:
+    """A layer's plans are declared once; preparation fills them in place."""
+    from vllm.utils.b12x import B12xWorkload
 
-def test_b12x_sparse_mla_reserves_largest_planned_workspace(monkeypatch) -> None:
-    reservations: list[tuple[tuple[tuple[int, ...], torch.dtype], ...]] = []
-    manager = SimpleNamespace(
-        get_simultaneous=lambda *specs: reservations.append(specs)
-    )
-    monkeypatch.setattr(
-        b12x_mla_sparse,
-        "is_workspace_manager_initialized",
-        lambda: True,
-    )
-    monkeypatch.setattr(
-        b12x_mla_sparse,
-        "current_workspace_manager",
-        lambda: manager,
-    )
+    class _FakePlan:
+        def __init__(self) -> None:
+            self.prepared = None
+
+        def request(self, *, name, prepare_call, benchmark_call=None, **_kwargs):
+            return SimpleNamespace(name=name, plan=self)
 
     impl = object.__new__(B12xMLASparseImpl)
-    impl._max_tokens = 64
-    impl._input_num_heads = 8
-    impl._q_head_dim = 512
-    impl._scratch_nbytes = 512
-    impl._decode_plan = SimpleNamespace(
-        shapes_and_dtypes=lambda: (((32,), torch.uint8),)
-    )
-    impl._extend_plan = SimpleNamespace(
-        shapes_and_dtypes=lambda: (((512,), torch.uint8),)
+    impl._is_glm_next = False
+    impl._decode_max_rows = 4
+    impl._plans = {("decode", 4): _FakePlan(), ("extend", 8): _FakePlan()}
+    impl._plan_caps = {("decode", 4): object(), ("extend", 8): object()}
+    impl._bound_kv_cache = torch.empty((2, 64, 656), dtype=torch.uint8)
+    impl._preparation_prefix = lambda: "test.sparse-mla"
+    declared = []
+
+    def declare(mode, rows):
+        declared.append((mode, rows))
+        return object(), _FakePlan()
+
+    monkeypatch.setattr(impl, "_declare_plan", declare)
+    workload = B12xWorkload(
+        stage="state", token_counts=(2, 4, 8), fixed_token_counts=(),
+        output_dtype=torch.bfloat16, max_tokens=8, max_seqs=1, max_model_len=8,
     )
 
-    impl._reserve_planned_workspaces()
+    (unit,) = impl.get_b12x_preparation_units(impl, workload)
+    first = {request.name: request.plan for request in unit.requests}
+    # Decode plans are exact in rows: every planned count that can route to
+    # decode is declared; a count above the decode capacity is not.
+    assert declared == [("decode", 2)]
+    assert first == {
+        "test.sparse-mla.decode.m2": impl._plans[("decode", 2)],
+        "test.sparse-mla.decode.m4": impl._plans[("decode", 4)],
+        "test.sparse-mla.extend.m8": impl._plans[("extend", 8)],
+    }
+    assert all(plan.prepared is None for plan in impl._plans.values())
 
-    assert reservations == [
-        (
-            ((64, 8, 512), torch.bfloat16),
-            ((512,), torch.uint8),
+    # A second declaration reuses the exact same plan objects: plans are
+    # declared once and never rebuilt by preparation itself.
+    (unit_again,) = impl.get_b12x_preparation_units(impl, workload)
+    second = {request.name: request.plan for request in unit_again.requests}
+    assert second == first
+    assert declared == [("decode", 2)]
+
+    for plan in impl._plans.values():
+        plan.prepared = object()
+    assert all(plan.prepared is not None for plan in impl._plans.values())
+
+
+def test_sparse_mla_preparation_releases_trial_operands() -> None:
+    """Trial buffers survive priming but are not retained by frozen plans."""
+    import gc
+    import weakref
+
+    impl = object.__new__(B12xMLASparseImpl)
+    cache = torch.zeros((1, 64), dtype=torch.uint8)
+    impl._bound_kv_cache = cache
+    caps = SimpleNamespace(
+        max_q_rows=2,
+        num_q_heads=4,
+        head_dim=8,
+        max_width=16,
+        max_batch=2,
+        page_size=64,
+        dtype=torch.bfloat16,
+        device="cpu",
+    )
+    operand_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+    calls = []
+
+    def bind(**operands):
+        operand_refs.extend(
+            weakref.ref(value) for name, value in operands.items() if name != "kv_cache"
         )
-    ]
+        return SimpleNamespace(**operands)
+
+    def run(binding, *, kv_cache):
+        assert kv_cache is cache
+        assert binding.scratch.shape == (128,)
+        assert torch.all(binding.q == 1)
+        assert all(ref() is not None for ref in operand_refs)
+        calls.append("run")
+
+    state = SimpleNamespace(
+        scratch_specs=lambda: (SimpleNamespace(shape=(128,), dtype=torch.uint8),),
+        bind=bind,
+        prime=lambda binding, **kwargs: calls.append("prime"),
+        run=run,
+    )
+    call = impl._make_prepare_call(state, caps)
+    assert call.owners == ()
+    assert calls == ["prime"]
+    call.produce()
+    call.invoke()
+    assert calls == ["prime", "run"]
+    del call
+    gc.collect()
+    assert operand_refs and all(ref() is None for ref in operand_refs)
+    assert impl._bound_kv_cache is cache
+
+
+def test_b12x_sparse_mla_plan_lookup_declares_unplanned_decode_rows_once(
+    monkeypatch,
+) -> None:
+    """A planned key is served as declared; an unplanned decode row count is
+    declared once and materializes its default on first use, never prepared."""
+    import b12x.preparation as preparation
+
+    class _FakePlan:
+        def request(self, *, name, prepare_call, **_kwargs):
+            return SimpleNamespace(name=name, plan=self, prepare_call=prepare_call)
+
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._preparation_prefix = lambda: "test.sparse-mla"
+    planned = _FakePlan()
+    impl._plans = {("decode", 8): planned}
+    impl._plan_caps = {("decode", 8): object()}
+    declared = []
+    prepared = []
+    prepare_calls = []
+
+    def declare(mode, rows):
+        declared.append((mode, rows))
+        return f"caps:{mode}:{rows}", _FakePlan()
+
+    monkeypatch.setattr(impl, "_declare_plan", declare)
+    monkeypatch.setattr(
+        impl,
+        "_make_prepare_call",
+        lambda state, caps: prepare_calls.append((state, caps)) or "layer-call",
+    )
+    monkeypatch.setattr(
+        preparation, "prepare_default", lambda request: prepared.append(request)
+    )
+
+    assert impl._plan(("decode", 8)) is planned
+    assert declared == [] and prepared == []
+
+    plan = impl._plan(("decode", 3))
+    assert declared == [("decode", 3)]
+    assert prepared == [] and prepare_calls == []
+    assert impl._plans[("decode", 3)] is plan
+    assert impl._plan_caps[("decode", 3)] == "caps:decode:3"
+
+    assert impl._plan(("decode", 3)) is plan
+    assert declared == [("decode", 3)]
+    assert prepared == []
+
+
+def test_b12x_sparse_mla_plan_key_is_exact_for_decode_rows() -> None:
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._max_speculative_decode_query_len = 1
+    impl._decode_max_rows = 24
+    impl._max_tokens = 128
+    impl.uses_full_ckv_dcp = lambda attn_metadata, num_tokens: False
+    decode = SimpleNamespace(num_reqs=11, max_query_len=1, is_spec_decode=False)
+    prefill = SimpleNamespace(num_reqs=1, max_query_len=37, is_spec_decode=False)
+
+    assert impl._plan_key(decode, 11) == ("decode", 11)
+    assert impl._plan_key(prefill, 37) == ("extend", 128)
+
+
 
 
 def _bare_glm_selector_metadata_builder() -> B12xMLASparseMetadataBuilder:
@@ -1881,18 +1870,15 @@ def test_b12x_dsv4_backend_preserves_cache_contract() -> None:
 
 def test_b12x_non_compressed_indexer_exposes_scores_for_dcp(monkeypatch) -> None:
     calls: dict[str, Any] = {}
+    plan = object()
 
     def bind(bound_plan, **kwargs):
-        calls["bind_plan"] = bound_plan
+        calls["plan"] = bound_plan
         calls["bind"] = kwargs
         return SimpleNamespace(
             output=kwargs["output_indices"],
             scores=kwargs["output_scores"],
         )
-
-    plan = SimpleNamespace(
-        shapes_and_dtypes=lambda: (((64,), torch.uint8),),
-    )
 
     def run(binding):
         calls["run"] = binding
@@ -1900,13 +1886,10 @@ def test_b12x_non_compressed_indexer_exposes_scores_for_dcp(monkeypatch) -> None
         binding.scores.fill_(0.5)
 
     module = SimpleNamespace(
-        Caps=lambda **kwargs: SimpleNamespace(**kwargs),
-        PAGED_INDEX_PAGE_SIZE=64,
-        plan=lambda caps: plan,
         bind=bind,
         run=run,
+        scratch_specs=lambda bound_plan, *, device: (((64,), torch.uint8),),
     )
-    monkeypatch.setattr(generic_b12x_indexer, "_require_b12x_indexer", lambda: module)
     monkeypatch.setattr(
         generic_b12x_indexer,
         "current_workspace_manager",
@@ -1928,248 +1911,28 @@ def test_b12x_non_compressed_indexer_exposes_scores_for_dcp(monkeypatch) -> None
         scores=scores,
     )
 
-    assert calls["bind_plan"] is plan
+    assert calls["plan"] is plan
     assert calls["bind"]["output_scores"] is scores
     assert calls["run"].scores is scores
     assert torch.count_nonzero(output != 7) == 0
     assert torch.count_nonzero(scores != 0.5) == 0
 
 
-def test_b12x_compressed_sparse_mla_uses_public_plan_bind_run(
-    monkeypatch,
-) -> None:
-    calls: dict[str, Any] = {}
 
-    def make_caps(**kwargs):
-        calls["caps"] = kwargs
-        return SimpleNamespace(**kwargs)
-
-    def bind(**kwargs):
-        calls["bind"] = kwargs
-        return SimpleNamespace(scratch=SimpleNamespace(mode=None))
-
-    plan = SimpleNamespace(
-        shapes_and_dtypes=lambda: (((32,), torch.uint8),),
-        bind=bind,
-    )
-
-    def run(**kwargs):
-        calls["run"] = kwargs
-        kwargs["out"].fill_(3)
-
-    module = SimpleNamespace(
-        Caps=make_caps,
-        plan=lambda caps: plan,
-        run=run,
-        split_chunks_for_contract=lambda **kwargs: 5,
-    )
-    monkeypatch.setattr(b12x_mla, "_require_b12x_compressed_sparse_mla", lambda: module)
-    monkeypatch.setattr(b12x_mla, "current_workspace_manager", lambda: _Workspace())
-
-    q = torch.empty((2, 16, 512), dtype=torch.bfloat16)
-    output = torch.empty_like(q)
-    b12x_mla._run_compressed_sparse_mla(
-        q=q,
-        output=output,
-        attn_sink=torch.zeros((32,), dtype=torch.float32),
-        scale=0.125,
-        swa_k_cache=torch.empty((1, 584), dtype=torch.uint8),
-        swa_indices=torch.zeros((2, 3), dtype=torch.int32),
-        swa_lens=torch.full((2,), 3, dtype=torch.int32),
-        swa_page_size=1,
-        indexed_k_cache=torch.empty((1, 584), dtype=torch.uint8),
-        indexed_indices=torch.zeros((2, 4), dtype=torch.int32),
-        indexed_lens=torch.full((2,), 4, dtype=torch.int32),
-        indexed_page_size=1,
-        mode="decode",
-        decode_row_capacity=8,
-    )
-
-    assert calls["caps"]["max_width"] == 7
-    assert calls["caps"]["max_chunks_per_row"] == 5
-    assert calls["bind"]["scratch"][0].dtype == torch.uint8
-    assert calls["run"]["binding"].scratch.mode == "decode"
-    assert calls["run"]["attn_sink"].shape == (16,)
-    assert calls["run"]["out"] is output
-    assert torch.count_nonzero(output != 3) == 0
-
-
-def test_b12x_wo_projection_packs_and_runs_public_api(monkeypatch) -> None:
-    calls: dict[str, Any] = {}
-
-    def pack_weights(*args, **kwargs):
-        calls["pack"] = (args, kwargs)
-        return object()
-
-    def run_inv_rope(*args, **kwargs):
-        calls["run"] = (args, kwargs)
-        return torch.full((args[0].shape[0], 256), 7, dtype=torch.bfloat16)
-
-    module = SimpleNamespace(
-        is_supported=lambda: True,
-        pack_weights=pack_weights,
-        run_inv_rope=run_inv_rope,
-    )
-    monkeypatch.setattr(b12x_mla, "get_b12x_wo_projection", lambda: module)
-    monkeypatch.setattr(
-        b12x_mla,
-        "current_stream",
-        lambda: SimpleNamespace(cuda_stream=123),
-    )
-
-    layer = object.__new__(b12x_mla.DeepseekV4B12xAttention)
-    torch.nn.Module.__init__(layer)
-    layer.n_local_groups = 2
-    layer.n_local_heads = 4
-    layer.head_dim = 128
-    layer.nope_head_dim = 96
-    layer.rope_head_dim = 32
-    layer.o_lora_rank = 128
-    layer.hidden_size = 256
-    layer.rotary_emb = SimpleNamespace(cos_sin_cache=torch.empty((1, 64)))
-    layer.wo_a = SimpleNamespace(
-        weight=torch.empty((256, 256), dtype=torch.float8_e4m3fn),
-        weight_scale_inv=torch.empty((2, 2), dtype=torch.float32),
-        b12x_warmup_provider=object(),
-    )
-    layer.wo_b = SimpleNamespace(
-        weight=torch.empty((256, 256), dtype=torch.float8_e4m3fn),
-        weight_scale_inv=torch.empty((2, 2), dtype=torch.float32),
-        b12x_warmup_provider=object(),
-        reduce_results=False,
-        tp_size=2,
-    )
-    layer._b12x_wo_projection_weights = None
-
-    layer.setup_b12x_wo_projection()
-    output = layer._o_proj(
-        torch.empty((3, 4, 128), dtype=torch.bfloat16),
-        torch.arange(3),
-    )
-
-    assert calls["pack"][1] == {
-        "groups": 2,
-        "group_width": 256,
-        "rank": 128,
-        "hidden": 256,
-    }
-    assert calls["run"][1]["heads_per_group"] == 2
-    assert calls["run"][1]["stream"] == 123
-    assert layer.wo_a.b12x_warmup_provider is None
-    assert layer.wo_b.b12x_warmup_provider is None
-    assert output.shape == (3, 256)
-    assert torch.count_nonzero(output != 7) == 0
-
-
-@pytest.mark.parametrize("capturing", [False, True])
-def test_b12x_mhc_uses_public_plan_bind_run(monkeypatch, capturing) -> None:
-    calls: dict[str, Any] = {}
-    retained_bindings: list[Any] = []
-
-    def make_caps(**kwargs):
-        calls["caps"] = kwargs
-        return SimpleNamespace(**kwargs)
-
-    def bind(plan, **kwargs):
-        calls["bind"] = (plan, kwargs)
-        return SimpleNamespace(**kwargs)
-
-    plan = SimpleNamespace(
-        shapes_and_dtypes=lambda: (((64,), torch.uint8),),
-    )
-
-    def run_pre(*args, **kwargs):
-        calls["pre"] = (args, kwargs)
-        binding = kwargs["binding"]
-        return binding.out, binding.post, binding.comb, binding.y
-
-    def run_post_pre(*args, **kwargs):
-        calls["post_pre"] = (args, kwargs)
-        binding = kwargs["binding"]
-        return binding.out, binding.post, binding.comb, binding.y
-
-    def run_post(*args):
-        calls["post"] = args
-        return args[1]
-
-    module = SimpleNamespace(
-        Caps=make_caps,
-        DEFAULT_BLOCK_K=128,
-        MULT=4,
-        bind=bind,
-        plan=lambda caps: plan,
-        run_post=run_post,
-        run_post_pre=run_post_pre,
-        run_pre=run_pre,
-    )
-    monkeypatch.setattr(b12x_mla, "_require_b12x_mhc", lambda: module)
-    monkeypatch.setattr(b12x_mla, "current_workspace_manager", lambda: _Workspace())
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
-    monkeypatch.setattr(
-        b12x_mla,
-        "retain_cuda_graph_capture_resource",
-        retained_bindings.append,
-    )
-
-    mhc = b12x_mla.B12xMHCResidual(
-        hidden_size=256,
-        hc_mult=4,
-        rms_eps=1e-6,
-        hc_eps=1e-6,
-        sinkhorn_iters=20,
-    )
-    residual = torch.empty((3, 256), dtype=torch.bfloat16)
-    hc_fn = torch.empty((24, 256), dtype=torch.float32)
-    hc_scale = torch.empty((3,), dtype=torch.float32)
-    hc_base = torch.empty((24,), dtype=torch.float32)
-    norm_weight = torch.empty((256,), dtype=torch.bfloat16)
-
-    residual_out, post, comb, layer_input = mhc.run_pre(
-        residual,
-        hc_fn,
-        hc_scale,
-        hc_base,
-        norm_weight=norm_weight,
-        norm_eps=1e-6,
-    )
-    next_outputs = mhc.run_post_pre(
-        layer_input,
-        residual_out,
-        post,
-        comb,
-        torch.empty((24, 1024), dtype=torch.float32),
-        hc_scale,
-        hc_base,
-        norm_weight=norm_weight,
-        norm_eps=1e-6,
-    )
-    final = mhc.run_post(layer_input, *next_outputs[:3])
-
-    assert calls["caps"]["hidden_size"] == 256
-    assert calls["caps"]["split_k"] == 8
-    assert calls["bind"][1]["scratch"].dtype == torch.uint8
-    assert calls["pre"][1]["binding"].expected_m == 3
-    assert calls["post_pre"][1]["expected_m"] == 3
-    bindings = [calls["pre"][1]["binding"], calls["post_pre"][1]["binding"]]
-    if capturing:
-        assert len(retained_bindings) == 2
-        for owner, binding in zip(retained_bindings, bindings):
-            assert owner[0] is plan
-            assert owner[1] is binding.scratch
-    else:
-        assert retained_bindings == bindings
-    assert residual_out.shape == (3, 4, 256)
-    assert layer_input.shape == (3, 256)
-    assert final is next_outputs[0]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("piecewise", [False, True])
 @torch.inference_mode()
-def test_b12x_mhc_graph_reuses_consumed_outputs(monkeypatch, piecewise) -> None:
+def test_b12x_mhc_graph_reuses_consumed_outputs(
+    monkeypatch, piecewise, request
+) -> None:
     import weakref
 
+    from b12x.preparation import PreparationSession
+
     from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+    from vllm.utils.b12x import B12xWorkload
     from vllm.v1.worker import workspace
 
     if torch.cuda.get_device_capability()[0] != 12:
@@ -2188,6 +1951,38 @@ def test_b12x_mhc_graph_reuses_consumed_outputs(monkeypatch, piecewise) -> None:
     scale = torch.full((3,), 0.1, device=device)
     base = torch.zeros(24, device=device)
     norm = torch.ones(4096, device=device, dtype=torch.bfloat16)
+    layer = SimpleNamespace(
+        prefix="mhc_graph_ownership",
+        hc_attn_fn=fn,
+        hc_ffn_fn=fn,
+        hc_ffn_fn_bf16=fn.bfloat16(),
+        hc_attn_fn_broadcast=fn_first,
+        hc_attn_scale=scale,
+        hc_ffn_scale=scale,
+        hc_attn_base=base,
+        hc_ffn_base=base,
+        attn_norm=SimpleNamespace(weight=norm, variance_epsilon=1e-6),
+        ffn_norm=SimpleNamespace(weight=norm, variance_epsilon=1e-6),
+    )
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(16,),
+        fixed_token_counts=(),
+        output_dtype=torch.bfloat16,
+        max_tokens=16,
+        max_seqs=1,
+        max_model_len=16,
+    )
+    session = PreparationSession(device=device, autotune=False)
+    request.addfinalizer(session.close)
+    session.prepare(
+        tuple(
+            request
+            for unit in mhc.get_b12x_preparation_units(layer, workload)
+            for request in unit.requests
+        )
+    )
+    session.freeze()
     consumed: list[weakref.ReferenceType[torch.Tensor]] = []
 
     def chain(record=False):
@@ -2230,7 +2025,6 @@ def test_b12x_mhc_graph_reuses_consumed_outputs(monkeypatch, piecewise) -> None:
     torch.cuda.current_stream().wait_stream(stream)
     # Keep the graph and its explicit owners live. Consumed activations must
     # still be reclaimable by its pool, not pinned by native bindings.
-    assert resources
     assert all(ref() is None for ref in consumed)
     for _ in range(3):
         source.normal_()
@@ -2238,28 +2032,22 @@ def test_b12x_mhc_graph_reuses_consumed_outputs(monkeypatch, piecewise) -> None:
         graph.replay()
         for actual, reference in zip(captured, expected):
             torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    del resources
 
 
 def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
     calls: dict[str, Any] = {}
 
-    def make_caps(**kwargs):
-        calls["caps"] = kwargs
-        return SimpleNamespace(**kwargs)
 
     def bind(bound_plan, **kwargs):
         calls["bind_plan"] = bound_plan
         calls["bind"] = kwargs
         return SimpleNamespace(
-            plan=bound_plan,
-            route="packed_contiguous",
+            runtime=SimpleNamespace(route="packed_contiguous"),
             output=kwargs["output_indices"],
         )
 
-    plan = SimpleNamespace(
-        layout=SimpleNamespace(route="packed_contiguous"),
-        shapes_and_dtypes=lambda: (((64,), torch.uint8),),
-    )
+    plan = object()
 
     def run(binding):
         calls["run"] = binding
@@ -2267,13 +2055,11 @@ def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
         binding.output.fill_(11)
 
     module = SimpleNamespace(
-        Caps=make_caps,
         PAGED_INDEX_PAGE_SIZE=64,
-        plan=lambda caps: plan,
         bind=bind,
         run=run,
+        scratch_specs=lambda bound_plan, *, device: (((64,), torch.uint8),),
     )
-    monkeypatch.setattr(b12x_indexer, "_require_b12x_indexer", lambda: module)
     monkeypatch.setattr(b12x_indexer, "current_workspace_manager", lambda: _Workspace())
 
     output = torch.full((3, 4), 37, dtype=torch.int32)
@@ -2292,8 +2078,8 @@ def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
         shared_page_table=True,
     )
 
+    assert calls["bind_plan"] is plan
     assert calls["bind"]["output_scores"] is scores
-    assert torch.count_nonzero(calls["output_before_run"] != 37) == 0
 
     builder = object.__new__(b12x_indexer.DeepseekV4B12xIndexerMetadataBuilder)
     builder.max_prefill_buffer_size = 1 << 30
@@ -2307,105 +2093,3 @@ def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
         (slice(1, 2), slice(0, 1)),
         (slice(2, 3), slice(0, 1)),
     ]
-    assert calls["bind_plan"] is plan
-    assert calls["bind"]["active_width"].item() == 128
-    assert calls["bind"]["output_indices"] is output
-    assert calls["run"].output is output
-    assert torch.count_nonzero(output != 11) == 0
-
-    indexer = b12x_indexer.DeepseekV4B12xSparseIndexer(
-        SimpleNamespace(),
-        quant_block_size=128,
-        scale_fmt="ue8m0",
-        topk_tokens=512,
-        head_dim=128,
-        max_model_len=65536,
-        max_total_seq_len=65536,
-        topk_indices_buffer=torch.empty((2, 512), dtype=torch.int32),
-        skip_k_cache_insert=True,
-        compress_ratio=4,
-    )
-    indexer._reserve_profile_workspace(
-        torch.empty((2, 64, 128), dtype=torch.float8_e4m3fn)
-    )
-    assert "source_layout" not in calls["caps"]
-    assert "shared_page_table" not in calls["caps"]
-    assert calls["caps"]["max_page_table_width"] == 1024
-
-
-def test_b12x_dsa_indexer_reuses_plans_and_rebinds_shared_workspace(
-    monkeypatch,
-) -> None:
-    calls = {"plan": 0, "workspace": 0, "bind": 0, "run": 0}
-
-    def bind(bound_plan, **kwargs):
-        calls["bind"] += 1
-        return SimpleNamespace(
-            plan=bound_plan,
-            route="packed_contiguous",
-            output=kwargs["output_indices"],
-        )
-
-    plan = SimpleNamespace(
-        layout=SimpleNamespace(route="packed_contiguous"),
-        shapes_and_dtypes=lambda: (((64,), torch.uint8),),
-    )
-
-    def make_plan(_caps):
-        calls["plan"] += 1
-        return plan
-
-    def run(binding):
-        calls["run"] += 1
-        binding.output.fill_(7)
-
-    module = SimpleNamespace(
-        Caps=lambda **kwargs: SimpleNamespace(**kwargs),
-        PAGED_INDEX_PAGE_SIZE=64,
-        plan=make_plan,
-        bind=bind,
-        run=run,
-    )
-
-    class Workspace:
-        def get_simultaneous(self, *shapes_and_dtypes):
-            calls["workspace"] += 1
-            return [
-                torch.empty(shape, dtype=dtype) for shape, dtype in shapes_and_dtypes
-            ]
-
-    workspace = Workspace()
-    monkeypatch.setattr(b12x_indexer, "_require_b12x_indexer", lambda: module)
-    monkeypatch.setattr(
-        b12x_indexer,
-        "current_workspace_manager",
-        lambda: workspace,
-    )
-
-    indexer = b12x_indexer.B12xC4SparseIndexer(
-        SimpleNamespace(),
-        quant_block_size=128,
-        scale_fmt="ue8m0",
-        topk_tokens=4,
-        head_dim=128,
-        max_model_len=128,
-        max_total_seq_len=128,
-        topk_indices_buffer=torch.empty((3, 4), dtype=torch.int32),
-        skip_k_cache_insert=True,
-        compress_ratio=4,
-    )
-    inputs = {
-        "q": torch.empty((3, 16, 128), dtype=torch.float8_e4m3fn),
-        "weights": torch.empty((3, 16, 1), dtype=torch.float32),
-        "kv_cache": torch.empty((4, 64, 132), dtype=torch.uint8),
-        "seq_lens": torch.full((3,), 128, dtype=torch.int32),
-        "block_table": torch.zeros((3, 2), dtype=torch.int32),
-        "output": torch.empty((3, 4), dtype=torch.int32),
-        "shared_page_table": True,
-    }
-
-    indexer.run_paged_topk(**inputs)
-    indexer.run_paged_topk(**inputs)
-
-    assert calls == {"plan": 1, "workspace": 2, "bind": 2, "run": 2}
-    assert torch.count_nonzero(inputs["output"] != 7) == 0

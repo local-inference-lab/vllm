@@ -29,6 +29,9 @@ from vllm.models.deepseek_v4.sparse_mla import (
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.b12x import (
+    set_b12x_preparation_provider,
+    B12xPreparationUnit,
+    B12xWorkload,
     get_b12x_compressed_sparse_mla,
     get_b12x_mhc,
     get_b12x_wo_projection,
@@ -92,6 +95,17 @@ def _require_b12x_mhc() -> Any:
         raise RuntimeError("DeepSeek V4 B12x mHC requires `pip install vllm[b12x]`.")
     if not module.is_supported():
         raise RuntimeError("B12x mHC is not supported on this device.")
+    for name in (
+        "Caps",
+        "plan",
+        "run_pre",
+        "run_post_pre",
+        "run_post",
+        "MULT",
+        "DEFAULT_BLOCK_K",
+        "DEFAULT_BLOCK_H",
+    ):
+        getattr(module, name)
     return module
 
 
@@ -124,11 +138,12 @@ class B12xMHCResidual:
     ) -> None:
         module = _require_b12x_mhc()
         self._caps = module.Caps
-        self._plan = module.plan
-        self._bind = module.bind
+        self._plan_factory = module.plan
         self._run_pre = module.run_pre
         self._run_post = module.run_post
         self._run_post_pre = module.run_post_pre
+        self._plans: dict[tuple[str, int], object] = {}
+        self._plan_key: tuple[int, ...] | None = None
 
         expected_hc_mult = int(module.MULT)
         if hc_mult != expected_hc_mult:
@@ -142,6 +157,7 @@ class B12xMHCResidual:
         self.hc_eps = float(hc_eps)
         self.sinkhorn_iters = int(sinkhorn_iters)
         self.block_k = int(module.DEFAULT_BLOCK_K)
+        self.block_h = int(module.DEFAULT_BLOCK_H)
         total_k = self.hc_mult * self.hidden_size
         if total_k % self.block_k != 0:
             raise ValueError(
@@ -150,51 +166,17 @@ class B12xMHCResidual:
             )
         self.split_k = total_k // self.block_k
 
-    def _binding(
-        self,
-        x: torch.Tensor,
-        *,
-        expected_m: int,
-        y: torch.Tensor | None = None,
-        post: torch.Tensor | None = None,
-        comb: torch.Tensor | None = None,
-        out: torch.Tensor | None = None,
-    ) -> Any:
-        tokens = int(x.shape[0])
-        expected_m = int(expected_m)
-        plan = self._plan(
-            self._caps(
-                device=x.device,
-                dtype=x.dtype,
-                max_tokens=max(1, tokens, expected_m),
-                hidden_size=self.hidden_size,
-                split_k=self.split_k,
-            )
+    def _plan_for(self, operation: str, tokens: int) -> object:
+        tokens = int(tokens)
+        exact = self._plans.get((operation, tokens))
+        if exact is not None:
+            return exact
+        capacity = max((rows for op, rows in self._plans if op == operation), default=0)
+        if 0 <= tokens <= capacity and capacity:
+            return self._plans[(operation, capacity)]
+        raise RuntimeError(
+            f"B12x mHC {operation} live M={tokens} exceeds prepared capacity {capacity}"
         )
-        buffers = current_workspace_manager().get_simultaneous(
-            *plan.shapes_and_dtypes()
-        )
-        if not buffers:
-            raise ValueError("B12x mHC scratch plan did not provide any buffers.")
-        scratch: torch.Tensor | tuple[torch.Tensor, ...]
-        scratch = buffers[0] if len(buffers) == 1 else tuple(buffers)
-        binding = self._bind(
-            plan,
-            scratch=scratch,
-            tokens=tokens,
-            y=y,
-            post=post,
-            comb=comb,
-            out=out,
-            expected_m=expected_m,
-        )
-        # Captured allocations belong to the graph pool and may be reused
-        # after their consumers finish. Retaining every bound output would pin
-        # every layer's activations. Only scratch predates the capture; eager
-        # breaks still require the complete binding to own their outputs.
-        owner = (plan, scratch) if torch.cuda.is_current_stream_capturing() else binding
-        retain_cuda_graph_capture_resource(owner)
-        return binding
 
     def run_pre(
         self,
@@ -206,56 +188,17 @@ class B12xMHCResidual:
         norm_weight: torch.Tensor,
         norm_eps: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        kwargs = {
-            "rms_eps": self.rms_eps,
-            "hc_eps": self.hc_eps,
-            "sinkhorn_iters": self.sinkhorn_iters,
-            "norm_weight": norm_weight,
-            "norm_eps": float(norm_eps),
-            "block_k": self.block_k,
-        }
-        if torch.compiler.is_compiling():
-            return self._run_pre(
-                residual,
-                hc_fn,
-                hc_scale,
-                hc_base,
-                split_k=self.split_k,
-                **kwargs,
-            )
-
-        tokens, hidden_size = residual.shape
-        residual_out = torch.empty(
-            (tokens, self.hc_mult, hidden_size),
-            dtype=residual.dtype,
-            device=residual.device,
-        )
-        layer_input = torch.empty(
-            (tokens, hidden_size), dtype=residual.dtype, device=residual.device
-        )
-        post_mix = torch.empty(
-            (tokens, self.hc_mult), dtype=torch.float32, device=residual.device
-        )
-        res_mix = torch.empty(
-            (tokens, self.hc_mult, self.hc_mult),
-            dtype=torch.float32,
-            device=residual.device,
-        )
-        binding = self._binding(
-            residual,
-            expected_m=int(tokens),
-            y=layer_input,
-            post=post_mix,
-            comb=res_mix,
-            out=residual_out,
-        )
         return self._run_pre(
             residual,
             hc_fn,
             hc_scale,
             hc_base,
-            binding=binding,
-            **kwargs,
+            rms_eps=self.rms_eps,
+            hc_eps=self.hc_eps,
+            sinkhorn_iters=self.sinkhorn_iters,
+            norm_weight=norm_weight,
+            norm_eps=float(norm_eps),
+            plan=self._plan_for("pre", int(residual.shape[0])),
         )
 
     def run_post_pre(
@@ -272,51 +215,7 @@ class B12xMHCResidual:
         norm_eps: float,
         hc_fn_bf16: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        expected_m = int(residual.shape[0])
-        kwargs = {
-            "rms_eps": self.rms_eps,
-            "hc_eps": self.hc_eps,
-            "sinkhorn_iters": self.sinkhorn_iters,
-            "norm_weight": norm_weight,
-            "norm_eps": float(norm_eps),
-            "block_k": self.block_k,
-            "expected_m": expected_m,
-            "fn_bf16": hc_fn_bf16,
-        }
-        if torch.compiler.is_compiling():
-            return self._run_post_pre(
-                x,
-                residual,
-                post,
-                comb,
-                hc_fn,
-                hc_scale,
-                hc_base,
-                split_k=self.split_k,
-                **kwargs,
-            )
-
-        tokens, hc_mult, hidden_size = residual.shape
-        residual_out = torch.empty_like(residual)
-        layer_input = torch.empty(
-            (tokens, hidden_size), dtype=residual.dtype, device=residual.device
-        )
-        post_out = torch.empty(
-            (tokens, hc_mult), dtype=torch.float32, device=residual.device
-        )
-        comb_out = torch.empty(
-            (tokens, hc_mult, hc_mult),
-            dtype=torch.float32,
-            device=residual.device,
-        )
-        binding = self._binding(
-            residual,
-            expected_m=expected_m,
-            y=layer_input,
-            post=post_out,
-            comb=comb_out,
-            out=residual_out,
-        )
+        tokens = int(residual.shape[0])
         return self._run_post_pre(
             x,
             residual,
@@ -325,8 +224,16 @@ class B12xMHCResidual:
             hc_fn,
             hc_scale,
             hc_base,
-            binding=binding,
-            **kwargs,
+            rms_eps=self.rms_eps,
+            hc_eps=self.hc_eps,
+            sinkhorn_iters=self.sinkhorn_iters,
+            norm_weight=norm_weight,
+            norm_eps=float(norm_eps),
+            fn_bf16=hc_fn_bf16,
+            plan=self._plan_for(
+                "post_pre_bf16" if hc_fn_bf16 is not None else "post_pre",
+                tokens,
+            ),
         )
 
     def run_post(
@@ -336,7 +243,190 @@ class B12xMHCResidual:
         post: torch.Tensor,
         comb: torch.Tensor,
     ) -> torch.Tensor:
-        return self._run_post(x, residual, post, comb)
+        return self._run_post(
+            x,
+            residual,
+            post,
+            comb,
+            plan=self._plan_for("post", int(residual.shape[0])),
+        )
+
+    def _request_name(self, layer: object, operation: str, tokens: int) -> str:
+        return f"deepseek_v4.mhc.{id(layer):x}.{operation}.m{tokens}"
+
+    def get_b12x_preparation_units(
+        self, layer: object, workload: B12xWorkload
+    ) -> tuple[B12xPreparationUnit, ...]:
+        """Declare every real mHC operand after decoder weights are published."""
+        from b12x.preparation import FrozenMapping
+
+        parameters = (
+            layer.hc_attn_fn_broadcast,
+            layer.hc_attn_fn,
+            layer.hc_ffn_fn,
+            layer.hc_ffn_fn_bf16,
+            layer.hc_attn_scale,
+            layer.hc_ffn_scale,
+            layer.hc_attn_base,
+            layer.hc_ffn_base,
+            layer.attn_norm.weight,
+            layer.ffn_norm.weight,
+        )
+        if any(parameter is None or parameter.is_meta for parameter in parameters):
+            return ()
+
+        key = tuple(sorted({workload.max_tokens, *workload.fixed_token_counts}))
+        if not self._plans or self._plan_key != key:
+            plans: dict[tuple[str, int], object] = {}
+            for tokens in key:
+                for operation, plan_operation, has_fn_bf16 in (
+                    ("pre", "pre", False),
+                    ("post_pre", "post_pre", False),
+                    ("post_pre_bf16", "post_pre", True),
+                    ("post", "post", False),
+                ):
+                    norm = (
+                        layer.attn_norm
+                        if operation in ("pre", "post_pre")
+                        else layer.ffn_norm
+                    )
+                    invocation = FrozenMapping(
+                        {
+                            "operation": plan_operation,
+                            "has_norm_weight": plan_operation != "post",
+                            "norm_weight_dtype": "bfloat16",
+                            "has_fn_bf16": has_fn_bf16,
+                            "lagged_mix": False,
+                            "bf16x2_eligible": True,
+                            "output_mode": "functional",
+                            "rms_eps": self.rms_eps,
+                            "hc_eps": self.hc_eps,
+                            "sinkhorn_iters": self.sinkhorn_iters,
+                            "norm_eps": float(norm.variance_epsilon),
+                            "block_k": self.block_k,
+                            "block_h": self.block_h,
+                        }
+                    )
+                    plans[(operation, tokens)] = self._plan_factory(
+                        self._caps(
+                            device=layer.hc_attn_fn.device,
+                            dtype=torch.bfloat16,
+                            max_tokens=tokens,
+                            hidden_size=self.hidden_size,
+                            split_k=self.split_k,
+                        ),
+                        invocation=invocation,
+                    )
+            self._plans = plans
+            self._plan_key = key
+
+        requests = [
+            self._plans[(operation, tokens)].request(
+                name=self._request_name(layer, operation, tokens),
+                prepare_call=self._prepare_call(layer, operation, tokens),
+                benchmark_call=self._prepare_call(layer, operation, tokens),
+            )
+            for tokens in key
+            for operation in ("pre", "post_pre", "post_pre_bf16", "post")
+        ]
+        return (B12xPreparationUnit(
+            name="DeepseekV4MHC", key=(id(layer), self.hidden_size, key),
+            requests=tuple(requests), stage="weights", autotune=not workload.eager_only,
+        ),)
+
+    def _prepare_call(self, layer: object, operation: str, tokens: int):
+        """Prime/benchmark only borrowed checkpoint tensors and fresh activations."""
+        def prepare(state):
+            from b12x.preparation import PreparedCall
+            from b12x.norm.mhc import _impl
+
+            device = layer.hc_attn_fn.device
+            residual = torch.empty(
+                (tokens, self.hidden_size) if operation == "pre" else (tokens, self.hc_mult, self.hidden_size), dtype=torch.bfloat16, device=device
+            )
+            x = torch.empty((tokens, self.hidden_size), dtype=torch.bfloat16, device=device)
+            post = torch.empty(
+                (tokens, self.hc_mult), dtype=torch.float32, device=device
+            )
+            comb = torch.empty(
+                (tokens, self.hc_mult, self.hc_mult),
+                dtype=torch.float32,
+                device=device,
+            )
+
+            def produce():
+                residual.normal_()
+                x.normal_()
+                post.normal_()
+                comb.normal_()
+
+            if operation == "pre":
+                run = lambda: _impl._b12x_mhc_pre_impl(
+                    residual,
+                    layer.hc_attn_fn_broadcast,
+                    layer.hc_attn_scale,
+                    layer.hc_attn_base,
+                    rms_eps=self.rms_eps,
+                    hc_eps=self.hc_eps,
+                    sinkhorn_iters=self.sinkhorn_iters,
+                    norm_weight=layer.attn_norm.weight,
+                    norm_eps=float(layer.attn_norm.variance_epsilon),
+                    _state=state,
+                )
+            elif operation in ("post_pre", "post_pre_bf16"):
+                if operation == "post_pre":
+                    fn, scale, base, norm, fn_bf16 = (
+                        layer.hc_attn_fn,
+                        layer.hc_attn_scale,
+                        layer.hc_attn_base,
+                        layer.attn_norm,
+                        None,
+                    )
+                else:
+                    fn, scale, base, norm, fn_bf16 = (
+                        layer.hc_ffn_fn,
+                        layer.hc_ffn_scale,
+                        layer.hc_ffn_base,
+                        layer.ffn_norm,
+                        layer.hc_ffn_fn_bf16,
+                    )
+                run = lambda: _impl._b12x_mhc_post_pre_impl(
+                    x,
+                    residual,
+                    post,
+                    comb,
+                    fn,
+                    scale,
+                    base,
+                    rms_eps=self.rms_eps,
+                    hc_eps=self.hc_eps,
+                    sinkhorn_iters=self.sinkhorn_iters,
+                    fn_bf16=fn_bf16,
+                    norm_weight=norm.weight,
+                    norm_eps=float(norm.variance_epsilon),
+                    _state=state,
+                )
+            else:
+                run = lambda: _impl._b12x_mhc_post_impl(
+                    x, residual, post, comb, _state=state
+                )
+            return PreparedCall(
+                run=run,
+                produce=produce,
+                owners=(
+                    layer.hc_attn_fn_broadcast,
+                    layer.hc_attn_fn,
+                    layer.hc_ffn_fn,
+                    layer.hc_ffn_fn_bf16,
+                    layer.hc_attn_scale,
+                    layer.hc_ffn_scale,
+                    layer.hc_attn_base,
+                    layer.hc_ffn_base,
+                    layer.attn_norm.weight,
+                    layer.ffn_norm.weight,
+                ),
+            )
+        return prepare
 
 
 def _get_dspark_decode_row_capacity(vllm_config: VllmConfig) -> int | None:
@@ -357,6 +447,16 @@ def _get_dspark_decode_row_capacity(vllm_config: VllmConfig) -> int | None:
 def _c128a_topk_width(max_model_len: int, compress_ratio: int) -> int:
     compressed_width = cdiv(max_model_len, compress_ratio)
     return cdiv(compressed_width, _C128A_TOPK_ALIGNMENT) * _C128A_TOPK_ALIGNMENT
+
+
+def _c128a_profile_widths(max_width: int) -> tuple[int, ...]:
+    """Widths emitted by C128 metadata's power-of-two, capacity-capped views."""
+    widths = {max_width}
+    width = _C128A_TOPK_ALIGNMENT
+    while width < max_width:
+        widths.add(width)
+        width *= 2
+    return tuple(sorted(widths))
 
 
 @cache
@@ -623,14 +723,16 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
     def setup_b12x_wo_projection(self) -> None:
         if self.wo_a.weight.dtype == self.wo_b.weight.dtype == torch.bfloat16:
             return
-        # These linears hold checkpoint tensors for the fused B12x projection;
-        # their ordinary forward methods are not used by this attention class.
-        self.wo_a.b12x_warmup_provider = None
-        self.wo_b.b12x_warmup_provider = None
         if self._b12x_wo_projection_weights is not None:
             return
 
         groups, group_width, rank, hidden = self._validate_wo_projection_tensors()
+        # The packed fused owner supersedes the two generic linear owners.
+        # Suppress and unpublish them so only the packed WO-projection plan is
+        # collected, and keep late generic registration from republishing them.
+        for child in (self.wo_a, self.wo_b):
+            child.b12x_preparation_suppressed = True
+            set_b12x_preparation_provider(child, None)
         module = _require_b12x_wo_projection()
         self._b12x_wo_projection_weights = module.pack_weights(
             self.wo_a.weight.detach(),
@@ -672,6 +774,16 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
             out = tensor_model_parallel_all_reduce(out)
         return out
 
+    def reserve_profile_scratch(self) -> None:
+        super().reserve_profile_scratch()
+        device = self.q_norm.weight.device
+        if device.type == "cuda":
+            # Reserve every layer type before compiled profile execution can
+            # skip its attention body. This tensor describes heads/device only.
+            self._reserve_profile_workspace(
+                torch.empty((0, self.padded_heads, _DSV4_HEAD_DIM), device=device)
+            )
+
     def _get_cache_page_view(
         self,
         cache: torch.Tensor,
@@ -686,6 +798,10 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
         return view
 
     def _reserve_profile_workspace(self, q: torch.Tensor) -> None:
+        from b12x.attention.compressed_sparse_mla._scratch import (
+            plan_compressed_sparse_mla_scratch,
+        )
+
         module = _require_b12x_compressed_sparse_mla()
         indexed_width = 0
         if self.compress_ratio == 4:
@@ -699,16 +815,24 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
                 self.compress_ratio,
             )
 
-        swa_width = int(self.window_size) + self.max_image_tokens
+        indexed_widths = (
+            _c128a_profile_widths(indexed_width)
+            if self.compress_ratio > 4
+            else (indexed_width,)
+        )
+        swa_widths = {
+            int(self.window_size),
+            int(self.window_size) + self.max_image_tokens,
+        }
         speculative_config = self.vllm_config.speculative_config
         if speculative_config is not None and speculative_config.use_dspark():
-            swa_width = max(
-                swa_width,
+            swa_widths.add(
                 get_dspark_swa_index_width(
                     int(self.window_size),
                     speculative_config.num_speculative_tokens or 0,
-                ),
+                )
             )
+        swa_width = max(swa_widths)
         width = max(swa_width + indexed_width, 1)
         rows = max(int(self.max_num_batched_tokens), 1)
         decode_row_capacity = _get_dspark_decode_row_capacity(self.vllm_config)
@@ -717,13 +841,22 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
             width=width,
             decode_row_capacity=decode_row_capacity,
         )
-        max_q_chunks = _max_q_chunks(
-            rows,
-            width,
-            module.split_chunks_for_contract,
-            decode_row_capacity,
+        # Split count is not monotonic in index width: a shorter prefix may
+        # use 12-token chunks while a longer prefix uses 64-token chunks.
+        # Cover every metadata width, not only the longest supported context.
+        max_q_chunks = max(
+            _max_q_chunks(
+                rows,
+                max(swa + indexed, 1),
+                module.split_chunks_for_contract,
+                decode_row_capacity,
+            )
+            for swa in swa_widths
+            for indexed in indexed_widths
         )
-        plan = module.plan(
+        # Allocation profiling needs geometry, not an executable declaration
+        # tied to live cache storage or an autotuning preparation session.
+        plan = plan_compressed_sparse_mla_scratch(
             module.Caps(
                 device=q.device,
                 num_q_heads=int(q.shape[1]),

@@ -80,6 +80,20 @@ def flush_weight_transfers() -> None:
         flush()
 
 
+def finish_weight_transfers() -> None:
+    """Complete a model routing epoch on every participating loading rank.
+
+    Writers may exchange rank-local descriptors at this explicit boundary.
+    Eager numerical consumers continue to use flush_weight_transfers.
+    """
+    writer = _writer.get()
+    finish = getattr(writer, "finish", None)
+    if finish is not None:
+        finish()
+    else:
+        flush_weight_transfers()
+
+
 def materialize_weight(source: torch.Tensor) -> torch.Tensor:
     """Own checkpoint values needed by a numerical loading transform."""
     writer = _writer.get()

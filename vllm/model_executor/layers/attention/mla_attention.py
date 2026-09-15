@@ -203,7 +203,7 @@ import functools
 import itertools
 import math
 from abc import abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 from math import lcm
@@ -235,7 +235,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.kernels.attention.b12x_mla_query import (
     can_implement_bf16_mla_query,
-    prewarm_bf16_mla_query,
     run_bf16_mla_query,
 )
 from vllm.model_executor.layers.attention.attention import (
@@ -264,7 +263,13 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
-from vllm.utils.b12x import B12xWarmupUnit
+from vllm.utils.b12x import (
+    set_b12x_preparation_provider,
+    B12xPreparationUnit,
+    B12xWorkload,
+    get_b12x_mla_query_projection,
+    register_b12x_layer,
+)
 from vllm.utils.flashinfer import has_flashinfer
 from vllm.utils.math_utils import cdiv, round_down, round_up
 from vllm.utils.torch_utils import (
@@ -962,7 +967,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 dtype=torch.bfloat16,
                 device=q_nope.device,
             )
-        return run_bf16_mla_query(q_nope, weight, q_pe, output)
+        return run_bf16_mla_query(
+            q_nope, weight, q_pe, output, layer_name=self._b12x_query_layer_name
+        )
 
     def forward_impl(
         self,
@@ -1455,9 +1462,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )
         if not should_load_quant_weights(quant_method):
             set_default_quant_scales(self, register_buffer=False)
-
         weight = getattr(self, "W_UK_T", None)
-        impl_warmup = getattr(self.impl, "warmup", None)
         if (
             isinstance(weight, torch.Tensor)
             and weight.dtype == torch.bfloat16
@@ -1469,59 +1474,113 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 output_dtype=torch.bfloat16,
                 device=weight.device,
             )
-        ) or callable(impl_warmup):
-            object.__setattr__(self, "b12x_warmup_provider", self)
+        ):
+            self._b12x_query_plans: dict[int, object] = {}
+            self._b12x_query_prefix = f"{self.layer_name}.mla_query"
+            register_b12x_layer(self._b12x_query_prefix, self)
+            self._b12x_query_layer_name = _encode_layer_name(self._b12x_query_prefix)
+            set_b12x_preparation_provider(self, self)
 
         if (
             self.impl.is_sparse
             and self.prefill_backend is None
             and getattr(self.kv_b_proj, "b12x_mxfp8_packed_weight", None) is not None
         ):
-            # MQA-only execution reads W_UK_T/W_UV, never the packed linear.
-            # A weight reload repacks the linear before refreshing those owned
-            # matrices. Do not retain an unused copy or schedule its warmup.
+            # Sparse MQA consumes the independently owned W_UK_T/W_UV, not
+            # this linear. Drop its holder as well as its packed tensors;
+            # weight reload recreates both before refreshing those matrices.
             self.kv_b_proj.b12x_mxfp8_packed_weight = None
-            self.kv_b_proj.b12x_warmup_provider = None
+            self.kv_b_proj.b12x_linear = None
+            set_b12x_preparation_provider(self.kv_b_proj, None)
 
-    def get_b12x_warmup_unit(
-        self,
-        layer: torch.nn.Module,
-        token_counts: tuple[int, ...],
-        output_dtype: torch.dtype,
-    ) -> B12xWarmupUnit:
-        del layer, output_dtype
+    def _b12x_query_name(self, tokens: int) -> str:
+        return f"{self._b12x_query_prefix}.m{tokens}"
+
+    def _declare_b12x_query_plan(self, tokens: int):
+        from b12x.gemm.mla_query_projection._tuning import ProjectionQuery
+
+        module = get_b12x_mla_query_projection()
+        assert module is not None
+        return module.plan(ProjectionQuery(
+            heads=int(self.W_UK_T.shape[0]),
+            max_rows=tokens,
+            weight_format="bf16",
+            output_dtype="bfloat16",
+            b_major="n",
+            sf_axis="n",
+        ))
+
+    def _b12x_query_call(self, tokens: int):
+        weight = self.W_UK_T
+        heads, nope_dim, latent_dim = map(int, weight.shape)
+
+        def prepare(state):
+            from b12x.preparation import PreparedCall
+
+            q_nope = torch.zeros(
+                (heads, tokens, nope_dim), dtype=torch.bfloat16, device=weight.device,
+            )
+            q_pe = torch.zeros(
+                (tokens, heads, 64), dtype=torch.bfloat16, device=weight.device,
+            )
+            output = torch.empty(
+                (tokens, heads, latent_dim + 64),
+                dtype=torch.bfloat16, device=weight.device,
+            )
+            return PreparedCall(run=lambda: state.run(q_nope, weight, q_pe, output))
+
+        return prepare
+
+    def b12x_query_plan(self, tokens: int):
+        """The exact-M plan for tokens, declared on first use with its default configuration.
+
+        Called from the fused-query custom op body only.
+        """
+        tokens = int(tokens)
+        plan = self._b12x_query_plans.get(tokens)
+        if plan is None:
+            plan = self._declare_b12x_query_plan(tokens)
+            self._b12x_query_plans[tokens] = plan
+        return plan
+
+    def get_b12x_preparation_units(
+        self, layer: torch.nn.Module, workload: B12xWorkload
+    ) -> Sequence[B12xPreparationUnit]:
+        if layer is not self:
+            raise ValueError("MLA query preparation owner mismatch")
         weight = getattr(self, "W_UK_T", None)
-        fused_query_rows = tuple(rows for rows in token_counts if 0 < rows <= 32)
-        impl_warmup = getattr(self.impl, "warmup", None)
-        impl_key_getter = getattr(self.impl, "b12x_warmup_key", None)
-        impl_key = impl_key_getter() if callable(impl_key_getter) else None
-
-        def compile() -> None:
-            if (
-                isinstance(weight, torch.Tensor)
-                and fused_query_rows
-                and can_implement_bf16_mla_query(
-                    num_heads=int(weight.shape[0]),
-                    max_m=max(fused_query_rows),
-                    nope_dim=int(weight.shape[1]),
-                    latent_dim=int(weight.shape[2]),
-                    output_dtype=torch.bfloat16,
-                    device=weight.device,
-                )
+        if not isinstance(weight, torch.Tensor) or weight.is_meta:
+            return ()
+        plans = self._b12x_query_plans
+        requests = []
+        for tokens in workload.token_counts:
+            if not can_implement_bf16_mla_query(
+                num_heads=int(weight.shape[0]),
+                max_m=tokens,
+                nope_dim=int(weight.shape[1]),
+                latent_dim=int(weight.shape[2]),
+                output_dtype=torch.bfloat16,
+                device=weight.device,
             ):
-                prewarm_bf16_mla_query(weight, fused_query_rows)
-            if callable(impl_warmup):
-                impl_warmup(token_counts)
-
-        weight_key = (
-            (tuple(weight.shape), weight.dtype, weight.device)
-            if isinstance(weight, torch.Tensor)
-            else None
-        )
-        return B12xWarmupUnit(
-            name="MLA",
-            key=(type(self), weight_key, impl_key),
-            compile=compile,
+                continue
+            plan = plans.get(tokens)
+            if plan is None:
+                plan = self._declare_b12x_query_plan(tokens)
+                plans[tokens] = plan
+            requests.append(plan.request(
+                name=self._b12x_query_name(tokens),
+                prepare_call=self._b12x_query_call(tokens),
+            ))
+        if not requests:
+            return ()
+        return (
+            B12xPreparationUnit(
+                name="MLA_QUERY",
+                key=(self._b12x_query_prefix, tuple(sorted(plans))),
+                requests=tuple(requests),
+                stage="weights",
+                autotune=not workload.eager_only,
+            ),
         )
 
     def get_attn_backend(self) -> type[AttentionBackend]:

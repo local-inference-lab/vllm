@@ -214,7 +214,9 @@ def test_mla_post_load_preserves_runtime_weight_addresses(monkeypatch, has_mha_p
     packed = object()
     provider = object()
     layer.kv_b_proj.b12x_mxfp8_packed_weight = packed
-    layer.kv_b_proj.b12x_warmup_provider = provider
+    layer.kv_b_proj.b12x_preparation_provider = provider
+    holder = object()
+    layer.kv_b_proj.b12x_linear = holder
 
     monkeypatch.setattr(
         mla_attention_module, "set_default_quant_scales", lambda *_, **__: None
@@ -232,13 +234,15 @@ def test_mla_post_load_preserves_runtime_weight_addresses(monkeypatch, has_mha_p
         assert layer.kv_b_proj.b12x_mxfp8_packed_weight is (
             packed if has_mha_prefill else None
         )
-        assert layer.kv_b_proj.b12x_warmup_provider is (
+        assert layer.kv_b_proj.b12x_preparation_provider is (
             provider if has_mha_prefill else None
         )
+        assert layer.kv_b_proj.b12x_linear is (holder if has_mha_prefill else None)
 
         layer.kv_b_proj.weight.add_(100)
         layer.kv_b_proj.b12x_mxfp8_packed_weight = object()
-        layer.kv_b_proj.b12x_warmup_provider = provider
+        layer.kv_b_proj.b12x_preparation_provider = provider
+        layer.kv_b_proj.b12x_linear = object()
         layer.process_weights_after_loading(torch.float32)
 
     assert layer.W_UV.data_ptr() == w_uv_ptr

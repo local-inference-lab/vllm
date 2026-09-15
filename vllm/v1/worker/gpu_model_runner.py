@@ -237,7 +237,7 @@ from vllm.v1.worker.utils import (
     is_residual_scattered_for_sp,
     raise_if_nan_logits,
 )
-from vllm.v1.worker.workspace import lock_workspace
+from vllm.v1.worker.workspace import current_workspace_manager, lock_workspace
 
 from .utils import (
     AttentionGroup,
@@ -6648,8 +6648,11 @@ class GPUModelRunner(
             reserve = getattr(module, "reserve_profile_scratch", None)
             if reserve is not None:
                 reserve()
+        current_workspace_manager().reserve_all()
 
-    def profile_run(self) -> None:
+    def profile_run(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> None:
         self._reserve_profile_scratch()
         # Profile with multimodal encoder & encoder cache.
         if self.supports_mm_inputs:
@@ -6725,12 +6728,15 @@ class GPUModelRunner(
         # transient peak instead of an unreachable sum of both passes.
         self._sync_device()
         del hidden_states, last_hidden_states, output
-        self._profile_deepseek_v4_attention()
+        self._profile_deepseek_v4_attention(prepare_profile_state)
+        current_workspace_manager().reserve_all()
         self.encoder_cache.clear()
         gc.collect()
 
     @torch.inference_mode()
-    def _profile_deepseek_v4_attention(self) -> None:
+    def _profile_deepseek_v4_attention(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> None:
         """Include the maximum DeepSeek V4 prefill peak in KV admission.
 
         The generic profile does not create attention metadata and distributes
@@ -6744,6 +6750,7 @@ class GPUModelRunner(
         if self.model_config.architecture not in {
             "DeepseekV4ForCausalLM",
             "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
         }:
             return
 
@@ -6751,6 +6758,8 @@ class GPUModelRunner(
         try:
             with set_current_vllm_config(self.vllm_config):
                 self._init_minimal_kv_cache_for_profiling(num_blocks=1)
+                if prepare_profile_state is not None:
+                    prepare_profile_state()
             model_output = self._dummy_run(
                 self.max_num_tokens,
                 force_attention=True,
@@ -6941,11 +6950,15 @@ class GPUModelRunner(
                 logger.info("Initialized EncoderCudaGraphManager for vision encoder")
 
     @torch.inference_mode()
-    def profile_cudagraph_memory(self) -> int:
+    def profile_cudagraph_memory(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> int:
         profiling_state_initialized = False
         try:
             with set_current_vllm_config(self.vllm_config):
                 self._init_minimal_kv_cache_for_profiling()
+                if prepare_profile_state is not None:
+                    prepare_profile_state()
             profiling_state_initialized = True
         finally:
             if not profiling_state_initialized:

@@ -221,6 +221,21 @@ def test_cache_config_hash_ignores_prefix_cache_retention_interval():
     assert CacheConfig(prefix_cache_retention_interval=64).compute_hash() == base_hash
 
 
+def test_swa_page_sizes_have_distinct_compile_cache_hashes():
+    configs = (
+        CacheConfig(swa_block_size=32),
+        CacheConfig(swa_block_size=64),
+        CacheConfig(swa_block_size=128),
+    )
+    assert len({config.compute_hash() for config in configs}) == 3
+
+
+@pytest.mark.parametrize("block_size", [0, -32, 16, 96, 256])
+def test_swa_page_size_rejects_unsupported_kernel_geometry(block_size):
+    with pytest.raises(ValueError, match="swa_block_size"):
+        CacheConfig(swa_block_size=block_size)
+
+
 def test_envs_compile_factors_relocation_invariant(tmp_path):
     """Relocating HOME or the XDG roots must not change the compile-cache
     env hash.

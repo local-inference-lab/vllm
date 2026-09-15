@@ -46,6 +46,8 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
+_DENSE_VARLEN_DECODE_MAX_REQS = 2
+
 
 _DEBUG_GRAPH_MEMORY_ACCOUNTING = (
     os.getenv("VLLM_DEBUG_GRAPH_MEMORY_ACCOUNTING", "0") == "1"
@@ -217,6 +219,7 @@ class BatchExecutionDescriptor:
     # uniform_token_count unset, so this is what keeps a prefill batch out of one.
     max_query_len: int | None = None
     num_active_loras: int = 0
+    exact_num_tokens: bool = False
 
 
 class CreateForwardFn(Protocol):
@@ -244,7 +247,8 @@ def _is_compatible(
     # desc.max_query_len=None means the graph does not constrain query length; a
     # caller that does not track max_query_len must not match one that does
     return (
-        (
+        (not desc.exact_num_tokens or num_tokens == desc.num_tokens)
+        and (
             desc.uniform_token_count is None
             or desc.uniform_token_count == uniform_token_count
         )
@@ -269,6 +273,7 @@ class CudaGraphManager:
         varlen_decode: bool = False,
         full_capture_request_sizes: frozenset[int] | None = None,
         specialize_full_decode: bool = False,
+        single_request_prefill_tokens: int = 0,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -280,6 +285,7 @@ class CudaGraphManager:
         self.varlen_decode = varlen_decode
         self.full_capture_request_sizes = full_capture_request_sizes
         self.specialize_full_decode = specialize_full_decode
+        self.single_request_prefill_tokens = single_request_prefill_tokens
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -411,6 +417,28 @@ class CudaGraphManager:
         capture_varlen_decode = (
             separate_decode_routine and bool(decode_mode) and self.varlen_decode
         )
+        if capture_varlen_decode:
+            # Keep exact low-concurrency FULL graphs for every possible
+            # per-request speculative width. The ordinary token ladder below
+            # remains as the padded fallback for larger request counts and
+            # heterogeneous low-concurrency totals.
+            dense_max_reqs = min(_DENSE_VARLEN_DECODE_MAX_REQS, self.max_num_reqs)
+            for num_active_loras, dense_num_reqs, query_len in product(
+                self.lora_capture_cases,
+                range(1, dense_max_reqs + 1),
+                range(1, self.decode_query_len + 1),
+            ):
+                num_tokens = dense_num_reqs * query_len
+                if num_tokens > max_cg_capture_size:
+                    continue
+                desc = BatchExecutionDescriptor(
+                    cg_mode=decode_mode,
+                    num_tokens=num_tokens,
+                    num_reqs=dense_num_reqs,
+                    max_query_len=self.decode_query_len,
+                    num_active_loras=num_active_loras,
+                )
+                descs_by_mode[decode_mode].append(desc)
         for num_tokens, num_active_loras in product(
             capture_sizes, self.lora_capture_cases
         ):
@@ -424,7 +452,8 @@ class CudaGraphManager:
                     max_query_len=self.decode_query_len,
                     num_active_loras=num_active_loras,
                 )
-                descs_by_mode[decode_mode].append(desc)
+                if desc not in descs_by_mode[decode_mode]:
+                    descs_by_mode[decode_mode].append(desc)
             # Capture uniform decode specfifc graphs if required
             #  (i.e. separate decode routine)
             elif separate_decode_routine and decode_mode and not self.varlen_decode:
@@ -473,6 +502,17 @@ class CudaGraphManager:
                 )
                 descs_by_mode[mixed_mode].append(desc)
 
+        if self.single_request_prefill_tokens and self.use_breakable_cg:
+            descs_by_mode[CUDAGraphMode.PIECEWISE].append(
+                BatchExecutionDescriptor(
+                    cg_mode=CUDAGraphMode.PIECEWISE,
+                    num_tokens=self.single_request_prefill_tokens,
+                    num_reqs=1,
+                    max_query_len=self.single_request_prefill_tokens,
+                    exact_num_tokens=True,
+                )
+            )
+
         for mode, descs in descs_by_mode.items():
             descs.sort(key=lambda d: d.num_tokens, reverse=True)
             self._capture_descs[mode] = descs
@@ -483,21 +523,23 @@ class CudaGraphManager:
                 lora_descs = [
                     d for d in mode_descs if d.num_active_loras == num_active_loras
                 ]
-                current_range_start = 0
-                # Dynamic speculative decoding can produce multiple graphs with the same
-                # num_tokens. Group them so each graph covers the same candidate range.
+                # Keep every graph large enough for a token count. A denser
+                # descriptor at the nearest size can still reject the runtime
+                # request count, in which case dispatch must continue to the
+                # ordinary larger padded graph rather than fall to PIECEWISE.
                 for num_tokens, group in groupby(lora_descs, lambda d: d.num_tokens):
-                    matching = list(group)
-                    matching.sort(
+                    matching = sorted(
+                        group,
                         key=lambda d: (
                             d.uniform_token_count is None,
                             d.max_query_len is None,
-                        )
+                            d.num_reqs is None,
+                            d.num_reqs or 0,
+                        ),
                     )
-                    for i in range(current_range_start, num_tokens + 1):
+                    for i in range(1, num_tokens + 1):
                         key = (i, num_active_loras)
                         self._candidates.setdefault(key, []).extend(matching)
-                    current_range_start = num_tokens + 1
 
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
@@ -513,6 +555,18 @@ class CudaGraphManager:
                 desc.num_tokens
                 for descs in self._capture_descs.values()
                 for desc in descs
+            }
+        )
+
+    def captured_full_batch_shapes(self) -> list[tuple[int, int]]:
+        """Sorted ``(num_tokens, num_reqs)`` shapes retained for FULL replay."""
+        return sorted(
+            {
+                (desc.num_tokens, desc.num_reqs)
+                for desc in self.graphs
+                if desc.cg_mode == CUDAGraphMode.FULL
+                and desc.num_reqs is not None
+                and desc.num_active_loras == 0
             }
         )
 
@@ -698,6 +752,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
         specialize_full_decode: bool = False,
+        single_request_prefill_tokens: int = 0,
     ):
         super().__init__(
             vllm_config,
@@ -707,6 +762,7 @@ class ModelCudaGraphManager(CudaGraphManager):
             lora_capture_cases=lora_capture_cases,
             varlen_decode=varlen_decode,
             specialize_full_decode=specialize_full_decode,
+            single_request_prefill_tokens=single_request_prefill_tokens,
         )
         self.hidden_states: torch.Tensor | None = None
         self.aux_hidden_states: list[torch.Tensor] = []
@@ -773,6 +829,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
                 max_query_len=desc.max_query_len,
             )
+            model_state.finalize_cudagraph_inputs(model_inputs, desc.cg_mode)
 
             # Capture with dummy rows marked as padding.
             input_buffers.is_padding.fill_(True)
@@ -958,7 +1015,10 @@ def _profiling_cudagraph_managers(runner: "GPUModelRunner") -> list[CudaGraphMan
 
 
 @torch.inference_mode()
-def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
+def profile_cudagraph_memory(
+    runner: "GPUModelRunner",
+    prepare_profile_state: Callable[[], None] | None = None,
+) -> int:
     """Estimate the GPU memory needed for CUDA graph capture.
 
     Called during memory profiling, *before* the real KV cache is allocated,
@@ -984,6 +1044,8 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     try:
         with set_current_vllm_config(runner.vllm_config):
             _init_minimal_kv_cache_for_profiling(runner)
+            if prepare_profile_state is not None:
+                prepare_profile_state()
         profiling_state_initialized = True
     finally:
         if not profiling_state_initialized:

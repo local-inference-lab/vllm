@@ -7,6 +7,7 @@ from torch.nn import Module
 from vllm._custom_ops import scaled_fp4_quant
 from vllm.model_executor.kernels.linear.nvfp4.b12x import (
     B12xNvFp4LinearKernel,
+    run_b12x_nvfp4_serialized_linear,
 )
 from vllm.model_executor.kernels.linear.nvfp4.base import NvFp4LinearLayerConfig
 from vllm.model_executor.layers.fused_moe import RoutedExperts
@@ -32,7 +33,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
-from vllm.utils.b12x import get_b12x_blockscaled
 
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
@@ -66,8 +66,12 @@ class Nvfp4OnlineLinearMethod(_Fp8OnlineLinearBase):
         replace_parameter(layer, "weight_global_scale", global_scale.reciprocal())
         replace_parameter(layer, "input_global_scale_inv", torch.ones_like(amax))
         replace_parameter(layer, "alpha", layer.weight_global_scale.clone())
-        self.kernel.process_weights_after_loading(layer)
+        # The quantized head scales its activations per call and runs the
+        # serialized GEMM, so its exact-M plans are serialized declarations
+        # even though the activations arrive in BF16.
+        layer.b12x_nvfp4_serialized_activations = not self.use_a16
         layer.b12x_activation_mode = "a16" if self.use_a16 else "quantized"
+        self.kernel.process_weights_after_loading(layer)
         layer._already_called_process_weights_after_loading = True
 
     def apply(
@@ -85,18 +89,15 @@ class Nvfp4OnlineLinearMethod(_Fp8OnlineLinearBase):
             input_scale.reciprocal(),
             is_sf_swizzled_layout=True,
         )
-        blockscaled = get_b12x_blockscaled()
-        assert blockscaled is not None
-        output = blockscaled.mm_nvfp4(
+        output = run_b12x_nvfp4_serialized_linear(
             x_packed,
             x_scale,
-            layer.weight,
-            layer.weight_scale,
-            input_scale * layer.weight_global_scale,
-            out_dtype=x.dtype,
+            bias,
+            int(layer.weight.shape[0]),
+            x.dtype,
+            layer.b12x_layer_name,
+            alpha=input_scale * layer.weight_global_scale,
         )
-        if bias is not None:
-            output = output + bias
         return output.view(*x.shape[:-1], layer.weight.shape[0])
 
 

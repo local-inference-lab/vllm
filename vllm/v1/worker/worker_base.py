@@ -92,6 +92,7 @@ class WorkerBase:
         # Device and model state
         self.device: torch.device | None = None
         self.model_runner: nn.Module | None = None
+        self._b12x_startup_coordinator = None
 
         # IR op priority and torch-wrap state are constant for the worker's
         # lifetime.
@@ -120,6 +121,79 @@ class WorkerBase:
             Compilation times (language_model, encoder) in seconds.
         """
         raise NotImplementedError
+
+    def begin_b12x_preparation(self, *, stage: str = "weights") -> dict[str, object]:
+        """Participate in startup when this worker has no b12x providers."""
+        from vllm.distributed.parallel_state import get_world_group
+        from vllm.v1.worker.b12x_startup import B12xPreparationCoordinator
+
+        del stage
+        if self._b12x_startup_coordinator is not None:
+            raise RuntimeError("b12x preparation is already active")
+        coordinator = B12xPreparationCoordinator(
+            None,
+            (),
+            global_rank=self.rank,
+            world_group=get_world_group(),
+        )
+        self._b12x_startup_coordinator = coordinator
+        return coordinator.status()
+
+    def advance_b12x_preparation(
+        self, *, cancel_tuning: bool = False
+    ) -> dict[str, object]:
+        coordinator = self._b12x_startup_coordinator
+        if coordinator is None:
+            raise RuntimeError("b12x preparation is not active")
+        outcome = coordinator.advance(cancel_tuning=cancel_tuning)
+        if outcome["done"]:
+            self._b12x_startup_coordinator = None
+        return outcome
+
+    def run_b12x_preparation(
+        self, *, control_address: tuple[str, int], capture_output: bool = False,
+    ) -> dict[str, object]:
+        """Run preparation on the worker thread with asynchronous host progress."""
+        import pickle
+        import time
+        from datetime import timedelta
+
+        import torch.distributed as dist
+
+        store = dist.TCPStore(
+            *control_address, is_master=False, timeout=timedelta(seconds=30),
+        )
+        from vllm.v1.executor._b12x_output import PreparationOutput
+
+        output_count = 0
+
+        def publish_output(line):
+            nonlocal output_count
+            output_count += 1
+            store.set(f"output/{self.rank}/{output_count}", line)
+            store.set(f"output_count/{self.rank}", str(output_count))
+
+        with PreparationOutput(publish_output, enabled=capture_output):
+            reported = 0.0
+            while True:
+                outcome = self.advance_b12x_preparation(cancel_tuning=store.check(["cancel"]))
+                if outcome["done"]:
+                    break
+                now = time.monotonic()
+                if now - reported >= 0.2:
+                    store.set(f"progress/{self.rank}", pickle.dumps(outcome))
+                    reported = now
+        store.set(f"progress/{self.rank}", pickle.dumps(outcome))
+        return outcome
+
+    def abort_b12x_preparation(self) -> dict[str, object]:
+        coordinator = self._b12x_startup_coordinator
+        if coordinator is None:
+            return {"done": True, "cleanup_complete": True}
+        try:
+            return coordinator.abort()
+        finally:
+            self._b12x_startup_coordinator = None
 
     def check_health(self) -> None:
         """Basic health check (override for device-specific checks)."""

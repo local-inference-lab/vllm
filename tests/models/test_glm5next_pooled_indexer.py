@@ -225,10 +225,10 @@ def test_glm53_adaptive_sparse_metadata_replays_device_boundaries(
         )
 
         cache = torch.empty((10, 256, 528), dtype=torch.uint8, device=device)
+        kv_c = torch.randn((2560, 512), dtype=torch.bfloat16, device=device)
+        slots = torch.arange(2560, dtype=torch.int64, device=device)
         sparse_mla.concat_and_cache_glm_next_mla_fp8(
-            torch.randn((2560, 512), dtype=torch.bfloat16, device=device),
-            cache,
-            torch.arange(2560, dtype=torch.int64, device=device),
+            kv_c, cache, slots, plan=sparse_mla.plan_cache_writer(kv_c, cache, slots)
         )
         query = torch.randn((12, 16, 512), dtype=torch.bfloat16, device=device)
         indices = torch.full((12, 2051), -1, dtype=torch.int32, device=device)
@@ -249,7 +249,8 @@ def test_glm53_adaptive_sparse_metadata_replays_device_boundaries(
                 page_size=256,
             )
         )
-        scratch = torch.empty(plan.layout.nbytes, dtype=torch.uint8, device=device)
+        (spec,) = plan.scratch_specs()
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
 
         def attention(request_ids, lengths):
             physical, counts = triton_convert_req_index_to_global_index(
@@ -260,7 +261,7 @@ def test_glm53_adaptive_sparse_metadata_replays_device_boundaries(
                 NUM_TOPK_TOKENS=2051,
                 return_valid_counts=True,
             )
-            return sparse_mla.run(
+            result = sparse_mla.run(
                 sparse_mla.bind(
                     plan,
                     scratch=scratch,
@@ -271,6 +272,8 @@ def test_glm53_adaptive_sparse_metadata_replays_device_boundaries(
                     selected_lengths=counts,
                 )
             )
+            # The extend mode also returns the log-sum-exp rows.
+            return result[0] if isinstance(result, tuple) else result
 
         observed_attention = attention(
             captured.req_id_per_token, captured.cache_seq_lens_per_token
@@ -741,7 +744,9 @@ def test_glm53_decode_table_capacity_uses_batched_token_limit() -> None:
     indexer.max_seqs = 16
     indexer.max_model_len = 4096
     indexer.dcp_world_size = 1
-    indexer.indexer_op = SimpleNamespace(max_model_len=4096 // 4)
+    indexer.indexer_op = SimpleNamespace(
+        max_model_len=4096 // 4, set_b12x_index_cache=lambda *args, **kwargs: None
+    )
     indexer.scratch = Glm5NextIndexerScratch(
         indexer.max_tokens, indexer.max_seqs, device
     )
@@ -989,24 +994,16 @@ def test_glm53_packed_tail_scores_through_existing_c4_indexer() -> None:
     weights = torch.ones((1, 32), dtype=torch.float32, device=device)
     block_table = torch.tensor([[virtual_page]], dtype=torch.int32, device=device)
     seq_lens = torch.tensor([2], dtype=torch.int32, device=device)
-    plan = module.plan(
-        module.Caps(
-            device=device,
-            num_q_heads=32,
-            max_q_rows=1,
-            max_page_table_width=1,
-            topk=512,
-            mode="decode",
-        )
-    )
-    scratch = tuple(
-        torch.empty(shape, dtype=dtype, device=device)
-        for shape, dtype in plan.shapes_and_dtypes()
+    caps = module.Caps(
+        device=device,
+        num_q_heads=32,
+        max_q_rows=1,
+        max_page_table_width=1,
+        topk=512,
+        mode="decode",
     )
     output = torch.empty((1, 512), dtype=torch.int32, device=device)
-    binding = module.bind(
-        plan,
-        scratch=scratch,
+    operands = dict(
         q_fp8=q,
         query_weights=weights,
         index_k_cache=_flatten_index_cache(index_cache),
@@ -1015,6 +1012,12 @@ def test_glm53_packed_tail_scores_through_existing_c4_indexer() -> None:
         active_width=torch.ones(1, dtype=torch.int32, device=device),
         output_indices=output,
     )
+    plan = module.plan(caps, invocation=module.invocation_from_tensors(caps, **operands))
+    scratch = tuple(
+        torch.empty(spec.shape, dtype=spec.dtype, device=device)
+        for spec in plan.scratch_specs()
+    )
+    binding = module.bind(plan, scratch=scratch, **operands)
     module.run(binding)
     torch.accelerator.synchronize()
     assert set(output[0, :2].tolist()) == {0, 1}

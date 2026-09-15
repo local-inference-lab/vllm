@@ -43,6 +43,16 @@ class ModelSpecificAttnMetadata:
 
 
 class ModelState(ABC):
+    single_request_prefill_cudagraph_tokens: int = 0
+    """Optional exact-row, single-request piecewise capture outside decode sizes."""
+
+    def can_use_single_request_prefill_graph(self, num_reqs, num_tokens, req_ids):
+        return False
+
+    def finalize_cudagraph_inputs(self, model_inputs, cg_mode):
+        """Refresh model-owned inputs after capture attention metadata is staged."""
+        return None
+
     specialize_full_decode_graphs: ClassVar[bool] = False
     """Capture decode-specific graphs alongside general full-model graphs."""
     supports_prompt_embeds: ClassVar[bool] = False
@@ -61,7 +71,6 @@ class ModelState(ABC):
         self.model = model
         self.device = device
 
-        self.max_model_len = self.model_config.max_model_len
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
         self.inputs_embeds_size = self.model_config.get_inputs_embeds_size()
@@ -100,6 +109,11 @@ class ModelState(ABC):
                     and observability_config.enable_mm_processor_stats
                 ),
             )
+
+    @property
+    def max_model_len(self) -> int:
+        """Use the worker's effective context limit, including KV auto-fit."""
+        return self.model_config.max_model_len
 
     def get_supported_generation_tasks(self) -> tuple[GenerationTask, ...]:
         from vllm.model_executor.models.interfaces import (

@@ -27,6 +27,7 @@ Contract with the runtime (``b12x.comm.roce.API_VERSION`` ==
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from contextlib import contextmanager
 
 import torch
@@ -39,6 +40,12 @@ from vllm.distributed.device_communicators.b12x_pcie_all_reduce import (
 )
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
+from vllm.utils.b12x import (
+    B12xPreparationUnit,
+    B12xWorkload,
+    PreparationResourceUnavailableError,
+    register_b12x_unit_provider,
+)
 
 logger = init_logger(__name__)
 
@@ -56,6 +63,8 @@ class B12xRoceAllReduce:
         group: ProcessGroup,
         device_group: ProcessGroup | None,
         device: torch.device,
+        *,
+        global_ranks: Sequence[int] | None = None,
     ) -> None:
         self.disabled = True
         self.group = group
@@ -66,6 +75,14 @@ class B12xRoceAllReduce:
         self._runtime = None
         self._announced = False
         self._announced_gather = False
+        self.global_ranks = tuple(
+            int(rank) for rank in (
+                global_ranks if global_ranks is not None else range(self.world_size)
+            )
+        )
+        if len(self.global_ranks) != self.world_size:
+            raise ValueError("RoCE global ranks must match the process group")
+        self._plan = None
 
         if device_group is None:
             logger.warning("RoCEnante requires a CUDA process group.")
@@ -102,6 +119,7 @@ class B12xRoceAllReduce:
             logger.warning("RoCEnante initialization failed: %s", exc)
             return
         self.disabled = False
+        register_b12x_unit_provider(self)
         if self.rank == 0:
             logger.info(
                 "Using RoCEnante (b12x one-shot RoCE collectives): world=%d, hcas=%s, "
@@ -169,6 +187,65 @@ class B12xRoceAllReduce:
                 + ")"
             )
         return None
+    def _request_name(self) -> str:
+        ranks = "-".join(map(str, self.global_ranks))
+        return f"distributed.roce.{ranks}.collectives"
+
+    def get_b12x_preparation_units(
+        self, owner: object, workload: B12xWorkload
+    ) -> Sequence[B12xPreparationUnit]:
+        """Declare the already-connected RDMA runtime; never discover a transport."""
+        if owner is not self:
+            raise ValueError("RoCE preparation owner mismatch")
+        if workload.stage != "weights" or self.disabled or self._runtime is None:
+            return ()
+        from b12x.comm import roce
+        from b12x.comm.roce import _preparation
+
+        query = roce.query_from_runtime(
+            self._runtime,
+            surface="AllReduce.all_reduce",
+            call={"dtypes": ("float16", "bfloat16", "float32")},
+            topology="roce_rdma",
+            peer_hosts=tuple(f"rank:{rank}" for rank in self.global_ranks),
+        )
+        self._plan = roce.plan(query, runtime=self._runtime)
+
+        def prepare(state):
+            # These buffers occupy the already-owned RoCE slots only while the
+            # session primes the concrete native protocol. They are not a
+            # serving fallback or a substitute for caller outputs.
+            buffers = [
+                torch.zeros(16 // dtype.itemsize, dtype=dtype, device=self.device)
+                for dtype in (torch.float16, torch.bfloat16, torch.float32)
+            ]
+            calls = [_preparation.prepared_call(state, inp=buffer) for buffer in buffers]
+            gather = _preparation.prepared_gather_call(state, inp=buffers[1])
+            return calls[0].__class__(
+                run=lambda: [call.run() for call in (*calls, gather)],
+                output=tuple(call.output for call in (*calls, gather)),
+            )
+
+        request = self._plan.request(
+            name=self._request_name(),
+            prepare_call=prepare,
+        )
+        return (
+            B12xPreparationUnit(
+                name="ROCE_ALL_REDUCE",
+                key=(self.global_ranks,),
+                requests=(request,),
+                stage="weights",
+                autotune=not workload.eager_only,
+            ),
+        )
+
+    def _prepared_plan(self):
+        if self._plan is None:
+            raise PreparationResourceUnavailableError(
+                "RoCE all-reduce has no declared plan"
+            )
+        return self._plan
 
     def check_health(self) -> None:
         """Fail-stop check of the runtime.
@@ -196,7 +273,7 @@ class B12xRoceAllReduce:
                 str(inp.dtype).replace("torch.", ""),
                 envs.VLLM_ROCE_ALLREDUCE_MAX_SIZE,
             )
-        return self._runtime.all_reduce(inp)
+        return self._runtime.all_reduce(inp, plan=self._prepared_plan())
 
     def should_all_gather(self, inp: torch.Tensor, dim: int) -> bool:
         return not self.disabled and self._runtime.should_all_gather(inp, dim)
@@ -214,7 +291,9 @@ class B12xRoceAllReduce:
                 str(inp.dtype).replace("torch.", ""),
                 dim,
             )
-        return self._runtime.all_gather(inp, dim=dim)
+        return self._runtime.all_gather(
+            inp, dim=dim, plan=self._prepared_plan()
+        )
 
     def supports_fused_add_rms_norm(self) -> bool:
         return False
@@ -224,10 +303,7 @@ class B12xRoceAllReduce:
         if self.disabled:
             yield
             return
-        # Compile and allocate scratch before capture; the runtime refuses both
-        # inside a graph.  vLLM's gather shards have 16-byte rows (direct
-        # layout), so the padded-gather scratch is not requested here.
-        self._runtime.prepare((torch.bfloat16, torch.float16, torch.float32))
+        self._prepared_plan()
         with self._runtime.capture(stream=stream):
             yield
 
@@ -235,4 +311,5 @@ class B12xRoceAllReduce:
         if self._runtime is not None:
             self._runtime.close()
             self._runtime = None
+        self._plan = None
         self.disabled = True

@@ -362,6 +362,10 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
+    # Actual per-request verification depths selected by adaptive verification.
+    # None when the scheduled draft lengths are exact.
+    num_verified_draft_tokens: list[int] | None = None
+
     # Per-step routed experts data captured by the worker.
     # ``routing_data`` shape: (num_scheduled_tokens, num_layers,
     #                         num_experts_per_tok); expert IDs as uint8/uint16.

@@ -121,6 +121,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 group=self.cpu_group,
                 device_group=self.device_group,
                 device=self.device,
+                global_ranks=self.ranks,
             )
         elif self.use_roce_allreduce and self.world_size > 1:
             # RoCEnante: multi-node DGX Spark one-shot RDMA collectives
@@ -131,6 +132,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 group=self.cpu_group,
                 device_group=self.device_group,
                 device=self.device,
+                global_ranks=self.ranks,
             )
 
         if use_torch_symm_mem and current_platform.is_cuda():

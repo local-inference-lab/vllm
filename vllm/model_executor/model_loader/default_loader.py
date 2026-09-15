@@ -37,6 +37,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
 )
+from vllm.model_executor.weight_transfer import finish_weight_transfers
 from vllm.tracing import instrument
 from vllm.transformers_utils.repo_utils import list_filtered_repo_files
 
@@ -488,12 +489,10 @@ class DefaultModelLoader(BaseModelLoader):
         self._init_ep_weight_filter(model_config)
 
         loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
+        finish_weight_transfers()
 
         self.counter_after_loading_weights = time.perf_counter()
-        logger.info_once(
-            "Loading weights took %.2f seconds",
-            self.counter_after_loading_weights - self.counter_before_loading_weights,
-        )
+        self._log_loading_time()
         # We only enable strict check for non-quantized models
         # that have loaded weights tracking by default.
         default_enable_weights_track = (
@@ -506,6 +505,12 @@ class DefaultModelLoader(BaseModelLoader):
         )
         if enable_weights_track:
             self.track_weights_loading(model, loaded_weights)
+
+    def _log_loading_time(self) -> None:
+        logger.info_once(
+            "Loading weights took %.2f seconds",
+            self.counter_after_loading_weights - self.counter_before_loading_weights,
+        )
 
     def track_weights_loading(
         self, model: nn.Module, loaded_weights: set[str] | None

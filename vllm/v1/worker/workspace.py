@@ -31,6 +31,9 @@ _GiB = 1024**3
 # Global workspace manager instance
 _manager: "WorkspaceManager | None" = None
 _workspace_lane: ContextVar[int] = ContextVar("vllm_workspace_lane", default=0)
+_preallocated_workspace: ContextVar[torch.Tensor | None] = ContextVar(
+    "vllm_preallocated_workspace", default=None
+)
 _cuda_graph_capture_resources: ContextVar[list[Any] | None] = ContextVar(
     "vllm_cuda_graph_capture_resources", default=None
 )
@@ -49,6 +52,20 @@ def use_workspace_lane(lane: int) -> Iterator[None]:
 
 
 @contextmanager
+def use_preallocated_workspace(scratch: torch.Tensor | None) -> Iterator[None]:
+    """Bind a caller-reserved scratch view; this scope never allocates storage."""
+    token = _preallocated_workspace.set(scratch)
+    try:
+        yield
+    finally:
+        _preallocated_workspace.reset(token)
+
+
+def current_preallocated_workspace() -> torch.Tensor | None:
+    return _preallocated_workspace.get()
+
+
+@contextmanager
 def collect_cuda_graph_capture_resources() -> Iterator[list[Any]]:
     """Collect objects whose storage is referenced by one CUDA graph.
 
@@ -63,6 +80,16 @@ def collect_cuda_graph_capture_resources() -> Iterator[list[Any]]:
     token = _cuda_graph_capture_resources.set(resources)
     try:
         yield resources
+    finally:
+        _cuda_graph_capture_resources.reset(token)
+
+
+@contextmanager
+def suspend_cuda_graph_capture_resources() -> Iterator[None]:
+    """Do not retain temporary owners from an uncaptured, in-place operation."""
+    token = _cuda_graph_capture_resources.set(None)
+    try:
+        yield
     finally:
         _cuda_graph_capture_resources.reset(token)
 
@@ -216,6 +243,10 @@ class WorkspaceManager:
             round_up(_compute_bytes(shape, dtype), 256)
             for shape, dtype in shapes_and_dtypes
         )
+        required_bytes = max(
+            required_bytes,
+            max(map(self._workspace_size_bytes, self._current_workspaces), default=0),
+        )
         undersized = [
             workspace_id
             for workspace_id, workspace in enumerate(self._current_workspaces)
@@ -294,11 +325,26 @@ class WorkspaceManager:
                     f"{current_size / _MB:.2f} MB. "
                     "Workspace growth is not allowed after locking."
                 )
+            if self._device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+                # Growth frees and reallocates the slot; inside a capture that
+                # bakes a transient address into the graph and, across TP
+                # ranks, diverges the captured launch sequence.
+                raise RuntimeError(
+                    f"Workspace growth requested from '{get_caller_info()}' during "
+                    f"CUDA graph capture ({current_size / _MB:.2f} MB -> "
+                    f"{required_bytes / _MB:.2f} MB). Size the workspace before capture."
+                )
 
             # Only resize the requesting ubatch/lane workspace. Other slots
             # resize lazily on their next get_simultaneous call.
             # Resizing all ubatches here would orphan the other ubatch's
             # old tensor when it still holds views into it (DBO leak).
+            # Kernels already queued on any stream may still read the slot
+            # being replaced; releasing its segment to the driver below is not
+            # stream-ordered, so wait for the device first. Growth happens only
+            # before the workspace is locked, never in steady-state serving.
+            if self._device.type == "cuda" and current_workspace is not None:
+                torch.cuda.synchronize(self._device)
             self._current_workspaces[workspace_id] = None
             del current_workspace
             # Release the freed segment back to CUDA so the caching

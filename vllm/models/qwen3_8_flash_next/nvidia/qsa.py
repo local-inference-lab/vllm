@@ -28,8 +28,12 @@ from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.b12x import (
-    B12xWarmupUnit,
+    set_b12x_preparation_provider,
+    B12xPreparationUnit,
+    B12xWorkload,
+    PreparationResourceUnavailableError,
     get_b12x_qsa,
+    get_b12x_projection_workspaces,
     get_b12x_scratch_buffers,
 )
 from vllm.utils.torch_utils import (
@@ -63,7 +67,10 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     get_kv_quant_mode,
 )
-from vllm.v1.worker.workspace import retain_cuda_graph_capture_resource
+from vllm.v1.worker.workspace import (
+    retain_cuda_graph_capture_resource,
+    use_preallocated_workspace,
+)
 
 from ..common.qsa_cache import (
     canonical_qsa_rope_positions,
@@ -151,147 +158,17 @@ class _StagedQSAMetadata:
     num_requests: int
 
 
-@dataclass(frozen=True)
+@dataclass
 class _QSAContextPlan:
-    """A QSA capacity plan with caller-owned scratch and exact-width page tables."""
+    """Immutable declaration metadata and generation-owned preparation buffers."""
 
     max_seq_len: int
+    caps: Any
     plan: Any
-    scratch: torch.Tensor
-    main_block_table: torch.Tensor
-    compressed_block_table: torch.Tensor
+    main_block_table: torch.Tensor | None = None
+    compressed_block_table: torch.Tensor | None = None
+    prepared_plan: Any | None = None
 
-
-class _B12xQSAWarmup:
-    """Compile every planned QSA prefill and decode capacity before serving."""
-
-    def get_b12x_warmup_unit(
-        self,
-        layer: nn.Module,
-        token_counts: tuple[int, ...],
-        output_dtype: torch.dtype,
-    ) -> B12xWarmupUnit:
-        del output_dtype
-        context_bindings = getattr(layer, "_qsa_prefill_bindings", ())
-        plan = context_bindings[-1].plan if context_bindings else None
-        caps = None if plan is None else plan.caps
-        prefill_rows = int(layer.max_tokens) - int(layer.max_speculative_tokens)
-
-        def compile() -> None:
-            live_contexts = getattr(layer, "_qsa_prefill_bindings", ())
-            if not live_contexts:
-                return
-            qsa = get_b12x_qsa()
-            if qsa is None:
-                raise RuntimeError("b12x QSA disappeared before kernel warmup")
-            caps = live_contexts[-1].plan.caps
-            device = caps.device
-            warmup_rows = max(prefill_rows, int(layer.max_decode_rows))
-            # Padded requests compile the transaction without touching live caches.
-            inputs = {
-                "query": torch.zeros(
-                    (warmup_rows, caps.q_heads, caps.head_dim),
-                    dtype=torch.bfloat16,
-                    device=device,
-                ),
-                "index_query": torch.zeros(
-                    (warmup_rows, caps.index_heads, caps.index_head_dim),
-                    dtype=torch.bfloat16,
-                    device=device,
-                ),
-                "raw_index_key": torch.zeros(
-                    (warmup_rows, caps.index_head_dim),
-                    dtype=torch.bfloat16,
-                    device=device,
-                ),
-                "request_ids": torch.full(
-                    (warmup_rows,), -1, dtype=torch.int32, device=device
-                ),
-                "query_positions": torch.full(
-                    (warmup_rows,), -1, dtype=torch.int64, device=device
-                ),
-                "rope_positions": torch.full(
-                    (warmup_rows, caps.position_axes),
-                    -1,
-                    dtype=torch.int64,
-                    device=device,
-                ),
-                "sequence_lengths": torch.zeros(
-                    caps.max_batch, dtype=torch.int32, device=device
-                ),
-                "query_start_loc": torch.zeros(
-                    caps.max_batch + 1, dtype=torch.int32, device=device
-                ),
-                "num_accepted_tokens": torch.ones(
-                    caps.max_batch, dtype=torch.int32, device=device
-                ),
-                "is_prefilling": torch.zeros(
-                    caps.max_batch, dtype=torch.bool, device=device
-                ),
-            }
-            row_inputs = {
-                "query",
-                "index_query",
-                "raw_index_key",
-                "request_ids",
-                "query_positions",
-                "rope_positions",
-            }
-
-            def compile_rows(context: _QSAContextPlan, rows: int) -> None:
-                dynamic = {
-                    key: value[:rows] if key in row_inputs else value
-                    for key, value in inputs.items()
-                }
-                qsa.run(layer._bind_qsa_context(context), **dynamic)
-                if layer.overlap_input_projections and rows <= 16:
-                    layer._index_ready.record(current_stream())
-                    qsa.run(
-                        layer._bind_qsa_context(context, overlap=True),
-                        **dynamic,
-                        index_ready=layer._index_ready,
-                    )
-
-            for context in live_contexts:
-                qsa.prewarm(layer._bind_qsa_context(context), rows=prefill_rows)
-                if layer.overlap_input_projections and prefill_rows <= 16:
-                    compile_rows(context, prefill_rows)
-            decode_context = getattr(layer, "_qsa_decode_context", None)
-            if decode_context is not None:
-                for rows in sorted(set(token_counts)):
-                    if 0 < rows <= decode_context.plan.caps.max_q_rows:
-                        compile_rows(decode_context, rows)
-                if getattr(layer, "_share_mtp_indices", False):
-                    rows = int(layer.max_seqs)
-                    qsa.run(
-                        layer._bind_qsa_context(decode_context),
-                        query=inputs["query"][:rows],
-                        request_ids=inputs["request_ids"][:rows],
-                        query_positions=inputs["query_positions"][:rows],
-                        reuse=qsa.DraftSelectionReuse(
-                            source_rows=layer._mtp_source_rows
-                        ),
-                    )
-
-        return B12xWarmupUnit(
-            name="QSA prefill",
-            key=(
-                type(layer),
-                None if caps is None else caps.device,
-                None if caps is None else int(caps.q_heads),
-                None if caps is None else int(caps.kv_heads),
-                None if caps is None else int(caps.head_dim),
-                None if caps is None else int(caps.main_page_size),
-                None if caps is None else int(caps.selection_width),
-                None if caps is None else caps.kv_dtype,
-                tuple(int(context.max_seq_len) for context in context_bindings),
-                prefill_rows,
-                tuple(token_counts),
-                int(layer.max_decode_rows),
-                bool(getattr(layer, "_share_mtp_indices", False)),
-            ),
-            compile=compile,
-        )
 
 
 class Qwen3_8FlashNextQSAMetadataBuilder(B12xPagedMetadataBuilder):
@@ -946,6 +823,8 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         self.max_tokens = int(scheduler.max_num_batched_tokens)
         self.max_seqs = int(scheduler.max_num_seqs)
         self.max_seq_len = int(model_config.max_model_len)
+        self._qsa_model_config = model_config
+        self._qsa_cache_config = vllm_config.cache_config
         self.max_speculative_tokens = int(vllm_config.num_speculative_tokens)
         if self.max_speculative_tokens > _QSA_MAX_SPECULATIVE_TOKENS:
             raise NotImplementedError(
@@ -1092,18 +971,247 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         )
         self._main_block_table: torch.Tensor | None = None
         self._compressed_cache: torch.Tensor | None = None
-        self._qsa_plan: Any | None = None
         self._qsa_decode_context: _QSAContextPlan | None = None
         self._qsa_prefill_bindings: tuple[_QSAContextPlan, ...] = ()
-        self._qsa_scratch: torch.Tensor | None = None
         self._b12x_diagnostic_request_ids: torch.Tensor | None = None
-        self.b12x_warmup_provider = _B12xQSAWarmup()
-
+        self._b12x_preparation_prefix = self.layer_name
+        if not getattr(self, "b12x_preparation_suppressed", False):
+            set_b12x_preparation_provider(self, self)
         _register_qsa_compilation_context(
             vllm_config.compilation_config,
             self.layer_name,
             self,
         )
+
+    def _qsa_request_name(self, mode: str, context: _QSAContextPlan, rows: int) -> str:
+        return (
+            f"{self._b12x_preparation_prefix}.qsa.{mode}."
+            f"context{context.max_seq_len}.m{rows}"
+        )
+
+    def _qsa_caps(self, **geometry):
+        sections = None
+        if self.position_axes == 3:
+            sections = getattr(self.rotary_emb, "mrope_section", None)
+            if sections is None:
+                raise RuntimeError("QSA M-RoPE requires mrope_section")
+            sections = tuple(map(int, sections))
+        return get_b12x_qsa().Caps(
+            max_batch=self.max_seqs, max_raw_state_slots=self.max_seqs,
+            max_speculative_tokens=self.max_speculative_tokens,
+            q_heads=self.num_heads, kv_heads=self.num_kv_heads, head_dim=self.head_dim,
+            index_heads=self.index_heads, index_kv_heads=1, index_head_dim=self.index_head_dim,
+            index_rotary_dim=int(self.rotary_emb.rotary_dim),
+            compress_ratio=self.compress_ratio, budget=self.budget,
+            position_axes=self.position_axes, mrope_sections=sections,
+            mrope_interleaved=bool(getattr(self.rotary_emb, "mrope_interleaved", False)),
+            rms_norm_eps=float(self.indexer.q_layernorm.variance_epsilon),
+            dtype=torch.bfloat16, kv_dtype=self.kv_cache_kernel_dtype, **geometry,
+        )
+
+    def _ensure_qsa_context_buffers(self, context):
+        """Materialize only after the registry admitted the complete envelope."""
+        caps = context.caps
+        if self._selector_done.device is None:
+            with torch.cuda.device(caps.device):
+                self._selector_done.record(current_stream())
+        if context.main_block_table is None:
+            context.main_block_table = torch.full(
+                (caps.max_batch, caps.main_table_width), -1,
+                dtype=torch.int32, device=caps.device,
+            )
+            context.compressed_block_table = (
+                context.main_block_table if caps.main_table_width == caps.compressed_table_width
+                else torch.full((caps.max_batch, caps.compressed_table_width), -1,
+                                dtype=torch.int32, device=caps.device)
+            )
+        if context is self._qsa_prefill_bindings[-1]:
+            self._main_block_table = context.main_block_table
+        if self._share_mtp_indices and self._mtp_anchor_storage is None:
+            full_caps = self._qsa_prefill_bindings[-1].caps
+            layout = get_b12x_qsa().DraftSelectionPlan(
+                caps.device, full_caps.max_q_rows, full_caps.selection_width,
+            )
+            (spec,) = layout.storage_specs()
+            self._mtp_anchor_storage = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+            self._mtp_anchor_state = layout.bind(storage=self._mtp_anchor_storage)
+            self._mtp_anchor_state.reset()
+            self._mtp_source_rows.fill_(-1)
+
+    def get_b12x_preparation_units(
+        self, layer: torch.nn.Module, workload: B12xWorkload,
+    ) -> tuple[B12xPreparationUnit, ...]:
+        from b12x.preparation import MemoryRequirements, PersistentMemory
+
+        if layer is not self:
+            raise ValueError("QSA preparation owner mismatch")
+        if self._qsa_decode_context is None or not self._qsa_prefill_bindings:
+            return ()
+        if max(workload.token_counts) > self.max_tokens:
+            raise ValueError("QSA workload exceeds declared token capacity")
+        contexts = (
+            *(("prefill", context) for context in self._qsa_prefill_bindings),
+            ("decode", self._qsa_decode_context),
+        )
+        requests = []
+        # QSA specializes on planned capacity, not exact live M. Each original
+        # context's native compiler covers its dynamic decode/prefill row paths.
+        for mode, context in contexts:
+            def memory(config, detected, context=context):
+                native = context.plan._memory_requirements(config, detected)
+                caps = context.caps
+                widths = (caps.main_table_width,) if caps.main_table_width == caps.compressed_table_width else (
+                    caps.main_table_width, caps.compressed_table_width,
+                )
+                required = caps.max_batch * sum(widths) * torch.int32.itemsize
+                resident = 0
+                if context.main_block_table is not None:
+                    resident = context.main_block_table.numel() * torch.int32.itemsize
+                    if context.compressed_block_table is not context.main_block_table:
+                        resident += context.compressed_block_table.numel() * torch.int32.itemsize
+                persistent = [PersistentMemory(
+                    key=(self, "qsa_tables", id(context)),
+                    required_nbytes=required, resident_nbytes=resident,
+                )]
+                if self._share_mtp_indices and context is self._qsa_prefill_bindings[-1]:
+                    layout = get_b12x_qsa().DraftSelectionPlan(
+                        caps.device, caps.max_q_rows, caps.selection_width,
+                    )
+                    required_anchor = sum(spec.nbytes for spec in layout.storage_specs())
+                    resident_anchor = 0 if self._mtp_anchor_storage is None else self._mtp_anchor_storage.numel()
+                    persistent.append(PersistentMemory(
+                        key=(self, "qsa_anchor"), required_nbytes=required_anchor,
+                        resident_nbytes=resident_anchor,
+                    ))
+                return MemoryRequirements(
+                    scratch=native.scratch, persistent=(*native.persistent, *persistent),
+                )
+            declaration = replace(context.plan, _memory_requirements=memory)
+            context.prepared_plan = declaration
+            requests.append(declaration.request(
+                name=self._qsa_request_name(mode, context, context.caps.max_q_rows),
+                prepare_call=self._qsa_prepare_call(context),
+                benchmark_call=self._qsa_prepare_call(context),
+            ))
+        if not requests:
+            return ()
+        return (B12xPreparationUnit(
+            name="QSA",
+            key=self._b12x_preparation_prefix,
+            requests=tuple(requests),
+            stage="state",
+            autotune=not workload.eager_only,
+        ),)
+
+    def _qsa_prepare_call(self, context: _QSAContextPlan):
+        from b12x.preparation import PreparedCall
+
+        def prepare(state):
+            caps, device = state.caps, state.caps.device
+            self._ensure_qsa_context_buffers(context)
+            impl = cast(Qwen3_8FlashNextQSAImpl, self.impl)
+            main_k, main_v = impl._kv_cache_views(self.kv_cache)
+            rows = min(
+                caps.max_q_rows, caps.max_seq_len,
+                main_k.shape[0] * caps.main_page_size,
+                self._compressed_cache.shape[0] * caps.compressed_page_size * caps.compress_ratio,
+            )
+            if context is self._qsa_decode_context:
+                rows = min(rows, caps.max_speculative_tokens + 1)
+            if rows < 1:
+                raise PreparationResourceUnavailableError("QSA primer requires a live cache page")
+            main_pages = triton.cdiv(rows, caps.main_page_size)
+            compressed_pages = triton.cdiv(rows // caps.compress_ratio, caps.compressed_page_size)
+            output = torch.empty((rows, caps.q_heads, caps.head_dim),
+                                 dtype=torch.bfloat16, device=device)
+            query = torch.empty_like(output)
+            source = torch.randn_like(query)
+            projection = torch.empty(
+                (rows, (caps.index_heads + caps.index_kv_heads) * caps.index_head_dim),
+                dtype=torch.bfloat16, device=device,
+            )
+            projection_source = torch.randn_like(projection)
+            index_query = projection[:, :caps.index_heads * caps.index_head_dim].unflatten(
+                -1, (caps.index_heads, caps.index_head_dim),
+            )
+            raw_index_key = projection[:, caps.index_heads * caps.index_head_dim:]
+            request_ids = torch.zeros(rows, dtype=torch.int32, device=device)
+            positions = torch.arange(rows, dtype=torch.int64, device=device)
+            rope_positions = positions[:, None].expand(rows, caps.position_axes).contiguous()
+            sequence_lengths = torch.zeros(caps.max_batch, dtype=torch.int32, device=device)
+            sequence_lengths[0] = rows
+            starts = torch.full((caps.max_batch + 1,), rows, dtype=torch.int32, device=device)
+            starts[0] = 0
+            slots = torch.full_like(self._raw_state_slot_ids, -1)
+            slots[0] = 0
+            accepted = torch.zeros(caps.max_batch, dtype=torch.int32, device=device)
+            accepted[0] = 1
+            prefilling = torch.zeros(caps.max_batch, dtype=torch.bool, device=device)
+            prefilling[0] = context is not self._qsa_decode_context
+            staged = _StagedQSAMetadata(
+                request_ids=request_ids, logical_positions=positions,
+                sequence_lengths=sequence_lengths, state_slot_ids=slots,
+                state_is_fresh=torch.ones(caps.max_batch, dtype=torch.bool, device=device),
+                num_accepted_tokens=accepted, query_start_loc=starts,
+                is_prefilling=prefilling, num_requests=1,
+            )
+            binding = self._bind_qsa_context(context, staged, output, state=state)
+            targets = [
+                self.kv_cache[:main_pages], self._raw_k_ring[:1],
+                self._compressed_cache[:compressed_pages],
+                self._raw_logical_positions[:1], self._raw_rope_positions[:1],
+                self._raw_interval_start_positions[:1],
+                context.main_block_table, self._selected_positions[:rows],
+            ]
+            if context.compressed_block_table is not context.main_block_table:
+                targets.append(context.compressed_block_table)
+            if self._mtp_anchor_storage is not None:
+                targets.append(self._mtp_anchor_storage)
+            snapshots = tuple((target, target.clone()) for target in targets)
+            key_source = torch.randn(main_k[:main_pages].shape, device=device).mul_(0.25).to(main_k.dtype)
+            value_source = torch.randn(main_v[:main_pages].shape, device=device).mul_(0.25).to(main_v.dtype)
+            main_ids = torch.arange(main_pages, dtype=torch.int32, device=device)
+            compressed_ids = torch.arange(compressed_pages, dtype=torch.int32, device=device)
+
+            def reset():
+                main_k[:main_pages].copy_(key_source)
+                main_v[:main_pages].copy_(value_source)
+                self._compressed_cache[:compressed_pages].zero_()
+                self._raw_k_ring[:1].zero_()
+                self._raw_logical_positions[:1].fill_(-1)
+                self._raw_rope_positions[:1].fill_(-1)
+                self._raw_interval_start_positions[:1].fill_(-1)
+                context.main_block_table.fill_(-1)
+                context.main_block_table[0, :main_pages].copy_(main_ids)
+                if context.compressed_block_table is not context.main_block_table:
+                    context.compressed_block_table.fill_(-1)
+                context.compressed_block_table[0, :compressed_pages].copy_(compressed_ids)
+                output.fill_(float("nan"))
+                if self._mtp_anchor_state is not None:
+                    self._mtp_anchor_state.reset()
+
+            def produce():
+                query.copy_(source)
+                projection.copy_(projection_source)
+
+            def restore():
+                from b12x.preparation.types import _close_all
+                _close_all(
+                    (lambda target=target, saved=saved: target.copy_(saved))
+                    for target, saved in snapshots
+                )
+
+            return PreparedCall(
+                run=lambda: state.run_for_preparation(
+                    binding, query=query, index_query=index_query,
+                    raw_index_key=raw_index_key, request_ids=request_ids,
+                    query_positions=positions, rope_positions=rope_positions,
+                    sequence_lengths=sequence_lengths, query_start_loc=starts,
+                    num_accepted_tokens=accepted, is_prefilling=prefilling,
+                ),
+                output=output, produce=produce, reset=reset, restore=restore,
+            )
+        return prepare
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
@@ -1157,6 +1265,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         super().bind_kv_cache(kv_cache)
+        self.max_seq_len = int(self._qsa_model_config.max_model_len)
         if kv_cache.ndim != 4 or int(kv_cache.shape[1]) != 2:
             raise ValueError(
                 "QSA requires a native B12x [pages,2,page,packed_kv] cache"
@@ -1206,90 +1315,82 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         qsa = get_b12x_qsa()
         if qsa is None or not qsa.is_supported():
             raise RuntimeError("b12x QSA is unavailable on the current device")
-        sections = None
-        if self.position_axes == 3:
-            mrope_section = getattr(self.rotary_emb, "mrope_section", None)
-            if mrope_section is None:
-                raise RuntimeError("QSA M-RoPE requires mrope_section")
-            sections = tuple(map(int, mrope_section))
-        caps_kwargs = {
-            "device": kv_cache.device,
-            "max_batch": self.max_seqs,
-            "max_raw_state_slots": self.max_seqs,
-            "num_main_cache_pages": planned_main_cache_pages,
-            "num_compressed_cache_pages": planned_compressed_cache_pages,
-            "main_page_size": main_page_size,
-            "compressed_page_size": compressed_page_size,
-            "max_speculative_tokens": self.max_speculative_tokens,
-            "q_heads": self.num_heads,
-            "kv_heads": self.num_kv_heads,
-            "head_dim": self.head_dim,
-            "index_heads": self.index_heads,
-            "index_kv_heads": 1,
-            "index_head_dim": self.index_head_dim,
-            "index_rotary_dim": int(self.rotary_emb.rotary_dim),
-            "compress_ratio": self.compress_ratio,
-            "budget": self.budget,
-            "position_axes": self.position_axes,
-            "mrope_sections": sections,
-            "mrope_interleaved": bool(
-                getattr(self.rotary_emb, "mrope_interleaved", False)
-            ),
-            "rms_norm_eps": float(self.indexer.q_layernorm.variance_epsilon),
-            "dtype": torch.bfloat16,
-            "kv_dtype": self.kv_cache_kernel_dtype,
-        }
-        prefill_plans = tuple(
-            (
-                capacity,
-                qsa.plan(
-                    qsa.Caps(
-                        max_q_rows=self.max_tokens,
-                        max_seq_len=capacity,
-                        **caps_kwargs,
-                    )
-                ),
+        def make_context(*, max_q_rows: int, max_seq_len: int):
+            caps = self._qsa_caps(
+                device=kv_cache.device, max_q_rows=max_q_rows, max_seq_len=max_seq_len,
+                main_page_size=main_page_size, compressed_page_size=compressed_page_size,
+                num_main_cache_pages=planned_main_cache_pages,
+                num_compressed_cache_pages=planned_compressed_cache_pages,
             )
+            projection_row_stride = (
+                (caps.index_heads + caps.index_kv_heads) * caps.index_head_dim
+            )
+            declaration = qsa.plan(
+                caps,
+                invocation=qsa.invocation_from_descriptors(caps, operands={
+                    "request_ids": {"dtype": "int32", "strides": (1,)},
+                    "rope_positions": {
+                        "dtype": "int64", "strides": (caps.position_axes, 1),
+                    },
+                    "index_query": {
+                        "dtype": "bfloat16",
+                        "strides": (
+                            projection_row_stride, caps.index_head_dim, 1,
+                        ),
+                    },
+                    "raw_index_key": {
+                        "dtype": "bfloat16", "strides": (projection_row_stride, 1),
+                    },
+                    "main_k_cache": {
+                        "dtype": str(main_k_cache.dtype).removeprefix("torch."),
+                        "strides": tuple(main_k_cache.stride()),
+                    },
+                    "main_v_cache": {
+                        "dtype": str(main_v_cache.dtype).removeprefix("torch."),
+                        "strides": tuple(main_v_cache.stride()),
+                    },
+                    "main_block_table": {
+                        "dtype": "int32", "strides": (caps.main_table_width, 1),
+                    },
+                    "compressed_k_cache": {
+                        "dtype": str(compressed_cache.dtype).removeprefix("torch."),
+                        "strides": tuple(compressed_cache.stride()),
+                    },
+                    "compressed_block_table": {
+                        "dtype": "int32",
+                        "strides": (caps.compressed_table_width, 1),
+                    },
+                    **{
+                        name: {
+                            "dtype": str(tensor.dtype).removeprefix("torch."),
+                            "strides": tuple(tensor.stride()),
+                        }
+                        for name, tensor in (
+                            ("raw_k_ring", self._raw_k_ring),
+                            ("raw_logical_positions", self._raw_logical_positions),
+                            ("raw_rope_positions", self._raw_rope_positions),
+                            ("raw_interval_start_positions", self._raw_interval_start_positions),
+                            ("raw_state_slot_ids", self._raw_state_slot_ids),
+                            ("index_q_norm_weight", self.indexer.q_layernorm.weight),
+                            ("index_k_norm_weight", self.indexer.k_layernorm.weight),
+                            ("rope_cos", self.rotary_emb.cos_sin_cache.chunk(2, dim=-1)[0]),
+                            ("rope_sin", self.rotary_emb.cos_sin_cache.chunk(2, dim=-1)[1]),
+                        )
+                    },
+                }),
+            )
+            return _QSAContextPlan(max_seq_len=max_seq_len, caps=caps, plan=declaration)
+
+        prefill_contexts = tuple(
+            make_context(max_q_rows=self.max_tokens, max_seq_len=capacity)
             for capacity in _qsa_prefill_context_capacities(
                 qsa_max_seq_len,
                 min(qsa_max_seq_len, max(self.max_tokens, self.budget)),
             )
         )
-        full_plan = prefill_plans[-1][1]
-        if self._share_mtp_indices:
-            anchor_plan = full_plan.draft_selection_plan()
-            (anchor_spec,) = anchor_plan.storage_specs()
-            self._mtp_anchor_storage = torch.empty(
-                anchor_spec.shape,
-                dtype=anchor_spec.dtype,
-                device=anchor_spec.device,
-            )
-            self._mtp_anchor_state = anchor_plan.bind(storage=self._mtp_anchor_storage)
-            self._mtp_anchor_state.reset()
-            self._mtp_source_rows.fill_(-1)
-        # A decode plan reserves rows for the verifier batch, not the prefill
-        # budget. This keeps the score workspace wide enough to avoid unnecessary
-        # top-k carry passes while covering the complete configured context.
-        decode_plan = qsa.plan(
-            qsa.Caps(
-                max_q_rows=self.max_decode_rows,
-                max_seq_len=qsa_max_seq_len,
-                **caps_kwargs,
-            )
+        decode_context = make_context(
+            max_q_rows=self.max_decode_rows, max_seq_len=qsa_max_seq_len,
         )
-        (scratch,) = get_b12x_scratch_buffers(full_plan)
-
-        def scratch_prefix(plan: Any) -> torch.Tensor:
-            specs = tuple(plan.scratch_specs())
-            if len(specs) != 1:
-                raise RuntimeError("QSA requires one caller-owned scratch buffer")
-            spec = specs[0]
-            elements = math.prod(spec.shape)
-            if spec.dtype != scratch.dtype or elements > scratch.numel():
-                raise RuntimeError(
-                    "QSA bounded-plan scratch must be a prefix of full-capacity scratch"
-                )
-            return scratch.flatten()[:elements].view(spec.shape)
 
         cos_sin = self.rotary_emb.cos_sin_cache
         rope_cos, rope_sin = cos_sin.chunk(2, dim=-1)
@@ -1299,42 +1400,9 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             or rope_sin.shape != rope_cos.shape
         ):
             raise RuntimeError("QSA received an unexpected main RoPE cache layout")
-        prefill_bindings: list[_QSAContextPlan] = []
-        for capacity, plan in (*prefill_plans, (qsa_max_seq_len, decode_plan)):
-            plan_scratch = scratch_prefix(plan)
-            main_table_width = int(plan.caps.main_table_width)
-            compressed_table_width = int(plan.caps.compressed_table_width)
-            main_block_table = torch.full(
-                (self.max_seqs, main_table_width),
-                -1,
-                dtype=torch.int32,
-                device=kv_cache.device,
-            )
-            compressed_block_table = (
-                main_block_table
-                if compressed_table_width == main_table_width
-                else torch.full(
-                    (self.max_seqs, compressed_table_width),
-                    -1,
-                    dtype=torch.int32,
-                    device=kv_cache.device,
-                )
-            )
-            prefill_bindings.append(
-                _QSAContextPlan(
-                    max_seq_len=capacity,
-                    plan=plan,
-                    scratch=plan_scratch,
-                    main_block_table=main_block_table,
-                    compressed_block_table=compressed_block_table,
-                )
-            )
-        full_context = prefill_bindings[-2]
-        self._main_block_table = full_context.main_block_table
-        self._qsa_plan = full_plan
-        self._qsa_decode_context = prefill_bindings[-1]
-        self._qsa_prefill_bindings = tuple(prefill_bindings[:-1])
-        self._qsa_scratch = scratch
+        self._qsa_decode_context = decode_context
+        self._qsa_prefill_bindings = prefill_contexts
+        self._main_block_table = None
 
     def _bind_qsa_context(
         self,
@@ -1343,20 +1411,35 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         output: torch.Tensor | None = None,
         *,
         overlap: bool = False,
+        state: object | None = None,
     ):
         impl = cast(Qwen3_8FlashNextQSAImpl, self.impl)
         main_k_cache, main_v_cache = impl._kv_cache_views(self.kv_cache)
         rope_cos, rope_sin = self.rotary_emb.cos_sin_cache.chunk(2, dim=-1)
-        rows = context.plan.caps.max_q_rows
-        draft_selection = None
-        if self._share_mtp_indices:
-            draft_selection = self._mtp_anchor_state
-            if draft_selection is None:
-                raise RuntimeError(
-                    "QSA draft anchor storage was not bound to its cache"
+        rows = context.caps.max_q_rows if output is None else int(output.shape[0])
+        if state is not None:
+            self._ensure_qsa_context_buffers(context)
+            binder = state.bind_for_preparation
+            # Trial and prepare factories own their scratch; the runtime
+            # binding below draws from the workspace manager instead.
+            specs = tuple(state.scratch_specs())
+            if len(specs) != 1:
+                raise RuntimeError("QSA preparation requires exactly one scratch buffer")
+            scratch = torch.empty(
+                specs[0].shape, dtype=specs[0].dtype, device=specs[0].device
+            )
+            max_q_rows = state.caps.max_q_rows
+        else:
+            plan = context.prepared_plan
+            if plan is None:
+                raise PreparationResourceUnavailableError(
+                    f"{self._b12x_preparation_prefix} lacks prepared QSA context {context.max_seq_len}"
                 )
-        return context.plan.bind(
-            scratch=context.scratch,
+            binder = lambda **kwargs: get_b12x_qsa().bind(plan, **kwargs)
+            (scratch,) = get_b12x_scratch_buffers(plan)
+            max_q_rows = context.caps.max_q_rows
+        return binder(
+            scratch=scratch,
             main_block_table=context.main_block_table,
             compressed_block_table=context.compressed_block_table,
             main_k_cache=main_k_cache,
@@ -1376,19 +1459,17 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             rope_cos=rope_cos,
             rope_sin=rope_sin,
             output=self._qsa_output[:rows] if output is None else output,
-            selected_positions=self._selected_positions[:rows],
+            selected_positions=self._selected_positions[:max_q_rows],
             selection_stream=aux_stream() if overlap else None,
             selection_done=self._selector_done if overlap else None,
-            draft_selection=draft_selection,
+            draft_selection=self._mtp_anchor_state,
         )
 
     def unbind_kv_cache(self) -> None:
         self._mtp_anchor_state = None
         self._mtp_anchor_storage = None
         self._qsa_decode_context = None
-        self._qsa_plan = None
         self._qsa_prefill_bindings = ()
-        self._qsa_scratch = None
         self._compressed_cache = None
         self._main_block_table = None
         super().unbind_kv_cache()
@@ -2119,9 +2200,14 @@ def _qsa_input_projections(
     layer_name: LayerNameType,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_forward_context().no_compile_layers[_resolve_layer_name(layer_name)]
+    qkv_scratch, index_scratch = get_b12x_projection_workspaces(
+        hidden_states.shape[0], layer.qkv_proj, layer.indexer.index_qk_proj
+    )
     if hidden_states.shape[0] > 16 or not torch.cuda.is_current_stream_capturing():
-        qkv, _ = layer.qkv_proj(hidden_states)
-        index_qk, _ = layer.indexer.index_qk_proj(hidden_states)
+        with use_preallocated_workspace(qkv_scratch):
+            qkv, _ = layer.qkv_proj(hidden_states)
+        with use_preallocated_workspace(index_scratch):
+            index_qk, _ = layer.indexer.index_qk_proj(hidden_states)
         return qkv, index_qk
 
     stream = aux_stream()
@@ -2129,9 +2215,10 @@ def _qsa_input_projections(
     main_stream = current_stream()
     stream.wait_stream(main_stream)
     hidden_states.record_stream(stream)
-    with torch.cuda.stream(stream):
+    with torch.cuda.stream(stream), use_preallocated_workspace(index_scratch):
         index_qk, _ = layer.indexer.index_qk_proj(hidden_states)
-    qkv, _ = layer.qkv_proj(hidden_states)
+    with use_preallocated_workspace(qkv_scratch):
+        qkv, _ = layer.qkv_proj(hidden_states)
     main_stream.wait_stream(stream)
     index_qk.record_stream(main_stream)
     return qkv, index_qk

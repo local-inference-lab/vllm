@@ -14,7 +14,6 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.model_executor.warmup.b12x_warmup import b12x_warmup
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
@@ -182,7 +181,6 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         max_tokens = worker.scheduler_config.max_num_batched_tokens
         deep_gemm_warmup(model, max_tokens)
 
-    b12x_warmup(worker, cudagraph_capture_sizes)
 
     minimax_m3_msa_warmup(worker)
 

@@ -963,9 +963,18 @@ class NvmlCudaPlatform(CudaPlatformBase):
     @classmethod
     @with_nvml_context
     def log_warnings(cls):
-        device_ids: int = pynvml.nvmlDeviceGetCount()
-        if device_ids > 1:
-            device_names = [cls._get_physical_device_name(i) for i in range(device_ids)]
+        device_ids = (
+            torch.cuda._parse_visible_devices()
+            if cls.device_control_env_var in os.environ
+            else range(pynvml.nvmlDeviceGetCount())
+        )
+        if len(device_ids) > 1:
+            device_names = [
+                cls._get_physical_device_name(
+                    cls.device_control_id_to_physical_device_id(str(device_id))
+                )
+                for device_id in device_ids
+            ]
             if (
                 len(set(device_names)) > 1
                 and os.environ.get("CUDA_DEVICE_ORDER") != "PCI_BUS_ID"

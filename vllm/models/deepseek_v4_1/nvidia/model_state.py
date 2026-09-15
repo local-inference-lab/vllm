@@ -5,6 +5,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.models.deepseek_v4_1.ced import CED_WINDOW, CEDState, ced_decoder_start
@@ -103,6 +104,16 @@ class DeepseekV41ModelState(DefaultModelState):
             )
             hf = self.model_config.hf_config
             self.ced_state.warmup(hf.hidden_size, hf.hc_mult)
+            parallel = vllm_config.parallel_config
+            if (
+                is_breakable_cudagraph_enabled()
+                and self.max_num_tokens == 4096
+                and parallel.decode_context_parallel_size == 1
+                and parallel.pipeline_parallel_size == 1
+                and parallel.data_parallel_size == 1
+                and vllm_config.lora_config is None
+            ):
+                self.single_request_prefill_cudagraph_tokens = 4096
         depth = model.token_lookback_depth
         self.lookback_token_ids: torch.Tensor | None = None
         if depth > 0:
@@ -147,6 +158,20 @@ class DeepseekV41ModelState(DefaultModelState):
         super().remove_request(req_id)
         self._ced_prompt_logprobs.discard(req_id)
         self._ced_prefix_start.pop(req_id, None)
+
+    def can_use_single_request_prefill_graph(self, num_reqs, num_tokens, req_ids):
+        return (
+            self.single_request_prefill_cudagraph_tokens > 0
+            and num_reqs == 1
+            and num_tokens == self.single_request_prefill_cudagraph_tokens
+            and not any(req in self._ced_prompt_logprobs for req in req_ids)
+        )
+
+    def finalize_cudagraph_inputs(self, model_inputs, cg_mode):
+        if cg_mode == CUDAGraphMode.PIECEWISE:
+            # prepare_attn stages CED after prepare_dummy_inputs. Capture the
+            # same compact branch and persistent index buffer used by serving.
+            model_inputs["ced_indices"] = self.get_ced_indices()
 
     def get_ced_indices(self) -> torch.Tensor | None:
         return None if self.ced_state is None else self.ced_state.get_indices()

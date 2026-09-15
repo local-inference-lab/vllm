@@ -476,7 +476,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
     def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
-
         self.weight_dtype = "mxfp4"
         self.mxfp4_backend, self.experts_cls = select_deepseek_v4_mxfp4_moe_backend(moe)
 
@@ -596,9 +595,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         w13_weight_scale = torch.nn.Parameter(
             torch.zeros(
-                num_experts,
-                self.moe.w13_num_shards * intermediate_size_per_partition,
-                hidden_size // mxfp4_block,
+                (
+                    num_experts,
+                    self.moe.w13_num_shards * intermediate_size_per_partition,
+                    hidden_size // mxfp4_block,
+                ),
                 dtype=scale_dtype,
             ),
             requires_grad=False,
@@ -624,9 +625,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         w2_weight_scale = torch.nn.Parameter(
             torch.zeros(
-                num_experts,
-                hidden_size,
-                intermediate_size_per_partition // mxfp4_block,
+                (
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // mxfp4_block,
+                ),
                 dtype=scale_dtype,
             ),
             requires_grad=False,
@@ -835,6 +838,56 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer=layer,
         )
 
+    def prepare_workspace(
+        self, hidden_states: torch.Tensor, shared_workspace_size: int
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+        if self.mxfp4_backend not in (
+            Mxfp4MoeBackend.B12X_MXFP4_MXFP8,
+            Mxfp4MoeBackend.B12X_MXFP4_BF16,
+        ):
+            return super().prepare_workspace(hidden_states, shared_workspace_size)
+        assert self.moe_kernel is not None
+        impl = self.moe_kernel.impl
+        assert isinstance(impl, mk.FusedMoEKernelModularImpl)
+        rows = hidden_states.shape[0]
+        workspace, shared_workspace = impl._allocate_buffers(
+            hidden_states.dtype,
+            self.output_dtype,
+            hidden_states.device,
+            rows,
+            rows,
+            self.moe.intermediate_size_per_partition,
+            self.moe.hidden_dim,
+            self.moe.experts_per_token,
+            self.moe.num_experts,
+            self.moe.num_local_experts,
+            None,
+            self.moe.activation,
+            shared_workspace_size,
+        )
+        assert shared_workspace is not None
+        return workspace, shared_workspace
+
+    def apply_with_workspace(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts: SharedExperts | None,
+        shared_experts_input: torch.Tensor | None,
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        return self.apply(
+            layer,
+            x,
+            topk_weights,
+            topk_ids,
+            shared_experts,
+            shared_experts_input,
+            workspace=workspace,
+        )
+
     def apply(
         self,
         layer: RoutedExperts,
@@ -843,6 +896,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         topk_ids: torch.Tensor,
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
@@ -858,6 +912,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             expert_map=layer.expert_map,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            workspace=workspace,
         )
 
     def apply_monolithic(

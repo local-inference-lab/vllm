@@ -149,6 +149,32 @@ def _apply_to_device_comms(
         action(dc)
 
 
+def register_b12x_collective_describer(owner, describe, *, group=None) -> bool:
+    """Attach exact native collective metadata to an existing TP communicator.
+
+    This never constructs a process group or a transport.  A producer may be
+    loaded on a non-native configuration; in that case it simply has no native
+    preparation obligation.
+    """
+    if group is None:
+        try:
+            group = get_tp_group()
+        except AssertionError:
+            return False
+    communicator = getattr(group, "device_communicator", None)
+    native = getattr(communicator, "b12x_ar_comm", None)
+    # Descriptor registration is an opt-in for the concrete native PCIe
+    # transport only.  A similarly shaped third-party communicator must not
+    # acquire b12x preparation obligations.
+    from vllm.distributed.device_communicators.b12x_pcie_all_reduce import (
+        B12xPcieAllReduce,
+    )
+    if not isinstance(native, B12xPcieAllReduce) or native.disabled:
+        return False
+    native.register_describer(owner, describe)
+    return True
+
+
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()

@@ -193,7 +193,8 @@ def test_v41_mixed_cache_pages_preserve_request_partial_states(monkeypatch):
     assert (views["index"][blocks["index"]] == 23).all()
 
 
-def test_v41_full_context_packs_shared_global_cache_without_page_inflation():
+@pytest.mark.parametrize("swa_size", [None, 32, 64, 128])
+def test_v41_full_context_packs_shared_global_cache_without_page_inflation(swa_size):
     from types import SimpleNamespace
 
     from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention, _Cache
@@ -202,6 +203,7 @@ def test_v41_full_context_packs_shared_global_cache_without_page_inflation():
 
     config = _mock_vllm_config("BLHNC")
     config.cache_config.block_size = 256
+    config.cache_config.swa_block_size = swa_size
     config.kv_transfer_config = None
     config.compilation_config.static_forward_context = {}
     config.speculative_config = None
@@ -219,6 +221,7 @@ def test_v41_full_context_packs_shared_global_cache_without_page_inflation():
             config, prefix + ".swa_cache", kind="swa", window=128, draft=layer >= 40
         )
         specs[swa.prefix] = swa.get_kv_cache_spec(config)
+        assert specs[swa.prefix].block_size == (128 if swa_size is None else swa_size)
         if layer not in (2, 8, 14, 20):
             continue
         ratio = 1 if layer == 20 else 2

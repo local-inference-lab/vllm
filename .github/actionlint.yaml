@@ -3,5 +3,6 @@
 self-hosted-runner:
   labels:
     - vllm-runners
+    - lil-wheel-builder
     # Not yet in actionlint's known-label set.
     - macos-26

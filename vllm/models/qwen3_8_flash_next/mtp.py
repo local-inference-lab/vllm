@@ -4,7 +4,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import weakref
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 import regex as re
@@ -15,7 +16,6 @@ import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, replace, set_current_vllm_config
 from vllm.distributed import get_pp_group
-from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -35,8 +35,22 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils.b12x import get_b12x_mtp_feedback, get_b12x_scratch_buffers
-from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.utils.b12x import (
+    set_b12x_preparation_provider,
+    B12xPreparationUnit,
+    B12xWorkload,
+    PreparationResourceUnavailableError,
+    b12x_layer,
+    b12x_layer_prefix,
+    get_b12x_mtp_feedback,
+    register_b12x_layer,
+)
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _encode_layer_name,
+    _resolve_layer_name,
+    direct_register_custom_op,
+)
 
 from .config import Qwen3_8FlashNextTextConfig
 from .hyperconnection import (
@@ -190,6 +204,7 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             self.hidden_size,
+            prefix=maybe_prefix(prefix, "embed_tokens"),
         )
         draft_vllm_config = _make_draft_vllm_config(
             vllm_config,
@@ -270,43 +285,28 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
         )
         if self.supports_mtp_prefill_compaction:
             self._prefill_output_indices = self._decode_output_indices
-        caps = _mtp_api().Caps(
+        self._feedback_caps = _mtp_api().Caps(
             device=device,
             max_tokens=max_tokens,
             hidden_size=self.hidden_size,
             streams=self.hc_count,
             dtype=torch.bfloat16,
         )
-        self._feedback_plan = _mtp_api().plan(caps)
-        (feedback_scratch,) = get_b12x_scratch_buffers(self._feedback_plan)
-        self.register_buffer(
-            "_feedback_scratch",
-            feedback_scratch,
-            persistent=False,
-        )
-        factory = dict(dtype=torch.bfloat16, device=device)
-        self.register_buffer(
-            "_feedback_token_embedding",
-            torch.empty(max_tokens, self.hidden_size, **factory),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_feedback_multi_state",
-            torch.empty(max_tokens, self.hc_count, self.hidden_size, **factory),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_feedback_output",
-            torch.empty(max_tokens, self.hc_count, self.hidden_size, **factory),
-            persistent=False,
-        )
-
+        self._plan = None
+        self._feedback_scratch_spec: tuple[tuple[int, ...], torch.dtype] | None = None
+        self.register_buffer("_feedback_token_embedding", None, persistent=False)
+        self.register_buffer("_feedback_multi_state", None, persistent=False)
+        self.register_buffer("_feedback_output", None, persistent=False)
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
         self.prefix = prefix
-
+        b12x_name = b12x_layer_prefix(self)
+        self._b12x_layer_name = _encode_layer_name(b12x_name)
+        register_b12x_layer(b12x_name, self)
+        if not getattr(self, "b12x_preparation_suppressed", False):
+            set_b12x_preparation_provider(self, self)
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -348,22 +348,207 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
             if compact is not None:
                 compact(source_rows)
 
+    @property
+    def _feedback_request_name(self) -> str:
+        return f"{self.prefix}.mtp.feedback"
+
+    @staticmethod
+    def _alignment(tensor: torch.Tensor) -> int:
+        pointer = tensor.data_ptr()
+        return min(16, pointer & -pointer) if pointer else 16
+
+    def _feedback_plan(self):
+        return _mtp_api().plan(
+            self._feedback_caps,
+            invocation={
+                "input_alignments": (
+                    16,
+                    16,
+                    self._alignment(self.pre_fc_norm_embedding.weight),
+                    self._alignment(self.pre_fc_norm_hidden.weight),
+                )
+            },
+        )
+
+    def _feedback_resources_ready(self) -> bool:
+        weights = (
+            self.pre_fc_norm_embedding.weight,
+            self.pre_fc_norm_hidden.weight,
+            self.fc_embedding.weight,
+            self.fc_hidden.weight,
+        )
+        return not any(weight.is_meta for weight in weights)
+
+    def get_b12x_preparation_units(
+        self, layer: torch.nn.Module, workload: B12xWorkload
+    ) -> Sequence[B12xPreparationUnit]:
+        if layer is not self:
+            raise ValueError("MTP preparation owner mismatch")
+        if workload.stage != "weights":
+            return ()
+        if not self._feedback_resources_ready():
+            return ()
+        if workload.max_tokens > self._feedback_caps.max_tokens:
+            raise PreparationResourceUnavailableError(
+                f"{self.prefix} MTP feedback capacity "
+                f"{self._feedback_caps.max_tokens} cannot serve "
+                f"{workload.max_tokens} tokens"
+            )
+        plan = self._feedback_plan()
+        self._plan = plan
+        request = plan.request(
+            name=self._feedback_request_name,
+            prepare_call=self._prepare_feedback_call,
+            benchmark_call=self._feedback_benchmark_factory(),
+        )
+        return (
+            B12xPreparationUnit(
+                name="MTP_FEEDBACK",
+                key=(self.prefix, workload.max_tokens),
+                requests=(request,),
+                stage="weights",
+                autotune=not workload.eager_only,
+            ),
+        )
+
+    def _publish_feedback_storage(self, state) -> None:
+        """Publish fixed feedback storage while keeping arena views transient."""
+        spec, = state.layout.scratch_specs()
+        self._feedback_scratch_spec = (spec.shape, spec.dtype)
+        factory = dict(device=spec.device, dtype=torch.bfloat16)
+        tokens = state.layout.caps.max_tokens
+        self._feedback_token_embedding = torch.empty(
+            (tokens, self.hidden_size), **factory
+        )
+        self._feedback_multi_state = torch.empty(
+            (tokens, self.hc_count, self.hidden_size), **factory
+        )
+        self._feedback_output = torch.empty(
+            state.layout.output_storage_shape(), **factory
+        )
+
+    def _prepare_feedback_call(self, state):
+        self._publish_feedback_storage(state)
+        token_embedding = self._feedback_token_embedding
+        multi_state = self._feedback_multi_state
+        output = self._feedback_output
+        assert token_embedding is not None
+        assert multi_state is not None
+        assert output is not None
+        assert self._feedback_scratch_spec is not None
+        # Trial scratch belongs to the trial; the serving workspace is drawn
+        # from only inside the feedback op body.
+        shape, dtype = self._feedback_scratch_spec
+        scratch = torch.empty(shape, dtype=dtype, device=token_embedding.device)
+        return self._feedback_call(
+            state,
+            scratch=scratch,
+            token_embedding=token_embedding,
+            multi_state=multi_state,
+            output=output,
+        )
+
+    def _feedback_benchmark_factory(self):
+        shared = None
+
+        def factory(state):
+            nonlocal shared
+            tensors = None if shared is None else tuple(ref() for ref in shared)
+            if tensors is None or any(tensor is None for tensor in tensors):
+                spec, = state.layout.scratch_specs()
+                scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+                tensor_factory = dict(device=spec.device, dtype=torch.bfloat16)
+                tokens = state.layout.caps.max_tokens
+                token_embedding = torch.empty(
+                    (tokens, self.hidden_size), **tensor_factory
+                )
+                multi_state = torch.empty(
+                    (tokens, self.hc_count, self.hidden_size), **tensor_factory
+                )
+                output = torch.empty(
+                    state.layout.output_storage_shape(), **tensor_factory
+                )
+                tensors = scratch, token_embedding, multi_state, output
+                shared = tuple(weakref.ref(tensor) for tensor in tensors)
+            scratch, token_embedding, multi_state, output = tensors
+            return self._feedback_call(
+                state,
+                scratch=scratch,
+                token_embedding=token_embedding,
+                multi_state=multi_state,
+                output=output,
+            )
+
+        return factory
+
+    def _feedback_call(
+        self,
+        state,
+        *,
+        scratch,
+        token_embedding,
+        multi_state,
+        output,
+    ):
+        from b12x.preparation import PreparedCall
+
+        def produce() -> None:
+            # Prime the installed fixed route with real-shaped, nonzero
+            # activations while borrowing the loaded norm and FC weights.
+            token_embedding.fill_(0.125)
+            multi_state.fill_(0.25)
+
+        def reset() -> None:
+            scratch.zero_()
+            output.zero_()
+
+        def run():
+            return state.run_tensors(
+                token_embedding,
+                multi_state,
+                self.pre_fc_norm_embedding.weight,
+                self.pre_fc_norm_hidden.weight,
+                self.fc_embedding.weight,
+                self.fc_hidden.weight,
+                scratch,
+                output,
+                eps=self.config.rms_norm_eps,
+            )
+
+        return PreparedCall(
+            run=run,
+            produce=produce,
+            reset=reset,
+            capture_safe=False,
+        )
+
     def _run_feedback(
         self,
         token_embedding: torch.Tensor,
         multi_state: torch.Tensor,
     ) -> None:
+        plan = self._plan
+        if plan is None or self._feedback_scratch_spec is None:
+            raise PreparationResourceUnavailableError(
+                f"{self.prefix} MTP feedback is not prepared"
+            )
+        from vllm.v1.worker.workspace import current_workspace_manager
+
+        (scratch,) = current_workspace_manager().get_simultaneous(
+            self._feedback_scratch_spec
+        )
         num_tokens = token_embedding.shape[0]
-        if num_tokens > self._feedback_plan.caps.max_tokens:
+        if num_tokens > self._feedback_caps.max_tokens:
             raise ValueError(
                 "Qwen3.8-Flash-Next MTP feedback capacity exceeded: "
-                f"{num_tokens}/{self._feedback_plan.caps.max_tokens} tokens"
+                f"{num_tokens}/{self._feedback_caps.max_tokens} tokens"
             )
         multi_state = multi_state.reshape(num_tokens, self.hc_count, self.hidden_size)
         self._feedback_token_embedding[:num_tokens].copy_(token_embedding)
         self._feedback_multi_state[:num_tokens].copy_(multi_state)
-        binding = self._feedback_plan.bind(
-            scratch=self._feedback_scratch,
+        binding = _mtp_api().bind(
+            plan,
+            scratch=scratch,
             token_embedding=self._feedback_token_embedding,
             multi_state=self._feedback_multi_state,
             token_norm_weight=self.pre_fc_norm_embedding.weight,
@@ -380,12 +565,16 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
         token_embedding: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        if self._plan is None or self._feedback_output is None:
+            raise PreparationResourceUnavailableError(
+                f"{self.prefix} MTP feedback is not prepared"
+            )
         if torch.compiler.is_compiling():
             torch.ops.vllm.qwen3_8_flash_next_mtp_feedback(
                 token_embedding,
                 hidden_states,
                 self._feedback_output,
-                self.prefix,
+                self._b12x_layer_name,
             )
         else:
             self._run_feedback(token_embedding, hidden_states)
@@ -457,9 +646,9 @@ def _mtp_feedback_op(
     token_embedding: torch.Tensor,
     multi_state: torch.Tensor,
     output: torch.Tensor,
-    layer_name: str,
+    layer_name: LayerNameType,
 ) -> None:
-    layer = get_forward_context().no_compile_layers[layer_name]
+    layer = b12x_layer(_resolve_layer_name(layer_name))
     layer._run_feedback(token_embedding, multi_state)
 
 
@@ -467,7 +656,7 @@ def _mtp_feedback_fake(
     token_embedding: torch.Tensor,
     multi_state: torch.Tensor,
     output: torch.Tensor,
-    layer_name: str,
+    layer_name: LayerNameType,
 ) -> None:
     return
 

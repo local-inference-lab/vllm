@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -34,6 +35,31 @@ from vllm.platforms import current_platform
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 logger = init_logger(__name__)
+
+def _register_b12x_embedding_collective(owner, prefix: str, width: int,
+                                        tp_size: int) -> None:
+    if tp_size <= 1:
+        return
+    from vllm.distributed.parallel_state import register_b12x_collective_describer
+
+    def describe(requirements):
+        if not prefix:
+            raise ValueError(
+                "B12X embedding collective preparation requires a stable module prefix"
+            )
+        from vllm.distributed.device_communicators.b12x_pcie_all_reduce import (
+            B12xPcieInvocation,
+        )
+        return tuple(
+            B12xPcieInvocation(
+                name=f"{prefix}.embedding_all_reduce.m{rows}",
+                operation="all_reduce", shape=(rows, width),
+                dtype=requirements.output_dtype,
+            )
+            for rows in requirements.token_counts
+        )
+
+    register_b12x_collective_describer(owner, describe)
 
 
 def _supports_default_lm_head_quantization(
@@ -305,7 +331,9 @@ class VocabParallelEmbedding(PluggableLayer):
             self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = tp_rank
         self.num_embeddings = num_embeddings
-        self.padding_size = padding_size
+        # The global padded vocabulary must satisfy both the requested storage
+        # alignment and the TP partitioning constraint for every world size.
+        self.padding_size = math.lcm(padding_size, self.tp_size)
         self.org_vocab_size = org_num_embeddings or num_embeddings
         num_added_embeddings = num_embeddings - self.org_vocab_size
         self.org_vocab_size_padded = pad_vocab_size(
@@ -433,6 +461,9 @@ class VocabParallelEmbedding(PluggableLayer):
             weight_loader=self.weight_loader,
         )
         self.update_param_tp_status()
+        _register_b12x_embedding_collective(
+            self, prefix, self.embedding_dim, self.tp_size,
+        )
 
     def update_param_tp_status(self):
         for param in self.parameters():

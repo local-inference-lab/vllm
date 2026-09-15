@@ -2703,10 +2703,27 @@ class Scheduler(SchedulerInterface):
             if scheduled_spec_token_ids and (
                 generated_token_ids or self.num_sampled_tokens_per_step == 0
             ):
-                num_draft_tokens = len(scheduled_spec_token_ids)
+                num_scheduled_draft_tokens = len(scheduled_spec_token_ids)
+                num_draft_tokens = num_scheduled_draft_tokens
+                if model_runner_output.num_verified_draft_tokens is not None:
+                    num_draft_tokens = model_runner_output.num_verified_draft_tokens[
+                        req_index
+                    ]
+                    assert 0 <= num_draft_tokens <= num_scheduled_draft_tokens
+                if scheduler_output.num_invalid_spec_tokens:
+                    num_valid_draft_tokens = num_scheduled_draft_tokens - (
+                        scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
+                    )
+                    num_draft_tokens = min(
+                        num_draft_tokens,
+                        num_valid_draft_tokens,
+                    )
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
-                num_rejected = num_draft_tokens - num_accepted
+                assert num_accepted <= num_draft_tokens
+                # Every unaccepted scheduler placeholder must be rolled back,
+                # including drafts omitted by adaptive verification.
+                num_rejected = num_scheduled_draft_tokens - num_accepted
                 if self.acceptance_length_controller is not None:
                     adaptive_num_drafts += 1
                     adaptive_num_draft_tokens += num_draft_tokens
@@ -2724,20 +2741,10 @@ class Scheduler(SchedulerInterface):
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
                     num_accepted_tokens=num_accepted,
-                    num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
-                    request_id=req_id,
                 )
-                if request.spec_decode_metrics is not None:
-                    # Exclude grammar-invalidated drafts from the proposed
-                    # count, mirroring make_spec_decoding_stats; the accepted
-                    # bucket (j) is unaffected.
-                    adj_draft_tokens = num_draft_tokens
-                    if scheduler_output.num_invalid_spec_tokens:
-                        adj_draft_tokens -= (
-                            scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
-                        )
+                if request.spec_decode_metrics is not None and num_draft_tokens:
                     request.spec_decode_metrics.observe(
-                        num_draft_tokens=adj_draft_tokens,
+                        num_draft_tokens=num_draft_tokens,
                         num_accepted=num_accepted,
                         detailed=self.spec_decode_metrics_level == "detailed",
                     )
@@ -2966,17 +2973,6 @@ class Scheduler(SchedulerInterface):
                     update.mean_num_draft_tokens,
                     self.acceptance_length_controller.observation_window,
                 )
-
-        if spec_decoding_stats is not None:
-            spec_decoding_stats.current_num_spec_tokens = (
-                self.acceptance_length_controller.num_spec_tokens_for_batch_size(
-                    batch_size
-                )
-                if self.acceptance_length_controller is not None
-                else scheduler_output.resolve_num_spec_tokens_to_schedule(
-                    self.num_spec_tokens
-                )
-            )
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
@@ -3605,15 +3601,11 @@ class Scheduler(SchedulerInterface):
         spec_decoding_stats: SpecDecodingStats | None,
         num_draft_tokens: int,
         num_accepted_tokens: int,
-        num_invalid_spec_tokens: dict[str, int] | None,
-        request_id: str,
     ) -> SpecDecodingStats | None:
         if not self.log_stats or not num_draft_tokens:
-            return None
+            return spec_decoding_stats
         if spec_decoding_stats is None:
             spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
-        if num_invalid_spec_tokens:
-            num_draft_tokens -= num_invalid_spec_tokens.get(request_id, 0)
         spec_decoding_stats.observe_draft(
             num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens
         )

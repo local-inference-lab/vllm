@@ -1111,7 +1111,6 @@ def test_glm5next_b12x_kda_prefill_matches_the_triton_chunk_path() -> None:
             qk_l2norm=True,
             checkpoint_export=True,
             null_state_index=NULL_BLOCK_ID,
-            metadata_validation="trusted",
         )
     )
     layer._b12x_prefill_plan = plan
@@ -1584,7 +1583,11 @@ def test_glm5next_b12x_kda_plan_reserves_null_state_zero(monkeypatch) -> None:
             return kwargs
 
         @staticmethod
-        def plan(caps):
+        def invocation_from_tensors(caps, **tensors):
+            return None
+
+        @staticmethod
+        def plan(caps, *, invocation=None):
             return caps
 
     layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
@@ -1596,6 +1599,18 @@ def test_glm5next_b12x_kda_plan_reserves_null_state_zero(monkeypatch) -> None:
     layer.local_num_heads = 8
     layer.head_dim = 128
     layer.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    layer.b12x_kda_null_state_index = 0
+    empty = torch.empty(0)
+    for name in (
+        "_b12x_kda_mixed_qkv", "_b12x_kda_raw_g", "_b12x_kda_raw_beta", "_b12x_kda_z",
+        "_b12x_kda_query_start_loc", "_b12x_kda_num_accepted_tokens", "_b12x_kda_state_indices",
+        "_b12x_kda_num_seqs", "_b12x_kda_num_tokens", "_b12x_kda_output",
+    ):
+        setattr(layer, name, empty)
+    layer.A_log = empty
+    layer.dt_bias = torch.empty(8 * 128)
+    layer.o_norm = SimpleNamespace(weight=empty)
+    layer.kv_cache = (empty, empty)
 
     monkeypatch.setattr(
         KimiGatedDeltaNetAttention,
@@ -1608,11 +1623,10 @@ def test_glm5next_b12x_kda_plan_reserves_null_state_zero(monkeypatch) -> None:
         SimpleNamespace(current_device=lambda: "cuda:0"),
     )
 
-    plan = layer._make_b12x_kda_plan(max_state_slots=32)
+    plan = layer._b12x_kda_decode_declaration(32)
 
     assert plan == captured_caps
     assert captured_caps["null_state_index"] == 0
-    assert captured_caps["kda_metadata_validation"] == "trusted"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1660,7 +1674,9 @@ def test_glm_adaptive_kda_graph_matches_independent_request_states(monkeypatch, 
     layer.gate_lower_bound = -5.0
     layer.A_log = torch.randn(heads, device=device)
     layer.dt_bias = torch.randn(heads * dim, device=device)
-    layer.o_norm = SimpleNamespace(weight=torch.ones(dim, device=device), eps=1e-6)
+    layer.o_norm = SimpleNamespace(
+        weight=torch.ones(dim, dtype=torch.bfloat16, device=device), eps=1e-6
+    )
     layer.conv1d = SimpleNamespace(
         weight=torch.randn(3 * heads * dim, 1, 4, device=device), bias=None
     )
@@ -1678,25 +1694,25 @@ def test_glm_adaptive_kda_graph_matches_independent_request_states(monkeypatch, 
     layer._b12x_kda_num_accepted_tokens = torch.ones(
         requests, dtype=torch.int32, device=device
     )
-    plan = api.plan(
-        api.Caps(
-            device=device,
-            max_tokens=tokens,
-            max_seqs=requests,
-            max_state_slots=33,
-            key_heads=heads,
-            value_heads=heads,
-            key_head_dim=dim,
-            value_head_dim=dim,
-            state_index_columns=columns,
-            model_dtype=torch.bfloat16,
-            state_dtype=torch.float32,
-            gate_activation="sigmoid",
-            qk_l2norm=True,
-            null_state_index=0,
-            kda_metadata_validation="trusted",
-        )
+    # The declaration takes its operand layouts from the layer's staging
+    # tensors, as the served layer declares it in bind_kv_cache.
+    layer.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    layer.b12x_kda_null_state_index = 0
+    monkeypatch.setattr(
+        KimiGatedDeltaNetAttention,
+        "get_state_dtype",
+        lambda self: (torch.bfloat16, torch.float32),
     )
+    width = heads * dim
+    layer._b12x_kda_mixed_qkv = torch.zeros((tokens, 3 * width), dtype=torch.bfloat16, device=device)
+    layer.use_full_rank_gate = True
+    layer._b12x_kda_raw_g = torch.zeros((tokens, heads, dim), dtype=torch.bfloat16, device=device)
+    layer._b12x_kda_raw_beta = torch.zeros((tokens, heads), dtype=torch.bfloat16, device=device)
+    layer._b12x_kda_z = torch.zeros((tokens, heads, dim), dtype=torch.bfloat16, device=device)
+    layer._b12x_kda_output = torch.zeros((tokens, heads, dim), dtype=torch.bfloat16, device=device)
+    layer._b12x_kda_query_start_loc = torch.zeros(requests + 1, dtype=torch.int32, device=device)
+    layer._b12x_kda_state_indices = torch.zeros((requests, columns), dtype=torch.int32, device=device)
+    plan = layer._b12x_kda_decode_declaration(33)
     layer._b12x_kda_plan = plan
     (layer._b12x_kda_scratch,) = get_b12x_scratch_buffers(plan)
     context = SimpleNamespace(
@@ -1764,15 +1780,18 @@ def test_glm_adaptive_kda_graph_matches_independent_request_states(monkeypatch, 
                 spec_state_indices_tensor=metadata.spec_state_indices_tensor[
                     row : row + 1
                 ],
-                num_accepted_tokens=accepted[row : row + 1],
+                num_accepted_tokens=accepted[row : row + 1].clone(),
             )
             context.attn_metadata[layer.prefix] = single
             context.additional_kwargs.clear()
+            # Per-request views of the four-head beta and of the accepted
+            # counts start below the declared 16-byte pointer alignment, so
+            # the reference binds copies; served batches bind prefixes.
             layer._forward(
                 mixed_qkv=inputs["mixed_qkv"][start:stop],
                 g1=inputs["g1"][:, start:stop],
                 g2=inputs["g2"][start:stop],
-                beta=inputs["beta"][:, start:stop],
+                beta=inputs["beta"][:, start:stop].clone(),
                 core_attn_out=expected[:, start:stop],
             )
         torch.testing.assert_close(graph_output, expected, atol=0, rtol=0)
@@ -1806,7 +1825,10 @@ def test_b12x_kda_shares_counts_but_preserves_each_layers_state_indices(
         lambda: forward_context,
     )
 
-    plan = SimpleNamespace(caps=SimpleNamespace(max_state_slots=32))
+    scratch_spec = SimpleNamespace(shape=(1,), dtype=torch.float32, device=torch.device("cpu"))
+    plan = SimpleNamespace(
+        caps=SimpleNamespace(max_state_slots=32), scratch_specs=lambda: (scratch_spec,)
+    )
     api = FakeApi()
 
     def make_layer():
@@ -1814,7 +1836,6 @@ def test_b12x_kda_shares_counts_but_preserves_each_layers_state_indices(
         torch.nn.Module.__init__(layer)
         layer._b12x_kda_api = api
         layer._b12x_kda_plan = plan
-        layer._b12x_kda_scratch = torch.empty(1)
         layer._b12x_kda_num_accepted_tokens = torch.zeros(2, dtype=torch.int32)
         layer._b12x_kda_num_seqs = torch.zeros(1, dtype=torch.int32)
         layer._b12x_kda_num_tokens = torch.zeros(1, dtype=torch.int32)

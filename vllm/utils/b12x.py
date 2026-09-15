@@ -1,24 +1,222 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Accessors for the optional ``b12x`` package."""
+"""Accessors and preparation types for the optional ``b12x`` package.
+
+A native kernel family declares its work as a b12x ``Plan`` that the layer
+holds for its lifetime. Preparation fills the plan in place. Custom ops carry
+tensors, primitives, and a layer name; their bodies resolve the layer and run
+the family's plain-Python path. Nothing here owns memory or graph lifetime.
+"""
+
+from __future__ import annotations
 
 import importlib
 import importlib.util
-from collections.abc import Callable, Hashable, Iterable
-from dataclasses import dataclass, fields, is_dataclass
+import weakref
+from collections.abc import Callable, Hashable, Iterable, Mapping
+from dataclasses import dataclass, fields, is_dataclass, replace
 from types import ModuleType
 from typing import Any, Literal
 
 import torch
 
 import vllm.envs as envs
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _resolve_layer_name,
+    direct_register_custom_op,
+)
+
+
+class PreparationResourceUnavailableError(RuntimeError):
+    """A native owner cannot describe or run its prepared work."""
 
 
 @dataclass(frozen=True)
-class B12xWarmupUnit:
+class B12xWorkload:
+    """Serving shapes one preparation pass prepares for.
+
+    ``stage`` selects the lifecycle point: ``weights`` runs after model load
+    and before memory profiling; ``state`` runs after the KV and state pools
+    exist. ``eager_only`` marks multimodal-encoder shapes that are executed
+    eagerly, never captured, and prepared with their default configuration.
+    """
+
+    stage: Literal["weights", "state"]
+    token_counts: tuple[int, ...]
+    fixed_token_counts: tuple[int, ...]
+    output_dtype: torch.dtype
+    max_tokens: int
+    max_seqs: int
+    max_model_len: int
+    speculative_tokens: int = 0
+    lane: int = 0
+    eager_only: bool = False
+
+    def __post_init__(self):
+        if self.stage not in ("weights", "state"):
+            raise ValueError("invalid native preparation stage")
+        for name in ("max_tokens", "max_seqs", "max_model_len"):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        for name in ("speculative_tokens", "lane"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        counts = tuple(self.token_counts)
+        if not counts or any(type(count) is not int or count <= 0 for count in counts):
+            raise ValueError("native preparation requires positive token counts")
+        if counts != tuple(sorted(set(counts))) or counts[-1] > self.max_tokens:
+            raise ValueError("token counts must be sorted, unique, and within capacity")
+        fixed = tuple(self.fixed_token_counts)
+        if fixed != tuple(sorted(set(fixed))) or not set(fixed) <= set(counts):
+            raise ValueError("fixed token counts must be a sorted subset of token counts")
+        if any(count >= self.max_tokens for count in fixed):
+            raise ValueError("fixed token counts must be below capacity")
+        if type(self.eager_only) is not bool:
+            raise TypeError("eager_only must be boolean")
+        object.__setattr__(self, "token_counts", counts)
+        object.__setattr__(self, "fixed_token_counts", fixed)
+
+
+@dataclass(frozen=True)
+class B12xPreparationUnit:
+    """One layer's preparation requests for one stage."""
+
     name: str
     key: Hashable
-    compile: Callable[[], None]
+    requests: tuple[object, ...]
+    stage: Literal["weights", "state"]
+    autotune: bool = True
+
+    def __post_init__(self):
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("preparation units require a family name")
+        hash(self.key)
+        if self.stage not in ("weights", "state"):
+            raise ValueError("invalid native preparation stage")
+        if type(self.autotune) is not bool:
+            raise TypeError("autotune must be boolean")
+        requests = tuple(self.requests)
+        names = [request.name for request in requests]
+        if len(names) != len(set(names)):
+            raise ValueError("preparation unit declares duplicate request names")
+        object.__setattr__(self, "requests", requests)
+
+
+_B12X_LAYERS: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+_B12X_UNIT_PROVIDERS: list[weakref.ref] = []
+
+
+def b12x_layer_prefix(layer: torch.nn.Module) -> str:
+    """A stable, process-unique name for a layer's custom-op lookups."""
+    prefix = getattr(layer, "prefix", None) or ""
+    existing = _B12X_LAYERS.get(prefix) if prefix else None
+    if not prefix or (existing is not None and existing is not layer):
+        prefix = f"{prefix or type(layer).__name__}#{id(layer):x}"
+    return prefix
+
+
+def register_b12x_layer(name: str, layer: torch.nn.Module) -> None:
+    """Make ``layer`` reachable from custom-op bodies by ``name``."""
+    existing = _B12X_LAYERS.get(name)
+    if existing is not None and existing is not layer:
+        raise ValueError(f"b12x layer name {name!r} is already registered")
+    _B12X_LAYERS[name] = layer
+
+
+def b12x_layer(name: str) -> torch.nn.Module:
+    layer = _B12X_LAYERS.get(name)
+    if layer is None:
+        raise PreparationResourceUnavailableError(f"no live b12x layer named {name!r}")
+    return layer
+
+
+def set_b12x_preparation_provider(layer: object, provider: object) -> None:
+    """Attach the preparation provider the driver discovers on ``layer``.
+
+    A provider is often the layer itself or another module. Stored through
+    ``object.__setattr__`` so ``torch.nn.Module`` never registers it as a
+    child, which would make a layer its own submodule and turn every walk
+    with ``remove_duplicate=False`` into infinite recursion.
+    """
+    object.__setattr__(layer, "b12x_preparation_provider", provider)
+
+
+def register_b12x_unit_provider(provider: object) -> None:
+    """Register a non-module owner, such as a communicator, for preparation."""
+    _B12X_UNIT_PROVIDERS.append(weakref.ref(provider))
+
+
+def b12x_unit_providers() -> list[object]:
+    live = []
+    for reference in list(_B12X_UNIT_PROVIDERS):
+        provider = reference()
+        if provider is None:
+            _B12X_UNIT_PROVIDERS.remove(reference)
+        else:
+            live.append(provider)
+    return live
+
+
+def scope_b12x_unit_calls(unit: B12xPreparationUnit, lane: int) -> B12xPreparationUnit:
+    """Run every callback of a unit's requests inside one workspace lane."""
+    from vllm.v1.worker.workspace import use_workspace_lane
+
+    def wrap_factory(factory):
+        def wrapped(state):
+            with use_workspace_lane(lane):
+                call = factory(state)
+
+            def scoped(callback):
+                if callback is None:
+                    return None
+
+                def invoke():
+                    with use_workspace_lane(lane):
+                        return callback()
+
+                return invoke
+
+            return replace(
+                call, run=scoped(call.run), produce=scoped(call.produce),
+                reset=scoped(call.reset), restore=scoped(call.restore), close=scoped(call.close),
+            )
+
+        return wrapped
+
+    def wrap_calls(calls):
+        if calls is None:
+            return None
+        if isinstance(calls, Mapping):
+            return {count: wrap_factory(factory) for count, factory in calls.items()}
+        return wrap_factory(calls)
+
+    requests = tuple(
+        replace(
+            request,
+            prepare_call=wrap_calls(request.prepare_call),
+            benchmark_call=wrap_calls(request.benchmark_call),
+        )
+        for request in unit.requests
+    )
+    return replace(unit, requests=requests)
+
+
+def b12x_preparation_token_counts(
+    *, max_tokens: int, cudagraph_capture_sizes: Iterable[int] = (),
+    compile_sizes: Iterable[int] = (), compile_range_endpoints: Iterable[int] = (),
+    speculative_tokens: int = 0,
+) -> tuple[int, ...]:
+    """Collect every exact serving specialization required by native owners."""
+    counts = {1, int(max_tokens)}
+    counts.update(int(value) for value in cudagraph_capture_sizes if int(value) > 0)
+    counts.update(int(value) for value in compile_sizes if int(value) > 0)
+    counts.update(int(value) for value in compile_range_endpoints if int(value) > 0)
+    if speculative_tokens > 0:
+        counts.add(max(1, int(max_tokens) - int(speculative_tokens)))
+    return tuple(sorted(counts))
 
 
 def get_b12x_dense_activation_mode(recipe: Literal["nvfp4", "mxfp8"]) -> str:
@@ -166,19 +364,62 @@ def get_b12x_ple_hash() -> ModuleType | None:
     return _get_submodule("b12x.sequence.ple_hash")
 
 
-def b12x_warmup_token_counts(
-    *,
-    max_tokens: int,
-    cudagraph_capture_sizes: Iterable[int] = (),
-) -> tuple[int, ...]:
-    # B12X deduplicates shapes that select the same internal kernel policy.
-    # Keep the complete serving shape set here rather than duplicating its
-    # policy-selection heuristics in vLLM.
-    counts = {1}
-    counts.update(int(size) for size in cudagraph_capture_sizes if int(size) > 0)
-    if int(max_tokens) > 0:
-        counts.add(int(max_tokens))
-    return tuple(sorted(counts))
+def _b12x_blockscaled_linear(
+    source: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_features: int,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    layer = b12x_layer(_resolve_layer_name(layer_name))
+    return layer.b12x_linear.run(source, bias)
+
+
+def _b12x_blockscaled_linear_fake(
+    source: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_features: int,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    return source.new_empty((*source.shape[:-1], out_features))
+
+
+direct_register_custom_op(
+    op_name="b12x_blockscaled_linear",
+    op_func=_b12x_blockscaled_linear,
+    fake_impl=_b12x_blockscaled_linear_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def run_b12x_blockscaled_linear(
+    source: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_features: int,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    """Run a layer's prepared block-scaled linear through the opaque op."""
+    return torch.ops.vllm.b12x_blockscaled_linear(source, bias, out_features, layer_name)
+
+
+def get_b12x_projection_workspaces(
+    rows: int, *layers: torch.nn.Module
+) -> tuple[torch.Tensor | None, ...]:
+    """Reserve disjoint scratch for projections that can run concurrently."""
+    sizes = tuple(
+        holder.get_workspace_size(rows)
+        if (holder := getattr(layer, "b12x_linear", None)) is not None
+        else 0
+        for layer in layers
+    )
+    if not any(sizes):
+        return (None,) * len(layers)
+
+    from vllm.v1.worker.workspace import current_workspace_manager
+
+    buffers = current_workspace_manager().get_simultaneous(
+        *(((size,), torch.uint8) for size in sizes)
+    )
+    return tuple(buffer if size else None for buffer, size in zip(buffers, sizes))
 
 
 def get_b12x_scratch_buffers(plan: Any) -> list[torch.Tensor]:

@@ -234,6 +234,25 @@ def _add_prefix(file: TextIO, worker_name: str, pid: int) -> None:
     file.write = write_with_prefix  # type: ignore[method-assign]
 
 
+class _UndecoratedLogStream:
+    """Borrow a log stream while bypassing its process-prefix writer."""
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._write = stream._original_write
+
+    def write(self, text):
+        return self._write(text)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def undecorated_log_stream(stream: TextIO):
+    """Keep terminal control sequences outside the line-prefix decorator."""
+    return _UndecoratedLogStream(stream) if hasattr(stream, "_original_write") else stream
+
+
 def decorate_logs(
     process_name: str | None = None, *, skip_if_decorated: bool = False
 ) -> None:

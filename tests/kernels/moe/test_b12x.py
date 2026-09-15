@@ -55,6 +55,26 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
+from vllm.utils.b12x import B12xWorkload
+
+
+def _prepare(layer, *, device, counts, fixed=(), output_dtype=torch.bfloat16,
+             max_tokens=None, autotune=False, stage="weights"):
+    """Collect a layer's preparation units and fill their plans in place."""
+    from b12x.preparation import PreparationSession
+
+    max_tokens = max_tokens or max(counts)
+    workload = B12xWorkload(
+        stage=stage, token_counts=tuple(sorted(set(counts))),
+        fixed_token_counts=tuple(sorted(set(fixed))), output_dtype=output_dtype,
+        max_tokens=max_tokens, max_seqs=1, max_model_len=max_tokens,
+    )
+    provider = layer.b12x_preparation_provider
+    units = list(provider.get_b12x_preparation_units(layer, workload))
+    requests = tuple(request for unit in units for request in unit.requests)
+    session = PreparationSession(device=device, autotune=autotune)
+    session.prepare(requests, autotune=autotune)
+    return session, units
 
 
 def _quantize_nvfp4_linear(
@@ -168,7 +188,9 @@ def _make_b12x_moe_kernel(
     topk: int,
     activation: MoEActivation,
     quant_config: FusedMoEQuantConfig,
-) -> mk.FusedMoEKernel:
+    *,
+    fixed_token_counts: tuple[int, ...] = (),
+) -> tuple[mk.FusedMoEKernel, object, object]:
     num_experts = w1.shape[0]
     moe_config = make_dummy_moe_config(
         num_experts=num_experts,
@@ -195,15 +217,25 @@ def _make_b12x_moe_kernel(
             assert quant_config.a2_gscale is not None
             layer.w13_input_scale = 1.0 / quant_config.a1_gscale
             layer.w2_input_scale = 1.0 / quant_config.a2_gscale
+    tokens = int(hidden_states.shape[0])
     experts.process_weights_after_loading(layer)
-    return mk.FusedMoEKernel(
-        maybe_make_prepare_finalize(
-            moe=moe_config,
-            quant_config=quant_config,
-            allow_new_interface=True,
-            use_monolithic=False,
+    session, units = _prepare(
+        layer, device=hidden_states.device, counts=(*fixed_token_counts, tokens),
+        fixed=fixed_token_counts,
+        output_dtype=hidden_states.dtype, max_tokens=tokens,
+    )
+    return (
+        mk.FusedMoEKernel(
+            maybe_make_prepare_finalize(
+                moe=moe_config,
+                quant_config=quant_config,
+                allow_new_interface=True,
+                use_monolithic=False,
+            ),
+            experts,
         ),
-        experts,
+        session,
+        units,
     )
 
 
@@ -217,7 +249,7 @@ def _run_b12x_moe(
     quant_config: FusedMoEQuantConfig,
 ) -> torch.Tensor:
     num_experts = w1.shape[0]
-    kernel = _make_b12x_moe_kernel(
+    kernel, session, _ = _make_b12x_moe_kernel(
         hidden_states,
         w1,
         w2,
@@ -225,23 +257,29 @@ def _run_b12x_moe(
         activation,
         quant_config,
     )
-    topk_weights, topk_ids, _ = fused_topk(
-        hidden_states, score, topk, renormalize=False
-    )
-    return kernel.apply(
-        hidden_states=hidden_states,
-        w1=w1,
-        w2=w2,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        activation=activation,
-        global_num_experts=num_experts,
-        expert_map=None,
-        apply_router_weight_on_input=False,
-    )
+    try:
+        topk_weights, topk_ids, _ = fused_topk(
+            hidden_states, score, topk, renormalize=False
+        )
+        return kernel.apply(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=activation,
+            global_num_experts=num_experts,
+            expert_map=None,
+            apply_router_weight_on_input=False,
+        )
+    finally:
+        session.close()
 
 
-def _quant_config(weight_dtype: str, activation_dtype: str | None):
+def _quant_config(
+    weight_dtype: str,
+    activation_dtype: str | None,
+):
     scale = torch.ones(1, dtype=torch.float32)
     return FusedMoEQuantConfig.make(
         quant_dtype=activation_dtype,
@@ -715,233 +753,61 @@ def test_b12x_moe_uses_minimax_swiglu_parameters() -> None:
     assert experts._swiglu_params(config.activation) == (7.0, 1.702, 1.0)
 
 
-def test_b12x_moe_warmup_runs_each_planner_regime_once(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    experts = B12xExperts(
-        make_dummy_moe_config(
-            num_experts=4,
-            experts_per_token=2,
-            hidden_dim=128,
-            intermediate_size=64,
-        ),
-        _quant_config("mxfp4", None),
-    )
-    prepared = SimpleNamespace(
-        num_experts=4,
-        hidden_size=128,
-        intermediate_size=64,
-        w1_fp4=torch.empty(0),
-    )
-    layer = SimpleNamespace(
-        activation=MoEActivation.SILU,
-        apply_router_weight_on_input=False,
-    )
-    planned_tokens = []
-    launched_tokens = []
-    launched_dtypes = []
-    launched_buffers = []
-    launched_resources = []
-    synchronized = []
+def test_b12x_moe_candidate_calls_share_bounded_trial_storage() -> None:
+    """Repeated candidate calls reuse one activation/output tensor set (a
+    weakref cache), while each call's scratch is a fresh, correctly shaped
+    trial-only allocation rather than a caller-owned workspace region."""
 
-    with pytest.raises(RuntimeError, match="process_weights_after_loading"):
-        experts.warmup_launches(layer, token_counts=(1,))
-    experts._prepared_experts = prepared
-
-    def fake_execution_plan(**kwargs):
-        tokens = kwargs["tokens"]
-        if tokens <= 2:
-            signature = ("micro", "decode")
-        elif tokens <= 4:
-            signature = ("dynamic", "small")
-        else:
-            signature = ("dynamic", "large")
-        return SimpleNamespace(
-            implementation=signature[0],
-            execution=signature[1],
-        )
-
-    def fake_plan(**kwargs):
-        planned_tokens.append(kwargs["tokens"])
-        return SimpleNamespace(
-            scratch_specs=lambda: [SimpleNamespace(dtype=torch.uint8, shape=(64,))]
-        )
-
-    def fake_run(**kwargs):
-        launched_tokens.append(kwargs["hidden_states"].shape[0])
-        launched_dtypes.append(kwargs["topk_ids"].dtype)
-        launched_buffers.append(
-            tuple(
-                kwargs[name].data_ptr()
-                for name in ("hidden_states", "output", "topk_weights", "scratch")
-            )
-        )
-        launched_resources.append(
-            tuple(
-                weakref.ref(kwargs[name])
-                for name in (
-                    "hidden_states",
-                    "output",
-                    "topk_ids",
-                    "topk_weights",
-                    "scratch",
+    class FakeState:
+        def __init__(self):
+            self.scratch = SimpleNamespace(
+                scratch_specs=lambda: (
+                    SimpleNamespace(
+                        shape=(32,), dtype=torch.uint8, device=torch.device("cpu")
+                    ),
                 )
             )
-        )
+            self.bound = None
 
-    def fake_synchronize():
-        assert all(
-            resource() is not None
-            for launch in launched_resources
-            for resource in launch
-        )
-        synchronized.append(True)
+        def bind(self, **kwargs):
+            self.bound = kwargs
+            return SimpleNamespace(run=lambda: None)
 
-    monkeypatch.setattr(b12x, "_b12x_moe_execution_plan", fake_execution_plan)
-    monkeypatch.setattr(b12x, "_run_b12x_moe_plan", fake_run)
-    monkeypatch.setattr(experts, "_plan", fake_plan)
-    monkeypatch.setattr(b12x.torch.accelerator, "synchronize", fake_synchronize)
-
-    warmed = experts.warmup_launches(layer, token_counts=(1, 2, 3, 4, 8))
-
-    assert warmed == 3
-    assert planned_tokens == [1, 3, 8]
-    assert launched_tokens == [1, 1, 3, 3, 8, 8]
-    assert launched_dtypes == [torch.int32, torch.int64] * 3
-    # Both route-id dtypes of one regime run on the same input, output,
-    # weight and scratch buffers; regimes do not share buffers.
-    assert launched_buffers[0] == launched_buffers[1]
-    assert launched_buffers[2] == launched_buffers[3]
-    assert launched_buffers[4] == launched_buffers[5]
-    assert len({launched_buffers[0], launched_buffers[2], launched_buffers[4]}) == 3
-    assert synchronized == [True]
-
-
-def test_b12x_moe_live_prefill_uses_registered_capacity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    experts = B12xExperts(
-        make_dummy_moe_config(
-            num_experts=4,
-            experts_per_token=2,
-            hidden_dim=128,
-            intermediate_size=64,
-            max_num_tokens=2048,
+    prepared = SimpleNamespace(
+        device=torch.device("cpu"),
+        hidden_size=16,
+        num_experts=8,
+        plan=SimpleNamespace(
+            activation=SimpleNamespace(io_dtype=torch.bfloat16)
         ),
-        _quant_config("mxfp4", None),
     )
-    experts._prepared_experts = SimpleNamespace(
-        plan=object(),
-        num_experts=4,
-        hidden_size=128,
-        intermediate_size=64,
-        w1_fp4=torch.empty(0),
-    )
-    layer = SimpleNamespace(
-        activation=MoEActivation.SILU,
-        apply_router_weight_on_input=False,
-    )
-    experts.get_b12x_warmup_unit(
-        layer,
-        (1, 4, 128, 2048),
-        torch.bfloat16,
-    )
-
-    caps_seen = []
-
-    class FakeCaps:
-        def __init__(self, **kwargs):
-            self.__dict__.update(kwargs)
-
-    def fake_plan(caps):
-        caps_seen.append(caps)
-        return object()
-
-    extension = SimpleNamespace(Caps=FakeCaps, plan=fake_plan)
-    monkeypatch.setattr(b12x, "_require_b12x_fused_moe", lambda: extension)
-
-    prefill_plan = experts._plan(
-        tokens=571,
+    factory = b12x._prepared_moe_call_factory(
+        tokens=4,
         topk=2,
-        activation=MoEActivation.SILU,
+        prepared=prepared,
+        output_dtype=torch.bfloat16,
     )
-    assert (
-        experts._plan(
-            tokens=777,
-            topk=2,
-            activation=MoEActivation.SILU,
-        )
-        is prefill_plan
-    )
-    experts._plan(
-        tokens=128,
-        topk=2,
-        activation=MoEActivation.SILU,
-    )
+    first_state = FakeState()
+    second_state = FakeState()
 
-    assert [caps.max_tokens for caps in caps_seen] == [2048, 128]
-    assert [caps.core_token_counts for caps in caps_seen] == [(2048,), (128,)]
-    with pytest.raises(ValueError, match="exceeds the configured prefill capacity"):
-        experts._plan(
-            tokens=2049,
-            topk=2,
-            activation=MoEActivation.SILU,
-        )
+    first_call = factory(first_state)
+    second_call = factory(second_state)
+
+    for name in ("a", "output", "topk_ids", "topk_weights"):
+        assert first_state.bound[name] is second_state.bound[name]
+    for scratch in (first_state.bound["scratch"][0], second_state.bound["scratch"][0]):
+        assert scratch.shape == (32,)
+        assert scratch.dtype == torch.uint8
+        assert scratch.device == torch.device("cpu")
+    assert first_state.bound["scratch"][0] is not second_state.bound["scratch"][0]
+    assert not first_call.capture_safe
+    assert not second_call.capture_safe
 
 
-def test_b12x_moe_reload_reprepares_current_parameters(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    plan = SimpleNamespace(
-        discards_source_parameters=False,
-        quant_modes=("w4a16",),
-        io_dtype="bfloat16",
-        activation="silu",
-    )
-    prepared_inputs: list[
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-    ] = []
 
-    def prepare_weights(**kwargs):
-        prepared_inputs.append(
-            (
-                kwargs["w1_fp4"],
-                kwargs["w2_fp4"],
-                kwargs["w1_blockscale"],
-                kwargs["w2_blockscale"],
-            )
-        )
-        return SimpleNamespace(plan=plan)
 
-    extension = SimpleNamespace(
-        plan_weights=lambda **_: plan, prepare_weights=prepare_weights
-    )
-    monkeypatch.setattr(b12x, "_require_b12x_fused_moe", lambda: extension)
-    experts = B12xExperts(
-        make_dummy_moe_config(num_experts=2, hidden_dim=4, intermediate_size=8),
-        _quant_config("mxfp4", None),
-    )
-    layer = SimpleNamespace(
-        activation=MoEActivation.SILU,
-        apply_router_weight_on_input=False,
-        w13_weight=torch.full((2, 8, 2), 1, dtype=torch.uint8),
-        w2_weight=torch.full((2, 4, 4), 1, dtype=torch.uint8),
-        w13_weight_scale=torch.full((2, 8, 1), 1, dtype=torch.uint8),
-        w2_weight_scale=torch.full((2, 4, 1), 1, dtype=torch.uint8),
-    )
 
-    experts.process_weights_after_loading(layer)
-    layer.w13_weight = torch.full_like(layer.w13_weight, 2)
-    layer.w2_weight = torch.full_like(layer.w2_weight, 2)
-    layer.w13_weight_scale = torch.full_like(layer.w13_weight_scale, 3)
-    layer.w2_weight_scale = torch.full_like(layer.w2_weight_scale, 3)
-    experts.process_weights_after_loading(layer)
 
-    assert len(prepared_inputs) == 2
-    assert prepared_inputs[-1][0] is layer.w13_weight
-    assert prepared_inputs[-1][1] is layer.w2_weight
-    assert prepared_inputs[-1][2] is layer.w13_weight_scale
-    assert prepared_inputs[-1][3] is layer.w2_weight_scale
 
 
 def test_b12x_source_release_preserves_prepared_storage_owner() -> None:
@@ -1008,56 +874,8 @@ def test_b12x_moe_rejects_router_weight_on_input_for_w4a8() -> None:
         experts.process_weights_after_loading(layer)
 
 
-def test_b12x_moe_workspace_uses_prepared_router_weight_contract(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    experts = B12xExperts(
-        make_dummy_moe_config(hidden_dim=128, intermediate_size=64),
-        _quant_config("mxfp4", None),
-    )
-    prepared = SimpleNamespace(
-        plan=SimpleNamespace(discards_source_parameters=False),
-    )
-    layer = SimpleNamespace(
-        activation=MoEActivation.SILU,
-        apply_router_weight_on_input=True,
-        w13_weight=torch.empty(0),
-        w2_weight=torch.empty(0),
-        w13_weight_scale=torch.empty(0),
-        w2_weight_scale=torch.empty(0),
-    )
-    monkeypatch.setattr(experts, "_prepare_experts", lambda **kwargs: prepared)
-    planned = []
 
-    def fake_plan(**kwargs):
-        planned.append(kwargs)
-        return SimpleNamespace(
-            scratch_specs=lambda: [SimpleNamespace(dtype=torch.uint8, shape=(64,))]
-        )
 
-    monkeypatch.setattr(experts, "_plan", fake_plan)
-
-    experts.process_weights_after_loading(layer)
-    assert layer.b12x_warmup_provider is experts
-    experts.workspace_shapes(
-        8,
-        128,
-        128,
-        2,
-        4,
-        4,
-        None,
-        MoEActivation.SILU,
-    )
-
-    assert planned == [
-        {
-            "tokens": 8,
-            "topk": 2,
-            "activation": MoEActivation.SILU,
-            "apply_router_weight_on_input": True,
-        }
-    ]
 
 
 @dataclass
@@ -1298,7 +1116,7 @@ def test_b12x_moe_cuda_graph_replay(
             tokens=4,
             seed=23,
         )
-        kernel = _make_b12x_moe_kernel(
+        kernel, session, _ = _make_b12x_moe_kernel(
             case.hidden_states,
             case.w1,
             case.w2,
@@ -1332,11 +1150,105 @@ def test_b12x_moe_cuda_graph_replay(
         lock_workspace()
         graph = torch.cuda.CUDAGraph()
         stream = torch.cuda.Stream()
-        with torch.cuda.graph(graph, stream=stream):
-            actual = apply()
-        graph.replay()
-        torch.accelerator.synchronize()
+        try:
+            with session.capture():
+                with torch.cuda.graph(graph, stream=stream):
+                    actual = apply()
+            graph.replay()
+            torch.accelerator.synchronize()
+        finally:
+            graph.reset()
+            session.close()
 
     assert torch.isfinite(expected).all()
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+
+@pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
+@pytest.mark.parametrize(
+    "weight_dtype,activation_dtype",
+    [("nvfp4", "nvfp4"), ("mxfp4", "mxfp8"), ("nvfp4", None)],
+    ids=["nvfp4", "w4a8", "w4a16"],
+)
+@torch.inference_mode()
+@pytest.mark.parametrize("capacity", [4, 128])
+def test_b12x_moe_prefill_capacity_and_exact_decode_reuse(
+    weight_dtype, activation_dtype, workspace_init, capacity,
+) -> None:
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from vllm.v1.worker.workspace import current_workspace_manager, lock_workspace
+
+    with set_current_vllm_config(
+        VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
+    ):
+        case = _make_b12x_moe_case(weight_dtype, activation_dtype, tokens=capacity)
+        kernel, session, _ = _make_b12x_moe_kernel(
+            case.hidden_states, case.w1, case.w2, case.topk, case.activation,
+            case.quant_config, fixed_token_counts=(4,) if capacity > 4 else (),
+        )
+        weights, ids, _ = fused_topk(
+            case.hidden_states, case.score, case.topk, renormalize=False,
+        )
+        ids64 = ids.to(torch.int64)
+        if activation_dtype == "nvfp4":
+            reference = _nvfp4_activation_reference(
+                case.hidden_states, case.w1_ref, case.w2_ref, weights, ids,
+                case.quant_config.a1_gscale, case.quant_config.a2_gscale,
+            )
+        else:
+            reference = torch_moe(
+                case.hidden_states, case.w1_ref, case.w2_ref, case.score,
+                case.topk, activation=case.activation,
+            )
+
+        def apply(rows, route_ids=ids):
+            return kernel.apply(
+                hidden_states=case.hidden_states[:rows], w1=case.w1, w2=case.w2,
+                topk_weights=weights[:rows], topk_ids=route_ids[:rows],
+                activation=case.activation, global_num_experts=case.w1.shape[0],
+                expert_map=None, apply_router_weight_on_input=False,
+            )
+
+        def check(output, rows):
+            assert torch.isfinite(output).all() and torch.count_nonzero(output)
+            torch.testing.assert_close(output, reference[:rows], atol=2e-1, rtol=2e-1)
+            cosine = torch.nn.functional.cosine_similarity(
+                output.flatten().float(), reference[:rows].flatten().float(), dim=0,
+            )
+            assert cosine > 0.99
+
+        try:
+            apply(capacity)
+            if capacity == 4 and activation_dtype == "mxfp8":
+                # Tiny W4A8 uses static M in mainline; eager first use is legal.
+                check(apply(3), 3)
+            lock_workspace()
+            buffers = tuple(
+                (buffer.data_ptr(), buffer.numel())
+                for buffer in current_workspace_manager()._current_workspaces
+                if buffer is not None
+            )
+            session.freeze()
+            with kernel_resolution_guard("prepared MoE capacity reuse"):
+                for rows in (count for count in (4, 3, 11, 31, 125, 128) if count <= capacity):
+                    for route_ids in (ids, ids64):
+                        check(apply(rows, route_ids), rows)
+                graph = torch.cuda.CUDAGraph()
+                try:
+                    with session.capture(), torch.cuda.graph(graph):
+                        actual = apply(4)
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    check(actual, 4)
+                finally:
+                    graph.reset()
+            assert buffers == tuple(
+                (buffer.data_ptr(), buffer.numel())
+                for buffer in current_workspace_manager()._current_workspaces
+                if buffer is not None
+            )
+        finally:
+            session.close()
+

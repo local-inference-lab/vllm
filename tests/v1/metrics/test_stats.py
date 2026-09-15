@@ -11,12 +11,33 @@ from vllm.v1.metrics.stats import (
     SchedulerStats,
 )
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+from vllm.v1.spec_decode.metrics import SpecDecodingLogging, SpecDecodingStats
 from vllm.v1.utils import compute_iteration_details
 
 
 def test_iteration_stats_repr():
     iteration_stats = IterationStats()
     assert repr(iteration_stats).startswith("IterationStats(")
+
+
+def test_spec_decoding_logging_uses_verified_position_counts():
+    spec_logging = SpecDecodingLogging()
+    one_verified = SpecDecodingStats.new(num_spec_tokens=3)
+    one_verified.observe_draft(num_draft_tokens=1, num_accepted_tokens=1)
+    two_verified = SpecDecodingStats.new(num_spec_tokens=3)
+    two_verified.observe_draft(num_draft_tokens=2, num_accepted_tokens=1)
+    spec_logging.observe(one_verified)
+    spec_logging.observe(two_verified)
+
+    messages = []
+    spec_logging.log(lambda fmt, *args: messages.append(fmt % args))
+
+    assert len(messages) == 1
+    assert "Mean verification depth: 1.50/3" in messages[0]
+    assert "Drafted: 3 tokens" in messages[0]
+    assert "Per-position acceptance rate: 1.000, 0.000, -----" in messages[0]
+    assert "Per-position verification coverage: 1.000, 0.500, 0.000" in messages[0]
+    assert "Avg Draft acceptance rate: 66.7%" in messages[0]
 
 
 def test_scheduler_iteration_details_serialization():

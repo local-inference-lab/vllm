@@ -68,6 +68,19 @@ def test_workspace_lanes_do_not_alias_and_restore_context(monkeypatch) -> None:
     assert target.data_ptr() == target_reused.data_ptr()
 
 
+def test_preallocated_workspace_view_restores_context() -> None:
+    outer = torch.empty(512, dtype=torch.uint8)
+    inner = torch.empty(256, dtype=torch.uint8)
+
+    assert workspace.current_preallocated_workspace() is None
+    with workspace.use_preallocated_workspace(outer):
+        assert workspace.current_preallocated_workspace() is outer
+        with workspace.use_preallocated_workspace(inner):
+            assert workspace.current_preallocated_workspace() is inner
+        assert workspace.current_preallocated_workspace() is outer
+    assert workspace.current_preallocated_workspace() is None
+
+
 def test_workspace_lanes_compose_with_ubatches(monkeypatch) -> None:
     active_ubatch = [0]
     monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: active_ubatch[0])
@@ -150,3 +163,16 @@ def test_cuda_graph_capture_resources_are_scoped_to_collector() -> None:
     assert resources == [first, second]
     assert nested_resources == [nested]
     assert not workspace.retain_cuda_graph_capture_resource(outside)
+
+
+def test_suspended_graph_resources_restore_collector_after_failure() -> None:
+    owner = object()
+    with workspace.collect_cuda_graph_capture_resources() as resources:
+        with (
+            pytest.raises(ValueError),
+            workspace.suspend_cuda_graph_capture_resources(),
+        ):
+            assert not workspace.retain_cuda_graph_capture_resource(object())
+            raise ValueError("eager operation failed")
+        assert workspace.retain_cuda_graph_capture_resource(owner)
+    assert resources == [owner]

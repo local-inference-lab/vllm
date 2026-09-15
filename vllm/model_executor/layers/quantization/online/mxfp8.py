@@ -88,9 +88,9 @@ class Mxfp8OnlineLinearMethod(_Fp8OnlineLinearBase):
         replace_parameter(layer, "weight", weight_fp8.data)
         replace_parameter(layer, "weight_scale", weight_scale.data)
 
-        self.kernel.process_weights_after_loading(layer)
         if self.use_a16 is not None and isinstance(self.kernel, B12xMxfp8LinearKernel):
             layer.b12x_activation_mode = "a16" if self.use_a16 else "quantized"
+        self.kernel.process_weights_after_loading(layer)
 
         layer._already_called_process_weights_after_loading = True
 

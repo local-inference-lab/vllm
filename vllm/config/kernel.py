@@ -221,6 +221,9 @@ class KernelConfig:
     enable_flashinfer_autotune: bool = None  # type: ignore[assignment]
     """If True, run FlashInfer autotuning during kernel warmup."""
 
+    enable_b12x_autotune: bool = True
+    """Search uncached b12x choices at startup; mandatory preparation always runs."""
+
     # TODO(roberto): Remove after registered CuTeDSL warmups are migrated
     # to the shared JIT warmup infrastructure.
     # https://github.com/vllm-project/vllm/pull/47451
@@ -322,6 +325,7 @@ class KernelConfig:
             "enable_cutedsl_warmup",
             "enable_jit_warmup",
             "enable_flashinfer_autotune",
+            "enable_b12x_autotune",
             "ir_op_priority",  # handled separately below
         }
         factors = get_hash_factors(self, ignored_factors)

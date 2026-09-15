@@ -46,6 +46,11 @@ class Mxfp8LinearKernel(ABC):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         raise NotImplementedError
 
+    def get_workspace_size(self, layer: torch.nn.Module, rows: int) -> int:
+        """Scratch bytes one call at ``rows`` needs from a caller-reserved view."""
+        del layer, rows
+        return 0
+
     @abstractmethod
     def apply_weights(
         self,

@@ -103,3 +103,29 @@ def test_composed_loader_waits_for_queued_reads_before_transforming():
     with weight_transfer(DeferredWriter()):
         loader(parameter, torch.arange(4, dtype=torch.float32))
     torch.testing.assert_close(parameter, torch.tensor([0.0, 2.0, 4.0, 6.0]))
+
+
+def test_explicit_completion_preserves_rank_local_flush_boundaries():
+    from vllm.model_executor.weight_transfer import (
+        finish_weight_transfers,
+        flush_weight_transfers,
+    )
+
+    calls = []
+
+    class Writer:
+        def __call__(self, destination, source):
+            return True
+
+        def flush(self):
+            calls.append("flush")
+
+        def finish(self):
+            calls.append("finish")
+
+    with weight_transfer(Writer()):
+        flush_weight_transfers()
+        finish_weight_transfers()
+    assert calls == ["flush", "finish"]
+    finish_weight_transfers()
+    assert calls == ["flush", "finish"]

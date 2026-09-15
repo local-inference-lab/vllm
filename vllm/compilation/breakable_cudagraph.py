@@ -45,7 +45,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import weak_ref_tensor, weak_ref_tensors
-from vllm.v1.worker.workspace import collect_cuda_graph_capture_resources
+from vllm.v1.worker.workspace import (
+    collect_cuda_graph_capture_resources,
+    suspend_cuda_graph_capture_resources,
+)
 
 logger = init_logger(__name__)
 
@@ -106,16 +109,24 @@ def eager_break_during_capture(fn: F) -> F:
         # Weak-ref args: strong refs in the replay lambda pin cudagraph-pool
         # slots across batch descriptors. cudagraph owns the slot, so the
         # weak_ref is safe to deref on replay.
-        weak_args = tuple(
-            weak_ref_tensor(a) if isinstance(a, torch.Tensor) else a for a in args
-        )
-        weak_kwargs = {
-            k: weak_ref_tensor(v) if isinstance(v, torch.Tensor) else v
-            for k, v in kwargs.items()
-        }
+        weak_args = _weak_tensor_arguments(args)
+        weak_kwargs = _weak_tensor_arguments(kwargs)
         return capture.add_eager(lambda: fn(*weak_args, **weak_kwargs))
 
     return wrapper  # type: ignore[return-value]
+
+
+def _weak_tensor_arguments(value: Any) -> Any:
+    """Keep tensor arguments weak even inside ordinary tuple/list/dict bundles."""
+    if isinstance(value, torch.Tensor):
+        return weak_ref_tensor(value)
+    if type(value) is tuple:
+        return tuple(_weak_tensor_arguments(item) for item in value)
+    if type(value) is list:
+        return [_weak_tensor_arguments(item) for item in value]
+    if type(value) is dict:
+        return {key: _weak_tensor_arguments(item) for key, item in value.items()}
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +215,10 @@ class BreakableCUDAGraphCapture:
         downstream dependencies via static output buffers.
         """
         self._end_segment()
-        result = fn()
+        # Eager operations own their temporary allocations per invocation;
+        # only their caller-owned in-place outputs cross the graph boundary.
+        with suspend_cuda_graph_capture_resources():
+            result = fn()
         self.segments.append(fn)
         self._num_eager_breaks += 1
         self._begin_segment()

@@ -191,194 +191,184 @@ def test_qsa_main_cache_views_reinterpret_fp8_storage() -> None:
 
 
 @pytest.mark.parametrize("draft", [False, True])
+@pytest.mark.parametrize("large_pool", [False, True])
 def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
-    monkeypatch,
-    draft,
+    monkeypatch, draft, large_pool,
 ) -> None:
-    actual_pages = 2
-    page_size = 8
-    max_seq_len = 40
-    planned_pages = max_seq_len // page_size
-    main_k_cache = torch.empty(
-        actual_pages,
-        page_size,
-        1,
-        256,
-        dtype=torch.bfloat16,
-    )
-    main_v_cache = torch.empty_like(main_k_cache)
-    compressed_cache = torch.empty(
-        actual_pages,
-        page_size // 4,
-        128,
-        dtype=torch.bfloat16,
-    )
-    bind_kwargs: dict[str, Any] = {}
-    planned_caps: list[SimpleNamespace] = []
-    shared_scratch = torch.empty(32, dtype=torch.uint8)
-    binding = object()
-    anchor_capacities = []
+    from contextlib import ExitStack
+    from b12x.attention import qsa
+    from b12x.preparation import PreparationSession
+    from vllm.utils.b12x import B12xWorkload, PreparationResourceUnavailableError
+    from vllm.v1.worker import workspace
 
-    class FakePlan:
-        def __init__(self, caps):
-            self.caps = caps
-            self.caps.main_table_width = math.ceil(
-                caps.max_seq_len / caps.main_page_size
-            )
-            self.caps.compressed_table_width = math.ceil(
-                (caps.max_seq_len // caps.compress_ratio) / caps.compressed_page_size
-            )
+    device = _require_qsa_gpu()
+    page_size, maximum = 16, 80
+    page_bytes = 2 * page_size * 256 + page_size // 4 * 128 * 2
+    high = 2**31 // page_bytes + 1 if large_pool else 0
 
-        def scratch_specs(self):
-            return (SimpleNamespace(shape=(32,), dtype=torch.uint8),)
-
-        def bind(self, **kwargs):
-            bind_kwargs.update(kwargs)
-            return binding
-
-        def draft_selection_plan(self):
-            anchor_capacities.append(self.caps.max_q_rows)
-            return SimpleNamespace(
-                storage_specs=lambda: (
-                    SimpleNamespace(
-                        shape=(53,),
-                        dtype=torch.uint8,
-                        device=torch.device("cpu"),
-                    ),
-                ),
-                bind=lambda *, storage: SimpleNamespace(
-                    storage=storage,
-                    reset=lambda: storage.zero_(),
-                ),
-            )
-
-    def plan(caps):
-        planned_caps.append(caps)
-        return FakePlan(caps)
-
-    fake_qsa = SimpleNamespace(
-        Caps=lambda **kwargs: SimpleNamespace(**kwargs),
-        is_supported=lambda: True,
-        plan=plan,
-    )
-    monkeypatch.setattr(qsa_module, "get_b12x_qsa", lambda: fake_qsa)
-    monkeypatch.setattr(
-        qsa_module,
-        "get_b12x_scratch_buffers",
-        lambda _plan: [shared_scratch],
-    )
-    monkeypatch.setattr(
-        qsa_module,
-        "qsa_compressed_cache_view",
-        lambda *_args, **_kwargs: compressed_cache,
-    )
+    def make_cache():
+        backing = torch.empty((high + 2) * page_bytes, dtype=torch.uint8, device=device)
+        backing[:2 * page_bytes].fill_(13)
+        backing[high * page_bytes:].fill_(17)
+        cache = backing.as_strided(
+            (high + 2, 2, page_size, 256),
+            (page_bytes, page_size * 256, 256, 1),
+        )
+        return backing, cache
 
     owner = Qwen3_8FlashNextQSAAttention.__new__(Qwen3_8FlashNextQSAAttention)
     torch.nn.Module.__init__(owner)
-    owner.impl = SimpleNamespace(
-        _kv_cache_views=lambda _cache: (main_k_cache, main_v_cache)
-    )
-    owner.max_tokens = 8
-    owner.max_seqs = 2
-    owner.max_seq_len = max_seq_len
-    owner.max_speculative_tokens = 2
-    owner.max_decode_rows = 6
+    impl = Qwen3_8FlashNextQSAImpl.__new__(Qwen3_8FlashNextQSAImpl)
+    impl.num_kv_heads, impl.head_size, impl.kv_cache_dtype = 1, 256, "fp8"
+    owner.impl = impl
+    owner.max_tokens, owner.max_seqs, owner.max_seq_len = 32, 2, maximum
+    owner._qsa_model_config = SimpleNamespace(max_model_len=maximum)
+    owner._qsa_cache_config = SimpleNamespace(block_size=page_size, num_gpu_blocks_override=None)
+    owner.max_speculative_tokens, owner.max_decode_rows = 2, 6
     owner._share_mtp_indices = draft
-    owner._mtp_source_rows = torch.full((2,), -1, dtype=torch.int64)
-    owner.compress_ratio = 4
-    owner.raw_ring_capacity = 8
-    owner.budget = 2048
-    owner.num_heads = 6
-    owner.num_kv_heads = 1
-    owner.head_dim = 256
-    owner.index_heads = 4
-    owner.index_head_dim = 128
-    owner.position_axes = 1
+    owner._mtp_source_rows = torch.full((2,), -1, dtype=torch.int64, device=device)
+    owner._mtp_anchor_state = owner._mtp_anchor_storage = None
+    owner.compress_ratio, owner.raw_ring_capacity, owner.budget = 4, 8, 2048
+    owner.num_heads, owner.num_kv_heads, owner.head_dim = 16, 1, 256
+    owner.index_heads, owner.index_head_dim, owner.position_axes = 4, 128, 1
+    angles = torch.arange(maximum, device=device).float()[:, None].expand(-1, 32) * 0.01
     owner.rotary_emb = SimpleNamespace(
         rotary_dim=64,
-        cos_sin_cache=torch.empty(64, 64),
+        cos_sin_cache=torch.cat((angles.cos(), angles.sin()), -1).to(torch.bfloat16),
     )
     owner.indexer = SimpleNamespace(
-        q_layernorm=SimpleNamespace(weight=torch.empty(128), variance_epsilon=1e-6),
-        k_layernorm=SimpleNamespace(weight=torch.empty(128)),
+        q_layernorm=SimpleNamespace(weight=torch.zeros(128, dtype=torch.bfloat16, device=device),
+                                   variance_epsilon=1e-6),
+        k_layernorm=SimpleNamespace(weight=torch.zeros(128, dtype=torch.bfloat16, device=device)),
     )
-    owner._raw_k_ring = torch.empty(2, 8, 128, dtype=torch.bfloat16)
-    owner._raw_logical_positions = torch.empty(2, 8, dtype=torch.int64)
-    owner._raw_rope_positions = torch.empty(2, 8, 1, dtype=torch.int64)
-    owner._raw_interval_start_positions = torch.empty(2, dtype=torch.int64)
-    owner._raw_state_slot_ids = torch.empty(2, dtype=torch.int32)
-    owner._qsa_output = torch.empty(8, 6, 256, dtype=torch.bfloat16)
-    owner._selected_positions = torch.empty(8, 2051, dtype=torch.int32)
-    owner._k_scale = torch.ones(1, dtype=torch.float32)
-    owner._v_scale = torch.ones(1, dtype=torch.float32)
-    owner.kv_cache_torch_dtype = torch.bfloat16
-    owner.kv_cache_kernel_dtype = torch.bfloat16
-
-    kv_cache = torch.empty(
-        actual_pages,
-        2,
-        page_size,
-        256,
-        dtype=torch.bfloat16,
+    owner._raw_k_ring = torch.full((2, 8, 128), 0.125, dtype=torch.bfloat16, device=device)
+    owner._raw_logical_positions = torch.full((2, 8), -1, dtype=torch.int64, device=device)
+    owner._raw_rope_positions = torch.full((2, 8, 1), -1, dtype=torch.int64, device=device)
+    owner._raw_interval_start_positions = torch.full((2,), -1, dtype=torch.int64, device=device)
+    owner._raw_state_slot_ids = torch.full((2,), -1, dtype=torch.int32, device=device)
+    owner._qsa_output = torch.empty((32, 16, 256), dtype=torch.bfloat16, device=device)
+    owner._selected_positions = torch.full((32, 2051), -1, dtype=torch.int32, device=device)
+    owner._k_scale = torch.ones(1, dtype=torch.float32, device=device)
+    owner._v_scale = torch.ones(1, dtype=torch.float32, device=device)
+    owner.kv_cache_torch_dtype, owner.kv_cache_kernel_dtype = torch.uint8, torch.float8_e4m3fn
+    owner._qsa_decode_context, owner._qsa_prefill_bindings = None, ()
+    owner._main_block_table = owner._compressed_cache = None
+    owner._selector_done = torch.cuda.Event()
+    owner._b12x_preparation_prefix = "qsa-owner-regression"
+    manager = workspace.WorkspaceManager(device)
+    monkeypatch.setattr(workspace, "_manager", manager)
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    workload = B12xWorkload(
+        stage="state", token_counts=(1, 3, 6, 16, 32), fixed_token_counts=(),
+        output_dtype=torch.bfloat16, max_tokens=32, max_seqs=2,
+        max_model_len=maximum, speculative_tokens=2,
     )
-    owner.bind_kv_cache(kv_cache)
 
-    assert len(planned_caps) == 2
-    assert not bind_kwargs
-    context = owner._qsa_decode_context
-    assert context.plan.caps.max_q_rows == owner.max_decode_rows
-    assert context.plan.caps.max_seq_len == max_seq_len
-    assert owner._bind_qsa_context(context) is binding
-    if draft:
-        assert anchor_capacities == [owner.max_tokens]
-        assert owner._mtp_anchor_storage.shape == (53,)
-        assert owner._mtp_anchor_state.storage is owner._mtp_anchor_storage
-        assert bind_kwargs["draft_selection"] is owner._mtp_anchor_state
-    caps = planned_caps[0]
-    assert caps.max_seq_len == max_seq_len
-    assert caps.max_q_rows == owner.max_tokens
-    assert caps.num_main_cache_pages == planned_pages
-    assert caps.num_compressed_cache_pages == planned_pages
-    assert owner._main_block_table.shape == (owner.max_seqs, planned_pages)
-    assert bind_kwargs["main_k_cache"] is main_k_cache
-    assert bind_kwargs["main_v_cache"] is main_v_cache
-    assert bind_kwargs["k_descale"] is owner._k_scale
-    assert bind_kwargs["v_descale"] is owner._v_scale
-    assert bind_kwargs["compressed_k_cache"] is compressed_cache
-    assert main_k_cache.shape[0] < caps.num_main_cache_pages
-    assert compressed_cache.shape[0] < caps.num_compressed_cache_pages
-    assert not hasattr(owner, "_qsa_binding")
-    assert bind_kwargs["scratch"].data_ptr() == shared_scratch.data_ptr()
-    assert bind_kwargs["output"].shape[0] == owner.max_decode_rows
-    assert bind_kwargs["selected_positions"].shape[0] == owner.max_decode_rows
-    bind_kwargs.clear()
-    assert owner._bind_qsa_context(context) is binding
-    assert bind_kwargs["main_k_cache"] is main_k_cache
-    caller_output = torch.empty(1, 6, 256, dtype=torch.bfloat16)
-    assert owner._bind_qsa_context(context, output=caller_output) is binding
-    assert bind_kwargs["output"] is caller_output
+    with ExitStack() as owned, workspace.use_workspace_lane(0):
+        session = PreparationSession(device=device, autotune=False)
+        owned.callback(session.close)
+        # Before any pool is bound, the decode/prefill contexts (and their
+        # plans) do not exist: preparation is scoped to the bound cache.
+        assert owner.get_b12x_preparation_units(owner, workload) == ()
 
-    owner.unbind_kv_cache()
+        def bind_prepare_and_exercise(cache, backing, *, previous_plans):
+            saved_prefix = backing[:2 * page_bytes].clone()
+            saved_state = tuple(
+                tensor.clone() for tensor in owner.get_recurrent_checkpoint_tensors()
+            )
+            allocated = torch.cuda.memory_allocated(device)
+            owner.bind_kv_cache(cache)
+            assert torch.cuda.memory_allocated(device) == allocated
+            context = owner._qsa_decode_context
+            with pytest.raises(PreparationResourceUnavailableError):
+                owner._bind_qsa_context(context)
 
-    assert owner.kv_cache.numel() == 0
-    assert owner._main_block_table is None
-    assert owner._compressed_cache is None
-    assert owner._qsa_plan is None
-    assert owner._qsa_decode_context is None
-    assert owner._qsa_prefill_bindings == ()
-    assert owner._qsa_scratch is None
-    assert owner._mtp_anchor_state is None
-    assert owner._mtp_anchor_storage is None
+            units = owner.get_b12x_preparation_units(owner, workload)
+            requests = tuple(request for unit in units for request in unit.requests)
+            plans = tuple(request.plan for request in requests)
+            result = session.prepare(requests, autotune=False)
+            owned.callback(result.close)
+            assert all(plan.prepared is not None for plan in plans)
+            if previous_plans is not None:
+                # A rebound pool declares fresh plan objects; it never reuses
+                # the released plans from the pool it replaced.
+                assert not set(plans) & set(previous_plans)
+            assert torch.equal(backing[:2 * page_bytes], saved_prefix)
+            for tensor, saved in zip(
+                owner.get_recurrent_checkpoint_tensors(), saved_state, strict=True
+            ):
+                torch.testing.assert_close(tensor, saved, rtol=0, atol=0)
 
-    replacement_cache = torch.empty_like(kv_cache)
-    owner.bind_kv_cache(replacement_cache)
+            main_k, main_v = impl._kv_cache_views(cache)
+            live_page = high + 1
+            if large_pool:
+                assert live_page * main_k.stride(0) * main_k.element_size() > 2**31
+            context.main_block_table[0, 0] = live_page
+            owner._raw_state_slot_ids[0] = 0
+            main_k[live_page].fill_(1)
+            query = torch.ones((1, 16, 256), dtype=torch.bfloat16, device=device)
+            projection = torch.full((1, 5 * 128), 0.125, dtype=torch.bfloat16, device=device)
+            output = torch.empty_like(query)
+            dynamic = dict(
+                query=query, index_query=projection[:, :4 * 128].unflatten(-1, (4, 128)),
+                raw_index_key=projection[:, 4 * 128:],
+                request_ids=torch.zeros(1, dtype=torch.int32, device=device),
+                query_positions=torch.zeros(1, dtype=torch.int64, device=device),
+                rope_positions=torch.zeros((1, 1), dtype=torch.int64, device=device),
+                sequence_lengths=torch.tensor([1, 0], dtype=torch.int32, device=device),
+                query_start_loc=torch.tensor([0, 1, 1], dtype=torch.int32, device=device),
+                num_accepted_tokens=torch.tensor([1, 0], dtype=torch.int32, device=device),
+                is_prefilling=torch.zeros(2, dtype=torch.bool, device=device),
+            )
+            manager.lock()
+            for overlap in (False, True):
+                binding = owner._bind_qsa_context(context, output=output, overlap=overlap)
+                owner._raw_interval_start_positions[0] = -1
+                main_v[live_page].fill_(0.25)
+                ready = torch.cuda.Event() if overlap else None
+                if ready is not None:
+                    ready.record()
+                dynamic["index_ready"] = ready
+                qsa.run(binding, **dynamic)
+                torch.testing.assert_close(output, torch.full_like(output, 0.25), rtol=0, atol=0)
+                graph = torch.cuda.CUDAGraph()
+                with session.capture():
+                    owner._raw_interval_start_positions[0] = -1
+                    with torch.cuda.graph(graph):
+                        if ready is not None:
+                            ready.record()
+                        qsa.run(binding, **dynamic)
+                    replay_allocated = torch.cuda.memory_allocated(device)
+                    owner._raw_interval_start_positions[0] = -1
+                    main_v[live_page].fill_(0.5)
+                    graph.replay()
+                    torch.cuda.synchronize(device)
+                    assert torch.cuda.memory_allocated(device) == replay_allocated
+                    torch.testing.assert_close(output, torch.full_like(output, 0.5), rtol=0, atol=0)
+                    graph.reset()
+            manager.unlock()
+            return context, plans
 
-    assert owner.kv_cache is replacement_cache
-    assert len(planned_caps) == 4
-    assert owner._qsa_plan is not None
-    assert owner._qsa_decode_context is not context
-    assert owner._bind_qsa_context(owner._qsa_decode_context) is binding
-    assert owner._qsa_scratch is not None
+        first_backing, first_cache = make_cache()
+        first_context, first_plans = bind_prepare_and_exercise(
+            first_cache, first_backing, previous_plans=None
+        )
+
+        # Release the first pool's plans before rebinding: the second bind
+        # must declare fresh plan objects, and the released plans must
+        # report no installed state.
+        for plan in first_plans:
+            session.release(plan)
+        assert all(plan.prepared is None for plan in first_plans)
+
+        second_backing, second_cache = make_cache()
+        second_context, second_plans = bind_prepare_and_exercise(
+            second_cache, second_backing, previous_plans=first_plans
+        )
+        assert second_context is not first_context
+
+        owner.unbind_kv_cache()
+        assert owner.get_b12x_preparation_units(owner, workload) == ()
 
 
 def test_qsa_registers_piecewise_splitting_op_once() -> None:
@@ -473,86 +463,6 @@ def test_qsa_prefill_context_capacities_cover_the_configured_limit() -> None:
     )
 
 
-@pytest.mark.parametrize("max_tokens", [4, 10])
-@pytest.mark.parametrize("draft", [False, True])
-def test_qsa_warmup_prewarms_prefill_and_runs_padded_decode(
-    monkeypatch, max_tokens, draft
-) -> None:
-    caps = SimpleNamespace(
-        device=torch.device("cpu"),
-        q_heads=2,
-        kv_heads=1,
-        head_dim=16,
-        index_heads=2,
-        index_head_dim=8,
-        position_axes=3,
-        max_batch=2,
-        main_page_size=16,
-        selection_width=8,
-        kv_dtype=torch.bfloat16,
-    )
-    contexts = tuple(
-        SimpleNamespace(
-            max_seq_len=capacity,
-            plan=SimpleNamespace(caps=caps),
-        )
-        for capacity in (32, 64)
-    )
-    layer = SimpleNamespace(
-        _qsa_prefill_bindings=contexts,
-        _qsa_decode_context=SimpleNamespace(
-            plan=SimpleNamespace(caps=SimpleNamespace(max_q_rows=6))
-        ),
-        _bind_qsa_context=lambda context: context,
-        max_tokens=max_tokens,
-        max_seqs=2,
-        _share_mtp_indices=draft,
-        _mtp_source_rows=torch.full((2,), -1, dtype=torch.int64),
-        max_speculative_tokens=2,
-        max_decode_rows=6,
-        overlap_input_projections=False,
-    )
-    calls = []
-
-    def prewarm(binding, *, rows):
-        assert any(binding is context for context in contexts)
-        assert rows == max_tokens - 2
-        calls.append((binding, rows))
-
-    def run(binding, **inputs):
-        rows = inputs["query"].shape[0]
-        calls.append((binding, rows))
-        assert inputs["query"].shape == (rows, 2, 16)
-        if "reuse" in inputs:
-            assert inputs["reuse"].source_rows is layer._mtp_source_rows
-            assert set(inputs) == {"query", "request_ids", "query_positions", "reuse"}
-            return
-        assert inputs["index_query"].shape == (rows, 2, 8)
-        assert inputs["raw_index_key"].shape == (rows, 8)
-        assert inputs["rope_positions"].shape == (rows, 3)
-        assert (inputs["request_ids"] == -1).all()
-        assert (inputs["query_positions"] == -1).all()
-        assert not inputs["sequence_lengths"].any()
-        assert not inputs["query_start_loc"].any()
-
-    monkeypatch.setattr(
-        qsa_module,
-        "get_b12x_qsa",
-        lambda: SimpleNamespace(
-            run=run, prewarm=prewarm, DraftSelectionReuse=SimpleNamespace
-        ),
-    )
-    unit = qsa_module._B12xQSAWarmup().get_b12x_warmup_unit(
-        layer, (1, 4, 8), torch.bfloat16
-    )
-    unit.compile()
-    assert calls == [
-        *((context, max_tokens - 2) for context in contexts),
-        (layer._qsa_decode_context, 1),
-        (layer._qsa_decode_context, 4),
-        *(([(layer._qsa_decode_context, 2)]) if draft else []),
-    ]
-
 
 def test_qsa_run_consumes_projection_views_and_writes_live_output(monkeypatch) -> None:
     rows = 2
@@ -620,15 +530,12 @@ def test_qsa_selects_the_smallest_sufficient_prefill_context_plan() -> None:
     binding_32 = object()
     binding_64 = object()
     decode_plan = object()
-    scratch = torch.empty(0)
-    table_32 = torch.empty(2, 4, dtype=torch.int32)
-    table_64 = torch.empty(2, 8, dtype=torch.int32)
     owner._qsa_prefill_bindings = (
-        qsa_module._QSAContextPlan(32, binding_32, scratch, table_32, table_32),
-        qsa_module._QSAContextPlan(64, binding_64, scratch, table_64, table_64),
+        qsa_module._QSAContextPlan(max_seq_len=32, caps=None, plan=binding_32),
+        qsa_module._QSAContextPlan(max_seq_len=64, caps=None, plan=binding_64),
     )
     owner._qsa_decode_context = qsa_module._QSAContextPlan(
-        64, decode_plan, scratch, table_64, table_64
+        max_seq_len=64, caps=None, plan=decode_plan,
     )
 
     assert owner._qsa_binding_for_workload(rows=1, max_seq_len=20).plan is decode_plan

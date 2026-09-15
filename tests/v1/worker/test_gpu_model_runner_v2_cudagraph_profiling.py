@@ -174,11 +174,13 @@ def test_profile_cudagraph_memory_samples_and_extrapolates(monkeypatch):
         mem_samples=[100 * gib, 20 * gib],
     )
 
-    result = cgu.profile_cudagraph_memory(runner)
+    result = cgu.profile_cudagraph_memory(
+        runner, lambda: runner.events.append("prepare")
+    )
 
     assert result == (1000 - (100 + 20) + (100 + 20 + 10)) * gib
     # Bootstrap, capture, and teardown run in order.
-    assert runner.events == ["init", "capture", "teardown"]
+    assert runner.events == ["init", "prepare", "capture", "teardown"]
     # Capture must use a throwaway pool, not the persistent global pool.
     assert runner.pool_during_capture == THROWAWAY_POOL
     assert runner.cudagraph_manager.pool == GLOBAL_POOL
@@ -285,8 +287,13 @@ def test_profile_cudagraph_memory_restores_compilation_counters(monkeypatch):
 
 def test_model_runner_delegates_to_cudagraph_utils(monkeypatch):
     runner = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
-    monkeypatch.setattr(mrv2, "_profile_cudagraph_memory", lambda r: 42)
-    assert runner.profile_cudagraph_memory() == 42
+    prepare = lambda: None
+    monkeypatch.setattr(
+        mrv2,
+        "_profile_cudagraph_memory",
+        lambda r, callback: (r, callback),
+    )
+    assert runner.profile_cudagraph_memory(prepare) == (runner, prepare)
 
 
 def test_extrapolate_full_graph_memory():

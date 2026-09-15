@@ -1670,6 +1670,10 @@ def test_schedule_spec_decoding_stats(
         assert stats.num_draft_tokens == expected[1]
         assert stats.num_accepted_tokens == expected[2]
         assert stats.num_accepted_tokens_per_pos == expected[3]
+        assert stats.num_draft_tokens_per_pos == [
+            sum(len(tokens) > pos for tokens in spec_tokens)
+            for pos in range(num_spec_tokens)
+        ]
 
     # Per-request accumulator: the same acceptance, bucketed by accepted draft
     # count (j) on each request rather than summed across the batch. The
@@ -1737,9 +1741,52 @@ def test_per_request_spec_decode_detailed_records_per_step():
     assert payload["num_spec_steps"] == 3
 
 
+def test_adaptive_verified_depth_drives_spec_decode_metrics():
+    scheduler = create_scheduler(
+        num_speculative_tokens=3,
+        per_request_spec_decode_metrics="detailed",
+    )
+    [req] = create_requests(num_requests=1, num_tokens=1)
+    scheduler.add_request(req)
+    req_id = req.request_id
+
+    def _model_output(sampled, verified=None):
+        return ModelRunnerOutput(
+            req_ids=[req_id],
+            req_id_to_index={req_id: 0},
+            sampled_token_ids=sampled,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            num_verified_draft_tokens=verified,
+        )
+
+    scheduler.update_from_output(scheduler.schedule(), _model_output([[0]]))
+    scheduler.update_draft_token_ids(DraftTokenIds([req_id], [[1, 2, 3]]))
+    output = scheduler.schedule()
+    engine_core_outputs = scheduler.update_from_output(
+        output,
+        _model_output([[1, 4]], verified=[2]),
+    )
+
+    stats = engine_core_outputs[0].scheduler_stats.spec_decoding_stats
+    assert stats.num_drafts == 1
+    assert stats.num_draft_tokens == 2
+    assert stats.num_accepted_tokens == 1
+    assert stats.num_accepted_tokens_per_pos == [1, 0, 0]
+    assert stats.num_draft_tokens_per_pos == [1, 1, 0]
+
+    payload = scheduler.requests[req_id].spec_decode_metrics.to_dict()
+    assert payload["num_spec_steps"] == 1
+    assert payload["num_draft_tokens"] == 2
+    assert payload["draft_acceptance_rate"] == 0.5
+    assert payload["per_step_drafted"] == [2]
+    assert req.num_computed_tokens == 3
+
+
 def test_per_request_spec_decode_subtracts_invalid_drafts():
     # Grammar-invalidated drafts (num_invalid_spec_tokens, set by structured
-    # output) are excluded from the proposed count, mirroring the aggregate.
+    # output) are excluded from the verified count, mirroring the aggregate.
     scheduler = create_scheduler(
         num_speculative_tokens=3,
         per_request_spec_decode_metrics="summary",
