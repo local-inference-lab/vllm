@@ -277,6 +277,7 @@ class DCPExchange:
             stream_affine=False,
         )
         self.plans = {}
+        self.gather_bindings = {}
         self._preparation_owner = None
         requests = []
         # The channel owns maximum-capacity storage; priming runs one row.
@@ -347,9 +348,17 @@ class DCPExchange:
         )
 
     def gather(self, query, out):
+        key = (id(query), id(out))
+        binding = self.gather_bindings.get(key)
+        if binding is None:
+            binding = self.runtime.bind_all_gather_heads(
+                query,
+                out,
+                plan=self.plans["all_gather_heads"],
+            )
+            self.gather_bindings[key] = binding
         return self.runtime.all_gather_heads(
-            query,
-            out=out,
+            binding,
             plan=self.plans["all_gather_heads"],
         )
 

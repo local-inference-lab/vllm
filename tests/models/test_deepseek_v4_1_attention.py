@@ -180,6 +180,43 @@ def test_shared_dcp_channel_exposes_one_unit_in_each_preparation_stage(monkeypat
         assert collected == [unit]
 
 
+def test_dcp_exchange_retains_one_gather_binding_per_tensor_pair():
+    from vllm.models.deepseek_v4_1 import dcp
+
+    calls = []
+
+    class Runtime:
+        def bind_all_gather_heads(self, query, out, *, plan):
+            binding = object()
+            calls.append(("bind", query, out, plan, binding))
+            return binding
+
+        def all_gather_heads(self, binding, *, plan):
+            calls.append(("gather", binding, plan))
+
+    exchange = dcp.DCPExchange.__new__(dcp.DCPExchange)
+    exchange.runtime = Runtime()
+    exchange.plans = {"all_gather_heads": object()}
+    exchange.gather_bindings = {}
+    query, out = torch.empty(1), torch.empty(1)
+
+    exchange.gather(query, out)
+    exchange.gather(query, out)
+    other_out = torch.empty(1)
+    exchange.gather(query, other_out)
+
+    assert [call[0] for call in calls] == [
+        "bind",
+        "gather",
+        "gather",
+        "bind",
+        "gather",
+    ]
+    assert calls[1][1] is calls[0][4]
+    assert calls[2][1] is calls[0][4]
+    assert calls[4][1] is calls[3][4]
+
+
 def test_dcp_helpers_require_loaded_channel_without_allocating_cuda_memory():
     """Declaration cannot initialize an IPC channel behind the planner."""
     if not torch.cuda.is_available():
