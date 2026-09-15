@@ -2186,8 +2186,19 @@ def test_glm5next_chunked_projection_keeps_whole_image_attention(
     assert attention_calls == [11]
 
 
-@pytest.mark.parametrize("token_budget,expand", [(8000, 1), (8192, 1), (8000, 2)])
-def test_glm5next_image_budget_covers_rectangular_canvases(token_budget, expand):
+@pytest.mark.parametrize(
+    "token_budget,expand,expected_tokens",
+    [
+        (8000, 1, 8000),
+        (8192, 1, 8192),
+        (8000, 2, 8000),
+        (8191, 1, 8190),
+        (8191, 2, 8188),
+    ],
+)
+def test_glm5next_image_budget_covers_rectangular_canvases(
+    token_budget, expand, expected_tokens
+):
     from vllm.models.glm5next.nvidia.multimodal import Glm5NextProcessingInfo
 
     processor = SimpleNamespace(
@@ -2204,8 +2215,10 @@ def test_glm5next_image_budget_covers_rectangular_canvases(token_budget, expand)
     canvas = info.get_image_size_with_most_features()
     assert canvas.width % (28 * expand) == 0
     assert canvas.height % (28 * expand) == 0
-    assert canvas.width * canvas.height // 28**2 == token_budget
-    assert info.get_max_image_tokens() == token_budget
+    assert canvas.width // processor.patch_size <= 8192
+    assert canvas.height // processor.patch_size <= 8192
+    assert canvas.width * canvas.height // 28**2 == expected_tokens
+    assert info.get_max_image_tokens() == expected_tokens
     assert (
         info.get_num_image_tokens(image_width=3082, image_height=2048) <= token_budget
     )

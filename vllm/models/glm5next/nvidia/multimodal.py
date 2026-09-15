@@ -52,6 +52,7 @@ from vllm.v1.worker.workspace import (
 )
 
 _VISION_PROJECTION_CHUNK_ROWS = 4096
+_VISION_ROPE_MAX_POSITION = 8192
 
 
 class Glm5NextVisionPatchEmbed(nn.Module):
@@ -491,7 +492,7 @@ class Glm5NextVisionTransformer(nn.Module):
         head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = get_rope(
             head_size=head_dim,
-            max_position=8192,
+            max_position=_VISION_ROPE_MAX_POSITION,
             is_neox_style=True,
             rope_parameters={"partial_rotary_factor": 0.5},
         )
@@ -795,7 +796,7 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
         return self._processor_pixel_budget(processor)[1]
 
     def get_image_size_with_most_features(self) -> ImageSize:
-        """Choose an aligned canvas that exhausts the image-token budget.
+        """Maximize aligned canvas area within the token and vision RoPE limits.
 
         A square canvas can underfill the budget: 89 by 89 merged patches
         produce 7921 features, while a valid 80 by 100 canvas produces 8000.
@@ -810,10 +811,19 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
         )
         if cells < 1:
             raise ValueError("Image budget must fit at least one aligned canvas cell")
-        height = isqrt(cells)
-        while cells % height:
-            height -= 1
-        return ImageSize(width=(cells // height) * factor, height=height * factor)
+        max_side = _VISION_ROPE_MAX_POSITION // (
+            processor.merge_size * processor.patch_expand_factor
+        )
+        if max_side < 1:
+            raise ValueError("One aligned canvas cell exceeds the vision RoPE grid")
+        width = height = 1
+        # Include every feasible shorter side. Maximum area prevents memory
+        # underprofiling; equal-area ties prefer the least elongated canvas.
+        for candidate_height in range(1, min(isqrt(cells), max_side) + 1):
+            candidate_width = min(cells // candidate_height, max_side)
+            if candidate_width * candidate_height >= width * height:
+                width, height = candidate_width, candidate_height
+        return ImageSize(width=width * factor, height=height * factor)
 
     def _get_video_max_pixels(self) -> int:
         mm_kwargs = self.ctx.get_merged_mm_kwargs({})
