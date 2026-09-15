@@ -105,7 +105,8 @@ def test_dcp_kv_replica_binds_fixed_tensors_once_before_live_launch(monkeypatch)
     class Runtime:
         def bind(self, *args, **kwargs):
             calls.append(("bind", args, kwargs))
-            return "binding"
+            count = sum(call[0] == "bind" for call in calls)
+            return f"binding-{count}"
 
         def replicate(self, *args, **kwargs):
             calls.append(("replicate", args, kwargs))
@@ -114,8 +115,8 @@ def test_dcp_kv_replica_binds_fixed_tensors_once_before_live_launch(monkeypatch)
     replica.runtime = Runtime()
     replica.plan = object()
     replica.output = torch.empty(1)
-    replica.binding = None
-    attention = SimpleNamespace(kv_cache=torch.empty(1))
+    replica.bindings = {}
+    attention = SimpleNamespace(prefix="layer.1", kv_cache=torch.empty(1))
     metadata = SimpleNamespace(
         block_table=torch.empty(1),
         request_positions=torch.empty(1),
@@ -128,8 +129,16 @@ def test_dcp_kv_replica_binds_fixed_tensors_once_before_live_launch(monkeypatch)
     replica.replicate(attention, metadata)
     metadata.num_reqs, metadata.max_seq_len = 2, 15
     replica.replicate(attention, metadata)
+    other = SimpleNamespace(prefix="layer.2", kv_cache=torch.empty(1))
+    replica.replicate(other, metadata)
 
-    assert [call[0] for call in calls] == ["bind", "replicate", "replicate"]
+    assert [call[0] for call in calls] == [
+        "bind",
+        "replicate",
+        "replicate",
+        "bind",
+        "replicate",
+    ]
     assert calls[0][1] == (
         attention.kv_cache,
         metadata.block_table,
@@ -137,10 +146,12 @@ def test_dcp_kv_replica_binds_fixed_tensors_once_before_live_launch(monkeypatch)
         metadata.query_start_loc,
         replica.output,
     )
-    assert calls[1][1] == ("binding",)
+    assert calls[1][1] == ("binding-1",)
     assert calls[1][2] == {"plan": replica.plan, "requests": 1, "max_tokens": 4}
-    assert calls[2][1] == ("binding",)
+    assert calls[2][1] == ("binding-1",)
     assert calls[2][2] == {"plan": replica.plan, "requests": 2, "max_tokens": 8}
+    assert calls[3][1][0] is other.kv_cache
+    assert calls[4][1] == ("binding-2",)
 
 
 def test_shared_dcp_channel_exposes_one_unit_in_each_preparation_stage(monkeypatch):

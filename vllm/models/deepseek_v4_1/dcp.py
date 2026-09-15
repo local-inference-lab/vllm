@@ -399,7 +399,7 @@ class DCPKVReplica:
             self.page_size * 288,
         )
         self.output = None
-        self.binding = None
+        self.bindings = {}
         self.runtime = pcie.PagedKvReplica.from_process_group(
             process_group=group.cpu_group,
             device=device,
@@ -493,14 +493,16 @@ class DCPKVReplica:
         return self.output
 
     def replicate(self, attention, metadata):
-        if self.binding is None:
+        key = attention.prefix
+        binding = self.bindings.get(key)
+        if binding is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "DCP KV replica tensors must be bound before capture"
                 )
             # Scheduler metadata uses persistent, in-place-updated buffers. Bind
             # their fixed ABI once; live request and token counts remain dynamic.
-            self.binding = self.runtime.bind(
+            binding = self.runtime.bind(
                 attention.kv_cache,
                 metadata.block_table,
                 metadata.request_positions,
@@ -508,8 +510,9 @@ class DCPKVReplica:
                 self.output,
                 plan=self.plan,
             )
+            self.bindings[key] = binding
         self.runtime.replicate(
-            self.binding,
+            binding,
             plan=self.plan,
             requests=metadata.num_reqs,
             max_tokens=max(1, (metadata.max_seq_len + 1) // 2),
