@@ -205,6 +205,17 @@ class Executor(ABC):
                     "advance_b12x_preparation",
                     kwargs={"cancel_tuning": self._b12x_autotuning_cancel.is_set()},
                 )
+                native = [
+                    bool(item.get("native")) for item in outcomes
+                ]
+                if any(native) and not all(native):
+                    raise RuntimeError(
+                        "b12x preparation world is asymmetrically native: "
+                        "outcomes "
+                        f"{[bool(item.get('native')) for item in outcomes]} "
+                        "by rank order; the native ranks would prepare "
+                        "single-sided and never authorize collectives."
+                    )
                 if display is not None:
                     progress = _aggregate_b12x_progress(outcomes)
                     if progress is not None:

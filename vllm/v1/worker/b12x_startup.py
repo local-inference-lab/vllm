@@ -73,6 +73,7 @@ class B12xPreparationCoordinator:
             if requests
         ]
         self._native = bool(self._batches)
+        self._native_reason = "native" if self._native else "no_units"
         self._job = None
         self._local_done = not self._native
         self._global_done = process_local_only and self._local_done
@@ -231,6 +232,8 @@ class B12xPreparationCoordinator:
             "round": self._round,
             "global_rank": self.global_rank,
             "world_ranks": self.world_ranks,
+            "native": self._native,
+            "native_reason": self._native_reason,
             "stop": self._stop,
             "ready": self._ready(),
             "tuning": self._ready_tuning(),
@@ -258,6 +261,28 @@ class B12xPreparationCoordinator:
                 raise RuntimeError(
                     "preparation control exchange has inconsistent round"
                 )
+        native = {
+            int(entry["global_rank"]): bool(entry.get("native"))
+            for entry in gathered
+        }
+        if any(native.values()) and not all(native.values()):
+            silent = sorted(rank for rank, value in native.items() if not value)
+            reasons = sorted(
+                {
+                    str(entry.get("native_reason"))
+                    for entry in gathered
+                    if not bool(entry.get("native"))
+                }
+            )
+            raise RuntimeError(
+                "preparation world is asymmetrically native: ranks "
+                f"{sorted(rank for rank, value in native.items() if value)} "
+                f"declared native but ranks {silent} did not "
+                f"(reason={reasons}). The native ranks would advance "
+                "single-sided and never authorize collectives; refusing to "
+                "prepare. Check the non-native ranks' unit collection: "
+                "provider gates, b12x_native_supported, or module imports."
+            )
 
     def _record_error(self, error: BaseException) -> None:
         self._error = {
