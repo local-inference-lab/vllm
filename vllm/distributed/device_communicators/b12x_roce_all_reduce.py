@@ -204,6 +204,7 @@ class B12xRoceAllReduce:
             return ()
         from b12x.comm import roce
         from b12x.comm.roce import _preparation
+        from b12x.preparation import CollectiveRequirement
 
         query = roce.query_from_runtime(
             self._runtime,
@@ -234,6 +235,14 @@ class B12xRoceAllReduce:
         request = self._plan.request(
             name=self._request_name(),
             prepare_call=prepare,
+            # Declaring the requirement is what makes the job yield a
+            # CollectiveRequirement signal: without it the two ranks' priming
+            # launches race, and the loser's kernel spins out (~20s spin
+            # budget), poisons the runtime, and the boot dies 4m50s later.
+            collective=CollectiveRequirement(
+                key=self._request_name(),
+                ranks=tuple(int(rank) for rank in self.global_ranks),
+            ),
         )
         return (
             B12xPreparationUnit(

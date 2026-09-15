@@ -37,6 +37,12 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Matches b12x.preparation's budget: a barrier wait may legitimately cover the
+# slowest rank's pre-launch round (compilation), but must not hide a dead peer.
+_BARRIER_TIMEOUT_SECONDS = float(
+    os.environ.get("B12X_COLLECTIVE_BARRIER_TIMEOUT", "120")
+)
+
 if os.environ.get("B12X_HANG_DUMP"):
     # A stalled worker dumps every thread's stack on SIGUSR1; ptrace-based
     # tools cannot reach worker processes from an unrelated shell. When the
@@ -409,6 +415,7 @@ def get_b12x_session(worker: "Worker"):
         device=worker.device,
         autotune=bool(config.kernel_config.enable_b12x_autotune),
         namespace=namespace,
+        collective_barrier=_make_collective_barrier(worker),
         # Compile workers are host processes that never touch CUDA, so the pool
         # is sized against host cores rather than against the device. The count
         # is per rank: a node runs this many compiler processes for each local
@@ -422,6 +429,32 @@ def get_b12x_session(worker: "Worker"):
     session.configure_tuning_shard(int(worker.rank), ranks)
     worker._b12x_session = session
     return session
+
+
+def _make_collective_barrier(worker: "Worker"):
+    """Build the launch-lockstep barrier the preparation session calls before
+    an authorized collective launch.
+
+    Uses the same store-backed control channel as the coordinator's exchange,
+    so it stays clear of model collectives. A rank that cannot enter within
+    the budget raises CollectiveBarrierTimeout, which surfaces as a loud
+    preparation failure naming the straggler instead of a silent kernel-side
+    spin-out on the peer.
+    """
+    from vllm.distributed.parallel_state import get_world_group
+
+    world_group = get_world_group()
+
+    def barrier(key, ranks):
+        del key  # StatelessProcessGroup.barrier is world-wide; key is advisory.
+        if world_group is None or len(ranks) <= 1:
+            return
+        from vllm.v1.worker.b12x_startup import _get_control_group
+
+        group = _get_control_group(world_group)
+        group.barrier(timeout=_BARRIER_TIMEOUT_SECONDS)
+
+    return barrier
 
 
 def begin_b12x_preparation(worker: "Worker", *, stage: str):
