@@ -5,6 +5,7 @@ import hashlib
 import importlib
 from collections.abc import Callable
 from dataclasses import replace
+from itertools import product
 from types import SimpleNamespace
 from typing import Any
 
@@ -2265,28 +2266,45 @@ def test_ds41_dcp_tuple_packing_keeps_replicated_index_separate(draft):
     specs = {}
     for source, ratio in enumerate((2, 2, 2, 1)):
         specs[f"main.{source}"] = MLAAttentionSpec(
-            block_size=256, num_kv_heads=1, head_size=512,
-            state_content_bytes=288, dtype=torch.uint8,
-            tokens_per_state=ratio, cache_dtype_str="b12x_dsv41",
+            block_size=256,
+            num_kv_heads=1,
+            head_size=512,
+            state_content_bytes=288,
+            dtype=torch.uint8,
+            tokens_per_state=ratio,
+            cache_dtype_str="b12x_dsv41",
         )
         specs[f"index.{source}"] = MLAAttentionSpec(
-            block_size=256, num_kv_heads=1, head_size=68,
-            state_content_bytes=68, dtype=torch.uint8,
-            tokens_per_state=ratio, cache_dtype_str="b12x_dsv41",
+            block_size=256,
+            num_kv_heads=1,
+            head_size=68,
+            state_content_bytes=68,
+            dtype=torch.uint8,
+            tokens_per_state=ratio,
+            cache_dtype_str="b12x_dsv41",
             dcp_replicated=True,
         )
         if ratio == 2:
             specs[f"state.{source}"] = CircularBufferSpec(
-                block_size=8, num_kv_heads=1, head_size=1024,
-                head_size_v=0, dtype=torch.float32, dcp_replicated=True,
+                block_size=8,
+                num_kv_heads=1,
+                head_size=1024,
+                head_size_v=0,
+                dtype=torch.float32,
+                dcp_replicated=True,
             )
     for layer in range(40 + 3 * draft):
         private = layer >= 20
         specs[f"swa.{layer}"] = SlidingWindowMLASpec(
-            block_size=128, num_kv_heads=1, head_size=512,
-            state_content_bytes=528, dtype=torch.uint8,
-            tokens_per_state=1, cache_dtype_str="b12x_dsv41",
-            dcp_replicated=True, sliding_window=128,
+            block_size=128,
+            num_kv_heads=1,
+            head_size=512,
+            state_content_bytes=528,
+            dtype=torch.uint8,
+            tokens_per_state=1,
+            cache_dtype_str="b12x_dsv41",
+            dcp_replicated=True,
+            sliding_window=128,
             extra_retained_tokens=int(layer >= 40),
             prefix_cache_enabled=not private,
             prefill_replay_window=128 if private else 0,
@@ -2294,23 +2312,56 @@ def test_ds41_dcp_tuple_packing_keeps_replicated_index_separate(draft):
     config = _grouping_config()
     config.model_config = SimpleNamespace(max_model_len=540672)
     config.parallel_config = SimpleNamespace(decode_context_parallel_size=4)
-    config.max_in_flight_tokens = 4096
+    # Async PP1 serving can have two 4096-token batches in flight.
+    config.max_in_flight_tokens = 8192
+    grouped_specs = group_and_unify_kv_cache_specs(specs)
+    assert grouped_specs is not None
+    baseline_groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(grouped_specs)
     groups = get_kv_cache_groups(config, specs)
+    assert len(baseline_groups) == (18 if draft else 17)
+    assert len(groups) == (26 if draft else 24)
     full_groups = [
-        group for group in groups
-        if any(name.startswith("main.") or name.startswith("index.")
-               for name in group.layer_names)
+        group
+        for group in groups
+        if any(
+            name.startswith("main.") or name.startswith("index.")
+            for name in group.layer_names
+        )
     ]
-    assert len(full_groups) == 2
-    assert {frozenset(group.layer_names) for group in full_groups} == {
-        frozenset(name for name in specs if name.startswith("main.")),
-        frozenset(name for name in specs if name.startswith("index.")),
+    assert all(
+        all(name.startswith("main.") for name in group.layer_names)
+        or all(name.startswith("index.") for name in group.layer_names)
+        for group in full_groups
+    )
+    assert {name for group in full_groups for name in group.layer_names} == {
+        name for name in specs if name.startswith("main.") or name.startswith("index.")
     }
     assert {name for group in groups for name in group.layer_names} == set(specs)
-    scheduler = generate_scheduler_kv_cache_config([
-        KVCacheConfig(num_blocks=100000, kv_cache_tensors=[], kv_cache_groups=groups,
-                      prefix_cache_retention_interval=0)
-    ])
+    assert len(groups) <= kv_cache_utils._MAX_UNIFORM_TYPE_SHARED_POOL_GROUPS
+    group_signature = [tuple(group.layer_names) for group in groups]
+    assert [
+        tuple(group.layer_names) for group in get_kv_cache_groups(config, specs)
+    ] == group_signature
+    for group in groups:
+        if any(name.startswith("swa.") for name in group.layer_names):
+            assert all(name.startswith("swa.") for name in group.layer_names)
+            layer_specs = [specs[name] for name in group.layer_names]
+            assert group.kv_cache_spec.prefix_cacheable == all(
+                spec.prefix_cacheable for spec in layer_specs
+            )
+            assert group.kv_cache_spec.prefill_replay_tokens == max(
+                spec.prefill_replay_tokens for spec in layer_specs
+            )
+    scheduler = generate_scheduler_kv_cache_config(
+        [
+            KVCacheConfig(
+                num_blocks=100000,
+                kv_cache_tensors=[],
+                kv_cache_groups=groups,
+                prefix_cache_retention_interval=0,
+            )
+        ]
+    )
     for group in scheduler.kv_cache_groups:
         if group.layer_names[0].startswith("main."):
             assert not group.kv_cache_spec.dcp_replicated
@@ -2319,6 +2370,13 @@ def test_ds41_dcp_tuple_packing_keeps_replicated_index_separate(draft):
             assert group.kv_cache_spec.dcp_replicated
             assert group.kv_cache_spec.max_num_blocks_per_req(config, 540672) == 2112
     packed_cost = kv_cache_utils._get_kv_cache_group_allocation_cost(config, groups)
+    baseline_cost = kv_cache_utils._get_kv_cache_group_allocation_cost(
+        config, baseline_groups
+    )
+    assert packed_cost < baseline_cost
+    if draft:
+        assert baseline_cost == 736_192_512
+        assert packed_cost == 681_394_176
     forced_groups = kv_cache_utils._get_weighted_shared_pool_kv_cache_groups(
         config, specs
     )
@@ -2326,6 +2384,17 @@ def test_ds41_dcp_tuple_packing_keeps_replicated_index_separate(draft):
         config, forced_groups
     )
     assert packed_cost < forced_cost
+
+    config.parallel_config = SimpleNamespace(decode_context_parallel_size=1)
+    dcp1_groups = get_kv_cache_groups(config, specs)
+    dcp1_grouped_specs = group_and_unify_kv_cache_specs(specs)
+    assert dcp1_grouped_specs is not None
+    dcp1_baseline = kv_cache_utils._get_kv_cache_groups_uniform_groups(
+        dcp1_grouped_specs
+    )
+    assert [tuple(group.layer_names) for group in dcp1_groups] == [
+        tuple(group.layer_names) for group in dcp1_baseline
+    ]
 
 
 @pytest.mark.parametrize(
@@ -2620,6 +2689,54 @@ def test_glm5next_weighted_groups_reject_more_than_eight_buckets(
         kv_cache_utils._get_weighted_shared_pool_kv_cache_groups(
             _glm5next_split_config(), {}
         )
+
+
+def test_weighted_shared_pool_selector_matches_exhaustive_search() -> None:
+    config = _glm5next_split_config()
+    specs = {
+        name: spec
+        for name, spec in _glm5next_split_specs("nvfp4_ds_mla").items()
+        if name == "model.target.0"
+        or name in {f"model.recurrent.{index}" for index in range(8)}
+    }
+    layer_buckets = kv_cache_utils._get_kv_cache_layer_buckets(specs)
+    baseline = kv_cache_utils._get_kv_cache_groups_uniform_page_size(
+        specs, log_padding=False
+    )
+    max_groups = kv_cache_utils._MAX_WEIGHTED_SHARED_POOL_GROUPS
+    split_options = [
+        [
+            kv_cache_utils._split_kv_cache_layer_buckets(specs, [layers], [count])
+            for count in range(1, min(len(layers), max_groups) + 1)
+        ]
+        for layers in layer_buckets
+    ]
+
+    selected, selected_key, _ = (
+        kv_cache_utils._select_weighted_shared_pool_kv_cache_groups(
+            config, baseline, split_options, max_groups
+        )
+    )
+    exhaustive = [
+        [group for option in choices for group in option]
+        for choices in product(*split_options)
+        if sum(len(option) for option in choices) <= max_groups
+    ]
+    expected = min(
+        exhaustive,
+        key=lambda groups: (
+            kv_cache_utils._get_kv_cache_group_allocation_cost(config, groups),
+            len(groups),
+        ),
+    )
+    expected_key = (
+        kv_cache_utils._get_kv_cache_group_allocation_cost(config, expected),
+        len(expected),
+    )
+    assert selected_key == expected_key
+    assert [tuple(group.layer_names) for group in selected] == [
+        tuple(group.layer_names) for group in expected
+    ]
 
 
 def test_glm5next_nvfp4_auto_geometry_capacity() -> None:

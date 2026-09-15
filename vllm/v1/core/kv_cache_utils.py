@@ -1370,41 +1370,18 @@ def _get_kv_cache_bytes_per_block(
 _MAX_WEIGHTED_SHARED_POOL_GROUPS = 8
 
 
-def _iter_bounded_group_counts(
-    group_count_ranges: Sequence[range],
-    max_total: int,
-) -> Iterator[tuple[int, ...]]:
-    """Yield group-count combinations whose sum does not exceed a limit.
-
-    Args:
-        group_count_ranges: Ascending positive group counts for each layer bucket.
-        max_total: Maximum sum permitted across one combination.
-
-    Yields:
-        A group-count tuple whose sum is at most ``max_total``.
-    """
-
-    def visit(
-        bucket_index: int,
-        running_total: int,
-        counts: tuple[int, ...],
-    ) -> Iterator[tuple[int, ...]]:
-        if bucket_index == len(group_count_ranges):
-            yield counts
-            return
-
-        remaining_buckets = len(group_count_ranges) - bucket_index - 1
-        for group_count in group_count_ranges[bucket_index]:
-            new_total = running_total + group_count
-            if new_total + remaining_buckets > max_total:
-                break
-            yield from visit(
-                bucket_index + 1,
-                new_total,
-                (*counts, group_count),
-            )
-
-    yield from visit(0, 0, ())
+def _get_kv_cache_request_blocks(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
+    """Calculate shared-pool blocks needed by a maximum-length request."""
+    return sum(
+        cdiv(
+            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+            group.kv_cache_spec.page_size_bytes,
+        )
+        for group in kv_cache_groups
+    )
 
 
 def _get_kv_cache_group_allocation_cost(
@@ -1420,14 +1397,68 @@ def _get_kv_cache_group_allocation_cost(
     Returns:
         Required shared-pool bytes for one maximum-length request.
     """
-    num_blocks_per_request = sum(
-        cdiv(
-            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
-            group.kv_cache_spec.page_size_bytes,
+    bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups)
+    request_blocks = _get_kv_cache_request_blocks(vllm_config, kv_cache_groups)
+    return bytes_per_block * request_blocks
+
+
+def _select_weighted_shared_pool_kv_cache_groups(
+    vllm_config: VllmConfig,
+    baseline_groups: list[KVCacheGroupSpec],
+    split_options: Sequence[Sequence[list[KVCacheGroupSpec]]],
+    max_groups: int,
+) -> tuple[list[KVCacheGroupSpec], tuple[int, int], int]:
+    """Select the lowest-cost candidate for the shared KV block pool.
+
+    Candidate construction is layout-specific, but every shared-pool layout
+    has the same admission objective: minimize maximum-request bytes, then
+    prefer fewer groups. A dynamic program retains the lowest request-block
+    count for each (group count, pool stride) pair, which is sufficient to find
+    the global minimum without enumerating every cross-product combination.
+    """
+    baseline_cost = _get_kv_cache_group_allocation_cost(vllm_config, baseline_groups)
+    baseline_within_limit = len(baseline_groups) <= max_groups
+    best_groups = baseline_groups if baseline_within_limit else None
+    best_key = (baseline_cost, len(baseline_groups)) if baseline_within_limit else None
+    states: dict[tuple[int, int], tuple[int, list[KVCacheGroupSpec]]] = {
+        (0, 0): (0, [])
+    }
+    for options in split_options:
+        next_states: dict[tuple[int, int], tuple[int, list[KVCacheGroupSpec]]] = {}
+        for (used_groups, used_stride), (
+            used_blocks,
+            selected_groups,
+        ) in states.items():
+            for option in options:
+                total_groups = used_groups + len(option)
+                if total_groups > max_groups:
+                    continue
+                stride = max(used_stride, _get_kv_cache_bytes_per_block(option))
+                blocks = used_blocks + _get_kv_cache_request_blocks(vllm_config, option)
+                state_key = (total_groups, stride)
+                previous = next_states.get(state_key)
+                if previous is None or blocks < previous[0]:
+                    next_states[state_key] = (
+                        blocks,
+                        [*selected_groups, *option],
+                    )
+        states = next_states
+
+    for (_, stride), (blocks, groups) in states.items():
+        candidate_key = (
+            stride * blocks,
+            len(groups),
         )
-        for group in kv_cache_groups
-    )
-    return _get_kv_cache_bytes_per_block(kv_cache_groups) * num_blocks_per_request
+        if best_key is None or candidate_key < best_key:
+            best_key = candidate_key
+            best_groups = groups
+
+    if best_groups is None or best_key is None:
+        raise ValueError(
+            "No compatible split KV cache layout fits within the "
+            f"{max_groups}-group limit."
+        )
+    return best_groups, best_key, baseline_cost
 
 
 def _get_weighted_shared_pool_kv_cache_groups(
@@ -1457,33 +1488,21 @@ def _get_weighted_shared_pool_kv_cache_groups(
     baseline_groups = _get_kv_cache_groups_uniform_page_size(
         kv_cache_spec, log_padding=False
     )
-    baseline_cost = _get_kv_cache_group_allocation_cost(vllm_config, baseline_groups)
-    baseline_within_limit = len(baseline_groups) <= _MAX_WEIGHTED_SHARED_POOL_GROUPS
-    best_groups = baseline_groups if baseline_within_limit else None
-    best_key = (baseline_cost, len(baseline_groups)) if baseline_within_limit else None
-
-    group_count_ranges = [
-        range(1, min(len(layers), _MAX_WEIGHTED_SHARED_POOL_GROUPS) + 1)
+    split_options = [
+        [
+            _split_kv_cache_layer_buckets(kv_cache_spec, [layers], [group_count])
+            for group_count in range(
+                1, min(len(layers), _MAX_WEIGHTED_SHARED_POOL_GROUPS) + 1
+            )
+        ]
         for layers in layer_buckets
     ]
-    for group_counts in _iter_bounded_group_counts(
-        group_count_ranges, _MAX_WEIGHTED_SHARED_POOL_GROUPS
-    ):
-        total_groups = sum(group_counts)
-        groups = _split_kv_cache_layer_buckets(
-            kv_cache_spec, layer_buckets, group_counts
-        )
-        cost = _get_kv_cache_group_allocation_cost(vllm_config, groups)
-        candidate_key = (cost, total_groups)
-        if best_key is None or candidate_key < best_key:
-            best_key = candidate_key
-            best_groups = groups
-
-    if best_groups is None or best_key is None:
-        raise ValueError(
-            "No compatible split KV cache layout fits within the "
-            f"{_MAX_WEIGHTED_SHARED_POOL_GROUPS}-group limit."
-        )
+    best_groups, best_key, baseline_cost = _select_weighted_shared_pool_kv_cache_groups(
+        vllm_config,
+        baseline_groups,
+        split_options,
+        _MAX_WEIGHTED_SHARED_POOL_GROUPS,
+    )
     if best_groups is not baseline_groups:
         logger.warning(
             "Rebalanced split KV cache groups from layer counts %s to %s; "
@@ -1936,9 +1955,7 @@ def _get_kv_cache_groups_uniform_groups(
         num_full_groups += 1
     assert num_full_groups > 0
     full_mla_groups = [
-        KVCacheGroupSpec(
-            layer_names=list(spec.kv_cache_specs), kv_cache_spec=spec
-        )
+        KVCacheGroupSpec(layer_names=list(spec.kv_cache_specs), kv_cache_spec=spec)
         for spec in grouped_specs[:num_full_groups]
     ]
 
@@ -2007,6 +2024,92 @@ def _get_kv_cache_groups_uniform_groups(
             )
 
     return [*full_mla_groups, *swa_mla_groups]
+
+
+# DS4.1 already needs more groups than the generic weighted allocator permits.
+# Keep this search bounded because each group adds a block-table row and prefix
+# cache bookkeeping. The current DS4.1 layout uses 18 groups, and 32 is enough
+# to recover the useful DCP4 packing alternatives without an unbounded search.
+_MAX_UNIFORM_TYPE_SHARED_POOL_GROUPS = 32
+
+
+def _split_uniform_type_kv_cache_spec(
+    spec: UniformTypeKVCacheSpecs,
+    num_groups: int,
+) -> list[KVCacheGroupSpec]:
+    """Split one uniform-type bucket without changing any per-layer spec."""
+    assert 1 <= num_groups <= spec.get_num_layer_tuples()
+    layers_per_page_size: dict[int, list[str]] = defaultdict(list)
+    for layer_name, layer_spec in spec.kv_cache_specs.items():
+        layers_per_page_size[layer_spec.page_size_bytes].append(layer_name)
+
+    groups = []
+    for group_index in range(num_groups):
+        layer_names = [
+            layer_name
+            for layers in layers_per_page_size.values()
+            for layer_name in layers[group_index::num_groups]
+        ]
+        if not layer_names:
+            continue
+        group_spec = UniformTypeKVCacheSpecs.from_specs(
+            {name: spec.kv_cache_specs[name] for name in layer_names}
+        )
+        assert group_spec is not None
+        groups.append(KVCacheGroupSpec(layer_names, group_spec))
+    return groups
+
+
+def _get_uniform_type_shared_pool_split_options(
+    grouped_specs: list[UniformTypeKVCacheSpecs],
+    max_groups: int,
+) -> list[list[list[KVCacheGroupSpec]]]:
+    """Build deterministic split choices for each packed uniform-type bucket."""
+    return [
+        [
+            _split_uniform_type_kv_cache_spec(spec, count)
+            for count in range(1, min(spec.get_num_layer_tuples(), max_groups) + 1)
+        ]
+        for spec in grouped_specs
+    ]
+
+
+def _rebalance_uniform_type_shared_pool_groups(
+    vllm_config: VllmConfig,
+    grouped_specs: list[UniformTypeKVCacheSpecs],
+    baseline_groups: list[KVCacheGroupSpec],
+) -> list[KVCacheGroupSpec]:
+    """Minimize DCP shared-pool padding for DS4-style packed cache specs.
+
+    DCP can shrink full-attention pages while leaving local and index state
+    replicated. The tuple layout above preserves that ownership correctly, but
+    a single tuple width can then leave the shared pool dominated by padding.
+    Generate compatible subdivisions and use the shared weighted cost selector
+    rather than introducing a model-specific allocation objective.
+    """
+    if vllm_config.parallel_config.decode_context_parallel_size == 1:
+        return baseline_groups
+
+    max_groups = max(len(baseline_groups), _MAX_UNIFORM_TYPE_SHARED_POOL_GROUPS)
+    split_options = _get_uniform_type_shared_pool_split_options(
+        grouped_specs, max_groups
+    )
+    best_groups, best_key, baseline_cost = _select_weighted_shared_pool_kv_cache_groups(
+        vllm_config, baseline_groups, split_options, max_groups
+    )
+
+    if best_groups is not baseline_groups:
+        logger.warning(
+            "Rebalanced packed DCP KV cache from %d to %d groups; "
+            "shared-pool max-request cost decreased from %d to %d bytes "
+            "(%.2f%%).",
+            len(baseline_groups),
+            len(best_groups),
+            baseline_cost,
+            best_key[0],
+            (baseline_cost - best_key[0]) / baseline_cost * 100,
+        )
+    return best_groups
 
 
 def _annotate_eagle_groups_deepseek_v4(
@@ -2132,7 +2235,10 @@ def get_kv_cache_groups(
         # yet some layers are full attention while others are sliding window
         # attention in different sizes. Need to group layers into multiple
         # UniformTypeKVCacheSpecs.
-        kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
+        baseline_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
+        kv_cache_groups = _rebalance_uniform_type_shared_pool_groups(
+            vllm_config, grouped_specs, baseline_groups
+        )
         _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
         return kv_cache_groups
 
