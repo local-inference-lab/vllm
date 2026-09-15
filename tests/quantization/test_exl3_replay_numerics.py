@@ -36,7 +36,10 @@ def _b12x():
             importlib.import_module("b12x.moe._shared.kernels.w4a16.kernel"),
             importlib.import_module("b12x.moe._shared.kernels.w4a16.host"),
         )
-    except Exception:  # noqa: BLE001
+    except (ImportError, ModuleNotFoundError):
+        # Only an absent build is a skip. Letting anything else through -- an
+        # initialisation error, a version mismatch raising at import time --
+        # would turn a real failure into a green run with no CUDA coverage.
         pytest.skip("B12X w4a16 Trellis kernels are unavailable")
 
 
@@ -249,17 +252,30 @@ def test_replay_matches_eager_across_changing_routes(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_replay_observes_new_inputs():
-    """Guards the test above: equality is vacuous if the output never moves."""
-    tokens, block_m, experts, bits = 8, 8, 8, 4
+@pytest.mark.parametrize(
+    "bits,activation_dtype,rotation_dtype",
+    [
+        (3, torch.float16, "fp16"),
+        (4, torch.float16, "fp16"),
+        (4, torch.bfloat16, "bf16"),
+    ],
+)
+def test_replay_observes_new_inputs(bits, activation_dtype, rotation_dtype):
+    """Guards the test above: equality is vacuous if the output never moves.
+
+    Parametrised over the same matrix, because the equality check is only
+    meaningful for a configuration this has also shown to be live. An
+    all-invariant or all-NaN output would satisfy exact equality on its own.
+    """
+    tokens, block_m, experts = 8, 8, 8
     kernel, prepared, launch, buffers, device = _build(
         experts=experts,
         bits=bits,
         tokens=tokens,
         block_m=block_m,
-        rotation_dtype="fp16",
+        rotation_dtype=rotation_dtype,
     )
-    x = torch.randn((tokens, HIDDEN), dtype=torch.float16, device=device)
+    x = torch.randn((tokens, HIDDEN), dtype=activation_dtype, device=device)
     topk_weights = torch.rand((tokens, TOPK), dtype=torch.float32, device=device)
     topk_ids = torch.randint(
         0, experts, (tokens, TOPK), dtype=torch.int32, device=device

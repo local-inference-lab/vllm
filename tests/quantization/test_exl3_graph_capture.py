@@ -41,7 +41,10 @@ def _b12x():
             importlib.import_module("b12x.moe._shared.kernels.w4a16.kernel"),
             importlib.import_module("b12x.moe._shared.kernels.w4a16.host"),
         )
-    except Exception:  # noqa: BLE001
+    except (ImportError, ModuleNotFoundError):
+        # Only an absent build is a skip. Letting anything else through -- an
+        # initialisation error, a version mismatch raising at import time --
+        # would turn a real failure into a green run with no CUDA coverage.
         pytest.skip("B12X w4a16 Trellis kernels are unavailable")
 
 
