@@ -656,6 +656,7 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
         self.vllm_config = vllm_config
         self._b12x_cache_page_views: dict[object, torch.Tensor] = {}
         self._b12x_wo_projection_weights: Any | None = None
+        self._b12x_wo_plans: dict[int, object] = {}
         super().__init__(vllm_config, *args, **kwargs)
 
     @classmethod
@@ -735,6 +736,94 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
             hidden=hidden,
         )
 
+    def _b12x_wo_plan(self, tokens: int):
+        if self._b12x_wo_projection_weights is None:
+            raise RuntimeError("B12x WO-A/WO-B weights were not packed after loading.")
+        module = _require_b12x_wo_projection()
+        weights = self._b12x_wo_projection_weights
+        table = self.rotary_emb.cos_sin_cache
+        plan = self._b12x_wo_plans.get(tokens)
+        if plan is None:
+            plan = module.plan(
+                module.Caps(
+                    device=table.device,
+                    max_tokens=tokens,
+                    groups=weights.groups,
+                    group_width=weights.group_width,
+                    rank=weights.rank,
+                    hidden=weights.hidden,
+                ),
+                invocation=dict(
+                    operation="inv_rope",
+                    heads_per_group=self.n_local_heads // self.n_local_groups,
+                    nope_dim=self.nope_head_dim,
+                    rope_dim=self.rope_head_dim,
+                    positions_dtype="int64",
+                    cos_sin_dtype=str(table.dtype).removeprefix("torch."),
+                ),
+            )
+            self._b12x_wo_plans[tokens] = plan
+        return plan
+
+    def get_b12x_preparation_units(
+        self, layer: object, workload: B12xWorkload
+    ) -> tuple[B12xPreparationUnit, ...]:
+        """Declare inv-RoPE WO plans so preparation primes them."""
+        if self._b12x_wo_projection_weights is None:
+            return ()
+        counts = tuple(sorted(set(workload.token_counts)))
+
+        def prepare(state):
+            from b12x.preparation import PreparedCall
+
+            device = self.rotary_emb.cos_sin_cache.device
+            source = torch.empty(
+                (state.query.max_tokens, self.n_local_heads, self.head_dim),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            positions = torch.arange(
+                state.query.max_tokens, dtype=torch.int64, device=device
+            )
+            positions.remainder_(self.rotary_emb.cos_sin_cache.shape[0])
+            scratch = tuple(
+                torch.empty(spec.shape, dtype=spec.dtype, device=device)
+                for spec in state._scratch_state.scratch_specs()
+            )
+            binding = state.bind_inv_rope(
+                scratch=scratch,
+                o=source,
+                positions=positions,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                weights=self._b12x_wo_projection_weights,
+                heads_per_group=self.n_local_heads // self.n_local_groups,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+            )
+            return PreparedCall(
+                run=lambda: state.run_inv_rope(binding),
+                produce=lambda: source.normal_(std=0.25),
+                owners=(self._b12x_wo_projection_weights, self.rotary_emb.cos_sin_cache),
+            )
+
+        requests = [
+            self._b12x_wo_plan(rows).request(
+                name=f"deepseek_v4.wo.m{rows}",
+                prepare_call=prepare,
+                benchmark_call=prepare,
+            )
+            for rows in counts
+        ]
+        return (
+            B12xPreparationUnit(
+                name="DeepseekV4WOProjection",
+                key=(id(self), counts),
+                requests=tuple(requests),
+                stage="weights",
+                autotune=not workload.eager_only,
+            ),
+        )
+
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         if self.wo_a.weight.dtype == self.wo_b.weight.dtype == torch.bfloat16:
             return bf16_o_proj(
@@ -749,16 +838,36 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
             )
         if self._b12x_wo_projection_weights is None:
             raise RuntimeError("B12x WO-A/WO-B weights were not packed after loading.")
+        from dataclasses import replace as _replace_binding
+        from b12x.preparation import require_prepared
+
+        tokens = o.shape[0]
         module = _require_b12x_wo_projection()
-        out = module.run_inv_rope(
-            o,
-            positions,
-            self.rotary_emb.cos_sin_cache,
-            self._b12x_wo_projection_weights,
+        plan = self._b12x_wo_plan(tokens)
+        require_prepared(plan, "gemm.wo_projection", o.device)
+        binding = module.bind_inv_rope(
+            plan,
+            scratch=current_workspace_manager().get_simultaneous(
+                *((s.shape, s.dtype) for s in plan.scratch_specs())
+            ),
+            o=o,
+            positions=positions,
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            weights=self._b12x_wo_projection_weights,
             heads_per_group=self.n_local_heads // self.n_local_groups,
             nope_dim=self.nope_head_dim,
             rope_dim=self.rope_head_dim,
-            stream=current_stream().cuda_stream,
+        )
+        output = torch.empty_strided(
+            (tokens, self.hidden_size, 1),
+            (self.hidden_size, 1, tokens * self.hidden_size),
+            dtype=torch.bfloat16,
+            device=o.device,
+        )
+        binding = _replace_binding(binding, output=output)
+        retain_cuda_graph_capture_resource(binding)
+        out = module.run_inv_rope(
+            binding=binding, plan=plan, stream=current_stream().cuda_stream
         )
         if self.wo_b.reduce_results and self.wo_b.tp_size > 1:
             out = tensor_model_parallel_all_reduce(out)
