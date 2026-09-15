@@ -9,6 +9,39 @@ import pytest
 import torch
 
 
+def test_dcp_index_cache_spec_is_opt_in_sharded():
+    from vllm.models.deepseek_v4_1.attention import _Cache
+
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=4),
+        cache_config=SimpleNamespace(block_size=256, swa_block_size=128),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    cache = _Cache(
+        config,
+        "model.layers.2.attn.indexer.k_cache",
+        kind="index",
+        ratio=2,
+        dcp_replicated=False,
+    )
+    spec = cache.get_kv_cache_spec(config)
+    assert spec.dcp_replicated is False
+    assert spec.num_states == 128
+    assert spec.tokens_per_state == 2
+
+
+def test_dcp_local_length_matches_striped_ownership():
+    from vllm.models.deepseek_v4_1.attention import _dcp_local_length
+
+    for length in (0, 1, 63, 64, 65, 255, 256, 257, 1025):
+        expected = [
+            sum(position // 64 % 4 == rank for position in range(length))
+            for rank in range(4)
+        ]
+        actual = [_dcp_local_length(length, 4, rank, 64) for rank in range(4)]
+        assert actual == expected
+
+
 def test_dcp_kv_replica_declares_one_shared_output_before_materialization(monkeypatch):
     """Catch wrapper contract errors before loading weights or creating IPC."""
     from b12x.comm import pcie
@@ -235,8 +268,9 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
 
 @pytest.mark.parametrize("compacted", [False, True])
 @pytest.mark.parametrize("dcp_size", [1, 4])
+@pytest.mark.parametrize("shard_index", [False, True])
 def test_indexer_declares_bounded_score_rows_at_model_context_capacity(
-    monkeypatch, compacted, dcp_size
+    monkeypatch, compacted, dcp_size, shard_index
 ):
     if not torch.cuda.is_available():
         pytest.skip("native b12x attention declarations require CUDA")
@@ -253,6 +287,7 @@ def test_indexer_declares_bounded_score_rows_at_model_context_capacity(
     module.is_ced_decoder, module.is_index_source = compacted, True
     module.n_local_heads, module.compress_ratio = 16, 1 if compacted else 2
     module.dcp_size, module.dcp_active = dcp_size, dcp_size > 1
+    module.dcp_shard_index = shard_index and dcp_size > 1
     module.dcp_prefill_replica = dcp_size == 4 and not compacted
     module.is_kv_source = True
     module.layer_id = 12 if compacted else 0
@@ -299,7 +334,8 @@ def test_indexer_declares_bounded_score_rows_at_model_context_capacity(
             assert plan.query.max_page_table_width == 4096
             assert not plan.query.return_lse
     assert module._main_width == 4096 // dcp_size
-    assert module._index_width == 4096
+    expected_index_width = 4096 // dcp_size if module.dcp_shard_index else 4096
+    assert module._index_width == expected_index_width
     assert "_prefill_kv" not in {name for name, _, _ in module._staging_specs}
     manager = WorkspaceManager(device)
     monkeypatch.setattr(attention, "current_workspace_manager", lambda: manager)

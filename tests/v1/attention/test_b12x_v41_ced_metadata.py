@@ -98,6 +98,87 @@ def test_dcp_global_topk_partitions_without_duplicates(world):
         torch.testing.assert_close(lengths, owned.sum(1).int())
 
 
+@cuda
+@pytest.mark.parametrize("rank", range(4))
+def test_dcp_index_candidates_preserve_order_and_global_newest(rank):
+    """Local candidate scoring retains global order and one forced newest block."""
+    from vllm.models.deepseek_v4_1.dcp import (
+        index_candidate_force_blocks,
+        localize_index_candidates,
+    )
+
+    width, stripe = 16384, 64
+    values = torch.tensor(
+        [511, 0, 128, 129, 512, -1, 63, 64, 255, 256, 1024],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    candidates = torch.full((2, width), -1, dtype=torch.int32, device="cuda")
+    candidates[0, : values.numel()] = values
+    candidates[1, : values.numel()] = values.flip(0)
+    lengths = torch.tensor(
+        [values.numel(), values.numel() - 2], dtype=torch.int32, device="cuda"
+    )
+    out = torch.full_like(candidates, -99)
+    local_lengths = torch.empty(2, dtype=torch.int32, device="cuda")
+    offsets = torch.empty((2, 32), dtype=torch.int32, device="cuda")
+    global_lengths = torch.tensor([0, 129, 513], dtype=torch.int32, device="cuda")
+    force_blocks = torch.empty_like(global_lengths)
+
+    def run():
+        localize_index_candidates(
+            candidates,
+            lengths,
+            out,
+            local_lengths,
+            offsets,
+            world_size=4,
+            rank=rank,
+            stripe=stripe,
+        )
+        index_candidate_force_blocks(
+            global_lengths,
+            force_blocks,
+            world_size=4,
+            rank=rank,
+            stripe=stripe,
+        )
+
+    def check():
+        for row in range(2):
+            source = candidates[row, : lengths[row]]
+            owned = (source >= 0) & (source // stripe % 4 == rank)
+            expected = source[owned]
+            expected = expected // (4 * stripe) * stripe + expected % stripe
+            assert local_lengths[row].item() == expected.numel()
+            torch.testing.assert_close(out[row, : expected.numel()], expected)
+        expected_force = []
+        for length in global_lengths.tolist():
+            newest = length - 1
+            if length > 0 and newest // stripe % 4 == rank:
+                local = newest // (4 * stripe) * stripe + newest % stripe
+                expected_force.append(local // 8)
+            else:
+                expected_force.append(-1)
+        assert force_blocks.tolist() == expected_force
+
+    run()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            run()
+        allocated = torch.cuda.memory_allocated()
+        for _ in range(3):
+            out.fill_(-77)
+            graph.replay()
+            torch.cuda.synchronize()
+            check()
+            assert torch.cuda.memory_allocated() == allocated
+    finally:
+        graph.reset()
+
+
 def test_boundary_is_full_resolution_source_after_encoder():
     config = SimpleNamespace(
         num_hidden_layers=40,

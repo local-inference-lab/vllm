@@ -1,16 +1,18 @@
 # DeepSeek V4.1 native B12X DCP (experimental)
 
-This feature branch starts at local-inference-lab `dev/jovian-judgement`
-`ab03e87100efa9536ec87e01994828b459c956ff`. Native DCP exchange preparation
-requires the companion yatesdr/b12x feature branch, commit `6b299a6b` (based
-on `9e90d60f0cc8f204aa2fd219ed9b6abee32de7d8`). No upstream PR is submitted.
+This feature branch includes local-inference-lab `dev/jovian-judgement`
+through `82250ef0135b76dd60239773812e7947f2d25596`. Native DCP exchange and
+sharded-index preparation require the companion yatesdr/b12x feature branch
+through `e811430fe08d34793a6fdbb30c06254735522b8c`. No upstream PR is submitted.
 
 ## Layout and execution
 
 - Compressed main KV is owner-sharded. Ownership uses original-token stripes
   divisible by the compression ratio; the tested stripe is 128 tokens.
-- Index KV, SWA and private compressor state are replicated. Existing native
-  global Full/Reindex/Reuse candidate selection is unchanged.
+- In the currently qualified path, index KV, SWA and private compressor state
+  are replicated. This is a safe implementation baseline, not proof that every
+  state is inherently unshardable. Existing native global Full/Reindex/Reuse
+  candidate selection is unchanged.
 - Tuple packing keeps replicated index and sharded main MLA in distinct full
   groups. Stripe validation uses physical sharded pages, not the replicated
   compressor ring's scheduling granularity. Shared exchange preparation is
@@ -22,11 +24,36 @@ on `9e90d60f0cc8f204aa2fd219ed9b6abee32de7d8`). No upstream PR is submitted.
 - Replicated SWA and the attention sink enter the attention union only on DCP
   rank zero. This prevents duplicated probability mass.
 - One serial channel is shared across layers, with a 256-row capacity. Prefill
-  attention is chunked within that capacity. This is not a fourfold increase
-  in total KV capacity, because the index and SWA remain replicated.
+  attention is chunked within that capacity. The current layout does not yield
+  a fourfold increase in total KV capacity because index and SWA are replicated
+  and the single shared block pool introduces cross-group stride padding.
 - Owned selected IDs are compacted in global selection order with true local
   lengths. DCP WO replay uses opt-in native variable-row capacity declarations;
   it does not pad rows, change GEMM precision, or create a serving-time plan.
+
+### All-index sharding under qualification
+
+`VLLM_DS41_DCP_SHARD_INDEX=1` changes all four DS4.1 index caches from the
+replicated baseline to striped DCP ownership. The feature is deliberately
+all-or-nothing: sharding only the three early index caches increases the current
+single-pool stride because the remaining replicated index cache still sets the
+group width.
+
+Each index layer scores its local cache and selects 512 local candidates. An
+exact all-gather/global-top-k merge returns global compressed-token IDs. At the
+candidate source layer, the same construction merges 2,048 coarse blocks before
+expanding them to the global 16,384-token reuse set. Only the rank owning the
+globally newest block forces that block into its local selection. Later layers
+compact the global reuse set into their local shard without changing its order,
+score it locally, and repeat the exact global merge. SWA ownership and numerical
+precision are unchanged.
+
+The bounded four-rank oracle passes exact 512-token and 2,048-block selection,
+candidate ownership and three CUDA-graph replays with stable allocation on all
+four SM120 GPUs. Focused cache-spec, local-length, source-selection and metadata
+tests pass. This is component qualification only; full-model startup, output
+parity, prefix reuse, long-context admission and performance remain required
+before enabling the option by default.
 
 ## Tests performed on cn4
 

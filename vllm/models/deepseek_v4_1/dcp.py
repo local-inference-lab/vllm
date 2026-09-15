@@ -10,6 +10,35 @@ from vllm.distributed import get_dcp_group
 from vllm.triton_utils import tl, triton
 from vllm.utils.b12x import B12xPreparationUnit
 
+_INDEX_CANDIDATE_WIDTH = 16384
+_INDEX_CANDIDATE_TILE = 512
+_INDEX_CANDIDATE_TILES = _INDEX_CANDIDATE_WIDTH // _INDEX_CANDIDATE_TILE
+
+
+def _validate_index_dcp(world_size: int, rank: int, stripe: int) -> None:
+    if world_size not in (2, 4):
+        raise ValueError("DS4.1 index sharding supports DCP2 or DCP4")
+    if not 0 <= rank < world_size:
+        raise ValueError("DS4.1 index-shard rank is outside the DCP group")
+    if stripe <= 0:
+        raise ValueError("DS4.1 index-shard stripe must be positive")
+
+
+def _validate_int32_cuda(*tensors: torch.Tensor) -> None:
+    device = tensors[0].device
+    if device.type != "cuda":
+        raise ValueError("DS4.1 index-shard metadata must be CUDA tensors")
+    if any(
+        tensor.dtype != torch.int32
+        or tensor.device != device
+        or not tensor.is_contiguous()
+        for tensor in tensors
+    ):
+        raise ValueError(
+            "DS4.1 index-shard metadata must be contiguous int32 tensors "
+            "on one CUDA device"
+        )
+
 
 @triton.jit
 def _local_indices(
@@ -44,6 +73,173 @@ def local_indices(indices, out, lengths, *, world_size, rank, stripe):
         rank,
         stripe,
         512,
+    )
+
+
+@triton.jit
+def _candidate_tile_counts(
+    Indices,
+    Lengths,
+    Counts,
+    DCP: tl.constexpr,
+    RANK: tl.constexpr,
+    STRIPE: tl.constexpr,
+    WIDTH: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    tile = tl.program_id(1)
+    col = tile * TILE + tl.arange(0, TILE)
+    length = tl.load(Lengths + row)
+    pos = tl.load(Indices + row * WIDTH + col, col < length, other=-1)
+    owned = (col < length) & (pos >= 0) & ((pos // STRIPE) % DCP == RANK)
+    tl.store(
+        Counts + row * (WIDTH // TILE) + tile,
+        tl.sum(owned.to(tl.int32), axis=0),
+    )
+
+
+@triton.jit
+def _candidate_tile_offsets(
+    Counts,
+    LocalLengths,
+    TILES: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    tile = tl.arange(0, TILES)
+    counts = tl.load(Counts + row * TILES + tile)
+    inclusive = tl.cumsum(counts, axis=0)
+    tl.store(Counts + row * TILES + tile, inclusive - counts)
+    tl.store(LocalLengths + row, tl.sum(counts, axis=0))
+
+
+@triton.jit
+def _scatter_local_candidates(
+    Indices,
+    Lengths,
+    Out,
+    Offsets,
+    DCP: tl.constexpr,
+    RANK: tl.constexpr,
+    STRIPE: tl.constexpr,
+    WIDTH: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    tile = tl.program_id(1)
+    col = tile * TILE + tl.arange(0, TILE)
+    length = tl.load(Lengths + row)
+    pos = tl.load(Indices + row * WIDTH + col, col < length, other=-1)
+    owned = (col < length) & (pos >= 0) & ((pos // STRIPE) % DCP == RANK)
+    within_tile = tl.cumsum(owned.to(tl.int32), axis=0) - 1
+    offset = tl.load(Offsets + row * (WIDTH // TILE) + tile)
+    local = pos // (STRIPE * DCP) * STRIPE + pos % STRIPE
+    tl.store(
+        Out + row * WIDTH + offset + within_tile,
+        local,
+        mask=owned,
+    )
+
+
+def localize_index_candidates(
+    indices: torch.Tensor,
+    lengths: torch.Tensor,
+    out: torch.Tensor,
+    local_lengths: torch.Tensor,
+    tile_offsets: torch.Tensor,
+    *,
+    world_size: int,
+    rank: int,
+    stripe: int,
+) -> None:
+    """Compact globally ordered candidates into one index-cache shard.
+
+    The caller owns all buffers. Only the prefix named by ``local_lengths`` is
+    written to ``out``; its tail remains unspecified and must not be consumed.
+    """
+    _validate_index_dcp(world_size, rank, stripe)
+    _validate_int32_cuda(
+        indices, lengths, out, local_lengths, tile_offsets
+    )
+    rows = indices.shape[0]
+    if indices.shape != out.shape or indices.shape[1] != _INDEX_CANDIDATE_WIDTH:
+        raise ValueError(
+            "DS4.1 index candidates require matching [rows, 16384] buffers"
+        )
+    if lengths.shape != (rows,) or local_lengths.shape != (rows,):
+        raise ValueError("DS4.1 index candidate lengths must match candidate rows")
+    if tile_offsets.shape != (rows, _INDEX_CANDIDATE_TILES):
+        raise ValueError("DS4.1 index candidate tile-offset buffer has wrong shape")
+    grid = (rows, _INDEX_CANDIDATE_TILES)
+    _candidate_tile_counts[grid](
+        indices,
+        lengths,
+        tile_offsets,
+        world_size,
+        rank,
+        stripe,
+        _INDEX_CANDIDATE_WIDTH,
+        _INDEX_CANDIDATE_TILE,
+    )
+    _candidate_tile_offsets[(rows,)](
+        tile_offsets,
+        local_lengths,
+        _INDEX_CANDIDATE_TILES,
+    )
+    _scatter_local_candidates[grid](
+        indices,
+        lengths,
+        out,
+        tile_offsets,
+        world_size,
+        rank,
+        stripe,
+        _INDEX_CANDIDATE_WIDTH,
+        _INDEX_CANDIDATE_TILE,
+    )
+
+
+@triton.jit
+def _candidate_force_blocks(
+    GlobalLengths,
+    ForceBlocks,
+    N,
+    DCP: tl.constexpr,
+    RANK: tl.constexpr,
+    STRIPE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    length = tl.load(GlobalLengths + row, row < N, other=0)
+    newest = length - 1
+    owned = (length > 0) & ((newest // STRIPE) % DCP == RANK)
+    local = newest // (STRIPE * DCP) * STRIPE + newest % STRIPE
+    force = tl.where(owned, local // 8, -1)
+    tl.store(ForceBlocks + row, force, row < N)
+
+
+def index_candidate_force_blocks(
+    global_lengths: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    world_size: int,
+    rank: int,
+    stripe: int,
+) -> None:
+    """Map the single globally newest coarse block to its owning DCP rank."""
+    _validate_index_dcp(world_size, rank, stripe)
+    _validate_int32_cuda(global_lengths, out)
+    if out.shape != global_lengths.shape:
+        raise ValueError("DS4.1 force-block output must match global int32 lengths")
+    block = 128
+    _candidate_force_blocks[(triton.cdiv(global_lengths.numel(), block),)](
+        global_lengths,
+        out,
+        global_lengths.numel(),
+        world_size,
+        rank,
+        stripe,
+        block,
     )
 
 

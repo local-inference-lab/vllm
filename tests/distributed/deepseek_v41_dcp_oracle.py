@@ -8,14 +8,156 @@ from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
-
 from b12x.attention import compressed_sparse_mla as mla
 from b12x.attention.compressed_sparse_mla.reference import (
     compressed_sparse_mla_reference,
     pack_deepseek_v41_cache_reference,
 )
 from b12x.preparation import PreparationSession, PreparedCall
+
 from vllm.models.deepseek_v4_1 import dcp
+
+
+class _OracleDcpGroup:
+    """Minimal CUDA coordinator used by the standalone index-shard oracle."""
+
+    def __init__(self, world_size, rank, device_group):
+        self.unique_name = "oracle-index-shard"
+        self.world_size = world_size
+        self.rank_in_group = rank
+        self.ranks = list(range(world_size))
+        self.cpu_group = dist.group.WORLD
+        self.device_group = device_group
+
+    def all_gather(self, value, dim=-1):
+        gathered = [torch.empty_like(value) for _ in range(self.world_size)]
+        dist.all_gather(gathered, value, group=self.device_group)
+        return torch.cat(gathered, dim=dim)
+
+
+def _global_index(local, rank, world, stripe):
+    return (
+        local // stripe * (world * stripe)
+        + rank * stripe
+        + local % stripe
+    )
+
+
+def _index_shard_case(device, rank, world, topk, stripe):
+    """Build rank-local candidates and their exact global top-k reference."""
+    rows, global_width = 4, 32768
+    local_width = global_width // world
+    local = torch.arange(local_width, device=device, dtype=torch.int64)
+    global_ids = _global_index(local, rank, world, stripe)
+    lengths = torch.tensor(
+        [global_width, global_width - 137, topk + 79, topk],
+        device=device,
+        dtype=torch.int64,
+    )
+    selected_ids = torch.full(
+        (rows, topk), -1, device=device, dtype=torch.int32
+    )
+    selected_scores = torch.full(
+        (rows, topk), -float("inf"), device=device, dtype=torch.float32
+    )
+    expected = []
+    all_ids = torch.arange(global_width, device=device, dtype=torch.int64)
+    for row in range(rows):
+        local_scores = (
+            (global_ids * 8191 + row * 131071) % 16777213
+        ).to(torch.float32)
+        local_scores.masked_fill_(global_ids >= lengths[row], -float("inf"))
+        values, positions = local_scores.topk(topk)
+        valid = torch.isfinite(values)
+        selected_ids[row, valid] = positions[valid].to(torch.int32)
+        selected_scores[row, valid] = values[valid]
+
+        global_scores = (
+            (all_ids * 8191 + row * 131071) % 16777213
+        ).to(torch.float32)
+        global_scores.masked_fill_(all_ids >= lengths[row], -float("inf"))
+        expected.append(global_scores.topk(topk).indices.to(torch.int32))
+    return selected_ids, selected_scores, torch.stack(expected)
+
+
+def check_index_shards(device, group):
+    """Exact global selection, candidate ownership, and graph replay."""
+    from vllm.v1.attention.backends.mla import b12x_indexer
+
+    rank, world = group.rank_in_group, group.world_size
+    b12x_indexer.get_dcp_group = lambda: group
+    merged_by_shape = {}
+    for topk, stripe in ((512, 64), (2048, 8)):
+        indices, scores, expected = _index_shard_case(
+            device, rank, world, topk, stripe
+        )
+        b12x_indexer._merge_dcp_topk(
+            indices, scores, rank, world, stripe
+        )
+        torch.cuda.synchronize()
+        for row in range(indices.shape[0]):
+            assert set(indices[row].cpu().tolist()) == set(
+                expected[row].cpu().tolist()
+            )
+        merged_by_shape[(topk, stripe)] = indices.clone()
+
+    candidates = torch.full(
+        (4, 16384), -1, device=device, dtype=torch.int32
+    )
+    candidates[:, :512].copy_(merged_by_shape[(512, 64)])
+    candidate_lengths = torch.full(
+        (4,), 512, device=device, dtype=torch.int32
+    )
+    local_candidates = torch.empty_like(candidates)
+    local_lengths = torch.empty_like(candidate_lengths)
+    tile_offsets = torch.empty((4, 32), device=device, dtype=torch.int32)
+    dcp.localize_index_candidates(
+        candidates,
+        candidate_lengths,
+        local_candidates,
+        local_lengths,
+        tile_offsets,
+        world_size=world,
+        rank=rank,
+        stripe=64,
+    )
+    torch.cuda.synchronize()
+    for row in range(candidates.shape[0]):
+        source = candidates[row, : candidate_lengths[row]].cpu().tolist()
+        expected_local = [
+            value // (world * 64) * 64 + value % 64
+            for value in source
+            if (value // 64) % world == rank
+        ]
+        length = int(local_lengths[row].item())
+        assert local_candidates[row, :length].cpu().tolist() == expected_local
+
+    source_indices, source_scores, expected = _index_shard_case(
+        device, rank, world, 512, 64
+    )
+    graph_indices = torch.empty_like(source_indices)
+    graph_scores = torch.empty_like(source_scores)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_indices.copy_(source_indices)
+        graph_scores.copy_(source_scores)
+        b12x_indexer._merge_dcp_topk(
+            graph_indices, graph_scores, rank, world, 64
+        )
+    allocated = torch.cuda.memory_allocated(device)
+    for _ in range(3):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated(device) == allocated
+        for row in range(graph_indices.shape[0]):
+            assert set(graph_indices[row].cpu().tolist()) == set(
+                expected[row].cpu().tolist()
+            )
+    graph.reset()
+    print(
+        f"rank={rank} index-shard exact-topk/ownership/graphs PASS",
+        flush=True,
+    )
 
 
 def check_tp_plain_push(device, session, coordinator):
@@ -211,6 +353,13 @@ def main():
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
     dist.init_process_group("gloo")
+    index_shard_only = "--index-shard-only" in sys.argv
+    if index_shard_only:
+        device_group = dist.new_group(ranks=list(range(world)), backend="nccl")
+        index_group = _OracleDcpGroup(world, rank, device_group)
+        check_index_shards(device, index_group)
+        dist.destroy_process_group()
+        return
     group = SimpleNamespace(
         unique_name="oracle",
         world_size=world,

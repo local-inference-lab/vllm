@@ -14,6 +14,7 @@ from b12x.attention.compressed_sparse_mla import rotary, weight_scale
 from b12x.gemm import wo_projection
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig
 from vllm.distributed import (
@@ -54,6 +55,7 @@ from vllm.utils.b12x import (
     set_b12x_preparation_provider,
 )
 from vllm.utils.torch_utils import current_stream
+from vllm.v1.attention.backends.utils import refresh_dcp_local_seq_lens_
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
@@ -63,6 +65,12 @@ from vllm.v1.worker.workspace import (
 
 def _source(prefix, layer):
     return re.sub(r"(layers\.)\d+", rf"\g<1>{layer}", prefix)
+
+
+def _dcp_local_length(length: int, world_size: int, rank: int, stripe: int) -> int:
+    virtual = world_size * stripe
+    rounds, remainder = divmod(length, virtual)
+    return rounds * stripe + min(max(remainder - rank * stripe, 0), stripe)
 
 
 def _native_linear(layer):
@@ -215,10 +223,24 @@ def _replica_pages(Reqs, Out, offset, WIDTH: tl.constexpr, B: tl.constexpr):
 
 
 class _Cache(nn.Module, AttentionLayerBase):
-    def __init__(self, config, prefix, *, kind, ratio=1, window=0, draft=False):
+    def __init__(
+        self,
+        config,
+        prefix,
+        *,
+        kind,
+        ratio=1,
+        window=0,
+        draft=False,
+        dcp_replicated=True,
+    ):
         super().__init__()
         self.prefix, self.kind, self.ratio, self.window = prefix, kind, ratio, window
         self.draft = draft
+        self.dcp_replicated = (
+            config.parallel_config.decode_context_parallel_size > 1
+            and dcp_replicated
+        )
         self.block_size = (
             config.cache_config.swa_block_size
             or CacheConfig.DEFAULT_DS41_SWA_BLOCK_SIZE
@@ -245,7 +267,7 @@ class _Cache(nn.Module, AttentionLayerBase):
             tokens_per_state=self.ratio,
             cache_dtype_str="b12x_dsv41",
             alignment=None,
-            dcp_replicated=config.parallel_config.decode_context_parallel_size > 1,
+            dcp_replicated=self.dcp_replicated,
         )
         if self.kind == "swa":
             boundary = ced_decoder_start(config.model_config.hf_config)
@@ -456,6 +478,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
         self.dcp_stripe = parallel.cp_kv_cache_interleave_size
         self.dcp_active = self.dcp_size > 1 and bool(self.compress_ratio)
+        self.dcp_shard_index = (
+            self.dcp_size > 1 and envs.VLLM_DS41_DCP_SHARD_INDEX
+        )
         # CED queries are already compact; retain their graph/exchange recipe.
         self.dcp_prefill_replica = (
             self.dcp_size == 4 and self.compress_ratio == 2 and not self.is_ced_decoder
@@ -466,6 +491,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             self.dcp_stripe % max(self.compress_ratio, 1)
         ):
             raise ValueError("V4.1 supports DCP2/4 with whole-state cache stripes")
+        if (
+            self.dcp_shard_index
+            and self.compress_ratio
+            and (self.dcp_stripe // self.compress_ratio) % 8
+        ):
+            raise ValueError(
+                "V4.1 DCP index shards require eight-state-aligned stripes"
+            )
         self._context = vllm_config.compilation_config.static_forward_context
         if prefix in self._context:
             raise ValueError(f"Duplicate attention layer {prefix}")
@@ -556,6 +589,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     f"{prefix}.indexer.k_cache",
                     kind="index",
                     ratio=self.compress_ratio,
+                    dcp_replicated=not self.dcp_shard_index,
                 )
             else:
                 k_cache = self._context[
@@ -625,9 +659,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         ) // self.config.cache_config.block_size
         self._index_page = self._main_page
         self._index_width = self._main_width
+        self._index_global_width = self._index_width
         dcp = getattr(self, "dcp_active", False)
         if dcp:
             self._main_width = triton.cdiv(self._main_width, self.dcp_size)
+        if getattr(self, "dcp_shard_index", False):
+            self._index_width = triton.cdiv(self._index_width, self.dcp_size)
         spec = self.config.speculative_config
         # Parallel drafting can admit two draft spans during verifier profiling.
         query_width = (
@@ -740,6 +777,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 specs.extend((
                     ("_candidates", (self.capacity, 16384), torch.int32),
                     ("_candidate_lens", (self.capacity,), torch.int32),
+                    ("_candidate_active", (1,), torch.int32),
                 ))
         self._short_index_shape = None
         if (
@@ -784,6 +822,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 setattr(self, name, torch.empty(shape, dtype=dtype, device=device))
         if self.indexer is not None:
             self._active.fill_(self._index_width * self._index_page)
+            if self.layer_id == self.candidate_source_layer:
+                self._candidate_active.fill_(
+                    self._index_global_width * self._index_page
+                )
         self._ready = True
 
 
@@ -1273,9 +1315,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 and self.layer_id <= self.candidate_source_layer
                 and not torch.cuda.is_current_stream_capturing()
             ):
+                visible = triton.cdiv(im.max_seq_len, self.compress_ratio)
+                if self.dcp_shard_index:
+                    visible = _dcp_local_length(
+                        visible,
+                        self.dcp_size,
+                        self.dcp_rank,
+                        self.dcp_stripe // self.compress_ratio,
+                    )
                 score_width = min(
                     self._index_width * self._index_page,
-                    max(1, triton.cdiv(im.max_seq_len, self.compress_ratio)),
+                    max(1, visible),
                 )
             chunk_rows = self.DECODE_CHUNK if mode == "decode" else self.INDEX_CHUNK
             index_pages = self._index_pages
@@ -1302,8 +1352,98 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     index_width,
                     128,
                 )
+                index_plan = self._index_plan(index_mode, count)
+                scratch_specs = tuple(
+                    (spec.shape, spec.dtype)
+                    for spec in dsa_indexer.scratch_specs(
+                        index_plan, device=iq_data.device
+                    )
+                )
+                integration_specs = []
+                if self.dcp_shard_index:
+                    integration_specs.extend(
+                        (
+                            ((count,), torch.int32),
+                            ((count, 512), torch.float32),
+                        )
+                    )
+                    if self.layer_id == self.candidate_source_layer:
+                        integration_specs.append(((count,), torch.int32))
+                    elif self.layer_id > self.candidate_source_layer:
+                        integration_specs.extend(
+                            (
+                                ((count, 16384), torch.int32),
+                                ((count, 32), torch.int32),
+                                ((count,), torch.int32),
+                            )
+                        )
+                buffers = current_workspace_manager().get_simultaneous(
+                    *integration_specs, *scratch_specs
+                )
+                cursor = 0
+                global_lengths = im.cache_lengths[offset:end]
+                index_lengths = global_lengths
+                output_scores = None
                 candidate_args = {}
-                if self.layer_id == self.candidate_source_layer:
+                if self.dcp_shard_index:
+                    from vllm.models.deepseek_v4_1.dcp import (
+                        index_candidate_force_blocks,
+                        localize_index_candidates,
+                    )
+
+                    index_lengths = buffers[cursor]
+                    cursor += 1
+                    output_scores = buffers[cursor]
+                    cursor += 1
+                    index_stripe = self.dcp_stripe // self.compress_ratio
+                    refresh_dcp_local_seq_lens_(
+                        index_lengths,
+                        global_lengths,
+                        count,
+                        self.dcp_size,
+                        self.dcp_rank,
+                        index_stripe,
+                    )
+                    if self.layer_id == self.candidate_source_layer:
+                        force_blocks = buffers[cursor]
+                        cursor += 1
+                        index_candidate_force_blocks(
+                            global_lengths,
+                            force_blocks,
+                            world_size=self.dcp_size,
+                            rank=self.dcp_rank,
+                            stripe=index_stripe,
+                        )
+                        candidate_args = dict(
+                            candidate_output=self._candidates[offset:end],
+                            candidate_output_lengths=self._candidate_lens[offset:end],
+                            candidate_force_blocks=force_blocks,
+                            candidate_visible_lengths=global_lengths,
+                            candidate_active_width=self._candidate_active,
+                        )
+                    elif self.layer_id > self.candidate_source_layer:
+                        local_candidates = buffers[cursor]
+                        tile_offsets = buffers[cursor + 1]
+                        local_candidate_lengths = buffers[cursor + 2]
+                        cursor += 3
+                        source = self._context[
+                            _source(self.prefix, self.candidate_source_layer)
+                        ]
+                        localize_index_candidates(
+                            source._candidates[offset:end],
+                            source._candidate_lens[offset:end],
+                            local_candidates,
+                            local_candidate_lengths,
+                            tile_offsets,
+                            world_size=self.dcp_size,
+                            rank=self.dcp_rank,
+                            stripe=index_stripe,
+                        )
+                        candidate_args = dict(
+                            candidate_indices=local_candidates,
+                            candidate_lengths=local_candidate_lengths,
+                        )
+                elif self.layer_id == self.candidate_source_layer:
                     candidate_args = dict(
                         candidate_output=self._candidates[offset:end],
                         candidate_output_lengths=self._candidate_lens[offset:end],
@@ -1316,27 +1456,50 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                         candidate_indices=source._candidates[offset:end],
                         candidate_lengths=source._candidate_lens[offset:end],
                     )
-                index_plan = self._index_plan(index_mode, count)
                 binding = dsa_indexer.bind(
                     index_plan,
-                    scratch=current_workspace_manager().get_simultaneous(
-                        *((spec.shape, spec.dtype)
-                          for spec in dsa_indexer.scratch_specs(
-                              index_plan, device=iq_data.device))),
+                    scratch=buffers[cursor:],
                     q_mxfp4=iq_data[offset:end],
                     q_scales=iq_scale[offset:end],
                     query_weights=iw[offset:end],
                     index_k_cache=self.indexer.k_cache.kv_cache,
                     page_table=index_pages[:count],
-                    cache_lengths=im.cache_lengths[offset:end],
+                    cache_lengths=index_lengths,
                     active_width=self._active,
                     score_width=score_width,
                     output_indices=self.topk_indices_buffer[offset:end],
+                    output_scores=output_scores,
                     **candidate_args,
                 )
                 retain_cuda_graph_capture_resource(binding)
                 dsa_indexer.score(binding)
-                dsa_indexer.select(binding)
+                if self.dcp_shard_index:
+                    from vllm.v1.attention.backends.mla.b12x_indexer import (
+                        _merge_dcp_topk,
+                    )
+
+                    dsa_indexer.select_tokens(binding)
+                    _merge_dcp_topk(
+                        self.topk_indices_buffer[offset:end],
+                        output_scores,
+                        self.dcp_rank,
+                        self.dcp_size,
+                        self.dcp_stripe // self.compress_ratio,
+                    )
+                    if self.layer_id == self.candidate_source_layer:
+                        block_indices, block_scores = (
+                            dsa_indexer.select_candidate_blocks(binding)
+                        )
+                        _merge_dcp_topk(
+                            block_indices,
+                            block_scores,
+                            self.dcp_rank,
+                            self.dcp_size,
+                            (self.dcp_stripe // self.compress_ratio) // 8,
+                        )
+                        dsa_indexer.expand_candidate_blocks(binding)
+                else:
+                    dsa_indexer.select(binding)
 
         chunk = state.query.query_rows
         for offset in range(0, rows, chunk):
