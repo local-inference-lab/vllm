@@ -622,7 +622,9 @@ def _run_compressed_sparse_mla(
         ),
         invocation=invocation,
     )
-    scratch = current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
+    scratch = current_workspace_manager().get_simultaneous(
+        *((s.shape, s.dtype) for s in plan.scratch_specs())
+    )
     binding = plan.bind(
         scratch=scratch,
         q=q,
@@ -1056,7 +1058,9 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
             ),
             invocation=invocation,
         )
-        current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
+        current_workspace_manager().get_simultaneous(
+            *((s.shape, s.dtype) for s in plan.scratch_specs())
+        )
 
     def forward_mqa(
         self,
