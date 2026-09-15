@@ -532,7 +532,7 @@ def main():
                 indexed_page_table=table,
             )
 
-            def prepare(state):
+            def prepare(state, bind_args=bind_args, kwargs=kwargs):
                 binding = state.bind_for_preparation(**bind_args)
                 return PreparedCall(run=lambda: state.run(binding, **kwargs))
 
@@ -541,12 +541,12 @@ def main():
             )
             binding = mla.bind(plan, **bind_args)
 
-            def run():
+            def run(binding=binding, kwargs=kwargs):
                 exchange.gather(source, gathered)
                 output, lse = mla.run(binding=binding, **kwargs)
                 exchange.reduce(output, lse, result)
 
-            def check(label):
+            def check(label, mode=mode):
                 expected = compressed_sparse_mla_reference(
                     gathered,
                     swa,

@@ -191,8 +191,8 @@ require_positive_int MAX_NUM_BATCHED_TOKENS "${MAX_NUM_BATCHED_TOKENS}"
 require_positive_int BLOCK_SIZE "${BLOCK_SIZE}"
 require_positive_int MAX_CUDAGRAPH_CAPTURE_SIZE \
   "${MAX_CUDAGRAPH_CAPTURE_SIZE}"
-if [[ ! "${NUM_SPECULATIVE_TOKENS}" =~ ^[0-9]+$ ]]; then
-  echo "NUM_SPECULATIVE_TOKENS must be nonnegative" >&2
+if [[ ! "${NUM_SPECULATIVE_TOKENS}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  echo "NUM_SPECULATIVE_TOKENS must be 0 or a positive integer without leading zeros" >&2
   exit 2
 fi
 require_positive_number DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE \
