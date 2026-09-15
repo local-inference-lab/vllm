@@ -348,7 +348,10 @@ class DCPExchange:
         )
 
     def gather(self, query, out):
-        key = (id(query), id(out))
+        # Attention creates fresh views over stable graph/workspace buffers.
+        # Address plus live rows identifies the fixed tensor ABI without
+        # retaining a new binding for every equivalent Python view object.
+        key = (query.data_ptr(), out.data_ptr(), query.shape[0])
         binding = self.gather_bindings.get(key)
         if binding is None:
             binding = self.runtime.bind_all_gather_heads(

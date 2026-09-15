@@ -201,7 +201,7 @@ def test_dcp_exchange_retains_one_gather_binding_per_tensor_pair():
     query, out = torch.empty(1), torch.empty(1)
 
     exchange.gather(query, out)
-    exchange.gather(query, out)
+    exchange.gather(query.view_as(query), out.view_as(out))
     other_out = torch.empty(1)
     exchange.gather(query, other_out)
 
