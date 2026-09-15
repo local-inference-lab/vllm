@@ -72,7 +72,6 @@ _EXL3_EXT: Any | None = None
 _B12X_FUSED_MOE_API: Any | None = None
 _B12X_MIXED_TRELLIS_API: Any | None = None
 _B12X_NATIVE_TRELLIS_API: Any | None = None
-_NATIVE_TRELLIS_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _RANK_SLICED_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _MIXED_TRELLIS_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _NEXT_RUNTIME_SCOPE_ID = 0
@@ -332,6 +331,23 @@ def _load_b12x_native_trellis() -> Any:
     )
     _B12X_NATIVE_TRELLIS_API = api
     return api
+
+
+def _direct_route_max_m() -> int:
+    """Largest row count the kernel will accept with an expert map attached.
+
+    Expert parallelism can only pass its map through the direct-route form, and
+    B12X gates that form on row count. Read the bound from the kernel module
+    rather than restating it, so a build that moves it is reflected here instead
+    of being discovered at compile time; fall back to the conservative
+    documented value if the symbol is absent.
+    """
+
+    try:
+        kernel = importlib.import_module("b12x.moe._shared.kernels.w4a16.kernel")
+    except Exception:  # noqa: BLE001
+        return 8
+    return int(getattr(kernel, "_W4A16_SMALL_M_DIRECT_MAX_M", 8))
 
 
 def _unique_tensor_storage_bytes(*buffers: Any) -> int:
@@ -2067,6 +2083,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # kernels consume, so preparation is a direct hand-off: no repack, no
         # second copy of the expert payload.
         native_api = _load_b12x_native_trellis()
+        # The fused FC1+FC2 launch keeps per-SM state in the prepared
+        # workspace and refuses anything under sms*4 + 2 int32 slots. The
+        # prepared weights retain it, so it stays alive for the graph's life.
+        sm_count = (
+            int(torch.cuda.get_device_properties(w13.device).multi_processor_count)
+            if w13.device.type == "cuda"
+            else 0
+        )
+        trellis_workspace = torch.zeros(
+            max(sm_count * 4 + 2, 2), dtype=torch.int32, device=w13.device
+        )
         layer.exl3_trellis_weights = native_api.prepare_weights(
             w13=w13,
             w2=w2,
@@ -2085,7 +2112,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             intermediate_rotations=intermediate_rotations,
             down_svh=down_svh,
             tile_config=tile_config,
-            workspace=w13.view(torch.int32).reshape(-1)[:1],
+            workspace=trellis_workspace,
         )
 
         slabs = (
@@ -2369,7 +2396,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # Routing stays in the global expert-ID space under EP; the kernel maps
         # it down with the expert map. Without EP the local ordering is the
         # routing space and no map is needed.
-        route_num_experts = int(layer.global_num_experts) if use_ep else 0
+        # Only EP widens the routing space beyond the rank's own experts. Leave
+        # it unset otherwise: the buffer planner then sizes the route pack from
+        # the prepared expert count, which is what the kernel validates against.
+        route_num_experts = int(layer.global_num_experts) if use_ep else None
         # The Trellis kernel boundary is fp16; only the rotation staging reads
         # activations in their native dtype.
         rotation_input_dtype = "bf16" if x.dtype is torch.bfloat16 else "fp16"
@@ -2378,11 +2408,22 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         def _plan_with_scratch(
             plan_max_tokens: int, plan_block_m: int, *, small_m_decode: bool
         ):
-            route_slots = api.max_packed_route_slots(
-                plan_max_tokens * topk,
-                plan_block_m,
-                int(layer.local_num_experts),
-            )
+            # The two routing forms size their block table differently. The
+            # packed form derives it from the route pack; the direct form the
+            # expert map rides on indexes one block per routed row, and the
+            # kernel checks the planned count against exactly that. Getting it
+            # wrong is a launch-contract mismatch at first EP call, not a
+            # gradual degradation.
+            direct_routes = use_ep and small_m_decode
+            if direct_routes:
+                max_m_blocks = plan_max_tokens * topk
+            else:
+                route_slots = api.max_packed_route_slots(
+                    plan_max_tokens * topk,
+                    plan_block_m,
+                    int(layer.local_num_experts),
+                )
+                max_m_blocks = (route_slots + plan_block_m - 1) // plan_block_m
             launch = api.compile_fused_moe(
                 size_m=plan_max_tokens,
                 hidden_size=int(layer.exl3_hidden_size),
@@ -2393,7 +2434,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 apply_router_weight_on_input=False,
                 zero_fc2_output=False,
                 moe_block_size=plan_block_m,
-                max_m_blocks=(route_slots + plan_block_m - 1) // plan_block_m,
+                max_m_blocks=max_m_blocks,
                 sms=int(props.multi_processor_count),
                 max_shared_mem=int(props.shared_memory_per_block_optin),
                 element_dtype="fp16",
@@ -2409,8 +2450,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 # kernel only offers it on the small-M decode variant. Ask for
                 # it only when EP actually needs it; the packed route path is
                 # otherwise both supported and unrestricted in M.
-                direct_topk_routes=use_ep and small_m_decode,
-                use_expert_map=use_ep and small_m_decode,
+                direct_topk_routes=direct_routes,
+                use_expert_map=direct_routes,
                 full_rotation=True,
                 intermediate_rotation=True,
                 rotation_input_dtype=rotation_input_dtype,
@@ -2419,13 +2460,40 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 prepared,
                 m=plan_max_tokens,
                 topk=topk,
-                dtype=x.dtype,
+                # Staging follows the kernel boundary, not the model dtype; the
+                # result is cast back to the activation dtype on the way out.
+                dtype=torch.float16,
                 device=x.device,
                 route_num_experts=route_num_experts,
                 full_rotation=True,
                 block_size_m=plan_block_m,
             )
             return launch, buffers
+
+        # Decide EP feasibility before compiling anything. The expert map can
+        # only be passed through the kernel's direct-route form, and that form
+        # is refused above a small row count -- so a decode window wider than
+        # that is just as unsupported as a prefill plan, and finding out at
+        # compile time wastes a plan and an arena first.
+        if use_ep:
+            direct_route_max_m = _direct_route_max_m()
+            if prefill_plan_enabled or max_trellis_m > direct_route_max_m:
+                raise NotImplementedError(
+                    "EXL3 expert parallelism needs the kernel's direct-route "
+                    "form, which this B12X build accepts only up to "
+                    f"m={direct_route_max_m}; this layer plans a Trellis window "
+                    f"of {max_trellis_m}"
+                    + (
+                        f" and a {max_batched_tokens}-token prefill plan"
+                        if prefill_plan_enabled
+                        else ""
+                    )
+                    + ". Serve this layer with tensor parallelism, or lower "
+                    "both VLLM_EXL3_TRELLIS_MAX_M and the scheduler's "
+                    f"max_num_batched_tokens to {direct_route_max_m} or less. "
+                    "Raising the Trellis window does not help: it is the row "
+                    "count itself the kernel gates on."
+                )
 
         trellis_plan, trellis_scratch = _plan_with_scratch(
             max_trellis_m, block_m, small_m_decode=True
@@ -2437,14 +2505,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         prefill_plan = None
         prefill_scratch = None
         if prefill_plan_enabled:
-            if use_ep:
-                raise NotImplementedError(
-                    "EXL3 expert parallelism needs the kernel's direct-route "
-                    "form, which this B12X build offers only on the small-M "
-                    "decode variant. Serve this layer with tensor parallelism, "
-                    "or cap VLLM_EXL3_TRELLIS_MAX_M at the scheduler's "
-                    "max_num_batched_tokens so every batch decodes."
-                )
             prefill_plan, prefill_scratch = _plan_with_scratch(
                 max_batched_tokens, prefill_block_m, small_m_decode=False
             )
@@ -2585,23 +2645,33 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         """Execute one uniform rank-sliced batch on the w4a16 Trellis kernels.
 
         Route packing, the intermediate caches and the rotation staging all come
-        from the buffer bundle planned before capture, so this call allocates
-        nothing and is safe to replay inside a CUDA graph.
+        from the buffer bundle planned before capture, so nothing here is sized,
+        compiled or autotuned at run time and the region is safe to replay.
+
+        It is not literally allocation-free: the kernel boundary is fp16, so a
+        bf16 activation takes a converting copy on the way out. That copy is an
+        ordinary capturable op backed by the graph's own pool, not a run-time
+        plan change.
         """
 
         expert_map = (
             layer.exl3_expert_map if getattr(layer, "exl3_use_ep", False) else None
         )
         m = int(x.shape[0])
+        prepared = layer.exl3_trellis_weights
+        trellis = prepared.trellis
         output = runtime["api"].run_moe(
             x,
-            layer.exl3_trellis_weights,
+            prepared,
             topk_weights,
             topk_ids,
             activation=layer.activation.value,
             intermediate_cache13=buffers.intermediate_cache13,
             intermediate_cache2=buffers.intermediate_cache2,
-            output=buffers.output,
+            # The bundle is sized for the planned capacity; the kernel wants the
+            # destination shaped to this batch. Slicing rows off a contiguous
+            # 2-D buffer keeps it contiguous, so this is still allocation-free.
+            output=buffers.output[:m],
             fc1_c_tmp=buffers.fc1_c_tmp,
             fc2_c_tmp=buffers.fc2_c_tmp,
             packed_route_indices=buffers.packed_route_indices,
@@ -2613,11 +2683,18 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             output_expert_map=expert_map,
             fused_launch=launch,
             route_block_size_m=block_size_m,
+            # The rotations live on the prepared weights; the kernel needs them
+            # again at launch, and full_rotation is only accepted when the
+            # projection-major intermediate scales are supplied.
+            intermediate_rotation_scales=trellis.intermediate_rotations,
+            suh_gate_table=trellis.gate_suh,
+            suh_up_table=trellis.up_suh,
+            svh_table=trellis.down_svh,
             rotation_a_gate=buffers.rotation_a_gate,
             rotation_a_up=buffers.rotation_a_up,
             full_rotation=True,
         )
-        return output[:m].to(x.dtype)
+        return output.to(x.dtype)
 
     def _apply_rank_sliced(
         self,
