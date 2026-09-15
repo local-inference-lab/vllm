@@ -166,17 +166,53 @@ class B12xMHCResidual:
             )
         self.split_k = total_k // self.block_k
 
-    def _plan_for(self, operation: str, tokens: int) -> object:
+    def _plan_for(self, operation: str, tokens: int, device=None) -> object:
         tokens = int(tokens)
         exact = self._plans.get((operation, tokens))
         if exact is not None:
             return exact
         capacity = max((rows for op, rows in self._plans if op == operation), default=0)
-        if 0 <= tokens <= capacity and capacity:
+        if tokens <= capacity and capacity:
             return self._plans[(operation, capacity)]
-        raise RuntimeError(
-            f"B12x mHC {operation} live M={tokens} exceeds prepared capacity {capacity}"
+        # Profiling and other pre-preparation callers execute against a live
+        # batch before the weights-stage provider declares any plan. Build an
+        # on-demand plan for this bucket; require_prepared lazily materializes
+        # it with the default configuration (a warning, not an error, outside
+        # a frozen session), and the served path keeps using the prepared plan.
+        from b12x.preparation import FrozenMapping
+
+        plan_operation = (
+            "post_pre" if operation in ("post_pre", "post_pre_bf16") else operation
         )
+        invocation = FrozenMapping(
+            {
+                "operation": plan_operation,
+                "has_norm_weight": plan_operation != "post",
+                "norm_weight_dtype": "bfloat16",
+                "has_fn_bf16": operation == "post_pre_bf16",
+                "lagged_mix": False,
+                "bf16x2_eligible": True,
+                "output_mode": "functional",
+                "rms_eps": self.rms_eps,
+                "hc_eps": self.hc_eps,
+                "sinkhorn_iters": self.sinkhorn_iters,
+                "norm_eps": self.rms_eps,
+                "block_k": self.block_k,
+                "block_h": self.block_h,
+            }
+        )
+        plan = self._plan_factory(
+            self._caps(
+                device=device,
+                dtype=torch.bfloat16,
+                max_tokens=max(tokens, 1),
+                hidden_size=self.hidden_size,
+                split_k=self.split_k,
+            ),
+            invocation=invocation,
+        )
+        self._plans[(operation, max(tokens, 1))] = plan
+        return plan
 
     def run_pre(
         self,
@@ -198,7 +234,7 @@ class B12xMHCResidual:
             sinkhorn_iters=self.sinkhorn_iters,
             norm_weight=norm_weight,
             norm_eps=float(norm_eps),
-            plan=self._plan_for("pre", int(residual.shape[0])),
+            plan=self._plan_for("pre", int(residual.shape[0]), residual.device),
         )
 
     def run_post_pre(
@@ -233,6 +269,7 @@ class B12xMHCResidual:
             plan=self._plan_for(
                 "post_pre_bf16" if hc_fn_bf16 is not None else "post_pre",
                 tokens,
+                residual.device,
             ),
         )
 
@@ -248,7 +285,7 @@ class B12xMHCResidual:
             residual,
             post,
             comb,
-            plan=self._plan_for("post", int(residual.shape[0])),
+            plan=self._plan_for("post", int(residual.shape[0]), residual.device),
         )
 
     def _request_name(self, layer: object, operation: str, tokens: int) -> str:
