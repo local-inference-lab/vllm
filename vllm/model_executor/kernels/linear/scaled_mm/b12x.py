@@ -210,6 +210,7 @@ class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             return ()
         k = int(weight.shape[1])
         prefix = _resolve_layer_name(layer.b12x_layer_name)
+        plans = layer.b12x_block_fp8_plans
         requests = []
         for rows in workload.token_counts:
             plan = _block_fp8_plan(layer, rows, workload.output_dtype)
@@ -480,6 +481,7 @@ class B12xTensorFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         if packed.values.is_meta:
             return ()
         prefix = _resolve_layer_name(layer.b12x_layer_name)
+        plans = layer.b12x_tensor_fp8_plans
         requests = []
         for rows in workload.token_counts:
             plan = _tensor_fp8_plan(layer, rows, self.config.out_dtype)

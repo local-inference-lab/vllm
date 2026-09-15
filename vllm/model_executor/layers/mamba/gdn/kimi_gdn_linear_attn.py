@@ -618,15 +618,41 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             torch.zeros((max_tokens, 3 * width), dtype=self.model_config.dtype, device=device),
             persistent=False,
         )
-        # A full-rank gate arrives as one value per head dimension.
-        raw_g_shape = (
-            (max_tokens, self.local_num_heads, self.head_dim)
+        # KDA consumes one forget-gate value per head dimension in either gate
+        # mode. Keep beta's row stride equal to its fused-projection view.
+        raw_beta_row_width = (
+            4 * self.local_projection_size
+            + self.head_dim
+            + self.local_num_heads
+            + self.in_proj_padding
             if self.use_full_rank_gate
-            else (max_tokens, self.local_num_heads)
+            else 3 * self.local_projection_size
+            + self.local_num_heads
+            + self.head_dim
+        )
+        raw_beta_offset = (
+            4 * self.local_projection_size + self.head_dim
+            if self.use_full_rank_gate
+            else 3 * self.local_projection_size
+        )
+        self.register_buffer(
+            "_b12x_kda_raw_beta_storage",
+            torch.zeros(
+                (max_tokens, raw_beta_row_width),
+                dtype=self.model_config.dtype,
+                device=device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_kda_raw_beta",
+            self._b12x_kda_raw_beta_storage.narrow(
+                1, raw_beta_offset, self.local_num_heads
+            ),
+            persistent=False,
         )
         for name, shape in (
-            ("_b12x_kda_raw_g", raw_g_shape),
-            ("_b12x_kda_raw_beta", (max_tokens, self.local_num_heads)),
+            ("_b12x_kda_raw_g", (max_tokens, self.local_num_heads, self.head_dim)),
             ("_b12x_kda_z", (max_tokens, self.local_num_heads, self.head_dim)),
             ("_b12x_kda_output", (max_tokens, self.local_num_heads, self.head_dim)),
         ):
@@ -885,6 +911,31 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         ).reshape_as(tensor)
         tensor.copy_(values.div_(max(values.numel(), 1)))
 
+    @staticmethod
+    def _b12x_trial_tensor(source: torch.Tensor) -> torch.Tensor:
+        """Allocate a trial tensor with the source's layout and alignment."""
+        storage_size = 1 + sum(
+            (size - 1) * stride
+            for size, stride in zip(source.shape, source.stride())
+            if size
+        )
+        source_pointer = source.data_ptr()
+        source_alignment = (
+            min(16, source_pointer & -source_pointer) if source_pointer else 16
+        )
+        storage = torch.empty(
+            storage_size + 16, dtype=source.dtype, device=source.device
+        )
+        for storage_offset in range(16):
+            trial = storage.as_strided(
+                source.shape, source.stride(), storage_offset=storage_offset
+            )
+            pointer = trial.data_ptr()
+            alignment = min(16, pointer & -pointer) if pointer else 16
+            if alignment == source_alignment:
+                return trial
+        return storage.as_strided(source.shape, source.stride())
+
     def _prepare_b12x_kda_decode(self, state):
         return self._b12x_kda_decode_call(state, benchmark=False)
 
@@ -900,16 +951,18 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         # in _run_b12x_kda_decode_post_conv draws from the workspace manager.
         scratch = torch.empty(spec[0], dtype=spec[1], device=slots.device)
         if benchmark:
-            mixed_qkv = torch.empty_like(self._b12x_kda_mixed_qkv)
-            raw_g = torch.empty_like(self._b12x_kda_raw_g)
-            raw_beta = torch.empty_like(self._b12x_kda_raw_beta)
-            z = torch.empty_like(self._b12x_kda_z)
-            output = torch.empty_like(self._b12x_kda_output)
-            query_start_loc = torch.empty_like(self._b12x_kda_query_start_loc)
-            accepted = torch.ones_like(self._b12x_kda_num_accepted_tokens)
-            state_indices = torch.full_like(self._b12x_kda_state_indices, slot)
-            num_seqs = torch.empty_like(self._b12x_kda_num_seqs)
-            num_tokens = torch.empty_like(self._b12x_kda_num_tokens)
+            mixed_qkv = self._b12x_trial_tensor(self._b12x_kda_mixed_qkv)
+            raw_g = self._b12x_trial_tensor(self._b12x_kda_raw_g)
+            raw_beta = self._b12x_trial_tensor(self._b12x_kda_raw_beta)
+            z = self._b12x_trial_tensor(self._b12x_kda_z)
+            output = self._b12x_trial_tensor(self._b12x_kda_output)
+            query_start_loc = self._b12x_trial_tensor(
+                self._b12x_kda_query_start_loc
+            )
+            accepted = self._b12x_trial_tensor(self._b12x_kda_num_accepted_tokens)
+            state_indices = self._b12x_trial_tensor(self._b12x_kda_state_indices)
+            num_seqs = self._b12x_trial_tensor(self._b12x_kda_num_seqs)
+            num_tokens = self._b12x_trial_tensor(self._b12x_kda_num_tokens)
             saved_state = slots[slot : slot + 1].clone()
         else:
             mixed_qkv, raw_g, raw_beta, z, output = (
@@ -972,18 +1025,20 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         # in _run_b12x_kda_prefill draws from the workspace manager instead.
         scratch = torch.empty(spec[0], dtype=spec[1], device=slots.device)
         if benchmark:
-            q = torch.empty_like(self._b12x_prefill_q)
-            k = torch.empty_like(self._b12x_prefill_k)
-            v = torch.empty_like(self._b12x_prefill_v)
-            raw_g = torch.empty_like(self._b12x_prefill_raw_g)
-            raw_beta = torch.empty_like(self._b12x_prefill_raw_beta)
-            output = torch.empty_like(self._b12x_prefill_output)
-            cu_seqlens = torch.empty_like(self._b12x_prefill_cu_seqlens)
-            indices = torch.full_like(self._b12x_prefill_initial_indices, slot)
-            checkpoint_indices = torch.full_like(self._b12x_prefill_null_indices, slot)
-            offsets = torch.zeros_like(self._b12x_prefill_zero_offsets)
-            num_seqs = torch.empty_like(self._b12x_prefill_num_seqs)
-            num_tokens = torch.empty_like(self._b12x_prefill_num_tokens)
+            q = self._b12x_trial_tensor(self._b12x_prefill_q)
+            k = self._b12x_trial_tensor(self._b12x_prefill_k)
+            v = self._b12x_trial_tensor(self._b12x_prefill_v)
+            raw_g = self._b12x_trial_tensor(self._b12x_prefill_raw_g)
+            raw_beta = self._b12x_trial_tensor(self._b12x_prefill_raw_beta)
+            output = self._b12x_trial_tensor(self._b12x_prefill_output)
+            cu_seqlens = self._b12x_trial_tensor(self._b12x_prefill_cu_seqlens)
+            indices = self._b12x_trial_tensor(self._b12x_prefill_initial_indices)
+            checkpoint_indices = self._b12x_trial_tensor(
+                self._b12x_prefill_null_indices
+            )
+            offsets = self._b12x_trial_tensor(self._b12x_prefill_zero_offsets)
+            num_seqs = self._b12x_trial_tensor(self._b12x_prefill_num_seqs)
+            num_tokens = self._b12x_trial_tensor(self._b12x_prefill_num_tokens)
             saved_state = slots[slot : slot + 1].clone()
             owners = (
                 scratch, q, k, v, raw_g, raw_beta, output, cu_seqlens,

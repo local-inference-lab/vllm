@@ -274,13 +274,15 @@ def collect_b12x_units(worker: "Worker", workload: B12xWorkload) -> list[B12xPre
     """Collect every unit of one stage from the model, the draft, and comms."""
     mark_b12x_eager_shapes(worker)
     units: list[B12xPreparationUnit] = []
-    # Target and draft can share the same embedding and output-head modules.
-    seen: set[int] = set()
-    units.extend(_units_from_modules(worker.get_model(), workload, seen=seen))
     draft = worker.get_draft_model()
     if draft is not None:
         lane = _draft_lane(worker)
-        draft_workload = _draft_workload(worker, workload, lane=lane)
+        workload = _draft_workload(worker, workload, lane=0)
+    # Target and draft can share the same embedding and output-head modules.
+    seen: set[int] = set()
+    units.extend(_units_from_modules(worker.get_model(), workload, seen=seen))
+    if draft is not None:
+        draft_workload = replace(workload, lane=lane)
         from vllm.v1.worker.workspace import use_workspace_lane
 
         with use_workspace_lane(lane):
@@ -288,10 +290,6 @@ def collect_b12x_units(worker: "Worker", workload: B12xWorkload) -> list[B12xPre
         if lane:
             draft_units = [scope_b12x_unit_calls(unit, lane) for unit in draft_units]
         units.extend(draft_units)
-        workload = replace(
-            workload, token_counts=draft_workload.token_counts,
-            fixed_token_counts=draft_workload.fixed_token_counts,
-        )
     for provider in b12x_unit_providers():
         hook = getattr(provider, "get_b12x_preparation_units", None)
         if callable(hook):

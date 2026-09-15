@@ -3,6 +3,8 @@
 
 import json
 import math
+import sys
+import types
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -10,7 +12,9 @@ import pytest
 import torch
 from transformers import AutoTokenizer
 
+from vllm.model_executor.layers import logits_processor as logits_processor_module
 from vllm.model_executor.layers import mla as mla_layer
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn import kimi_gdn_linear_attn
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
     KimiGatedDeltaNetAttention,
@@ -319,6 +323,74 @@ def test_glm5next_mtp_prepares_configured_draft_head(monkeypatch) -> None:
     predictor.prepare_draft_lm_head(source_head)
 
     assert predictor.quantized_draft_head is quantized_head
+
+
+@pytest.mark.parametrize("runtime_quantization", [None, "nvfp4", "mxfp8"])
+def test_glm5next_mtp_registers_b12x_draft_heads(
+    monkeypatch, runtime_quantization: str | None
+) -> None:
+    class PreparationRecorder:
+        def __init__(self) -> None:
+            self.heads = []
+
+        def prepare_b12x_vocab_projection(self, head) -> None:
+            self.heads.append(head)
+
+    predictor = Glm5NextMultiTokenPredictor.__new__(Glm5NextMultiTokenPredictor)
+    torch.nn.Module.__init__(predictor)
+    heads = [torch.nn.Linear(4, 8, bias=False) for _ in range(2)]
+    for head in heads:
+        head.runtime_lm_head_quantization = runtime_quantization
+    predictor._mtp_layers = [
+        SimpleNamespace(shared_head=SimpleNamespace(head=head)) for head in heads
+    ]
+    predictor.logits_processor = PreparationRecorder()
+    predictor.quantized_draft_head = None
+    monkeypatch.setattr(glm5next_mtp, "make_quantized_draft_head", lambda _: None)
+
+    predictor.prepare_draft_lm_head(
+        SimpleNamespace(runtime_lm_head_quantization=runtime_quantization)
+    )
+
+    expected = [] if runtime_quantization in ("nvfp4", "mxfp8") else heads
+    assert predictor.logits_processor.heads == expected
+
+
+def test_b12x_vocab_projection_owner_is_not_a_child_module(monkeypatch) -> None:
+    class FakeHead(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = SimpleNamespace(
+                ndim=2,
+                dtype=torch.bfloat16,
+                is_cuda=True,
+                is_contiguous=lambda: True,
+            )
+            self.quant_method = FakeMethod()
+
+    class FakeMethod:
+        pass
+
+    processor = LogitsProcessor.__new__(LogitsProcessor)
+    torch.nn.Module.__init__(processor)
+    processor.use_b12x_vocab_projection = True
+    processor._b12x_vocab_projection = SimpleNamespace(is_supported=lambda: True)
+    processor._b12x_vocab_heads = {}
+    processor._b12x_vocab_plans = {}
+    head = FakeHead()
+    monkeypatch.setattr(logits_processor_module, "VocabParallelEmbedding", FakeHead)
+    monkeypatch.setattr(
+        logits_processor_module, "UnquantizedEmbeddingMethod", FakeMethod
+    )
+    monkeypatch.setattr(logits_processor_module, "UnquantizedLinearMethod", FakeMethod)
+    monkeypatch.setattr(
+        logits_processor_module, "set_b12x_preparation_provider", lambda *_: None
+    )
+
+    processor.prepare_b12x_vocab_projection(head)
+
+    assert head._b12x_vocab_projection_owner is processor
+    assert processor not in dict(head.named_modules()).values()
 
 
 def test_glm5next_mtp_preserves_position_zero_embedding() -> None:
@@ -1593,6 +1665,180 @@ def test_glm5next_b12x_kda_plan_reserves_null_state_zero(monkeypatch) -> None:
     assert captured_caps["null_state_index"] == 0
 
 
+@pytest.mark.parametrize("use_full_rank_gate", [False, True])
+def test_b12x_kda_decode_buffers_match_live_gate_layout(
+    monkeypatch, use_full_rank_gate: bool
+) -> None:
+    class FakeApi:
+        bind_kda = run_kda = object()
+
+        @staticmethod
+        def is_supported(device):
+            return True
+
+    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    layer.enable_b12x_kda_decode = True
+    layer.gate_lower_bound = -5.0
+    layer.head_dim = 128
+    layer.local_num_heads = 16
+    layer.local_projection_size = 16 * 128
+    layer.use_full_rank_gate = use_full_rank_gate
+    layer.in_proj_padding = 0
+    layer.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    layer.num_spec = 0
+    layer._b12x_kda_api = None
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=16),
+    )
+    monkeypatch.setattr(kimi_gdn_linear_attn, "get_b12x_gdn_decode", lambda: FakeApi())
+    monkeypatch.setattr(
+        kimi_gdn_linear_attn,
+        "current_platform",
+        SimpleNamespace(current_device=lambda: "cpu", is_cuda=lambda: True),
+    )
+    monkeypatch.setattr(
+        KimiGatedDeltaNetAttention,
+        "get_state_dtype",
+        lambda self: (torch.bfloat16, torch.float32),
+    )
+
+    layer._initialize_b12x_kda_decode(vllm_config)
+
+    assert layer._b12x_kda_raw_g.shape == (16, 16, 128)
+    live_width = (
+        4 * layer.local_projection_size + layer.head_dim + layer.local_num_heads
+        if use_full_rank_gate
+        else 3 * layer.local_projection_size + layer.local_num_heads + layer.head_dim
+    )
+    beta_offset = (
+        4 * layer.local_projection_size + layer.head_dim
+        if use_full_rank_gate
+        else 3 * layer.local_projection_size
+    )
+    live_beta = torch.empty(16, live_width).narrow(
+        1, beta_offset, layer.local_num_heads
+    )
+    assert layer._b12x_kda_raw_beta.shape == live_beta.shape
+    assert layer._b12x_kda_raw_beta.stride() == live_beta.stride()
+
+
+@pytest.mark.parametrize("use_full_rank_gate", [False, True])
+def test_b12x_kda_trial_buffers_preserve_declared_layout(
+    monkeypatch, use_full_rank_gate: bool
+) -> None:
+    class PreparedCall:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    preparation = types.ModuleType("b12x.preparation")
+    preparation.PreparedCall = PreparedCall
+    package = types.ModuleType("b12x")
+    package.__path__ = []
+    monkeypatch.setitem(sys.modules, "b12x", package)
+    monkeypatch.setitem(sys.modules, "b12x.preparation", preparation)
+
+    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    layer.head_dim = 4
+    layer.local_num_heads = 3
+    layer.gate_lower_bound = -5.0
+    layer.A_log = torch.empty(3)
+    layer.dt_bias = torch.empty(12)
+    layer.o_norm = SimpleNamespace(weight=torch.empty(3))
+    layer.kv_cache = (torch.empty(1), torch.empty((2, 3, 4, 4)))
+    layer._b12x_kda_mixed_qkv = torch.empty((2, 9))
+    layer._b12x_kda_raw_g = torch.empty((2, 3, 4))
+    beta_width = 15 if use_full_rank_gate else 12
+    beta_offset = 8 if use_full_rank_gate else 4
+    beta_storage = torch.empty((2, beta_width))
+    layer._b12x_kda_raw_beta = beta_storage.narrow(1, beta_offset, 3)
+    layer._b12x_kda_z = torch.empty((2, 3, 4))
+    layer._b12x_kda_output = torch.empty((2, 3, 4))
+    layer._b12x_kda_query_start_loc = torch.empty(2, dtype=torch.int32)
+    layer._b12x_kda_num_accepted_tokens = torch.empty(1, dtype=torch.int32)
+    layer._b12x_kda_state_indices = torch.empty((1, 1), dtype=torch.int32)
+    layer._b12x_kda_num_seqs = torch.empty(1, dtype=torch.int32)
+    layer._b12x_kda_num_tokens = torch.empty(1, dtype=torch.int32)
+    layer._b12x_prefill_q = torch.empty((2, 3, 4))
+    layer._b12x_prefill_k = torch.empty((2, 3, 4))
+    layer._b12x_prefill_v = torch.empty((2, 3, 4))
+    layer._b12x_prefill_raw_g = torch.empty((2, 3, 4))
+    prefill_beta_storage = torch.empty((2, beta_width))
+    layer._b12x_prefill_raw_beta = prefill_beta_storage.narrow(1, beta_offset, 3)
+    layer._b12x_prefill_output = torch.empty((2, 3, 4))
+    layer._b12x_prefill_cu_seqlens = torch.empty(2, dtype=torch.int32)
+    layer._b12x_prefill_initial_indices = torch.empty(1, dtype=torch.int32)
+    layer._b12x_prefill_null_indices = torch.empty(1, dtype=torch.int32)
+    layer._b12x_prefill_zero_offsets = torch.empty(1, dtype=torch.int32)
+    layer._b12x_prefill_num_seqs = torch.empty(1, dtype=torch.int32)
+    layer._b12x_prefill_num_tokens = torch.empty(1, dtype=torch.int32)
+    layer._b12x_prefill_max_tokens = 2
+
+    class State:
+        layout = SimpleNamespace(
+            scratch_specs=lambda: [
+                SimpleNamespace(shape=(1,), dtype=torch.float32)
+            ]
+        )
+
+        def bind_kda(self, **tensors):
+            self.decode = tensors
+            return tensors
+
+        def bind(self, **tensors):
+            self.prefill = tensors
+            return tensors
+
+        def run(self, binding, **kwargs):
+            return None
+
+    state = State()
+    layer._b12x_kda_decode_call(state, benchmark=True)
+    layer._b12x_kda_prefill_call(state, benchmark=True)
+
+    decode_sources = {
+        "mixed_qkv": layer._b12x_kda_mixed_qkv,
+        "raw_g": layer._b12x_kda_raw_g,
+        "raw_beta": layer._b12x_kda_raw_beta,
+        "z": layer._b12x_kda_z,
+        "output": layer._b12x_kda_output,
+        "query_start_loc": layer._b12x_kda_query_start_loc,
+        "num_accepted_tokens": layer._b12x_kda_num_accepted_tokens,
+        "state_indices": layer._b12x_kda_state_indices,
+        "num_seqs": layer._b12x_kda_num_seqs,
+        "num_tokens": layer._b12x_kda_num_tokens,
+    }
+    prefill_sources = {
+        "q": layer._b12x_prefill_q,
+        "k": layer._b12x_prefill_k,
+        "v": layer._b12x_prefill_v,
+        "raw_g": layer._b12x_prefill_raw_g,
+        "raw_beta": layer._b12x_prefill_raw_beta,
+        "output": layer._b12x_prefill_output,
+        "cu_seqlens": layer._b12x_prefill_cu_seqlens,
+        "initial_state_indices": layer._b12x_prefill_initial_indices,
+        "checkpoint_state_indices": layer._b12x_prefill_null_indices,
+        "checkpoint_offsets": layer._b12x_prefill_zero_offsets,
+        "num_seqs": layer._b12x_prefill_num_seqs,
+        "num_tokens": layer._b12x_prefill_num_tokens,
+    }
+    for binding, sources in (
+        (state.decode, decode_sources),
+        (state.prefill, prefill_sources),
+    ):
+        for name, source in sources.items():
+            trial = binding[name]
+            assert trial.shape == source.shape
+            assert trial.stride() == source.stride()
+            assert trial.dtype == source.dtype
+            source_pointer = source.data_ptr()
+            trial_pointer = trial.data_ptr()
+            source_alignment = min(16, source_pointer & -source_pointer)
+            trial_alignment = min(16, trial_pointer & -trial_pointer)
+            assert trial_alignment == source_alignment
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("tokens", [3, 12])
 def test_glm_adaptive_kda_graph_matches_independent_request_states(monkeypatch, tokens):
@@ -2251,3 +2497,79 @@ def test_glm5next_mtp_resolves_mxfp8_quantization(
     quant_config.packed_modules_mapping = {}
 
     assert quant_config._resolve_quant_algo("model.layers.45.mlp.experts") == "MXFP8"
+
+
+def test_glm5next_registers_mhc_preparation_after_broadcast_publication(
+    monkeypatch,
+) -> None:
+    """b12x mHC plans come only from startup preparation.
+
+    Every GLM layer with a b12x mHC must publish it as a provider, and only
+    after the first layer's broadcast projection exists: that projection decides
+    whether the layer declares ``pre``. Layers built without mHC publish nothing
+    and must not break the hook.
+    """
+    layers = []
+    for mhc in (object(), object()):
+        layer = object.__new__(Glm5NextDecoderLayer)
+        torch.nn.Module.__init__(layer)
+        layer._b12x_mhc = mhc
+        layers.append(layer)
+
+    class FakeModule(torch.nn.Module):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(glm5next_model, "Glm5NextMLAAttention", FakeModule)
+    monkeypatch.setattr(glm5next_model, "Glm5NextMLP", FakeModule)
+    monkeypatch.setattr(glm5next_model, "RMSNorm", FakeModule)
+    config = SimpleNamespace(
+        hidden_size=16,
+        is_moe=False,
+        num_hidden_layers=1,
+        rms_norm_eps=1e-5,
+        n_routed_experts=None,
+        mhc=False,
+        is_kda_layer=lambda layer_idx: False,
+        v_head_dim=4,
+        kv_lora_rank=4,
+        num_attention_heads=2,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=0,
+        q_lora_rank=4,
+        max_position_embeddings=128,
+        mla_nope=True,
+        mlp_layer_types=["dense"],
+        intermediate_size=32,
+        hidden_act="silu",
+        swiglu_limit=None,
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=None,
+        quant_config=None,
+        parallel_config=SimpleNamespace(use_sequence_parallel_moe=False),
+    )
+    non_mhc = Glm5NextDecoderLayer(vllm_config, config, 0, prefix="model.layers.2")
+    assert non_mhc._b12x_mhc is None
+    layers.append(non_mhc)
+    model = object.__new__(glm5next_model.Glm5NextModel)
+    torch.nn.Module.__init__(model)
+    model.layers = torch.nn.ModuleList(layers)
+    model.start_layer, model.end_layer = 0, len(layers)
+
+    model.process_b12x_weights_after_loading()
+
+    assert layers[0].b12x_preparation_provider is layers[0]._b12x_mhc
+    assert layers[1].b12x_preparation_provider is layers[1]._b12x_mhc
+    assert not hasattr(layers[2], "b12x_preparation_provider")
+
+    calls: list[str] = []
+    causal_lm = object.__new__(glm5next_model.Glm5NextForCausalLM)
+    torch.nn.Module.__init__(causal_lm)
+    causal_lm.model = SimpleNamespace(
+        finalize_mhc_broadcast_weights=lambda: calls.append("broadcast"),
+        process_b12x_weights_after_loading=lambda: calls.append("providers"),
+    )
+    causal_lm.process_weights_after_loading()
+
+    assert calls == ["broadcast", "providers"]
