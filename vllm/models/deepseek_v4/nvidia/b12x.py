@@ -980,6 +980,18 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
             if swa_kv_cache.ndim < 2
             else None
         )
+        if indexed_width:
+            indexed_page_nbytes = (
+                page_size // self.compress_ratio
+            ) * _DSV4_CACHE_BYTES_PER_TOKEN
+            indexed_meta = {
+                "shape": (1, indexed_page_nbytes),
+                "stride": (indexed_page_nbytes, 1),
+                "alignment": 16,
+                "dtype": str(self.swa_cache_layer.dtype).removeprefix("torch."),
+            }
+        else:
+            indexed_meta = None
         invocation = module.invocation_from_descriptors(
             q=_descriptor_from_tensor(q),
             swa_cache=(
@@ -991,6 +1003,22 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
                         page_size,
                         "swa_k_cache",
                     )
+                )
+            ),
+            indexed_cache=(
+                indexed_meta
+                if indexed_meta is not None
+                else (
+                    _descriptor_from_tensor(
+                        self._get_cache_page_view(
+                            compressed_cache,
+                            page_size // self.compress_ratio,
+                            "indexed_k_cache",
+                        )
+                    )
+                    if (compressed_cache := self.kv_cache) is not None
+                    and self.compress_ratio > 1
+                    else None
                 )
             ),
             attn_sink_present=False,
