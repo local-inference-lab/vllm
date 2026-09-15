@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 
 import torch
 
@@ -16,14 +17,16 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.b12x import (
-    set_b12x_preparation_provider,
     B12xWorkload,
     b12x_layer_prefix,
-    get_b12x_blockscaled as _import_b12x_blockscaled,
     get_b12x_dense_activation_mode,
     register_b12x_layer,
     reuse_packed_weight_storage,
     run_b12x_blockscaled_linear,
+    set_b12x_preparation_provider,
+)
+from vllm.utils.b12x import (
+    get_b12x_blockscaled as _import_b12x_blockscaled,
 )
 from vllm.utils.torch_utils import _encode_layer_name
 
@@ -63,16 +66,19 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
         assert api is not None
         packed = api.pack_weight(
             weight.detach(),
-            scales[:, : in_features // MXFP8_BLOCK_SIZE].detach(),
+            scales[:out_features, : in_features // MXFP8_BLOCK_SIZE].detach(),
         )
+        # Both B12X activation-precision paths read the MMA-layout scales.
+        # The row-layout copy is packaging metadata, not an execution input.
+        packed = replace(packed, weight=replace(packed.weight, scale_rows=None))
         layer.b12x_mxfp8_packed_weight = reuse_packed_weight_storage(
             getattr(layer, "b12x_mxfp8_packed_weight", None), packed
         )
         # A method that pre-quantizes or keeps BF16 activations sets the mode
         # before weight processing; the configured default applies otherwise.
-        layer.b12x_activation_mode = (
-            getattr(layer, "b12x_activation_mode", None) or get_b12x_dense_activation_mode("mxfp8")
-        )
+        layer.b12x_activation_mode = getattr(
+            layer, "b12x_activation_mode", None
+        ) or get_b12x_dense_activation_mode("mxfp8")
         layer.b12x_bf16_input_supported = (
             in_features % 128 == 0 and out_features % 8 == 0
         )
@@ -93,6 +99,7 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
         replace_parameter(layer, "weight_scale", scales.new_empty((0,)))
         if not getattr(layer, "b12x_preparation_suppressed", False):
             set_b12x_preparation_provider(layer, self)
+
     def get_b12x_preparation_units(
         self, layer: torch.nn.Module, workload: B12xWorkload
     ) -> Sequence[object]:

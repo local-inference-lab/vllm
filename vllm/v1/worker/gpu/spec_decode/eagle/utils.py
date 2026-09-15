@@ -132,7 +132,14 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     # every module in the draft that holds a buffer reference so that
     # the per-layer indexer and sparse-attention backends all point to
     # the target's buffer.
-    if hasattr(target_inner, "topk_indices_buffer"):
+    share_indexer_storage = getattr(eagle_model, "share_target_indexer_storage", None)
+    if share_indexer_storage is not None:
+        if (
+            get_pp_group().world_size == 1
+            and not vllm_config.parallel_config.enable_dbo
+        ):
+            share_indexer_storage(target_inner)
+    elif hasattr(target_inner, "topk_indices_buffer"):
         target_buffer = target_inner.topk_indices_buffer
         if target_buffer is not None:
             for _, module in draft_inner.named_modules():

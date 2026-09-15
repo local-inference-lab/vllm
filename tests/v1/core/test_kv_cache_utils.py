@@ -2447,6 +2447,7 @@ def test_glm5next_split_cache_preserves_physical_pages(
 
 def _glm5next_split_config() -> SimpleNamespace:
     return SimpleNamespace(
+        use_request_boundary_checkpoints=False,
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
         speculative_config=None,
         model_config=SimpleNamespace(max_model_len=202_752),
@@ -2584,6 +2585,7 @@ def test_glm5next_nvfp4_auto_geometry_capacity() -> None:
         prefix_cache_retention_interval=4096,
     )
     vllm_config = SimpleNamespace(
+        use_request_boundary_checkpoints=False,
         model_config=SimpleNamespace(max_model_len=202_752),
         parallel_config=SimpleNamespace(decode_context_parallel_size=4),
         cache_config=SimpleNamespace(mamba_cache_mode="align"),
@@ -3330,6 +3332,71 @@ def test_auto_fit_max_model_len_with_hybrid():
         vllm_config, [kv_cache_specs], [available_memory]
     )
     assert vllm_config.model_config.max_model_len == 1024
+
+
+@pytest.mark.parametrize("dcp", [1, 2, 4])
+@pytest.mark.parametrize("num_blocks,expected_pages", [(38, 0), (70, 15)])
+def test_boundary_capacity_includes_private_endpoints(dcp, num_blocks, expected_pages):
+    """Live MTP state alone does not cover instruction/prompt/response copies."""
+    config = SimpleNamespace(
+        use_request_boundary_checkpoints=True,
+        model_config=SimpleNamespace(max_model_len=1048576),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp),
+        cache_config=SimpleNamespace(mamba_cache_mode="align"),
+    )
+    attention = MLAAttentionSpec(
+        block_size=2048,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.uint8,
+        model_version="glm5_next",
+    )
+    state = MambaSpec(
+        block_size=2048,
+        shapes=((1,),),
+        dtypes=(torch.uint8,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=3,
+    )
+    groups = [KVCacheGroupSpec([f"state-{i}"], state) for i in range(6)]
+    groups.append(KVCacheGroupSpec(["attention"], attention))
+    block_bytes = kv_cache_utils._pool_bytes_per_block(groups)
+    # Six groups require five live/scratch states each; three endpoints
+    # additionally own eight blocks each. The null block is unavailable.
+    available = (num_blocks - 1) * block_bytes
+    estimate = kv_cache_utils._estimate_max_model_len_from_groups(
+        config, groups, available
+    )
+    assert estimate == expected_pages * 2048 * dcp
+    assert config.model_config.max_model_len == 1048576
+
+    if expected_pages == 0:
+        with pytest.raises(ValueError, match="even a single token"):
+            kv_cache_utils._auto_fit_max_model_len(config, [groups], [available])
+    else:
+        kv_cache_utils._auto_fit_max_model_len(config, [groups], [available])
+        assert config.model_config.max_model_len == estimate
+        assert kv_cache_utils._max_memory_usage_bytes_from_groups(config, groups) == (
+            available
+        )
+        assert kv_cache_utils._get_kv_cache_group_allocation_cost(config, groups) == (
+            available
+        )
+        cache = KVCacheConfig(
+            num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=groups
+        )
+        assert get_max_concurrency_for_kv_cache_config(config, cache) == (
+            num_blocks / (30 + 24 + expected_pages)
+        )
+
+    # An aligned-policy control has no endpoint reservation. Its capacity
+    # calculation must keep the ordinary live-state contract.
+    config.use_request_boundary_checkpoints = False
+    config.model_config.max_model_len = 1048576
+    control = kv_cache_utils._estimate_max_model_len_from_groups(
+        config, groups, available
+    )
+    assert control == (num_blocks - 1 - 30) * 2048 * dcp
 
 
 def test_auto_fit_max_model_len_not_triggered():

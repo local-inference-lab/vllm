@@ -491,6 +491,27 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
+def _byte_ranges_overlap(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Conservatively test strided byte spans, allowing disjoint arena views."""
+    if not a.numel() or not b.numel():
+        return False
+    if a.untyped_storage().data_ptr() != b.untyped_storage().data_ptr():
+        return False
+
+    def span(tensor):
+        start = tensor.storage_offset() * tensor.element_size()
+        stop = (
+            start
+            + (1 + sum((n - 1) * s for n, s in zip(tensor.shape, tensor.stride())))
+            * tensor.element_size()
+        )
+        return start, stop
+
+    a_start, a_stop = span(a)
+    b_start, b_stop = span(b)
+    return a_start < b_stop and b_start < a_stop
+
+
 def causal_conv1d_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -509,57 +530,48 @@ def causal_conv1d_fn(
     block_size_to_align=0,
     metadata=None,
     validate_data=False,
+    out: torch.Tensor | None = None,
 ):
-    """support varlen + continuous batching when x is 2D tensor
+    """Apply causal convolution to concatenated variable-length sequences.
 
-    x: (dim,cu_seq_len)
-        cu_seq_len = total tokens of all seqs in that batch
-        sequences are concatenated from left to right for varlen
-    weight: (dim, width)
-    conv_states: (...,dim,width - 1) itype
-        updated inplace if cache_indices are not provided
-        [it use `cache_indices` to get the index to the cache of conv_state for that sequence
+    Args:
+        x: Input of shape (dim, total_tokens), with sequences concatenated.
+        weight: Convolution weights of shape (dim, width).
+        bias: Optional per-channel bias of shape (dim,).
+        conv_states: Mutable history of shape (cache_slots, dim, state_length),
+            where state_length is at least width - 1. Cache indices select
+            initial history and the slots updated with input tokens.
+        query_start_loc: Int32 cumulative token offsets of shape (batch + 1,),
+            starting at zero and ending at total_tokens.
+        cache_indices: Optional int32 mapping from sequences to state slots.
+        has_initial_state: Optional boolean per sequence selecting whether to
+            consume its cached history.
+        activation: None, "silu", "swish", or True (equivalent to "silu").
+        pad_slot_id: Sentinel cache index for entries that must not be processed.
+        null_block_id: Sentinel for an unavailable recurrent checkpoint.
+        block_idx_first_scheduled_token: Int32 per-sequence offset into
+            cache_indices for the first block receiving scheduled tokens.
+        block_idx_last_scheduled_token: Int32 per-sequence offset into
+            cache_indices for the last block receiving scheduled tokens.
+        initial_state_idx: Int32 per-sequence offset into cache_indices for
+            the block containing initial history.
+        num_computed_tokens: Number of previously computed tokens per sequence.
+        block_size_to_align: Token interval for storing aligned cached states.
+        metadata: Optional precomputed batch and token-chunk launch metadata.
+            Without it, metadata is constructed from query_start_loc.
+        validate_data: Enable additional shape, stride, and alignment assertions.
+        out: Optional caller-owned output matching x's shape, dtype, and device.
+            It must be disjoint from input, weight, bias, and state storage;
+            input and state dtypes must also match.
 
-        conv_state[cache_indices[i]] for seq-i - to be used as initial_state when has_initial_state[i] = True
-             and after that conv_state[cache_indices[i]] need to be shift-left and updated with values from 'x'
-        ]
-    query_start_loc: (batch + 1) int32
-        The cumulative sequence lengths of the sequences in
-        the batch, used to index into sequence. prepended by 0.
-        if
-        x = [5, 1, 1, 1] <- continuous batching (batch=4)
-        then
-        query_start_loc = [0, 5, 6, 7, 8] <- the starting index of the next sequence; while the last value is
-           the ending index of the last sequence
-        [length(query_start_loc)-1 == batch]
-        for example: query_start_loc = torch.Tensor([0,10,16,17]),
-        x.shape=(dim,17)
-    cache_indices: (batch)  int32
-        indicates the corresponding state index,
-        like so: conv_state = conv_states[cache_indices[batch_id]]
-    has_initial_state: (batch) bool
-        indicates whether should the kernel take the current state as initial
-        state for the calculations
-        [single boolean for each sequence in the batch: True or False]
-    bias: (dim,)
-    activation: either None or "silu" or "swish" or True
-    pad_slot_id: int
-        if cache_indices is passed, lets the kernel identify padded
-        entries that will not be processed,
-        for example: cache_indices = [pad_slot_id, 1, 20, pad_slot_id]
-        in this case, the kernel will not process entries at
-        indices 0 and 3
-    block_idx_first_scheduled_token: (batch,), dtype int32
-        The pointer into cache_indices, where the first cache block to be filled is located.
-    block_idx_last_scheduled_token: (batch,), dtype int32
-        The pointer into cache_indices, where the last cache block to be filled is located.
-    initial_state_idx: (batch,), dtype int32
-        The pointer into cache_indices, where the cache block containing the initial state is located.
-    num_computed_tokens: (batch,), dtype int32
-        The number of tokens already completed for each sequence
-    block_size_to_align: int
-        The block size to align the cached states to
-    out: same shape as `x`
+    Returns:
+        Convolved tokens with x's shape and original dtype. When out is supplied,
+        the returned tensor uses that caller-owned storage.
+
+    Raises:
+        ValueError: Caller-owned output has incompatible geometry, dtype, or
+            device, or overlaps input or state storage.
+        AssertionError: State geometry or enabled data-validation checks fail.
     """
     if isinstance(activation, bool) and activation:
         activation = "silu"
@@ -568,7 +580,24 @@ def causal_conv1d_fn(
     # Store original dtype to cast back at the end
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
-    out = torch.empty_like(x)
+    if out is None:
+        out = torch.empty_like(x)
+    elif (
+        out.shape != x.shape
+        or out.dtype != x.dtype
+        or out.dtype != original_x_dtype
+        or out.device != x.device
+    ):
+        raise ValueError(
+            "Convolution output must match input/state shape, dtype and device"
+        )
+    elif any(
+        source is not None and _byte_ranges_overlap(out, source)
+        for source in (x, weight, bias, conv_states)
+    ):
+        raise ValueError(
+            "Convolution output storage must be disjoint from inputs and state"
+        )
     if metadata is not None:
         nums_dict = metadata.nums_dict
         args = nums_dict

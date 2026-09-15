@@ -437,11 +437,27 @@ def test_b12x_mxfp8_support_respects_runtime_probe(monkeypatch) -> None:
     assert reason == "b12x.gemm.blockscaled is not supported"
 
 
+@dataclass(frozen=True)
+class _MXFP8Rows:
+    values: torch.Tensor
+    scale_mma: torch.Tensor
+    scale_rows: torch.Tensor | None
+
+
+@dataclass(frozen=True)
+class _MXFP8LinearWeight:
+    weight: _MXFP8Rows
+    out_features: int
+
+
 def test_b12x_mxfp8_process_weights_packs_modelopt_layout(monkeypatch) -> None:
     import vllm.model_executor.kernels.linear.mxfp8.b12x as b12x_mod
 
     calls = []
-    packed = types.SimpleNamespace(out_features=48)
+    packed = _MXFP8LinearWeight(
+        _MXFP8Rows(torch.empty(48, 128), torch.empty(48, 4), torch.empty(48, 4)),
+        out_features=48,
+    )
 
     def pack(weight: torch.Tensor, weight_scale: torch.Tensor):
         calls.append((weight, weight_scale))
@@ -471,7 +487,11 @@ def test_b12x_mxfp8_process_weights_packs_modelopt_layout(monkeypatch) -> None:
 
     kernel.process_weights_after_loading(layer)
 
-    assert layer.b12x_mxfp8_packed_weight is packed
+    retained = layer.b12x_mxfp8_packed_weight
+    assert retained.weight.values is packed.weight.values
+    assert retained.weight.scale_mma is packed.weight.scale_mma
+    assert retained.weight.scale_rows is None
+    assert layer.b12x_preparation_provider is kernel
     assert len(calls) == 1
     weight, weight_scale = calls[0]
     assert weight.shape == (48, 128)
@@ -491,6 +511,7 @@ def test_b12x_mxfp8_reload_reuses_packed_tensor_addresses(monkeypatch) -> None:
     class Rows:
         values: torch.Tensor
         scale_mma: torch.Tensor
+        scale_rows: torch.Tensor | None
 
     @dataclass(frozen=True)
     class PackedWeight:
@@ -501,7 +522,10 @@ def test_b12x_mxfp8_reload_reuses_packed_tensor_addresses(monkeypatch) -> None:
 
     def pack(weight: torch.Tensor, weight_scale: torch.Tensor) -> PackedWeight:
         return PackedWeight(
-            weight=Rows(values=weight.clone(), scale_mma=weight_scale.clone()),
+            weight=Rows(
+                values=weight.clone(), scale_mma=weight_scale.clone(),
+                scale_rows=weight_scale.clone(),
+            ),
             in_features=int(weight.shape[1]),
             padded_in_features=int(weight.shape[1]),
             out_features=int(weight.shape[0]),
@@ -544,6 +568,7 @@ def test_b12x_mxfp8_reload_reuses_packed_tensor_addresses(monkeypatch) -> None:
     # The holder, and with it the declared plan, survives a reload into the
     # same packed storage.
     assert layer.b12x_linear is holder
+    assert packed.weight.scale_rows is None
     assert packed.weight.values.data_ptr() == values_ptr
     assert packed.weight.scale_mma.data_ptr() == scales_ptr
     torch.testing.assert_close(
@@ -1364,17 +1389,19 @@ def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, recipe, mode):
     ):
         pytest.skip("SM120/SM121 required")
     blockscaled = pytest.importorskip("b12x.gemm.blockscaled")
-    from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
-    from vllm._custom_ops import scaled_fp4_quant
+
     from tests.kernels.quantization.nvfp4_utils import dequantize_nvfp4_to_dtype
+    from vllm._custom_ops import scaled_fp4_quant
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
         _mxfp8_e4m3_quantize_torch,
     )
+    from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
 
     monkeypatch.setenv(f"VLLM_B12X_{recipe.upper()}_ACTIVATION_MODE", mode)
     torch.manual_seed(1234)
     n, k = 4096, 5376
     layer = torch.nn.Module()
+    counts: tuple[int, ...]
     if recipe == "nvfp4":
         codes = torch.randint(0, 16, (n, k), device="cuda", dtype=torch.uint8)
         values = codes[:, ::2] | (codes[:, 1::2] << 4)
@@ -1399,7 +1426,7 @@ def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, recipe, mode):
             exponents.float() - 127
         ).repeat_interleave(32, 1)
         kernel = object.__new__(B12xMxfp8LinearKernel)
-        counts = (1, 2, 4, 8, 14, 32)
+        counts = (1, 2, 4, 8, 14, 32, 3072)
     layer.weight = torch.nn.Parameter(values, requires_grad=False)
     layer.weight_scale = torch.nn.Parameter(scales, requires_grad=False)
     reset_workspace_manager()
@@ -1408,14 +1435,26 @@ def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, recipe, mode):
     try:
         kernel.process_weights_after_loading(layer)
         packed = getattr(layer, f"b12x_{recipe}_packed_weight")
+        if recipe == "mxfp8":
+            assert packed.weight.scale_rows is None
+            row_scale_reference = blockscaled.pack_weight(values, scales)
         if recipe == "nvfp4":
             assert packed.values.data_ptr() == layer.weight.data_ptr()
             assert packed.scale_mma.data_ptr() == layer.weight_scale.data_ptr()
             assert packed.global_scale is layer.weight_global_scale
         session, _ = _prepare(
-            layer, device=torch.device("cuda"), counts=counts, fixed=fixed,
+            layer,
+            device=torch.device("cuda"),
+            counts=counts,
+            fixed=fixed,
             max_tokens=max(counts),
         )
+        if recipe == "mxfp8":
+            row_reference_workspace = torch.empty(
+                (layer.b12x_linear.get_workspace_size(max(counts)),),
+                dtype=torch.uint8,
+                device="cuda",
+            )
         bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
 
         def reference(source, a16):
@@ -1427,15 +1466,24 @@ def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, recipe, mode):
                 )
                 return (
                     dequantize_nvfp4_to_dtype(
-                        aq, sf, layer.input_global_scale_inv, torch.float32, source.device,
-                    ) @ decoded.T
+                        aq,
+                        sf,
+                        layer.input_global_scale_inv,
+                        torch.float32,
+                        source.device,
+                    )
+                    @ decoded.T
                 ).bfloat16() + bias
             aq, sf = _mxfp8_e4m3_quantize_torch(source)
-            query = blockscaled.query_from_call((aq, sf), packed, out_dtype=source.dtype)
+            query = blockscaled.query_from_call(
+                (aq, sf), packed, out_dtype=source.dtype
+            )
             plan = reference_plans.get(query)
             if plan is None:
                 plan = reference_plans[query] = blockscaled.plan(query)
-            return blockscaled.mm((aq, sf), packed, bias=bias, out_dtype=source.dtype, plan=plan)
+            return blockscaled.mm(
+                (aq, sf), packed, bias=bias, out_dtype=source.dtype, plan=plan
+            )
 
         reference_plans = {}
 
@@ -1445,6 +1493,15 @@ def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, recipe, mode):
             expected = reference(source, config.mode == "a16")
             for _ in range(3):
                 actual = kernel.apply_weights(layer, source, bias)
+            if recipe == "mxfp8":
+                unchanged = blockscaled.mm(
+                    source,
+                    row_scale_reference,
+                    bias=bias,
+                    plan=layer.b12x_linear.plan,
+                    workspace=row_reference_workspace,
+                )
+                torch.testing.assert_close(actual, unchanged, atol=0, rtol=0)
             torch.testing.assert_close(actual, expected, atol=0.5, rtol=0.02)
             graph = torch.cuda.CUDAGraph()
             with session.capture():
@@ -1461,7 +1518,9 @@ def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, recipe, mode):
                     assert output.data_ptr() == pointer
                     assert torch.isfinite(output).all() and torch.count_nonzero(output)
             expected = reference(source, config.mode == "a16")
-            relative = (output.float() - expected.float()).norm() / expected.float().norm()
+            relative = (
+                output.float() - expected.float()
+            ).norm() / expected.float().norm()
             assert relative < 0.005
     finally:
         session.close()
@@ -1710,7 +1769,7 @@ def _run_v41_sharded_embedding(rank, port):
     )
 
     device = torch.device("cuda", rank)
-    torch.cuda.set_device(device)
+    torch.accelerator.set_device_index(device)
     with set_current_vllm_config(VllmConfig()), torch.no_grad():
         try:
             init_test_distributed_environment(2, 1, rank, str(port), local_rank=rank)
@@ -1724,7 +1783,7 @@ def _run_v41_sharded_embedding(rank, port):
 def test_v41_vocab_embedding_sharded_global_ids_and_target_weight_tie(monkeypatch):
     # This test already spawns fresh workers. Forking an outer test process
     # after a preceding CUDA test would inherit an unusable CUDA context.
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+    if not torch.cuda.is_available() or torch.accelerator.device_count() < 2:
         pytest.skip("native b12x embedding requires two GPUs")
     if any(torch.cuda.get_device_capability(i)[0] != 12 for i in range(2)):
         pytest.skip("native b12x embedding requires two SM12x GPUs")
@@ -1755,7 +1814,7 @@ def test_v41_mhc_shares_scratch_and_preserves_live_outputs(
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("native b12x mHC requires SM12x")
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", torch.accelerator.current_device_index())
     capacity, hidden = 4096, 5120
     monkeypatch.setattr(b12x_layers, "_capacity", lambda: capacity)
     monkeypatch.setattr(
@@ -1771,11 +1830,11 @@ def test_v41_mhc_shares_scratch_and_preserves_live_outputs(
         hc_eps=1e-6,
         hc_sinkhorn_iters=20,
     )
-    allocated = torch.cuda.memory_allocated(device)
+    allocated = torch.accelerator.memory_allocated(device)
     with torch.device(device):
         first, second = b12x_layers.B12xMHC(config), b12x_layers.B12xMHC(config)
     # Model construction must not reserve capacity-sized activations per layer.
-    assert torch.cuda.memory_allocated(device) - allocated < 1024**2
+    assert torch.accelerator.memory_allocated(device) - allocated < 1024**2
     torch.manual_seed(4124096)
     shape = (tokens, hidden) if broadcast else (tokens, 4, hidden)
     residual = torch.randn(shape, device=device, dtype=torch.bfloat16)
@@ -1854,7 +1913,7 @@ def test_v41_mhc_shares_scratch_and_preserves_live_outputs(
     def expected():
         incoming = identity
         state = residual
-        outputs = []
+        outputs: list[torch.Tensor] = []
         for index in range(2):
             predicted = torch.empty_like(incoming)
             result = mhc.run_pre(
@@ -1910,7 +1969,7 @@ def test_v41_mhc_shares_scratch_and_preserves_live_outputs(
         for factor in (0.5, -1.0):
             residual.mul_(factor)
             graph.replay()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             for got, want in zip(captured, expected(), strict=True):
                 torch.testing.assert_close(got, want, rtol=2e-5, atol=0.008)
         del resources

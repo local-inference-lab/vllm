@@ -568,6 +568,10 @@ class Worker(WorkerBase):
                 self.model_runner.profile_run(self._prepare_b12x_profile_state)
             finally:
                 self._release_b12x_profile_state()
+            # Retired profile buffers must be available to the contiguous KV
+            # pool even when its explicit budget bypasses automatic sizing.
+            torch.accelerator.synchronize()
+            torch.accelerator.empty_cache()
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
                 f"GiB, reserved {format_gib(kv_cache_memory_bytes)} GiB memory for "

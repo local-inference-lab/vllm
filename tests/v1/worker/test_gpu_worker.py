@@ -165,6 +165,27 @@ def test_startup_plan_apply_gate(plan_env):
     assert explicit.cache_config.kv_cache_memory_bytes == 7 * GiB_bytes
 
 
+def test_explicit_kv_budget_releases_completed_profile_allocations(monkeypatch):
+    events = []
+    worker = _plan_worker(kv_bytes=4 * GiB_bytes)
+    worker.model_config = SimpleNamespace(multimodal_config=None)
+    worker._prepare_b12x_profile_state = lambda: events.append("prepare")
+    worker._release_b12x_profile_state = lambda: events.append("state_release")
+    worker.model_runner = SimpleNamespace(
+        profile_run=lambda prepare: (prepare(), events.append("profile"))
+    )
+    monkeypatch.setattr(gpu_worker, "maybe_apply_startup_plan", lambda worker: None)
+    monkeypatch.setattr(
+        gpu_worker.torch.accelerator, "synchronize", lambda: events.append("sync")
+    )
+    monkeypatch.setattr(
+        gpu_worker.torch.accelerator, "empty_cache", lambda: events.append("release")
+    )
+
+    assert gpu_worker.Worker.determine_available_memory(worker) == 4 * GiB_bytes
+    assert events == ["prepare", "profile", "state_release", "sync", "release"]
+
+
 @pytest.mark.parametrize(
     "final_free_memory,expected_available_memory",
     [(90, 75), (85, 70)],
@@ -303,6 +324,10 @@ def test_post_capture_recommendation_counts_measured_graph_memory_once(
         observability_config=SimpleNamespace(
             jit_monitor_mode="off", jit_monitor_verbose=False
         ),
+    )
+    worker._b12x_session = None
+    worker._compile_or_warm_up_model_after_preparation = lambda: (
+        gpu_worker.Worker._compile_or_warm_up_model_after_preparation(worker)
     )
     saved = []
     monkeypatch.setattr(
