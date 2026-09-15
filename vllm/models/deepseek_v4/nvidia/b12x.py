@@ -600,15 +600,23 @@ def _run_compressed_sparse_mla(
         swa_k_cache=swa_k_cache,
         indexed_k_cache=indexed_k_cache,
     )
+    indexed_width_serving = (
+        int(indexed_indices.shape[-1]) if indexed_indices is not None else 0
+    )
     plan = module.plan(
         module.Caps(
             device=q.device,
             num_q_heads=heads,
             max_q_rows=max(rows, 1),
             max_width=max(width, 1),
+            swa_width=max(int(width) - indexed_width_serving, 0),
+            indexed_width=indexed_width_serving,
             head_dim=_DSV4_HEAD_DIM,
             v_head_dim=_DSV4_HEAD_DIM,
             page_size=int(swa_page_size),
+            indexed_page_size=(
+                int(indexed_page_size) if indexed_page_size is not None else None
+            ),
             max_chunks_per_row=max_chunks_per_row,
             decode_row_capacity=decode_row_capacity,
         ),
@@ -1032,6 +1040,13 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
                 num_q_heads=int(q.shape[1]),
                 max_q_rows=rows,
                 max_width=width,
+                # Split-width declaration keeps Caps.indexed_width equal to the
+                # local indexed_width that gates the descriptor below. The
+                # legacy both-None normalization would instead set
+                # Caps.indexed_width = max_width, forcing the cache descriptor
+                # present even when this layer declares none.
+                swa_width=max(width - indexed_width, 0),
+                indexed_width=indexed_width,
                 head_dim=_DSV4_HEAD_DIM,
                 v_head_dim=_DSV4_HEAD_DIM,
                 page_size=page_size,
