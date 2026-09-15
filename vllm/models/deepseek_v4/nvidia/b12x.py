@@ -922,28 +922,6 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
             module.split_chunks_for_contract,
             decode_row_capacity,
         )
-        # plan() keys the compile identity on the caller's storage ABI, so the
-        # profile-reservation declaration must describe the same operands the
-        # serving path binds: the page views this layer actually runs against.
-        swa_cache = self._get_cache_page_view(
-            self.swa_cache_layer.kv_cache,
-            self.swa_cache_layer.block_size,
-            "swa_k_cache",
-        )
-        compressed_cache = self.kv_cache if self.compress_ratio > 1 else None
-        if compressed_cache is not None:
-            indexed_cache = self._get_cache_page_view(
-                compressed_cache,
-                self.swa_cache_layer.block_size // self.compress_ratio,
-                "indexed_k_cache",
-            )
-        else:
-            indexed_cache = None
-        invocation = module.invocation_from_tensors(
-            q=q,
-            swa_k_cache=swa_cache,
-            indexed_k_cache=indexed_cache,
-        )
         plan = module.plan(
             module.Caps(
                 device=q.device,
@@ -956,8 +934,7 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
                 max_chunks_per_row=max_chunks_per_row,
                 max_q_chunks=max_q_chunks,
                 decode_row_capacity=decode_row_capacity,
-            ),
-            invocation=invocation,
+            )
         )
         current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
 
