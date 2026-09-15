@@ -782,6 +782,37 @@ def test_b12x_c4_declaration_matches_glm_query_and_page_table_layout() -> None:
     assert invocation["page_table"]["strides"] == (0, 1)
 
 
+def test_b12x_c4_replans_after_page_table_width_changes() -> None:
+    from vllm.models.deepseek_v4.nvidia import b12x_indexer as c4
+
+    plans = []
+    indexer = c4.B12xC4SparseIndexer.__new__(c4.B12xC4SparseIndexer)
+    nn.Module.__init__(indexer)
+    indexer._index_num_q_heads = 32
+    indexer._index_max_page_table_width = 4
+    indexer._score_output = False
+    indexer._index_cache = torch.empty((1, 64, 132), dtype=torch.uint8)
+    indexer.topk_tokens = 512
+    indexer.max_model_len = 256
+    indexer.topk_indices_buffer = torch.empty((1, 512), dtype=torch.int32)
+    indexer._plans = {}
+    indexer._b12x_indexer = SimpleNamespace(
+        Caps=lambda **caps: SimpleNamespace(**caps),
+        plan=lambda caps, invocation: plans.append(caps) or caps,
+        invocation_from_descriptors=lambda caps, operands: operands,
+    )
+
+    old_plan = indexer._plan_for("decode", 1)
+    indexer.set_b12x_index_cache(
+        indexer._index_cache, num_q_heads=32, max_page_table_width=8
+    )
+    new_plan = indexer._plan_for("decode", 1)
+
+    assert old_plan is not new_plan
+    assert new_plan.max_page_table_width == 8
+    assert len(plans) == 2
+
+
 def test_deepseek_c4_default_page_table_width_is_unchanged() -> None:
     from vllm.models.deepseek_v4.nvidia import b12x_indexer as c4
 

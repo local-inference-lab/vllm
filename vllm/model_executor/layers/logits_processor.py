@@ -139,7 +139,7 @@ class LogitsProcessor(PluggableLayer):
             self._b12x_vocab_heads = owner._b12x_vocab_heads
             return
         self._b12x_vocab_heads[id(lm_head)] = lm_head
-        lm_head._b12x_vocab_projection_owner = self
+        object.__setattr__(lm_head, "_b12x_vocab_projection_owner", self)
         set_b12x_preparation_provider(self, self)
     def _b12x_vocab_name(self, head: VocabParallelEmbedding, tokens: int) -> str:
         return f"logits.vocab.{id(self):x}.{id(head):x}.m{tokens}"

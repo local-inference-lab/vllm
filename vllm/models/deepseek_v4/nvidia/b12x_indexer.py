@@ -299,6 +299,12 @@ class B12xC4SparseIndexer(nn.Module):
         if next_width is not None and next_width <= 0:
             raise ValueError("C4 index page-table width must be positive")
         next_scores = self._score_output if score_output is None else bool(score_output)
+        if (
+            next_heads != self._index_num_q_heads
+            or next_width != self._index_max_page_table_width
+            or next_scores != self._score_output
+        ):
+            self._plans.clear()
         self._index_cache = kv_cache
         self._index_num_q_heads = next_heads
         self._index_max_page_table_width = next_width

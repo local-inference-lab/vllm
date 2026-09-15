@@ -12,7 +12,9 @@ import pytest
 import torch
 from transformers import AutoTokenizer
 
+from vllm.model_executor.layers import logits_processor as logits_processor_module
 from vllm.model_executor.layers import mla as mla_layer
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn import kimi_gdn_linear_attn
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
     KimiGatedDeltaNetAttention,
@@ -332,8 +334,7 @@ def test_glm5next_mtp_registers_b12x_draft_heads(
             self.heads = []
 
         def prepare_b12x_vocab_projection(self, head) -> None:
-            if getattr(head, "runtime_lm_head_quantization", None) is None:
-                self.heads.append(head)
+            self.heads.append(head)
 
     predictor = Glm5NextMultiTokenPredictor.__new__(Glm5NextMultiTokenPredictor)
     torch.nn.Module.__init__(predictor)
@@ -353,6 +354,43 @@ def test_glm5next_mtp_registers_b12x_draft_heads(
 
     expected = [] if runtime_quantization in ("nvfp4", "mxfp8") else heads
     assert predictor.logits_processor.heads == expected
+
+
+def test_b12x_vocab_projection_owner_is_not_a_child_module(monkeypatch) -> None:
+    class FakeHead(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = SimpleNamespace(
+                ndim=2,
+                dtype=torch.bfloat16,
+                is_cuda=True,
+                is_contiguous=lambda: True,
+            )
+            self.quant_method = FakeMethod()
+
+    class FakeMethod:
+        pass
+
+    processor = LogitsProcessor.__new__(LogitsProcessor)
+    torch.nn.Module.__init__(processor)
+    processor.use_b12x_vocab_projection = True
+    processor._b12x_vocab_projection = SimpleNamespace(is_supported=lambda: True)
+    processor._b12x_vocab_heads = {}
+    processor._b12x_vocab_plans = {}
+    head = FakeHead()
+    monkeypatch.setattr(logits_processor_module, "VocabParallelEmbedding", FakeHead)
+    monkeypatch.setattr(
+        logits_processor_module, "UnquantizedEmbeddingMethod", FakeMethod
+    )
+    monkeypatch.setattr(logits_processor_module, "UnquantizedLinearMethod", FakeMethod)
+    monkeypatch.setattr(
+        logits_processor_module, "set_b12x_preparation_provider", lambda *_: None
+    )
+
+    processor.prepare_b12x_vocab_projection(head)
+
+    assert head._b12x_vocab_projection_owner is processor
+    assert processor not in dict(head.named_modules()).values()
 
 
 def test_glm5next_mtp_preserves_position_zero_embedding() -> None:

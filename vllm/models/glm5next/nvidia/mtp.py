@@ -153,7 +153,10 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         Otherwise, create the GLM-specific copy selected by
         ``VLLM_GLM53_MTP_DRAFT_HEAD`` from an unquantized target head.
         """
-        if getattr(source_head, "runtime_lm_head_quantization", None) == "nvfp4":
+        if getattr(source_head, "runtime_lm_head_quantization", None) in (
+            "nvfp4",
+            "mxfp8",
+        ):
             self.quantized_draft_head = None
             return
         self.quantized_draft_head = make_quantized_draft_head(source_head)
