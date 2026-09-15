@@ -491,7 +491,15 @@ def test_rank_sliced_parameter_preallocates_projection_major_slab(monkeypatch):
     torch.testing.assert_close(param.exl3_tensors[(2, "w3")], w3)
 
 
-def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
+def test_rank_sliced_weights_use_native_trellis_contract(monkeypatch):
+    """Uniform rank-sliced layers prepare on the native w4a16 Trellis contract.
+
+    B12X 1.3.0 removed the in-memory Trellis entry points from the fused-MoE
+    facade, so the slabs are handed to the w4a16 kernels directly. Asserting the
+    hand-off keeps the rotation tensors and the slab layout from silently
+    drifting apart again.
+    """
+
     experts = 2
     hidden = intermediate = 128
     bits = 3
@@ -510,21 +518,23 @@ def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
         "w2_svh": torch.ones((experts, hidden), dtype=torch.float16),
     }
 
-    class FakeFusedMoe:
+    class FakeNativeTrellis:
         def __init__(self):
-            self.plan_kwargs = None
             self.prepare_kwargs = None
-
-        def plan_weights(self, **kwargs):
-            self.plan_kwargs = kwargs
-            return SimpleNamespace(source_format=kwargs["source_format"])
 
         def prepare_weights(self, **kwargs):
             self.prepare_kwargs = kwargs
-            return SimpleNamespace(plan=kwargs["plan"])
+            return SimpleNamespace(
+                weight_layout="trellis",
+                scale_format="trellis_scales",
+                w13_layout=kwargs["w13_layout"],
+            )
 
-    api = FakeFusedMoe()
-    monkeypatch.setattr(exl3_module, "_load_b12x_fused_moe", lambda: api)
+    native = FakeNativeTrellis()
+    monkeypatch.setattr(exl3_module, "_load_b12x_native_trellis", lambda: native)
+    monkeypatch.setattr(
+        exl3_module, "_load_b12x_fused_moe", lambda: SimpleNamespace()
+    )
     method = object.__new__(Exl3MoEMethod)
     method.quant_config = SimpleNamespace(bits=float(bits))
     method._rank_sliced_backing = lambda _layer, name: slabs[name]
@@ -542,26 +552,26 @@ def test_rank_sliced_weights_use_unified_fused_moe_contract(monkeypatch):
 
     method._prepare_rank_sliced_weights(layer)
 
-    assert api.plan_kwargs == {
-        "quant_modes": "w4a16",
-        "source_format": "b12x_trellis",
-        "trellis_codebook": "mcg",
-        "activation": "silu",
-        "params_dtype": torch.float16,
-        "num_experts": experts,
-        "hidden_size": hidden,
-        "intermediate_size": intermediate,
-        "w13_layout": "w13",
-        "trellis_bits": bits,
-        "trellis_tile_config": (64, 128, 64, 128),
-    }
-    assert api.prepare_kwargs is not None
-    assert api.prepare_kwargs["plan"] is layer.exl3_trellis_weights.plan
-    assert api.prepare_kwargs["params_dtype"] == torch.float16
-    assert api.prepare_kwargs["w1_fp4"] is slabs["w13_trellis"]
-    assert api.prepare_kwargs["w2_fp4"] is slabs["w2_trellis"]
-    assert api.prepare_kwargs["trellis_mcg"] is marker
-
+    kwargs = native.prepare_kwargs
+    assert kwargs is not None
+    # The slabs are handed over as-is: preparation must not repack or copy the
+    # expert payload, which is the whole point of streaming it per rank.
+    assert kwargs["w13"] is slabs["w13_trellis"]
+    assert kwargs["w2"] is slabs["w2_trellis"]
+    assert kwargs["num_experts"] == experts
+    assert kwargs["hidden_size"] == hidden
+    assert kwargs["intermediate_size"] == intermediate
+    assert kwargs["trellis_bits"] == bits
+    assert kwargs["codebook"] == "mcg"
+    assert kwargs["w13_layout"] == "trellis_t256_proj"
+    assert kwargs["tile_config"] == (64, 128, 64, 128)
+    # Rotations travel with the weights rather than being regenerated. Compare
+    # storage, not object identity: indexing a slab yields a fresh view object
+    # each time, so `is` would pass or fail for reasons unrelated to copying.
+    assert kwargs["gate_suh"].data_ptr() == slabs["w13_suh"][0].data_ptr()
+    assert kwargs["up_suh"].data_ptr() == slabs["w13_suh"][1].data_ptr()
+    assert kwargs["down_svh"].data_ptr() == slabs["w2_svh"].data_ptr()
+    assert kwargs["intermediate_rotations"].shape == (experts, 3 * intermediate)
 
 def test_mixed_rank_sliced_weights_are_partitioned_by_declared_bitrate(monkeypatch):
     experts = 4
