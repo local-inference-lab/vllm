@@ -20,6 +20,165 @@ from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+@cuda
+@pytest.mark.parametrize("world,rank", [(2, 0), (2, 1), *[(4, r) for r in range(4)]])
+@pytest.mark.parametrize("replicated", [False, True])
+def test_dcp_nonowner_queries_survive_compressed_slot_ownership(
+    world, rank, replicated
+):
+    """Queries remain global while only complete, owned states are written."""
+    from vllm.models.deepseek_v4_1.sparse_mla import _tokens
+
+    starts = torch.tensor([0, 10], dtype=torch.int32, device="cuda")
+    seq = torch.tensor([135], dtype=torch.int32, device="cuda")
+    table = torch.tensor([[7, 9]], dtype=torch.int32, device="cuda")
+    inputs = torch.full((16,), -1, dtype=torch.int64, device="cuda")
+    outputs = [
+        torch.empty(16, dtype=dtype, device="cuda")
+        for dtype in (torch.int64, torch.int32, torch.int64, torch.int32)
+    ]
+    _tokens[(1,)](
+        starts,
+        seq,
+        table,
+        inputs,
+        *outputs,
+        1,
+        16,
+        2,
+        2,
+        16,
+        128,
+        2,
+        128,
+        False,
+        world,
+        rank,
+        128,
+        replicated,
+    )
+    pos = torch.arange(125, 135, device="cuda")
+    local = pos if replicated else pos // (world * 128) * 128 + pos % 128
+    owned = (
+        torch.ones_like(pos, dtype=torch.bool)
+        if replicated
+        else pos // 128 % world == rank
+    )
+    slots = 7 * 128 + local // 2
+    slots = torch.where(owned & ((pos + 1) % 2 == 0), slots, -1)
+    torch.testing.assert_close(outputs[0][:10], pos)
+    torch.testing.assert_close(outputs[2][:10], slots)
+    assert outputs[1][:10].tolist() == [0] * 10
+    torch.testing.assert_close(outputs[3][:10], ((pos + 1) // 2).int())
+    assert outputs[0][10:].tolist() == [-1] * 6
+    assert outputs[2][10:].tolist() == [-1] * 6
+
+
+@cuda
+@pytest.mark.parametrize("world", [2, 4])
+def test_dcp_global_topk_partitions_without_duplicates(world):
+    """Compact owned IDs in selected order and honor each global live length."""
+    from vllm.models.deepseek_v4_1.dcp import local_indices
+
+    selected = torch.arange(511, -1, -1, dtype=torch.int32, device="cuda")
+    selected = selected.repeat(4, 1)
+    selected[:, 13] = -1
+    global_lengths = torch.tensor([0, 17, 511, 512], device="cuda", dtype=torch.int32)
+    for rank in range(world):
+        out = torch.empty_like(selected)
+        lengths = global_lengths.clone()
+        local_indices(selected, out, lengths, world_size=world, rank=rank, stripe=64)
+        owned = (selected >= 0) & (selected // 64 % world == rank)
+        owned &= torch.arange(512, device="cuda") < global_lengths[:, None]
+        expected = torch.full_like(selected, -1)
+        for row in range(4):
+            ids = selected[row, owned[row]]
+            expected[row, :ids.numel()] = ids // (world * 64) * 64 + ids % 64
+        torch.testing.assert_close(out, expected)
+        torch.testing.assert_close(lengths, owned.sum(1).int())
+
+
+@cuda
+@pytest.mark.parametrize("rank", range(4))
+def test_dcp_index_candidates_preserve_order_and_global_newest(rank):
+    """Local candidate scoring retains global order and one forced newest block."""
+    from vllm.models.deepseek_v4_1.dcp import (
+        index_candidate_force_blocks,
+        localize_index_candidates,
+    )
+
+    width, stripe = 16384, 64
+    values = torch.tensor(
+        [511, 0, 128, 129, 512, -1, 63, 64, 255, 256, 1024],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    candidates = torch.full((2, width), -1, dtype=torch.int32, device="cuda")
+    candidates[0, : values.numel()] = values
+    candidates[1, : values.numel()] = values.flip(0)
+    lengths = torch.tensor(
+        [values.numel(), values.numel() - 2], dtype=torch.int32, device="cuda"
+    )
+    out = torch.full_like(candidates, -99)
+    local_lengths = torch.empty(2, dtype=torch.int32, device="cuda")
+    offsets = torch.empty((2, 32), dtype=torch.int32, device="cuda")
+    global_lengths = torch.tensor([0, 129, 513], dtype=torch.int32, device="cuda")
+    force_blocks = torch.empty_like(global_lengths)
+
+    def run():
+        localize_index_candidates(
+            candidates,
+            lengths,
+            out,
+            local_lengths,
+            offsets,
+            world_size=4,
+            rank=rank,
+            stripe=stripe,
+        )
+        index_candidate_force_blocks(
+            global_lengths,
+            force_blocks,
+            world_size=4,
+            rank=rank,
+            stripe=stripe,
+        )
+
+    def check():
+        for row in range(2):
+            source = candidates[row, : lengths[row]]
+            owned = (source >= 0) & (source // stripe % 4 == rank)
+            expected = source[owned]
+            expected = expected // (4 * stripe) * stripe + expected % stripe
+            assert local_lengths[row].item() == expected.numel()
+            torch.testing.assert_close(out[row, : expected.numel()], expected)
+        expected_force = []
+        for length in global_lengths.tolist():
+            newest = length - 1
+            if length > 0 and newest // stripe % 4 == rank:
+                local = newest // (4 * stripe) * stripe + newest % stripe
+                expected_force.append(local // 8)
+            else:
+                expected_force.append(-1)
+        assert force_blocks.tolist() == expected_force
+
+    run()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            run()
+        allocated = torch.cuda.memory_allocated()
+        for _ in range(3):
+            out.fill_(-77)
+            graph.replay()
+            torch.cuda.synchronize()
+            check()
+            assert torch.cuda.memory_allocated() == allocated
+    finally:
+        graph.reset()
+
+
 def test_boundary_is_full_resolution_source_after_encoder():
     config = SimpleNamespace(
         num_hidden_layers=40,

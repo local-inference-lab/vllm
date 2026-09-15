@@ -753,6 +753,53 @@ def test_b12x_moe_uses_minimax_swiglu_parameters() -> None:
     assert experts._swiglu_params(config.activation) == (7.0, 1.702, 1.0)
 
 
+def test_b12x_moe_workspace_reuses_only_the_current_prepared_envelope() -> None:
+    """Avoid serving-time lowering without stale sizes or retained GPU state."""
+    class Payload:
+        pass
+
+    class Plan:
+        def __init__(self, variants=None):
+            self.prepared = Payload()
+            self.variants = variants or {}
+            self.nbytes, self.calls = 257, 0
+
+        def scratch_specs(self):
+            self.calls += 1
+            return (SimpleNamespace(nbytes=self.nbytes),)
+
+    experts = B12xExperts.__new__(B12xExperts)
+    experts.moe_config = SimpleNamespace(in_dtype=torch.bfloat16)
+    experts._plan_key = ((4, 128),)
+    experts._plan_activation = MoEActivation.SILU
+    experts._plan_route_on_input = experts._apply_router_weight_on_input = False
+    experts._plan = plan = Plan({4: Plan(), 128: Plan()})
+
+    def shape(rows):
+        return experts.workspace_shapes(
+            rows, 64, 128, 2, 8, 8, None, MoEActivation.SILU
+        )
+
+    assert shape(4) == ((0,), (129,), (4, 128))
+    assert shape(17) == ((0,), (129,), (17, 128))
+    assert plan.calls == 1
+    plan.variants[4].prepared, plan.nbytes = Payload(), 259
+    assert shape(4)[1] == (130,)
+    assert plan.calls == 2
+    plan.prepared, plan.nbytes = Payload(), 261
+    assert shape(4)[1] == (131,)
+    assert plan.calls == 3
+    released = weakref.ref(plan.prepared)
+    plan.prepared, plan.nbytes = None, 263
+    assert released() is None
+    assert shape(4)[1] == shape(17)[1] == (132,)
+    assert plan.calls == 5
+    experts._plan = Plan()
+    assert shape(4)[1] == (129,)
+    with pytest.raises(ValueError, match="capacity"):
+        shape(129)
+
+
 def test_b12x_moe_candidate_calls_share_bounded_trial_storage() -> None:
     """Repeated candidate calls reuse one activation/output tensor set (a
     weakref cache), while each call's scratch is a fresh, correctly shaped
@@ -1251,4 +1298,3 @@ def test_b12x_moe_prefill_capacity_and_exact_decode_reuse(
             )
         finally:
             session.close()
-

@@ -1801,6 +1801,36 @@ def test_validate_mamba_align_subblock_prefill():
     VllmConfig.validate_block_size(config)
 
 
+@pytest.mark.parametrize("sharded_block_size,valid", [(256, True), (64, False)])
+def test_validate_dcp_stripes_ignore_replicated_compressor_ring(
+    sharded_block_size, valid
+):
+    """Scheduling granularity is not the physical sharded attention page."""
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=8, mamba_cache_mode="none"),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=4,
+            dcp_kv_cache_interleave_size=1,
+            cp_kv_cache_interleave_size=128,
+        ),
+    )
+    groups = [
+        SimpleNamespace(kv_cache_spec=SimpleNamespace(
+            block_size=8, dcp_replicated=True
+        )),
+        SimpleNamespace(kv_cache_spec=SimpleNamespace(
+            block_size=sharded_block_size, dcp_replicated=False
+        )),
+    ]
+    if valid:
+        VllmConfig.validate_block_size(config, groups)
+    else:
+        with pytest.raises(AssertionError, match="Block_size\\(64\\)"):
+            VllmConfig.validate_block_size(config, groups)
+    with pytest.raises(AssertionError, match="Block_size\\(8\\)"):
+        VllmConfig.validate_block_size(config)
+
+
 @pytest.mark.parametrize(
     ("model_id", "compilation_config", "optimization_level"),
     [

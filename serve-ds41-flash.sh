@@ -41,6 +41,8 @@ TORCH_PROFILE_USE_GZIP="${TORCH_PROFILE_USE_GZIP:-1}"
 TORCH_PROFILE_DEFAULT_DIR=/tmp/vllm-ds4-decode
 TORCH_PROFILE_MAX_ITERATIONS=4
 TP_SIZE="${TP_SIZE:-4}"
+DCP_SIZE="${DCP_SIZE:-1}"
+CP_KV_CACHE_INTERLEAVE_SIZE="${CP_KV_CACHE_INTERLEAVE_SIZE:-128}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-7}"
 DSPARK_ADAPTIVE_VERIFICATION="${DSPARK_ADAPTIVE_VERIFICATION:-1}"
 DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE="${DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE:-1.0}"
@@ -182,12 +184,17 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 
 require_positive_int TP_SIZE "${TP_SIZE}"
+require_positive_int DCP_SIZE "${DCP_SIZE}"
+require_positive_int CP_KV_CACHE_INTERLEAVE_SIZE "${CP_KV_CACHE_INTERLEAVE_SIZE}"
 require_positive_int MAX_NUM_SEQS "${MAX_NUM_SEQS}"
 require_positive_int MAX_NUM_BATCHED_TOKENS "${MAX_NUM_BATCHED_TOKENS}"
 require_positive_int BLOCK_SIZE "${BLOCK_SIZE}"
 require_positive_int MAX_CUDAGRAPH_CAPTURE_SIZE \
   "${MAX_CUDAGRAPH_CAPTURE_SIZE}"
-require_positive_int NUM_SPECULATIVE_TOKENS "${NUM_SPECULATIVE_TOKENS}"
+if [[ ! "${NUM_SPECULATIVE_TOKENS}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  echo "NUM_SPECULATIVE_TOKENS must be 0 or a positive integer without leading zeros" >&2
+  exit 2
+fi
 require_positive_number DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE \
   "${DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE}"
 if [[ "${MAX_MODEL_LEN}" != "auto" && "${MAX_MODEL_LEN}" != "-1" ]]; then
@@ -407,6 +414,7 @@ speculative_config=$(printf \
   '{"method":"dspark","num_speculative_tokens":%s,"draft_tensor_parallel_size":%s,"attention_backend":"B12X","draft_sample_method":"greedy","rejection_sample_method":"standard","enable_adaptive_verification":%s,"adaptive_verification_cost_scale":%s}' \
   "${NUM_SPECULATIVE_TOKENS}" "${TP_SIZE}" "${adaptive_verification}" \
   "${DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE}")
+if [[ "${NUM_SPECULATIVE_TOKENS}" == 0 ]]; then speculative_config=null; fi
 engram_config=$(printf \
   '{"cpu_offload":false,"table_memory":"%s","disk_resident_scales":%s,"projection_tp":%s}' \
   "${ENGRAM_TABLE_MEMORY}" "${disk_resident_scales}" \
@@ -419,7 +427,8 @@ command=(
   --dtype bfloat16
   --tensor-parallel-size "${TP_SIZE}"
   --pipeline-parallel-size 1
-  --decode-context-parallel-size 1
+  --decode-context-parallel-size "${DCP_SIZE}"
+  --cp-kv-cache-interleave-size "${CP_KV_CACHE_INTERLEAVE_SIZE}"
   --load-format "${LOAD_FORMAT}"
   --safetensors-load-strategy lazy
   --block-size "${BLOCK_SIZE}"

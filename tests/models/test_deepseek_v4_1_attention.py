@@ -2,16 +2,245 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Prepared native attention resources and inverse-RoPE WO integration."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 
+def test_dcp_index_cache_spec_is_opt_in_sharded():
+    from vllm.models.deepseek_v4_1.attention import _Cache
+
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=4),
+        cache_config=SimpleNamespace(block_size=256, swa_block_size=128),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    cache = _Cache(
+        config,
+        "model.layers.2.attn.indexer.k_cache",
+        kind="index",
+        ratio=2,
+        dcp_replicated=False,
+    )
+    spec = cache.get_kv_cache_spec(config)
+    assert spec.dcp_replicated is False
+    assert spec.num_states == 128
+    assert spec.tokens_per_state == 2
+
+
+def test_dcp_local_length_matches_striped_ownership():
+    from vllm.models.deepseek_v4_1.attention import _dcp_local_length
+
+    for length in (0, 1, 63, 64, 65, 255, 256, 257, 1025):
+        expected = [
+            sum(position // 64 % 4 == rank for position in range(length))
+            for rank in range(4)
+        ]
+        actual = [_dcp_local_length(length, 4, rank, 64) for rank in range(4)]
+        assert actual == expected
+
+
+def test_dcp_kv_replica_declares_one_shared_output_before_materialization(monkeypatch):
+    """Catch wrapper contract errors before loading weights or creating IPC."""
+    from b12x.comm import pcie
+    from b12x.preparation import FrozenMapping
+    from b12x.preparation import device as preparation_device
+
+    from vllm.models.deepseek_v4_1 import dcp
+
+    runtime = pcie.PagedKvReplica.__new__(pcie.PagedKvReplica)
+    runtime.device, runtime.rank, runtime.world_size = torch.device("cuda", 0), 0, 4
+    runtime.max_requests, runtime.max_tokens, runtime.local_capacity = 4, 1536, 384
+    runtime.slab_bytes = 4 * 384 * 288 + 4096
+    monkeypatch.setattr(
+        pcie.PagedKvReplica, "from_process_group", lambda **kwargs: runtime
+    )
+    monkeypatch.setattr(dcp.DCPKVReplica, "_instances", {})
+    group = SimpleNamespace(unique_name="test-replica", cpu_group=None, ranks=range(4))
+    monkeypatch.setattr(dcp, "get_dcp_group", lambda: group)
+    monkeypatch.setattr(
+        preparation_device, "detect_device",
+        lambda device: SimpleNamespace(identity=None),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    attention = SimpleNamespace(
+        attn_sink=SimpleNamespace(device=runtime.device),
+        max_model_len=3072, _main_page=128, dcp_stripe=128, _helpers=object(),
+        config=SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_seqs=4),
+            parallel_config=SimpleNamespace(use_ubatching=False),
+        ),
+    )
+    replica = dcp.DCPKVReplica.get(attention)
+    assert replica.output is None
+    assert replica.plan.invocation["vllm_prefill_shape"] == (49, 128 * 288)
+    bad_query = replace(replica.plan.query, call=FrozenMapping({
+        "page_size": 256, "stripe": 256, "ratio": 1, "max_tokens": 1536,
+    }))
+    with pytest.raises(ValueError, match="owner capacity"):
+        pcie.plan(bad_query, runtime=runtime)
+    memory = replica.plan.memory_requirements()
+    assert sum(item.required_nbytes for item in memory.persistent) == (
+        runtime.slab_bytes + 49 * 128 * 288
+    )
+    assert sum(item.resident_nbytes for item in memory.persistent) == runtime.slab_bytes
+    output = replica.prepare_output(torch.device("cpu"))
+    assert replica.prepare_output(torch.device("cpu")) is output
+    other = SimpleNamespace(**{**vars(attention), "_helpers": object()})
+    assert dcp.DCPKVReplica.get(other) is replica
+    assert replica.preparation_units(other._helpers) == ()
+    memory = replica.plan.memory_requirements()
+    assert sum(item.resident_nbytes for item in memory.persistent) == sum(
+        item.required_nbytes for item in memory.persistent
+    )
+
+
+def test_dcp_kv_replica_binds_fixed_tensors_once_before_live_launch(monkeypatch):
+    from vllm.models.deepseek_v4_1 import dcp
+
+    calls = []
+
+    class Runtime:
+        def bind(self, *args, **kwargs):
+            calls.append(("bind", args, kwargs))
+            count = sum(call[0] == "bind" for call in calls)
+            return f"binding-{count}"
+
+        def replicate(self, *args, **kwargs):
+            calls.append(("replicate", args, kwargs))
+
+    replica = dcp.DCPKVReplica.__new__(dcp.DCPKVReplica)
+    replica.runtime = Runtime()
+    replica.plan = object()
+    replica.output = torch.empty(1)
+    replica.bindings = {}
+    attention = SimpleNamespace(prefix="layer.1", kv_cache=torch.empty(1))
+    metadata = SimpleNamespace(
+        block_table=torch.empty(1),
+        request_positions=torch.empty(1),
+        query_start_loc=torch.empty(1),
+        num_reqs=1,
+        max_seq_len=7,
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    replica.replicate(attention, metadata)
+    metadata.num_reqs, metadata.max_seq_len = 2, 15
+    replica.replicate(attention, metadata)
+    other = SimpleNamespace(prefix="layer.2", kv_cache=torch.empty(1))
+    replica.replicate(other, metadata)
+
+    assert [call[0] for call in calls] == [
+        "bind",
+        "replicate",
+        "replicate",
+        "bind",
+        "replicate",
+    ]
+    assert calls[0][1] == (
+        attention.kv_cache,
+        metadata.block_table,
+        metadata.request_positions,
+        metadata.query_start_loc,
+        replica.output,
+    )
+    assert calls[1][1] == ("binding-1",)
+    assert calls[1][2] == {"plan": replica.plan, "requests": 1, "max_tokens": 4}
+    assert calls[2][1] == ("binding-1",)
+    assert calls[2][2] == {"plan": replica.plan, "requests": 2, "max_tokens": 8}
+    assert calls[3][1][0] is other.kv_cache
+    assert calls[4][1] == ("binding-2",)
+
+
+def test_shared_dcp_channel_exposes_one_unit_in_each_preparation_stage(monkeypatch):
+    """Layer reuse must not produce conflicting collective request names."""
+    from vllm.models.deepseek_v4_1 import dcp
+
+    monkeypatch.setattr(dcp.DCPExchange, "_instances", {})
+    monkeypatch.setattr(
+        dcp, "get_dcp_group", lambda: SimpleNamespace(unique_name="test-dcp")
+    )
+    unit = object()
+
+    def init(self, group, heads, device):
+        self.unit = unit
+        self._preparation_owner = None
+
+    monkeypatch.setattr(dcp.DCPExchange, "__init__", init)
+    first = dcp.DCPExchange.get(16, torch.device("cuda", 0))
+    helpers = [object() for _ in range(40)]
+    for _stage in ("weights", "state", "weights"):
+        collected = []
+        for helper in helpers:
+            exchange = dcp.DCPExchange.get(16, torch.device("cuda", 0))
+            assert exchange is first
+            collected.extend(exchange.preparation_units(helper))
+        assert collected == [unit]
+
+
+def test_dcp_exchange_retains_one_gather_binding_per_tensor_pair():
+    from vllm.models.deepseek_v4_1 import dcp
+
+    calls = []
+
+    class Runtime:
+        def bind_all_gather_heads(self, query, out, *, plan):
+            binding = object()
+            calls.append(("bind", query, out, plan, binding))
+            return binding
+
+        def all_gather_heads(self, binding, *, plan):
+            calls.append(("gather", binding, plan))
+
+    exchange = dcp.DCPExchange.__new__(dcp.DCPExchange)
+    exchange.runtime = Runtime()
+    exchange.plans = {"all_gather_heads": object()}
+    exchange.gather_bindings = {}
+    query, out = torch.empty(1), torch.empty(1)
+
+    exchange.gather(query, out)
+    exchange.gather(query.view_as(query), out.view_as(out))
+    other_out = torch.empty(1)
+    exchange.gather(query, other_out)
+
+    assert [call[0] for call in calls] == [
+        "bind",
+        "gather",
+        "gather",
+        "bind",
+        "gather",
+    ]
+    assert calls[1][1] is calls[0][4]
+    assert calls[2][1] is calls[0][4]
+    assert calls[4][1] is calls[3][4]
+
+
+def test_dcp_helpers_require_loaded_channel_without_allocating_cuda_memory():
+    """Declaration cannot initialize an IPC channel behind the planner."""
+    if not torch.cuda.is_available():
+        pytest.skip("allocation guard requires CUDA")
+    from vllm.models.deepseek_v4_1 import attention
+    from vllm.utils.b12x import PreparationResourceUnavailableError
+
+    module = SimpleNamespace(
+        dcp_active=True,
+        rotary_emb=SimpleNamespace(cos_sin_cache=torch.empty(1, device="cuda")),
+    )
+    allocated = torch.cuda.memory_allocated()
+    with pytest.raises(
+        PreparationResourceUnavailableError, match="after weight loading"
+    ):
+        attention._AttentionHelpers(module).get_b12x_preparation_units(module, None)
+    assert torch.cuda.memory_allocated() == allocated
+
+
 @pytest.mark.parametrize("groups,heads_per_group,rank,hidden", [(1, 1, 128, 128), (2, 8, 1024, 5120)])
+@pytest.mark.parametrize("dcp_size", [1, 4])
 @torch.no_grad()
 def test_wo_preparation_exact_rows_owns_output_and_replays(
-    monkeypatch, workspace_init, groups, heads_per_group, rank, hidden,
+    monkeypatch, workspace_init, groups, heads_per_group, rank, hidden, dcp_size,
 ):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("native b12x WO projection requires SM12x")
@@ -19,7 +248,7 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
     from b12x.gemm._shared.wo_mxfp8 import quantize_wo_projection_weights_mxfp8_torch
     from b12x.preparation import PreparationSession
     from vllm.models.deepseek_v4_1 import attention
-    from vllm.utils.b12x import B12xWorkload
+    from vllm.utils.b12x import B12xWorkload, PreparationResourceUnavailableError
     from vllm.v1.worker.workspace import current_workspace_manager
 
     torch.manual_seed(411)
@@ -49,6 +278,7 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
         output_dtype=torch.bfloat16, max_tokens=capacity, max_seqs=8, max_model_len=4096,
     )
     module.capacity, module.max_model_len, module.swa_width = capacity, 4096, 128
+    module.dcp_size = dcp_size
     module.is_ced_decoder = compacted
     module.compress_ratio = 0
     module.indexer = module.compressor = None
@@ -73,15 +303,6 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
         session.prepare(tuple(request for unit in units for request in unit.requests))
         assert module._ready and module._helper_plan("q").prepared is not None
         assert module.swa_cache_layer.kv_cache.numel() == 0
-        for rows in (3, 17):
-            assert rows not in module._wo_plans
-            actual = module._o_proj(source[:rows], positions[:rows])
-            plan = module._wo_plans[rows]
-            assert plan.query.max_tokens == rows and plan.prepared is not None
-            assert plan.selection.source in ("default", "fixed")
-            assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
-            assert module._wo_plan(rows) is plan
-        counts = tuple(sorted((*counts, 3, 17)))
         for plan in module._wo_plans.values():
             current_workspace_manager().get_simultaneous(
                 *((spec.shape, spec.dtype) for spec in plan.scratch_specs())
@@ -126,20 +347,31 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
                 assert torch.isfinite(replayed).all() and torch.count_nonzero(replayed) > 0
             finally:
                 graph.reset()
-        with pytest.raises(RuntimeError, match="frozen"):
-            module._o_proj(source[:5], positions[:5])
-    from b12x.preparation.session import _LAZY_SESSIONS
-    for rows in (3, 17):
-        _LAZY_SESSIONS[device.index].release(module._wo_plans[rows])
+        if dcp_size == 1:
+            with pytest.raises(RuntimeError, match="frozen"):
+                module._o_proj(source[:5], positions[:5])
+        else:
+            with pytest.raises(PreparationResourceUnavailableError, match="decode.*capacity"):
+                module._o_proj(source[:5], positions[:5])
+            declared = tuple(module._wo_plans)
+            module._o_proj(source[:5], positions[:5], is_prefill=True)
+            assert tuple(module._wo_plans) == declared
+            with pytest.raises(PreparationResourceUnavailableError, match="capacity"):
+                module._wo_plan(capacity + 1)
 
 
 @pytest.mark.parametrize("compacted", [False, True])
-def test_indexer_declares_bounded_score_rows_at_model_context_capacity(compacted):
+@pytest.mark.parametrize("dcp_size", [1, 4])
+@pytest.mark.parametrize("shard_index", [False, True])
+def test_indexer_declares_bounded_score_rows_at_model_context_capacity(
+    monkeypatch, compacted, dcp_size, shard_index
+):
     if not torch.cuda.is_available():
         pytest.skip("native b12x attention declarations require CUDA")
     from b12x.attention import compressed_sparse_mla as mla, dsa_indexer
     from vllm.models.deepseek_v4_1 import attention
     from vllm.utils.b12x import B12xWorkload
+    from vllm.v1.worker.workspace import WorkspaceManager
 
     device = torch.device("cuda", torch.cuda.current_device())
     module = attention.DeepseekV4Attention.__new__(attention.DeepseekV4Attention)
@@ -147,8 +379,13 @@ def test_indexer_declares_bounded_score_rows_at_model_context_capacity(compacted
     module.prefix = "model.layers.0.attn"
     module.capacity, module.max_model_len, module.swa_width = 4096, 1048576, 128
     module.is_ced_decoder, module.is_index_source = compacted, True
-    module.n_local_heads, module.compress_ratio = 16, 2
-    module.layer_id, module.candidate_source_layer, module.kv_source_layer_id = 0, 12, 0
+    module.n_local_heads, module.compress_ratio = 16, 1 if compacted else 2
+    module.dcp_size, module.dcp_active = dcp_size, dcp_size > 1
+    module.dcp_shard_index = shard_index and dcp_size > 1
+    module.dcp_prefill_replica = dcp_size == 4 and not compacted
+    module.is_kv_source = True
+    module.layer_id = 12 if compacted else 0
+    module.candidate_source_layer, module.kv_source_layer_id = 12, 0
     module._context = {module.prefix: module}
     module.topk_indices_buffer = None
     module.config = SimpleNamespace(
@@ -161,9 +398,16 @@ def test_indexer_declares_bounded_score_rows_at_model_context_capacity(compacted
         block_size=256,
         kv_cache=torch.empty((1, mla.page_nbytes(256, cache_kind="swa")), dtype=torch.uint8, device=device),
     )
-    module.kv_cache = torch.empty((1, mla.page_nbytes(128, cache_kind="indexed")), dtype=torch.uint8, device=device)
+    main_page = 256 // module.compress_ratio
+    module.kv_cache = torch.empty(
+        (1, mla.page_nbytes(main_page, cache_kind="indexed")),
+        dtype=torch.uint8, device=device,
+    )
     module.indexer = SimpleNamespace(heads=32, k_cache=SimpleNamespace(
-        kv_cache=torch.empty((1, dsa_indexer.index_mxfp4_page_bytes(128)), dtype=torch.uint8, device=device),
+        kv_cache=torch.empty(
+            (1, dsa_indexer.index_mxfp4_page_bytes(main_page)),
+            dtype=torch.uint8, device=device,
+        ),
     ))
     workload = B12xWorkload(
         stage="state", token_counts=(1, 7, 64, 257, 4089, 4096),
@@ -172,6 +416,34 @@ def test_indexer_declares_bounded_score_rows_at_model_context_capacity(compacted
     )
     allocated = torch.cuda.memory_allocated(device)
     (unit,) = module.get_b12x_preparation_units(module, workload)
+    assert torch.cuda.memory_allocated(device) == allocated
+    assert not hasattr(module, "_dcp_exchange")
+    for plan in module._attention_plans.values():
+        replica = module.dcp_prefill_replica and plan.query.mode == "extend"
+        assert plan.query.num_q_heads == (16 if replica else 16 * dcp_size)
+        if dcp_size > 1 and not replica:
+            assert plan.query.query_rows <= 256
+        if replica:
+            assert plan.query.query_rows == module.capacity
+            assert plan.query.max_page_table_width == 4096
+            assert not plan.query.return_lse
+    assert module._main_width == 4096 // dcp_size
+    expected_index_width = 4096 // dcp_size if module.dcp_shard_index else 4096
+    assert module._index_width == expected_index_width
+    assert "_prefill_kv" not in {name for name, _, _ in module._staging_specs}
+    manager = WorkspaceManager(device)
+    monkeypatch.setattr(attention, "current_workspace_manager", lambda: manager)
+    module.reserve_profile_scratch()
+    manager.lock()
+    allocated = torch.cuda.memory_allocated(device)
+    regimes = [("decode", 64), ("prefill", 256)]
+    if module._short_index_shape is not None:
+        regimes.append(("prefill_short", module._short_index_shape[0]))
+    for mode, rows in regimes:
+        declaration = module._declare_index_plan(mode, rows)
+        manager.get_simultaneous(
+            *((spec.shape, spec.dtype) for spec in declaration.scratch_specs())
+        )
     assert torch.cuda.memory_allocated(device) == allocated
     assert unit.requests and all(request.collective is None for request in unit.requests)
     counts = module._preparation_token_counts(workload)
@@ -248,13 +520,15 @@ def test_indexer_primer_restores_live_cache(layer_id):
             torch.testing.assert_close(cache, original, rtol=0, atol=0)
 
 
-def test_wo_prefill_remainders_reuse_declared_chunk_capacity():
+@pytest.mark.parametrize("dcp_size", [1, 4])
+def test_wo_prefill_remainders_reuse_declared_chunk_capacity(dcp_size):
     from vllm.models.deepseek_v4_1 import attention
     from vllm.utils.b12x import B12xWorkload
 
     module = attention.DeepseekV4Attention.__new__(attention.DeepseekV4Attention)
     torch.nn.Module.__init__(module)
     module.prefix, module.capacity, module.is_ced_decoder = "model.layers.0.attn", 4096, False
+    module.dcp_size = dcp_size
     module.n_local_groups, module.n_local_heads = 2, 16
     module.head_dim, module.rope_head_dim = 512, 64
     module._wo_plans = {}
@@ -274,3 +548,9 @@ def test_wo_prefill_remainders_reuse_declared_chunk_capacity():
     assert module._wo_plans == declarations
     assert not module._wo_plan(1).query.dynamic_tokens
     assert module._wo_plan(8).query.max_tokens == 8
+    if dcp_size > 1:
+        from vllm.utils.b12x import PreparationResourceUnavailableError
+
+        with pytest.raises(PreparationResourceUnavailableError, match="decode.*capacity"):
+            module._wo_plan(7)
+        assert module._wo_plans == declarations

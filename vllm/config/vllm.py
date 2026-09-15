@@ -57,7 +57,7 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-    from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
 else:
     PretrainedConfig = Any
 
@@ -2746,7 +2746,9 @@ class VllmConfig:
                 f"Model Runner V2 does not yet support: {', '.join(unsupported)}"
             )
 
-    def validate_block_size(self) -> None:
+    def validate_block_size(
+        self, kv_cache_groups: Iterable["KVCacheGroupSpec"] | None = None
+    ) -> None:
         """Validate block_size against DCP and mamba constraints.
 
         Called after Platform.update_block_size_for_backend() has
@@ -2768,14 +2770,26 @@ class VllmConfig:
                     "_interleave_size. And dcp-kv-cache-interleave-size will be "
                     "deprecated when PCP is fully supported."
                 )
-            assert (
-                self.parallel_config.cp_kv_cache_interleave_size <= block_size
-                and block_size % self.parallel_config.cp_kv_cache_interleave_size == 0
-            ), (
-                f"Block_size({block_size}) should be greater "
-                "than or equal to and divisible by cp_kv_cache_interleave_size "
-                f"({self.parallel_config.cp_kv_cache_interleave_size})."
+            sharded_block_sizes = (
+                [block_size]
+                if kv_cache_groups is None
+                else [
+                    group.kv_cache_spec.block_size
+                    for group in kv_cache_groups
+                    if not getattr(group.kv_cache_spec, "dcp_replicated", False)
+                ]
             )
+            for sharded_block_size in sharded_block_sizes:
+                assert (
+                    self.parallel_config.cp_kv_cache_interleave_size
+                    <= sharded_block_size
+                    and sharded_block_size
+                    % self.parallel_config.cp_kv_cache_interleave_size == 0
+                ), (
+                    f"Block_size({sharded_block_size}) should be greater "
+                    "than or equal to and divisible by cp_kv_cache_interleave_size "
+                    f"({self.parallel_config.cp_kv_cache_interleave_size})."
+                )
 
         # Mamba cache align-mode constraints
         if self.cache_config.mamba_cache_mode == "align":
