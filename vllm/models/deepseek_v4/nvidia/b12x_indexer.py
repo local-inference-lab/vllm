@@ -15,6 +15,7 @@ from vllm.utils.b12x import (
     B12xPreparationUnit,
     B12xWorkload,
     PreparationResourceUnavailableError,
+    b12x_layer_prefix,
     get_b12x_dsa_indexer,
     set_b12x_preparation_provider,
 )
@@ -207,6 +208,7 @@ class B12xC4SparseIndexer(nn.Module):
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
         compress_ratio: int = 1,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         del quant_block_size, scale_fmt, max_total_seq_len
@@ -228,15 +230,17 @@ class B12xC4SparseIndexer(nn.Module):
         self.k_cache = k_cache
         self._index_cache = getattr(k_cache, "kv_cache", None)
         self._index_num_q_heads: int | None = None
+        self._index_max_page_table_width: int | None = None
         self._score_output = False
         self._score_collective_registered = False
         self.topk_tokens = int(topk_tokens)
         self.max_model_len = int(max_model_len)
         self.topk_indices_buffer = topk_indices_buffer
         self._plans: dict[tuple[str, int], object] = {}
-        self._preparation_prefix = (
-            f"{getattr(k_cache, 'prefix', type(self).__qualname__)}.c4_indexer"
+        owner_prefix = (
+            prefix or getattr(k_cache, "prefix", None) or b12x_layer_prefix(self)
         )
+        self._preparation_prefix = f"{owner_prefix}.c4_indexer"
         self.register_buffer(
             "_active_width",
             torch.empty((1,), dtype=torch.int32, device=topk_indices_buffer.device),
@@ -264,9 +268,7 @@ class B12xC4SparseIndexer(nn.Module):
         )
         plan = self._plans.get((mode, capacity))
         if plan is None:
-            width = max(
-                1, (self.max_model_len + _INDEX_PAGE_SIZE - 1) // _INDEX_PAGE_SIZE
-            )
+            width = self._max_page_table_width
             caps = self._caps(mode=mode, rows=capacity, max_page_table_width=width)
             plan = self._b12x_indexer.plan(
                 caps,
@@ -294,6 +296,7 @@ class B12xC4SparseIndexer(nn.Module):
         kv_cache: torch.Tensor,
         *,
         num_q_heads: int | None = None,
+        max_page_table_width: int | None = None,
         score_output: bool | None = None,
     ) -> None:
         """Publish the real C4 storage before its owner is collected."""
@@ -304,15 +307,22 @@ class B12xC4SparseIndexer(nn.Module):
         )
         if next_heads is not None and next_heads <= 0:
             raise ValueError("C4 index query head count must be positive")
+        next_width = self._index_max_page_table_width
+        if max_page_table_width is not None:
+            next_width = int(max_page_table_width)
+        if next_width is not None and next_width <= 0:
+            raise ValueError("C4 index page-table width must be positive")
         next_scores = self._score_output if score_output is None else bool(score_output)
         if (
             self._index_cache is not kv_cache
             or self._index_num_q_heads != next_heads
+            or self._index_max_page_table_width != next_width
             or self._score_output != next_scores
         ):
             self._plans.clear()
         self._index_cache = kv_cache
         self._index_num_q_heads = next_heads
+        self._index_max_page_table_width = next_width
         self._score_output = next_scores
         if self._score_output and not self._score_collective_registered:
             from vllm.distributed import get_dcp_group
@@ -342,14 +352,25 @@ class B12xC4SparseIndexer(nn.Module):
     def _num_q_heads(self) -> int:
         return self._index_num_q_heads or int(getattr(self.k_cache, "num_q_heads", 1))
 
+    @property
+    def _max_page_table_width(self) -> int:
+        return self._index_max_page_table_width or max(
+            1, (self.max_model_len + _INDEX_PAGE_SIZE - 1) // _INDEX_PAGE_SIZE
+        )
+
     def _invocation(self, caps, *, scores: bool):
         rows, width = caps.max_q_rows, caps.max_page_table_width
-        descriptor = lambda shape, dtype: {
-            "shape": tuple(shape),
-            "strides": tuple(torch.empty(shape, device="meta").stride()),
-            "dtype": dtype,
-            "alignment": 16,
-        }
+
+        def descriptor(shape, dtype, *, strides=None):
+            if strides is None:
+                strides = torch.empty(shape, device="meta").stride()
+            return {
+                "shape": tuple(shape),
+                "strides": tuple(strides),
+                "dtype": dtype,
+                "alignment": 16,
+            }
+
         cache_view = _flatten_index_cache(self._index_cache)
         cache_descriptor = {
             "shape": tuple(cache_view.shape),
@@ -365,7 +386,11 @@ class B12xC4SparseIndexer(nn.Module):
                 ),
                 "query_weights": descriptor((rows, caps.num_q_heads), "float32"),
                 "index_k_cache": cache_descriptor,
-                "page_table": descriptor((rows, width), "int32"),
+                "page_table": descriptor(
+                    (rows, width),
+                    "int32",
+                    strides=(0, 1) if caps.mode == "prefill" else None,
+                ),
                 "cache_lengths": descriptor((rows,), "int32"),
                 "active_width": descriptor((1,), "int32"),
                 "output_indices": descriptor((rows, self.topk_tokens), "int32"),
@@ -383,7 +408,7 @@ class B12xC4SparseIndexer(nn.Module):
         kv_cache = self._index_cache
         if not isinstance(kv_cache, torch.Tensor) or kv_cache.numel() == 0:
             return ()
-        width = max(1, (self.max_model_len + _INDEX_PAGE_SIZE - 1) // _INDEX_PAGE_SIZE)
+        width = self._max_page_table_width
         requests = []
         plans: dict[tuple[str, int], object] = {}
         from b12x.preparation import PreparedCall
@@ -407,6 +432,7 @@ class B12xC4SparseIndexer(nn.Module):
                     live_keys = min(
                         self.max_model_len,
                         int(kv_cache.shape[0]) * _INDEX_PAGE_SIZE,
+                        caps.max_page_table_width * _INDEX_PAGE_SIZE,
                         2 * self.topk_tokens,
                     )
                     live_pages = (live_keys + _INDEX_PAGE_SIZE - 1) // _INDEX_PAGE_SIZE
@@ -446,13 +472,18 @@ class B12xC4SparseIndexer(nn.Module):
                         device=caps.device,
                     )
                     pages = torch.zeros(
-                        (caps.max_q_rows, caps.max_page_table_width),
+                        (
+                            1 if mode == "prefill" else caps.max_q_rows,
+                            caps.max_page_table_width,
+                        ),
                         dtype=torch.int32,
                         device=caps.device,
                     )
                     pages[:, :live_pages] = torch.arange(
                         live_pages, dtype=torch.int32, device=caps.device
                     )
+                    if mode == "prefill":
+                        pages = pages.expand(caps.max_q_rows, -1)
                     output = torch.empty(
                         (caps.max_q_rows, self.topk_tokens),
                         dtype=torch.int32,

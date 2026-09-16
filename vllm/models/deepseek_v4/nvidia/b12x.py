@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import cache
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -148,6 +148,21 @@ def b12x_dsv4_is_supported() -> bool:
     )
 
 
+@dataclass(frozen=True)
+class MHCOperands:
+    """Decoder-layer attribute names that B12xMHCResidual prepares against.
+
+    The defaults are DeepSeek V4's. A model whose layers name their norms
+    differently, or that keeps no BF16 copy of the FFN mixing projection,
+    declares that here so preparation reads the operands the layer really
+    runs with and declares only the operations it executes.
+    """
+
+    attn_norm: str = "attn_norm"
+    ffn_norm: str = "ffn_norm"
+    ffn_fn_bf16: str | None = "hc_ffn_fn_bf16"
+
+
 class B12xMHCResidual:
     def __init__(
         self,
@@ -157,15 +172,16 @@ class B12xMHCResidual:
         rms_eps: float,
         hc_eps: float,
         sinkhorn_iters: int,
+        operands: MHCOperands | None = None,
     ) -> None:
         module = _require_b12x_mhc()
+        self.operands = operands if operands is not None else MHCOperands()
         self._caps = module.Caps
         self._plan_factory = module.plan
         self._run_pre = module.run_pre
         self._run_post = module.run_post
         self._run_post_pre = module.run_post_pre
         self._plans: dict[tuple[str, int], Plan] = {}
-        self._plan_key: tuple[tuple[int, ...], bool] | None = None
 
         expected_hc_mult = int(module.MULT)
         if hc_mult != expected_hc_mult:
@@ -276,77 +292,104 @@ class B12xMHCResidual:
     def _request_name(self, layer: torch.nn.Module, operation: str, tokens: int) -> str:
         return f"deepseek_v4.mhc.{id(layer):x}.{operation}.m{tokens}"
 
+    def _attn_norm(self, layer: torch.nn.Module) -> Any:
+        return getattr(layer, self.operands.attn_norm)
+
+    def _ffn_norm(self, layer: torch.nn.Module) -> Any:
+        return getattr(layer, self.operands.ffn_norm)
+
+    def _ffn_fn_bf16(self, layer: torch.nn.Module) -> torch.Tensor | None:
+        name = self.operands.ffn_fn_bf16
+        return None if name is None else getattr(layer, name)
+
+    def _operations(self, layer: torch.nn.Module) -> tuple[str, ...]:
+        """The mHC operations ``layer`` executes, in declaration order.
+
+        Only the first decoder layer holds the published broadcast attention
+        projection and runs ``pre``; every layer runs the fused ``post_pre``
+        and may end the stream with ``post``. ``post_pre_bf16`` exists only
+        when the model keeps a BF16 copy of the FFN mixing projection.
+        """
+        operations: tuple[str, ...] = (
+            ("pre",) if layer.hc_attn_fn_broadcast is not None else ()
+        )
+        operations += ("post_pre",)
+        if self.operands.ffn_fn_bf16 is not None:
+            operations += ("post_pre_bf16",)
+        return operations + ("post",)
+
+    def _operands(
+        self, layer: torch.nn.Module, operations: tuple[str, ...]
+    ) -> tuple[torch.Tensor | None, ...]:
+        """Every checkpoint tensor the declared ``operations`` read."""
+        operands: tuple[torch.Tensor | None, ...] = (
+            layer.hc_attn_fn,
+            layer.hc_ffn_fn,
+            layer.hc_attn_scale,
+            layer.hc_ffn_scale,
+            layer.hc_attn_base,
+            layer.hc_ffn_base,
+            self._attn_norm(layer).weight,
+            self._ffn_norm(layer).weight,
+        )
+        if "pre" in operations:
+            operands += (layer.hc_attn_fn_broadcast,)
+        if "post_pre_bf16" in operations:
+            operands += (self._ffn_fn_bf16(layer),)
+        return operands
+
     def get_b12x_preparation_units(
         self, layer: torch.nn.Module, workload: B12xWorkload
     ) -> tuple[B12xPreparationUnit, ...]:
         """Declare every real mHC operand after decoder weights are published."""
         from b12x.preparation import FrozenMapping
 
-        parameters = (
-            layer.hc_attn_fn,
-            layer.hc_ffn_fn,
-            layer.hc_ffn_fn_bf16,
-            layer.hc_attn_scale,
-            layer.hc_ffn_scale,
-            layer.hc_attn_base,
-            layer.hc_ffn_base,
-            layer.attn_norm.weight,
-            layer.ffn_norm.weight,
-        )
-        if any(parameter is None or parameter.is_meta for parameter in parameters):
+        operations = self._operations(layer)
+        if any(
+            operand is None or operand.is_meta
+            for operand in self._operands(layer, operations)
+        ):
             return ()
 
-        tokens_to_prepare = tuple(
-            sorted({workload.max_tokens, *workload.fixed_token_counts})
-        )
-        broadcast = layer.hc_attn_fn_broadcast
-        has_broadcast = broadcast is not None and not broadcast.is_meta
-        key = (tokens_to_prepare, has_broadcast)
-        if not self._plans or self._plan_key != key:
-            plans: dict[tuple[str, int], Plan] = {}
-            for tokens in tokens_to_prepare:
-                for operation, plan_operation, has_fn_bf16 in (
-                    ("pre", "pre", False),
-                    ("post_pre", "post_pre", False),
-                    ("post_pre_bf16", "post_pre", True),
-                    ("post", "post", False),
-                ):
-                    if operation == "pre" and not has_broadcast:
-                        continue
-                    norm = (
-                        layer.attn_norm
-                        if operation in ("pre", "post_pre")
-                        else layer.ffn_norm
-                    )
-                    invocation = FrozenMapping(
-                        {
-                            "operation": plan_operation,
-                            "has_norm_weight": plan_operation != "post",
-                            "norm_weight_dtype": "bfloat16",
-                            "has_fn_bf16": has_fn_bf16,
-                            "lagged_mix": False,
-                            "bf16x2_eligible": True,
-                            "output_mode": "functional",
-                            "rms_eps": self.rms_eps,
-                            "hc_eps": self.hc_eps,
-                            "sinkhorn_iters": self.sinkhorn_iters,
-                            "norm_eps": float(norm.variance_epsilon),
-                            "block_k": self.block_k,
-                            "block_h": self.block_h,
-                        }
-                    )
-                    plans[(operation, tokens)] = self._plan_factory(
-                        self._caps(
-                            device=layer.hc_attn_fn.device,
-                            dtype=torch.bfloat16,
-                            max_tokens=tokens,
-                            hidden_size=self.hidden_size,
-                            split_k=self.split_k,
-                        ),
-                        invocation=invocation,
-                    )
-            self._plans = plans
-            self._plan_key = key
+        key = tuple(sorted({workload.max_tokens, *workload.fixed_token_counts}))
+        for tokens in key:
+            for operation in operations:
+                if (operation, tokens) in self._plans:
+                    continue
+                has_fn_bf16 = operation == "post_pre_bf16"
+                plan_operation = "post_pre" if has_fn_bf16 else operation
+                norm = (
+                    self._attn_norm(layer)
+                    if operation in ("pre", "post_pre")
+                    else self._ffn_norm(layer)
+                )
+                invocation = FrozenMapping(
+                    {
+                        "operation": plan_operation,
+                        "has_norm_weight": plan_operation != "post",
+                        "norm_weight_dtype": "bfloat16",
+                        "has_fn_bf16": has_fn_bf16,
+                        "lagged_mix": False,
+                        "bf16x2_eligible": True,
+                        "output_mode": "functional",
+                        "rms_eps": self.rms_eps,
+                        "hc_eps": self.hc_eps,
+                        "sinkhorn_iters": self.sinkhorn_iters,
+                        "norm_eps": float(norm.variance_epsilon),
+                        "block_k": self.block_k,
+                        "block_h": self.block_h,
+                    }
+                )
+                self._plans[(operation, tokens)] = self._plan_factory(
+                    self._caps(
+                        device=layer.hc_attn_fn.device,
+                        dtype=torch.bfloat16,
+                        max_tokens=tokens,
+                        hidden_size=self.hidden_size,
+                        split_k=self.split_k,
+                    ),
+                    invocation=invocation,
+                )
 
         requests = [
             self._plans[(operation, tokens)].request(
@@ -354,7 +397,8 @@ class B12xMHCResidual:
                 prepare_call=self._prepare_call(layer, operation, tokens),
                 benchmark_call=self._prepare_call(layer, operation, tokens),
             )
-            for operation, tokens in self._plans
+            for tokens in key
+            for operation in operations
         ]
         return (
             B12xPreparationUnit(
@@ -400,6 +444,7 @@ class B12xMHCResidual:
                 comb.normal_()
 
             if operation == "pre":
+                attn_norm = self._attn_norm(layer)
                 run = lambda: _impl._b12x_mhc_pre_impl(
                     residual,
                     layer.hc_attn_fn_broadcast,
@@ -408,8 +453,8 @@ class B12xMHCResidual:
                     rms_eps=self.rms_eps,
                     hc_eps=self.hc_eps,
                     sinkhorn_iters=self.sinkhorn_iters,
-                    norm_weight=layer.attn_norm.weight,
-                    norm_eps=float(layer.attn_norm.variance_epsilon),
+                    norm_weight=attn_norm.weight,
+                    norm_eps=float(attn_norm.variance_epsilon),
                     _state=state,
                 )
             elif operation in ("post_pre", "post_pre_bf16"):
@@ -418,7 +463,7 @@ class B12xMHCResidual:
                         layer.hc_attn_fn,
                         layer.hc_attn_scale,
                         layer.hc_attn_base,
-                        layer.attn_norm,
+                        self._attn_norm(layer),
                         None,
                     )
                 else:
@@ -426,8 +471,8 @@ class B12xMHCResidual:
                         layer.hc_ffn_fn,
                         layer.hc_ffn_scale,
                         layer.hc_ffn_base,
-                        layer.ffn_norm,
-                        layer.hc_ffn_fn_bf16,
+                        self._ffn_norm(layer),
+                        self._ffn_fn_bf16(layer),
                     )
                 run = lambda: _impl._b12x_mhc_post_pre_impl(
                     x,
@@ -452,18 +497,7 @@ class B12xMHCResidual:
             return PreparedCall(
                 run=run,
                 produce=produce,
-                owners=(
-                    layer.hc_attn_fn_broadcast,
-                    layer.hc_attn_fn,
-                    layer.hc_ffn_fn,
-                    layer.hc_ffn_fn_bf16,
-                    layer.hc_attn_scale,
-                    layer.hc_ffn_scale,
-                    layer.hc_attn_base,
-                    layer.hc_ffn_base,
-                    layer.attn_norm.weight,
-                    layer.ffn_norm.weight,
-                ),
+                owners=self._operands(layer, self._operations(layer)),
             )
 
         return prepare
