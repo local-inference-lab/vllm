@@ -17,6 +17,12 @@ class DeepseekV41Config(PretrainedConfig):
 
     model_type = "deepseek_v41"
 
+    # Top-k width of the sparse indexer selection. 512 is the qualified
+    # default; 1024/2048 are experimental and need a b12x build whose
+    # MXFP4 indexer gate admits them (vLLM reads this from the
+    # flattened top-level config).
+    index_topk: int = 512
+
     def __init__(
         self,
         text_config: dict[str, Any] | None = None,
