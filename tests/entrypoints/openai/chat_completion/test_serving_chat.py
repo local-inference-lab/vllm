@@ -46,7 +46,7 @@ from vllm.exceptions import VLLMValidationError
 from vllm.inputs import TokensPrompt
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.outputs import CompletionOutput, RequestOutput
-from vllm.parser import HarmonyParser
+from vllm.parser import HarmonyParser, ParserManager
 from vllm.renderers.hf import HfRenderer
 from vllm.renderers.mistral import MistralRenderer
 from vllm.renderers.online_renderer import OnlineRenderer
@@ -2410,3 +2410,111 @@ def test_make_request_with_harmony_reuses_kv_transfer_prompt_token_ids():
     assert engine_input["prompt_token_ids"] == [10, 20, 30]
     # The reuse key is consumed and other kv_transfer_params are preserved.
     assert request.kv_transfer_params == {"do_remote_prefill": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_choice", ["auto", "required", "named", "none"])
+@pytest.mark.parametrize(
+    "stream,finish_reason,complete",
+    [
+        (False, "length", False),
+        (False, "length", True),
+        (True, "length", False),
+        (True, "length", True),
+        (False, "stop", True),
+        (True, "stop", True),
+        (False, None, True),
+    ],
+)
+async def test_tool_call_preserves_engine_finish_reason(
+    tool_choice: str, stream: bool, finish_reason: str | None, complete: bool
+):
+    """Parsing a tool call must not hide output truncation from the client."""
+    tokenizer = get_tokenizer(MODEL_NAME)
+    serving = _build_minimal_metrics_serving_chat(False)
+    serving.model_config = MockModelConfig()
+    serving.enable_auto_tools = True
+    serving.parser_cls = ParserManager.get_parser(
+        tool_parser_name="deepseek_v41",
+        reasoning_parser_name="",
+        enable_auto_tools=True,
+        model_name=MODEL_NAME,
+    )
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "Look up Paris."}],
+        stream=stream,
+        tool_choice=(
+            {"type": "function", "function": {"name": "lookup"}}
+            if tool_choice == "named"
+            else tool_choice
+        ),
+        tools=[{"type": "function", "function": {"name": "lookup"}}],
+    )
+    text = (
+        '\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="lookup">\n'
+        '<｜DSML｜ parameter name="city" string="true">Paris'
+    )
+    if complete:
+        text += "</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+    if tool_choice == "none":
+        text = "Paris is in France."
+    ids = tokenizer.encode(text, add_special_tokens=False)
+
+    async def outputs():
+        previous = ""
+        previous_end = 0
+        for end in range(1, len(ids) + 1) if stream else [len(ids)]:
+            current = tokenizer.decode(ids[:end], skip_special_tokens=False)
+            # GPT-2 can split the DSML markers across UTF-8 byte boundaries.
+            if current.endswith("\ufffd"):
+                continue
+            result = _make_metrics_request_output(
+                token_ids=tuple(ids[previous_end:end])
+            )
+            result.outputs[0].text = current[len(previous) :]
+            result.outputs[0].finish_reason = finish_reason if end == len(ids) else None
+            result.finished = end == len(ids)
+            previous = current
+            previous_end = end
+            yield result
+        assert previous == text
+
+    arguments = dict(
+        request=request,
+        result_generator=outputs(),
+        request_id="tool-limit",
+        model_name=MODEL_NAME,
+        conversation=[],
+        tokenizer=tokenizer,
+        request_metadata=RequestResponseMetadata(request_id="tool-limit"),
+    )
+    expected = finish_reason or "stop"
+    if tool_choice in ("auto", "required") and finish_reason == "stop":
+        expected = "tool_calls"
+    if tool_choice == "auto" and finish_reason is None:
+        expected = "tool_calls"
+    if stream:
+        choices = []
+        async for line in serving.chat_completion_stream_generator(
+            **arguments, chat_template_kwargs={"thinking": False}
+        ):
+            if line.startswith("data: {"):
+                event = json.loads(line[6:])
+                assert "error" not in event, event
+                choices.extend(event["choices"])
+        assert any(c["delta"].get("tool_calls") for c in choices) == (
+            tool_choice != "none"
+        )
+        reasons = [c["finish_reason"] for c in choices if c["finish_reason"]]
+        assert reasons == [expected]
+    else:
+        parser = serving.parser_cls(
+            tokenizer, request.tools, chat_template_kwargs={"thinking": False}
+        )
+        response = await serving.chat_completion_full_generator(
+            **arguments, parser=parser
+        )
+        assert isinstance(response, ChatCompletionResponse)
+        assert bool(response.choices[0].message.tool_calls) == (tool_choice != "none")
+        assert response.choices[0].finish_reason == expected
