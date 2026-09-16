@@ -14,7 +14,7 @@ from torch import nn
 from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.distributed import get_pp_group
+from vllm.distributed import get_pp_group, tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
@@ -73,6 +73,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
+from . import hc_prefill
 from .config import Qwen3_8FlashNextConfig, Qwen3_8FlashNextTextConfig
 from .hyperconnection import (
     GatedResidual,
@@ -147,12 +148,20 @@ _HC_WEIGHTS_MAPPER = WeightsMapper(
 
 
 class Qwen3_8FlashNextSparseMoeBlock(Qwen3NextSparseMoeBlock):
-    def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        *,
+        reduce_results: bool = True,
+    ) -> None:
         if vllm_config.parallel_config.use_sequence_parallel_moe:
             raise NotImplementedError(
                 "Qwen3.8-Flash-Next HC does not support sequence-parallel MoE"
             )
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        super().__init__(
+            vllm_config=vllm_config, prefix=prefix, reduce_results=reduce_results
+        )
         config = vllm_config.model_config.hf_text_config
         self.n_shared_experts = int(config.shared_expert_intermediate_size > 0)
 
@@ -170,6 +179,10 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
         self.config = config
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
+        self.defer_hc_reductions = (
+            envs.VLLM_QWEN3_8_HC_PREFILL_MODE != "off"
+            and self.layer_idx < config.num_hidden_layers
+        )
         self.ple: Qwen3_8FlashNextPLELayer | None = None
         if self.layer_idx + 1 in config.ple_layer_ids:
             dense_ids = sorted(set(config.ple_layer_ids))
@@ -188,6 +201,8 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
                 overlap_input_projections=envs.VLLM_QWEN3_8_FLASH_NEXT_OVERLAP,
+                reduce_results=not self.defer_hc_reductions,
+                prefill_checkpoint_blocks=int(envs.VLLM_QWEN3_8_PREFILL_COALESCE),
             )
         elif layer_type == "full_attention":
             if getattr(config, "indexer_n_heads", None) is None:
@@ -197,6 +212,7 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
                     cache_config=vllm_config.cache_config,
                     quant_config=vllm_config.quant_config,
                     prefix=f"{prefix}.self_attn",
+                    reduce_results=not self.defer_hc_reductions,
                 )
             else:
                 qsa_module = import_module("vllm.models.qwen3_8_flash_next.qsa")
@@ -206,6 +222,7 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
                     layer_id=self.layer_idx,
                     quant_config=vllm_config.quant_config,
                     prefix=f"{prefix}.self_attn",
+                    reduce_results=not self.defer_hc_reductions,
                 )
         else:
             raise ValueError(f"invalid layer_type {layer_type!r}")
@@ -217,7 +234,9 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
         )
         if is_moe:
             self.mlp = Qwen3_8FlashNextSparseMoeBlock(
-                vllm_config=vllm_config, prefix=f"{prefix}.mlp"
+                vllm_config=vllm_config,
+                prefix=f"{prefix}.mlp",
+                reduce_results=not self.defer_hc_reductions,
             )
         else:
             self.mlp = Qwen3NextMLP(
@@ -226,6 +245,7 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=vllm_config.quant_config,
                 prefix=f"{prefix}.mlp",
+                reduce_results=not self.defer_hc_reductions,
             )
 
         hc_config = HyperConnectionConfig(
@@ -258,14 +278,19 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
         ngram_context: torch.Tensor | None,
         ple_prefetched: bool = False,
         output_indices: torch.Tensor | None = None,
+        hc_owner: hc_prefill.RowOwnership | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         attn_hc = self.attn_hyper_connection
+        if hc_owner is not None and output_indices is not None:
+            raise ValueError("Qwen HC ownership cannot compact decode outputs")
         if self.ple is not None:
             if prev_block_output is not None and prev_injection is not None:
                 hidden_states = attn_hc.combine(
                     hidden_states, prev_block_output, prev_injection
                 )
                 prev_block_output = prev_injection = None
+            if hc_owner is not None:
+                hidden_states = hc_owner.gather(hidden_states)
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
             hidden_states = hidden_states + self.ple(
@@ -275,6 +300,8 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
                 ngram_context,
                 prefetched=ple_prefetched,
             )
+            if hc_owner is not None:
+                hidden_states = hc_owner.local(hidden_states)
         if prev_block_output is not None and prev_injection is not None:
             hidden_states, block_input, injection = attn_hc.combine_and_mix(
                 hidden_states, prev_block_output, prev_injection
@@ -282,10 +309,18 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
         else:
             hidden_states, block_input, injection = attn_hc.mix(hidden_states)
 
+        if hc_owner is not None:
+            block_input = hc_owner.gather(block_input)
         if self.layer_type == "linear_attention":
             attn_out = self.linear_attn(hidden_states=block_input)
         else:
             attn_out = self.self_attn(hidden_states=block_input, positions=positions)
+        if self.defer_hc_reductions:
+            attn_out = (
+                hc_owner.reduce(attn_out)
+                if hc_owner is not None
+                else tensor_model_parallel_all_reduce(attn_out)
+            )
         if output_indices is not None:
             hidden_states = hidden_states[output_indices]
             attn_out = attn_out[output_indices]
@@ -296,7 +331,15 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
                 hidden_states, attn_out, injection
             )
         )
+        if hc_owner is not None:
+            block_input = hc_owner.gather(block_input)
         mlp_out = self.mlp(block_input)
+        if self.defer_hc_reductions:
+            mlp_out = (
+                hc_owner.reduce(mlp_out)
+                if hc_owner is not None
+                else tensor_model_parallel_all_reduce(mlp_out)
+            )
         return hidden_states, mlp_out, injection
 
 
@@ -435,6 +478,15 @@ class Qwen3_8FlashNextModel(nn.Module):
             )
         else:
             self.register_buffer("_mtp_hidden_buffer", None, persistent=False)
+        hc_prefill.configure(self, vllm_config, envs.VLLM_QWEN3_8_HC_PREFILL_MODE)
+        if self.hc_prefill_mode != "off":
+            from vllm.model_executor.layers.linear import (
+                _register_b12x_row_parallel_collective,
+            )
+
+            _register_b12x_row_parallel_collective(
+                self, f"{prefix}.hc_block_output", config.hidden_size, True
+            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -448,6 +500,7 @@ class Qwen3_8FlashNextModel(nn.Module):
         query_start_loc: torch.Tensor | None = None,
         ngram_context: torch.Tensor | None = None,
         deepstack_input_embeds: IntermediateTensors | None = None,
+        hc_prefill_eager: bool = False,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -462,6 +515,14 @@ class Qwen3_8FlashNextModel(nn.Module):
                 raise ValueError("pipeline stage requires intermediate tensors")
             hidden_states = intermediate_tensors["hidden_states"]
 
+        hc_owner = (
+            hc_prefill.create(self, hidden_states.shape[0])
+            if hc_prefill_eager
+            else None
+        )
+        full_rows = hidden_states.shape[0]
+        if hc_owner is not None:
+            hidden_states = hc_owner.local(hidden_states)
         block_output = None
         injection = None
         last_layer = None
@@ -497,6 +558,7 @@ class Qwen3_8FlashNextModel(nn.Module):
                 query_start_loc=query_start_loc,
                 ngram_context=ngram_context,
                 ple_prefetched=ple_prefetched,
+                hc_owner=hc_owner,
             )
             ple_prefetched = next_ple_prefetched
             if deepstack_input_embeds is not None and layer_idx < len(
@@ -505,6 +567,8 @@ class Qwen3_8FlashNextModel(nn.Module):
                 deepstack_embed = deepstack_input_embeds[
                     f"deepstack_input_embeds_{layer_idx}"
                 ]
+                if hc_owner is not None:
+                    deepstack_embed = hc_owner.local(deepstack_embed)
                 deepstack_embed = (
                     deepstack_embed.unsqueeze(-2)
                     .expand(
@@ -534,8 +598,14 @@ class Qwen3_8FlashNextModel(nn.Module):
         multi_hidden, sample_hidden_states, _ = final_mixer.combine_and_mix(
             hidden_states, block_output, injection
         )
+        if hc_owner is not None:
+            sample_hidden_states = hc_owner.gather(sample_hidden_states)
+            if self._mtp_hidden_buffer is not None:
+                multi_hidden = hc_owner.gather(multi_hidden)
         if self._mtp_hidden_buffer is not None:
             self._mtp_hidden_buffer[: multi_hidden.shape[0]].copy_(multi_hidden)
+        if hc_prefill_eager:
+            hc_prefill.report(self, hc_owner, full_rows)
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -631,6 +701,18 @@ class Qwen3_8FlashNextForCausalLM(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
+        if hc_prefill.eligible(self.model, positions.shape[-1]):
+            eager_forward: Callable[..., torch.Tensor | IntermediateTensors] = (
+                self.model.forward
+            )
+            return eager_forward(
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                hc_prefill_eager=True,
+                **kwargs,
+            )
         return self.model(
             input_ids,
             positions,
@@ -900,7 +982,7 @@ class Qwen3_8FlashNextForConditionalGeneration(
             and self.use_deepstack
             else None
         )
-        hidden_states = self.language_model.model(
+        hidden_states = self.language_model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,

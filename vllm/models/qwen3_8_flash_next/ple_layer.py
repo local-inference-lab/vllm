@@ -36,16 +36,17 @@ from vllm.model_executor.weight_transfer import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.b12x import (
-    set_b12x_preparation_provider,
     B12xPreparationUnit,
     B12xWorkload,
     get_b12x_ple,
     get_b12x_ple_embedding,
     get_b12x_scratch_buffers,
+    set_b12x_preparation_provider,
 )
 from vllm.utils.torch_utils import current_stream, direct_register_custom_op
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.kv_cache_interface import MambaSpec
 
 from .config import Qwen3_8FlashNextTextConfig
 from .ple_attn import PLEAttentionBackend, PLEAttentionMetadata
@@ -360,6 +361,7 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         )
         if not getattr(self, "b12x_preparation_suppressed", False):
             set_b12x_preparation_provider(self, self)
+
     def _declare_embedding_plan(self, token_count: int):
         api = _b12x_module("ple_embedding")
         return api.plan(
@@ -404,8 +406,10 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
             disk_table=self.ngram_embedding.disk_table,
         )
 
-    def _bind_embedding_state(self, state: object, token_count: int):
-        capacity = self.max_total_tokens if self.requires_disk_preparation else token_count
+    def _bind_embedding_state(self, state: Any, token_count: int):
+        capacity = (
+            self.max_total_tokens if self.requires_disk_preparation else token_count
+        )
         return state.bind(
             scratch=self._scratch,
             weight=self.ngram_embedding.weight,
@@ -443,19 +447,23 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
             if plan is None:
                 plan = self._declare_embedding_plan(token_count)
                 plans[token_count] = plan
-            requests.append(plan.request(
-                name=self._request_name(token_count),
-                prepare_call=self._embedding_prepare_call(token_count),
-            ))
+            requests.append(
+                plan.request(
+                    name=self._request_name(token_count),
+                    prepare_call=self._embedding_prepare_call(token_count),
+                )
+            )
         if not requests:
             return ()
-        return (B12xPreparationUnit(
-            name="PLE embedding",
-            key=self.owner_prefix,
-            requests=tuple(requests),
-            stage="weights",
-            autotune=False,
-        ),)
+        return (
+            B12xPreparationUnit(
+                name="PLE embedding",
+                key=self.owner_prefix,
+                requests=tuple(requests),
+                stage="weights",
+                autotune=False,
+            ),
+        )
 
     def _embedding_prepare_call(self, token_count: int):
         def prepare(state):
@@ -498,6 +506,7 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                 restore=restore,
                 owners=(binding,),
             )
+
         return prepare
 
     def _prepare_inputs(
@@ -574,7 +583,6 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         self._disk_prepared_tokens = num_tokens
         self._disk_prepared = True
 
-
     def _run_prefetch(
         self,
         input_ids: torch.Tensor,
@@ -625,7 +633,8 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         if covered_until != self._table_layout.shard_end:
             raise ValueError(
                 "PLE embedding shards do not cover the local table: "
-                f"stopped at row {covered_until}, expected {self._table_layout.shard_end}"
+                f"stopped at row {covered_until}, "
+                f"expected {self._table_layout.shard_end}"
             )
 
         if self._table_layout.weight_scale_shape is not None:
@@ -743,7 +752,8 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                 if loaded_weight.dtype != self._table_layout.weight_scale_dtype:
                     raise TypeError(
                         "PLE embedding weight_scale must have dtype "
-                        f"{self._table_layout.weight_scale_dtype}, got {loaded_weight.dtype}"
+                        f"{self._table_layout.weight_scale_dtype}, "
+                        f"got {loaded_weight.dtype}"
                     )
                 scale = loaded_weight.float()
                 if not bool(torch.isfinite(scale).all()) or not bool((scale > 0).all()):
@@ -1055,7 +1065,7 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             persistent=False,
         )
         self.register_buffer("_scratch", None, persistent=False)
-        self._state_caps = None
+        self._state_caps: Any = None
         self._state_plans: dict[int, object] = {}
         self.kv_cache = (torch.tensor([]),)
 
@@ -1064,6 +1074,7 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
         self._preparation_prefix = prefix or f"qwen3_8_flash_next.ple.{self.layer_idx}"
         if not getattr(self, "b12x_preparation_suppressed", False):
             set_b12x_preparation_provider(self, self)
+
     def _make_caps(self, max_state_slots: int):
         api = _b12x_module("ple")
         return api.Caps(
@@ -1178,20 +1189,24 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
                 continue
             plan = self._declare_state_plan(token_count)
             plans[token_count] = plan
-            requests.append(plan.request(
-                name=self._state_request_name(token_count),
-                prepare_call=self._state_prepare_call(token_count),
-            ))
+            requests.append(
+                plan.request(
+                    name=self._state_request_name(token_count),
+                    prepare_call=self._state_prepare_call(token_count),
+                )
+            )
         self._state_plans = plans
         if not requests:
             return ()
-        return (B12xPreparationUnit(
-            name="PLE state",
-            key=self._preparation_prefix,
-            requests=tuple(requests),
-            stage="state",
-            autotune=False,
-        ),)
+        return (
+            B12xPreparationUnit(
+                name="PLE state",
+                key=self._preparation_prefix,
+                requests=tuple(requests),
+                stage="state",
+                autotune=False,
+            ),
+        )
 
     def _state_prepare_call(self, token_count: int):
         def prepare(state):
@@ -1212,11 +1227,17 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             # it snapshots and restores everything it overwrites: a plan can be
             # prepared on demand in the middle of a live forward pass.
             staging = (
-                self._residual[:token_count], self._key[:token_count],
-                self._value[:token_count], self._out[:token_count],
-                self._query_start_loc, self._state_slot_ids, self._state_is_fresh,
-                self._num_accepted_tokens, self._request_is_prefill,
-                self._num_seqs, self._num_tokens,
+                self._residual[:token_count],
+                self._key[:token_count],
+                self._value[:token_count],
+                self._out[:token_count],
+                self._query_start_loc,
+                self._state_slot_ids,
+                self._state_is_fresh,
+                self._num_accepted_tokens,
+                self._request_is_prefill,
+                self._num_seqs,
+                self._num_tokens,
             )
             snapshot = tuple(buffer.clone() for buffer in staging)
             binding = state.bind(
@@ -1260,12 +1281,33 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
                 self._num_seqs.fill_(1)
                 self._num_tokens.fill_(token_count)
 
+            checkpoint_offsets = torch.zeros_like(
+                self._state_slot_ids, dtype=torch.int32
+            )
+            checkpoint_slots = torch.full_like(self._state_slot_ids, -1)
+
+            def run():
+                result = state.run(binding, eps=self.eps, token_count=token_count)
+                if envs.VLLM_QWEN3_8_PREFILL_COALESCE:
+                    # Capture can invoke export even when no request checkpoints.
+                    # Prime its module with inactive slots before resolution freezes.
+                    state.export_checkpoint(
+                        binding, checkpoint_offsets, checkpoint_slots
+                    )
+                return result
+
             return PreparedCall(
-                run=lambda: state.run(binding, eps=self.eps, token_count=token_count),
+                run=run,
                 reset=reset,
                 restore=restore,
-                owners=(scratch, original_conv_state),
+                owners=(
+                    scratch,
+                    original_conv_state,
+                    checkpoint_offsets,
+                    checkpoint_slots,
+                ),
             )
+
         return prepare
 
     def unbind_kv_cache(self) -> None:
@@ -1298,6 +1340,18 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             conv_kernel=self.conv_state_len + 1,
             num_spec=self.num_spec_tokens,
         )
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
+        spec = super().get_kv_cache_spec(vllm_config)
+        assert isinstance(spec, MambaSpec)
+        if not envs.VLLM_QWEN3_8_PREFILL_COALESCE:
+            return spec
+        if (
+            vllm_config.use_request_boundary_checkpoints
+            or vllm_config.cache_config.mamba_cache_mode != "align"
+        ):
+            raise ValueError("Qwen PLE internal checkpoints require aligned caching")
+        return replace(spec, num_prefill_checkpoint_blocks=1)
 
     def _prepare_metadata(
         self,
@@ -1352,9 +1406,17 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
         self._key[:token_count].copy_(key)
         self._value[:token_count].copy_(value)
         self._prepare_metadata(metadata, query_start_loc, token_count)
-        _b12x_module("ple").run_mixed(
-            self._bind_ple(token_count), eps=self.eps, token_count=token_count
-        )
+        binding = self._bind_ple(token_count)
+        api = _b12x_module("ple")
+        api.run_mixed(binding, eps=self.eps, token_count=token_count)
+        if metadata.checkpoint_columns is not None:
+            assert metadata.checkpoint_offsets is not None
+            assert metadata.checkpoint_slots is not None
+            api.export_checkpoint(
+                binding,
+                offsets=metadata.checkpoint_offsets,
+                slots=metadata.checkpoint_slots,
+            )
 
     def forward(
         self,

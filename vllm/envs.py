@@ -203,6 +203,8 @@ if TYPE_CHECKING:
     VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
     VLLM_MTP_NVFP4_LM_HEAD: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
+    VLLM_QWEN3_8_HC_PREFILL_MODE: str = "off"
+    VLLM_QWEN3_8_PREFILL_COALESCE: bool = False
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
@@ -1695,6 +1697,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Overlap independent small-batch projections in Qwen3.8-Flash-Next graphs.
     "VLLM_QWEN3_8_FLASH_NEXT_OVERLAP": lambda: bool(
         int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_OVERLAP", "1"))
+    ),
+    "VLLM_QWEN3_8_HC_PREFILL_MODE": lambda: os.getenv(
+        "VLLM_QWEN3_8_HC_PREFILL_MODE", "off"
+    ),
+    "VLLM_QWEN3_8_PREFILL_COALESCE": lambda: bool(
+        int(os.getenv("VLLM_QWEN3_8_PREFILL_COALESCE", "0"))
     ),
     # Gather DCP-sharded C4 records before B12X sparse-MLA prefill. This avoids
     # query replication plus the per-rank LSE combine and is opt-in while the

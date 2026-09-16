@@ -340,6 +340,7 @@ def test_mtp_compaction_preserves_attention_rows_and_selected_outputs(indices):
         model_module.Qwen3_8FlashNextDecoderLayer
     )
     nn.Module.__init__(layer)
+    layer.defer_hc_reductions = False
     layer.ple = None
     layer.layer_type = "full_attention"
     rows = {}
@@ -1451,7 +1452,11 @@ def test_ple_embedding_reuses_capacity_for_live_token_counts(
         layer._bind_embedding(129)
 
 
-def test_ple_state_prepare_call_restores_the_staging_buffers_it_overwrites(monkeypatch):
+@pytest.mark.parametrize("coalesce", [False, True])
+def test_ple_state_prepare_call_restores_the_staging_buffers_it_overwrites(
+    monkeypatch, coalesce
+):
+    monkeypatch.setenv("VLLM_QWEN3_8_PREFILL_COALESCE", str(int(coalesce)))
     layer = Qwen3_8FlashNextPLELayer.__new__(Qwen3_8FlashNextPLELayer)
     nn.Module.__init__(layer)
     layer.eps = 1e-6
@@ -1489,7 +1494,15 @@ def test_ple_state_prepare_call_restores_the_staging_buffers_it_overwrites(monke
         )
     }
     conv_state = layer.kv_cache[0].clone()
-    runs = []
+    runs: list[dict[str, Any]] = []
+    exports: list[dict[str, Any]] = []
+
+    def export_checkpoint(binding, offsets, slots):
+        assert runs, "checkpoint export requires normalized inputs from the main path"
+        assert offsets.dtype == torch.int32 and slots.dtype == torch.int64
+        assert offsets.shape == slots.shape == layer._state_slot_ids.shape
+        assert not offsets.any() and (slots == -1).all()
+        exports.append(binding)
 
     def run(binding, **kwargs):
         runs.append(kwargs)
@@ -1506,6 +1519,7 @@ def test_ple_state_prepare_call_restores_the_staging_buffers_it_overwrites(monke
         ),
         bind=lambda **kwargs: kwargs,
         run=run,
+        export_checkpoint=export_checkpoint,
     )
 
     call = layer._state_prepare_call(4)(state)
@@ -1513,6 +1527,7 @@ def test_ple_state_prepare_call_restores_the_staging_buffers_it_overwrites(monke
     assert float(layer._residual.min()) == 1.0 and int(layer._num_seqs) == 1
     call.run()
     assert runs == [{"eps": 1e-6, "token_count": 4}]
+    assert len(exports) == int(coalesce)
     call.restore()
 
     for name, saved in live.items():
