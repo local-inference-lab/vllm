@@ -19,8 +19,8 @@ from vllm.v1.worker.startup_plan import (
 def test_mark_b12x_eager_shapes_covers_encoder_and_connector_profile_shapes(
     monkeypatch,
 ) -> None:
-    from vllm.model_executor.warmup.b12x_prepare import mark_b12x_eager_shapes
     import vllm.multimodal.encoder_budget as encoder_budget
+    from vllm.model_executor.warmup.b12x_prepare import mark_b12x_eager_shapes
 
     class _Model(nn.Module):
         def __init__(self):
@@ -62,10 +62,7 @@ def test_mark_b12x_eager_shapes_covers_encoder_and_connector_profile_shapes(
     assert model.visual.block.b12x_eager_only is True
     for connector in (model.visual.merger, model.visual.deepstack_merger_list):
         assert connector.b12x_eager_token_counts == (16_384,)
-        assert all(
-            module.b12x_eager_only
-            for module in connector.modules()
-        )
+        assert all(module.b12x_eager_only for module in connector.modules())
 
 
 def test_b12x_workload_covers_target_and_draft_profile_shapes() -> None:
@@ -98,6 +95,7 @@ def test_b12x_workload_covers_target_and_draft_profile_shapes() -> None:
     assert workload.fixed_token_counts == (1, 2, 4, 8)
     assert workload.max_tokens == 128
     assert workload.speculative_tokens == 3
+
 
 # Startup-plan persistence (vllm/v1/worker/startup_plan.py), applied and
 # saved by Worker.determine_available_memory / compile_or_warm_up_model.
@@ -178,8 +176,7 @@ def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
     graph_estimate,
     estimate_graphs,
 ):
-    """Pool-dependent plans are prepared before, and released after, the
-    throwaway CUDA-graph memory profiling pass."""
+    """KV admission counts retained allocations, not released profiling blocks."""
     events: list[object] = []
 
     def profile_cudagraph_memory(prepare_profile_state):
@@ -215,12 +212,8 @@ def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
         device="cuda:0",
         model_config=SimpleNamespace(multimodal_config=None),
         parallel_config=SimpleNamespace(),
-        _prepare_b12x_profile_state=lambda: events.append(
-            "prepare_b12x_profile_state"
-        ),
-        _release_b12x_profile_state=lambda: events.append(
-            "release_b12x_profile_state"
-        ),
+        _prepare_b12x_profile_state=lambda: events.append("prepare_b12x_profile_state"),
+        _release_b12x_profile_state=lambda: events.append("release_b12x_profile_state"),
         vllm_config=SimpleNamespace(
             compilation_config=SimpleNamespace(
                 cudagraph_mode=gpu_worker.CUDAGraphMode.PIECEWISE,
@@ -234,10 +227,27 @@ def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
         "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", str(int(estimate_graphs))
     )
     monkeypatch.setattr(gpu_worker, "memory_profiling", fake_memory_profiling)
+
+    def final_snapshot(**_kwargs):
+        assert events[-3:] == ["collect", "synchronize", "empty_cache"]
+        events.append("final_snapshot")
+        return SimpleNamespace(free_memory=final_free_memory)
+
+    monkeypatch.setattr(gpu_worker.gc, "collect", lambda: events.append("collect"))
+    monkeypatch.setattr(
+        gpu_worker.torch.accelerator,
+        "synchronize",
+        lambda: events.append("synchronize"),
+    )
+    monkeypatch.setattr(
+        gpu_worker.torch.accelerator,
+        "empty_cache",
+        lambda: events.append("empty_cache"),
+    )
     monkeypatch.setattr(
         gpu_worker,
         "MemorySnapshot",
-        lambda **_kwargs: SimpleNamespace(free_memory=final_free_memory),
+        final_snapshot,
     )
     monkeypatch.setattr(
         gpu_worker,
@@ -260,6 +270,10 @@ def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
         "prepare_b12x_profile_state",
         "profile_cudagraph_memory",
         "release_b12x_profile_state",
+        "collect",
+        "synchronize",
+        "empty_cache",
+        "final_snapshot",
     ]
     applied_graph_estimate = graph_estimate if estimate_graphs else 0
     assert available == expected_available_memory - applied_graph_estimate

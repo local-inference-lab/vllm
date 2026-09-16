@@ -89,7 +89,7 @@ from vllm.v1.worker.startup_plan import (
 )
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
-from vllm.v1.worker.workspace import current_workspace_manager, init_workspace_manager
+from vllm.v1.worker.workspace import init_workspace_manager
 
 from ...model_executor.model_loader import TensorizerLoader
 from .gpu.warmup import warmup_kernels
@@ -612,10 +612,8 @@ class Worker(WorkerBase):
             # Pool-dependent plans are prepared against it with their default
             # configurations and released once the throwaway graphs are gone.
             try:
-                cudagraph_memory_estimate = (
-                    self.model_runner.profile_cudagraph_memory(
-                        self._prepare_b12x_profile_state
-                    )
+                cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory(
+                    self._prepare_b12x_profile_state
                 )
             finally:
                 self._release_b12x_profile_state()
@@ -627,13 +625,20 @@ class Worker(WorkerBase):
             else 0
         )
 
+        # Prepared plans can retain profiling tensors beyond graph teardown.
+        # Reclaim their released allocator blocks before measuring persistence.
+        gc.collect()
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
+
         # Backend and CUDA-graph profiling can initialize communication pools,
         # compiled modules, and other persistent device allocations after the
         # main activation profile. Include their retained footprint before the
         # remaining memory is assigned to production KV cache storage.
         final_profile_snapshot = MemorySnapshot(device=self.device)
         late_persistent_memory = max(
-            profile_result.after_profile.free_memory - final_profile_snapshot.free_memory,
+            profile_result.after_profile.free_memory
+            - final_profile_snapshot.free_memory,
             0,
         )
         self.total_consumed = profile_result.total_consumed + late_persistent_memory
