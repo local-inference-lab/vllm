@@ -22,11 +22,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.b12x import (
-    set_b12x_preparation_provider,
     B12xPreparationUnit,
     B12xWorkload,
-    PreparationResourceUnavailableError,
     get_b12x_bf16_vocab_projection,
+    set_b12x_preparation_provider,
 )
 from vllm.utils.flashinfer import has_flashinfer
 
@@ -133,8 +132,15 @@ class LogitsProcessor(PluggableLayer):
             or not lm_head.weight.is_contiguous()
         ):
             return
+        owner = getattr(lm_head, "_b12x_vocab_projection_owner", None)
+        if owner is not None:
+            self._b12x_vocab_plans = owner._b12x_vocab_plans
+            self._b12x_vocab_heads = owner._b12x_vocab_heads
+            return
         self._b12x_vocab_heads[id(lm_head)] = lm_head
+        object.__setattr__(lm_head, "_b12x_vocab_projection_owner", self)
         set_b12x_preparation_provider(self, self)
+
     def _b12x_vocab_name(self, head: VocabParallelEmbedding, tokens: int) -> str:
         return f"logits.vocab.{id(self):x}.{id(head):x}.m{tokens}"
 
@@ -142,10 +148,14 @@ class LogitsProcessor(PluggableLayer):
         projection = self._b12x_vocab_projection
         assert head is not None and projection is not None
         out_features, in_features = map(int, head.weight.shape)
-        return projection.plan(projection.Caps(
-            device=head.weight.device, max_tokens=rows,
-            in_features=in_features, out_features=out_features,
-        ))
+        return projection.plan(
+            projection.Caps(
+                device=head.weight.device,
+                max_tokens=rows,
+                in_features=in_features,
+                out_features=out_features,
+            )
+        )
 
     def _b12x_vocab_call(self, head: VocabParallelEmbedding, rows: int):
         in_features = int(head.weight.shape[1])
@@ -156,13 +166,16 @@ class LogitsProcessor(PluggableLayer):
             # This is deliberately an isolated representative hidden-state
             # buffer.  The loaded vocabulary matrix remains borrowed.
             source = torch.empty(
-                (rows, in_features), dtype=torch.bfloat16,
+                (rows, in_features),
+                dtype=torch.bfloat16,
                 device=head.weight.device,
             )
 
             def produce() -> None:
                 indices = torch.arange(
-                    source.numel(), device=source.device, dtype=torch.float32,
+                    source.numel(),
+                    device=source.device,
+                    dtype=torch.float32,
                 ).reshape_as(source)
                 source.copy_((indices.remainder(53).sub_(26)).mul_(1 / 32))
 
@@ -177,8 +190,13 @@ class LogitsProcessor(PluggableLayer):
     def _b12x_vocab_plan_for(self, head: VocabParallelEmbedding, rows: int):
         """Reuse a prepared capacity for the unpadded sampled positions."""
         plans = self._b12x_vocab_plans.setdefault(id(head), {})
-        capacity = rows if rows in plans else min(
-            (count for count in plans if count >= rows), default=rows,
+        capacity = (
+            rows
+            if rows in plans
+            else min(
+                (count for count in plans if count >= rows),
+                default=rows,
+            )
         )
         plan = plans.get(capacity)
         if plan is None:
@@ -187,7 +205,9 @@ class LogitsProcessor(PluggableLayer):
         return plan
 
     def get_b12x_preparation_units(
-        self, layer: torch.nn.Module, workload: B12xWorkload,
+        self,
+        layer: torch.nn.Module,
+        workload: B12xWorkload,
     ) -> Sequence[B12xPreparationUnit]:
         if layer is not self:
             return ()
@@ -203,19 +223,23 @@ class LogitsProcessor(PluggableLayer):
                     plan = self._declare_b12x_vocab_plan(head, tokens)
                     plans[tokens] = plan
                 call = self._b12x_vocab_call(head, tokens)
-                requests.append(plan.request(
-                    name=self._b12x_vocab_name(head, tokens),
-                    prepare_call=call,
-                    benchmark_call=call,
-                ))
+                requests.append(
+                    plan.request(
+                        name=self._b12x_vocab_name(head, tokens),
+                        prepare_call=call,
+                        benchmark_call=call,
+                    )
+                )
             if requests:
-                units.append(B12xPreparationUnit(
-                    name="VOCAB_PROJECTION",
-                    key=(id(self), head_id, tuple(sorted(plans))),
-                    requests=tuple(requests),
-                    stage="weights",
-                    autotune=not workload.eager_only,
-                ))
+                units.append(
+                    B12xPreparationUnit(
+                        name="VOCAB_PROJECTION",
+                        key=(id(self), head_id, tuple(sorted(plans))),
+                        requests=tuple(requests),
+                        stage="weights",
+                        autotune=not workload.eager_only,
+                    )
+                )
         return tuple(units)
 
     def forward(
@@ -279,7 +303,9 @@ class LogitsProcessor(PluggableLayer):
                 projection = self._b12x_vocab_projection
                 assert projection is not None
                 binding = projection.bind(
-                    plan, source=flat, weight=lm_head.weight,
+                    plan,
+                    source=flat,
+                    weight=lm_head.weight,
                 )
                 logits = projection.run(binding)
                 return logits.reshape(*hidden_states.shape[:-1], -1)

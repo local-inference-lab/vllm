@@ -13,6 +13,7 @@ uses ``wait_stream``, which CUDA graph capture records as dependency edges.
 """
 
 import os
+from copy import copy
 
 import torch
 from einops import rearrange
@@ -57,6 +58,7 @@ class Glm5NextKDAAttentionBackend(GDNAttentionBackend):
     @classmethod
     def supports_device_cpu_query_lens_mismatch(cls) -> bool:
         return True
+
 
 _GATE_SIDE_STREAM = os.getenv("VLLM_GLM53_KDA_GATE_SIDE_STREAM", "1") != "0"
 _side_streams: dict[int, torch.cuda.Stream] = {}
@@ -104,6 +106,21 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
 
     enable_b12x_kda_decode = True
     b12x_kda_null_state_index = 0
+
+    def __init__(self, config, vllm_config: VllmConfig, prefix: str = "") -> None:
+        quant_config = vllm_config.quant_config
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "fp8"
+            and getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+        ):
+            # Native GLM FP8 exports keep KDA weights in BF16. Their unfused
+            # exclusion names do not always match this fused adapter. ModelOpt
+            # exports describe each projection independently and must retain
+            # that quantization contract. Do not mutate the model-wide config.
+            vllm_config = copy(vllm_config)
+            vllm_config.quant_config = None
+        super().__init__(config, vllm_config, prefix)
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         if (

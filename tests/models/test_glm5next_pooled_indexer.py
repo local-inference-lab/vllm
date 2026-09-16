@@ -740,8 +740,13 @@ def test_glm53_decode_table_capacity_uses_batched_token_limit() -> None:
     indexer.max_seqs = 16
     indexer.max_model_len = 4096
     indexer.dcp_world_size = 1
+    published = {}
+
+    def publish(*args, **kwargs):
+        published.update(kwargs)
+
     indexer.indexer_op = SimpleNamespace(
-        max_model_len=4096 // 4, set_b12x_index_cache=lambda *args, **kwargs: None
+        max_model_len=4096 // 4, set_b12x_index_cache=publish
     )
 
     indexer.bind_main_kv_cache(main)
@@ -749,6 +754,78 @@ def test_glm53_decode_table_capacity_uses_batched_token_limit() -> None:
     assert indexer._decode_block_table.shape[0] == indexer.max_tokens
     assert indexer._decode_block_table.shape[0] > indexer.max_seqs * (5 + 1)
     assert indexer.indexer_op.max_model_len == 4096 // 4
+    assert published["num_q_heads"] == 32
+    assert published["max_page_table_width"] == indexer._pool_block_table.shape[1]
+
+
+def test_b12x_c4_declaration_matches_glm_query_and_page_table_layout() -> None:
+    from vllm.models.deepseek_v4.nvidia import b12x_indexer as c4
+
+    indexer = c4.B12xC4SparseIndexer.__new__(c4.B12xC4SparseIndexer)
+    nn.Module.__init__(indexer)
+    indexer._index_num_q_heads = 32
+    indexer._index_max_page_table_width = 4104
+    indexer._index_cache = torch.empty((1, 64, 132), dtype=torch.uint8)
+    indexer.topk_tokens = 512
+    fake_module = SimpleNamespace(
+        invocation_from_descriptors=lambda caps, operands: operands
+    )
+    indexer._b12x_indexer = fake_module
+    caps = SimpleNamespace(
+        max_q_rows=8192, max_page_table_width=4104, num_q_heads=32, mode="prefill"
+    )
+
+    invocation = indexer._invocation(caps, scores=False)
+
+    assert invocation["q_fp8"]["shape"][1:] == (32, 128)
+    assert invocation["page_table"]["shape"] == (8192, 4104)
+    assert invocation["page_table"]["strides"] == (0, 1)
+
+
+def test_b12x_c4_replans_after_page_table_width_changes() -> None:
+    from vllm.models.deepseek_v4.nvidia import b12x_indexer as c4
+
+    plans = []
+    indexer = c4.B12xC4SparseIndexer.__new__(c4.B12xC4SparseIndexer)
+    nn.Module.__init__(indexer)
+    indexer._index_num_q_heads = 32
+    indexer._index_max_page_table_width = 4
+    indexer._score_output = False
+    indexer._index_cache = torch.empty((1, 64, 132), dtype=torch.uint8)
+    indexer.topk_tokens = 512
+    indexer.max_model_len = 256
+    indexer.topk_indices_buffer = torch.empty((1, 512), dtype=torch.int32)
+    indexer._plans = {}
+
+    def make_plan(caps, invocation):
+        plans.append(caps)
+        return caps
+
+    indexer._b12x_indexer = SimpleNamespace(
+        Caps=lambda **caps: SimpleNamespace(**caps),
+        plan=make_plan,
+        invocation_from_descriptors=lambda caps, operands: operands,
+    )
+
+    old_plan = indexer._plan_for("decode", 1)
+    indexer.set_b12x_index_cache(
+        indexer._index_cache, num_q_heads=32, max_page_table_width=8
+    )
+    new_plan = indexer._plan_for("decode", 1)
+
+    assert old_plan is not new_plan
+    assert new_plan.max_page_table_width == 8
+    assert len(plans) == 2
+
+
+def test_deepseek_c4_default_page_table_width_is_unchanged() -> None:
+    from vllm.models.deepseek_v4.nvidia import b12x_indexer as c4
+
+    indexer = c4.B12xC4SparseIndexer.__new__(c4.B12xC4SparseIndexer)
+    indexer.max_model_len = 262_144
+    indexer._index_max_page_table_width = None
+
+    assert indexer._max_page_table_width == 4096
 
 
 def test_glm53_selector_capacity_tracks_auto_fit_max_model_len() -> None:
@@ -878,7 +955,9 @@ def test_glm53_packed_tail_scores_through_existing_c4_indexer() -> None:
         active_width=torch.ones(1, dtype=torch.int32, device=device),
         output_indices=output,
     )
-    plan = module.plan(caps, invocation=module.invocation_from_tensors(caps, **operands))
+    plan = module.plan(
+        caps, invocation=module.invocation_from_tensors(caps, **operands)
+    )
     scratch = tuple(
         torch.empty(spec.shape, dtype=spec.dtype, device=device)
         for spec in plan.scratch_specs()
@@ -901,6 +980,51 @@ def test_glm53_packed_tail_scores_through_existing_c4_indexer() -> None:
     torch.accelerator.synchronize()
     assert torch.accelerator.memory_allocated() == allocated
     assert set(output[0, :2].tolist()) == {0, 1}
+
+
+def test_b12x_c4_indexers_name_their_preparation_requests_per_layer(
+    monkeypatch,
+) -> None:
+    """GLM builds one C4 indexer per sparse layer without a prefixed k_cache.
+
+    Startup preparation rejects the whole model when two requests share a name,
+    so each indexer must carry its layer's prefix into its request names.
+    """
+    from vllm.models.deepseek_v4.nvidia import b12x_indexer as c4
+
+    monkeypatch.setattr(c4, "_require_b12x_indexer", lambda: SimpleNamespace())
+
+    def make(k_cache, prefix=None):
+        return c4.B12xC4SparseIndexer(
+            k_cache,
+            quant_block_size=128,
+            scale_fmt="ue8m0",
+            topk_tokens=4,
+            head_dim=128,
+            max_model_len=64,
+            max_total_seq_len=64,
+            topk_indices_buffer=torch.empty((8, 4), dtype=torch.int32),
+            skip_k_cache_insert=True,
+            compress_ratio=4,
+            prefix=prefix,
+        )
+
+    first = make(None, prefix="model.layers.3.self_attn.indexer")
+    second = make(None, prefix="model.layers.7.self_attn.indexer")
+
+    assert first._request_name("decode", 1) == (
+        "model.layers.3.self_attn.indexer.c4_indexer.decode.m1"
+    )
+    assert first._request_name("decode", 1) != second._request_name("decode", 1)
+
+    prefixed_cache = make(SimpleNamespace(prefix="layers.1.attn", kv_cache=None))
+    assert prefixed_cache._request_name("prefill", 8) == (
+        "layers.1.attn.c4_indexer.prefill.m8"
+    )
+    anonymous = [make(None), make(None)]
+    assert anonymous[0]._request_name("decode", 1) != anonymous[1]._request_name(
+        "decode", 1
+    )
 
 
 def test_glm53_pool_write_matches_fp8_reference() -> None:
@@ -1295,9 +1419,7 @@ def test_glm53_pool_expansion_appends_only_the_incomplete_tail() -> None:
     expand_pool_ids(pool_ids, positions, output)
 
     assert torch.all(output[0, 3:] == -1)
-    assert torch.equal(
-        output[0, :3].cpu(), torch.tensor([0, 1, 2], dtype=torch.int32)
-    )
+    assert torch.equal(output[0, :3].cpu(), torch.tensor([0, 1, 2], dtype=torch.int32))
     assert torch.equal(output[1, :8].cpu(), torch.tensor([4, 5, 6, 7, 0, 1, 2, 3]))
     assert torch.all(output[1, 8:] == -1)
     assert torch.equal(output[2, :2048].cpu(), torch.arange(2048, dtype=torch.int32))
