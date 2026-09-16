@@ -710,6 +710,51 @@ def _packed_main_cache(
     return raw, main
 
 
+def test_glm53_selector_constructs_with_matching_preparation_heads(
+    monkeypatch: pytest.MonkeyPatch, default_vllm_config
+) -> None:
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+
+    dsa_indexer = pytest.importorskip("b12x.attention.dsa_indexer")
+    for module in (linear, parameter):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(dsa_indexer, "is_supported", lambda: True)
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8, max_num_seqs=2),
+        model_config=SimpleNamespace(max_model_len=4096),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1, cp_kv_cache_interleave_size=1
+        ),
+        speculative_config=None,
+    )
+    indexer = Glm5NextPooledIndexer(
+        config,
+        SimpleNamespace(
+            index_topk=2048,
+            index_n_heads=32,
+            index_head_dim=128,
+            index_kpool=4,
+            qk_rope_head_dim=0,
+        ),
+        hidden_size=128,
+        q_lora_rank=128,
+        quant_config=None,
+        cache_config=SimpleNamespace(block_size=256),
+        topk_indices_buffer=torch.empty(8, 2051, dtype=torch.int32),
+        pool_topk_indices_buffer=torch.empty(8, 512, dtype=torch.int32),
+        main_layer_name="model.layers.0.self_attn",
+        prefix="model.layers.0.self_attn.indexer",
+    )
+    _, main = _packed_main_cache(
+        device=torch.device("cpu"), blocks=2, layers=1, block_size=256, layer=0
+    )
+    indexer.bind_main_kv_cache(main)
+
+    assert indexer.indexer_op._num_q_heads == indexer._q_fp8.shape[1] == 32
+
+
 def test_glm53_packed_tail_accepts_nvfp4_main_record() -> None:
     _, main = _packed_main_cache(
         device=torch.device("cpu"),

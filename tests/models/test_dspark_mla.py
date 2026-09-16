@@ -107,6 +107,7 @@ def test_v41_dspark_retains_each_markov_embedding_during_graph_replay(
         pytest.skip("native b12x Markov embedding requires SM12x")
     monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", "0")
     from b12x._lib.runtime_control import kernel_resolution_guard
+
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
     from vllm.models.deepseek_v4_1.nvidia.dspark import (
         DSparkMarkovHead as V41DSparkMarkovHead,
@@ -134,14 +135,16 @@ def test_v41_dspark_retains_each_markov_embedding_during_graph_replay(
 
         graph = torch.cuda.CUDAGraph()
         with kernel_resolution_guard("V4.1 retained DSpark Markov rows"):
-            with workspace.collect_cuda_graph_capture_resources() as retained:
-                with torch.cuda.graph(graph):
-                    captured = [head.embed(ids) for ids in token_ids]
+            with (
+                workspace.collect_cuda_graph_capture_resources() as retained,
+                torch.cuda.graph(graph),
+            ):
+                captured = [head.embed(ids) for ids in token_ids]
             for offset in (1, 19):
                 for step, ids in enumerate(token_ids):
                     ids.add_(offset + step).remainder_(vocab)
                 graph.replay()
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 for rows, ids in zip(captured, token_ids):
                     torch.testing.assert_close(
                         rows,
@@ -250,8 +253,8 @@ def test_v41_context_graph_replay_matches_checkpoint_projection(
     from contextlib import nullcontext
 
     from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.attention import compressed_sparse_mla
     from b12x.preparation import PreparationSession
-    from vllm.utils.b12x import B12xWorkload, b12x_unit_providers
 
     from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
     from vllm.models.deepseek_v4_1.b12x_layers import (
@@ -263,6 +266,7 @@ def test_v41_context_graph_replay_matches_checkpoint_projection(
         DSparkDeepseekV4Model,
         _ContextKVProjection,
     )
+    from vllm.utils.b12x import B12xWorkload, b12x_unit_providers
     from vllm.v1.worker import workspace
     from vllm.v1.worker.gpu import cudagraph_utils
 
@@ -351,7 +355,9 @@ def test_v41_context_graph_replay_matches_checkpoint_projection(
         session = PreparationSession(device=device, autotune=False)
         workload = B12xWorkload(
             stage="state",
-            token_counts=tuple(context.manager.compilation_config.cudagraph_capture_sizes),
+            token_counts=tuple(
+                context.manager.compilation_config.cudagraph_capture_sizes
+            ),
             fixed_token_counts=(),
             output_dtype=torch.bfloat16,
             max_tokens=8,
@@ -384,10 +390,13 @@ def test_v41_context_graph_replay_matches_checkpoint_projection(
                     # New allocations on every call ensure graphs never bind the
                     # target's transient auxiliary outputs.
                     aux = [
-                        torch.randn(rows, 128, dtype=torch.bfloat16, generator=generator)
+                        torch.randn(
+                            rows, 128, dtype=torch.bfloat16, generator=generator
+                        )
                         for _ in range(2)
                     ]
-                    positions.fill_(1000000)  # stale padding must not read this RoPE row
+                    # Stale padding must not read this RoPE row.
+                    positions.fill_(1000000)
                     positions[:rows].copy_(torch.arange(rows, dtype=torch.int64) + rows)
                     slots[0].copy_(torch.arange(8, dtype=torch.int64) + 32)
                     slots[1].copy_(torch.arange(8, dtype=torch.int64) + 64)
@@ -402,11 +411,13 @@ def test_v41_context_graph_replay_matches_checkpoint_projection(
                         # Oracle uses the original fused checkpoint projection.
                         kv = attn.kv_norm(attn.fused_wqa_wkv(main_x)[:, 256:])
                         group = 0 if layer_groups is None else layer_groups[i]
-                        attn.insert_context_kv(kv, positions[:rows], slots[group, :rows])
+                        attn.insert_context_kv(
+                            kv, positions[:rows], slots[group, :rows]
+                        )
                         expected.append(attn.swa_cache_layer.kv_cache.clone())
                         attn.swa_cache_layer.kv_cache.fill_(91)
                     context.run(aux, rows)
-                    torch.cuda.synchronize()
+                    torch.accelerator.synchronize()
                     torch.testing.assert_close(hidden[:rows], main_x, rtol=0, atol=0)
                     for layer, cache in zip(model.layers, expected):
                         torch.testing.assert_close(
