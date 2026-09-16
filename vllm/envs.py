@@ -207,7 +207,10 @@ if TYPE_CHECKING:
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
     VLLM_PLE_CPU_OFFLOAD: bool = False
-    VLLM_PLE_TABLE_MEMORY: Literal["ram", "disk"] | None = None
+    VLLM_PLE_TABLE_MEMORY: Literal["ram", "disk", "shared"] | None = None
+    VLLM_PLE_SHARED_TABLE_DIR: str = "/dev/shm/vllm-ple"
+    VLLM_PLE_SHARED_TABLE_ROLE: Literal["auto", "populate", "attach"] = "auto"
+    VLLM_PLE_SHARED_TABLE_LOCK_TIMEOUT_S: int = 3600
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
@@ -1712,11 +1715,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PLE_TABLE_MEMORY": env_with_choices(
         "VLLM_PLE_TABLE_MEMORY",
         None,
-        ["ram", "disk"],
+        ["ram", "disk", "shared"],
     ),
     # Fallback when neither additional_config nor VLLM_PLE_TABLE_MEMORY selects
     # a policy: store PLE table payloads in CUDA-mapped host memory.
     "VLLM_PLE_CPU_OFFLOAD": lambda: bool(int(os.getenv("VLLM_PLE_CPU_OFFLOAD", "0"))),
+    # "shared" PLE tables: tmpfs directory holding one table per checkpoint
+    # and TP rank that independent same-host processes map and register.
+    "VLLM_PLE_SHARED_TABLE_DIR": lambda: os.getenv(
+        "VLLM_PLE_SHARED_TABLE_DIR", "/dev/shm/vllm-ple"
+    ),
+    # auto: populate when no complete table exists, else attach.
+    # attach: fail fast without a complete table.  populate: always rewrite.
+    "VLLM_PLE_SHARED_TABLE_ROLE": env_with_choices(
+        "VLLM_PLE_SHARED_TABLE_ROLE",
+        "auto",
+        ["auto", "populate", "attach"],
+    ),
+    # Seconds to wait for another process to finish populating the table.
+    "VLLM_PLE_SHARED_TABLE_LOCK_TIMEOUT_S": lambda: int(
+        os.getenv("VLLM_PLE_SHARED_TABLE_LOCK_TIMEOUT_S", "3600")
+    ),
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_INT4", "0"))
