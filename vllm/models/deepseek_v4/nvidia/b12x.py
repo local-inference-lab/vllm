@@ -636,6 +636,7 @@ def _run_compressed_sparse_mla(
         q=q,
         swa_k_cache=swa_k_cache,
         indexed_k_cache=indexed_k_cache,
+        attn_sink=attn_sink[:heads],
         out=output,
     )
     indexed_width_serving = (
