@@ -76,11 +76,6 @@ from vllm.transformers_utils.configs.qwen4_exp import (
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
-from vllm.transformers_utils.configs.qwen4_exp import (
-    Qwen4ExpTextConfig,
-)
-from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
-
 from . import hc_prefill
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 
@@ -568,7 +563,7 @@ class Qwen4ExpModel(nn.Module):
                 input_ids=input_ids,
                 query_start_loc=query_start_loc,
                 ngram_context=ngram_context,
-        ple_prefetched=ple_prefetched,
+                ple_prefetched=ple_prefetched,
                 hc_owner=hc_owner,
             )
             if deepstack_input_embeds is not None and layer_idx < len(

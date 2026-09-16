@@ -99,20 +99,29 @@ class RowOwnership:
         if tensor.shape[0] != self.rows // 4:
             raise ValueError("Qwen HC owned tensor has the wrong row count")
         self.gathers += 1
-        return self.group.all_gather(tensor.contiguous(), dim=0)
+        source = tensor.contiguous()
+        output = source.new_empty((self.rows, *source.shape[1:]))
+        self.group.all_gather(output, source)
+        return output
 
     def reduce(self, tensor: torch.Tensor) -> torch.Tensor:
         if tensor.shape[0] != self.rows:
             raise ValueError("Qwen HC reduction requires full TP partial rows")
         self.reductions += 1
-        return self.group.reduce_scatter(tensor.contiguous(), dim=0)
+        source = tensor.contiguous()
+        output = source.new_empty((self.rows // 4, *source.shape[1:]))
+        self.group.reduce_scatter(output, source)
+        return output
 
 
 def create(model, rows: int) -> RowOwnership | None:
     if model.hc_prefill_mode != "shard":
         return None
     group = get_tp_group()
-    return RowOwnership(rows, group.rank_in_group, group)
+    comm = getattr(group.device_communicator, "pynccl_comm", None)
+    if comm is None or not comm.available or comm.disabled:
+        raise RuntimeError("Qwen HC ownership requires the TP NCCL communicator")
+    return RowOwnership(rows, group.rank_in_group, comm)
 
 
 def report(model, owner: RowOwnership | None, rows: int) -> None:
