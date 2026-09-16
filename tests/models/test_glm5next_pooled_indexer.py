@@ -1027,6 +1027,47 @@ def test_b12x_c4_indexers_name_their_preparation_requests_per_layer(
     )
 
 
+def test_c4_preparation_names_do_not_collide_without_cache_owner(monkeypatch):
+    from b12x.attention import dsa_indexer
+
+    from vllm.models.deepseek_v4.nvidia import b12x_indexer
+    from vllm.utils.b12x import B12xWorkload
+
+    monkeypatch.setattr(b12x_indexer, "_require_b12x_indexer", lambda: dsa_indexer)
+    workload = B12xWorkload(
+        stage="state",
+        token_counts=(1, 8),
+        fixed_token_counts=(1,),
+        output_dtype=torch.bfloat16,
+        max_tokens=8,
+        max_seqs=1,
+        max_model_len=1024,
+    )
+    owners, names = [], []
+    for _ in range(2):
+        owner = b12x_indexer.B12xC4SparseIndexer(
+            None,
+            128,
+            "ue8m0",
+            512,
+            128,
+            1024,
+            1024,
+            torch.empty((8, 512), dtype=torch.int32),
+            skip_k_cache_insert=True,
+            compress_ratio=4,
+        )
+        owners.append(owner)
+        owner.set_b12x_index_cache(
+            torch.empty((16, 64, 132), dtype=torch.uint8), num_q_heads=32
+        )
+        (unit,) = owner.get_b12x_preparation_units(owner, workload)
+        request_names = [request.name for request in unit.requests]
+        assert request_names
+        names.extend(request_names)
+    assert len(names) == len(set(names))
+
+
 def test_glm53_pool_write_matches_fp8_reference() -> None:
     device = _require_glm_gpu()
     generator = torch.Generator(device=device).manual_seed(53)

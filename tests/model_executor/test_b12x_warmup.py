@@ -375,6 +375,9 @@ def test_profile_prepares_collectives_and_releases_only_fresh_plans(
     installed = _Request(
         "installed", plan=SimpleNamespace(name="installed", prepared=object())
     )
+    for request in (plain, collective, installed):
+        assert isinstance(request.plan, SimpleNamespace)
+        request.plan.scratch_specs = lambda: ()
 
     class Job:
         session = SimpleNamespace(_pool=None)
