@@ -29,12 +29,12 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.b12x import (
-    set_b12x_preparation_provider,
     B12xPreparationUnit,
     B12xWorkload,
     PreparationResourceUnavailableError,
     get_b12x_fused_moe,
     reuse_packed_weight_storage,
+    set_b12x_preparation_provider,
 )
 
 logger = init_logger(__name__)
@@ -144,9 +144,7 @@ def _prepared_moe_call_factory(
                 dtype=prepared.plan.activation.io_dtype,
                 device=device,
             )
-            activation_source = torch.empty_like(hidden).normal_(
-                mean=0.0, std=0.125
-            )
+            activation_source = torch.empty_like(hidden).normal_(mean=0.0, std=0.125)
             output = torch.empty(hidden.shape, dtype=output_dtype, device=device)
             route_rows = torch.arange(
                 tokens, dtype=torch.int32, device=device
@@ -154,9 +152,13 @@ def _prepared_moe_call_factory(
             route_columns = torch.arange(
                 topk, dtype=torch.int32, device=device
             ).unsqueeze(0)
-            route_ids = (route_rows + route_columns).remainder_(
-                int(prepared.num_experts)
-            ).contiguous()
+            # Distribute routed pairs across the expert set. Sliding adjacent
+            # rows by one expert biases small-batch tuning toward narrow grids.
+            route_ids = (
+                (route_rows * topk + route_columns)
+                .remainder_(int(prepared.num_experts))
+                .contiguous()
+            )
             route_logits = (
                 route_rows.to(dtype=torch.float32) * 0.03125
                 + route_columns.to(dtype=torch.float32) * 0.125
@@ -190,8 +192,6 @@ def _is_current_stream_capturing() -> bool:
     return bool(is_capturing is not None and is_capturing())
 
 
-
-
 def _normalize_topk_weights(topk_weights: torch.Tensor) -> torch.Tensor:
     if topk_weights.dtype == torch.float32 and topk_weights.is_contiguous():
         return topk_weights
@@ -200,8 +200,6 @@ def _normalize_topk_weights(topk_weights: torch.Tensor) -> torch.Tensor:
             "b12x MoE topk_weights normalization would allocate during CUDA capture"
         )
     return topk_weights.to(dtype=torch.float32).contiguous()
-
-
 
 
 def _replace_parameter_with_empty(
@@ -592,7 +590,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         return plan
 
     def _plan_for_tokens(
-        self, tokens: int, *, activation: MoEActivation, apply_router_weight_on_input: bool
+        self,
+        tokens: int,
+        *,
+        activation: MoEActivation,
+        apply_router_weight_on_input: bool,
     ) -> Any:
         """Reuse the declared prefill capacity and exact graph variants."""
         plan = self._prepared_plan(
@@ -611,6 +613,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
     def get_b12x_preparation_units(
         self, layer: torch.nn.Module, workload: B12xWorkload
     ) -> Sequence[B12xPreparationUnit]:
+        from b12x.preparation import FrozenMapping
+
         if workload.stage != "weights":
             return ()
         if workload.output_dtype != self.moe_config.in_dtype:
@@ -636,6 +640,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 ),
                 routing=fused_moe.RoutingSpec(
                     apply_router_weight_on_input=route_on_input,
+                ),
+                # Tuning choices depend on the routing corpus. Invalidate only
+                # MoE choices when its distribution changes, not compiled code
+                # or unrelated component selections.
+                invocation=FrozenMapping(
+                    {"tuning_route_pattern": "cyclic_disjoint_topk"}
                 ),
             )
             self._plan = plan
@@ -686,8 +696,13 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 benchmark_call=benchmark_call,
             )
         key = (
-            self._quant_mode, self._source_format, self._w13_layout,
-            activation, route_on_input, counts, workload.output_dtype,
+            self._quant_mode,
+            self._source_format,
+            self._w13_layout,
+            activation,
+            route_on_input,
+            counts,
+            workload.output_dtype,
         )
         return (
             B12xPreparationUnit(
@@ -770,7 +785,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         # during materialization.  Preserve the caller's representation: a
         # conversion here would allocate during capture and would silently
         # discard the prepared int64 path.
-        if topk_ids.dtype not in (torch.int32, torch.int64) or not topk_ids.is_contiguous():
+        if (
+            topk_ids.dtype not in (torch.int32, torch.int64)
+            or not topk_ids.is_contiguous()
+        ):
             raise TypeError("b12x MoE topk_ids must be contiguous int32 or int64")
         topk_weights = _normalize_topk_weights(topk_weights)
         plan = self._plan_for_tokens(
@@ -796,15 +814,15 @@ class B12xExperts(mk.FusedMoEExpertsModular):
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
         raise NotImplementedError("LoRA is not supported for B12xExperts")
 
+
 def _register_b12x_moe_output_collective(
     layer: torch.nn.Module, *, hidden_size: int
 ) -> None:
     """Describe the rank-local routed-MoE output to the existing TP transport."""
-    from vllm.distributed.parallel_state import register_b12x_collective_describer
     from vllm.distributed.device_communicators.b12x_pcie_all_reduce import (
         B12xPcieInvocation,
     )
-
+    from vllm.distributed.parallel_state import register_b12x_collective_describer
 
     def describe(workload):
         prefix = layer.layer_name

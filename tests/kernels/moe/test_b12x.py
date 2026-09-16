@@ -835,7 +835,12 @@ def test_b12x_moe_uses_minimax_swiglu_parameters() -> None:
     assert experts._swiglu_params(config.activation) == (7.0, 1.702, 1.0)
 
 
-def test_b12x_moe_candidate_calls_share_bounded_trial_storage() -> None:
+@pytest.mark.parametrize(
+    "tokens,topk,num_experts", ((4, 2, 8), (8, 8, 288), (64, 8, 288))
+)
+def test_b12x_moe_candidate_calls_share_bounded_trial_storage(
+    tokens: int, topk: int, num_experts: int
+) -> None:
     """Repeated candidate calls reuse one activation/output tensor set (a
     weakref cache), while each call's scratch is a fresh, correctly shaped
     trial-only allocation rather than a caller-owned workspace region."""
@@ -858,12 +863,12 @@ def test_b12x_moe_candidate_calls_share_bounded_trial_storage() -> None:
     prepared = SimpleNamespace(
         device=torch.device("cpu"),
         hidden_size=16,
-        num_experts=8,
+        num_experts=num_experts,
         plan=SimpleNamespace(activation=SimpleNamespace(io_dtype=torch.bfloat16)),
     )
     factory = b12x._prepared_moe_call_factory(
-        tokens=4,
-        topk=2,
+        tokens=tokens,
+        topk=topk,
         prepared=prepared,
         output_dtype=torch.bfloat16,
     )
@@ -884,6 +889,16 @@ def test_b12x_moe_candidate_calls_share_bounded_trial_storage() -> None:
     assert first_state.bound["scratch"][0] is not second_state.bound["scratch"][0]
     assert not first_call.capture_safe
     assert not second_call.capture_safe
+    first_call.restore()
+    ids = first_state.bound["topk_ids"]
+    # Adjacent rows must not collapse a top-k batch onto tokens+topk-1
+    # experts: that understates the parallel work of distributed routing.
+    assert ids.unique().numel() == min(tokens * topk, num_experts)
+    assert all(row.unique().numel() == topk for row in ids)
+    assert torch.isfinite(first_state.bound["a"]).all()
+    torch.testing.assert_close(
+        first_state.bound["topk_weights"].sum(dim=1), torch.ones(tokens)
+    )
 
 
 def test_b12x_source_release_preserves_prepared_storage_owner() -> None:
