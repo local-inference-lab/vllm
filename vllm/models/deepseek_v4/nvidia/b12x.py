@@ -1073,7 +1073,10 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
             attn_sink_present=False,
             return_lse=False,
             lse_scale="base2",
-            output_mode="internal",
+            # Serving runs with a caller-owned out tensor (module.run(out=output));
+            # the profile reservation must declare the same output ownership or
+            # _run_compressed_sparse_mla's plan identity diverges from reserve.
+            output_mode="provided",
         )
         plan = module.plan(
             module.Caps(
