@@ -202,9 +202,13 @@ class B12xC4SparseIndexer(nn.Module):
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
         compress_ratio: int = 1,
+        num_q_heads: int | None = None,
     ) -> None:
         super().__init__()
         del quant_block_size, scale_fmt, max_total_seq_len
+        self._declared_num_q_heads = (
+            int(num_q_heads) if num_q_heads is not None else None
+        )
         if not skip_k_cache_insert:
             raise ValueError("B12x C4 indexing requires a model-owned cache writer.")
         if use_fp4_cache:
@@ -306,7 +310,11 @@ class B12xC4SparseIndexer(nn.Module):
             )
     @property
     def _num_q_heads(self) -> int:
-        return self._index_num_q_heads or int(getattr(self.k_cache, "num_q_heads", 1))
+        return (
+            self._index_num_q_heads
+            or self._declared_num_q_heads
+            or int(getattr(self.k_cache, "num_q_heads", 1))
+        )
 
     def _invocation(self, caps, *, scores: bool):
         rows, width = caps.max_q_rows, caps.max_page_table_width

@@ -975,6 +975,7 @@ class DeepseekV4Indexer(nn.Module):
             skip_k_cache_insert=True,
             use_fp4_cache=self.use_fp4_kv,
             compress_ratio=self.compress_ratio,
+            num_q_heads=self.n_head,
         )
 
         # None on ROCm — maybe_execute_in_parallel falls back to sequential.
