@@ -10,7 +10,7 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.distributed import get_pp_group
+from vllm.distributed import get_pp_group, tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
@@ -76,11 +76,13 @@ from vllm.transformers_utils.configs.qwen4_exp import (
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
-from ..config import Qwen4ExpConfig
+from vllm.transformers_utils.configs.qwen4_exp import (
+    Qwen4ExpTextConfig,
+)
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+
+from . import hc_prefill
 from .hyperconnection import GatedResidual, HyperConnectionConfig
-from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
-from .ple_layer import Qwen4ExpPLELayer
-from .qsa import Qwen4ExpQSAAttention
 
 
 def without_modelopt_fp4(
@@ -160,13 +162,21 @@ _HC_WEIGHTS_MAPPER = WeightsMapper(
 class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
     """Qwen3Next MoE with Qwen4Exp HC validation."""
 
-    def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        *,
+        reduce_results: bool = True,
+    ) -> None:
         parallel_config = vllm_config.parallel_config
         if parallel_config.use_sequence_parallel_moe:
             raise NotImplementedError(
                 "Qwen4Exp HC does not support sequence-parallel MoE"
             )
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        super().__init__(
+            vllm_config=vllm_config, prefix=prefix, reduce_results=reduce_results
+        )
         config = vllm_config.model_config.hf_text_config
         self.n_shared_experts = int(config.shared_expert_intermediate_size > 0)
 
@@ -191,6 +201,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
             raise NotImplementedError(
                 "Qwen4Exp HC does not support sequence-parallel MoE"
             )
+        self.defer_hc_reductions = (
+            envs.VLLM_QWEN3_8_HC_PREFILL_MODE != "off"
+            and self.layer_idx < config.num_hidden_layers
+        )
         self.ple: Qwen4ExpPLELayer | None = None
         ple_layer_ids = config.ple_layer_ids
         if (self.layer_idx + 1) in ple_layer_ids:
@@ -223,6 +237,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                     cache_config=cache_config,
                     quant_config=quant_config,
                     prefix=f"{prefix}.self_attn",
+                    reduce_results=not self.defer_hc_reductions,
                 )
             else:
                 self.self_attn = Qwen4ExpQSAAttention(
@@ -231,6 +246,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                     layer_id=self.layer_idx,
                     quant_config=quant_config,
                     prefix=f"{prefix}.self_attn",
+                    reduce_results=not self.defer_hc_reductions,
                 )
         else:
             raise ValueError(f"Invalid layer_type {layer_type}")
@@ -252,6 +268,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                reduce_results=not self.defer_hc_reductions,
             )
 
         hc_config = HyperConnectionConfig(
@@ -281,8 +298,13 @@ class Qwen4ExpDecoderLayer(nn.Module):
         input_ids: torch.Tensor | None,
         query_start_loc: torch.Tensor | None,
         ngram_context: torch.Tensor | None,
+        ple_prefetched: bool = False,
+        output_indices: torch.Tensor | None = None,
+        hc_owner: hc_prefill.RowOwnership | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         attn_hc = self.attn_hyper_connection
+        if hc_owner is not None and output_indices is not None:
+            raise ValueError("Qwen HC ownership cannot compact decode outputs")
         if self.ple is not None:
             # PLE adds directly to the multi-stream state, so pending HC state
             # must be materialized before the addition.
@@ -292,6 +314,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 )
                 prev_block_output = prev_injection = None
 
+        if hc_owner is not None:
+            hidden_states = hc_owner.gather(hidden_states)
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
             hidden_states = hidden_states + self.ple(
@@ -302,6 +326,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
 
         # Fuse a pending combine with this HC module's mix when possible.
+        if hc_owner is not None:
+            hidden_states = hc_owner.local(hidden_states)
         if prev_block_output is not None and prev_injection is not None:
             hidden_states, block_input, injection = attn_hc.combine_and_mix(
                 hidden_states, prev_block_output, prev_injection
@@ -309,6 +335,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
         else:
             hidden_states, block_input, injection = attn_hc.mix(hidden_states)
 
+        if hc_owner is not None:
+            block_input = hc_owner.gather(block_input)
         if self.layer_type == "linear_attention":
             attn_out = self.linear_attn(hidden_states=block_input)
         elif self.layer_type == "full_attention":
@@ -319,11 +347,26 @@ class Qwen4ExpDecoderLayer(nn.Module):
         else:
             raise ValueError("Invalid layer_type")
 
+        if self.defer_hc_reductions:
+            attn_out = (
+                hc_owner.reduce(attn_out)
+                if hc_owner is not None
+                else tensor_model_parallel_all_reduce(attn_out)
+            )
+
         mlp_hc = self.mlp_hyper_connection
         hidden_states, block_input, injection = mlp_hc.combine_and_mix(
             hidden_states, attn_out, injection
         )
+        if hc_owner is not None:
+            block_input = hc_owner.gather(block_input)
         mlp_out = self.mlp(block_input)
+        if self.defer_hc_reductions:
+            mlp_out = (
+                hc_owner.reduce(mlp_out)
+                if hc_owner is not None
+                else tensor_model_parallel_all_reduce(mlp_out)
+            )
         return hidden_states, mlp_out, injection
 
 
@@ -464,7 +507,16 @@ class Qwen4ExpModel(nn.Module):
                 dtype=vllm_config.model_config.dtype,
             )
         else:
-            self._mtp_hidden_buffer = None
+            self.register_buffer("_mtp_hidden_buffer", None, persistent=False)
+        hc_prefill.configure(self, vllm_config, envs.VLLM_QWEN3_8_HC_PREFILL_MODE)
+        if self.hc_prefill_mode != "off":
+            from vllm.model_executor.layers.linear import (
+                _register_b12x_row_parallel_collective,
+            )
+
+            _register_b12x_row_parallel_collective(
+                self, f"{prefix}.hc_block_output", config.hidden_size, True
+            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -478,6 +530,7 @@ class Qwen4ExpModel(nn.Module):
         query_start_loc: torch.Tensor | None = None,
         ngram_context: torch.Tensor | None = None,
         deepstack_input_embeds: IntermediateTensors | None = None,
+        hc_prefill_eager: bool = False,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -492,6 +545,14 @@ class Qwen4ExpModel(nn.Module):
                 raise ValueError("pipeline stage requires intermediate tensors")
             hidden_states = intermediate_tensors["hidden_states"]
 
+        hc_owner = (
+            hc_prefill.create(self, hidden_states.shape[0])
+            if hc_prefill_eager
+            else None
+        )
+        full_rows = hidden_states.shape[0]
+        if hc_owner is not None:
+            hidden_states = hc_owner.local(hidden_states)
         block_output = None
         injection = None
         last_layer = None
@@ -507,6 +568,8 @@ class Qwen4ExpModel(nn.Module):
                 input_ids=input_ids,
                 query_start_loc=query_start_loc,
                 ngram_context=ngram_context,
+        ple_prefetched=ple_prefetched,
+                hc_owner=hc_owner,
             )
             if deepstack_input_embeds is not None and layer_idx < len(
                 deepstack_input_embeds
@@ -548,12 +611,18 @@ class Qwen4ExpModel(nn.Module):
         multi_hidden, sample_hidden_states, _ = final_mixer.combine_and_mix(
             hidden_states, block_output, injection
         )
+        if hc_owner is not None:
+            sample_hidden_states = hc_owner.gather(sample_hidden_states)
+            if self._mtp_hidden_buffer is not None:
+                multi_hidden = hc_owner.gather(multi_hidden)
         if self._mtp_hidden_buffer is not None:
             # Capture the pre-final-mixer multi-stream hidden state
             # [T, hc_count*H] for the MTP drafter (zero extra compute:
             # this tensor is needed by the final mixer regardless).
             num_tokens = multi_hidden.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+        if hc_prefill_eager:
+            hc_prefill.report(self, hc_owner, full_rows)
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -669,6 +738,22 @@ class Qwen4ExpForCausalLM(
     ) -> torch.Tensor | IntermediateTensors:
         # Forward kwargs unchanged so the runner's _maybe_add_ngram_kwargs
         # path (query_start_loc / ngram_context) reaches Qwen4ExpModel.
+        if hc_prefill.eligible(
+            self.model,
+            positions.shape[-1],
+            deepstack=kwargs.get("deepstack_input_embeds") is not None,
+        ):
+            eager_forward: Callable[..., torch.Tensor | IntermediateTensors] = (
+                self.model.forward
+            )
+            return eager_forward(
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                hc_prefill_eager=True,
+                **kwargs,
+            )
         return self.model(
             input_ids,
             positions,

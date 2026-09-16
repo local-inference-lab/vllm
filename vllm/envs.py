@@ -204,6 +204,7 @@ if TYPE_CHECKING:
     VLLM_MTP_NVFP4_LM_HEAD: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_HC_TP: bool = True
+    VLLM_QWEN3_8_HC_PREFILL_MODE: str = "off"
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
@@ -1697,6 +1698,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Shard BF16 HyperConnection projections with FP32 down-projection outputs.
     "VLLM_QWEN3_8_FLASH_NEXT_HC_TP": lambda: bool(
         int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_HC_TP", "1"))
+    "VLLM_QWEN3_8_HC_PREFILL_MODE": lambda: os.getenv(
+        "VLLM_QWEN3_8_HC_PREFILL_MODE", "off"
     ),
     # Gather DCP-sharded C4 records before B12X sparse-MLA prefill. This avoids
     # query replication plus the per-rank LSE combine and is opt-in while the

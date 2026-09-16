@@ -126,7 +126,13 @@ def _should_replicate_misaligned_shared_expert(
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
-    def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        *,
+        reduce_results: bool = True,
+    ):
         super().__init__()
 
         config = vllm_config.model_config.hf_text_config
@@ -215,9 +221,14 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             )
 
         self.experts = FusedMoEFactory(
+<<<<<<< HEAD
             shared_experts=(
                 None if self.replicate_shared_expert else self.shared_expert
             ),
+=======
+            reduce_results=reduce_results,
+            shared_experts=self.shared_expert,
+>>>>>>> 790cba16a9 (Add opt-in Qwen prefill HC token ownership with deferred TP reductions)
             gate=self.gate,
             num_experts=self.n_routed_experts,
             top_k=config.num_experts_per_tok,
