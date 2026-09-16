@@ -49,6 +49,12 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from .config import Qwen3_8FlashNextTextConfig
 from .ple_attn import PLEAttentionBackend, PLEAttentionMetadata
+from .ple_shared_table import (
+    SharedTable,
+    SharedTableConfig,
+    SharedTableGeometry,
+    open_shared_table,
+)
 
 logger = init_logger(__name__)
 
@@ -107,23 +113,83 @@ def _b12x_module(name: str) -> Any:
     return api
 
 
-def _resolve_ple_table_memory(additional_config: Any) -> str:
-    """Translate the public offload policy into a b12x storage mode."""
+def _resolve_ple_table_policy(additional_config: Any) -> str:
+    """Return the public offload policy: device, ram, disk or shared."""
     if isinstance(additional_config, dict) and "ple_table_memory" in additional_config:
         table_memory = additional_config["ple_table_memory"]
     else:
         table_memory = envs.VLLM_PLE_TABLE_MEMORY
         if table_memory is None:
-            return "mapped_host" if envs.VLLM_PLE_CPU_OFFLOAD else "device"
-    if table_memory == "ram":
-        return "mapped_host"
-    if table_memory == "disk":
-        return "io_uring"
-    if table_memory == "device":
-        return "device"
+            return "ram" if envs.VLLM_PLE_CPU_OFFLOAD else "device"
+    if table_memory in {"device", "ram", "disk", "shared"}:
+        return table_memory
     raise ValueError(
         "additional_config.ple_table_memory must be 'device', "
-        f"'ram', or 'disk', got {table_memory!r}"
+        f"'ram', 'disk', or 'shared', got {table_memory!r}"
+    )
+
+
+def _resolve_ple_table_memory(additional_config: Any) -> str:
+    """Translate the public offload policy into a b12x storage mode."""
+    return {
+        "device": "device",
+        "ram": "mapped_host",
+        "disk": "io_uring",
+        # A shared table is mapped-host memory whose bytes another process
+        # may own; b12x sees no difference.
+        "shared": "mapped_host",
+    }[_resolve_ple_table_policy(additional_config)]
+
+
+def _additional_config_value(additional_config: Any, key: str, default: Any) -> Any:
+    if isinstance(additional_config, dict) and key in additional_config:
+        return additional_config[key]
+    return default
+
+
+def _resolve_ple_shared_table(vllm_config: VllmConfig) -> SharedTableConfig | None:
+    """Return the shared-table settings when the policy is ``shared``."""
+    additional_config = vllm_config.additional_config
+    if _resolve_ple_table_policy(additional_config) != "shared":
+        return None
+    model_config = vllm_config.model_config
+    return SharedTableConfig(
+        directory=str(
+            _additional_config_value(
+                additional_config,
+                "ple_shared_table_dir",
+                envs.VLLM_PLE_SHARED_TABLE_DIR,
+            )
+        ),
+        role=str(
+            _additional_config_value(
+                additional_config,
+                "ple_shared_table_role",
+                envs.VLLM_PLE_SHARED_TABLE_ROLE,
+            )
+        ),
+        lock_timeout_s=float(
+            _additional_config_value(
+                additional_config,
+                "ple_shared_table_lock_timeout_s",
+                envs.VLLM_PLE_SHARED_TABLE_LOCK_TIMEOUT_S,
+            )
+        ),
+        model_path=str(model_config.model),
+        revision=model_config.revision,
+    )
+
+
+def shared_ple_tables_attached(module: nn.Module) -> bool:
+    """True when every PLE table under ``module`` is attached to a complete
+    shared table, so its checkpoint shards need not be read at all."""
+    embeddings = [
+        child
+        for child in module.modules()
+        if isinstance(child, Qwen3_8FlashNextNGramEmbedding)
+    ]
+    return bool(embeddings) and all(
+        embedding.ngram_embedding.shared_attached for embedding in embeddings
     )
 
 
@@ -158,12 +224,81 @@ class Qwen3_8FlashNextPLEGroupedNorm(nn.Module):
         )
 
 
+def _shared_table_storage(api: Any, layout: Any, shared_table: SharedTable) -> Any:
+    """Build a b12x ``TableStorage`` over shared-table mappings.
+
+    Mirrors ``allocate_storage``: mapped-host tensors come from the shared
+    files, everything else is an ordinary device tensor of this process.
+    """
+
+    def device_tensor(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        return allocate_weights(
+            torch.empty, shape, dtype=dtype, device=layout.caps.device
+        )
+
+    weight_scale = weight_scale_load_view = None
+    if layout.weight_scale_shape is not None:
+        weight_scale = shared_table.device_view("weight_scale")
+        weight_scale_load_view = shared_table.host_view("weight_scale")
+        if weight_scale is None:
+            weight_scale = device_tensor(
+                layout.weight_scale_shape, layout.weight_scale_dtype
+            )
+            weight_scale_load_view = weight_scale
+    weight_scale_2 = None
+    if layout.weight_scale_2_shape is not None:
+        weight_scale_2 = device_tensor(
+            layout.weight_scale_2_shape, layout.weight_scale_2_dtype
+        )
+    return api.TableStorage(
+        weight=shared_table.device_view("weight"),
+        weight_scale=weight_scale,
+        weight_scale_2=weight_scale_2,
+        weight_load_view=shared_table.host_view("weight"),
+        weight_scale_load_view=weight_scale_load_view,
+        weight_scale_2_load_view=weight_scale_2,
+        mapped_host_nbytes=shared_table.nbytes,
+        _mapped_allocations=(shared_table,),
+    )
+
+
 class _NGramEmbeddingStorage(nn.Module):
-    def __init__(self, layout: Any, shard_rows: int) -> None:
+    def __init__(
+        self,
+        layout: Any,
+        shard_rows: int,
+        *,
+        shared_config: SharedTableConfig | None = None,
+        shared_geometry: SharedTableGeometry | None = None,
+    ) -> None:
         super().__init__()
         self.disk_table = None
         self._table_storage = None
-        if layout.caps.table_memory == "io_uring":
+        self.shared_table: SharedTable | None = None
+        if shared_config is not None:
+            if layout.caps.table_memory != "mapped_host":
+                raise ValueError(
+                    "shared PLE tables require table_memory='mapped_host', got "
+                    f"{layout.caps.table_memory!r}"
+                )
+            if shared_geometry is None:
+                raise ValueError("shared PLE tables require their geometry")
+            api = _b12x_module("ple_embedding")
+            self.shared_table = open_shared_table(
+                shared_geometry, shared_config, device=layout.caps.device
+            )
+            try:
+                self._table_storage = _shared_table_storage(
+                    api, layout, self.shared_table
+                )
+            except BaseException:
+                self.shared_table.close()
+                raise
+            tensors = {
+                name: getattr(self._table_storage, name)
+                for name in ("weight", "weight_scale", "weight_scale_2")
+            }
+        elif layout.caps.table_memory == "io_uring":
             api = _b12x_module("ple_embedding")
             self.disk_table = api.DiskTable(layout, shard_rows)
             tensors: dict[str, torch.Tensor | None] = {"weight": None}
@@ -213,6 +348,16 @@ class _NGramEmbeddingStorage(nn.Module):
     def mapped_host_nbytes(self) -> int:
         return int(self._table_storage.mapped_host_nbytes) if self._table_storage else 0
 
+    @property
+    def shared_attached(self) -> bool:
+        """True when the rows are complete bytes owned by a shared table."""
+        return self.shared_table is not None and self.shared_table.attached
+
+    def publish_shared_table(self) -> None:
+        """Mark a populated shared table complete; no-op otherwise."""
+        if self.shared_table is not None and self.shared_table.populating:
+            self.shared_table.publish()
+
 
 class Qwen3_8FlashNextNGramEmbedding(nn.Module):
     """Prime-hashed learned n-gram embedding with fixed b12x storage."""
@@ -237,6 +382,8 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         prefix: str,
         dtype: torch.dtype,
         table_memory: str,
+        *,
+        shared_table: SharedTableConfig | None = None,
     ) -> None:
         super().__init__()
         self.embedding_dim = int(embedding_dim)
@@ -306,8 +453,29 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         shard_rows = (
             self._table_layout.padded_vocab_size + self.split_ngram_parts - 1
         ) // self.split_ngram_parts
-        self.ngram_embedding = _NGramEmbeddingStorage(self._table_layout, shard_rows)
-        if self.ngram_embedding.mapped_host_nbytes:
+        shared_geometry = None
+        if shared_table is not None:
+            shared_geometry = SharedTableGeometry.from_layout(
+                self._table_layout,
+                model_path=shared_table.model_path,
+                revision=shared_table.revision,
+                embedding_dim=self.embedding_dim,
+                dense_layer_ordinal=int(ple_dense_layer_id),
+            )
+        self.ngram_embedding = _NGramEmbeddingStorage(
+            self._table_layout,
+            shard_rows,
+            shared_config=shared_table,
+            shared_geometry=shared_geometry,
+        )
+        if self.ngram_embedding.shared_attached:
+            # Another process proved these rows complete before READY; only
+            # weight_scale_2 and the geometry buffers still come from the
+            # checkpoint.
+            local_rows = (self._table_layout.shard_start, self._table_layout.shard_end)
+            self._embedding_load_ranges.add(local_rows)
+            self._scale_load_ranges.add(local_rows)
+        elif self.ngram_embedding.mapped_host_nbytes:
             logger.info(
                 "Using %.2f GiB of CUDA-mapped host memory for this TP rank's "
                 "PLE table",
@@ -655,6 +823,11 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         ):
             raise ValueError("NVFP4 PLE embedding checkpoint is missing weight_scale_2")
         self._embedding_validated = True
+        # Coverage of every local row is the proof shared-table followers
+        # wait for.
+        publish = getattr(self.ngram_embedding, "publish_shared_table", None)
+        if publish is not None:
+            publish()
 
     def forward(
         self,
@@ -868,6 +1041,10 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                             source.offset,
                             scale=suffix == "weight_scale",
                         )
+                elif getattr(embedding, "shared_attached", False):
+                    # The rows already sit in the shared table; the geometry
+                    # checks above are the only thing this shard contributes.
+                    pass
                 else:
                     parameter = getattr(embedding, suffix)
                     destination = getattr(
@@ -960,6 +1137,7 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             f"{prefix}.ple_embedding",
             dtype,
             table_memory,
+            shared_table=_resolve_ple_shared_table(vllm_config),
         )
         self.key_proj = ReplicatedLinear(
             int(config.ple_embed_dim),
