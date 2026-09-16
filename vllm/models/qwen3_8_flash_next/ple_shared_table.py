@@ -19,6 +19,9 @@ Layout under ``<dir>``::
     <key>/READY           empty marker created last
     <key>.lock            flock target, separate so <key>/ can be replaced
 
+The directory must be tmpfs (or another shmem-backed file system): the CUDA
+driver refuses to pin ``MAP_SHARED`` pages of ordinary file systems.
+
 ``key`` derives from the checkpoint identity and the planned table geometry,
 so TP ranks and checkpoint revisions never share a directory.  A manifest that
 disagrees with the live plan in any field fails startup; nothing here falls
@@ -529,7 +532,12 @@ class SharedTableMapping:
             flags |= cudart.cudaHostRegisterReadOnly
         with torch.cuda.device(self.device):
             (error,) = cudart.cudaHostRegister(self._pointer, self.nbytes, flags)
-        _check_cuda(error, "cudaHostRegister")
+        if error != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(
+                f"cudaHostRegister failed for {self.path}: {error}; the table "
+                "directory must be on tmpfs (for example /dev/shm), the driver "
+                "does not pin mappings of ordinary file systems"
+            )
         self._registered = True
         self.read_only_registration = read_only
 

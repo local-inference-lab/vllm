@@ -3,6 +3,7 @@
 """CPU-only tests for host-shared Qwen3.8-Flash-Next PLE tables."""
 
 import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -582,9 +583,15 @@ def test_shared_tables_attached_requires_every_embedding() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-def test_registered_mapping_exposes_the_device_alias(tmp_path: Path) -> None:
+def test_registered_mapping_exposes_the_device_alias() -> None:
+    import tempfile
+
     from cuda.bindings import runtime as cudart
 
+    # The driver only pins tmpfs-backed mappings; pytest's tmp_path may not be.
+    if not Path("/dev/shm").is_dir():
+        pytest.skip("needs a tmpfs at /dev/shm")
+    tmp_path = Path(tempfile.mkdtemp(prefix="vllm-ple-test-", dir="/dev/shm"))
     geometry = _geometry()
     device = torch.device("cuda", torch.cuda.current_device())
     populator = open_shared_table(geometry, _config(tmp_path), device=device)
@@ -605,3 +612,4 @@ def test_registered_mapping_exposes_the_device_alias(tmp_path: Path) -> None:
             )
     follower.close()
     populator.close()
+    shutil.rmtree(tmp_path)
