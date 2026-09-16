@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """PLE cache-group ownership and fixed-address mixed graph inputs."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -26,7 +27,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import MambaSpec
 
 
-def _builder(num_spec):
+def _builder(num_spec, checkpoints=0):
     config = create_vllm_config(
         model_name="Qwen/Qwen3.5-0.8B", block_size=16, max_num_batched_tokens=256
     )
@@ -42,9 +43,48 @@ def _builder(num_spec):
         shapes=((16, 12),),
         dtypes=(torch.bfloat16,),
         num_speculative_blocks=num_spec,
+        num_prefill_checkpoint_blocks=checkpoints,
     )
     return PLEAttentionMetadataBuilder(
         spec, ["model.layers.0.ple"], config, torch.device("cpu")
+    )
+
+
+def test_ple_internal_checkpoints_follow_prefill_rows_and_cache_group_remapping():
+    first, second = _builder(3, 1), _builder(3, 1)
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[80, 35, 67], query_lens=[4, 35, 35]),
+        16,
+        torch.device("cpu"),
+        arange_block_indices=True,
+    ).replace(is_prefilling=torch.tensor([False, True, True]))
+    width = common.block_table_tensor.shape[1] + 3
+    table = torch.arange(3 * width, dtype=torch.int32).view(3, width) + 100
+    common = common.replace(block_table_tensor=table)
+    metadata = first.build(
+        0, common, num_accepted_tokens=torch.ones(3, dtype=torch.int32)
+    )
+    assert metadata.checkpoint_offsets.tolist() == [0, 32, 32, 0]
+    assert metadata.checkpoint_slots.tolist() == [-1, table[1, 1], table[2, 3], -1]
+    prior = metadata.checkpoint_slots.clone()
+    updated = second.update_block_table(metadata, table + 1000, None)
+    assert updated.checkpoint_offsets.tolist() == [0, 32, 32, 0]
+    assert updated.checkpoint_slots.tolist() == [
+        -1,
+        table[1, 1] + 1000,
+        table[2, 3] + 1000,
+        -1,
+    ]
+    torch.testing.assert_close(metadata.checkpoint_slots, prior)
+    first.kv_cache_spec = replace(first.kv_cache_spec, num_prefill_checkpoint_blocks=0)
+    disabled = first.build(
+        0, common, num_accepted_tokens=torch.ones(3, dtype=torch.int32)
+    )
+    assert (
+        disabled.checkpoint_columns
+        is disabled.checkpoint_offsets
+        is disabled.checkpoint_slots
+        is None
     )
 
 

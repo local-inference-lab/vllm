@@ -3,7 +3,7 @@
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -82,6 +82,7 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.workspace import (
     retain_cuda_graph_capture_resource,
     use_preallocated_workspace,
@@ -628,6 +629,22 @@ class ChunkGatedDeltaRule(CustomOp):
 
 @PluggableLayer.register("qwen_gated_delta_net_attention")
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
+        spec = super().get_kv_cache_spec(vllm_config)
+        assert isinstance(spec, MambaSpec)
+        if not self.prefill_checkpoint_blocks:
+            return spec
+        if (
+            self.gdn_prefill_backend != "b12x"
+            or self.gdn_decode_kernel != "b12x"
+            or vllm_config.use_request_boundary_checkpoints
+            or vllm_config.cache_config.mamba_cache_mode != "align"
+        ):
+            raise ValueError(
+                "Qwen prefill checkpoints require B12X GDN and aligned caching"
+            )
+        return replace(spec, num_prefill_checkpoint_blocks=1)
+
     def get_state_shape(
         self,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
@@ -649,8 +666,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         gqa_interleaved_layout=False,
         reduce_results: bool = True,
         overlap_input_projections: bool = False,
+        prefill_checkpoint_blocks: int = 0,
     ) -> None:
         super().__init__(config, vllm_config, prefix)
+        if prefill_checkpoint_blocks not in (0, 1):
+            raise ValueError(
+                "Qwen GDN supports zero or one internal prefill checkpoint"
+            )
+        self.prefill_checkpoint_blocks = prefill_checkpoint_blocks
 
         self.num_k_heads = config.linear_num_key_heads
         self.num_v_heads = config.linear_num_value_heads
@@ -1011,17 +1034,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     key=(self._b12x_preparation_prefix, "gdn-decode"),
                     requests=(request,),
                     stage="state",
+                    autotune=not workload.eager_only,
                 )
             )
         for capacity, plan in self._b12x_prefill_plans.items():
             request = plan.request(
                 name=f"{self._b12x_preparation_prefix}.gdn.prefill.{capacity}",
-                prepare_call=lambda state, capacity=capacity: (
-                    self._prepare_b12x_gdn_prefill(state, capacity)
-                ),
-                benchmark_call=lambda state, capacity=capacity: (
-                    self._benchmark_b12x_gdn_prefill(state, capacity)
-                ),
+                prepare_call=lambda state,
+                capacity=capacity: self._prepare_b12x_gdn_prefill(state, capacity),
+                benchmark_call=lambda state,
+                capacity=capacity: self._benchmark_b12x_gdn_prefill(state, capacity),
             )
             units.append(
                 B12xPreparationUnit(
@@ -1029,6 +1051,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     key=(self._b12x_preparation_prefix, "gdn-prefill", capacity),
                     requests=(request,),
                     stage="state",
+                    autotune=not workload.eager_only,
                 )
             )
         return tuple(units)
@@ -2989,6 +3012,43 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             query_start_loc=metadata.query_start_loc,
             metadata=metadata.convolution_metadata(rows),
         ).transpose(0, 1)
+        prefill_output = torch.empty_like(core_attn_out)
+        if self.prefill_checkpoint_blocks:
+            # The checkpoint stores raw convolution inputs. The recurrent
+            # prefill runner independently publishes the matching SSM state.
+            from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
+                _store_cache_checkpoints_kernel,
+            )
+
+            checkpoint = metadata.checkpoint
+            state_len = self.conv_kernel_size - 1
+            width = packed.shape[-1]
+            _store_cache_checkpoints_kernel[
+                (
+                    checkpoint.checkpoint_offsets.numel(),
+                    triton.cdiv(width * state_len, 256),
+                )
+            ](
+                packed,
+                conv_state,
+                self.kv_cache[1],
+                self.kv_cache[1],
+                metadata.query_start_loc,
+                checkpoint.checkpoint_offsets,
+                checkpoint.state_indices,
+                packed.stride(0),
+                packed.stride(1),
+                *conv_state.stride(),
+                self.kv_cache[1].stride(0),
+                self.kv_cache[1].stride(0),
+                checkpoint.checkpoint_offsets.stride(0),
+                state_len,
+                width,
+                0,
+                0,
+                256,
+                False,
+            )
         runner.run(
             mixed_qkv=convolved,
             a=a.index_select(0, non_spec_indices),
