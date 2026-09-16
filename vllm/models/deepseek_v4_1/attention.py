@@ -411,6 +411,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         self._index_page, self._index_width = self._main_page, self._main_width
         self.is_kv_source = self.layer_id in hf.kv_source_layer_ids
         self.is_index_source = self.layer_id in hf.index_source_layer_ids
+        self._index_topk = getattr(hf, "index_topk", 512)
         self.kv_source_layer_id = (
             max(s for s in hf.kv_source_layer_ids if s <= self.layer_id)
             if self.compress_ratio
