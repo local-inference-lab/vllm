@@ -888,6 +888,39 @@ def test_deepseek_c4_default_page_table_width_is_unchanged() -> None:
     assert indexer._max_page_table_width == 4096
 
 
+def test_glm53_physical_selection_prepares_before_resolution_freeze() -> None:
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.attention.sparse_mla import expand_pooled_topk_to_physical_slots
+    from b12x.preparation import PreparationSession
+
+    device = _require_glm_gpu()
+    indexer = Glm5NextPooledIndexer.__new__(Glm5NextPooledIndexer)
+    nn.Module.__init__(indexer)
+    indexer.block_size = 2048
+    indexer._parent_table_width = 512
+    indexer._main_cache_num_blocks = 1024
+    indexer._expand_pooled_topk_to_physical_slots = expand_pooled_topk_to_physical_slots
+    output = torch.empty((32, 2051), dtype=torch.int32, device=device)
+    counts = torch.empty(32, dtype=torch.int32, device=device)
+    indexer.max_tokens = 32
+    indexer.prefix = "model.layers.3.indexer"
+    indexer.topk_indices_buffer = output
+    indexer._physical_active_counts = counts
+    request = indexer.get_b12x_physical_selection_preparation_request()
+    session = PreparationSession(device=device, autotune=False, compile_workers=0)
+    session.prepare((request,))
+    assert request.plan.prepared is not None
+    with kernel_resolution_guard("prepared physical-selection replay"):
+        for rows in (1, 4, 32):
+            call = indexer.make_b12x_physical_selection_prepare_call(
+                output[:rows], counts[:rows]
+            )
+            call.run()
+            assert torch.all(output[:rows, 0] == 0)
+            assert torch.all(output[:rows, 1:] == -1)
+            assert torch.all(counts[:rows] == 1)
+
+
 def test_glm53_selector_capacity_tracks_auto_fit_max_model_len() -> None:
     indexer = Glm5NextPooledIndexer.__new__(Glm5NextPooledIndexer)
     nn.Module.__init__(indexer)

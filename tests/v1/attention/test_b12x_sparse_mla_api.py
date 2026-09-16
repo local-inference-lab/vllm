@@ -1109,8 +1109,10 @@ def test_b12x_sparse_mla_routes_only_planned_decode_rows(
     assert impl._use_decode_execution(metadata, num_tokens) is expected_decode
 
 
+@pytest.mark.parametrize("selection_dcp_size", [None, 1, 4])
 def test_b12x_sparse_mla_declares_plans_once_and_prepares_in_place(
     monkeypatch,
+    selection_dcp_size,
 ) -> None:
     """A layer's plans are declared once; preparation fills them in place."""
     from vllm.utils.b12x import B12xWorkload
@@ -1129,6 +1131,17 @@ def test_b12x_sparse_mla_declares_plans_once_and_prepares_in_place(
     impl._plan_caps = {("decode", 4): object(), ("extend", 8): object()}
     impl._bound_kv_cache = torch.empty((2, 64, 656), dtype=torch.uint8)
     impl._preparation_prefix = lambda: "test.sparse-mla"
+    impl.dcp_world_size = selection_dcp_size or 1
+    selection_plan = _FakePlan()
+    impl._physical_selection_provider = (
+        SimpleNamespace(
+            get_b12x_physical_selection_preparation_request=lambda: SimpleNamespace(
+                name="test.physical_selection", plan=selection_plan
+            )
+        )
+        if selection_dcp_size is not None
+        else None
+    )
     declared = []
 
     def declare(mode, rows):
@@ -1151,11 +1164,14 @@ def test_b12x_sparse_mla_declares_plans_once_and_prepares_in_place(
     # Decode plans are exact in rows: every planned count that can route to
     # decode is declared; a count above the decode capacity is not.
     assert declared == [("decode", 2)]
-    assert first == {
+    expected = {
         "test.sparse-mla.decode.m2": impl._plans[("decode", 2)],
         "test.sparse-mla.decode.m4": impl._plans[("decode", 4)],
         "test.sparse-mla.extend.m8": impl._plans[("extend", 8)],
     }
+    if selection_dcp_size == 1:
+        expected["test.physical_selection"] = selection_plan
+    assert first == expected
     assert all(plan.prepared is None for plan in impl._plans.values())
 
     # A second declaration reuses the exact same plan objects: plans are
@@ -1168,6 +1184,165 @@ def test_b12x_sparse_mla_declares_plans_once_and_prepares_in_place(
     for plan in impl._plans.values():
         plan.prepared = object()
     assert all(plan.prepared is not None for plan in impl._plans.values())
+
+
+@pytest.mark.parametrize(
+    ("kernel_returns_lse", "consumer_needs_lse"),
+    [(False, False), (True, False), (True, True)],
+)
+def test_sparse_mla_forward_normalizes_decode_and_extend_results(
+    monkeypatch, kernel_returns_lse, consumer_needs_lse
+):
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = False
+    impl._input_num_heads = 2
+    impl._plan_key = lambda metadata, tokens: ("extend", 4)
+    impl._plan = lambda key: object()
+    impl._workspace_specs = lambda **kwargs: (
+        ((4, 2, 8), torch.bfloat16),
+        ((512,), torch.uint8),
+    )
+    impl.topk_indices_buffer = torch.zeros((4, 8), dtype=torch.int32)
+    impl._physical_selection_provider = None
+    impl.dcp_world_size = 1
+    impl.need_to_return_lse_for_decode = consumer_needs_lse
+    impl._bind = lambda plan, **kwargs: kwargs
+    output = torch.ones((4, 2, 8), dtype=torch.bfloat16)
+    lse = torch.zeros((4, 2), dtype=torch.float32)
+    impl._run = lambda binding: (output, lse) if kernel_returns_lse else output
+    monkeypatch.setattr(
+        b12x_mla_sparse, "current_workspace_manager", lambda: _Workspace()
+    )
+    metadata = SimpleNamespace(
+        block_size=64,
+        seq_lens=torch.ones(4, dtype=torch.int32),
+        cache_seq_lens_per_token=torch.ones(4, dtype=torch.int32),
+        num_reqs=4,
+    )
+    actual, actual_lse = impl.forward_mqa(
+        torch.ones((4, 2, 8), dtype=torch.bfloat16),
+        torch.empty((1, 64, 528), dtype=torch.uint8),
+        metadata,
+        None,
+    )
+    assert actual is output
+    assert actual_lse is (lse if consumer_needs_lse else None)
+
+
+def test_sparse_mla_preparation_borrows_declared_scratch_shape(monkeypatch):
+    from b12x._lib.scratch import scratch_buffer_spec
+
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._bound_kv_cache = torch.zeros((2, 64, 528), dtype=torch.uint8)
+    caps = SimpleNamespace(
+        max_q_rows=4,
+        num_q_heads=2,
+        head_dim=8,
+        max_width=16,
+        max_batch=2,
+        page_size=64,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+    spec = scratch_buffer_spec("workspace", nbytes=512, device=caps.device)
+    impl._scratch_nbytes = spec.nbytes
+    borrowed = torch.empty(spec.shape, dtype=spec.dtype)
+    reservations = []
+
+    def get_simultaneous(*specs):
+        assert specs == ((spec.shape, spec.dtype),)
+        return (borrowed,)
+
+    monkeypatch.setattr(
+        "vllm.v1.attention.backends.mla.b12x_mla_sparse.current_workspace_manager",
+        lambda: SimpleNamespace(
+            reserve_all=lambda *specs: reservations.append(specs),
+            get_simultaneous=get_simultaneous,
+        ),
+    )
+    bound = {}
+    calls = []
+
+    def bind(**kwargs):
+        bound.update(kwargs)
+        assert kwargs["scratch"].shape == spec.shape
+        assert kwargs["scratch"].dtype == spec.dtype
+        assert kwargs["scratch"] is borrowed
+        return kwargs
+
+    state = SimpleNamespace(
+        scratch_specs=lambda: (spec,),
+        bind=bind,
+        prime=lambda binding, **kwargs: calls.append("prime"),
+        run=lambda binding, **kwargs: calls.append("run"),
+    )
+    call = impl._make_prepare_call(state, caps)
+    call.produce()
+    call.run()
+    assert calls == ["prime", "run"]
+    assert torch.all(bound["q"] == 1)
+    assert bound["kv_cache"] is impl._bound_kv_cache
+    second_call = impl._make_prepare_call(state, caps)
+    second_call.produce()
+    second_call.run()
+    assert calls == ["prime", "run", "prime", "run"]
+    assert reservations == [(((spec.nbytes,), torch.uint8),)] * 2
+
+
+@pytest.mark.parametrize("query_projection", [False, True])
+def test_mla_layer_discovers_backend_and_optional_query_plans(
+    monkeypatch, query_projection
+):
+    from vllm.model_executor.layers.attention import mla_attention
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+    from vllm.model_executor.warmup.b12x_prepare import _units_from_modules
+    from vllm.utils.b12x import (
+        B12xPreparationUnit,
+        B12xWorkload,
+        set_b12x_preparation_provider,
+    )
+
+    unit = B12xPreparationUnit(
+        name="sparse MLA", key="cache-owner", requests=(), stage="state"
+    )
+
+    class Backend:
+        def get_b12x_preparation_units(self, owner, workload):
+            assert owner is self
+            assert workload.stage == "state"
+            return (unit,)
+
+    layer = MLAAttention.__new__(MLAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.impl = Backend()
+    set_b12x_preparation_provider(layer.impl, layer.impl)
+    set_b12x_preparation_provider(layer, layer)
+    if query_projection:
+        layer.W_UK_T = torch.empty((2, 16, 32), dtype=torch.bfloat16)
+        layer._b12x_query_plans = {}
+        layer._b12x_query_prefix = "test.query"
+        layer._b12x_query_call = lambda tokens: None
+        layer._declare_b12x_query_plan = lambda tokens: SimpleNamespace(
+            request=lambda name, **kwargs: SimpleNamespace(name=name)
+        )
+        monkeypatch.setattr(
+            mla_attention, "can_implement_bf16_mla_query", lambda **kwargs: True
+        )
+    workload = B12xWorkload(
+        stage="state",
+        token_counts=(8,),
+        fixed_token_counts=(),
+        output_dtype=torch.bfloat16,
+        max_tokens=8,
+        max_seqs=1,
+        max_model_len=64,
+    )
+    units = tuple(_units_from_modules(layer, workload))
+    assert units[0] is unit
+    assert len(units) == (2 if query_projection else 1)
+    if query_projection:
+        assert units[1].name == "MLA_QUERY"
+        assert [request.name for request in units[1].requests] == ["test.query.m8"]
 
 
 def test_b12x_sparse_mla_plan_lookup_declares_unplanned_decode_rows_once(

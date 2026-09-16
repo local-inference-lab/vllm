@@ -24,11 +24,11 @@ from vllm.model_executor.layers.attention.sparse_mla_attention import (
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
 from vllm.utils.b12x import (
-    set_b12x_preparation_provider,
     B12xPreparationUnit,
     B12xWorkload,
     PreparationResourceUnavailableError,
     get_b12x_sparse_mla,
+    set_b12x_preparation_provider,
 )
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -1333,15 +1333,17 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             int(vllm_config.cache_config.block_size) if self._is_glm_next else 64
         )
         self._ckv_gather_enabled = (
-            self._is_glm_next and self.dcp_world_size > 1
+            self._is_glm_next
+            and self.dcp_world_size > 1
             and envs.VLLM_B12X_MLA_CKV_GATHER
         )
         max_ckv_tokens = envs.VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS
-        cp_kv_cache_interleave_size = int(vllm_config.parallel_config.cp_kv_cache_interleave_size)
-        self._ckv_capacity_tokens = (
-            (max_ckv_tokens + self.dcp_world_size - 1) // self.dcp_world_size
-            + max_seqs * cp_kv_cache_interleave_size
+        cp_kv_cache_interleave_size = int(
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
         )
+        self._ckv_capacity_tokens = (
+            max_ckv_tokens + self.dcp_world_size - 1
+        ) // self.dcp_world_size + max_seqs * cp_kv_cache_interleave_size
         self._ckv_local_capacity = 0
         self._module = module
         self._kernel_page_size = 0
@@ -1354,6 +1356,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         self.supports_quant_query_input = False
         if not getattr(self, "b12x_preparation_suppressed", False):
             set_b12x_preparation_provider(self, self)
+
     def _set_kernel_page_size(self, kernel_page_size: int) -> None:
         if kernel_page_size <= 0 or kernel_page_size % 64:
             raise ValueError(
@@ -1439,7 +1442,8 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
 
         if self._bound_kv_cache is None or self._bound_kv_cache.numel() == 0:
             raise PreparationResourceUnavailableError(
-                "sparse MLA benchmark requires the published KV cache")
+                "sparse MLA benchmark requires the published KV cache"
+            )
         rows = int(caps.max_q_rows)
         q = torch.empty(
             (rows, int(caps.num_q_heads), int(caps.head_dim)),
@@ -1453,12 +1457,19 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             (rows, int(caps.max_width)), dtype=torch.int32, device=caps.device
         )
         cache_lengths = torch.full(
-            (int(caps.max_batch),), int(caps.page_size),
-            dtype=torch.int32, device=caps.device,
+            (int(caps.max_batch),),
+            int(caps.page_size),
+            dtype=torch.int32,
+            device=caps.device,
         )
         selected_lengths = torch.ones(rows, dtype=torch.int32, device=caps.device)
-        scratch = torch.empty(
-            (int(state.layout.nbytes),), dtype=torch.uint8, device=caps.device
+        (scratch_spec,) = state.scratch_specs()
+        # Preparation calls execute serially but retain their owners. Borrow
+        # caller-owned scratch so exact-row plans do not each pin a workspace.
+        workspace = current_workspace_manager()
+        workspace.reserve_all(((self._scratch_nbytes,), torch.uint8))
+        (scratch,) = workspace.get_simultaneous(
+            (scratch_spec.shape, scratch_spec.dtype)
         )
         binding = state.bind(
             scratch=scratch,
@@ -1555,16 +1566,23 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     dependencies=tuple(request.name for request in requests),
                 )
             )
+        provider = getattr(self, "_physical_selection_provider", None)
+        selection_request = getattr(
+            provider, "get_b12x_physical_selection_preparation_request", None
+        )
+        if selection_request is not None and self.dcp_world_size == 1:
+            requests.append(selection_request())
         if not requests:
             return ()
-        return (B12xPreparationUnit(
-            name="sparse MLA",
-            key=self._preparation_prefix(),
-            requests=tuple(requests),
-            stage="state",
-            autotune=not workload.eager_only,
-        ),)
-
+        return (
+            B12xPreparationUnit(
+                name="sparse MLA",
+                key=self._preparation_prefix(),
+                requests=tuple(requests),
+                stage="state",
+                autotune=not workload.eager_only,
+            ),
+        )
 
     def _use_decode_execution(
         self,
@@ -1610,7 +1628,6 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             scratch_spec,
             *(ckv_specs if include_ckv else ()),
         )
-
 
     def _borrow_workspaces(
         self,
@@ -2027,8 +2044,9 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             selected_lengths=active_counts,
         )
         result = self._run(binding)
+        # The extend kernel returns LSE even when decode does not request it.
+        output, lse = result if isinstance(result, tuple) else (result, None)
         if self.need_to_return_lse_for_decode:
-            output, lse = result
+            assert lse is not None
             return output, lse
-        assert isinstance(result, torch.Tensor)
-        return result, None
+        return output, None

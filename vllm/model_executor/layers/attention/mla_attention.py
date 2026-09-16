@@ -264,11 +264,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.b12x import (
-    set_b12x_preparation_provider,
     B12xPreparationUnit,
     B12xWorkload,
     get_b12x_mla_query_projection,
     register_b12x_layer,
+    set_b12x_preparation_provider,
 )
 from vllm.utils.flashinfer import has_flashinfer
 from vllm.utils.math_utils import cdiv, round_down, round_up
@@ -718,6 +718,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             indexer=indexer,
             **extra_impl_args,
         )
+        if getattr(self.impl, "b12x_preparation_provider", None) is not None:
+            # The implementation is not an nn.Module. Its KV-dependent plans
+            # must be discovered through the owning attention layer.
+            set_b12x_preparation_provider(self, self)
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
         self.is_amx_bmm_enabled = getattr(self.impl, "uses_amx_bmm", False)
         # AMX reads kv_b_proj's weight directly and never calls it live; the
@@ -1473,14 +1477,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         module = get_b12x_mla_query_projection()
         assert module is not None
-        return module.plan(ProjectionQuery(
-            heads=int(self.W_UK_T.shape[0]),
-            max_rows=tokens,
-            weight_format="bf16",
-            output_dtype="bfloat16",
-            b_major="n",
-            sf_axis="n",
-        ))
+        return module.plan(
+            ProjectionQuery(
+                heads=int(self.W_UK_T.shape[0]),
+                max_rows=tokens,
+                weight_format="bf16",
+                output_dtype="bfloat16",
+                b_major="n",
+                sf_axis="n",
+            )
+        )
 
     def _b12x_query_call(self, tokens: int):
         weight = self.W_UK_T
@@ -1490,21 +1496,26 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             from b12x.preparation import PreparedCall
 
             q_nope = torch.zeros(
-                (heads, tokens, nope_dim), dtype=torch.bfloat16, device=weight.device,
+                (heads, tokens, nope_dim),
+                dtype=torch.bfloat16,
+                device=weight.device,
             )
             q_pe = torch.zeros(
-                (tokens, heads, 64), dtype=torch.bfloat16, device=weight.device,
+                (tokens, heads, 64),
+                dtype=torch.bfloat16,
+                device=weight.device,
             )
             output = torch.empty(
                 (tokens, heads, latent_dim + 64),
-                dtype=torch.bfloat16, device=weight.device,
+                dtype=torch.bfloat16,
+                device=weight.device,
             )
             return PreparedCall(run=lambda: state.run(q_nope, weight, q_pe, output))
 
         return prepare
 
     def b12x_query_plan(self, tokens: int):
-        """The exact-M plan for tokens, declared on first use with its default configuration.
+        """Return the exact-M plan, declaring its default configuration on first use.
 
         Called from the fused-query custom op body only.
         """
@@ -1520,9 +1531,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
     ) -> Sequence[B12xPreparationUnit]:
         if layer is not self:
             raise ValueError("MLA query preparation owner mismatch")
+        impl = getattr(self, "impl", None)
+        provider = getattr(impl, "b12x_preparation_provider", None)
+        hook = getattr(provider, "get_b12x_preparation_units", None)
+        backend_units = tuple(hook(impl, workload)) if callable(hook) else ()
         weight = getattr(self, "W_UK_T", None)
-        if not isinstance(weight, torch.Tensor) or weight.is_meta:
-            return ()
+        if (
+            not isinstance(weight, torch.Tensor)
+            or weight.is_meta
+            or not hasattr(self, "_b12x_query_plans")
+        ):
+            return backend_units
         plans = self._b12x_query_plans
         requests = []
         for tokens in workload.token_counts:
@@ -1539,13 +1558,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if plan is None:
                 plan = self._declare_b12x_query_plan(tokens)
                 plans[tokens] = plan
-            requests.append(plan.request(
-                name=self._b12x_query_name(tokens),
-                prepare_call=self._b12x_query_call(tokens),
-            ))
+            requests.append(
+                plan.request(
+                    name=self._b12x_query_name(tokens),
+                    prepare_call=self._b12x_query_call(tokens),
+                )
+            )
         if not requests:
-            return ()
+            return backend_units
         return (
+            *backend_units,
             B12xPreparationUnit(
                 name="MLA_QUERY",
                 key=(self._b12x_query_prefix, tuple(sorted(plans))),

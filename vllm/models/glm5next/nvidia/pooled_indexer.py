@@ -394,6 +394,60 @@ class Glm5NextPooledIndexer(nn.Module):
         self._index_cache = None
         self._main_cache_num_blocks = 0
 
+    def make_b12x_physical_selection_prepare_call(
+        self, output: torch.Tensor, active_counts: torch.Tensor
+    ):
+        """Prepare pool expansion with the bound cache's exact page geometry."""
+        from b12x.preparation import PreparedCall
+
+        rows = int(output.shape[0])
+        device = output.device
+        pools = torch.zeros((rows, _POOL_TOPK), dtype=torch.int32, device=device)
+        positions = torch.zeros(rows, dtype=torch.int64, device=device)
+        requests = torch.zeros(rows, dtype=torch.int32, device=device)
+        table = torch.zeros(
+            (1, self._parent_table_width), dtype=torch.int32, device=device
+        )
+        return PreparedCall(
+            run=lambda: self._expand_pooled_topk_to_physical_slots(
+                pools,
+                positions,
+                requests,
+                table,
+                output,
+                active_counts,
+                pool_size=_POOL_SIZE,
+                block_size=self.block_size,
+                block_stride_rows=self.block_size,
+                num_cache_blocks=self._main_cache_num_blocks,
+            ),
+            owners=(pools, positions, requests, table, output, active_counts),
+        )
+
+    def get_b12x_physical_selection_preparation_request(self):
+        module = get_b12x_sparse_mla()
+        if module is None or not hasattr(module, "plan_pooled_selection"):
+            raise RuntimeError(
+                "GLM pooled selection requires B12X pooled-selection preparation."
+            )
+        plan = module.plan_pooled_selection(
+            device=self.topk_indices_buffer.device,
+            max_rows=self.max_tokens,
+            page_size=self.block_size,
+            max_page_table_width=self._parent_table_width,
+            num_cache_blocks=self._main_cache_num_blocks,
+        )
+
+        def prepare(state):
+            return self.make_b12x_physical_selection_prepare_call(
+                torch.empty_like(self.topk_indices_buffer),
+                torch.empty_like(self._physical_active_counts),
+            )
+
+        return plan.request(
+            name=f"{self.prefix}.physical_selection", prepare_call=prepare
+        )
+
     def get_b12x_physical_selection(
         self,
         *,
