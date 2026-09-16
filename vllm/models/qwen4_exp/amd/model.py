@@ -76,7 +76,7 @@ from vllm.transformers_utils.configs.qwen4_exp import (
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
-from . import hc_prefill
+from vllm.models.qwen4_exp.common import hc_prefill
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 
 

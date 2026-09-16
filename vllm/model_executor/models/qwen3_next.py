@@ -221,14 +221,10 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             )
 
         self.experts = FusedMoEFactory(
-<<<<<<< HEAD
+            reduce_results=reduce_results,
             shared_experts=(
                 None if self.replicate_shared_expert else self.shared_expert
             ),
-=======
-            reduce_results=reduce_results,
-            shared_experts=self.shared_expert,
->>>>>>> 790cba16a9 (Add opt-in Qwen prefill HC token ownership with deferred TP reductions)
             gate=self.gate,
             num_experts=self.n_routed_experts,
             top_k=config.num_experts_per_tok,

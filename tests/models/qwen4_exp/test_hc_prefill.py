@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.models.qwen3_8_flash_next import hc_prefill
+from vllm.models.qwen4_exp.common import hc_prefill
 
 
 @pytest.mark.parametrize(

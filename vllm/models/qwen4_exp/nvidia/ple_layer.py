@@ -11,6 +11,7 @@ from torch import nn
 from vllm.compilation.breakable_cudagraph import (
     eager_break_during_capture,
 )
+from vllm import envs
 from vllm.config import (
     CacheConfig,
     ModelConfig,
@@ -42,6 +43,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.kv_cache_interface import MambaSpec
 
 from .b12x_ple import (
     B12xNGramEmbedding,
@@ -685,6 +687,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 plan.request(
                     name=self._state_request_name(token_count),
                     prepare_call=self._state_prepare_call(token_count),
+                    autotune=False,
                 )
             )
         self._state_plans = plans
@@ -696,6 +699,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 key=self._preparation_prefix,
                 requests=tuple(requests),
                 stage="state",
+                autotune=False,
             ),
         )
 
@@ -772,11 +776,31 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 self._num_seqs.fill_(1)
                 self._num_tokens.fill_(token_count)
 
+            checkpoint_offsets = torch.zeros_like(
+                self._state_slot_ids, dtype=torch.int32
+            )
+            checkpoint_slots = torch.full_like(self._state_slot_ids, -1)
+
+            def run():
+                result = state.run(binding, eps=self.eps, token_count=token_count)
+                if envs.VLLM_QWEN3_8_PREFILL_COALESCE:
+                    # Capture can invoke export even when no request checkpoints.
+                    # Prime its module with inactive slots before resolution freezes.
+                    state.export_checkpoint(
+                        binding, checkpoint_offsets, checkpoint_slots
+                    )
+                return result
+
             return PreparedCall(
-                run=lambda: state.run(binding, eps=self.eps, token_count=token_count),
+                run=run,
                 reset=reset,
                 restore=restore,
-                owners=(scratch, original_conv_state),
+                owners=(
+                    scratch,
+                    original_conv_state,
+                    checkpoint_offsets,
+                    checkpoint_slots,
+                ),
             )
 
         return prepare
@@ -785,6 +809,18 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         self._state_caps = None
         self._state_plans = {}
         super().unbind_kv_cache()
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
+        spec = super().get_kv_cache_spec(vllm_config)
+        assert isinstance(spec, MambaSpec)
+        if not envs.VLLM_QWEN3_8_PREFILL_COALESCE:
+            return spec
+        if (
+            vllm_config.use_request_boundary_checkpoints
+            or vllm_config.cache_config.mamba_cache_mode != "align"
+        ):
+            raise ValueError("Qwen PLE internal checkpoints require aligned caching")
+        return replace(spec, num_prefill_checkpoint_blocks=1)
 
     def _prepare_metadata(
         self,
@@ -839,9 +875,17 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         self._key[:token_count].copy_(key)
         self._value[:token_count].copy_(value)
         self._prepare_metadata(metadata, query_start_loc, token_count)
-        _b12x_module("ple").run_mixed(
-            self._bind_ple(token_count), eps=self.eps, token_count=token_count
-        )
+        binding = self._bind_ple(token_count)
+        api = _b12x_module("ple")
+        api.run_mixed(binding, eps=self.eps, token_count=token_count)
+        if metadata.checkpoint_columns is not None:
+            assert metadata.checkpoint_offsets is not None
+            assert metadata.checkpoint_slots is not None
+            api.export_checkpoint(
+                binding,
+                offsets=metadata.checkpoint_offsets,
+                slots=metadata.checkpoint_slots,
+            )
 
 
 __all__ = [
