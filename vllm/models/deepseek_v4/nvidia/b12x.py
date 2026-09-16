@@ -658,6 +658,7 @@ def _run_compressed_sparse_mla(
             ),
             max_chunks_per_row=max_chunks_per_row,
             decode_row_capacity=decode_row_capacity,
+            mode=mode,
         ),
         invocation=invocation,
     )
@@ -673,7 +674,6 @@ def _run_compressed_sparse_mla(
         indexed_indices=indexed_indices,
         indexed_lengths=indexed_lens,
     )
-    binding.scratch.mode = mode
     module.run(
         binding=binding,
         swa_k_cache=swa_k_cache,
