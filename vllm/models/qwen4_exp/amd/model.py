@@ -1077,7 +1077,7 @@ class Qwen4ExpForConditionalGeneration(
         else:
             deepstack_input_embeds = None
 
-        hidden_states = self.language_model.model(
+        hidden_states = self.language_model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
