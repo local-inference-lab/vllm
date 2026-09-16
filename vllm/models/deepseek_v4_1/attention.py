@@ -907,7 +907,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             pages[:, :live_pages] = torch.arange(live_pages, dtype=torch.int32, device=device)
             lengths = torch.full((rows,), live_tokens, dtype=torch.int32, device=device)
             active = torch.full((1,), live_tokens, dtype=torch.int32, device=device)
-            indices = torch.empty((rows, 512), dtype=torch.int32, device=device)
+            indices = torch.empty((rows, self._index_topk), dtype=torch.int32, device=device)
             kwargs = {}
             if self.layer_id == self.candidate_source_layer:
                 kwargs = dict(
