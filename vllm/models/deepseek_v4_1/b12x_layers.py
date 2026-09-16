@@ -586,7 +586,9 @@ def _mhc_pre(
         comb=comb,
         pre_out=pre_out,
     )
-    retain_cuda_graph_capture_resource(binding)
+    # Caller-owned outputs follow PyTorch's graph-pool lifetimes. Retaining
+    # them through the binding prevents reuse across layers and graph shapes.
+    retain_cuda_graph_capture_resource(scratch)
     if previous_output is None:
         mhc.run_pre(
             residual,
