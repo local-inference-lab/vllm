@@ -846,7 +846,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             kwargs = {}
             if self.compress_ratio:
                 indices, lengths, pages = cache_inputs(
-                    self._owner().kv_cache, self._main_page, 512, "indexed",
+                    self._owner().kv_cache, self._main_page, self._index_topk, "indexed",
                 )
                 table = torch.full((rows, self._main_width), -1, dtype=torch.int32, device=device)
                 table[:, :pages] = torch.arange(pages, dtype=torch.int32, device=device)
