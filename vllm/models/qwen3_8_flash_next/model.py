@@ -79,7 +79,11 @@ from .hyperconnection import (
     HyperConnectionConfig,
     HyperConnectionWorkspace,
 )
-from .ple_layer import Qwen3_8FlashNextPLELayer, _resolve_ple_table_memory
+from .ple_layer import (
+    Qwen3_8FlashNextPLELayer,
+    _resolve_ple_table_memory,
+    shared_ple_tables_attached,
+)
 
 
 def _is_file_backed_ple_weight(name: str) -> bool:
@@ -732,10 +736,13 @@ class Qwen3_8FlashNextForCausalLM(
 
     @property
     def checkpoint_file_weight_filter(self) -> Callable[[str], bool] | None:
+        if not self.config.ple_layer_ids:
+            return None
         if (
-            self.config.ple_layer_ids
-            and _resolve_ple_table_memory(self.vllm_config.additional_config)
-            == "io_uring"
+            _resolve_ple_table_memory(self.vllm_config.additional_config) == "io_uring"
+            # Attached shared tables already hold every row, so the shards are
+            # only checked by name and geometry, never read.
+            or shared_ple_tables_attached(self)
         ):
             return _is_file_backed_ple_weight
         return None
