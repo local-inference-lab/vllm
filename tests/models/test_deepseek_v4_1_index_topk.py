@@ -50,3 +50,16 @@ def test_index_topk_defaults_to_512_without_a_config_key() -> None:
     hf = SimpleNamespace()
     assert getattr(hf, "index_topk", 512) == 512
     assert attention.DeepseekV4Attention.__init__ is not None
+
+
+def test_index_topk_is_assigned_by_the_module_constructor() -> None:
+    """The threading reads self._index_topk; the constructor must set it."""
+    import inspect
+
+    from vllm.models.deepseek_v4_1 import attention
+
+    source = inspect.getsource(attention.DeepseekV4Attention.__init__)
+    assert "self._index_topk" in source, (
+        "the index_topk threading reads self._index_topk, so __init__ must "
+        "assign it from the HF config"
+    )
