@@ -1434,8 +1434,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         plan = self._wo_plan(rows, is_prefill=is_prefill)
         require_prepared(plan, "gemm.wo_projection", o.device)
         weights = self._wo_projection_weights
+        scratch = _scratch(plan)
         binding = wo_projection.bind_inv_rope(
-            plan, scratch=_scratch(plan), o=o, positions=positions,
+            plan, scratch=scratch, o=o, positions=positions,
             cos_sin_cache=self.rotary_emb.cos_sin_cache, weights=weights,
             heads_per_group=self.n_local_heads // self.n_local_groups,
             nope_dim=self.head_dim - self.rope_head_dim, rope_dim=self.rope_head_dim,
@@ -1446,7 +1447,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             dtype=torch.bfloat16, device=o.device,
         )
         binding = replace(binding, output=output)
-        retain_cuda_graph_capture_resource(binding)
+        # The model owns the plan and weights; graph pools manage activation
+        # lifetimes. Keep only the borrowed workspace, not layer activations.
+        retain_cuda_graph_capture_resource(scratch)
         local = wo_projection.run_inv_rope(
             binding=binding, plan=plan, stream=current_stream().cuda_stream,
         )
