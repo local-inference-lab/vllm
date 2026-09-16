@@ -4,10 +4,12 @@
 
 import gc
 import weakref
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 
 from vllm.config import CUDAGraphMode
 
@@ -336,9 +338,11 @@ def test_index_preparation_reuses_reserved_workspace(native_workspace):
         torch.testing.assert_close(cache, torch.zeros_like(cache), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("projection_kind", ["linear", "dspark_context"])
 def test_block_linear_capture_retains_scratch_not_caller_activations(
     native_workspace,
     monkeypatch,
+    projection_kind,
 ):
     from vllm.models.deepseek_v4_1 import b12x_layers
 
@@ -353,10 +357,22 @@ def test_block_linear_capture_retains_scratch_not_caller_activations(
     layer.weight = torch.randn(256, 256, device=device).to(torch.float8_e4m3fn)
     layer.weight_scale_inv = torch.ones(8, 8, device=device).to(torch.float8_e8m0fnu)
     monkeypatch.setattr(b12x_layers, "_execution_capacities", lambda: (16,))
-    method = b12x_layers.B12xFP8LinearMethod(
-        SimpleNamespace(weight_block_size=[32, 32])
-    )
-    method.process_weights_after_loading(layer)
+    if projection_kind == "linear":
+        method = b12x_layers.B12xFP8LinearMethod(
+            SimpleNamespace(weight_block_size=[32, 32])
+        )
+        method.process_weights_after_loading(layer)
+        project = partial(method.apply, layer)
+        plans = layer.b12x_plans
+    else:
+        from vllm.models.deepseek_v4_1.nvidia import dspark
+
+        monkeypatch.setattr(dspark, "_execution_capacities", lambda: (16,))
+        method = dspark._ContextKVProjection(
+            SimpleNamespace(fused_wqa_wkv=layer, q_lora_rank=0), 16
+        )
+        project = method
+        plans = method.plans
     workload = B12xWorkload(
         stage="weights",
         token_counts=(8, 16),
@@ -376,7 +392,7 @@ def test_block_linear_capture_retains_scratch_not_caller_activations(
     )
     session.freeze()
     manager.reserve_all(
-        *((spec.shape, spec.dtype) for spec in layer.b12x_plans[0].scratch_specs())
+        *((spec.shape, spec.dtype) for spec in plans[0].scratch_specs())
     )
     manager.lock()
     inputs = torch.randn(16, 256, dtype=torch.bfloat16, device=device)
@@ -385,7 +401,7 @@ def test_block_linear_capture_retains_scratch_not_caller_activations(
 
     def run(rows):
         source = inputs[:rows] + 1
-        output = method.apply(layer, source)
+        output = project(source)
         references.extend((weakref.ref(source), weakref.ref(output)))
         outputs[:rows].copy_(output)
 
@@ -695,6 +711,7 @@ def test_attention_shared_scratch_graph_replay(
     device = torch.device("cuda", torch.accelerator.current_device_index())
     torch.manual_seed(142)
     layer = _layer(attention, swa_page=swa_page)
+    layer.rotary_emb = SimpleNamespace(cos_sin_cache=torch.empty(0, device=device))
     layer.config.cache_config.block_size = main_page
     layer.max_model_len = 4096
     if rows == 36:
@@ -755,13 +772,12 @@ def test_attention_shared_scratch_graph_replay(
             device=device,
             dtype=torch.uint8,
         )
-        _write_cache(
-            kv,
-            cache,
-            torch.arange(length, device=device) + page,
-            page_size=page,
-            cache_kind=kind,
-            cache_format="deepseek_v41",
+        from b12x.attention._shared.mla.compressed_reference import (
+            pack_deepseek_v41_cache_reference,
+        )
+
+        cache[1:].copy_(
+            pack_deepseek_v41_cache_reference(kv, page_size=page, cache_kind=kind)
         )
         if kind == "swa":
             layer.swa_cache_layer.kv_cache = cache
@@ -782,12 +798,6 @@ def test_attention_shared_scratch_graph_replay(
     index_keys = torch.zeros((length, 128), dtype=torch.bfloat16, device=device)
     index_keys[:512, 0] = 1
     index_keys[256:768, 1] = 1
-    _write_index_keys(
-        index_keys,
-        index_k_cache=layer.indexer.k_cache.kv_cache,
-        slot_mapping=torch.arange(length, device=device) + main_page,
-        page_size=main_page,
-    )
     layer.attn_sink = torch.zeros(layer.n_local_heads, device=device)
     q = torch.randn(
         (rows, layer.n_local_heads, 512), dtype=torch.bfloat16, device=device
@@ -811,17 +821,35 @@ def test_attention_shared_scratch_graph_replay(
     units = layer.get_b12x_preparation_units(layer, workload)
     requests = tuple(request for unit in units for request in unit.requests)
     session.prepare(requests, autotune=False)
+    attention.dsa_indexer.quantize_write_index_k_mxfp4(
+        layer._index_plan("prefill", min(rows, layer.INDEX_CHUNK)),
+        index_keys,
+        index_k_cache=layer.indexer.k_cache.kv_cache,
+        slot_mapping=torch.arange(length, device=device) + main_page,
+    )
+    activation_refs: list[tuple[str, StorageWeakRef]] = []
 
     def run():
-        attention.dsa_indexer.quantize_q_mxfp4(
-            layer._index_plan("decode", min(rows, layer.DECODE_CHUNK)),
-            iq,
-            q_mxfp4=packed,
-            q_scales=scales,
+        query = q.clone()
+        index_query = packed.clone(), scales.clone(), weights.clone()
+        activation_refs.extend(
+            (name, StorageWeakRef(tensor.untyped_storage()))
+            for name, tensor in zip(
+                ("query", "index_query", "index_scales", "index_weights"),
+                (query, *index_query),
+            )
         )
-        layer.forward_mqa(
-            q, None, positions, out, index_query=(packed, scales, weights)
-        )
+        mode = "decode" if is_decode else "prefill"
+        chunk = layer.DECODE_CHUNK if is_decode else layer.INDEX_CHUNK
+        for offset in range(0, rows, chunk):
+            end = min(offset + chunk, rows)
+            attention.dsa_indexer.quantize_q_mxfp4(
+                layer._index_plan(mode, end - offset),
+                iq[offset:end],
+                q_mxfp4=index_query[0][offset:end],
+                q_scales=index_query[1][offset:end],
+            )
+        layer.forward_mqa(query, None, positions, out, index_query=index_query)
 
     run()
     batched_output = out.clone()
@@ -845,6 +873,10 @@ def test_attention_shared_scratch_graph_replay(
         torch.cuda.graph(graph, stream=stream),
     ):
         run()
+    # Graph resources own scratch, not the per-layer query activations.
+    gc.collect()
+    retained = [name for name, reference in activation_refs if not reference.expired()]
+    assert not retained, f"Capture resources retained caller activations: {retained}"
     # Changed queries exercise both selection and attention on replay, after
     # all plan storage has been reused by another operation.
     for step, seed in enumerate((143, 144)):
