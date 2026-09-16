@@ -1255,6 +1255,67 @@ def test_b12x_moe_cuda_graph_replay(
 @pytest.mark.parametrize(
     "weight_dtype,activation_dtype",
     [("nvfp4", "nvfp4"), ("mxfp4", "mxfp8"), ("nvfp4", None)],
+)
+@pytest.mark.parametrize("tokens", [4, 128])
+@torch.inference_mode()
+def test_b12x_moe_tuning_replays_native_candidate_in_cuda_graph(
+    weight_dtype, activation_dtype, tokens, workspace_init
+) -> None:
+    """The race must time graph execution with live producers and fixed storage."""
+    from b12x.preparation._measurement import _prepare_race
+    from b12x.preparation.types import require_prepared
+
+    with set_current_vllm_config(
+        VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
+    ):
+        case = _make_b12x_moe_case(weight_dtype, activation_dtype, tokens=tokens)
+        _, session, units = _make_b12x_moe_kernel(
+            case.hidden_states,
+            case.w1,
+            case.w2,
+            case.topk,
+            case.activation,
+            case.quant_config,
+        )
+        race = None
+        try:
+            request = units[0].requests[0]
+            plan = request.plan
+            assert plan.invocation["tuning_execution_context"] == "cuda_graph"
+            state = require_prepared(plan, plan.component_id)
+            call = request.benchmark_call(state)
+            assert call.capture_safe
+            call.restore()
+            call.invoke()
+            expected = call.output.clone()
+            assert torch.isfinite(expected).all() and torch.count_nonzero(expected)
+            address = call.output.data_ptr()
+            session.freeze()
+            race = _prepare_race(
+                [call], device_ordinal=torch.accelerator.current_device_index()
+            )
+            assert race.timers[0].graph is not None
+            for _ in range(3):
+                call.output.fill_(float("nan"))
+                allocated = torch.accelerator.memory_stats()["allocation.all.allocated"]
+                race.timers[0].replay()
+                torch.accelerator.synchronize()
+                assert (
+                    torch.accelerator.memory_stats()["allocation.all.allocated"]
+                    == allocated
+                )
+                assert call.output.data_ptr() == address
+                torch.testing.assert_close(call.output, expected, atol=2e-2, rtol=2e-2)
+        finally:
+            if race is not None:
+                race.close()
+            session.close()
+
+
+@pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
+@pytest.mark.parametrize(
+    "weight_dtype,activation_dtype",
+    [("nvfp4", "nvfp4"), ("mxfp4", "mxfp8"), ("nvfp4", None)],
     ids=["nvfp4", "w4a8", "w4a16"],
 )
 @torch.inference_mode()
