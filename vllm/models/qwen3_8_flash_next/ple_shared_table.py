@@ -20,7 +20,16 @@ Layout under ``<dir>``::
     <key>.lock            flock target, separate so <key>/ can be replaced
 
 The directory must be tmpfs (or another shmem-backed file system): the CUDA
-driver refuses to pin ``MAP_SHARED`` pages of ordinary file systems.
+driver refuses to pin ``MAP_SHARED`` pages of ordinary file systems.  It is
+private to one user: the root is created ``0700``, and a root, table
+directory or file that is a symlink, owned by another user, or writable by
+group/others is rejected, so every replica sharing a table must run as the
+same user.
+
+The key identifies a checkpoint by ``model_path`` and ``revision``, not by
+content.  Replacing the files behind a local checkpoint path without changing
+either leaves the key unchanged, and the next process attaches the old
+table; prune the key (see the CLI) before reusing a mutable path.
 
 ``key`` derives from the checkpoint identity and the planned table geometry,
 so TP ranks and checkpoint revisions never share a directory.  A manifest that
@@ -41,6 +50,7 @@ import mmap
 import os
 import shutil
 import socket
+import stat
 import sys
 import time
 from collections.abc import Sequence
@@ -284,8 +294,10 @@ class SharedTableLock:
     def acquire(self) -> None:
         if self._fd is not None:
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+        _ensure_private_root(self.path.parent)
+        fd = os.open(
+            self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600
+        )
         deadline = time.monotonic() + self.timeout_s
         logged = False
         try:
@@ -330,6 +342,34 @@ class SharedTableLock:
 
     def __exit__(self, *exc: object) -> None:
         self.release()
+
+
+def _require_private(path: Path, *, directory: bool) -> None:
+    """Refuse a table path another local user could have planted or altered."""
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode):
+        raise SharedTableError(f"shared PLE table path {path} is a symlink")
+    if directory and not stat.S_ISDIR(info.st_mode):
+        raise SharedTableError(f"shared PLE table path {path} is not a directory")
+    if not directory and not stat.S_ISREG(info.st_mode):
+        raise SharedTableError(f"shared PLE table path {path} is not a regular file")
+    if info.st_uid != os.geteuid():
+        raise SharedTableError(
+            f"shared PLE table path {path} is owned by uid {info.st_uid}, not "
+            f"{os.geteuid()}; every replica sharing a table must run as one user"
+        )
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise SharedTableError(
+            f"shared PLE table path {path} is writable by group or others "
+            f"(mode {stat.S_IMODE(info.st_mode):04o})"
+        )
+
+
+def _ensure_private_root(directory: Path) -> None:
+    """Create the table root ``0700`` or verify an existing one is private."""
+    with suppress(FileExistsError):
+        os.mkdir(directory, 0o700)
+    _require_private(directory, directory=True)
 
 
 def _try_lock(path: Path) -> tuple[int | None, bool]:
@@ -451,8 +491,9 @@ class SharedTableMapping:
             )
         # Attachers still open read-write when the file allows it, so the
         # registration fallback below can map with PROT_WRITE.
+        _require_private(self.path, directory=False)
         open_flags = os.O_RDWR if writable or os.access(path, os.W_OK) else os.O_RDONLY
-        self._fd = os.open(path, open_flags | os.O_CLOEXEC)
+        self._fd = os.open(path, open_flags | os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
             size = os.fstat(self._fd).st_size
             if size != self.nbytes:
@@ -571,7 +612,8 @@ class SharedTableMapping:
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as handle:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2, sort_keys=True)
         handle.write("\n")
         handle.flush()
@@ -591,7 +633,9 @@ def read_manifest(table_dir: Path) -> dict[str, Any] | None:
     """Return the manifest of a complete table, or None when READY is absent."""
     if not (table_dir / READY_FILE).exists():
         return None
+    _require_private(table_dir, directory=True)
     manifest_path = table_dir / MANIFEST_FILE
+    _require_private(manifest_path, directory=False)
     try:
         with open(manifest_path, encoding="utf-8") as handle:
             manifest = json.load(handle)
@@ -743,7 +787,9 @@ class SharedTable:
             }
             _write_json(self.table_dir / MANIFEST_FILE, manifest)
             ready = self.table_dir / READY_FILE
-            fd = os.open(ready, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            fd = os.open(
+                ready, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+            )
             try:
                 os.fsync(fd)
             finally:
@@ -764,6 +810,19 @@ class SharedTable:
             time.monotonic() - self._started,
         )
 
+    def abort(self) -> None:
+        """Give up populating: remove the partial directory and release the lock.
+
+        The mappings stay valid (tmpfs keeps unlinked pages alive for them), so
+        a model that still references the tensors cannot fault; a waiting
+        follower repopulates instead of timing out on the lock.
+        """
+        if self._lock is None or self._published:
+            return
+        self._published = True
+        _remove_table_dir(self.table_dir)
+        self._lock.release()
+
     def close(self) -> None:
         if self._closed:
             return
@@ -772,10 +831,14 @@ class SharedTable:
             for mapping in reversed(list(self._mappings.values())):
                 mapping.close()
         finally:
-            if self._lock is not None and not self._published:
-                # Never leave a half-written table behind for followers.
-                _remove_table_dir(self.table_dir)
-                self._lock.release()
+            # Never leave a half-written table behind for followers.
+            self.abort()
+
+    def __del__(self) -> None:
+        if sys is None or sys.is_finalizing():
+            return
+        with suppress(Exception):
+            self.abort()
 
 
 def _open_mappings(
@@ -804,9 +867,13 @@ def _open_mappings(
 
 def _create_table_files(geometry: SharedTableGeometry, table_dir: Path) -> None:
     _remove_table_dir(table_dir)
-    table_dir.mkdir(parents=True)
+    os.mkdir(table_dir, 0o700)
     for spec in geometry.files:
-        fd = os.open(table_dir / spec.name, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
+        fd = os.open(
+            table_dir / spec.name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
         try:
             # Reserve every page now so a full tmpfs fails here with ENOSPC
             # instead of raising SIGBUS in the checkpoint copy later.
@@ -890,7 +957,16 @@ class TableStatus:
 
 
 def _directory_nbytes(path: Path) -> int:
-    return sum(entry.stat().st_size for entry in path.iterdir() if entry.is_file())
+    # A concurrent prune may remove the directory or its files at any point.
+    total = 0
+    try:
+        for entry in path.iterdir():
+            with suppress(OSError):
+                if entry.is_file():
+                    total += entry.stat().st_size
+    except OSError:
+        pass
+    return total
 
 
 def list_tables(directory: str | os.PathLike[str]) -> list[TableStatus]:
@@ -909,7 +985,7 @@ def list_tables(directory: str | os.PathLike[str]) -> list[TableStatus]:
         if state != "populating":
             try:
                 manifest = read_manifest(entry)
-            except SharedTableError:
+            except (SharedTableError, OSError):
                 manifest = None
             if manifest is not None:
                 state = "ready"
@@ -929,7 +1005,9 @@ def prune_tables(
 
     Tables whose lock is held (being populated) are left alone.  Removing a
     table that running processes have mapped is safe: tmpfs keeps the pages
-    until the last mapping closes, and no new process can attach to it.
+    until the last mapping closes, and no new process can attach to it.  The
+    empty ``<key>.lock`` files stay: ``flock`` binds to an inode, and
+    unlinking one while another process opens the key would leave two owners.
     """
     root = Path(directory)
     kept = set(keep)
@@ -943,7 +1021,6 @@ def prune_tables(
         try:
             if not dry_run:
                 _remove_table_dir(root / status.key)
-                lock_path(root, status.key).unlink(missing_ok=True)
             removed.append(status.key)
         finally:
             if fd is not None:

@@ -316,12 +316,81 @@ def test_cli_list_and_prune(tmp_path: Path, capsys) -> None:
 
     assert prune_tables(tmp_path, keep=[keep.key]) == [stale.key]
     assert not (tmp_path / stale.key).exists()
-    assert not shared.lock_path(tmp_path, stale.key).exists()
+    # flock binds to an inode: the lock file must survive the prune so a
+    # concurrent opener never ends up holding a different inode.
+    assert shared.lock_path(tmp_path, stale.key).exists()
     assert (tmp_path / keep.key / "READY").exists()
     # A table being populated is never pruned.
     assert (tmp_path / busy.key).exists()
     populating.close()
     assert shared.main(["--dir", str(tmp_path / "missing"), "list"]) == 0
+
+
+def test_abort_releases_lock_and_removes_partial_table(tmp_path: Path) -> None:
+    geometry = _geometry()
+    table = open_shared_table(geometry, _config(tmp_path), device=CPU)
+    view = table.host_view("weight")
+    view.fill_(9)
+    table.abort()
+    assert not (tmp_path / geometry.key).exists()
+    # The mapping stays usable for a model that still references it.
+    assert int(view.view(torch.uint8)[0, 0]) == 9
+    # Another opener is not blocked and repopulates.
+    follower = open_shared_table(
+        geometry, _config(tmp_path, lock_timeout_s=0), device=CPU
+    )
+    assert follower.populating
+    follower.close()
+    table.close()
+
+
+def test_validation_failure_aborts_populate() -> None:
+    model = _AttachedAudit(attached=False)
+    model.ngram_embedding.aborted = 0
+    model.ngram_embedding.abort_shared_table = lambda: setattr(
+        model.ngram_embedding, "aborted", model.ngram_embedding.aborted + 1
+    )
+    model.load_weights(_shard_weights(meta=False)[:4])
+    with pytest.raises(ValueError, match="do not cover the local table"):
+        model._validate_embedding_loaded()
+    assert model.ngram_embedding.aborted == 1
+    assert model.ngram_embedding.published == 0
+
+
+def test_root_is_created_private_and_unsafe_paths_are_rejected(tmp_path: Path) -> None:
+    root = tmp_path / "tables"
+    geometry = _geometry()
+    table = open_shared_table(
+        geometry, _config(tmp_path, directory=str(root)), device=CPU
+    )
+    assert oct(root.stat().st_mode & 0o777) == "0o700"
+    assert oct((root / geometry.key).stat().st_mode & 0o777) == "0o700"
+    assert oct((root / geometry.key / "weight.bin").stat().st_mode & 0o777) == "0o600"
+    _fill(table)
+    table.publish()
+    table.close()
+
+    # A group/world-writable table directory is not trusted even with READY.
+    (root / geometry.key).chmod(0o777)
+    with pytest.raises(shared.SharedTableError, match="writable by group or others"):
+        open_shared_table(geometry, _config(tmp_path, directory=str(root)), device=CPU)
+    (root / geometry.key).chmod(0o700)
+    open_shared_table(
+        geometry, _config(tmp_path, directory=str(root)), device=CPU
+    ).close()
+
+    # A symlinked root is refused.
+    link = tmp_path / "link"
+    link.symlink_to(root)
+    with pytest.raises(shared.SharedTableError, match="symlink"):
+        open_shared_table(geometry, _config(tmp_path, directory=str(link)), device=CPU)
+
+    # A world-writable root is refused.
+    other = tmp_path / "loose"
+    other.mkdir(mode=0o777)
+    other.chmod(0o777)
+    with pytest.raises(shared.SharedTableError, match="writable by group or others"):
+        open_shared_table(geometry, _config(tmp_path, directory=str(other)), device=CPU)
 
 
 @dataclass(kw_only=True)

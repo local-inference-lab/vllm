@@ -358,6 +358,11 @@ class _NGramEmbeddingStorage(nn.Module):
         if self.shared_table is not None and self.shared_table.populating:
             self.shared_table.publish()
 
+    def abort_shared_table(self) -> None:
+        """Release an unfinished populate so followers repopulate; no-op otherwise."""
+        if self.shared_table is not None and self.shared_table.populating:
+            self.shared_table.abort()
+
 
 class Qwen3_8FlashNextNGramEmbedding(nn.Module):
     """Prime-hashed learned n-gram embedding with fixed b12x storage."""
@@ -781,7 +786,23 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
     def _validate_embedding_loaded(self) -> None:
         if self._embedding_validated:
             return
+        try:
+            self._check_embedding_loaded()
+        except Exception:
+            # A populating shared table must not keep its lock (and a partial
+            # directory) alive while this process reports the failure.
+            abort = getattr(self.ngram_embedding, "abort_shared_table", None)
+            if abort is not None:
+                abort()
+            raise
+        self._embedding_validated = True
+        # Coverage of every local row is the proof shared-table followers
+        # wait for.
+        publish = getattr(self.ngram_embedding, "publish_shared_table", None)
+        if publish is not None:
+            publish()
 
+    def _check_embedding_loaded(self) -> None:
         covered_until = self._table_layout.shard_start
         for start, end in sorted(self._embedding_load_ranges):
             if start > covered_until:
@@ -822,12 +843,6 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
             and not self._weight_scale_2_loaded
         ):
             raise ValueError("NVFP4 PLE embedding checkpoint is missing weight_scale_2")
-        self._embedding_validated = True
-        # Coverage of every local row is the proof shared-table followers
-        # wait for.
-        publish = getattr(self.ngram_embedding, "publish_shared_table", None)
-        if publish is not None:
-            publish()
 
     def forward(
         self,
