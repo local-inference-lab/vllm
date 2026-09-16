@@ -662,7 +662,8 @@ def _run_compressed_sparse_mla(
     scratch = current_workspace_manager().get_simultaneous(
         *((s.shape, s.dtype) for s in plan.scratch_specs())
     )
-    binding = plan.bind(
+    binding = module.bind(
+        plan,
         scratch=scratch,
         q=q,
         swa_indices=swa_indices,
