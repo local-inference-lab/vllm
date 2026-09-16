@@ -144,7 +144,6 @@ class B12xMHCResidual:
         self._run_post_pre = module.run_post_pre
         self._plans: dict[tuple[str, int], object] = {}
         self._b12x_declared_width: int | None = None
-        self._b12x_declared_rows: int | None = None
         self._plan_key: tuple[int, ...] | None = None
 
         expected_hc_mult = int(module.MULT)
@@ -603,17 +602,15 @@ def _run_compressed_sparse_mla(
     indexed_page_size: int | None,
     mode: Literal["decode", "extend"],
     decode_row_capacity: int | None = None,
-    declared_rows: int | None = None,
     declared_width: int | None = None,
 ) -> None:
     module = _require_b12x_compressed_sparse_mla()
     rows, heads = int(q.shape[0]), int(q.shape[1])
     # CUDA-graph capture reuses one prepared plan per mode: pad the declared
-    # geometry to the reservation-era capacities so every capture batch size
-    # resolves to the already-prepared identity instead of a fresh plan that
-    # b12x refuses to materialize mid-capture.
-    if declared_rows is not None:
-        rows = max(rows, int(declared_rows))
+    # row geometry to the decode capacity so every capture batch size resolves
+    # to one identity instead of a fresh plan that b12x refuses to materialize
+    # mid-capture. Width pads to the reservation-era declared width.
+    rows = max(rows, int(decode_row_capacity or 0))
     if (
         mode == "decode"
         and decode_row_capacity is not None
@@ -1011,7 +1008,6 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
         width = max(swa_width + indexed_width, 1)
         rows = max(int(self.max_num_batched_tokens), 1)
         self._b12x_declared_width = width
-        self._b12x_declared_rows = rows
         decode_row_capacity = _get_dspark_decode_row_capacity(self.vllm_config)
         max_chunks_per_row = module.split_chunks_for_contract(
             rows=rows,
@@ -1264,7 +1260,6 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
             indexed_page_size=indexed_page_size,
             mode="decode",
             decode_row_capacity=_get_dspark_decode_row_capacity(self.vllm_config),
-            declared_rows=self._b12x_declared_rows,
             declared_width=self._b12x_declared_width,
         )
 
