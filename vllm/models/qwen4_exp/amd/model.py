@@ -573,6 +573,8 @@ class Qwen4ExpModel(nn.Module):
                 deepstack_embed = deepstack_input_embeds[
                     f"deepstack_input_embeds_{layer_idx}"
                 ]
+                if hc_owner is not None:
+                    deepstack_embed = hc_owner.local(deepstack_embed)
                 deepstack_embed = (
                     deepstack_embed.unsqueeze(-2)
                     .expand(
@@ -732,13 +734,7 @@ class Qwen4ExpForCausalLM(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
-        # Forward kwargs unchanged so the runner's _maybe_add_ngram_kwargs
-        # path (query_start_loc / ngram_context) reaches Qwen4ExpModel.
-        if hc_prefill.eligible(
-            self.model,
-            positions.shape[-1],
-            deepstack=kwargs.get("deepstack_input_embeds") is not None,
-        ):
+        if hc_prefill.eligible(self.model, positions.shape[-1]):
             eager_forward: Callable[..., torch.Tensor | IntermediateTensors] = (
                 self.model.forward
             )

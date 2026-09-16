@@ -46,11 +46,11 @@ def configure(model, config, mode: str) -> None:
         raise RuntimeError(f"Qwen HC ownership configuration mismatch: {votes}")
 
 
-def eligible(model, rows: int, *, deepstack: bool = False) -> bool:
+def eligible(model, rows: int) -> bool:
     """Only real pure prefills with evenly owned rows bypass compiled decode."""
     if model.hc_prefill_mode == "off" or torch.compiler.is_compiling():
         return False
-    if rows < 1024 or rows % 4 or deepstack:
+    if rows < 1024 or rows % 4:
         return False
     if not is_forward_context_available() or torch.cuda.is_current_stream_capturing():
         return False
