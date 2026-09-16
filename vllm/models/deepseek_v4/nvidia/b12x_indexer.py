@@ -15,6 +15,7 @@ from vllm.utils.b12x import (
     B12xPreparationUnit,
     B12xWorkload,
     PreparationResourceUnavailableError,
+    b12x_layer_prefix,
     get_b12x_dsa_indexer,
     set_b12x_preparation_provider,
 )
@@ -235,7 +236,7 @@ class B12xC4SparseIndexer(nn.Module):
         self.topk_indices_buffer = topk_indices_buffer
         self._plans: dict[tuple[str, int], object] = {}
         self._preparation_prefix = (
-            f"{getattr(k_cache, 'prefix', type(self).__qualname__)}.c4_indexer"
+            f"{getattr(k_cache, 'prefix', None) or b12x_layer_prefix(self)}.c4_indexer"
         )
         self.register_buffer(
             "_active_width",

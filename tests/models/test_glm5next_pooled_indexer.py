@@ -751,6 +751,39 @@ def test_glm53_decode_table_capacity_uses_batched_token_limit() -> None:
     assert indexer.indexer_op.max_model_len == 4096 // 4
 
 
+def test_glm53_physical_selection_prepares_before_resolution_freeze() -> None:
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.attention.sparse_mla import expand_pooled_topk_to_physical_slots
+    from b12x.preparation import PreparationSession
+
+    device = _require_glm_gpu()
+    indexer = Glm5NextPooledIndexer.__new__(Glm5NextPooledIndexer)
+    nn.Module.__init__(indexer)
+    indexer.block_size = 2048
+    indexer._parent_table_width = 512
+    indexer._main_cache_num_blocks = 1024
+    indexer._expand_pooled_topk_to_physical_slots = expand_pooled_topk_to_physical_slots
+    output = torch.empty((32, 2051), dtype=torch.int32, device=device)
+    counts = torch.empty(32, dtype=torch.int32, device=device)
+    indexer.max_tokens = 32
+    indexer.prefix = "model.layers.3.indexer"
+    indexer.topk_indices_buffer = output
+    indexer._physical_active_counts = counts
+    request = indexer.get_b12x_physical_selection_preparation_request()
+    session = PreparationSession(device=device, autotune=False, compile_workers=0)
+    session.prepare((request,))
+    assert request.plan.prepared is not None
+    with kernel_resolution_guard("prepared physical-selection replay"):
+        for rows in (1, 4, 32):
+            call = indexer.make_b12x_physical_selection_prepare_call(
+                output[:rows], counts[:rows]
+            )
+            call.run()
+            assert torch.all(output[:rows, 0] == 0)
+            assert torch.all(output[:rows, 1:] == -1)
+            assert torch.all(counts[:rows] == 1)
+
+
 def test_glm53_selector_capacity_tracks_auto_fit_max_model_len() -> None:
     indexer = Glm5NextPooledIndexer.__new__(Glm5NextPooledIndexer)
     nn.Module.__init__(indexer)
@@ -878,7 +911,9 @@ def test_glm53_packed_tail_scores_through_existing_c4_indexer() -> None:
         active_width=torch.ones(1, dtype=torch.int32, device=device),
         output_indices=output,
     )
-    plan = module.plan(caps, invocation=module.invocation_from_tensors(caps, **operands))
+    plan = module.plan(
+        caps, invocation=module.invocation_from_tensors(caps, **operands)
+    )
     scratch = tuple(
         torch.empty(spec.shape, dtype=spec.dtype, device=device)
         for spec in plan.scratch_specs()
@@ -1295,9 +1330,7 @@ def test_glm53_pool_expansion_appends_only_the_incomplete_tail() -> None:
     expand_pool_ids(pool_ids, positions, output)
 
     assert torch.all(output[0, 3:] == -1)
-    assert torch.equal(
-        output[0, :3].cpu(), torch.tensor([0, 1, 2], dtype=torch.int32)
-    )
+    assert torch.equal(output[0, :3].cpu(), torch.tensor([0, 1, 2], dtype=torch.int32))
     assert torch.equal(output[1, :8].cpu(), torch.tensor([4, 5, 6, 7, 0, 1, 2, 3]))
     assert torch.all(output[1, 8:] == -1)
     assert torch.equal(output[2, :2048].cpu(), torch.arange(2048, dtype=torch.int32))
