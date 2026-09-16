@@ -206,6 +206,7 @@ if TYPE_CHECKING:
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
+    VLLM_DS41_DCP_SHARD_INDEX: bool = False
     VLLM_PLE_CPU_OFFLOAD: bool = False
     VLLM_PLE_TABLE_MEMORY: Literal["ram", "disk"] | None = None
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
@@ -1707,6 +1708,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS", "524288")
+    ),
+    # Shard DS4.1 index caches across DCP ranks and reconstruct exact global
+    # selections. Opt-in while the model-specific path is being qualified.
+    "VLLM_DS41_DCP_SHARD_INDEX": lambda: bool(
+        int(os.getenv("VLLM_DS41_DCP_SHARD_INDEX", "0"))
     ),
     # Qwen3.8-Flash-Next PLE offload policy, resolved by vLLM for b12x.
     "VLLM_PLE_TABLE_MEMORY": env_with_choices(

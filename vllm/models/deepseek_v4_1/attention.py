@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """V4.1 Full/Reindex/Reuse topology with native b12x compute only."""
 
-from dataclasses import replace
 import math
+from dataclasses import replace
 from typing import cast
 
 import regex as re
@@ -14,9 +14,14 @@ from b12x.attention.compressed_sparse_mla import rotary, weight_scale
 from b12x.gemm import wo_projection
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig
-from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
+from vllm.distributed import (
+    get_dcp_group,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import (
@@ -44,13 +49,14 @@ from vllm.models.deepseek_v4_1.sparse_mla import (
 )
 from vllm.triton_utils import tl, triton
 from vllm.utils.b12x import (
-    set_b12x_preparation_provider,
     B12xPreparationUnit,
     B12xWorkload,
     PreparationResourceUnavailableError,
     register_b12x_unit_provider,
+    set_b12x_preparation_provider,
 )
 from vllm.utils.torch_utils import current_stream
+from vllm.v1.attention.backends.utils import refresh_dcp_local_seq_lens_
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
@@ -60,6 +66,12 @@ from vllm.v1.worker.workspace import (
 
 def _source(prefix, layer):
     return re.sub(r"(layers\.)\d+", rf"\g<1>{layer}", prefix)
+
+
+def _dcp_local_length(length: int, world_size: int, rank: int, stripe: int) -> int:
+    virtual = world_size * stripe
+    rounds, remainder = divmod(length, virtual)
+    return rounds * stripe + min(max(remainder - rank * stripe, 0), stripe)
 
 
 def _native_linear(layer):
@@ -95,9 +107,14 @@ class _AttentionHelpers:
         self, layer: object, workload: B12xWorkload
     ) -> tuple[B12xPreparationUnit, ...]:
         from b12x.preparation import FrozenMapping, MemoryRequirements, PreparedCall
+
         attn = self.attention
         table = attn.rotary_emb.cos_sin_cache
         device = table.device
+        if getattr(attn, "dcp_active", False) and not hasattr(attn, "_dcp_exchange"):
+            raise PreparationResourceUnavailableError(
+                "V4.1 DCP channel must be initialized after weight loading"
+            )
         attn._declare_attention(device)
         roles = [("kv", 1, 512, 1), ("q", attn.n_local_heads, 512, 1)]
         if attn.indexer is not None:
@@ -171,10 +188,15 @@ class _AttentionHelpers:
                 name=f"{attn.prefix}.helper.{role}", prepare_call=prepare_writer,
             ))
         attn._helper_plans = plans
-        return (B12xPreparationUnit(
+        units = (B12xPreparationUnit(
             name="V41AttentionHelpers", key=(attn.prefix, attn.capacity),
             requests=tuple(requests), stage="weights", autotune=not workload.eager_only,
         ), attn._wo_preparation_unit(workload))
+        if getattr(attn, "dcp_active", False):
+            units += attn._dcp_exchange.preparation_units(self)
+        if hasattr(attn, "_dcp_kv_replica"):
+            units += attn._dcp_kv_replica.preparation_units(self)
+        return units
 
 
 @triton.jit(do_not_specialize=["offset", "stride", "width"])
@@ -192,11 +214,34 @@ def _pages(
     tl.store(Out + row * WIDTH + col, page, col < WIDTH)
 
 
+@triton.jit(do_not_specialize=["offset"])
+def _replica_pages(Reqs, Out, offset, WIDTH: tl.constexpr, B: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.program_id(1) * B + tl.arange(0, B)
+    req = tl.load(Reqs + offset + row)
+    page = tl.where(req >= 0, req.to(tl.int64) * WIDTH + col + 1, -1)
+    tl.store(Out + row * WIDTH + col, page, col < WIDTH)
+
+
 class _Cache(nn.Module, AttentionLayerBase):
-    def __init__(self, config, prefix, *, kind, ratio=1, window=0, draft=False):
+    def __init__(
+        self,
+        config,
+        prefix,
+        *,
+        kind,
+        ratio=1,
+        window=0,
+        draft=False,
+        dcp_replicated=True,
+    ):
         super().__init__()
         self.prefix, self.kind, self.ratio, self.window = prefix, kind, ratio, window
         self.draft = draft
+        self.dcp_replicated = (
+            config.parallel_config.decode_context_parallel_size > 1
+            and dcp_replicated
+        )
         self.block_size = (
             config.cache_config.swa_block_size
             or CacheConfig.DEFAULT_DS41_SWA_BLOCK_SIZE
@@ -223,6 +268,7 @@ class _Cache(nn.Module, AttentionLayerBase):
             tokens_per_state=self.ratio,
             cache_dtype_str="b12x_dsv41",
             alignment=None,
+            dcp_replicated=self.dcp_replicated,
         )
         if self.kind == "swa":
             boundary = ced_decoder_start(config.model_config.hf_config)
@@ -428,12 +474,31 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             or self.compress_ratio not in (0, 1, 2)
         ):
             raise ValueError("unsupported V4.1 native attention geometry")
+        parallel = vllm_config.parallel_config
+        self.dcp_size = parallel.decode_context_parallel_size
+        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
+        self.dcp_stripe = parallel.cp_kv_cache_interleave_size
+        self.dcp_active = self.dcp_size > 1 and bool(self.compress_ratio)
+        self.dcp_shard_index = (
+            self.dcp_size > 1 and envs.VLLM_DS41_DCP_SHARD_INDEX
+        )
+        # CED queries are already compact; retain their graph/exchange recipe.
+        self.dcp_prefill_replica = (
+            self.dcp_size == 4 and self.compress_ratio == 2 and not self.is_ced_decoder
+        )
+        if parallel.prefill_context_parallel_size != 1:
+            raise ValueError("V4.1 prefill context parallel is unsupported")
+        if self.dcp_size not in (1, 2, 4) or (
+            self.dcp_stripe % max(self.compress_ratio, 1)
+        ):
+            raise ValueError("V4.1 supports DCP2/4 with whole-state cache stripes")
         if (
-            vllm_config.parallel_config.decode_context_parallel_size != 1
-            or vllm_config.parallel_config.prefill_context_parallel_size != 1
+            self.dcp_shard_index
+            and self.compress_ratio
+            and (self.dcp_stripe // self.compress_ratio) % 8
         ):
             raise ValueError(
-                "V4.1 TP shards heads, not context; context parallel is unsupported"
+                "V4.1 DCP index shards require eight-state-aligned stripes"
             )
         self._context = vllm_config.compilation_config.static_forward_context
         if prefix in self._context:
@@ -527,6 +592,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     f"{prefix}.indexer.k_cache",
                     kind="index",
                     ratio=self.compress_ratio,
+                    dcp_replicated=not self.dcp_shard_index,
                 )
             else:
                 k_cache = self._context[
@@ -596,6 +662,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         ) // self.config.cache_config.block_size
         self._index_page = self._main_page
         self._index_width = self._main_width
+        self._index_global_width = self._index_width
+        dcp = getattr(self, "dcp_active", False)
+        if dcp:
+            self._main_width = triton.cdiv(self._main_width, self.dcp_size)
+        if getattr(self, "dcp_shard_index", False):
+            self._index_width = triton.cdiv(self._index_width, self.dcp_size)
         spec = self.config.speculative_config
         # Parallel drafting can admit two draft spans during verifier profiling.
         query_width = (
@@ -615,16 +687,26 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             ("decode", min(self.capacity, decode_rows)),
             ("extend", self.capacity),
         ):
+            exchange = dcp and not (mode == "extend" and self.dcp_prefill_replica)
+            heads = self.n_local_heads * (self.dcp_size if exchange else 1)
+            main_width = (
+                triton.cdiv(self.max_model_len, self.config.cache_config.block_size)
+                if mode == "extend" and self.dcp_prefill_replica else self._main_width
+            )
+            if exchange:
+                from vllm.models.deepseek_v4_1.dcp import DCPExchange
+
+                capacity = min(capacity, DCPExchange.CHUNK)
             caps = mla.Caps(
                     device=device,
-                    num_q_heads=self.n_local_heads,
+                    num_q_heads=heads,
                     max_q_rows=capacity,
                     max_width=self.swa_width + (512 if self.compress_ratio else 0),
                     swa_width=self.swa_width,
                     indexed_width=512 if self.compress_ratio else 0,
                     swa_page_size=self.swa_cache_layer.block_size,
                     indexed_page_size=self._main_page,
-                    max_page_table_width=self._main_width,
+                    max_page_table_width=main_width,
                     mode=mode,
                     # DSpark's two-span reservation can exceed the generic
                     # 256-row cutoff even when replaying a six-row C1 graph.
@@ -636,11 +718,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             )
             swa_cache = getattr(self.swa_cache_layer, "kv_cache", None)
             indexed_cache = getattr(self._owner(), "kv_cache", None) if self.compress_ratio else None
+            if mode == "extend" and self.dcp_prefill_replica:
+                indexed_cache = getattr(self._owner(), "_prefill_kv", None)
             declaration = mla.plan(
                 caps,
                 invocation=mla.invocation_from_descriptors(
-                    q={"shape": (capacity, self.n_local_heads, 512),
-                       "stride": (self.n_local_heads * 512, 512, 1), "alignment": 16,
+                    q={"shape": (capacity, heads, 512),
+                       "stride": (heads * 512, 512, 1), "alignment": 16,
                        "dtype": "bfloat16"},
                     swa_cache=descriptor(swa_cache, page_size=self.swa_cache_layer.block_size, kind="swa"),
                     indexed_cache=(
@@ -648,6 +732,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                         if self.compress_ratio else None
                     ),
                     attn_sink_present=True, output_mode="provided",
+                    return_lse=exchange, lse_scale="natural" if exchange else "base2",
                 ),
             )
             metadata_specs = (
@@ -656,7 +741,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 ((capacity,), torch.int32),
             )
             if self.compress_ratio:
-                metadata_specs += (((capacity, self._main_width), torch.int32),)
+                metadata_specs += (((capacity, main_width), torch.int32),)
+            if exchange:
+                metadata_specs += (
+                    ((capacity, 512), torch.int32),
+                    ((capacity, heads, 512), torch.bfloat16),
+                    ((capacity, heads, 512), torch.bfloat16),
+                )
             self._attention_workspace_specs[mode] = metadata_specs
             # These metadata views coexist with native scratch in one arena.
             # Only integration-owned storage is added; launch policy stays native.
@@ -689,6 +780,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 specs.extend((
                     ("_candidates", (self.capacity, 16384), torch.int32),
                     ("_candidate_lens", (self.capacity,), torch.int32),
+                    ("_candidate_active", (1,), torch.int32),
                 ))
         self._short_index_shape = None
         if (
@@ -723,12 +815,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             raise RuntimeError("V4.1 metadata must be prepared before graph capture")
         if not hasattr(self, "_staging_specs"):
             self._declare_attention(device)
+        if self.dcp_prefill_replica:
+            # All encoder layers alias one channel-owned output. The native
+            # replica declaration accounts it once, independently of helpers.
+            self._prefill_kv = self._dcp_kv_replica.prepare_output(device)
         for name, shape, dtype in self._staging_specs:
             tensor = getattr(self, name, None)
             if tensor is None or tuple(tensor.shape) != shape or tensor.dtype != dtype:
                 setattr(self, name, torch.empty(shape, dtype=dtype, device=device))
         if self.indexer is not None:
             self._active.fill_(self._index_width * self._index_page)
+            if self.layer_id == self.candidate_source_layer:
+                self._candidate_active.fill_(
+                    self._index_global_width * self._index_page
+                )
         self._ready = True
 
 
@@ -739,6 +839,25 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             counts.add(compact_max)
             counts.update(range(CED_WINDOW, compact_max + 1, CED_WINDOW))
         return tuple(sorted(counts))
+
+    def reserve_profile_scratch(self):
+        """Admit full-context eager scratch before the runner locks its arena."""
+        self._declare_attention(self.rotary_emb.cos_sin_cache.device)
+        declarations = list(self._attention_declarations.values())
+        if self.indexer is not None:
+            regimes = [
+                ("decode", min(self.capacity, self.DECODE_CHUNK)),
+                ("prefill", min(self.capacity, self.INDEX_CHUNK)),
+            ]
+            if self._short_index_shape is not None:
+                regimes.append(("prefill_short", self._short_index_shape[0]))
+            declarations.extend(
+                self._declare_index_plan(mode, rows) for mode, rows in regimes
+            )
+        for declaration in declarations:
+            current_workspace_manager().get_simultaneous(
+                *((spec.shape, spec.dtype) for spec in declaration.scratch_specs())
+            )
 
     def _index_request_name(self, mode: str, rows: int) -> str:
         return f"{self.prefix}.mxfp4_index.{mode}.m{rows}"
@@ -801,7 +920,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             from b12x.preparation import PreparedCall
 
             device = self.swa_cache_layer.kv_cache.device
-            source = torch.randn((rows, self.n_local_heads, 512),
+            source = torch.randn((rows, state.query.num_q_heads, 512),
                                  dtype=torch.bfloat16, device=device)
             q = torch.empty_like(source)
             out = torch.empty_like(source)
@@ -840,11 +959,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 self.swa_width, "swa",
             )
             kwargs = {}
+            replica = mode == "extend" and self.dcp_prefill_replica
+            indexed_cache = (
+                self._owner()._prefill_kv if replica else self._owner().kv_cache
+            ) if self.compress_ratio else None
             if self.compress_ratio:
                 indices, lengths, pages = cache_inputs(
-                    self._owner().kv_cache, self._main_page, 512, "indexed",
+                    indexed_cache, self._main_page, 512, "indexed",
                 )
-                table = torch.full((rows, self._main_width), -1, dtype=torch.int32, device=device)
+                table = torch.full((rows, state.query.max_page_table_width), -1,
+                                   dtype=torch.int32, device=device)
                 table[:, :pages] = torch.arange(pages, dtype=torch.int32, device=device)
                 kwargs = dict(indexed_indices=indices, indexed_lengths=lengths,
                               indexed_page_table=table)
@@ -869,11 +993,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             return PreparedCall(
                 run=lambda: state.run(
                     binding, swa_k_cache=self.swa_cache_layer.kv_cache,
-                    indexed_k_cache=self._owner().kv_cache if self.compress_ratio else None,
+                    indexed_k_cache=indexed_cache,
                     swa_page_size=self.swa_cache_layer.block_size,
                     indexed_page_size=self._main_page,
-                    sm_scale=512**-0.5, attn_sink=self.attn_sink, out=out,
+                    sm_scale=512**-0.5,
+                    attn_sink=(self._dcp_sink if state.query.return_lse else self.attn_sink),
+                    out=out,
                     cache_format="deepseek_v41",
+                    return_lse=state.query.return_lse,
+                    lse_scale=state.query.lse_scale,
                 ),
                 output=out, produce=lambda: q.copy_(source),
                 reset=reset, restore=restore,
@@ -1083,6 +1211,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             cache_format="deepseek_v41",
             plan=self._helper_plan("indexed_cache_write"),
         )
+        if self.dcp_prefill_replica and not main.is_decode:
+            # Refresh after every source write, never from a context identity
+            # memo: physical-page reuse and resumed conversations stay fresh.
+            self._dcp_kv_replica.replicate(self, main)
 
     def forward(
         self, positions, hidden_states, llama_4_scaling=None, *, global_kv_ready=None
@@ -1163,7 +1295,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
 
         plan = self._attention_plan(mode)
         state = require_prepared(plan, "attention.compressed_sparse_mla")
-        if rows > state.query.query_rows:
+        if rows > state.query.query_rows and not getattr(self, "dcp_active", False):
             raise ValueError(
                 f"V4.1 {mode} rows {rows} exceed prepared capacity "
                 f"{state.query.query_rows}"
@@ -1186,9 +1318,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 and self.layer_id <= self.candidate_source_layer
                 and not torch.cuda.is_current_stream_capturing()
             ):
+                visible = triton.cdiv(im.max_seq_len, self.compress_ratio)
+                if self.dcp_shard_index:
+                    visible = _dcp_local_length(
+                        visible,
+                        self.dcp_size,
+                        self.dcp_rank,
+                        self.dcp_stripe // self.compress_ratio,
+                    )
                 score_width = min(
                     self._index_width * self._index_page,
-                    max(1, triton.cdiv(im.max_seq_len, self.compress_ratio)),
+                    max(1, visible),
                 )
             chunk_rows = self.DECODE_CHUNK if mode == "decode" else self.INDEX_CHUNK
             index_pages = self._index_pages
@@ -1215,8 +1355,98 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     index_width,
                     128,
                 )
+                index_plan = self._index_plan(index_mode, count)
+                scratch_specs = tuple(
+                    (spec.shape, spec.dtype)
+                    for spec in dsa_indexer.scratch_specs(
+                        index_plan, device=iq_data.device
+                    )
+                )
+                integration_specs = []
+                if self.dcp_shard_index:
+                    integration_specs.extend(
+                        (
+                            ((count,), torch.int32),
+                            ((count, 512), torch.float32),
+                        )
+                    )
+                    if self.layer_id == self.candidate_source_layer:
+                        integration_specs.append(((count,), torch.int32))
+                    elif self.layer_id > self.candidate_source_layer:
+                        integration_specs.extend(
+                            (
+                                ((count, 16384), torch.int32),
+                                ((count, 32), torch.int32),
+                                ((count,), torch.int32),
+                            )
+                        )
+                buffers = current_workspace_manager().get_simultaneous(
+                    *integration_specs, *scratch_specs
+                )
+                cursor = 0
+                global_lengths = im.cache_lengths[offset:end]
+                index_lengths = global_lengths
+                output_scores = None
                 candidate_args = {}
-                if self.layer_id == self.candidate_source_layer:
+                if self.dcp_shard_index:
+                    from vllm.models.deepseek_v4_1.dcp import (
+                        index_candidate_force_blocks,
+                        localize_index_candidates,
+                    )
+
+                    index_lengths = buffers[cursor]
+                    cursor += 1
+                    output_scores = buffers[cursor]
+                    cursor += 1
+                    index_stripe = self.dcp_stripe // self.compress_ratio
+                    refresh_dcp_local_seq_lens_(
+                        index_lengths,
+                        global_lengths,
+                        count,
+                        self.dcp_size,
+                        self.dcp_rank,
+                        index_stripe,
+                    )
+                    if self.layer_id == self.candidate_source_layer:
+                        force_blocks = buffers[cursor]
+                        cursor += 1
+                        index_candidate_force_blocks(
+                            global_lengths,
+                            force_blocks,
+                            world_size=self.dcp_size,
+                            rank=self.dcp_rank,
+                            stripe=index_stripe,
+                        )
+                        candidate_args = dict(
+                            candidate_output=self._candidates[offset:end],
+                            candidate_output_lengths=self._candidate_lens[offset:end],
+                            candidate_force_blocks=force_blocks,
+                            candidate_visible_lengths=global_lengths,
+                            candidate_active_width=self._candidate_active,
+                        )
+                    elif self.layer_id > self.candidate_source_layer:
+                        local_candidates = buffers[cursor]
+                        tile_offsets = buffers[cursor + 1]
+                        local_candidate_lengths = buffers[cursor + 2]
+                        cursor += 3
+                        source = self._context[
+                            _source(self.prefix, self.candidate_source_layer)
+                        ]
+                        localize_index_candidates(
+                            source._candidates[offset:end],
+                            source._candidate_lens[offset:end],
+                            local_candidates,
+                            local_candidate_lengths,
+                            tile_offsets,
+                            world_size=self.dcp_size,
+                            rank=self.dcp_rank,
+                            stripe=index_stripe,
+                        )
+                        candidate_args = dict(
+                            candidate_indices=local_candidates,
+                            candidate_lengths=local_candidate_lengths,
+                        )
+                elif self.layer_id == self.candidate_source_layer:
                     candidate_args = dict(
                         candidate_output=self._candidates[offset:end],
                         candidate_output_lengths=self._candidate_lens[offset:end],
@@ -1229,28 +1459,64 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                         candidate_indices=source._candidates[offset:end],
                         candidate_lengths=source._candidate_lens[offset:end],
                     )
-                index_plan = self._index_plan(index_mode, count)
                 binding = dsa_indexer.bind(
                     index_plan,
-                    scratch=current_workspace_manager().get_simultaneous(
-                        *((spec.shape, spec.dtype)
-                          for spec in dsa_indexer.scratch_specs(
-                              index_plan, device=iq_data.device))),
+                    scratch=buffers[cursor:],
                     q_mxfp4=iq_data[offset:end],
                     q_scales=iq_scale[offset:end],
                     query_weights=iw[offset:end],
                     index_k_cache=self.indexer.k_cache.kv_cache,
                     page_table=index_pages[:count],
-                    cache_lengths=im.cache_lengths[offset:end],
+                    cache_lengths=index_lengths,
                     active_width=self._active,
                     score_width=score_width,
                     output_indices=self.topk_indices_buffer[offset:end],
+                    output_scores=output_scores,
                     **candidate_args,
                 )
                 retain_cuda_graph_capture_resource(binding)
                 dsa_indexer.score(binding)
-                dsa_indexer.select(binding)
+                if self.dcp_shard_index:
+                    from vllm.v1.attention.backends.mla.b12x_indexer import (
+                        _merge_dcp_topk,
+                    )
 
+                    dsa_indexer.select_tokens(binding)
+                    _merge_dcp_topk(
+                        self.topk_indices_buffer[offset:end],
+                        output_scores,
+                        self.dcp_rank,
+                        self.dcp_size,
+                        self.dcp_stripe // self.compress_ratio,
+                    )
+                    if self.layer_id == self.candidate_source_layer:
+                        block_indices, block_scores = (
+                            dsa_indexer.select_candidate_blocks(binding)
+                        )
+                        _merge_dcp_topk(
+                            block_indices,
+                            block_scores,
+                            self.dcp_rank,
+                            self.dcp_size,
+                            (self.dcp_stripe // self.compress_ratio) // 8,
+                        )
+                        dsa_indexer.expand_candidate_blocks(binding)
+                else:
+                    dsa_indexer.select(binding)
+
+        chunk = state.query.query_rows
+        for offset in range(0, rows, chunk):
+            end = min(offset + chunk, rows)
+            self._attention_chunk(
+                q[offset:end], output[offset:end], swa, main, owner, mode, offset
+            )
+
+    def _attention_chunk(self, q, output, swa, main, owner, mode, offset):
+        from b12x.preparation import require_prepared
+
+        rows = q.shape[0]
+        plan = self._attention_plan(mode)
+        state = require_prepared(plan, "attention.compressed_sparse_mla")
         # Reuse the shared arena only after indexing completes. Keep full-batch
         # metadata beside, not overlapping, the native attention scratch.
         buffers = current_workspace_manager().get_simultaneous(
@@ -1269,7 +1535,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             visible,
             swa.query_start_loc,
             swa.request_positions,
-            0,
+            offset,
             swa.block_table.stride(0),
             self.swa_cache_layer.block_size,
             self.window_size,
@@ -1283,21 +1549,45 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         if main is not None:
             main_pages = buffers[3]
             metadata_count += 1
-            _pages[(rows, triton.cdiv(self._main_width, 128))](
-                main.req_id_per_token,
-                main.block_table,
-                main_pages,
-                0,
-                main.block_table.stride(0),
-                main.block_table.shape[1],
-                self._main_width,
-                128,
-            )
+            width = main_pages.shape[1]
+            if mode == "extend" and self.dcp_prefill_replica:
+                _replica_pages[(rows, triton.cdiv(width, 128))](
+                    main.req_id_per_token, main_pages, offset, width, 128,
+                )
+            else:
+                _pages[(rows, triton.cdiv(width, 128))](
+                    main.req_id_per_token, main.block_table, main_pages, offset,
+                    main.block_table.stride(0),
+                    min(main.block_table.shape[1], width), width, 128,
+                )
             kwargs = dict(
-                indexed_indices=owner.topk_indices_buffer[:rows],
+                indexed_indices=owner.topk_indices_buffer[offset : offset + rows],
                 indexed_lengths=top_lengths[:rows],
                 indexed_page_table=main_pages[:rows],
             )
+        replica = mode == "extend" and self.dcp_prefill_replica
+        dcp = getattr(self, "dcp_active", False) and not replica
+        if dcp:
+            from vllm.models.deepseek_v4_1.dcp import local_indices
+
+            indices, gathered, partial = buffers[metadata_count : metadata_count + 3]
+            metadata_count += 3
+            local_indices(
+                kwargs["indexed_indices"],
+                indices[:rows],
+                top_lengths[:rows],
+                world_size=self.dcp_size,
+                rank=self.dcp_rank,
+                stripe=self.dcp_stripe // self.compress_ratio,
+            )
+            kwargs["indexed_indices"] = indices[:rows]
+            # Replicated SWA and the sink must enter the union exactly once.
+            if self.dcp_rank != 0:
+                swa_lengths.zero_()
+            q = self._dcp_exchange.gather(q, gathered[:rows])
+            native_output = partial[:rows]
+        else:
+            native_output = output
         binding = mla.bind(
             plan,
             scratch=buffers[metadata_count:],
@@ -1307,17 +1597,22 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             **kwargs,
         )
         retain_cuda_graph_capture_resource(binding)
-        mla.run(
+        result = mla.run(
             binding=binding,
             swa_k_cache=self.swa_cache_layer.kv_cache,
-            indexed_k_cache=self._owner().kv_cache if main is not None else None,
+            indexed_k_cache=(self._owner()._prefill_kv if replica
+                             else self._owner().kv_cache) if main is not None else None,
             swa_page_size=self.swa_cache_layer.block_size,
             indexed_page_size=self._main_page,
             sm_scale=512**-0.5,
-            attn_sink=self.attn_sink,
-            out=output,
+            attn_sink=self._dcp_sink if dcp else self.attn_sink,
+            out=native_output,
             cache_format="deepseek_v41",
+            return_lse=dcp,
+            lse_scale="natural" if dcp else "base2",
         )
+        if dcp:
+            self._dcp_exchange.reduce(result[0], result[1], output)
 
     def setup_wo_projection(self):
         groups = self.n_local_groups
@@ -1356,6 +1651,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             hidden=hidden,
             block_size=(32, 32),
         )
+        if getattr(self, "dcp_active", False):
+            from vllm.models.deepseek_v4_1.dcp import DCPExchange
+
+            self._dcp_exchange = DCPExchange.get(
+                self.n_local_heads, self.attn_sink.device
+            )
+            sink = get_dcp_group().all_gather(self.attn_sink.data, dim=0)
+            self._dcp_sink = (
+                sink if self.dcp_rank == 0 else torch.full_like(sink, -float("inf"))
+            )
+        if self.dcp_prefill_replica:
+            from vllm.models.deepseek_v4_1.dcp import DCPKVReplica
+
+            self._dcp_kv_replica = DCPKVReplica.get(self)
 
     def _wo_preparation_unit(self, workload):
         from b12x.preparation import PreparedCall
@@ -1394,10 +1703,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         requests = []
         token_counts = self._preparation_token_counts(workload)
         for rows in token_counts:
-            requests.append(self._wo_plan(rows).request(
+            requests.append(self._wo_plan(rows, declaration=True).request(
                 name=f"{self.prefix}.wo.m{rows}", prepare_call=prepare, benchmark_call=prepare,
             ))
-        requests.append(self._wo_plan(self.capacity, is_prefill=True).request(
+        requests.append(self._wo_plan(self.capacity, is_prefill=True, declaration=True).request(
             name=f"{self.prefix}.wo.prefill", prepare_call=prepare, benchmark_call=prepare,
         ))
         return B12xPreparationUnit(
@@ -1405,10 +1714,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             requests=tuple(requests), stage="weights", autotune=not workload.eager_only,
         )
 
-    def _wo_plan(self, rows: int, *, is_prefill: bool = False):
+    def _wo_plan(self, rows: int, *, is_prefill: bool = False, declaration=False):
         key = "prefill" if is_prefill else rows
         planned_rows = self.capacity if is_prefill else rows
         if key not in self._wo_plans:
+            if not declaration and getattr(self, "dcp_size", 1) > 1:
+                kind = "prefill" if is_prefill else "decode"
+                raise PreparationResourceUnavailableError(
+                    f"DCP WO has no prepared {kind} capacity for {rows} live rows"
+                )
             weights = self._wo_projection_weights
             if weights is None:
                 raise PreparationResourceUnavailableError("V4.1 WO weights are not packed")

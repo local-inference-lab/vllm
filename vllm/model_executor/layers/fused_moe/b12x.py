@@ -718,6 +718,30 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             int(topk_ids.shape[1]),
         )
 
+    def _scratch_nbytes(self, plan: Any) -> int:
+        states = (
+            plan.prepared,
+            *(child.prepared for child in getattr(plan, "variants", {}).values()),
+        )
+        cache = getattr(self, "_scratch_size_cache", None)
+        if (
+            cache is not None
+            and cache[0]() is plan
+            and len(cache[1]) == len(states)
+            and all(state is not None for state in states)
+            and all(ref() is state for ref, state in zip(cache[1], states))
+        ):
+            return cache[2]
+        nbytes = sum(spec.nbytes for spec in plan.scratch_specs())
+        # A new/released child selection invalidates the family's envelope.
+        # Weak references must not keep released prepared GPU state alive.
+        self._scratch_size_cache = (
+            (weakref.ref(plan), tuple(weakref.ref(state) for state in states), nbytes)
+            if all(state is not None for state in states)
+            else None
+        )
+        return nbytes
+
     def workspace_shapes(
         self,
         M: int,
@@ -735,7 +759,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             activation=activation,
             apply_router_weight_on_input=self._apply_router_weight_on_input,
         )
-        required_nbytes = sum(spec.nbytes for spec in plan.scratch_specs())
+        required_nbytes = self._scratch_nbytes(plan)
         itemsize = self.moe_config.in_dtype.itemsize
         return (0,), (max(1, (required_nbytes + itemsize - 1) // itemsize),), (M, K)
 
