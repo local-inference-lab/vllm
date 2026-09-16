@@ -40,6 +40,8 @@ def test_ownership_requires_complete_pure_prefill_metadata(
     model = SimpleNamespace(hc_prefill_mode="shard")
     assert hc_prefill.eligible(model, 7520) is expected
     assert not hc_prefill.eligible(model, 674)
+    context.cudagraph_runtime_mode.name = "PIECEWISE"
+    assert hc_prefill.eligible(model, 7520) is expected
     context.cudagraph_runtime_mode.name = "FULL"
     assert not hc_prefill.eligible(model, 7520)
 

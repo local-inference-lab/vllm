@@ -57,7 +57,9 @@ def eligible(model, rows: int) -> bool:
     context = get_forward_context()
     if (
         getattr(context, "is_dummy_run", False)
-        or context.cudagraph_runtime_mode.name != "NONE"
+        # PIECEWISE selects wrappers inside the compiled model. The ownership
+        # entry point calls forward directly, so those wrappers are bypassed.
+        or context.cudagraph_runtime_mode.name not in ("NONE", "PIECEWISE")
         or context.ubatch_slices is not None
         or not isinstance(context.attn_metadata, dict)
     ):
