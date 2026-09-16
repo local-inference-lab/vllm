@@ -411,6 +411,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         self._index_page, self._index_width = self._main_page, self._main_width
         self.is_kv_source = self.layer_id in hf.kv_source_layer_ids
         self.is_index_source = self.layer_id in hf.index_source_layer_ids
+        self._index_topk = getattr(hf, "index_topk", 512)
         self.kv_source_layer_id = (
             max(s for s in hf.kv_source_layer_ids if s <= self.layer_id)
             if self.compress_ratio
@@ -619,9 +620,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     device=device,
                     num_q_heads=self.n_local_heads,
                     max_q_rows=capacity,
-                    max_width=self.swa_width + (512 if self.compress_ratio else 0),
+                    max_width=self.swa_width
+                    + (self._index_topk if self.compress_ratio else 0),
                     swa_width=self.swa_width,
-                    indexed_width=512 if self.compress_ratio else 0,
+                    indexed_width=self._index_topk if self.compress_ratio else 0,
                     swa_page_size=self.swa_cache_layer.block_size,
                     indexed_page_size=self._main_page,
                     max_page_table_width=self._main_width,
@@ -679,7 +681,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             self._owns_topk_indices = self.topk_indices_buffer is None and self.is_index_source
         specs = []
         if self._owns_topk_indices:
-            specs.append(("topk_indices_buffer", (self.capacity, 512), torch.int32))
+            specs.append(
+                ("topk_indices_buffer", (self.capacity, self._index_topk), torch.int32)
+            )
         if self.indexer is not None:
             specs.extend((
                 ("_index_pages", (self.INDEX_CHUNK, self._index_width), torch.int32),
@@ -842,7 +846,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             kwargs = {}
             if self.compress_ratio:
                 indices, lengths, pages = cache_inputs(
-                    self._owner().kv_cache, self._main_page, 512, "indexed",
+                    self._owner().kv_cache, self._main_page, self._index_topk, "indexed",
                 )
                 table = torch.full((rows, self._main_width), -1, dtype=torch.int32, device=device)
                 table[:, :pages] = torch.arange(pages, dtype=torch.int32, device=device)
@@ -903,7 +907,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             pages[:, :live_pages] = torch.arange(live_pages, dtype=torch.int32, device=device)
             lengths = torch.full((rows,), live_tokens, dtype=torch.int32, device=device)
             active = torch.full((1,), live_tokens, dtype=torch.int32, device=device)
-            indices = torch.empty((rows, 512), dtype=torch.int32, device=device)
+            indices = torch.empty((rows, self._index_topk), dtype=torch.int32, device=device)
             kwargs = {}
             if self.layer_id == self.candidate_source_layer:
                 kwargs = dict(
@@ -970,7 +974,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         return dsa_indexer.plan(dsa_indexer.Caps(
             device=self.rotary_emb.cos_sin_cache.device,
             num_q_heads=self.indexer.heads, max_q_rows=rows,
-            max_page_table_width=width, topk=512,
+            max_page_table_width=width, topk=self._index_topk,
             mode="decode" if mode == "decode" else "prefill",
             cache_format="mxfp4", page_size=self._index_page,
             max_candidates=16384 if self.layer_id > self.candidate_source_layer else 0,
@@ -1274,6 +1278,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             self.swa_cache_layer.block_size,
             self.window_size,
             self.swa_width,
+            self._index_topk,
             self.is_draft,
             triton.next_power_of_2(self.swa_width),
             swa_replay_start=swa.swa_replay_start if self.is_ced_decoder else None,
