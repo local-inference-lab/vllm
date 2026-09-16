@@ -432,6 +432,7 @@ class B12xC4SparseIndexer(nn.Module):
                     live_keys = min(
                         self.max_model_len,
                         int(kv_cache.shape[0]) * _INDEX_PAGE_SIZE,
+                        caps.max_page_table_width * _INDEX_PAGE_SIZE,
                         2 * self.topk_tokens,
                     )
                     live_pages = (live_keys + _INDEX_PAGE_SIZE - 1) // _INDEX_PAGE_SIZE

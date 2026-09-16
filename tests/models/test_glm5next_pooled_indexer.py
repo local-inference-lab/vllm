@@ -828,6 +828,66 @@ def test_deepseek_c4_default_page_table_width_is_unchanged() -> None:
     assert indexer._max_page_table_width == 4096
 
 
+@pytest.mark.parametrize("page_width", [1, 4, 32])
+def test_c4_preparation_respects_bound_page_capacity(monkeypatch, page_width):
+    """A DCP-local table can address fewer keys than the backing cache holds."""
+    from b12x.attention import dsa_indexer
+
+    from vllm.models.deepseek_v4.nvidia import b12x_indexer as c4
+    from vllm.utils.b12x import B12xWorkload
+
+    monkeypatch.setattr(c4, "_require_b12x_indexer", lambda: dsa_indexer)
+    owner = c4.B12xC4SparseIndexer(
+        None,
+        128,
+        "ue8m0",
+        512,
+        128,
+        1024,
+        1024,
+        torch.empty((8, 512), dtype=torch.int32),
+        skip_k_cache_insert=True,
+        compress_ratio=4,
+    )
+    cache = torch.full((16, 64, 132), 0x5A, dtype=torch.uint8)
+    owner.set_b12x_index_cache(cache, num_q_heads=32, max_page_table_width=page_width)
+    workload = B12xWorkload(
+        stage="state",
+        token_counts=(1, 8),
+        fixed_token_counts=(1,),
+        output_dtype=torch.bfloat16,
+        max_tokens=8,
+        max_seqs=1,
+        max_model_len=1024,
+    )
+    bindings = []
+
+    def bind(**kwargs):
+        bindings.append(kwargs)
+        return kwargs
+
+    state = SimpleNamespace(layout=SimpleNamespace(scratch_specs=lambda: ()), bind=bind)
+    (unit,) = owner.get_b12x_preparation_units(owner, workload)
+    for request in unit.requests:
+        assert callable(request.prepare_call)
+        call = request.prepare_call(state)
+        metadata = bindings[-1]
+        pages = metadata["real_page_table"]
+        live_keys = min(1024, page_width * 64)
+        live_pages = live_keys // 64
+        assert pages.shape[1] == page_width
+        assert metadata["cache_seqlens_int32"].tolist() == [live_keys] * pages.shape[0]
+        assert metadata["active_width"].item() == live_keys
+        assert pages[0, :live_pages].tolist() == list(range(live_pages))
+        assert pages[0, live_pages:].count_nonzero().item() == 0
+        if metadata["shared_page_table"]:
+            assert pages.stride(0) == 0
+        assert call.restore is not None
+        call.restore()
+    assert len(bindings) == 2  # Decode and prefill use the same capacity bound.
+    assert torch.all(cache == 0x5A)
+
+
 def test_glm53_selector_capacity_tracks_auto_fit_max_model_len() -> None:
     indexer = Glm5NextPooledIndexer.__new__(Glm5NextPooledIndexer)
     nn.Module.__init__(indexer)
