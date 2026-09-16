@@ -636,6 +636,7 @@ def _run_compressed_sparse_mla(
         q=q,
         swa_k_cache=swa_k_cache,
         indexed_k_cache=indexed_k_cache,
+        out=output,
     )
     indexed_width_serving = (
         int(indexed_indices.shape[-1]) if indexed_indices is not None else 0
