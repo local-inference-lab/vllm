@@ -27,6 +27,8 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.modelopt import ModelOptLinearMethod
+from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Static
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -511,13 +513,11 @@ class DFlashQwen3Model(nn.Module):
         layers_attn: list[nn.Module],
         has_bias: bool,
     ) -> None:
-        from vllm.model_executor.layers.quantization.modelopt import (
-            ModelOptMxFp8LinearMethod,
-        )
-
         quant_methods = [a.qkv_proj.quant_method for a in layers_attn]
         uses_mxfp8 = [
-            isinstance(method, ModelOptMxFp8LinearMethod) for method in quant_methods
+            isinstance(method, ModelOptLinearMethod)
+            and method.spec.weight == kMxfp8Static
+            for method in quant_methods
         ]
         if any(uses_mxfp8) and not all(uses_mxfp8):
             raise ValueError(
@@ -593,12 +593,11 @@ class DFlashQwen3Model(nn.Module):
 
     def process_weights_after_loading(self) -> None:
         """Pack the serialized MXFP8 context projection for its GEMM backend."""
-        from vllm.model_executor.layers.quantization.modelopt import (
-            ModelOptMxFp8LinearMethod,
-        )
-
         quant_method = self.layers[0].self_attn.qkv_proj.quant_method
-        if not isinstance(quant_method, ModelOptMxFp8LinearMethod):
+        if not (
+            isinstance(quant_method, ModelOptLinearMethod)
+            and quant_method.spec.weight == kMxfp8Static
+        ):
             return
         if self._fused_kv_weight is None or self._fused_kv_weight_scale is None:
             raise RuntimeError(
@@ -607,9 +606,23 @@ class DFlashQwen3Model(nn.Module):
             )
 
         output_size, input_size = self._fused_kv_weight.shape
-        self._fused_kv_linear.input_size_per_partition = input_size
-        self._fused_kv_linear.output_size_per_partition = output_size
-        self._fused_kv_linear.logical_widths = [output_size]
+        # Fused context K/V has an independent weight shape and kernel
+        # lifecycle; do not repack through the query projection's method.
+        fused_method = ModelOptLinearMethod(
+            quant_method.spec, quant_method.ctx, quant_method.fmt
+        )
+        fused_method.input_dtype = quant_method.input_dtype
+        fused_method.out_dtype = quant_method.out_dtype
+        fused_method.marlin_input_dtype = quant_method.marlin_input_dtype
+        self._fused_kv_linear.has_bias = self._fused_kv_bias is not None
+        fused_method.create_weights(
+            self._fused_kv_linear,
+            input_size_per_partition=input_size,
+            output_partition_sizes=[output_size],
+            input_size=input_size,
+            output_size=output_size,
+            params_dtype=self.hidden_norm.weight.dtype,
+        )
         self._fused_kv_linear.register_parameter(
             "weight", nn.Parameter(self._fused_kv_weight, requires_grad=False)
         )
@@ -617,13 +630,13 @@ class DFlashQwen3Model(nn.Module):
             "weight_scale",
             nn.Parameter(self._fused_kv_weight_scale, requires_grad=False),
         )
-        quant_method.process_weights_after_loading(self._fused_kv_linear)
-        self._fused_kv_quant_method = quant_method
+        fused_method.process_weights_after_loading(self._fused_kv_linear)
+        self._fused_kv_quant_method = fused_method
         self._fused_kv_weight = None
         self._fused_kv_weight_scale = None
         logger.info_once(
             "Using %s for the fused DFlash context K/V projection.",
-            type(quant_method.kernel).__name__,
+            type(fused_method.kernel).__name__,
         )
 
     def _project_context_kv(
