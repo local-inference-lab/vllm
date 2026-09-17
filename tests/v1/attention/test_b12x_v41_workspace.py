@@ -1047,6 +1047,7 @@ def test_output_projection_capture_releases_caller_activations(
             ),
         )
     layer.setup_wo_projection()
+    layer._declare_attention(device)
     workload = B12xWorkload(
         stage="weights",
         token_counts=(8, 16),
