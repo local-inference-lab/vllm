@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import weakref
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -234,7 +235,10 @@ class B12xPcieAllReduce:
             )
         )
         self._describers: list[
-            tuple[object, Callable[[object], Sequence[B12xPcieInvocation]]]
+            tuple[
+                weakref.ReferenceType[object],
+                Callable[[object], Sequence[B12xPcieInvocation]],
+            ]
         ] = []
         self._plans: dict[str, object] = {}
         self._invocations: dict[str, B12xPcieInvocation] = {}
@@ -439,13 +443,29 @@ class B12xPcieAllReduce:
         owner: object,
         describe: Callable[[object], Sequence[B12xPcieInvocation]],
     ) -> None:
+        """Register metadata without extending the producing module's lifetime.
+
+        Describers must capture metadata, not their owner. Draft modules can be
+        replaced by shared target modules before preparation discovers calls.
+
+        Args:
+            owner: Weak-referenceable producer, normally a model module. Its
+                collection makes the registration ineligible for discovery.
+            describe: Callable mapping a workload to collective descriptors.
+                It must not retain the owner directly or through a closure.
+
+        Raises:
+            TypeError: If describe is not callable or owner does not support
+                weak references.
+        """
         if not callable(describe):
             raise TypeError("PCIe collective describer must be callable")
-        for index, (existing_owner, _) in enumerate(self._describers):
-            if existing_owner is owner:
-                self._describers[index] = (owner, describe)
+        owner_ref = weakref.ref(owner)
+        for index, (existing_ref, _) in enumerate(self._describers):
+            if existing_ref() is owner:
+                self._describers[index] = (owner_ref, describe)
                 return
-        self._describers.append((owner, describe))
+        self._describers.append((owner_ref, describe))
 
     @staticmethod
     def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
@@ -560,11 +580,14 @@ class B12xPcieAllReduce:
             _twoshot_preparation,
         )
 
-        invocations = [
-            invocation
-            for _, describe in self._describers
-            for invocation in describe(workload)
-        ]
+        invocations: list[B12xPcieInvocation] = []
+        live_describers = []
+        for owner_ref, describe in self._describers:
+            registered_owner = owner_ref()
+            if registered_owner is not None:
+                live_describers.append((owner_ref, describe))
+                invocations.extend(describe(workload))
+        self._describers = live_describers
         names = [invocation.name for invocation in invocations]
         if len(names) != len(set(names)):
             from collections import Counter

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import gc
+import weakref
 from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -29,8 +31,8 @@ from vllm.distributed.parallel_state import (
     get_world_group,
     graph_capture,
 )
-from vllm.utils.b12x import B12xWorkload, PreparationResourceUnavailableError
 from vllm.platforms import current_platform
+from vllm.utils.b12x import B12xWorkload, PreparationResourceUnavailableError
 
 from ..utils import (
     get_open_port,
@@ -59,6 +61,8 @@ def _make_communicator(
     communicator._plans = {"prepared": plan}
     communicator._routes = {}
     communicator._invocations = {}
+    communicator._describers = []
+    communicator.global_ranks = (0, 1)
     communicator._plan_for = MagicMock(return_value=plan)
     return communicator, runtime
 
@@ -122,6 +126,171 @@ def test_descriptor_registration_rejects_non_native_communicator() -> None:
 
     assert not register_b12x_collective_describer(object(), lambda _: (), group=group)
     native_like.register_describer.assert_not_called()
+
+
+def _collect_registered_invocations(communicator):
+    """Exercise declaration discovery without allocating native transports.
+
+    Args:
+        communicator: PCIe communicator with descriptor owners registered.
+
+    Returns:
+        Invocations supplied by the live owners for the test workload.
+    """
+    communicator._route_invocation = MagicMock(return_value=None)
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(1, 6),
+        fixed_token_counts=(1, 6),
+        output_dtype=torch.bfloat16,
+        max_tokens=4096,
+        max_seqs=8,
+        max_model_len=1048576,
+        speculative_tokens=5,
+    )
+    assert communicator.get_b12x_preparation_units(communicator, workload) == ()
+    return [call.args[0] for call in communicator._route_invocation.call_args_list]
+
+
+def test_collective_owner_requires_weak_references_without_retained_adapter() -> None:
+    communicator, _ = _make_communicator()
+
+    class Owner:
+        pass
+
+    owner = Owner()
+    communicator.register_describer(owner, lambda _: ())
+    with pytest.raises(TypeError, match="weak reference"):
+        communicator.register_describer(object(), lambda _: ())
+
+    assert len(communicator._describers) == 1
+    assert _collect_registered_invocations(communicator) == []
+    del owner
+    gc.collect()
+    assert _collect_registered_invocations(communicator) == []
+    assert communicator._describers == []
+
+
+@pytest.mark.parametrize("prefix", ["model.embed_tokens", "lm_head"])
+def test_shared_vocabulary_replacement_releases_collective_owner(
+    monkeypatch: pytest.MonkeyPatch, prefix: str
+) -> None:
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        _register_b12x_embedding_collective,
+    )
+
+    communicator, _ = _make_communicator()
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.register_b12x_collective_describer",
+        communicator.register_describer,
+    )
+    target = torch.nn.Module()
+    draft = torch.nn.Module()
+    replaced = weakref.ref(draft)
+    _register_b12x_embedding_collective(target, prefix, 4096, 2)
+    _register_b12x_embedding_collective(draft, prefix, 4096, 2)
+    draft = target
+    gc.collect()
+
+    assert replaced() is None
+    invocations = _collect_registered_invocations(communicator)
+    assert [item.name for item in invocations] == [
+        f"{prefix}.embedding_all_reduce.m1",
+        f"{prefix}.embedding_all_reduce.m6",
+    ]
+    assert len(communicator._describers) == 1
+
+
+def test_live_collective_owner_refresh_preserves_distinct_owners() -> None:
+    communicator, _ = _make_communicator()
+    first, second = torch.nn.Module(), torch.nn.Module()
+    invocation = b12x_pcie_all_reduce.B12xPcieInvocation(
+        name="first", operation="all_reduce", shape=(1, 4096), dtype=torch.bfloat16
+    )
+    describe = MagicMock(return_value=(invocation,))
+    other = MagicMock(return_value=())
+    communicator.register_describer(first, lambda _: ())
+    communicator.register_describer(second, other)
+    communicator.register_describer(first, describe)
+
+    assert _collect_registered_invocations(communicator) == [invocation]
+    assert len(communicator._describers) == 2
+    describe.assert_called_once()
+    other.assert_called_once()
+
+
+def test_live_collective_name_collision_is_rejected() -> None:
+    communicator, _ = _make_communicator()
+    owners = [torch.nn.Module(), torch.nn.Module()]
+    invocation = b12x_pcie_all_reduce.B12xPcieInvocation(
+        name="shared", operation="all_reduce", shape=(1, 4096), dtype=torch.bfloat16
+    )
+    for owner in owners:
+        communicator.register_describer(owner, lambda _: (invocation,))
+    with pytest.raises(ValueError, match="duplicate names: shared"):
+        _collect_registered_invocations(communicator)
+
+
+def test_moe_collective_description_does_not_retain_replaced_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.fused_moe.b12x import (
+        _register_b12x_moe_output_collective,
+    )
+
+    communicator, _ = _make_communicator()
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.register_b12x_collective_describer",
+        communicator.register_describer,
+    )
+    owner = torch.nn.Module()
+    owner.layer_name = "model.layers.0.mlp.routed_experts"
+    reference = weakref.ref(owner)
+    _register_b12x_moe_output_collective(owner, hidden_size=4096)
+    del owner
+    gc.collect()
+
+    assert reference() is None
+    assert _collect_registered_invocations(communicator) == []
+
+
+@pytest.mark.parametrize("kind", ["deepseek_v4", "sparse_mla"])
+def test_indexer_collective_description_does_not_retain_replaced_module(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    communicator, _ = _make_communicator()
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.register_b12x_collective_describer",
+        lambda owner, describe, **kwargs: communicator.register_describer(
+            owner, describe
+        ),
+    )
+    monkeypatch.setattr("vllm.distributed.get_dcp_group", lambda: None)
+    owner = torch.nn.Module()
+    owner._preparation_prefix = "model.layers.0.indexer"
+    owner.topk_tokens = 256
+    reference = weakref.ref(owner)
+    if kind == "deepseek_v4":
+        from vllm.models.deepseek_v4.nvidia.b12x_indexer import B12xC4SparseIndexer
+
+        owner._index_cache = None
+        owner._index_num_q_heads = 16
+        owner._index_max_page_table_width = 16
+        owner._score_output = True
+        owner._score_collective_registered = False
+        owner._plans = {}
+        B12xC4SparseIndexer.set_b12x_index_cache(owner, torch.ones(1))
+    else:
+        from vllm.v1.attention.backends.mla import b12x_indexer
+
+        monkeypatch.setattr(b12x_indexer, "get_dcp_group", lambda: None)
+        owner.dcp_world_size = 2
+        b12x_indexer.B12xSparseIndexer._register_score_collectives(owner)
+    del owner
+    gc.collect()
+
+    assert reference() is None
+    assert _collect_registered_invocations(communicator) == []
 
 
 def test_explicit_oneshot_limit_overrides_b12x_policy(

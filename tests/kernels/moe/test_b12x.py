@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -220,6 +221,7 @@ def _make_b12x_moe_kernel(
     )
     experts = B12xExperts(moe_config, quant_config)
     layer = SimpleNamespace(
+        layer_name="test.b12x_moe",
         activation=activation,
         apply_router_weight_on_input=False,
         w13_weight=w1,
@@ -1278,6 +1280,7 @@ def test_b12x_moe_tuning_times_native_candidate_without_capture(
             case.quant_config,
         )
         race = None
+        graph = None
         try:
             request = units[0].requests[0]
             plan = request.plan
@@ -1306,17 +1309,53 @@ def test_b12x_moe_tuning_times_native_candidate_without_capture(
                 return result
 
             call.run = checked_run
-            monkeypatch.setattr(torch.cuda, "CUDAGraph", forbidden_capture)
-            race = _prepare_race(
-                [call], device_ordinal=torch.accelerator.current_device_index()
-            )
+            with monkeypatch.context() as guards:
+                guards.setattr(torch.cuda, "CUDAGraph", forbidden_capture)
+                race = _prepare_race(
+                    [call], device_ordinal=torch.accelerator.current_device_index()
+                )
+                # Exclude reclaimable fixture cycles from resident storage.
+                gc.collect()
+                torch.accelerator.synchronize()
+                for _ in range(3):
+                    call.output.fill_(float("nan"))
+                    # Timer cache eviction may allocate temporary reductions;
+                    # measured calls cannot grow resident tensor storage.
+                    resident = torch.accelerator.memory_stats()[
+                        "active_bytes.all.current"
+                    ]
+                    race.timers[0].replay()
+                    torch.accelerator.synchronize()
+                    assert (
+                        torch.accelerator.memory_stats()["active_bytes.all.current"]
+                        == resident
+                    )
+                    assert call.output.data_ptr() == address
+                    torch.testing.assert_close(
+                        call.output, expected, atol=2e-2, rtol=2e-2
+                    )
+                assert all(value > 0 for value in race.timers[0].samples())
+                race.close()
+                race = None
+
+            call.run = run
+            graph = torch.cuda.CUDAGraph()
+            with session.capture(), torch.cuda.graph(graph):
+                call.invoke()
             for _ in range(3):
                 call.output.fill_(float("nan"))
-                race.timers[0].replay()
+                allocated = torch.accelerator.memory_stats()["allocation.all.allocated"]
+                graph.replay()
                 torch.accelerator.synchronize()
+                assert (
+                    torch.accelerator.memory_stats()["allocation.all.allocated"]
+                    == allocated
+                )
                 assert call.output.data_ptr() == address
                 torch.testing.assert_close(call.output, expected, atol=2e-2, rtol=2e-2)
         finally:
+            if graph is not None:
+                graph.reset()
             if race is not None:
                 race.close()
             session.close()

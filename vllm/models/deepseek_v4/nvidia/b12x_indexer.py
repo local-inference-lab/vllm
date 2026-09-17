@@ -333,12 +333,15 @@ class B12xC4SparseIndexer(nn.Module):
                 register_b12x_collective_describer,
             )
 
+            prefix = self._preparation_prefix
+            topk_tokens = self.topk_tokens
+
             def describe(workload):
                 return tuple(
                     B12xPcieInvocation(
-                        name=f"{self._preparation_prefix}.score_all_reduce.m{rows}.lane{workload.lane}",
+                        name=f"{prefix}.score_all_reduce.m{rows}.lane{workload.lane}",
                         operation="all_reduce",
-                        shape=(rows, self.topk_tokens),
+                        shape=(rows, topk_tokens),
                         dtype=torch.float32,
                     )
                     for rows in workload.token_counts

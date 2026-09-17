@@ -331,10 +331,28 @@ class B12xSparseIndexer(nn.Module):
     def _register_score_collectives(self) -> None:
         if self.dcp_world_size <= 1:
             return
+        from vllm.distributed.device_communicators.b12x_pcie_all_reduce import (
+            B12xPcieInvocation,
+        )
         from vllm.distributed.parallel_state import register_b12x_collective_describer
-        from vllm.distributed.device_communicators.b12x_pcie_all_reduce import B12xPcieInvocation
+
+        prefix = self._preparation_prefix
+        topk_tokens = self.topk_tokens
+
         def describe(requirements):
-            return tuple(B12xPcieInvocation(name=f"{self._preparation_prefix}.score_all_reduce.m{rows}.lane{requirements.workspace_lane}", operation="all_reduce", shape=(rows, self.topk_tokens), dtype=torch.float32) for rows in requirements.token_counts)
+            return tuple(
+                B12xPcieInvocation(
+                    name=(
+                        f"{prefix}.score_all_reduce.m{rows}"
+                        f".lane{requirements.workspace_lane}"
+                    ),
+                    operation="all_reduce",
+                    shape=(rows, topk_tokens),
+                    dtype=torch.float32,
+                )
+                for rows in requirements.token_counts
+            )
+
         register_b12x_collective_describer(self, describe, group=get_dcp_group())
 
     def _request_name(self, mode: str, rows: int) -> str:
@@ -477,4 +495,3 @@ class B12xSparseIndexer(nn.Module):
             if score is not None:
                 _merge_dcp_topk(output, score, self.dcp_rank, self.dcp_world_size, self.cp_kv_cache_interleave_size)
         return self.topk_indices_buffer
-
