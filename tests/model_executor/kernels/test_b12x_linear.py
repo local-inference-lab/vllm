@@ -53,6 +53,7 @@ def _prepare(
     max_tokens=None,
     autotune=False,
     stage="weights",
+    cache_dir=None,
 ):
     """Collect a layer's preparation units and fill their plans in place."""
     from b12x.preparation import PreparationSession
@@ -70,7 +71,7 @@ def _prepare(
     provider = layer.b12x_preparation_provider
     units = list(provider.get_b12x_preparation_units(layer, workload))
     requests = tuple(request for unit in units for request in unit.requests)
-    session = PreparationSession(device=device, autotune=autotune)
+    session = PreparationSession(device=device, autotune=autotune, cache_dir=cache_dir)
     session.prepare(requests, autotune=autotune)
     return session, units
 
@@ -1439,7 +1440,7 @@ def test_b12x_dense_precision_rejects_invalid_override(monkeypatch, recipe):
 
 @pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("mode", ["auto", "a16", "quantized"])
-def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, recipe, mode):
+def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, tmp_path, recipe, mode):
     """Prepare real exact-M executions, then verify numerical and graph replay."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (12, 0),
@@ -1495,13 +1496,26 @@ def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, recipe, mode):
             assert packed.values.data_ptr() == layer.weight.data_ptr()
             assert packed.scale_mma.data_ptr() == layer.weight_scale.data_ptr()
             assert packed.global_scale is layer.weight_global_scale
-        session, _ = _prepare(
-            layer,
-            device=torch.device("cuda"),
-            counts=counts,
-            fixed=fixed,
-            max_tokens=max(counts),
-        )
+
+        def forbidden_capture(*args, **kwargs):
+            raise AssertionError("linear autotuning attempted CUDA graph capture")
+
+        with monkeypatch.context() as guards:
+            guards.setattr(torch.cuda, "CUDAGraph", forbidden_capture)
+            session, _ = _prepare(
+                layer,
+                device=torch.device("cuda"),
+                counts=counts,
+                fixed=fixed,
+                max_tokens=max(counts),
+                autotune=mode == "auto",
+                cache_dir=tmp_path,
+            )
+        if mode == "auto":
+            assert any(
+                plan.selection.source == "tuned"
+                for plan in layer.b12x_linear.plan.variants.values()
+            )
         bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
 
         def reference(source, a16):

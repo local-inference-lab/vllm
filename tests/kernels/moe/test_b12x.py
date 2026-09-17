@@ -1259,10 +1259,10 @@ def test_b12x_moe_cuda_graph_replay(
 )
 @pytest.mark.parametrize("tokens", [4, 128])
 @torch.inference_mode()
-def test_b12x_moe_preparation_preserves_timing_and_graph_replay(
-    weight_dtype, activation_dtype, tokens, workspace_init
+def test_b12x_moe_tuning_times_native_candidate_without_capture(
+    weight_dtype, activation_dtype, tokens, workspace_init, monkeypatch
 ) -> None:
-    """Prepared calls preserve fixed output storage in timing and serving graphs."""
+    """Tuning uses gated events with live producers and fixed MoE storage."""
     from b12x.preparation._measurement import _prepare_race
     from b12x.preparation.types import require_prepared
 
@@ -1283,43 +1283,58 @@ def test_b12x_moe_preparation_preserves_timing_and_graph_replay(
         try:
             request = units[0].requests[0]
             plan = request.plan
-            assert plan.invocation["tuning_execution_context"] == "cuda_graph"
             state = require_prepared(plan, plan.component_id)
             call = request.benchmark_call(state)
-            assert call.capture_safe
+            assert not call.capture_safe
             call.restore()
             call.invoke()
             expected = call.output.clone()
             assert torch.isfinite(expected).all() and torch.count_nonzero(expected)
             address = call.output.data_ptr()
             session.freeze()
-            race = _prepare_race(
-                [call], device_ordinal=torch.accelerator.current_device_index()
-            )
-            for _ in range(3):
+
+            def forbidden_capture(*args, **kwargs):
+                raise AssertionError("autotuning must not capture CUDA graphs")
+
+            run = call.run
+
+            def checked_run():
                 allocated = torch.accelerator.memory_stats()["allocation.all.allocated"]
-                call.invoke()
-                torch.accelerator.synchronize()
+                result = run()
                 assert (
                     torch.accelerator.memory_stats()["allocation.all.allocated"]
                     == allocated
                 )
-                call.output.fill_(float("nan"))
-                # Cache eviction can allocate temporary reduction storage outside
-                # the measured call; it must not increase resident tensor storage.
-                resident = torch.accelerator.memory_stats()["active_bytes.all.current"]
-                race.timers[0].replay()
-                torch.accelerator.synchronize()
-                assert (
-                    torch.accelerator.memory_stats()["active_bytes.all.current"]
-                    == resident
-                )
-                assert call.output.data_ptr() == address
-                torch.testing.assert_close(call.output, expected, atol=2e-2, rtol=2e-2)
-            assert all(value > 0 for value in race.timers[0].samples())
-            race.close()
-            race = None
+                return result
 
+            call.run = checked_run
+            with monkeypatch.context() as guards:
+                guards.setattr(torch.cuda, "CUDAGraph", forbidden_capture)
+                race = _prepare_race(
+                    [call], device_ordinal=torch.accelerator.current_device_index()
+                )
+                for _ in range(3):
+                    call.output.fill_(float("nan"))
+                    # Timer cache eviction may allocate temporary reductions;
+                    # measured calls cannot grow resident tensor storage.
+                    resident = torch.accelerator.memory_stats()[
+                        "active_bytes.all.current"
+                    ]
+                    race.timers[0].replay()
+                    torch.accelerator.synchronize()
+                    assert (
+                        torch.accelerator.memory_stats()["active_bytes.all.current"]
+                        == resident
+                    )
+                    assert call.output.data_ptr() == address
+                    torch.testing.assert_close(
+                        call.output, expected, atol=2e-2, rtol=2e-2
+                    )
+                assert all(value > 0 for value in race.timers[0].samples())
+                race.close()
+                race = None
+
+            call.run = run
             graph = torch.cuda.CUDAGraph()
             with session.capture(), torch.cuda.graph(graph):
                 call.invoke()
