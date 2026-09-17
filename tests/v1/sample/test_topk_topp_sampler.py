@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import Generator
@@ -13,6 +15,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p_probs,
     apply_top_k_top_p_pytorch,
     random_sample,
+    register_top_k_top_p_warmups,
     warmup_top_k_top_p,
 )
 from vllm.v1.sample.sampler import Sampler
@@ -74,21 +77,34 @@ def test_apply_top_k_top_p_probs_matches_processed_logits(
     reason="requires GPU Triton compilation",
 )
 @pytest.mark.parametrize("vocab_size", [257, 129280])
+@pytest.mark.parametrize("max_num_rows", [1, 7, 128])
 def test_filter_warmup_covers_speculative_rows_and_constraint_subsets(
-    monkeypatch: pytest.MonkeyPatch, vocab_size: int
+    monkeypatch: pytest.MonkeyPatch, vocab_size: int, max_num_rows: int
 ):
-    """Four K5 requests must not compile top-p-only filtering after warmup."""
+    """Seeded filtering must cover singleton, split-row and large-batch keys."""
     from triton import knobs
 
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+
     device = torch.device(DEVICE_TYPE)
-    warmup_top_k_top_p(vocab_size, 24, device)
+    registry = JitWarmupRegistry(
+        SimpleNamespace(
+            model_config=SimpleNamespace(get_vocab_size=lambda: vocab_size),
+            scheduler_config=SimpleNamespace(max_num_seqs=max_num_rows),
+            num_speculative_tokens=0,
+        )
+    )
+    with registry.activate():
+        register_top_k_top_p_warmups()
+    registry.warmup()
+    warmup_top_k_top_p(vocab_size, max_num_rows, device)
     torch.accelerator.synchronize()
 
     def unexpected_compile(**kwargs):
         pytest.fail("Filtering compiled a kernel after bounded sampler warmup")
 
     monkeypatch.setattr(knobs.runtime, "jit_post_compile_hook", unexpected_compile)
-    for num_rows in (8, 9, 15, 16, 17, 24):
+    for num_rows in range(1, max_num_rows + 1):
         logits = torch.zeros(num_rows, vocab_size, device=device)
         top_k = torch.full((num_rows,), 20, dtype=torch.int32, device=device)
         top_p = torch.full((num_rows,), 0.95, device=device)
