@@ -436,6 +436,24 @@ class B12xMHCResidual:
                 dtype=torch.float32,
                 device=device,
             )
+            # Each candidate owns one output set. Functional allocations inside
+            # repeated capture samples would reserve additional graph-pool copies
+            # that are absent from the tuner's primed-residency measurement.
+            residual_out = torch.empty(
+                (tokens, self.hc_mult, self.hidden_size),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            outputs = (
+                {}
+                if operation == "post"
+                else {
+                    "residual_out": residual_out,
+                    "y_out": torch.empty_like(x),
+                    "post_out": torch.empty_like(post),
+                    "comb_out": torch.empty_like(comb),
+                }
+            )
 
             def produce():
                 residual.normal_()
@@ -456,6 +474,7 @@ class B12xMHCResidual:
                     norm_weight=attn_norm.weight,
                     norm_eps=float(attn_norm.variance_epsilon),
                     _state=state,
+                    **outputs,
                 )
             elif operation in ("post_pre", "post_pre_bf16"):
                 if operation == "post_pre":
@@ -489,10 +508,11 @@ class B12xMHCResidual:
                     norm_weight=norm.weight,
                     norm_eps=float(norm.variance_epsilon),
                     _state=state,
+                    **outputs,
                 )
             else:
                 run = lambda: _impl._b12x_mhc_post_impl(
-                    x, residual, post, comb, _state=state
+                    x, residual, post, comb, out=residual_out, _state=state
                 )
             return PreparedCall(
                 run=run,

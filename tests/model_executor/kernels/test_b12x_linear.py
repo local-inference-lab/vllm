@@ -7,6 +7,7 @@ import importlib
 import sys
 import types
 from dataclasses import dataclass
+from typing import Any
 
 import pytest
 import torch
@@ -1798,6 +1799,117 @@ def test_b12x_mhc_declares_the_operations_each_layer_runs(
     if not first_layer:
         with pytest.raises(RuntimeError, match="prepared capacity 0"):
             mhc._plan_for("pre", 8)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("operation", ["pre", "post_pre", "post_pre_bf16", "post"])
+@pytest.mark.parametrize("tokens", [3, 4096])
+def test_b12x_mhc_preparation_reuses_outputs_with_exact_graph_replay(
+    monkeypatch, operation, tokens
+):
+    """Tuning fixtures retain one output set per candidate, not per sample."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("native b12x mHC requires SM12x")
+    from b12x.norm.mhc import _impl
+    from b12x.preparation import PreparationSession
+
+    from vllm.models.deepseek_v4.nvidia import b12x as dsv4_b12x
+
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    hidden, mult = 4096, 4
+    fn = torch.randn(24, mult * hidden, device=device) * 0.001
+    norm = types.SimpleNamespace(
+        weight=torch.ones(hidden, dtype=torch.bfloat16, device=device),
+        variance_epsilon=1e-6,
+    )
+    layer = types.SimpleNamespace(
+        hc_attn_fn=fn,
+        hc_ffn_fn=fn,
+        hc_attn_scale=torch.ones(3, device=device),
+        hc_ffn_scale=torch.ones(3, device=device),
+        hc_attn_base=torch.zeros(24, device=device),
+        hc_ffn_base=torch.zeros(24, device=device),
+        hc_attn_fn_broadcast=fn.view(24, mult, hidden).sum(1),
+        attn_norm=norm,
+        ffn_norm=norm,
+        hc_ffn_fn_bf16=fn.to(torch.bfloat16),
+    )
+    mhc = dsv4_b12x.B12xMHCResidual(
+        hidden_size=hidden,
+        hc_mult=mult,
+        rms_eps=1e-6,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+    )
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(tokens,),
+        fixed_token_counts=(),
+        output_dtype=torch.bfloat16,
+        max_tokens=tokens,
+        max_seqs=1,
+        max_model_len=tokens,
+    )
+    (unit,) = mhc.get_b12x_preparation_units(layer, workload)
+    request = next(
+        item for item in unit.requests if item.name.endswith(f".{operation}.m{tokens}")
+    )
+    native_operation = "post_pre" if operation == "post_pre_bf16" else operation
+    name = f"_b12x_mhc_{native_operation}_impl"
+    native = getattr(_impl, name)
+    captured_call: list[tuple[tuple[torch.Tensor, ...], dict[str, Any]]] = []
+
+    def observe(*args, **kwargs):
+        captured_call[:] = [(args, kwargs)]
+        return native(*args, **kwargs)
+
+    def outputs(value):
+        return value if isinstance(value, tuple) else (value,)
+
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
+        session.prepare((request,))
+        call = request.prepare_call(request.plan.prepared.state)
+        with monkeypatch.context() as hooks:
+            hooks.setattr(_impl, name, observe)
+            call.produce()
+            first = outputs(call.invoke())
+        args, kwargs = captured_call.pop()
+        reference_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in {"residual_out", "y_out", "post_out", "comb_out", "out"}
+        }
+        pointers = [tensor.data_ptr() for tensor in first]
+        second = outputs(call.invoke())
+        assert [tensor.data_ptr() for tensor in second] == pointers
+        for actual, expected in zip(
+            second, outputs(native(*args, **reference_kwargs)), strict=True
+        ):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with session.capture(), torch.cuda.graph(graph):
+                call.invoke()
+                call.invoke()
+            for _ in range(2):
+                call.produce()
+                for tensor in first:
+                    tensor.fill_(float("nan"))
+                allocated = torch.accelerator.memory_allocated(device)
+                graph.replay()
+                torch.accelerator.synchronize()
+                assert torch.accelerator.memory_allocated(device) == allocated
+                assert [
+                    tensor.data_ptr() for tensor in outputs(call.output)
+                ] == pointers
+                expected = outputs(native(*args, **reference_kwargs))
+                for actual, wanted in zip(first, expected, strict=True):
+                    assert torch.isfinite(actual).all()
+                    torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
+        finally:
+            graph.reset()
 
 
 def test_b12x_mhc_keeps_plans_across_workloads(monkeypatch) -> None:
