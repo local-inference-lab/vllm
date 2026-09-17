@@ -893,6 +893,7 @@ class Scheduler(SchedulerInterface):
             service_class: ComputeServiceClass | None = None,
             *,
             allow_preemption: bool = True,
+            preempt_only_if_empty: bool = False,
             enforce_lora_limit: bool = False,
         ) -> None:
             nonlocal draft_input_budget
@@ -1062,9 +1063,11 @@ class Scheduler(SchedulerInterface):
                             # The request can be scheduled.
                             break
 
-                        if not allow_preemption:
-                            # Leftover service must not evict work selected and
-                            # admitted earlier in this model step.
+                        if not allow_preemption or (
+                            preempt_only_if_empty and num_scheduled_tokens
+                        ):
+                            # Leftover service must not evict work selected
+                            # and admitted earlier in this model step.
                             break
 
                         # The request cannot be scheduled.
@@ -1809,7 +1812,11 @@ class Scheduler(SchedulerInterface):
         if adaptive_prefill_turn and token_budget > 0:
             schedule_running_requests(
                 "decode",
-                allow_preemption=False,
+                # An empty prefill turn must allow decode preemption to avoid
+                # reselecting prefill forever without a compute-time charge.
+                # Recheck emptiness at each allocation failure so later decode
+                # attempts cannot evict work scheduled by this fallback.
+                preempt_only_if_empty=True,
                 enforce_lora_limit=True,
             )
 
