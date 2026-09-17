@@ -4,6 +4,7 @@
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
 import time
+from collections.abc import Iterable
 from typing import Annotated, Any, ClassVar, Literal
 
 from openai.types.chat.chat_completion_audio import (
@@ -554,7 +555,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
             if not isinstance(msg, dict):
                 continue
             tool_calls = msg.get("tool_calls")
-            if tool_calls is not None:
+            if isinstance(tool_calls, Iterable) and not isinstance(
+                tool_calls, (str, bytes, dict)
+            ):
                 msg["tool_calls"] = [
                     normalize_tool_namespace(call) for call in tool_calls
                 ]
