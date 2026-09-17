@@ -447,6 +447,16 @@ class B12xPcieAllReduce:
 
         Describers must capture metadata, not their owner. Draft modules can be
         replaced by shared target modules before preparation discovers calls.
+
+        Args:
+            owner: Weak-referenceable producer, normally a model module. Its
+                collection makes the registration ineligible for discovery.
+            describe: Callable mapping a workload to collective descriptors.
+                It must not retain the owner directly or through a closure.
+
+        Raises:
+            TypeError: If describe is not callable or owner does not support
+                weak references.
         """
         if not callable(describe):
             raise TypeError("PCIe collective describer must be callable")
