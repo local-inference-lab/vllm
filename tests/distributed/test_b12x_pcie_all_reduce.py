@@ -129,7 +129,14 @@ def test_descriptor_registration_rejects_non_native_communicator() -> None:
 
 
 def _collect_registered_invocations(communicator):
-    """Exercise declaration discovery without allocating native transports."""
+    """Exercise declaration discovery without allocating native transports.
+
+    Args:
+        communicator: PCIe communicator with descriptor owners registered.
+
+    Returns:
+        Invocations supplied by the live owners for the test workload.
+    """
     communicator._route_invocation = MagicMock(return_value=None)
     workload = B12xWorkload(
         stage="weights",
@@ -143,6 +150,25 @@ def _collect_registered_invocations(communicator):
     )
     assert communicator.get_b12x_preparation_units(communicator, workload) == ()
     return [call.args[0] for call in communicator._route_invocation.call_args_list]
+
+
+def test_collective_owner_requires_weak_references_without_retained_adapter() -> None:
+    communicator, _ = _make_communicator()
+
+    class Owner:
+        pass
+
+    owner = Owner()
+    communicator.register_describer(owner, lambda _: ())
+    with pytest.raises(TypeError, match="weak reference"):
+        communicator.register_describer(object(), lambda _: ())
+
+    assert len(communicator._describers) == 1
+    assert _collect_registered_invocations(communicator) == []
+    del owner
+    gc.collect()
+    assert _collect_registered_invocations(communicator) == []
+    assert communicator._describers == []
 
 
 @pytest.mark.parametrize("prefix", ["model.embed_tokens", "lm_head"])
