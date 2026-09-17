@@ -125,9 +125,7 @@ class _PreparedMoECall:
             produce=produce,
             reset=reset,
             restore=restore,
-            # Serving replays this GPU work in CUDA graphs. Eager timing also
-            # charges Python launch gaps, which can reverse candidate ordering.
-            capture_safe=hidden.is_cuda,
+            capture_safe=False,
         )
 
 
@@ -649,7 +647,6 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 invocation=FrozenMapping(
                     {
                         "tuning_route_pattern": "cyclic_disjoint_topk",
-                        "tuning_execution_context": "cuda_graph",
                     }
                 ),
             )
