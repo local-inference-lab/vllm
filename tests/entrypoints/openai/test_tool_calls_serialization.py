@@ -226,6 +226,43 @@ def test_namespace_description_is_preserved_exactly_once():
     ).model_dump() == (parsed.model_dump())
 
 
+@pytest.mark.parametrize("tool_calls", [1, False, 1.5])
+def test_invalid_tool_calls_shape_reports_the_field(tool_calls):
+    with pytest.raises(ValidationError) as error:
+        _make_request(
+            [{"role": "assistant", "content": None, "tool_calls": tool_calls}]
+        )
+    assert any("tool_calls" in item["loc"] for item in error.value.errors())
+
+
+@pytest.mark.parametrize(
+    "outer, inner, expected",
+    [
+        (None, "Stock operations.", "Stock operations.\nFind a SKU."),
+        ("Outer description.", "Inner description.", "Outer description.\nFind a SKU."),
+        ("", "Inner description.", "Find a SKU."),
+    ],
+)
+def test_consistent_namespaces_preserve_first_non_null_description(
+    outer, inner, expected
+):
+    tool = {
+        "type": "function",
+        "namespace": {"name": "inventory", "description": outer},
+        "function": {
+            "name": "lookup",
+            "namespace": {"name": "inventory", "description": inner},
+            "description": "Find a SKU.",
+        },
+    }
+    original = copy.deepcopy(tool)
+    parsed = ChatCompletionToolsParam.model_validate(tool)
+    assert parsed.function.name == "inventory::lookup"
+    assert parsed.function.description == expected
+    assert tool == original
+    assert ChatCompletionToolsParam.model_validate(parsed.model_dump()) == parsed
+
+
 @pytest.mark.parametrize("tool_choice", ["none", "auto", "required"])
 @pytest.mark.parametrize(
     "namespace, name",

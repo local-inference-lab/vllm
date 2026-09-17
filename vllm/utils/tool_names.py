@@ -41,8 +41,11 @@ def normalize_tool_namespace(tool: Any) -> Any:
     if not declarations:
         return tool
     namespace, description = declarations[0]
-    if any(name != namespace for name, _ in declarations[1:]):
-        raise ValueError("Conflicting tool namespaces on the tool and function")
+    for declared_name, declared_description in declarations[1:]:
+        if declared_name != namespace:
+            raise ValueError("Conflicting tool namespaces on the tool and function")
+        if description is None:
+            description = declared_description
 
     name = function.get("name")
     if not isinstance(name, str) or not name:
