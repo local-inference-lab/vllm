@@ -4,10 +4,12 @@
 
 import gc
 import weakref
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 
 from vllm.config import CUDAGraphMode
 
@@ -180,13 +182,17 @@ def test_prepare_memory_is_metadata_not_capacity_activations(native_workspace):
     assert allocated <= metadata_bytes + persistent_topk_bytes + 1024**2
 
 
+@pytest.mark.parametrize("projection_kind", ["linear", "dspark_context"])
 def test_block_linear_capture_retains_scratch_not_caller_activations(
-    native_workspace, monkeypatch,
+    native_workspace,
+    monkeypatch,
+    projection_kind,
 ):
     from vllm.models.deepseek_v4_1 import b12x_layers
 
     _, manager, workspace = native_workspace
     from b12x.preparation import PreparationSession
+
     from vllm.utils.b12x import B12xWorkload
 
     torch.manual_seed(89)
@@ -195,23 +201,43 @@ def test_block_linear_capture_retains_scratch_not_caller_activations(
     layer.weight = torch.randn(256, 256, device=device).to(torch.float8_e4m3fn)
     layer.weight_scale_inv = torch.ones(8, 8, device=device).to(torch.float8_e8m0fnu)
     monkeypatch.setattr(b12x_layers, "_execution_capacities", lambda: (16,))
-    method = b12x_layers.B12xFP8LinearMethod(
-        SimpleNamespace(weight_block_size=[32, 32])
-    )
-    method.process_weights_after_loading(layer)
+    if projection_kind == "linear":
+        method = b12x_layers.B12xFP8LinearMethod(
+            SimpleNamespace(weight_block_size=[32, 32])
+        )
+        method.process_weights_after_loading(layer)
+        project = partial(method.apply, layer)
+        plans = layer.b12x_plans
+    else:
+        from vllm.models.deepseek_v4_1.nvidia import dspark
+
+        monkeypatch.setattr(dspark, "_execution_capacities", lambda: (16,))
+        method = dspark._ContextKVProjection(
+            SimpleNamespace(fused_wqa_wkv=layer, q_lora_rank=0), 16
+        )
+        project = method
+        plans = method.plans
     workload = B12xWorkload(
-        stage="weights", token_counts=(8, 16), fixed_token_counts=(8,),
-        output_dtype=torch.bfloat16, max_tokens=16, max_seqs=1, max_model_len=16,
+        stage="weights",
+        token_counts=(8, 16),
+        fixed_token_counts=(8,),
+        output_dtype=torch.bfloat16,
+        max_tokens=16,
+        max_seqs=1,
+        max_model_len=16,
     )
     session = PreparationSession(device=device, autotune=False, compile_workers=2)
-    session.prepare(tuple(
-        request for unit in method.get_b12x_preparation_units(layer, workload)
-        for request in unit.requests
-    ))
+    session.prepare(
+        tuple(
+            request
+            for unit in method.get_b12x_preparation_units(layer, workload)
+            for request in unit.requests
+        )
+    )
     session.freeze()
-    manager.reserve_all(*(
-        (spec.shape, spec.dtype) for spec in layer.b12x_plans[0].scratch_specs()
-    ))
+    manager.reserve_all(
+        *((spec.shape, spec.dtype) for spec in plans[0].scratch_specs())
+    )
     manager.lock()
     inputs = torch.randn(16, 256, dtype=torch.bfloat16, device=device)
     outputs = torch.empty_like(inputs)
@@ -219,7 +245,7 @@ def test_block_linear_capture_retains_scratch_not_caller_activations(
 
     def run(rows):
         source = inputs[:rows] + 1
-        output = method.apply(layer, source)
+        output = project(source)
         references.extend((weakref.ref(source), weakref.ref(output)))
         outputs[:rows].copy_(output)
 
@@ -250,6 +276,159 @@ def test_block_linear_capture_retains_scratch_not_caller_activations(
             outputs.fill_(float("nan"))
             graphs[rows].replay()
             torch.testing.assert_close(outputs[:rows], expected, rtol=0, atol=0)
+    finally:
+        for graph in graphs.values():
+            graph.reset()
+        session.close()
+
+
+@pytest.mark.parametrize("operation", ["pre", "post_pre"])
+@pytest.mark.parametrize("capture_kind", ["full", "breakable"])
+def test_mhc_capture_retains_scratch_not_caller_activations(
+    native_workspace, monkeypatch, operation, capture_kind
+):
+    """Intermediate MHC outputs must be reusable across shared-pool graphs."""
+    from b12x.preparation import PreparationSession
+
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+    from vllm.models.deepseek_v4_1 import b12x_layers
+    from vllm.utils.b12x import B12xWorkload, register_b12x_layer
+
+    _, manager, workspace = native_workspace
+    monkeypatch.setattr(b12x_layers, "_execution_capacities", lambda: (8, 16))
+    device = torch.device("cuda")
+    hidden = 5120
+    torch.manual_seed(146)
+    layer = torch.nn.Module()
+    for kind in ("attn", "ffn"):
+        setattr(layer, f"hc_{kind}_fn", torch.randn(24, hidden * 4, device=device) / 64)
+        setattr(layer, f"hc_{kind}_scale", torch.ones(3, device=device))
+        setattr(layer, f"hc_{kind}_base", torch.zeros(24, device=device))
+        setattr(
+            layer,
+            f"{kind}_norm",
+            SimpleNamespace(
+                weight=torch.ones(hidden, dtype=torch.bfloat16, device=device)
+            ),
+        )
+    layer.hc_attn_fn_broadcast = None
+    module = layer._b12x_mhc = b12x_layers.B12xMHC(
+        SimpleNamespace(
+            hidden_size=hidden,
+            rms_norm_eps=1e-20,
+            hc_eps=1e-6,
+            hc_sinkhorn_iters=20,
+            hc_mult=4,
+        )
+    )
+    name = f"test.mhc.capture.{operation}"
+    module.bind_layer_name(name)
+    register_b12x_layer(name, layer)
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(8, 16),
+        fixed_token_counts=(8,),
+        output_dtype=torch.bfloat16,
+        max_tokens=16,
+        max_seqs=1,
+        max_model_len=16,
+    )
+    session = PreparationSession(device=device, autotune=False, compile_workers=2)
+    session.prepare(
+        tuple(
+            request
+            for unit in module.get_b12x_preparation_units(layer, workload)
+            for request in unit.requests
+        )
+    )
+    session.freeze()
+    manager.reserve_all(
+        *(
+            (spec.shape, spec.dtype)
+            for plan in module._plans.values()
+            for spec in plan.scratch_specs()
+        )
+    )
+    manager.lock()
+    residual = torch.randn(16, 4, hidden, dtype=torch.bfloat16, device=device)
+    previous = torch.randn(16, hidden, dtype=torch.bfloat16, device=device)
+    pre = torch.full((16, 4), 0.25, device=device)
+    previous_post = pre.clone()
+    comb = torch.eye(4, device=device).expand(16, -1, -1).contiguous()
+    destinations = [
+        torch.empty_like(residual),
+        torch.empty_like(pre),
+        torch.empty_like(comb),
+        torch.empty_like(previous),
+        torch.empty_like(pre),
+    ]
+    references: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def run(rows):
+        kwargs = (
+            {}
+            if operation == "pre"
+            else dict(
+                previous_output=previous[:rows],
+                previous_post=previous_post[:rows],
+                previous_comb=comb[:rows],
+            )
+        )
+        values = module.pre(
+            residual[:rows],
+            layer.hc_attn_fn,
+            layer.hc_attn_scale,
+            layer.hc_attn_base,
+            layer.attn_norm.weight,
+            pre[:rows],
+            **kwargs,
+        )
+        capture = BreakableCUDAGraphCapture.current()
+        if capture is not None:
+            # The lagged outputs cross a segment boundary before consumption.
+            capture.add_eager(lambda: None)
+        for destination, value in zip(destinations, values, strict=True):
+            references.append(weakref.ref(value))
+            destination[:rows].copy_(value)
+
+    pool = torch.cuda.graph_pool_handle()
+    graphs, owners = {}, []
+    try:
+        for rows in (16, 8):
+            run(rows)
+            torch.accelerator.synchronize()
+            graph = (
+                torch.cuda.CUDAGraph()
+                if capture_kind == "full"
+                else BreakableCUDAGraphCapture(pool=pool)
+            )
+            graphs[rows] = graph
+            context = (
+                torch.cuda.graph(graph, pool=pool) if capture_kind == "full" else graph
+            )
+            with (
+                session.capture(),
+                workspace.collect_cuda_graph_capture_resources() as resources,
+                torch.cuda.stream(torch.cuda.Stream()),
+                context,
+            ):
+                run(rows)
+            torch.accelerator.synchronize()
+            owners.append(resources)
+            gc.collect()
+            assert all(reference() is None for reference in references)
+            assert resources
+
+        for rows in (8, 16, 8, 16):
+            residual.normal_()
+            previous.normal_()
+            run(rows)
+            expected = [output[:rows].clone() for output in destinations]
+            for output in destinations:
+                output.fill_(float("nan"))
+            graphs[rows].replay()
+            for output, reference in zip(destinations, expected, strict=True):
+                torch.testing.assert_close(output[:rows], reference, rtol=0, atol=0)
     finally:
         for graph in graphs.values():
             graph.reset()
@@ -364,12 +543,15 @@ def test_attention_shared_scratch_graph_replay(
 ):
     attention, manager, workspace = native_workspace
     from b12x.preparation import PreparationSession
+
     from vllm.utils.b12x import B12xWorkload
+
     # A TP4 rank must score all replicated heads without obtaining a TP group.
     monkeypatch.setattr(attention, "get_tensor_model_parallel_world_size", lambda: 4)
     device = torch.device("cuda", torch.accelerator.current_device_index())
     torch.manual_seed(142)
     layer = _layer(attention, swa_page=swa_page)
+    layer.rotary_emb = SimpleNamespace(cos_sin_cache=torch.empty(0, device=device))
     layer.config.cache_config.block_size = main_page
     layer.max_model_len = 4096
     if rows == 36:
@@ -377,7 +559,9 @@ def test_attention_shared_scratch_graph_replay(
         layer.config.compilation_config.max_cudagraph_capture_size = 32
     layer._prepare(device)
     if rows == 36:
-        assert layer._attention_declarations["decode"].query.query_rows == 4 * (1 + 2 * 5)
+        assert layer._attention_declarations["decode"].query.query_rows == 4 * (
+            1 + 2 * 5
+        )
     length = 2048
     positions = torch.full((rows,), -1, dtype=torch.int64, device=device)
     positions[:live_rows] = torch.arange(
@@ -428,13 +612,12 @@ def test_attention_shared_scratch_graph_replay(
             device=device,
             dtype=torch.uint8,
         )
-        attention.mla.write_cache(
-            kv,
-            cache,
-            torch.arange(length, device=device) + page,
-            page_size=page,
-            cache_kind=kind,
-            cache_format="deepseek_v41",
+        from b12x.attention._shared.mla.compressed_reference import (
+            pack_deepseek_v41_cache_reference,
+        )
+
+        cache[1:].copy_(
+            pack_deepseek_v41_cache_reference(kv, page_size=page, cache_kind=kind)
         )
         if kind == "swa":
             layer.swa_cache_layer.kv_cache = cache
@@ -455,12 +638,6 @@ def test_attention_shared_scratch_graph_replay(
     index_keys = torch.zeros((length, 128), dtype=torch.bfloat16, device=device)
     index_keys[:512, 0] = 1
     index_keys[256:768, 1] = 1
-    attention.dsa_indexer.quantize_write_index_k_mxfp4(
-        index_keys,
-        index_k_cache=layer.indexer.k_cache.kv_cache,
-        slot_mapping=torch.arange(length, device=device) + main_page,
-        page_size=main_page,
-    )
     layer.attn_sink = torch.zeros(layer.n_local_heads, device=device)
     q = torch.randn(
         (rows, layer.n_local_heads, 512), dtype=torch.bfloat16, device=device
@@ -472,20 +649,47 @@ def test_attention_shared_scratch_graph_replay(
     scales = torch.empty((rows, 32, 4), dtype=torch.uint8, device=device)
     out = torch.empty_like(q)
     workload = B12xWorkload(
-        stage="state", token_counts=tuple(sorted({rows, 4 if is_decode else 64})),
-        fixed_token_counts=(), output_dtype=torch.bfloat16,
-        max_tokens=max(rows, 64), max_seqs=4, max_model_len=layer.max_model_len,
+        stage="state",
+        token_counts=tuple(sorted({rows, 4 if is_decode else 64})),
+        fixed_token_counts=(),
+        output_dtype=torch.bfloat16,
+        max_tokens=max(rows, 64),
+        max_seqs=4,
+        max_model_len=layer.max_model_len,
     )
     session = PreparationSession(device=device, autotune=False)
     units = layer.get_b12x_preparation_units(layer, workload)
     requests = tuple(request for unit in units for request in unit.requests)
     session.prepare(requests, autotune=False)
+    attention.dsa_indexer.quantize_write_index_k_mxfp4(
+        layer._index_plan("prefill", min(rows, layer.INDEX_CHUNK)),
+        index_keys,
+        index_k_cache=layer.indexer.k_cache.kv_cache,
+        slot_mapping=torch.arange(length, device=device) + main_page,
+    )
+    activation_refs: list[tuple[str, StorageWeakRef]] = []
 
     def run():
-        attention.dsa_indexer.quantize_q_mxfp4(iq, q_mxfp4=packed, q_scales=scales)
-        layer.forward_mqa(
-            q, None, positions, out, index_query=(packed, scales, weights)
+        query = q.clone()
+        index_query = packed.clone(), scales.clone(), weights.clone()
+        activation_refs.extend(
+            (name, StorageWeakRef(tensor.untyped_storage()))
+            for name, tensor in zip(
+                ("query", "index_query", "index_scales", "index_weights"),
+                (query, *index_query),
+            )
         )
+        mode = "decode" if is_decode else "prefill"
+        chunk = layer.DECODE_CHUNK if is_decode else layer.INDEX_CHUNK
+        for offset in range(0, rows, chunk):
+            end = min(offset + chunk, rows)
+            attention.dsa_indexer.quantize_q_mxfp4(
+                layer._index_plan(mode, end - offset),
+                iq[offset:end],
+                q_mxfp4=index_query[0][offset:end],
+                q_scales=index_query[1][offset:end],
+            )
+        layer.forward_mqa(query, None, positions, out, index_query=index_query)
 
     run()
     batched_output = out.clone()
@@ -509,6 +713,10 @@ def test_attention_shared_scratch_graph_replay(
         torch.cuda.graph(graph, stream=stream),
     ):
         run()
+    # Graph resources own scratch, not the per-layer query activations.
+    gc.collect()
+    retained = [name for name, reference in activation_refs if not reference.expired()]
+    assert not retained, f"Capture resources retained caller activations: {retained}"
     # Changed queries exercise both selection and attention on replay, after
     # all plan storage has been reused by another operation.
     for step, seed in enumerate((143, 144)):
@@ -527,7 +735,9 @@ def test_attention_shared_scratch_graph_replay(
         expected_topk[live_rows:] = -1
         for plan in layer._index_plans.values():
             for scratch in attention.dsa_indexer.scratch_specs(plan, device=device):
-                torch.empty(scratch.shape, dtype=scratch.dtype, device=device).fill_(0xA5)
+                torch.empty(scratch.shape, dtype=scratch.dtype, device=device).fill_(
+                    0xA5
+                )
         out.fill_(float("nan"))
         layer.topk_indices_buffer[:rows].fill_(-1)
         graph.replay()
@@ -539,6 +749,109 @@ def test_attention_shared_scratch_graph_replay(
     graph.reset()
     session.close()
     del resources
+
+
+@pytest.mark.parametrize("is_prefill", [False, True])
+def test_output_projection_capture_releases_caller_activations(
+    native_workspace, is_prefill
+):
+    """WO bindings may borrow inputs and results without pinning them per graph."""
+    from b12x.preparation import PreparationSession
+
+    from vllm.utils.b12x import B12xWorkload
+
+    attention, manager, workspace = native_workspace
+    device = torch.device("cuda")
+    torch.manual_seed(147)
+    layer = _layer(attention)
+    layer.capacity = 16
+    layer.n_local_groups = 2
+    layer.n_local_heads = 16
+    layer.head_dim = 512
+    layer.rope_head_dim = 64
+    layer.o_lora_rank = 1024
+    layer.hidden_size = 5120
+    layer._wo_plans = {}
+    angles = torch.randn(32, 32, device=device)
+    layer.rotary_emb = SimpleNamespace(
+        cos_sin_cache=torch.cat((angles.cos(), angles.sin()), dim=-1)
+    )
+    for name, shape in (("wo_a", (2048, 4096)), ("wo_b", (5120, 2048))):
+        setattr(
+            layer,
+            name,
+            SimpleNamespace(
+                weight=(torch.randn(shape, device=device) / 32).to(torch.float8_e4m3fn),
+                weight_scale_inv=torch.ones(
+                    shape[0] // 32, shape[1] // 32, device=device
+                ).to(torch.float8_e8m0fnu),
+            ),
+        )
+    layer.setup_wo_projection()
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(8, 16),
+        fixed_token_counts=(8,),
+        output_dtype=torch.bfloat16,
+        max_tokens=16,
+        max_seqs=1,
+        max_model_len=32,
+    )
+    session = PreparationSession(device=device, autotune=False, compile_workers=2)
+    session.prepare(layer._wo_preparation_unit(workload).requests)
+    session.freeze()
+    manager.reserve_all(
+        *(
+            (spec.shape, spec.dtype)
+            for plan in layer._wo_plans.values()
+            for spec in plan.scratch_specs()
+        )
+    )
+    manager.lock()
+    inputs = torch.randn(16, 16, 512, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(16, device=device)
+    output = torch.empty(16, 5120, dtype=torch.bfloat16, device=device)
+    references: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def run(rows):
+        source = inputs[:rows] + 1
+        result = layer._o_proj(source, positions[:rows], is_prefill=is_prefill)
+        references.extend((weakref.ref(source), weakref.ref(result)))
+        if result._base is not None:
+            references.append(weakref.ref(result._base))
+        output[:rows].copy_(result)
+
+    pool = torch.cuda.graph_pool_handle()
+    graphs, owners = {}, []
+    try:
+        for rows in (16, 8):
+            run(rows)
+            torch.accelerator.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            graphs[rows] = graph
+            with (
+                session.capture(),
+                workspace.collect_cuda_graph_capture_resources() as resources,
+                torch.cuda.graph(graph, pool=pool),
+            ):
+                run(rows)
+            owners.append(resources)
+            gc.collect()
+            assert all(reference() is None for reference in references)
+            assert resources
+
+        for rows in (8, 16, 8, 16):
+            inputs.normal_()
+            positions.copy_(torch.randperm(16, device=device))
+            run(rows)
+            expected = output[:rows].clone()
+            output.fill_(float("nan"))
+            graphs[rows].replay()
+            torch.testing.assert_close(output[:rows], expected, rtol=0, atol=0)
+    finally:
+        for graph in graphs.values():
+            graph.reset()
+        session.close()
 
 
 def test_output_projection_uses_fused_block32_path(native_workspace, monkeypatch):
@@ -632,11 +945,14 @@ def test_model_post_load_packs_output_projections(native_workspace):
 
 
 def test_dspark_post_load_packs_output_projections(
-    native_workspace, monkeypatch, default_vllm_config, dist_init,
+    native_workspace,
+    monkeypatch,
+    default_vllm_config,
+    dist_init,
 ):
-    from vllm.models.deepseek_v4_1.nvidia import dspark
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+    from vllm.models.deepseek_v4_1.nvidia import dspark
 
     _, _, _ = native_workspace
     calls = []
@@ -873,10 +1189,12 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
     native_workspace, monkeypatch, request, main_page, swa_page
 ):
     from contextlib import ExitStack
+
     from b12x.attention._shared.mla.compressed_reference import (
         unpack_deepseek_v41_cache_reference,
     )
     from b12x.preparation import PreparationSession
+
     from vllm.utils.b12x import B12xWorkload
 
     attention, manager, workspace = native_workspace
@@ -1006,8 +1324,12 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
         return torch.einsum("rhk,kd->rhd", logits.softmax(-1)[..., :-1], values)
 
     workload = B12xWorkload(
-        stage="state", token_counts=(17, 65, 128), fixed_token_counts=(),
-        output_dtype=torch.bfloat16, max_tokens=128, max_seqs=1,
+        stage="state",
+        token_counts=(17, 65, 128),
+        fixed_token_counts=(),
+        output_dtype=torch.bfloat16,
+        max_tokens=128,
+        max_seqs=1,
         max_model_len=layer.max_model_len,
     )
     session = PreparationSession(device=device, autotune=False)
@@ -1038,14 +1360,16 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
                 run()
             for live in (128, 65, 17):
                 positions.fill_(-1)
-                positions[:live] = torch.arange(boundary, boundary + live, device=device)
+                positions[:live] = torch.arange(
+                    boundary, boundary + live, device=device
+                )
                 reqs.fill_(-1)
                 reqs[:live] = 0
                 visible.copy_((positions + 1).clamp_min(0).int())
                 starts[1] = live
                 q.normal_()
                 expected = oracle(live)
-                # Eager under the scoped guard also catches live-count specialization leaks.
+                # Eager under the guard also catches live-count specialization.
                 run()
                 torch.testing.assert_close(
                     out[:live].float(), expected, rtol=0.04, atol=0.025
@@ -1059,9 +1383,7 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
                     out[live:], torch.zeros_like(out[live:]), rtol=0, atol=0
                 )
                 selected = layer.topk_indices_buffer[:live]
-                assert torch.all(
-                    (selected < 0) | (selected <= positions[:live, None])
-                )
+                assert torch.all((selected < 0) | (selected <= positions[:live, None]))
         finally:
             graph.reset()
             del resources
