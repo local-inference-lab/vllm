@@ -1010,6 +1010,110 @@ def test_output_projection_prepares_uncaptured_decode_sizes(native_workspace):
     del resources
 
 
+@pytest.mark.parametrize("is_prefill", [False, True])
+def test_output_projection_capture_releases_caller_activations(
+    native_workspace, is_prefill
+):
+    """WO bindings may borrow inputs and results without pinning them per graph."""
+    from b12x.preparation import PreparationSession
+
+    from vllm.utils.b12x import B12xWorkload
+
+    attention, manager, workspace = native_workspace
+    device = torch.device(torch.accelerator.current_accelerator().type)
+    torch.manual_seed(147)
+    layer = _layer(attention)
+    layer.capacity = 16
+    layer.n_local_groups = 2
+    layer.n_local_heads = 16
+    layer.head_dim = 512
+    layer.rope_head_dim = 64
+    layer.o_lora_rank = 1024
+    layer.hidden_size = 5120
+    layer._wo_plans = {}
+    angles = torch.randn(32, 32, device=device)
+    layer.rotary_emb = SimpleNamespace(
+        cos_sin_cache=torch.cat((angles.cos(), angles.sin()), dim=-1)
+    )
+    for name, shape in (("wo_a", (2048, 4096)), ("wo_b", (5120, 2048))):
+        setattr(
+            layer,
+            name,
+            SimpleNamespace(
+                weight=(torch.randn(shape, device=device) / 32).to(torch.float8_e4m3fn),
+                weight_scale_inv=torch.ones(
+                    shape[0] // 32, shape[1] // 32, device=device
+                ).to(torch.float8_e8m0fnu),
+            ),
+        )
+    layer.setup_wo_projection()
+    layer._declare_attention(device)
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(8, 16),
+        fixed_token_counts=(8,),
+        output_dtype=torch.bfloat16,
+        max_tokens=16,
+        max_seqs=1,
+        max_model_len=32,
+    )
+    session = PreparationSession(device=device, autotune=False, compile_workers=2)
+    session.prepare(layer._wo_preparation_unit(workload).requests)
+    session.freeze()
+    manager.reserve_all(
+        *(
+            (spec.shape, spec.dtype)
+            for plan in layer._wo_plans.values()
+            for spec in plan.scratch_specs()
+        )
+    )
+    manager.lock()
+    inputs = torch.randn(16, 16, 512, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(16, device=device)
+    output = torch.empty(16, 5120, dtype=torch.bfloat16, device=device)
+    references: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def run(rows):
+        source = inputs[:rows] + 1
+        result = layer._o_proj(source, positions[:rows], is_prefill=is_prefill)
+        references.extend((weakref.ref(source), weakref.ref(result)))
+        if result._base is not None:
+            references.append(weakref.ref(result._base))
+        output[:rows].copy_(result)
+
+    pool = torch.cuda.graph_pool_handle()
+    graphs, owners = {}, []
+    try:
+        for rows in (16, 8):
+            run(rows)
+            torch.accelerator.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            graphs[rows] = graph
+            with (
+                session.capture(),
+                workspace.collect_cuda_graph_capture_resources() as resources,
+                torch.cuda.graph(graph, pool=pool),
+            ):
+                run(rows)
+            owners.append(resources)
+            gc.collect()
+            assert all(reference() is None for reference in references)
+            assert resources
+
+        for rows in (8, 16, 8, 16):
+            inputs.normal_()
+            positions.copy_(torch.randperm(16, device=device))
+            run(rows)
+            expected = output[:rows].clone()
+            output.fill_(float("nan"))
+            graphs[rows].replay()
+            torch.testing.assert_close(output[:rows], expected, rtol=0, atol=0)
+    finally:
+        for graph in graphs.values():
+            graph.reset()
+        session.close()
+
+
 def test_output_projection_uses_fused_block32_path(native_workspace, monkeypatch):
     from dataclasses import dataclass
 
