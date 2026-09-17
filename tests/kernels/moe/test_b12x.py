@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -1313,6 +1314,9 @@ def test_b12x_moe_tuning_times_native_candidate_without_capture(
                 race = _prepare_race(
                     [call], device_ordinal=torch.accelerator.current_device_index()
                 )
+                # Exclude reclaimable fixture cycles from resident storage.
+                gc.collect()
+                torch.accelerator.synchronize()
                 for _ in range(3):
                     call.output.fill_(float("nan"))
                     # Timer cache eviction may allocate temporary reductions;
