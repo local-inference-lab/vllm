@@ -220,6 +220,7 @@ def _make_b12x_moe_kernel(
     )
     experts = B12xExperts(moe_config, quant_config)
     layer = SimpleNamespace(
+        layer_name="test.b12x_moe",
         activation=activation,
         apply_router_weight_on_input=False,
         w13_weight=w1,
@@ -1258,10 +1259,10 @@ def test_b12x_moe_cuda_graph_replay(
 )
 @pytest.mark.parametrize("tokens", [4, 128])
 @torch.inference_mode()
-def test_b12x_moe_tuning_replays_native_candidate_in_cuda_graph(
+def test_b12x_moe_preparation_preserves_timing_and_graph_replay(
     weight_dtype, activation_dtype, tokens, workspace_init
 ) -> None:
-    """The race must time graph execution with live producers and fixed storage."""
+    """Prepared calls preserve fixed output storage in timing and serving graphs."""
     from b12x.preparation._measurement import _prepare_race
     from b12x.preparation.types import require_prepared
 
@@ -1278,6 +1279,7 @@ def test_b12x_moe_tuning_replays_native_candidate_in_cuda_graph(
             case.quant_config,
         )
         race = None
+        graph = None
         try:
             request = units[0].requests[0]
             plan = request.plan
@@ -1294,7 +1296,6 @@ def test_b12x_moe_tuning_replays_native_candidate_in_cuda_graph(
             race = _prepare_race(
                 [call], device_ordinal=torch.accelerator.current_device_index()
             )
-            assert race.timers[0].graph is not None
             for _ in range(3):
                 call.output.fill_(float("nan"))
                 allocated = torch.accelerator.memory_stats()["allocation.all.allocated"]
@@ -1306,7 +1307,27 @@ def test_b12x_moe_tuning_replays_native_candidate_in_cuda_graph(
                 )
                 assert call.output.data_ptr() == address
                 torch.testing.assert_close(call.output, expected, atol=2e-2, rtol=2e-2)
+            assert all(value > 0 for value in race.timers[0].samples())
+            race.close()
+            race = None
+
+            graph = torch.cuda.CUDAGraph()
+            with session.capture(), torch.cuda.graph(graph):
+                call.invoke()
+            for _ in range(3):
+                call.output.fill_(float("nan"))
+                allocated = torch.accelerator.memory_stats()["allocation.all.allocated"]
+                graph.replay()
+                torch.accelerator.synchronize()
+                assert (
+                    torch.accelerator.memory_stats()["allocation.all.allocated"]
+                    == allocated
+                )
+                assert call.output.data_ptr() == address
+                torch.testing.assert_close(call.output, expected, atol=2e-2, rtol=2e-2)
         finally:
+            if graph is not None:
+                graph.reset()
             if race is not None:
                 race.close()
             session.close()
