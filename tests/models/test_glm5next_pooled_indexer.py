@@ -933,9 +933,14 @@ def test_deepseek_c4_default_page_table_width_is_unchanged() -> None:
     assert indexer._max_page_table_width == 4096
 
 
-def test_glm53_physical_selection_prepares_before_resolution_freeze() -> None:
+def test_glm53_physical_selection_prepares_before_resolution_freeze(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from b12x._lib.runtime_control import kernel_resolution_guard
-    from b12x.attention.sparse_mla import expand_pooled_topk_to_physical_slots
+    from b12x.attention.sparse_mla import (
+        expand_pooled_topk_to_physical_slots,
+        pooled_selection,
+    )
     from b12x.preparation import PreparationSession
 
     device = _require_glm_gpu()
@@ -943,7 +948,7 @@ def test_glm53_physical_selection_prepares_before_resolution_freeze() -> None:
     nn.Module.__init__(indexer)
     indexer.block_size = 2048
     indexer._parent_table_width = 512
-    indexer._main_cache_num_blocks = 1024
+    indexer._main_cache_num_blocks = 1_000_000
     indexer._expand_pooled_topk_to_physical_slots = expand_pooled_topk_to_physical_slots
     output = torch.empty((32, 2051), dtype=torch.int32, device=device)
     counts = torch.empty(32, dtype=torch.int32, device=device)
@@ -955,15 +960,67 @@ def test_glm53_physical_selection_prepares_before_resolution_freeze() -> None:
     session = PreparationSession(device=device, autotune=False, compile_workers=0)
     session.prepare((request,))
     assert request.plan.prepared is not None
+    assert indexer._physical_selection_plan is request.plan
+
+    def reject_resolution(*args, **kwargs):
+        raise AssertionError("serving must reuse the retained compiled program")
+
+    monkeypatch.setattr(
+        pooled_selection._expand_pooled_topk_to_physical_slots_kernel,
+        "run",
+        reject_resolution,
+    )
     with kernel_resolution_guard("prepared physical-selection replay"):
-        for rows in (1, 4, 32):
+        for rows in (0, 1, 4, 32):
             call = indexer.make_b12x_physical_selection_prepare_call(
-                output[:rows], counts[:rows]
+                request.plan.prepared.state, output[:rows], counts[:rows]
             )
             call.run()
             assert torch.all(output[:rows, 0] == 0)
             assert torch.all(output[:rows, 1:] == -1)
             assert torch.all(counts[:rows] == 1)
+
+        pools = torch.full((7, 512), -1, dtype=torch.int32, device=device)
+        positions = torch.zeros(7, dtype=torch.int64, device=device)
+        requests = torch.zeros(7, dtype=torch.int32, device=device)
+        table = torch.zeros((2, 512), dtype=torch.int32, device=device)
+
+        def expand():
+            indexer._expand_pooled_topk_to_physical_slots(
+                pools,
+                positions,
+                requests,
+                table,
+                output[:7],
+                counts[:7],
+                pool_size=4,
+                block_size=2048,
+                block_stride_rows=2048,
+                num_cache_blocks=1_000_000,
+                plan=indexer._physical_selection_plan,
+            )
+
+        expand()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            expand()
+        positions.fill_(4)
+        pools[:, 0] = 0
+        requests.fill_(1)
+        table[1, 0] = 999_999
+        output.fill_(37)
+        counts.fill_(37)
+        graph.replay()
+        torch.accelerator.synchronize(device.index)
+        expected = torch.arange(5, device=device) + 999_999 * 2048
+        torch.testing.assert_close(
+            output[:7, :5], expected.expand(7, 5), rtol=0, atol=0, check_dtype=False
+        )
+        assert torch.all(output[:7, 5:] == -1)
+        assert torch.all(counts[:7] == 5)
+
+    indexer.unbind_main_kv_cache()
+    assert indexer._physical_selection_plan is None
 
 
 def test_glm53_selector_capacity_tracks_auto_fit_max_model_len() -> None:

@@ -143,6 +143,7 @@ class Glm5NextPooledIndexer(nn.Module):
         self._expand_pooled_topk_to_physical_slots = (
             b12x_sparse_mla.expand_pooled_topk_to_physical_slots
         )
+        self._physical_selection_plan = None
         self.index_kpool_compress_ape = nn.Parameter(
             allocate_weights(
                 torch.empty,
@@ -360,6 +361,7 @@ class Glm5NextPooledIndexer(nn.Module):
         return index_cache, subpages_per_parent, parent_stride_pages
 
     def bind_main_kv_cache(self, main_cache: torch.Tensor) -> None:
+        self._physical_selection_plan = None
         index_cache, subpages, parent_stride_pages = self._index_cache_view(main_cache)
         block_size = int(main_cache.shape[1])
         parent_table_width = self._max_parent_table_width(
@@ -393,9 +395,10 @@ class Glm5NextPooledIndexer(nn.Module):
     def unbind_main_kv_cache(self) -> None:
         self._index_cache = None
         self._main_cache_num_blocks = 0
+        self._physical_selection_plan = None
 
     def make_b12x_physical_selection_prepare_call(
-        self, output: torch.Tensor, active_counts: torch.Tensor
+        self, state, output: torch.Tensor, active_counts: torch.Tensor
     ):
         """Prepare pool expansion with the bound cache's exact page geometry."""
         from b12x.preparation import PreparedCall
@@ -409,7 +412,7 @@ class Glm5NextPooledIndexer(nn.Module):
             (1, self._parent_table_width), dtype=torch.int32, device=device
         )
         return PreparedCall(
-            run=lambda: self._expand_pooled_topk_to_physical_slots(
+            run=lambda: state.run(
                 pools,
                 positions,
                 requests,
@@ -437,9 +440,11 @@ class Glm5NextPooledIndexer(nn.Module):
             max_page_table_width=self._parent_table_width,
             num_cache_blocks=self._main_cache_num_blocks,
         )
+        self._physical_selection_plan = plan
 
         def prepare(state):
             return self.make_b12x_physical_selection_prepare_call(
+                state,
                 torch.empty_like(self.topk_indices_buffer),
                 torch.empty_like(self._physical_active_counts),
             )
@@ -700,6 +705,8 @@ class Glm5NextPooledIndexer(nn.Module):
         if decode_only and self.dcp_world_size == 1 and self._emit_physical_selection:
             if self._main_cache_num_blocks < 1:
                 raise RuntimeError("GLM selector main cache is not bound")
+            if self._physical_selection_plan is None:
+                raise RuntimeError("GLM physical selection has not been declared")
             self._expand_pooled_topk_to_physical_slots(
                 pool_ids[:live_rows],
                 positions[:live_rows],
@@ -711,6 +718,7 @@ class Glm5NextPooledIndexer(nn.Module):
                 block_size=self.block_size,
                 block_stride_rows=self.block_size,
                 num_cache_blocks=self._main_cache_num_blocks,
+                plan=self._physical_selection_plan,
             )
         else:
             expand_pool_ids(
