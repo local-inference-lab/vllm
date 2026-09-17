@@ -15,7 +15,6 @@ import pickle
 import time
 from contextlib import nullcontext
 
-
 _CONTROL_GROUPS: dict[tuple[int, int], object] = {}
 
 
@@ -39,11 +38,13 @@ class B12xPreparationCoordinator:
         world_group,
         process_local_only: bool = False,
         workspace=None,
+        request_workspace_lanes: dict[str, tuple[int, ...]] | None = None,
     ) -> None:
         if type(global_rank) is not int or global_rank < 0:
             raise ValueError("global_rank must be a nonnegative integer")
         self.session = session
         self._workspace = workspace
+        self._request_workspace_lanes = request_workspace_lanes
         self._active_requests = ()
         self.global_rank = global_rank
         self.world_group = world_group
@@ -110,7 +111,9 @@ class B12xPreparationCoordinator:
             return self._advance(cancel_tuning=cancel_tuning)
         finally:
             self._timing.add("advance", time.perf_counter() - started)
-            self._timing.record("progress", periodic=not self._global_done, round=self._round)
+            self._timing.record(
+                "progress", periodic=not self._global_done, round=self._round
+            )
             self._last_advance_end = time.perf_counter()
 
     def _advance(self, *, cancel_tuning: bool = False) -> dict[str, object]:
@@ -126,7 +129,7 @@ class B12xPreparationCoordinator:
                 self._error = pickle.loads(self._control.get("failed"))
                 self._safe_close()
         try:
-            with (self._timing.span("local") if self._timing else nullcontext()):
+            with self._timing.span("local") if self._timing else nullcontext():
                 self._advance_local()
         except BaseException as error:
             self._record_error(error)
@@ -144,17 +147,21 @@ class B12xPreparationCoordinator:
             self._round += 1
             return self._outcome()
 
-        if not (self._local_done or self._error or self._ready() or self._ready_tuning()):
+        if not (
+            self._local_done or self._error or self._ready() or self._ready_tuning()
+        ):
             return self._outcome()
 
-        with (self._timing.span("control_exchange") if self._timing else nullcontext()):
+        with self._timing.span("control_exchange") if self._timing else nullcontext():
             decision = self._exchange()
         if self._timing:
             self._timing.record(
-                "exchange", round=self._round,
+                "exchange",
+                round=self._round,
                 local_results=len(self._ready_tuning()),
                 selected_results=len(decision["tuning"]),
-                collective=decision["collective"], done=decision["done"],
+                collective=decision["collective"],
+                done=decision["done"],
             )
         self._stop |= decision["stop"]
         if decision["error"] is not None:
@@ -172,7 +179,9 @@ class B12xPreparationCoordinator:
                 from b12x.preparation import TuningRequirement
 
                 self._authorized_tuning = tuple(
-                    TuningRequirement(_unscoped_key(key), ranks, assignment, latency, index)
+                    TuningRequirement(
+                        _unscoped_key(key), ranks, assignment, latency, index
+                    )
                     for key, ranks, assignment, latency, index in decision["tuning"]
                     if self.global_rank in ranks
                 )
@@ -198,7 +207,9 @@ class B12xPreparationCoordinator:
                 decision = self._decision(gathered)
             except Exception as error:
                 self._record_error(error)
-                decision = dict(stop=True, error=self._error, collective=None, tuning=(), done=False)
+                decision = dict(
+                    stop=True, error=self._error, collective=None, tuning=(), done=False
+                )
             self._control.set(f"{prefix}/decision", pickle.dumps(decision))
         return pickle.loads(self._control.get(f"{prefix}/decision"))
 
@@ -214,7 +225,9 @@ class B12xPreparationCoordinator:
             authorized = {item[0] for item in tuning}
             pending = {item[0] for entry in gathered for item in entry["tuning"]}
             if authorized != pending:
-                raise RuntimeError("preparation ranks reached incompatible tuning boundaries")
+                raise RuntimeError(
+                    "preparation ranks reached incompatible tuning boundaries"
+                )
         return dict(
             stop=stop,
             error=error,
@@ -253,20 +266,36 @@ class B12xPreparationCoordinator:
         if progress.pending_compilation:
             pool = job.session._pool
             if pool is not None:
-                with (self._timing.span("compiler_wait") if self._timing else nullcontext()):
+                with (
+                    self._timing.span("compiler_wait")
+                    if self._timing
+                    else nullcontext()
+                ):
                     pool.wait_for_progress(timeout=0.05)
         if not progress.done:
             return
 
         job.result().close()
         if self._workspace is not None:
+            from vllm.v1.worker.workspace import use_workspace_lane
+
             for request in self._active_requests:
                 specs = tuple(request.plan.scratch_specs())
                 if specs:
-                    self._workspace.get_simultaneous(
-                        *((spec.shape, spec.dtype) for spec in specs)
+                    lanes = (
+                        (0,)
+                        if self._request_workspace_lanes is None
+                        else self._request_workspace_lanes[request.name]
                     )
-            self._workspace.reserve_all()
+                    for lane in lanes:
+                        with use_workspace_lane(lane):
+                            self._workspace.get_simultaneous(
+                                *((spec.shape, spec.dtype) for spec in specs)
+                            )
+            if self._request_workspace_lanes is None:
+                self._workspace.reserve_all()
+            else:
+                self._workspace.reserve_by_lane()
         self._active_requests = ()
         self._job = None
         if self._batches:
@@ -278,8 +307,7 @@ class B12xPreparationCoordinator:
         if self._last_progress is None:
             return ()
         return tuple(
-            (item.key, item.ranks)
-            for item in self._last_progress.ready_collectives
+            (item.key, item.ranks) for item in self._last_progress.ready_collectives
         )
 
     def _ready_tuning(self) -> tuple[tuple[object, ...], ...]:
@@ -419,9 +447,7 @@ def _get_control_group(world_group):
         control_group = StatelessProcessGroup(
             rank=rank,
             world_size=world_size,
-            store=dist.PrefixStore(
-                "b12x_preparation_control_v1", get_store()
-            ),
+            store=dist.PrefixStore("b12x_preparation_control_v1", get_store()),
         )
         _CONTROL_GROUPS[key] = control_group
     elif control_group.world_size != world_size:
@@ -440,9 +466,7 @@ def _authorize_ready(
         rank = int(entry["global_rank"])
         for key, ranks in entry["ready"]:
             ranks = tuple(ranks)
-            if ranks != tuple(sorted(set(ranks))) or not set(ranks) <= set(
-                world_ranks
-            ):
+            if ranks != tuple(sorted(set(ranks))) or not set(ranks) <= set(world_ranks):
                 raise RuntimeError(
                     "preparation collective has an invalid participant set"
                 )
@@ -503,5 +527,7 @@ def _authorize_tuning(
         if len(indices) != len(set(indices)):
             raise RuntimeError("preparation tuning shards overlap")
         latency_us, candidate_index, _, assignment = min(candidates)
-        winners.append((key, participants_by_key[key], assignment, latency_us, candidate_index))
+        winners.append(
+            (key, participants_by_key[key], assignment, latency_us, candidate_index)
+        )
     return tuple(winners)
