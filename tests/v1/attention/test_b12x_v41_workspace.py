@@ -787,12 +787,13 @@ def test_attention_shared_scratch_graph_replay(
             device=device,
             dtype=torch.uint8,
         )
-        from b12x.attention._shared.mla.compressed_reference import (
-            pack_deepseek_v41_cache_reference,
-        )
-
-        cache[1:].copy_(
-            pack_deepseek_v41_cache_reference(kv, page_size=page, cache_kind=kind)
+        _write_cache(
+            kv,
+            cache,
+            torch.arange(length, device=device) + page,
+            page_size=page,
+            cache_kind=kind,
+            cache_format="deepseek_v41",
         )
         if kind == "swa":
             layer.swa_cache_layer.kv_cache = cache
@@ -813,6 +814,12 @@ def test_attention_shared_scratch_graph_replay(
     index_keys = torch.zeros((length, 128), dtype=torch.bfloat16, device=device)
     index_keys[:512, 0] = 1
     index_keys[256:768, 1] = 1
+    _write_index_keys(
+        index_keys,
+        index_k_cache=layer.indexer.k_cache.kv_cache,
+        slot_mapping=torch.arange(length, device=device) + main_page,
+        page_size=main_page,
+    )
     layer.attn_sink = torch.zeros(layer.n_local_heads, device=device)
     q = torch.randn(
         (rows, layer.n_local_heads, 512), dtype=torch.bfloat16, device=device
@@ -836,12 +843,6 @@ def test_attention_shared_scratch_graph_replay(
     units = layer.get_b12x_preparation_units(layer, workload)
     requests = tuple(request for unit in units for request in unit.requests)
     session.prepare(requests, autotune=False)
-    attention.dsa_indexer.quantize_write_index_k_mxfp4(
-        layer._index_plan("prefill", min(rows, layer.INDEX_CHUNK)),
-        index_keys,
-        index_k_cache=layer.indexer.k_cache.kv_cache,
-        slot_mapping=torch.arange(length, device=device) + main_page,
-    )
     activation_refs: list[tuple[str, StorageWeakRef]] = []
 
     def run():
