@@ -829,8 +829,9 @@ def _register_b12x_moe_output_collective(
     )
     from vllm.distributed.parallel_state import register_b12x_collective_describer
 
+    prefix = layer.layer_name
+
     def describe(workload):
-        prefix = layer.layer_name
         return tuple(
             B12xPcieInvocation(
                 name=f"{prefix}.moe_output_all_reduce.m{rows}.lane{workload.lane}",
