@@ -14,6 +14,8 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 
 
 def test_dflash_loader_honors_draft_load_config(monkeypatch):
+    from vllm.config import LoadConfig
+
     draft_load_config = object()
     draft_model_config = SimpleNamespace(hf_config=SimpleNamespace())
     speculative_config = SimpleNamespace(
@@ -25,6 +27,7 @@ def test_dflash_loader_honors_draft_load_config(monkeypatch):
     vllm_config = SimpleNamespace(
         attention_config=SimpleNamespace(),
         cache_config=SimpleNamespace(),
+        load_config=LoadConfig(load_format="fastsafetensors"),
         speculative_config=speculative_config,
     )
     loaded = SimpleNamespace(model=SimpleNamespace())
@@ -42,17 +45,16 @@ def test_dflash_loader_honors_draft_load_config(monkeypatch):
     monkeypatch.setattr(dflash_utils, "replace", fake_replace)
     monkeypatch.setattr(dflash_utils, "get_model", fake_get_model)
     monkeypatch.setattr(
-        dflash_utils,
-        "get_pp_group",
+        "vllm.v1.worker.gpu.spec_decode.utils.get_pp_group",
+        lambda: SimpleNamespace(world_size=2),
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.spec_decode.eagle.utils.get_pp_group",
         lambda: SimpleNamespace(world_size=2),
     )
     monkeypatch.setattr(
         "vllm.compilation.backends.set_model_tag",
         lambda _tag: nullcontext(),
-    )
-    monkeypatch.setattr(
-        "vllm.model_executor.models.qwen3_dflash.dflash_target_rope_is_neox_style",
-        lambda _model: None,
     )
     monkeypatch.setattr(
         "vllm.model_executor.models.qwen3_dflash.dflash_has_any_non_causal",
@@ -61,6 +63,8 @@ def test_dflash_loader_honors_draft_load_config(monkeypatch):
 
     assert dflash_utils.load_dflash_model(SimpleNamespace(), vllm_config) is loaded
     assert captured["load_config"] is draft_load_config
+    assert captured["vllm_config"].load_config.load_format == "auto"
+    assert vllm_config.load_config.load_format == "fastsafetensors"
 
 
 def test_dflash_reset_attn_releases_cache_layout_state():
@@ -158,7 +162,7 @@ def test_dflash_context_projection_rejects_mixed_quantization(mxfp8_layer: int):
     from torch import nn
 
     from vllm.model_executor.layers.quantization.modelopt import (
-        ModelOptMxFp8LinearMethod,
+        build_linear_method,
     )
     from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
 
@@ -166,8 +170,8 @@ def test_dflash_context_projection_rejects_mixed_quantization(mxfp8_layer: int):
         def __getitem__(self, _key):
             raise AssertionError("weights must not be read before validation")
 
-    mxfp8_method = object.__new__(ModelOptMxFp8LinearMethod)
-    methods = [None, None]
+    mxfp8_method = build_linear_method(None, "MXFP8", "")
+    methods = [build_linear_method(None, "FP8", ""), None]
     methods[mxfp8_layer] = mxfp8_method
     layers_attn = [
         SimpleNamespace(
@@ -184,6 +188,84 @@ def test_dflash_context_projection_rejects_mixed_quantization(mxfp8_layer: int):
 
     with pytest.raises(ValueError, match="Every DFlash attention layer"):
         model._build_context_kv_buffers(layers_attn, has_bias=False)
+
+
+@pytest.mark.parametrize("mxfp8", [False, True])
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_fused_context_projection_owns_its_linear_method(monkeypatch, mxfp8, has_bias):
+    """Fused K/V packing must not reconfigure the query projection's kernel."""
+    from torch import nn
+
+    import vllm.model_executor.layers.quantization.modelopt as modelopt
+    import vllm.model_executor.parameter as parameter
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
+
+    kernels = []
+
+    def select_kernel(spec, layer, runtime_dtypes, **kwargs):
+        kernel = SimpleNamespace(
+            process_weights_after_loading=lambda layer: None,
+            input_quant_key=lambda: None,
+        )
+        kernels.append((kernel, layer.output_size_per_partition))
+        assert runtime_dtypes.input_dtype == torch.bfloat16
+        assert runtime_dtypes.out_dtype == torch.bfloat16
+        assert runtime_dtypes.marlin_input_dtype == torch.float16
+        assert layer.has_bias is has_bias
+        return kernel
+
+    monkeypatch.setattr(modelopt, "select_linear_kernel", select_kernel)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 1)
+    method = modelopt.build_linear_method(None, "MXFP8", "") if mxfp8 else None
+    original_kernel = object()
+    if method is not None:
+        method.kernel = original_kernel
+        method.input_dtype = method.out_dtype = torch.bfloat16
+        method.marlin_input_dtype = torch.float16
+    layers = []
+    for index in range(2):
+        projection = nn.Module()
+        projection.quant_method = method
+        weight = torch.full((192, 64), index + 1, dtype=torch.bfloat16)
+        if mxfp8:
+            weight = weight.to(torch.float8_e4m3fn)
+            projection.weight_scale = nn.Parameter(
+                torch.full((192, 2), 127, dtype=torch.uint8), requires_grad=False
+            )
+        projection.weight = nn.Parameter(weight, requires_grad=False)
+        if has_bias:
+            projection.bias = nn.Parameter(torch.full((192,), float(index + 1)))
+        attention = SimpleNamespace(
+            qkv_proj=projection,
+            q_size=128,
+            k_norm=SimpleNamespace(weight=torch.ones(32)),
+        )
+        layers.append(SimpleNamespace(self_attn=attention))
+    model = object.__new__(DFlashQwen3Model)
+    nn.Module.__init__(model)
+    model.layers = layers
+    model.hidden_norm = SimpleNamespace(weight=torch.ones(64, dtype=torch.bfloat16))
+    model._fused_kv_linear = nn.Module()
+    model._fused_kv_quant_method = None
+    model._build_context_kv_buffers([layer.self_attn for layer in layers], has_bias)
+    expected = model._fused_kv_weight.clone()
+    model.process_weights_after_loading()
+    if mxfp8:
+        assert method is not None
+        assert model._fused_kv_quant_method is not method
+        assert method.kernel is original_kernel
+        assert kernels == [(model._fused_kv_quant_method.kernel, 128)]
+        assert model._fused_kv_linear.weight_block_size == [1, 32]
+        torch.testing.assert_close(
+            model._fused_kv_linear.weight.float(), expected.float()
+        )
+        assert model._fused_kv_weight is None
+        assert model._fused_kv_weight_scale is None
+    else:
+        assert not kernels
+        assert model._fused_kv_quant_method is None
+        torch.testing.assert_close(model._fused_kv_weight, expected)
 
 
 def test_selector_edges_match_sequential_reference():
