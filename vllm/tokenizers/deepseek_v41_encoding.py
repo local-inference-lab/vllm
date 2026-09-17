@@ -11,6 +11,8 @@ import copy
 import json
 from typing import Any, Dict, List, Optional, Union
 
+from vllm.utils.tool_names import normalize_tool_namespace
+
 bos_token: str = "<｜begin▁of▁sentence｜>"
 eos_token: str = "<｜end▁of▁sentence｜>"
 thinking_start_token: str = "<think>"
@@ -55,8 +57,8 @@ def to_json(value: Any) -> str:
 
 
 def tools_from_openai_format(tools):
-    """Extract function definitions from OpenAI-format tool list."""
-    return [tool["function"] for tool in tools]
+    """Extract function definitions with namespace-qualified identities."""
+    return [normalize_tool_namespace(tool)["function"] for tool in tools]
 
 
 def tool_calls_from_openai_format(tool_calls):
@@ -66,7 +68,7 @@ def tool_calls_from_openai_format(tool_calls):
             "name": tool_call["function"]["name"],
             "arguments": tool_call["function"]["arguments"],
         }
-        for tool_call in tool_calls
+        for tool_call in map(normalize_tool_namespace, tool_calls)
     ]
 
 
