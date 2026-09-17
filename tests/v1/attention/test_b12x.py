@@ -685,15 +685,18 @@ def test_b12x_attention_runtime_page_size_comes_from_cache() -> None:
         _kv_page_size(key_cache, torch.empty((3, 128, 4, 128), device="meta"))
 
 
-def test_b12x_attention_requires_prepared_decode_plan() -> None:
+def test_b12x_attention_routes_unprepared_decode_to_extend_plan() -> None:
     impl = object.__new__(B12xPagedAttentionImpl)
-    impl._plans = {}
+    extend_plan = object()
+    impl._plans = {("extend", 64, 7, 16): extend_plan}
     impl._verify_q_per_req = 0
     impl._extend_q_capacities = (16,)
     metadata = SimpleNamespace(max_query_len=1)
 
-    with pytest.raises(PreparationResourceUnavailableError, match="not prepared"):
-        impl._select_plan(metadata, 7, 7, 7, 64)
+    assert impl._select_plan(metadata, 7, 7, 7, 64) == (
+        extend_plan,
+        ("extend", 64, 7, 16),
+    )
 
 
 def test_b12x_attention_fp8_descales_follow_request_batch() -> None:

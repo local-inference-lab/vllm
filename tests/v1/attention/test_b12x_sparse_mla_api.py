@@ -1426,16 +1426,18 @@ def test_b12x_sparse_mla_plan_lookup_declares_unplanned_decode_rows_once(
     assert prepared == []
 
 
-def test_b12x_sparse_mla_plan_key_is_exact_for_decode_rows() -> None:
+def test_b12x_sparse_mla_plan_key_routes_unprepared_decode_to_extend() -> None:
     impl = object.__new__(B12xMLASparseImpl)
     impl._max_speculative_decode_query_len = 1
     impl._decode_max_rows = 24
     impl._max_tokens = 128
+    impl._plans = {("decode", 8): object(), ("extend", 128): object()}
     impl.uses_full_ckv_dcp = lambda attn_metadata, num_tokens: False
     decode = SimpleNamespace(num_reqs=11, max_query_len=1, is_spec_decode=False)
     prefill = SimpleNamespace(num_reqs=1, max_query_len=37, is_spec_decode=False)
 
-    assert impl._plan_key(decode, 11) == ("decode", 11)
+    assert impl._plan_key(decode, 11) == ("extend", 128)
+    assert impl._plan_key(decode, 8) == ("decode", 8)
     assert impl._plan_key(prefill, 37) == ("extend", 128)
 
 

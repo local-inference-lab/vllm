@@ -1681,7 +1681,9 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         if self.uses_full_ckv_dcp(attn_metadata, num_tokens):
             return ("ckv_extend", self._max_tokens)
         if self._use_decode_execution(attn_metadata, num_tokens):
-            return ("decode", num_tokens)
+            key = ("decode", num_tokens)
+            if key in self._plans:
+                return key
         return ("extend", self._max_tokens)
 
     def finalize_kv_cache_geometry(self, kernel_page_size: int) -> None:

@@ -777,6 +777,17 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         plan = self._plans.get(key)
         if plan is not None:
             return plan, key
+        if key[0] in ("decode", "verify"):
+            capacity = next(
+                (candidate for candidate in self._extend_q_capacities
+                 if q_capacity <= candidate),
+                None,
+            )
+            if capacity is not None:
+                extend_key = ("extend", page_size, num_reqs, capacity)
+                extend_plan = self._plans.get(extend_key)
+                if extend_plan is not None:
+                    return extend_plan, extend_key
         # A variant the preparation pass did not declare is declared here with
         # its default configuration and materialized on first use.
         if key_cache is None or value_cache is None:
