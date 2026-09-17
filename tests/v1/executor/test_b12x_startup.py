@@ -14,8 +14,8 @@ import pytest
 import torch.distributed as dist
 
 from vllm.v1.executor.abstract import Executor, _aggregate_b12x_progress
-from vllm.v1.worker.worker_base import WorkerBase
 from vllm.v1.worker.b12x_startup import B12xPreparationCoordinator, _authorize_tuning
+from vllm.v1.worker.worker_base import WorkerBase
 
 """Cooperative control for the b12x warmup prelude."""
 
@@ -79,6 +79,52 @@ class _Session:
 
     def cancel_tuning(self):
         self.events.append("cancel")
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_freeze_b12x_preparation_is_gated_by_startup_env(
+    monkeypatch, enabled
+) -> None:
+    from vllm import envs
+    from vllm.v1.worker.gpu_worker import Worker
+
+    calls: list[object] = []
+
+    def freeze():
+        calls.append("freeze")
+
+    session = SimpleNamespace(freeze=freeze)
+    worker = SimpleNamespace(_b12x_session=session)
+    monkeypatch.setattr(envs, "VLLM_B12X_FREEZE_AFTER_STARTUP", enabled)
+    Worker.freeze_b12x_preparation(worker)
+    assert calls == (["freeze"] if enabled else [])
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_executor_freezes_workers_only_after_startup(monkeypatch, enabled) -> None:
+    from vllm import envs
+
+    calls: list[object] = []
+
+    def prepare(**kwargs):
+        calls.append(("prepare", kwargs))
+
+    def rpc(method):
+        calls.append(method)
+        return [SimpleNamespace(language_model=1, encoder=2)]
+
+    executor = SimpleNamespace(
+        _run_b12x_preparation=prepare,
+        collective_rpc=rpc,
+        vllm_config=SimpleNamespace(compilation_config=SimpleNamespace()),
+    )
+    monkeypatch.setattr(envs, "VLLM_B12X_FREEZE_AFTER_STARTUP", enabled)
+    Executor.compile_or_warm_up_model(executor)
+    assert calls[:2] == [
+        ("prepare", {"stage": "state"}),
+        "compile_or_warm_up_model",
+    ]
+    assert ("freeze_b12x_preparation" in calls) is enabled
 
 
 
@@ -304,10 +350,9 @@ def test_abort_closes_active_job_once() -> None:
 @pytest.mark.parametrize("variant", ("batched", "varlen"))
 def test_attention_tuning_rendezvous_ignores_rank_local_device_ordinal(variant):
     import torch
-    from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
-
     from b12x.attention import varlen
     from b12x.preparation.session import PreparationJob
+    from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 
     mode = FakeTensorMode()
     ranks = (0, 1, 2, 3)
@@ -492,6 +537,7 @@ def test_executor_runs_worker_on_calling_thread_and_cancels_without_step_rpcs():
 
 def test_candidate_progress_waits_for_every_expected_rank_to_finish_planning():
     from dataclasses import replace
+
     from b12x.preparation import PreparationProgress
 
     known = PreparationProgress(False, False, (), False, total_candidates=120, measured_candidates=30)
@@ -567,9 +613,14 @@ def test_cancel_drains_pending_winners_then_orders_collective_warmup():
 
 def test_heuristic_warmup_is_local_on_each_rank(tmp_path, monkeypatch):
     from dataclasses import dataclass
+
     from b12x.preparation import (
-        CollectiveRequirement, DetectedDevice, MemoryRequirements, Plan,
-        PreparationSession, PreparedCall,
+        CollectiveRequirement,
+        DetectedDevice,
+        MemoryRequirements,
+        Plan,
+        PreparationSession,
+        PreparedCall,
     )
     from b12x.preparation.tuning import Knob, TuningContract
 

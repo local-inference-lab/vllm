@@ -73,6 +73,47 @@ def test_b12x_plan_resolver_uses_exact_then_capacity():
         resolver.declare(replace(workload, max_tokens=32), capacity=lambda rows: rows)
 
 
+def test_b12x_plan_resolver_declaration_is_immutable_and_capacity_based(caplog):
+    resolver = B12xPlanResolver("resolver-test")
+    calls = []
+
+    def exact(rows):
+        calls.append(("exact", rows))
+        return ("exact", rows)
+
+    def capacity(rows):
+        calls.append(("capacity", rows))
+        return ("capacity", rows)
+
+    resolver.declare_capacities(
+        fixed_counts=(2, 8), capacities=(16, 32), exact=exact, capacity=capacity
+    )
+    assert calls == [("exact", 2), ("exact", 8), ("capacity", 16), ("capacity", 32)]
+    assert resolver.resolve(2) == ("exact", 2)
+    assert resolver.resolve(1) == ("capacity", 16)
+    assert resolver.resolve(16) == ("capacity", 16)
+    assert resolver.resolve(17) == ("capacity", 32)
+    assert resolver.resolve(32) == ("capacity", 32)
+    assert calls == [("exact", 2), ("exact", 8), ("capacity", 16), ("capacity", 32)]
+
+    resolver.declare_capacities(
+        fixed_counts=(2, 8), capacities=(16, 32), exact=exact, capacity=capacity
+    )
+    assert calls == [("exact", 2), ("exact", 8), ("capacity", 16), ("capacity", 32)]
+    with pytest.raises(PreparationResourceUnavailableError, match="covers 33"):
+        resolver.resolve(33)
+    with pytest.raises(ValueError, match="capacity changed"):
+        resolver.declare_capacities(
+            fixed_counts=(2, 8), capacities=(16, 64), exact=exact, capacity=capacity
+        )
+
+    with caplog.at_level("WARNING"):
+        resolver.declare_capacities(
+            fixed_counts=(2, 4, 8), capacities=(16, 32), exact=exact, capacity=capacity
+        )
+    assert "exact plans for (4,) were not declared" in caplog.text
+
+
 def _prepare(
     layer,
     *,
