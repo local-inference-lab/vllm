@@ -338,6 +338,48 @@ Supported models:
 
 Flags: `--tool-call-parser deepseek_v31 --chat-template {see_above}`
 
+### DeepSeek-V4.1 Models (`deepseek_v41`)
+
+Status: implemented. The `deepseek_v41` tokenizer and parser support spaced
+DSML tool calls and namespace-qualified function names for
+`deepseek-ai/DeepSeek-V4.1-Flash`.
+
+Use `--tokenizer-mode deepseek_v41 --tool-call-parser deepseek_v41
+--reasoning-parser deepseek_v41 --enable-auto-tool-choice`.
+
+Chat Completions accepts a namespace on a function tool:
+
+```json
+{
+  "type": "function",
+  "namespace": {"name": "inventory", "description": "Stock operations."},
+  "function": {
+    "name": "lookup",
+    "description": "Look up an item.",
+    "parameters": {"type": "object", "properties": {"sku": {"type": "string"}}}
+  }
+}
+```
+
+The namespace may also be a string, or appear inside `function`. Before
+validation and rendering, it becomes `function.name="inventory::lookup"`.
+The namespace description is prepended to the function description.
+The same normalization applies to assistant tool-call history and named
+`tool_choice` objects. A qualified name must agree with any explicit namespace;
+conflicting declarations are rejected. Tools without namespaces are unchanged.
+
+Complete and streamed Chat Completions responses retain the qualified
+`function.name`; they do not add a separate response `namespace` field. Dispatch
+tools by that qualified name and preserve it when sending assistant history.
+This extension is separate from the Responses API's `type="namespace"` schema.
+
+The tokenizer also accepts `{"role":"latest_reminder","content":"..."}`
+between a system message and a user message, rendering the reference
+`<｜latest_reminder｜>` marker for date, locale or similar context. This is a
+DeepSeek-specific role, not a standard OpenAI message role. Other unknown roles
+remain invalid. The encoding contract follows the
+[DeepSeek V4.1 reference](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/encoding/README.md).
+
 ### OpenAI OSS Models (`openai`)
 
 Supported models:
