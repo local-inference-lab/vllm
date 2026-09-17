@@ -439,12 +439,14 @@ def test_block_linear_capture_retains_scratch_not_caller_activations(
 
 
 @pytest.mark.parametrize("operation", ["pre", "post_pre"])
+@pytest.mark.parametrize("capture_kind", ["full", "breakable"])
 def test_mhc_capture_retains_scratch_not_caller_activations(
-    native_workspace, monkeypatch, operation
+    native_workspace, monkeypatch, operation, capture_kind
 ):
     """Intermediate MHC outputs must be reusable across shared-pool graphs."""
     from b12x.preparation import PreparationSession
 
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
     from vllm.models.deepseek_v4_1 import b12x_layers
     from vllm.utils.b12x import B12xWorkload, register_b12x_layer
 
@@ -537,6 +539,10 @@ def test_mhc_capture_retains_scratch_not_caller_activations(
             pre[:rows],
             **kwargs,
         )
+        capture = BreakableCUDAGraphCapture.current()
+        if capture is not None:
+            # The lagged outputs cross a segment boundary before consumption.
+            capture.add_eager(lambda: None)
         for destination, value in zip(destinations, values, strict=True):
             references.append(weakref.ref(value))
             destination[:rows].copy_(value)
@@ -547,14 +553,23 @@ def test_mhc_capture_retains_scratch_not_caller_activations(
         for rows in (16, 8):
             run(rows)
             torch.accelerator.synchronize()
-            graph = torch.cuda.CUDAGraph()
+            graph = (
+                torch.cuda.CUDAGraph()
+                if capture_kind == "full"
+                else BreakableCUDAGraphCapture(pool=pool)
+            )
             graphs[rows] = graph
+            context = (
+                torch.cuda.graph(graph, pool=pool) if capture_kind == "full" else graph
+            )
             with (
                 session.capture(),
                 workspace.collect_cuda_graph_capture_resources() as resources,
-                torch.cuda.graph(graph, pool=pool),
+                torch.cuda.stream(torch.cuda.Stream()),
+                context,
             ):
                 run(rows)
+            torch.accelerator.synchronize()
             owners.append(resources)
             gc.collect()
             assert all(reference() is None for reference in references)
