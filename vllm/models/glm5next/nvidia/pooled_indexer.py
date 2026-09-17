@@ -568,6 +568,16 @@ class Glm5NextPooledIndexer(nn.Module):
                 f"actual={actual_table_width}, required={self._parent_table_width}"
             )
 
+        decode_only = decode_rows == live_rows
+        emit_physical_selection = (
+            decode_only and self.dcp_world_size == 1 and self._emit_physical_selection
+        )
+        if emit_physical_selection:
+            if self._main_cache_num_blocks < 1:
+                raise RuntimeError("GLM selector main cache is not bound")
+            if self._physical_selection_plan is None:
+                raise RuntimeError("GLM physical selection has not been declared")
+
         update_decode_pools(
             index_cache,
             self._tail,
@@ -586,7 +596,6 @@ class Glm5NextPooledIndexer(nn.Module):
         )
         parent_table = main_metadata.block_table[:num_reqs, : self._parent_table_width]
         seq_lens = self._pool_seq_lens[:live_rows]
-        decode_only = decode_rows == live_rows
         decode_table = self._decode_block_table[:decode_rows]
         if decode_only:
             prepare_c4_decode_metadata(
@@ -707,11 +716,7 @@ class Glm5NextPooledIndexer(nn.Module):
         output = self.topk_indices_buffer[:rows]
         if live_rows < rows:
             output[live_rows:].fill_(-1)
-        if decode_only and self.dcp_world_size == 1 and self._emit_physical_selection:
-            if self._main_cache_num_blocks < 1:
-                raise RuntimeError("GLM selector main cache is not bound")
-            if self._physical_selection_plan is None:
-                raise RuntimeError("GLM physical selection has not been declared")
+        if emit_physical_selection:
             self._expand_pooled_topk_to_physical_slots(
                 pool_ids[:live_rows],
                 positions[:live_rows],
