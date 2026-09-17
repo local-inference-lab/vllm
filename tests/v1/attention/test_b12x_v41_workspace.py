@@ -320,9 +320,9 @@ def test_index_preparation_reuses_reserved_workspace(native_workspace):
     plan = layer._declare_index_plan("prefill", 256)
     attention._scratch(plan)
     manager.lock()
-    torch.cuda.synchronize()
-    before = torch.cuda.memory_allocated(device)
-    torch.cuda.reset_peak_memory_stats(device)
+    torch.accelerator.synchronize()
+    before = torch.accelerator.memory_allocated(device)
+    torch.accelerator.reset_peak_memory_stats(device)
     with PreparationSession(device=device, autotune=False) as session:
         session.prepare(
             [
@@ -332,8 +332,8 @@ def test_index_preparation_reuses_reserved_workspace(native_workspace):
                 )
             ]
         )
-        torch.cuda.synchronize()
-        peak = torch.cuda.max_memory_allocated(device) - before
+        torch.accelerator.synchronize()
+        peak = torch.accelerator.max_memory_allocated(device) - before
         assert peak < 64 * 1024**2
         torch.testing.assert_close(cache, torch.zeros_like(cache), rtol=0, atol=0)
 
@@ -432,6 +432,159 @@ def test_block_linear_capture_retains_scratch_not_caller_activations(
             outputs.fill_(float("nan"))
             graphs[rows].replay()
             torch.testing.assert_close(outputs[:rows], expected, rtol=0, atol=0)
+    finally:
+        for graph in graphs.values():
+            graph.reset()
+        session.close()
+
+
+@pytest.mark.parametrize("operation", ["pre", "post_pre"])
+@pytest.mark.parametrize("capture_kind", ["full", "breakable"])
+def test_mhc_capture_retains_scratch_not_caller_activations(
+    native_workspace, monkeypatch, operation, capture_kind
+):
+    """Intermediate MHC outputs must be reusable across shared-pool graphs."""
+    from b12x.preparation import PreparationSession
+
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+    from vllm.models.deepseek_v4_1 import b12x_layers
+    from vllm.utils.b12x import B12xWorkload, register_b12x_layer
+
+    _, manager, workspace = native_workspace
+    monkeypatch.setattr(b12x_layers, "_execution_capacities", lambda: (8, 16))
+    device = torch.device("cuda")
+    hidden = 5120
+    torch.manual_seed(146)
+    layer = torch.nn.Module()
+    for kind in ("attn", "ffn"):
+        setattr(layer, f"hc_{kind}_fn", torch.randn(24, hidden * 4, device=device) / 64)
+        setattr(layer, f"hc_{kind}_scale", torch.ones(3, device=device))
+        setattr(layer, f"hc_{kind}_base", torch.zeros(24, device=device))
+        setattr(
+            layer,
+            f"{kind}_norm",
+            SimpleNamespace(
+                weight=torch.ones(hidden, dtype=torch.bfloat16, device=device)
+            ),
+        )
+    layer.hc_attn_fn_broadcast = None
+    module = layer._b12x_mhc = b12x_layers.B12xMHC(
+        SimpleNamespace(
+            hidden_size=hidden,
+            rms_norm_eps=1e-20,
+            hc_eps=1e-6,
+            hc_sinkhorn_iters=20,
+            hc_mult=4,
+        )
+    )
+    name = f"test.mhc.capture.{operation}"
+    module.bind_layer_name(name)
+    register_b12x_layer(name, layer)
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(8, 16),
+        fixed_token_counts=(8,),
+        output_dtype=torch.bfloat16,
+        max_tokens=16,
+        max_seqs=1,
+        max_model_len=16,
+    )
+    session = PreparationSession(device=device, autotune=False, compile_workers=2)
+    session.prepare(
+        tuple(
+            request
+            for unit in module.get_b12x_preparation_units(layer, workload)
+            for request in unit.requests
+        )
+    )
+    session.freeze()
+    manager.reserve_all(
+        *(
+            (spec.shape, spec.dtype)
+            for plan in module._plans.values()
+            for spec in plan.scratch_specs()
+        )
+    )
+    manager.lock()
+    residual = torch.randn(16, 4, hidden, dtype=torch.bfloat16, device=device)
+    previous = torch.randn(16, hidden, dtype=torch.bfloat16, device=device)
+    pre = torch.full((16, 4), 0.25, device=device)
+    previous_post = pre.clone()
+    comb = torch.eye(4, device=device).expand(16, -1, -1).contiguous()
+    destinations = [
+        torch.empty_like(residual),
+        torch.empty_like(pre),
+        torch.empty_like(comb),
+        torch.empty_like(previous),
+        torch.empty_like(pre),
+    ]
+    references: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def run(rows):
+        kwargs = (
+            {}
+            if operation == "pre"
+            else dict(
+                previous_output=previous[:rows],
+                previous_post=previous_post[:rows],
+                previous_comb=comb[:rows],
+            )
+        )
+        values = module.pre(
+            residual[:rows],
+            layer.hc_attn_fn,
+            layer.hc_attn_scale,
+            layer.hc_attn_base,
+            layer.attn_norm.weight,
+            pre[:rows],
+            **kwargs,
+        )
+        capture = BreakableCUDAGraphCapture.current()
+        if capture is not None:
+            # The lagged outputs cross a segment boundary before consumption.
+            capture.add_eager(lambda: None)
+        for destination, value in zip(destinations, values, strict=True):
+            references.append(weakref.ref(value))
+            destination[:rows].copy_(value)
+
+    pool = torch.cuda.graph_pool_handle()
+    graphs, owners = {}, []
+    try:
+        for rows in (16, 8):
+            run(rows)
+            torch.accelerator.synchronize()
+            graph = (
+                torch.cuda.CUDAGraph()
+                if capture_kind == "full"
+                else BreakableCUDAGraphCapture(pool=pool)
+            )
+            graphs[rows] = graph
+            context = (
+                torch.cuda.graph(graph, pool=pool) if capture_kind == "full" else graph
+            )
+            with (
+                session.capture(),
+                workspace.collect_cuda_graph_capture_resources() as resources,
+                torch.cuda.stream(torch.cuda.Stream()),
+                context,
+            ):
+                run(rows)
+            torch.accelerator.synchronize()
+            owners.append(resources)
+            gc.collect()
+            assert all(reference() is None for reference in references)
+            assert resources
+
+        for rows in (8, 16, 8, 16):
+            residual.normal_()
+            previous.normal_()
+            run(rows)
+            expected = [output[:rows].clone() for output in destinations]
+            for output in destinations:
+                output.fill_(float("nan"))
+            graphs[rows].replay()
+            for output, reference in zip(destinations, expected, strict=True):
+                torch.testing.assert_close(output[:rows], reference, rtol=0, atol=0)
     finally:
         for graph in graphs.values():
             graph.reset()
@@ -846,7 +999,7 @@ def test_output_projection_prepares_uncaptured_decode_sizes(native_workspace):
                     output = layer._o_proj(source[:15], positions[:15])
                 source.neg_()
                 graph.replay()
-                torch.cuda.synchronize(device)
+                torch.accelerator.synchronize(device)
                 torch.testing.assert_close(
                     output, torch.full_like(output, -128), rtol=0, atol=0
                 )
@@ -862,7 +1015,7 @@ def test_output_projection_uses_fused_block32_path(native_workspace, monkeypatch
     import b12x.preparation as preparation
 
     attention, _, _ = native_workspace
-    calls = {}
+    calls: dict[str, object] = {}
     plan = SimpleNamespace(scratch_specs=lambda: (), prepared=object())
 
     @dataclass
@@ -875,7 +1028,7 @@ def test_output_projection_uses_fused_block32_path(native_workspace, monkeypatch
 
     def bind_inv_rope(actual_plan, **kwargs):
         assert actual_plan is plan
-        calls["bind"] = kwargs
+        calls["bind_kwargs"] = kwargs
         return Binding()
 
     def require_prepared(actual_plan, component, device):
@@ -922,17 +1075,24 @@ def test_output_projection_uses_fused_block32_path(native_workspace, monkeypatch
         torch.arange(3, device="cuda"),
     )
 
-    assert calls["pack"][1] == {
+    pack_call = calls["pack"]
+    assert isinstance(pack_call, tuple)
+    assert pack_call[1] == {
         "groups": 2,
         "group_width": 256,
         "rank": 128,
         "hidden": 256,
         "block_size": (32, 32),
     }
-    assert calls["bind"]["heads_per_group"] == 2
-    assert calls["bind"]["nope_dim"] == 96
-    assert calls["bind"]["rope_dim"] == 32
-    assert calls["run"][1]["stream"] == 123
+    bind_kwargs = calls["bind_kwargs"]
+    assert isinstance(bind_kwargs, dict)
+    assert bind_kwargs["heads_per_group"] == 2
+    assert bind_kwargs["nope_dim"] == 96
+    assert bind_kwargs["rope_dim"] == 32
+    run_call = calls["run"]
+    assert isinstance(run_call, tuple)
+    assert isinstance(run_call[1], dict)
+    assert run_call[1]["stream"] == 123
     assert output.shape == (3, 256)
     assert torch.count_nonzero(output != 7) == 0
 
