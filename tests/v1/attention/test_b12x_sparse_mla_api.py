@@ -104,6 +104,39 @@ def test_b12x_selector_routes_deepseek_v41() -> None:
         DeepseekV41ForCausalLMConfig.verify_and_update_config(config)
 
 
+@pytest.mark.parametrize("max_num_batched_tokens", [4, 10_000])
+def test_b12x_indexer_prefill_chunks_match_declared_capacity(
+    monkeypatch, max_num_batched_tokens: int
+) -> None:
+    monkeypatch.setattr(
+        generic_b12x_indexer.envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 1
+    )
+    builder = object.__new__(generic_b12x_indexer.B12xIndexerMetadataBuilder)
+    builder.max_prefill_buffer_size = 10_000
+    builder.vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=max_num_batched_tokens
+        ),
+        model_config=SimpleNamespace(max_model_len=250),
+    )
+
+    chunks = builder._split_prefill_chunks(
+        torch.tensor([1]),
+        torch.tensor([100]),
+        num_decodes=0,
+        max_logits_bytes=1 << 30,
+    )
+
+    capacity = generic_b12x_indexer._prefill_plan_q_rows(builder.vllm_config)
+    assert capacity < 100
+    assert chunks == [
+        (slice(0, 1), slice(start, min(start + capacity, 100)))
+        for start in range(0, 100, capacity)
+    ]
+    rows = [row for _, query in chunks for row in range(query.start, query.stop)]
+    assert rows == list(range(100))
+
+
 def test_deepseek_v41_tp3_padding_uses_generic_parallel_hook() -> None:
     text_config = SimpleNamespace(num_attention_heads=64, o_groups=8)
     model_config = SimpleNamespace(
