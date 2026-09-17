@@ -16,7 +16,7 @@ from tests.kernels.utils import fp8_ulp_distance
 from vllm.config import VllmConfig
 from vllm.model_executor.kernels.linear.scaled_mm.b12x import (
     B12xFp8BlockScaledMMKernel,
-    _run_b12x_fp8_block_scaled_mm,
+    run_b12x_block_fp8_linear,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.cutlass import cutlass_scaled_mm
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -390,13 +390,43 @@ def test_w8a8_block_fp8_b12x_matmul(M, N, K):
         [128, 128],
         torch.bfloat16,
     )
-    out = _run_b12x_fp8_block_scaled_mm(
-        A_fp8,
-        B_fp8,
-        As,
-        Bs,
-        torch.bfloat16,
+    # The kernel declares one capacity regime per layer: M=1 runs its exact
+    # regime and every other M runs the capacity regime.
+    from b12x.preparation import PreparationSession
+
+    from vllm.utils.b12x import B12xWorkload, register_b12x_layer
+    from vllm.utils.torch_utils import _encode_layer_name
+
+    layer = torch.nn.Module()
+    name = f"block-fp8-matmul-{M}-{N}-{K}"
+    layer.b12x_layer_name = _encode_layer_name(name)
+    register_b12x_layer(name, layer)
+    layer.weight = torch.nn.Parameter(B_fp8, requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(Bs, requires_grad=False)
+    layer.b12x_block_fp8_regimes = None
+    kernel = object.__new__(B12xFp8BlockScaledMMKernel)
+    kernel.config = types.SimpleNamespace(out_dtype=torch.bfloat16)
+    capacity = 2 * M + 1
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(1, capacity),
+        fixed_token_counts=(1,),
+        output_dtype=torch.bfloat16,
+        max_tokens=capacity,
+        max_seqs=1,
+        max_model_len=capacity,
     )
+    units = kernel.get_b12x_preparation_units(layer, workload)
+    with PreparationSession(device=A_fp8.device, autotune=False) as session:
+        session.prepare(tuple(request for unit in units for request in unit.requests))
+        out = run_b12x_block_fp8_linear(
+            A_fp8,
+            As,
+            B_fp8,
+            Bs,
+            torch.bfloat16,
+            layer.b12x_layer_name,
+        )
 
     rel_diff = torch.mean(torch.abs(out.float() - ref_out.float())) / torch.mean(
         torch.abs(ref_out.float())
