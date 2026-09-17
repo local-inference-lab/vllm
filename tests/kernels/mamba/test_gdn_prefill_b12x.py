@@ -10,6 +10,7 @@ import torch
 
 from vllm.model_executor.layers.mamba.ops.b12x_gdn_prefill import (
     B12xGdnPrefill,
+    GdnPrefillStaging,
     prefill_capacities,
 )
 
@@ -25,6 +26,25 @@ from vllm.model_executor.layers.mamba.ops.b12x_gdn_prefill import (
 )
 def test_prefill_capacity_family_covers_exact_scheduler_limit(capacity, expected):
     assert prefill_capacities(capacity) == expected
+
+
+@pytest.mark.parametrize("max_tokens", (16, 6019, 32768))
+def test_prefill_staging_memory_depends_on_sequences_not_token_capacity(max_tokens):
+    staging = GdnPrefillStaging.allocate(
+        max_tokens=max_tokens,
+        max_seqs=16,
+        key_heads=16,
+        value_heads=48,
+        device=torch.device("cpu"),
+    )
+    assert staging.nbytes == ((16 + 1) + 4 * 16 + 2) * 4
+    assert staging.is_compatible(
+        max_tokens=max_tokens,
+        max_seqs=16,
+        key_heads=16,
+        value_heads=48,
+        device=torch.device("cpu"),
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -324,8 +344,10 @@ def test_prefill_pooled_state_graph_replays_changed_lengths_and_slots():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("rows", (49, 64))
 def test_mixed_gdn_graph_replays_prefill_decode_verification_and_empty_worklists(
     default_vllm_config,
+    rows,
 ):
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.preparation import PreparationSession
@@ -353,7 +375,7 @@ def test_mixed_gdn_graph_replays_prefill_decode_verification_and_empty_worklists
         pytest.skip("SM12x is required")
     torch.manual_seed(23)
     device = torch.device("cuda")
-    rows, seqs, key_heads, value_heads = 64, 3, 2, 6
+    seqs, key_heads, value_heads = 3, 2, 6
     width = (2 * key_heads + value_heads) * 128
     layer = QwenGatedDeltaNetAttention.__new__(QwenGatedDeltaNetAttention)
     torch.nn.Module.__init__(layer)
@@ -383,7 +405,7 @@ def test_mixed_gdn_graph_replays_prefill_decode_verification_and_empty_worklists
         pool,
     )
     layer._b12x_preparation_prefix = "test.mixed-gdn"
-    layer._b12x_prefill_max_tokens = rows
+    layer._b12x_prefill_max_tokens = 64
     layer._b12x_prefill_max_seqs = seqs
     layer._b12x_prefill_staging = None
     layer._b12x_decode_plan = None
@@ -446,6 +468,11 @@ def test_mixed_gdn_graph_replays_prefill_decode_verification_and_empty_worklists
         ),
         attn_metadata=attention,
     )
+    immutable_inputs = {
+        name: value.clone()
+        for name, value in inputs.items()
+        if isinstance(value, torch.Tensor) and name != "core_attn_out"
+    }
     saved_conv, saved_pool = conv.clone(), pool.clone()
 
     def stage(lengths, computed, drafts, swap):
@@ -593,6 +620,8 @@ def test_mixed_gdn_graph_replays_prefill_decode_verification_and_empty_worklists
                     )
                     assert_close("mixed state", pool, expected_pool, ratio=5e-3)
                     torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
+                    for name, value in immutable_inputs.items():
+                        torch.testing.assert_close(inputs[name], value, rtol=0, atol=0)
             finally:
                 guard.__exit__(None, None, None)
         finally:
