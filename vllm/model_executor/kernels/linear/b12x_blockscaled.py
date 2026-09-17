@@ -2,8 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Layer-held block-scaled linear state shared by the b12x linear kernels.
 
-A holder owns one packed weight and the exact-M ``Plan`` declared for the
-serving shapes. The kernel's ``apply_weights`` reaches ``run`` through the
+Every b12x dense linear declares one regime plan per layer: exact static-shape
+regimes for the workload's fixed row counts plus one capacity regime that
+serves every other row count up to ``max_tokens``. The fixed-operand kernels
+(block-FP8, tensor-FP8, serialized NVFP4, MXFP4) keep that declaration on the
+layer through ``declare_regimes``; the packed BF16 holder below keeps it on
+itself. A holder owns one packed weight and the regime ``Plan`` declared for
+the serving shapes. The kernel's ``apply_weights`` reaches ``run`` through the
 ``vllm::b12x_blockscaled_linear`` custom op, so compiled graphs carry only
 tensors, the output width, and the layer name. ``run`` resolves the prepared
 regime for the live row count and draws its workspace from the worker's
@@ -14,6 +19,8 @@ workspace is locked.
 from __future__ import annotations
 
 import weakref
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 
@@ -25,6 +32,7 @@ from vllm.utils.b12x import (
     PreparationResourceUnavailableError,
     get_b12x_blockscaled,
 )
+from vllm.utils.torch_utils import _resolve_layer_name
 
 COMPONENT = "gemm.blockscaled_precision"
 logger = init_logger(__name__)
@@ -32,7 +40,12 @@ logger = init_logger(__name__)
 
 def _operands(packed, recipe: str):
     if recipe == "nvfp4":
-        return packed.values, packed.scale_mma, packed.global_scale, packed.global_scale_kind
+        return (
+            packed.values,
+            packed.scale_mma,
+            packed.global_scale,
+            packed.global_scale_kind,
+        )
     weight = packed.weight
     return weight.values, weight.scale_mma, None, "none"
 
@@ -71,6 +84,74 @@ def keep_declared_regimes(
         )
 
 
+@dataclass(frozen=True)
+class DeclaredRegimes:
+    """A layer's declared regime plan and the regime key it was declared for."""
+
+    plan: object
+    key: tuple[int, tuple[int, ...]]
+
+
+def declare_regimes(
+    layer: torch.nn.Module,
+    attr: str,
+    workload: B12xWorkload,
+    declare: Callable[[int], object],
+):
+    """Declare one capacity regime per layer in ``attr``; later workloads reuse it.
+
+    ``declare`` builds the plan for a row capacity. Exact-M regimes cover the
+    workload's fixed counts, and the capacity regime serves every other row
+    count up to ``workload.max_tokens``.
+    """
+    declared = getattr(layer, attr, None)
+    if declared is not None:
+        keep_declared_regimes(
+            _resolve_layer_name(layer.b12x_layer_name), declared.key, workload
+        )
+        return declared.plan
+    plan = declare(workload.max_tokens)
+    setattr(layer, attr, DeclaredRegimes(plan, regime_key(workload)))
+    return plan
+
+
+def declared_plan(layer: torch.nn.Module, attr: str):
+    """The plan ``declare_regimes`` stored in ``attr``; op-body only."""
+    declared = getattr(layer, attr, None)
+    if declared is None:
+        raise PreparationResourceUnavailableError(
+            f"{_resolve_layer_name(layer.b12x_layer_name)}: b12x linear has "
+            "no declared plan"
+        )
+    return declared.plan
+
+
+def regime_unit(
+    name: str,
+    prefix: str,
+    plan,
+    workload: B12xWorkload,
+    out_dtype: torch.dtype,
+    call_for_rows: Callable[[int], Callable],
+    *,
+    request_name: str | None = None,
+) -> B12xPreparationUnit:
+    """The weights-stage unit that prepares every regime of a declared plan."""
+    calls = {rows: call_for_rows(rows) for rows in plan.token_counts}
+    request = plan.request(
+        name=request_name or f"linear.{name.lower()}.{prefix}",
+        prepare_calls=calls,
+        benchmark_calls=calls,
+    )
+    return B12xPreparationUnit(
+        name=name,
+        key=(prefix, *regime_key(workload), out_dtype),
+        requests=(request,),
+        stage="weights",
+        autotune=not workload.eager_only,
+    )
+
+
 class B12xBlockscaledLinear:
     def __init__(
         self,
@@ -107,7 +188,7 @@ class B12xBlockscaledLinear:
         return _operands(self.packed, self.recipe)
 
     def holds(self, packed) -> bool:
-        """True when ``packed`` shares the storage this holder's plan was declared on."""
+        """True when ``packed`` shares the storage the holder's plan was declared on."""
         mine = _operands(self.packed, self.recipe)[:2]
         theirs = _operands(packed, self.recipe)[:2]
         return all(
@@ -117,10 +198,15 @@ class B12xBlockscaledLinear:
 
     def signature(self, workload: B12xWorkload):
         return (
-            self.recipe, self.activation_mode, self.in_features,
-            int(self.packed.padded_in_features), self.out_features,
-            self.activation_scale is not None, workload.max_tokens,
-            workload.fixed_token_counts, workload.output_dtype,
+            self.recipe,
+            self.activation_mode,
+            self.in_features,
+            int(self.packed.padded_in_features),
+            self.out_features,
+            self.activation_scale is not None,
+            workload.max_tokens,
+            workload.fixed_token_counts,
+            workload.output_dtype,
         )
 
     def ensure_plan(self, workload: B12xWorkload):
@@ -169,14 +255,19 @@ class B12xBlockscaledLinear:
             tensors = None if shared is None else tuple(ref() for ref in shared)
             if tensors is None or any(tensor is None for tensor in tensors):
                 source = torch.empty(
-                    (rows, holder.in_features), dtype=torch.bfloat16, device=values.device,
+                    (rows, holder.in_features),
+                    dtype=torch.bfloat16,
+                    device=values.device,
                 )
                 shared = (weakref.ref(source),)
             else:
                 (source,) = tensors
             workspace = (
-                torch.empty(state.required_workspace, dtype=torch.uint8, device=values.device)
-                if state.required_workspace else None
+                torch.empty(
+                    state.required_workspace, dtype=torch.uint8, device=values.device
+                )
+                if state.required_workspace
+                else None
             )
 
             def produce() -> None:
@@ -184,12 +275,19 @@ class B12xBlockscaledLinear:
 
             def run() -> None:
                 state.run(
-                    source, values, scales, global_scale,
-                    activation_scale=activation_scale, workspace=workspace,
+                    source,
+                    values,
+                    scales,
+                    global_scale,
+                    activation_scale=activation_scale,
+                    workspace=workspace,
                 )
 
             return PreparedCall(
-                run=run, produce=produce, owners=(values, scales), capture_safe=False,
+                run=run,
+                produce=produce,
+                owners=(values, scales),
+                capture_safe=False,
             )
 
         return prepare
@@ -199,8 +297,11 @@ class B12xBlockscaledLinear:
         calls = {rows: self._call_factory(rows) for rows in plan.token_counts}
         request = plan.request(name=name, prepare_calls=calls, benchmark_calls=calls)
         return B12xPreparationUnit(
-            name=self.recipe.upper(), key=self.signature(workload), requests=(request,),
-            stage="weights", autotune=not workload.eager_only,
+            name=self.recipe.upper(),
+            key=self.signature(workload),
+            requests=(request,),
+            stage="weights",
+            autotune=not workload.eager_only,
         )
 
     def get_workspace_size(self, rows: int) -> int:
@@ -256,6 +357,10 @@ class B12xBlockscaledLinear:
         api = get_b12x_blockscaled()
         assert api is not None
         return api.mm(
-            source, self.packed, plan=plan, bias=bias, workspace=workspace,
+            source,
+            self.packed,
+            plan=plan,
+            bias=bias,
+            workspace=workspace,
             activation_global_scale=self.activation_scale,
         )

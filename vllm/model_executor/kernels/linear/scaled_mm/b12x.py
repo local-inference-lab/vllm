@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Sequence
 
 import torch
 
 from vllm.model_executor.kernels.linear.b12x_blockscaled import (
-    keep_declared_regimes,
-    regime_key,
+    declare_regimes,
+    declared_plan,
+    regime_unit,
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     _upcast_e8m0_to_fp32,
@@ -19,7 +19,6 @@ from vllm.platforms import current_platform
 from vllm.utils.b12x import (
     B12xPreparationUnit,
     B12xWorkload,
-    PreparationResourceUnavailableError,
     b12x_layer,
     b12x_layer_prefix,
     register_b12x_layer,
@@ -46,70 +45,6 @@ from .BlockScaledMMLinearKernel import (
 from .ScaledMMLinearKernel import FP8ScaledMMLinearKernel
 
 
-@dataclass(frozen=True)
-class _Fp8Regimes:
-    """A layer's declared FP8 plan and the regime key it was declared for."""
-
-    plan: object
-    key: tuple[int, tuple[int, ...]]
-
-
-def _declare_regimes(
-    layer: torch.nn.Module,
-    attr: str,
-    workload: B12xWorkload,
-    declare: Callable[[int], object],
-):
-    """Declare one capacity regime per layer; later workloads reuse it.
-
-    ``declare`` builds the plan for a row capacity. Exact-M regimes cover the
-    workload's fixed counts, and the capacity regime serves every other row
-    count up to ``workload.max_tokens``.
-    """
-    declared = getattr(layer, attr, None)
-    if declared is not None:
-        keep_declared_regimes(
-            _resolve_layer_name(layer.b12x_layer_name), declared.key, workload
-        )
-        return declared.plan
-    plan = declare(workload.max_tokens)
-    setattr(layer, attr, _Fp8Regimes(plan, regime_key(workload)))
-    return plan
-
-
-def _declared_plan(layer: torch.nn.Module, attr: str):
-    declared = getattr(layer, attr, None)
-    if declared is None:
-        raise PreparationResourceUnavailableError(
-            f"{_resolve_layer_name(layer.b12x_layer_name)}: b12x FP8 linear has "
-            "no declared plan"
-        )
-    return declared.plan
-
-
-def _regime_unit(
-    name: str,
-    prefix: str,
-    plan,
-    workload: B12xWorkload,
-    out_dtype: torch.dtype,
-    call_for_rows: Callable[[int], Callable],
-) -> B12xPreparationUnit:
-    calls = {rows: call_for_rows(rows) for rows in plan.token_counts}
-    request = plan.request(
-        name=f"linear.{name.lower()}.{prefix}",
-        prepare_calls=calls,
-        benchmark_calls=calls,
-    )
-    return B12xPreparationUnit(
-        name=name,
-        key=(prefix, *regime_key(workload), out_dtype),
-        requests=(request,),
-        stage="weights",
-        autotune=not workload.eager_only,
-    )
-
-
 def _block_fp8_plan(
     layer: torch.nn.Module, workload: B12xWorkload, out_dtype: torch.dtype
 ):
@@ -130,7 +65,7 @@ def _block_fp8_plan(
         )
         return api.plan_regimes(query, exact_m=workload.fixed_token_counts)
 
-    return _declare_regimes(layer, "b12x_block_fp8_regimes", workload, declare)
+    return declare_regimes(layer, "b12x_block_fp8_regimes", workload, declare)
 
 
 def _b12x_block_fp8_linear(
@@ -142,7 +77,7 @@ def _b12x_block_fp8_linear(
     layer_name: LayerNameType,
 ) -> torch.Tensor:
     layer = b12x_layer(_resolve_layer_name(layer_name))
-    plan = _declared_plan(layer, "b12x_block_fp8_regimes")
+    plan = declared_plan(layer, "b12x_block_fp8_regimes")
     blockscaled = _import_b12x_blockscaled()
     assert blockscaled is not None
     return blockscaled.mm_block_fp8(
@@ -340,7 +275,7 @@ class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             return call
 
         return (
-            _regime_unit("BLOCK_FP8", prefix, plan, workload, out_dtype, call_for_rows),
+            regime_unit("BLOCK_FP8", prefix, plan, workload, out_dtype, call_for_rows),
         )
 
     def apply_block_scaled_mm(
@@ -380,7 +315,7 @@ def _tensor_fp8_plan(
         )
         return api.plan_regimes(query, exact_m=workload.fixed_token_counts)
 
-    return _declare_regimes(layer, "b12x_tensor_fp8_regimes", workload, declare)
+    return declare_regimes(layer, "b12x_tensor_fp8_regimes", workload, declare)
 
 
 def _b12x_tensor_fp8_linear(
@@ -392,7 +327,7 @@ def _b12x_tensor_fp8_linear(
 ) -> torch.Tensor:
     layer = b12x_layer(_resolve_layer_name(layer_name))
     packed = layer.b12x_tensor_fp8_packed_weight
-    plan = _declared_plan(layer, "b12x_tensor_fp8_regimes")
+    plan = declared_plan(layer, "b12x_tensor_fp8_regimes")
     tensor_fp8 = _import_b12x_tensor_fp8()
     assert tensor_fp8 is not None
     return tensor_fp8.mm(source, packed, plan=plan, bias=bias, out_dtype=out_dtype)
@@ -580,9 +515,7 @@ class B12xTensorFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
             return call
 
         return (
-            _regime_unit(
-                "TENSOR_FP8", prefix, plan, workload, out_dtype, call_for_rows
-            ),
+            regime_unit("TENSOR_FP8", prefix, plan, workload, out_dtype, call_for_rows),
         )
 
     def apply_weights(
