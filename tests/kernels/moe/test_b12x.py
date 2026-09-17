@@ -1297,13 +1297,22 @@ def test_b12x_moe_preparation_preserves_timing_and_graph_replay(
                 [call], device_ordinal=torch.accelerator.current_device_index()
             )
             for _ in range(3):
-                call.output.fill_(float("nan"))
                 allocated = torch.accelerator.memory_stats()["allocation.all.allocated"]
-                race.timers[0].replay()
+                call.invoke()
                 torch.accelerator.synchronize()
                 assert (
                     torch.accelerator.memory_stats()["allocation.all.allocated"]
                     == allocated
+                )
+                call.output.fill_(float("nan"))
+                # Cache eviction can allocate temporary reduction storage outside
+                # the measured call; it must not increase resident tensor storage.
+                resident = torch.accelerator.memory_stats()["active_bytes.all.current"]
+                race.timers[0].replay()
+                torch.accelerator.synchronize()
+                assert (
+                    torch.accelerator.memory_stats()["active_bytes.all.current"]
+                    == resident
                 )
                 assert call.output.data_ptr() == address
                 torch.testing.assert_close(call.output, expected, atol=2e-2, rtol=2e-2)
