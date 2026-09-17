@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -172,3 +173,76 @@ def test_suspended_graph_resources_restore_collector_after_failure() -> None:
             raise ValueError("eager operation failed")
         assert workspace.retain_cuda_graph_capture_resource(owner)
     assert resources == [owner]
+
+
+@pytest.mark.parametrize("image_tokens", [0, 384])
+def test_dsv4_metadata_free_profile_does_not_reserve_split_attention(
+    monkeypatch, image_tokens
+) -> None:
+    """Prepared state declarations own attention scratch before KV admission."""
+    from b12x.attention import compressed_sparse_mla
+
+    from vllm.models.deepseek_v4.nvidia import b12x as dsv4
+
+    requested = []
+    monkeypatch.setattr(
+        workspace,
+        "_manager",
+        SimpleNamespace(get_simultaneous=lambda *specs: requested.append(specs)),
+    )
+    monkeypatch.setattr(
+        dsv4, "_require_b12x_compressed_sparse_mla", lambda: compressed_sparse_mla
+    )
+    monkeypatch.setattr(
+        dsv4, "get_forward_context", lambda: SimpleNamespace(attn_metadata=None)
+    )
+    layer = dsv4.DeepseekV4B12xAttention.__new__(dsv4.DeepseekV4B12xAttention)
+    torch.nn.Module.__init__(layer)
+    layer.compress_ratio = 128
+    layer.max_model_len = 1048576
+    layer.max_num_batched_tokens = 4096
+    layer.window_size = 128
+    layer.max_image_tokens = image_tokens
+    layer.swa_cache_layer = SimpleNamespace(block_size=256)
+    layer.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            use_dspark=lambda: True, num_speculative_tokens=5
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4096, max_num_seqs=8),
+    )
+    q = torch.randn((3, 32, 512), dtype=torch.bfloat16)
+    original_q = q.clone()
+    output = torch.full_like(q, float("nan"))
+    layer.forward_mqa(q, torch.empty(0), torch.arange(3), output)
+
+    torch.testing.assert_close(q, original_q, rtol=0, atol=0)
+    assert torch.count_nonzero(output) == 0
+    assert requested == []
+
+
+def test_dsv4_profile_retains_padded_query_reservation() -> None:
+    from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+    from vllm.models.deepseek_v4.nvidia.b12x import DeepseekV4B12xAttention
+
+    assert (
+        DeepseekV4B12xAttention.reserve_profile_scratch
+        is DeepseekV4Attention.reserve_profile_scratch
+    )
+    layer = DeepseekV4B12xAttention.__new__(DeepseekV4B12xAttention)
+    torch.nn.Module.__init__(layer)
+    layer.kv_cache_torch_dtype = torch.uint8
+    device = torch.device("cuda:0")
+    layer.q_norm = SimpleNamespace(weight=SimpleNamespace(device=device))
+    layer._q_padded_scratch_num_ubatches = 2
+    layer.max_num_batched_tokens = 4096
+    layer.padded_heads = 32
+    layer.head_dim = 512
+    layer._q_padded_scratch_dtype = torch.bfloat16
+    reserved = []
+    layer._reserve_q_padded_scratch_buffer = lambda *args: reserved.append(args)
+
+    layer.reserve_profile_scratch()
+
+    assert reserved == [
+        (4096, 32, 512, torch.bfloat16, device, ubatch) for ubatch in range(2)
+    ]
