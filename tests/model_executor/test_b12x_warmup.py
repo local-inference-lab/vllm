@@ -383,6 +383,31 @@ def test_scope_unit_calls_wraps_mapping_factories() -> None:
     request.prepare_call = {2: lambda state: _Call(run=lambda: _workspace_lane.get())}
     scoped = scope_b12x_unit_calls(_unit("u", request), 1)
     assert scoped.requests[0].prepare_call[2](object()).run() == 1
+    assert scoped.workspace_lanes == (1,)
+
+
+@pytest.mark.parametrize("draft_lane", [0, 1])
+def test_shared_preparation_scratch_covers_both_model_owners(draft_lane):
+    target, draft, shared = (torch.nn.Module() for _ in range(3))
+    for module in (target, draft, shared):
+        module.b12x_preparation_provider = _Provider()
+    target.shared = shared
+    draft.shared = shared
+    units = b12x_prepare.collect_b12x_units(
+        _worker(target, draft=draft, draft_lane=draft_lane), _workload()
+    )
+    ownership = b12x_prepare._request_workspace_lanes(units)
+    assert ownership[f"{id(target):x}"] == (0,)
+    assert ownership[f"{id(draft):x}"] == (draft_lane,)
+    assert ownership[f"{id(shared):x}"] == tuple(sorted({0, draft_lane}))
+    assert (
+        sum(
+            f"{id(shared):x}" == request.name
+            for unit in units
+            for request in unit.requests
+        )
+        == 1
+    )
 
 
 def test_blockscaled_holder_declares_provided_workspace_under_the_cap(
