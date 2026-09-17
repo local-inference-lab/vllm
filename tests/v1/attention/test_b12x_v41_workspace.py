@@ -701,6 +701,73 @@ def test_mhc_fixed_capacity_buckets_preserve_decode_policy(
             assert bool(torch.isfinite(y).all())
 
 
+def _v41_fp8_operands(cache, kind):
+    """Decode native cache rows into E4M3 operands and per-64 scales.
+
+    This independent operand reference follows B12X's
+    tests/_reference/v41_fp8.py. SWA pairs its E8M0 scales; indexed NVFP4
+    uses a power-of-two scale that bounds four adjacent scale groups.
+    """
+    if kind == "swa":
+        rows = cache.reshape(-1, 528)
+        codes = rows[:, :512].contiguous().view(torch.float8_e4m3fn).double()
+        original = rows[:, 512:528].double()
+        exponent = original.reshape(-1, 8, 2).amax(-1).clamp_min(1) - 127
+        values = codes * torch.exp2(original - 127).repeat_interleave(32, dim=1)
+    else:
+        rows = cache.reshape(-1, 288)
+        packed = rows[:, :256].long()
+        codes = torch.stack((packed & 15, packed >> 4), -1).flatten(1)
+        lut = torch.tensor(
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+            dtype=torch.float64,
+            device=cache.device,
+        )
+        original = rows[:, 256:288].contiguous().view(torch.float8_e4m3fn).double()
+        values = lut[codes] * original.repeat_interleave(16, dim=1)
+        bound = original.reshape(-1, 8, 4).amax(-1) * (6 / 448)
+        exponent = torch.ceil(torch.log2(bound.clamp_min(2.0**-126)))
+    scales = torch.exp2(exponent)
+    codes = (values / scales.repeat_interleave(64, dim=1)).float()
+    return codes.to(torch.float8_e4m3fn).float(), scales.float()
+
+
+def _v41_fp8_prefill_reference(q, values, scales, valid, sink):
+    """Model BF16 Q/K and per-64-key FP8 probability/value products.
+
+    Prefill computes Q/K with BF16 operands. Each output group independently
+    quantizes scaled probabilities to E4M3 before its product with FP8 V;
+    partial numerators remain FP32 until the final LSE merge.
+    """
+    keys = (values * scales.repeat_interleave(64, dim=-1)).bfloat16().float()
+    logits = torch.einsum("rhd,rkd->rhk", q.float(), keys) * 512**-0.5
+    logits.masked_fill_(~valid[:, None], -torch.inf)
+    partials, lses = [], []
+    for first in range(0, values.shape[1], 64):
+        local = logits[:, :, first : first + 64]
+        maximum = local.amax(-1)
+        p = torch.exp(local - maximum[:, :, None])
+        p = torch.where(valid[:, None, first : first + 64], p, 0)
+        denominator = p.sum(-1)
+        groups = []
+        for group in range(8):
+            weighted = p * scales[:, None, first : first + 64, group]
+            pscale = weighted.abs().amax(-1, keepdim=True).clamp_min(1e-10) / 448
+            pq = (weighted / pscale).to(torch.float8_e4m3fn).float()
+            vq = values[:, first : first + 64, group * 64 : (group + 1) * 64]
+            groups.append(torch.einsum("rhk,rkd->rhd", pq, vq) * pscale)
+        partials.append(torch.cat(groups, -1) / denominator.clamp_min(1e-30)[..., None])
+        lses.append(
+            torch.where(denominator > 0, maximum + denominator.log(), -torch.inf)
+        )
+    lse = torch.stack(lses, -1)
+    maximum = torch.maximum(lse.amax(-1), sink.float()[None])
+    weights = torch.where(torch.isfinite(lse), torch.exp(lse - maximum[..., None]), 0)
+    denominator = weights.sum(-1) + torch.exp(sink.float()[None] - maximum)
+    output = (torch.stack(partials, -2) * weights[..., None]).sum(-2)
+    return (output / denominator.clamp_min(1e-30)[..., None]).bfloat16().float()
+
+
 @pytest.mark.parametrize("main_page,swa_page", [(64, 32), (128, 64), (256, 128)])
 @pytest.mark.parametrize(
     "is_decode,rows,live_rows",
@@ -1568,14 +1635,14 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
 ):
     from contextlib import ExitStack
 
-    from b12x.attention._shared.mla.compressed_reference import (
-        unpack_deepseek_v41_cache_reference,
-    )
     from b12x.preparation import PreparationSession
 
     from vllm.utils.b12x import B12xWorkload
 
     attention, manager, workspace = native_workspace
+    precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    request.addfinalizer(lambda: torch.set_float32_matmul_precision(precision))
     torch.manual_seed(713)
     device = torch.device("cuda", torch.accelerator.current_device_index())
     layer = _layer(attention, 20, swa_page=swa_page)
@@ -1640,17 +1707,19 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
         )
         if kind == "swa":
             layer.swa_cache_layer.kv_cache = cache
-            swa_values = unpack_deepseek_v41_cache_reference(
-                cache, page_size=page, cache_kind=kind
-            )[page : page + length].clone()
+            swa_values, swa_scales = (
+                part[page : page + length].clone()
+                for part in _v41_fp8_operands(cache, kind)
+            )
             # NaN FP8 payloads in every old SWA row: reading below the
             # replay boundary cannot accidentally look like a valid zero page.
             cache[1 : 1 + boundary // page].fill_(0x7F)
         else:
             layer.kv_cache = cache
-            main_values = unpack_deepseek_v41_cache_reference(
-                cache, page_size=page, cache_kind=kind
-            )[page : page + length].clone()
+            main_values, main_scales = (
+                part[page : page + length].clone()
+                for part in _v41_fp8_operands(cache, kind)
+            )
     layer.indexer.k_cache.kv_cache = torch.zeros(
         (
             length // main_page + 1,
@@ -1690,21 +1759,35 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
         )
 
     def oracle(live):
-        values = torch.cat((swa_values[boundary:], main_values))
-        logical = torch.cat(
+        selected = layer.topk_indices_buffer[:live].long()
+        # Candidate order affects per-tile FP8 rounding. Verify its complete
+        # causal set independently before using that order in the numeric oracle.
+        columns = torch.arange(selected.shape[1], device=device)[None]
+        expected_ids = columns.expand_as(selected).clone()
+        expected_ids.masked_fill_(columns > positions[:live, None], length)
+        actual_ids = selected.masked_fill(selected < 0, length).sort(dim=1).values
+        torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
+        swa_logical = torch.arange(boundary, length, device=device)[None]
+        swa_valid = swa_logical <= positions[:live, None]
+        main_valid = (selected >= 0) & (selected <= positions[:live, None])
+        valid = torch.cat((swa_valid, main_valid), dim=1)
+        values = torch.cat(
             (
-                torch.arange(boundary, length, device=device),
-                torch.arange(length, device=device),
-            )
+                swa_values[None, boundary:].expand(live, -1, -1),
+                main_values[selected.clamp_min(0)],
+            ),
+            dim=1,
+        ).masked_fill(~valid[..., None], 0)
+        scales = torch.cat(
+            (
+                swa_scales[None, boundary:].expand(live, -1, -1),
+                main_scales[selected.clamp_min(0)],
+            ),
+            dim=1,
+        ).masked_fill(~valid[..., None], 0)
+        return _v41_fp8_prefill_reference(
+            q[:live], values, scales, valid, layer.attn_sink
         )
-        logits = torch.einsum("rhd,kd->rhk", q[:live].float(), values) * 512**-0.5
-        logits.masked_fill_(
-            logical[None, None] > positions[:live, None, None], -torch.inf
-        )
-        logits = torch.cat(
-            (logits, layer.attn_sink[None, :, None].expand(live, -1, -1)), -1
-        )
-        return torch.einsum("rhk,kd->rhd", logits.softmax(-1)[..., :-1], values)
 
     workload = B12xWorkload(
         stage="state",
@@ -1751,9 +1834,9 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
                 visible.copy_((positions + 1).clamp_min(0).int())
                 starts[1] = live
                 q.normal_()
-                expected = oracle(live)
                 # Eager execution also catches live-count specialization leaks.
                 run()
+                expected = oracle(live)
                 torch.testing.assert_close(
                     out[:live].float(), expected, rtol=0.04, atol=0.025
                 )
