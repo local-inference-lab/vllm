@@ -23,7 +23,14 @@ def _normalize_messages(
     result = [dict(message) for message in copy.deepcopy(messages)]
     for message in result:
         role = message.get("role")
-        if role not in ("system", "developer", "user", "assistant", "tool"):
+        if role not in (
+            "system",
+            "developer",
+            "user",
+            "assistant",
+            "tool",
+            "latest_reminder",
+        ):
             raise ValueError(f"Invalid role: {role}")
         if role == "developer":
             message["role"] = "system"

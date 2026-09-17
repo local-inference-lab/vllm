@@ -4,12 +4,14 @@
 import copy
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from tests.tokenizers_.test_deepseek_v4 import FakeHfTokenizer
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.tokenizers.deepseek_v41 import get_deepseek_v41_tokenizer
+from vllm.tokenizers.deepseek_v41_encoding import encode_messages
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -185,3 +187,67 @@ def test_images_preserve_content_order_and_reference_separator(image_type):
 def test_unsupported_media_is_a_request_error():
     with pytest.raises(ValueError, match="text and image content only"):
         render([{"role": "user", "content": [{"type": "input_audio"}]}])
+
+
+_FIXTURES = json.loads(
+    (Path(__file__).parent / "fixtures/deepseek_v41/encoding.json").read_text()
+)
+
+
+@pytest.mark.parametrize("case", _FIXTURES["cases"], ids=lambda case: case["name"])
+def test_prompt_matches_reference_fixture(case):
+    original = copy.deepcopy(case["messages"])
+    request = ChatCompletionRequest(
+        messages=case["messages"],
+        tools=case.get("tools"),
+    )
+    prompt = get_deepseek_v41_tokenizer(FakeHfTokenizer()).apply_chat_template(
+        request.messages,
+        tools=[tool.model_dump(exclude_none=True) for tool in request.tools]
+        if request.tools
+        else None,
+        tokenize=False,
+        **case["kwargs"],
+    )
+    assert prompt == case["expected"]
+    assert case["messages"] == original
+
+
+@pytest.mark.parametrize("location", ["tool", "function"])
+@pytest.mark.parametrize("namespace", ["inventory", {"name": "inventory"}])
+def test_direct_encoder_and_api_preserve_the_same_tool_identity(location, namespace):
+    tool: dict[str, Any] = {"type": "function", "function": {"name": "lookup"}}
+    call: dict[str, Any] = {
+        "id": "call_a",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": '{"sku":"A1"}'},
+    }
+    for item in (tool, call):
+        (item if location == "tool" else item["function"])["namespace"] = namespace
+    messages = [
+        {"role": "system", "content": "Use tools.", "tools": [tool]},
+        {"role": "user", "content": "Find A1."},
+        {"role": "assistant", "content": "", "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": "call_a", "content": "In stock."},
+    ]
+    original = copy.deepcopy(messages)
+    direct = encode_messages(messages, thinking_mode="chat")
+    request = ChatCompletionRequest(messages=messages)
+    rendered = get_deepseek_v41_tokenizer(FakeHfTokenizer()).apply_chat_template(
+        request.messages,
+        tokenize=False,
+        thinking=False,
+    )
+    assert rendered == direct
+    assert '"name": "inventory::lookup"' in rendered
+    assert 'name="inventory::lookup"' in rendered
+    assert "<tool_result>In stock.</tool_result>" in rendered
+    assert messages == original
+
+
+def test_reminder_does_not_enable_arbitrary_message_roles():
+    with pytest.raises(ValueError, match="Invalid role: SYSTEM"):
+        get_deepseek_v41_tokenizer(FakeHfTokenizer()).apply_chat_template(
+            [{"role": "SYSTEM", "content": "Hello"}],
+            tokenize=False,
+        )
