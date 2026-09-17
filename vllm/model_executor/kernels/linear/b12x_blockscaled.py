@@ -20,22 +20,25 @@ from __future__ import annotations
 
 import weakref
 from collections.abc import Callable
-from dataclasses import dataclass
 
 import torch
 
 import vllm.envs as envs
-from vllm.logger import init_logger
 from vllm.utils.b12x import (
     B12xPreparationUnit,
     B12xWorkload,
     PreparationResourceUnavailableError,
     get_b12x_blockscaled,
 )
-from vllm.utils.torch_utils import _resolve_layer_name
+
+# Compatibility exports for existing linear backends.
+from vllm.utils.b12x import DeclaredRegimes as DeclaredRegimes  # noqa: F401
+from vllm.utils.b12x import declare_regimes as declare_regimes  # noqa: F401
+from vllm.utils.b12x import declared_plan as declared_plan  # noqa: F401
+from vllm.utils.b12x import keep_declared_regimes as keep_declared_regimes  # noqa: F401
+from vllm.utils.b12x import regime_key as regime_key  # noqa: F401
 
 COMPONENT = "gemm.blockscaled_precision"
-logger = init_logger(__name__)
 
 
 def _operands(packed, recipe: str):
@@ -48,82 +51,6 @@ def _operands(packed, recipe: str):
         )
     weight = packed.weight
     return weight.values, weight.scale_mma, None, "none"
-
-
-def regime_key(workload: B12xWorkload) -> tuple[int, tuple[int, ...]]:
-    """The capacity and exact row counts a regime declaration covers."""
-    return workload.max_tokens, workload.fixed_token_counts
-
-
-def keep_declared_regimes(
-    layer_name: str,
-    declared: tuple[int, tuple[int, ...]],
-    workload: B12xWorkload,
-) -> None:
-    """Check a later workload against the regimes a layer already declared.
-
-    The plan is never replaced once declared, so a prepared plan stays
-    installed. A later workload that asks for more exact-M regimes is served
-    by the capacity regime for those counts; a different capacity is an error.
-    """
-    if declared == regime_key(workload):
-        return
-    max_tokens, fixed_token_counts = declared
-    if workload.max_tokens != max_tokens:
-        raise ValueError(
-            f"{layer_name}: b12x linear capacity changed "
-            f"from {max_tokens} to {workload.max_tokens}"
-        )
-    missing = sorted(set(workload.fixed_token_counts) - set(fixed_token_counts))
-    if missing:
-        logger.warning_once(
-            "%s: exact-M regimes for %s were not declared in the weights "
-            "stage; the capacity regime serves those counts.",
-            layer_name,
-            tuple(missing),
-        )
-
-
-@dataclass(frozen=True)
-class DeclaredRegimes:
-    """A layer's declared regime plan and the regime key it was declared for."""
-
-    plan: object
-    key: tuple[int, tuple[int, ...]]
-
-
-def declare_regimes(
-    layer: torch.nn.Module,
-    attr: str,
-    workload: B12xWorkload,
-    declare: Callable[[int], object],
-):
-    """Declare one capacity regime per layer in ``attr``; later workloads reuse it.
-
-    ``declare`` builds the plan for a row capacity. Exact-M regimes cover the
-    workload's fixed counts, and the capacity regime serves every other row
-    count up to ``workload.max_tokens``.
-    """
-    declared = getattr(layer, attr, None)
-    if declared is not None:
-        keep_declared_regimes(
-            _resolve_layer_name(layer.b12x_layer_name), declared.key, workload
-        )
-        return declared.plan
-    plan = declare(workload.max_tokens)
-    setattr(layer, attr, DeclaredRegimes(plan, regime_key(workload)))
-    return plan
-
-
-def declared_plan(layer: torch.nn.Module, attr: str):
-    """The plan ``declare_regimes`` stored in ``attr``; op-body only."""
-    declared = getattr(layer, attr, None)
-    if declared is None:
-        raise PreparationResourceUnavailableError(
-            f"{_resolve_layer_name(layer.b12x_layer_name)}: b12x linear has "
-            "no declared plan"
-        )
-    return declared.plan
 
 
 def regime_unit(

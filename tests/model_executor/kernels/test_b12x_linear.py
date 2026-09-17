@@ -6,7 +6,7 @@ from __future__ import annotations
 import importlib
 import sys
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 import torch
@@ -40,8 +40,56 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp4Dynamic,
 )
 from vllm.platforms import PlatformEnum
-from vllm.utils.b12x import B12xWorkload, register_b12x_layer
+from vllm.utils.b12x import (
+    B12xPlanResolver,
+    B12xWorkload,
+    PreparationResourceUnavailableError,
+    register_b12x_layer,
+)
 from vllm.utils.torch_utils import _encode_layer_name
+
+
+def test_b12x_plan_resolver_uses_exact_then_capacity():
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(1, 4, 16),
+        fixed_token_counts=(1, 4),
+        output_dtype=torch.bfloat16,
+        max_tokens=16,
+        max_seqs=1,
+        max_model_len=16,
+    )
+    resolver = B12xPlanResolver("resolver-test")
+    resolver.declare(
+        workload,
+        exact=lambda rows: ("exact", rows),
+        capacity=lambda rows: ("capacity", rows),
+    )
+    assert resolver.resolve(4) == ("exact", 4)
+    assert resolver.resolve(7) == ("capacity", 16)
+    with pytest.raises(PreparationResourceUnavailableError, match="resolver-test"):
+        resolver.resolve(17)
+    with pytest.raises(ValueError, match="capacity changed"):
+        resolver.declare(replace(workload, max_tokens=32), capacity=lambda rows: rows)
+
+
+def test_b12x_plan_resolver_resolve_never_declares():
+    resolver = B12xPlanResolver("resolver-test")
+    declarations = []
+
+    def declare(kind, rows):
+        declarations.append((kind, rows))
+        return kind, rows
+
+    resolver.declare_capacities(
+        fixed_counts=(1, 4),
+        capacities=(16,),
+        exact=lambda rows: declare("exact", rows),
+        capacity=lambda rows: declare("capacity", rows),
+    )
+    assert declarations == [("exact", 1), ("exact", 4), ("capacity", 16)]
+    assert resolver.resolve(7) == ("capacity", 16)
+    assert declarations == [("exact", 1), ("exact", 4), ("capacity", 16)]
 
 
 def _prepare(
