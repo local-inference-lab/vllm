@@ -45,6 +45,7 @@ def rewrite_requirements(
     torch_version: str,
     torchvision_version: str,
     flashinfer_version: str,
+    cutlass_dsl_version: str,
 ) -> bytes:
     """Return wheel metadata with dependencies matching the foundation ABI."""
     message = BytesParser(policy=compat32).parsebytes(metadata)
@@ -53,12 +54,21 @@ def rewrite_requirements(
         "torch": f"torch=={torch_version}",
         "torchvision": f"torchvision=={torchvision_version}",
         "flashinfer-python": f"flashinfer-python=={flashinfer_version}",
+        "nvidia-cutlass-dsl": f"nvidia-cutlass-dsl[cu13]=={cutlass_dsl_version}",
     }
     seen: set[str] = set()
     rewritten: list[str] = []
     for value in requirements:
         requirement = Requirement(value)
         name = canonicalize_name(requirement.name)
+        # The SM120 foundation, B12X and FlashInfer share DSL 4.6.2. Upstream's
+        # 4.7.1 bump accompanies FA4, which does not support SM120. Keep the
+        # explicitly supported foundation contract; re-review future bumps.
+        if name == "nvidia-cutlass-dsl" and str(requirement.specifier) not in {
+            "==4.6.2",
+            "==4.7.1",
+        }:
+            raise ValueError(f"unreviewed CUTLASS DSL requirement: {requirement}")
         if name == "torchaudio":
             seen.add(name)
             continue
@@ -182,6 +192,7 @@ def normalize_wheel(
     torch_version: str,
     torchvision_version: str,
     flashinfer_version: str,
+    cutlass_dsl_version: str,
     source_date_epoch: int,
 ) -> dict[str, str]:
     """Normalize one vLLM wheel in place and return packaged ELF runpaths."""
@@ -199,6 +210,7 @@ def normalize_wheel(
                 torch_version=torch_version,
                 torchvision_version=torchvision_version,
                 flashinfer_version=flashinfer_version,
+                cutlass_dsl_version=cutlass_dsl_version,
             )
         )
         runpaths = patch_elf_runpaths(root)
@@ -214,6 +226,7 @@ def main() -> None:
     parser.add_argument("--torch-version", required=True)
     parser.add_argument("--torchvision-version", required=True)
     parser.add_argument("--flashinfer-version", required=True)
+    parser.add_argument("--cutlass-dsl-version", required=True)
     parser.add_argument("--source-date-epoch", type=int, required=True)
     args = parser.parse_args()
     runpaths = normalize_wheel(
@@ -221,6 +234,7 @@ def main() -> None:
         torch_version=args.torch_version,
         torchvision_version=args.torchvision_version,
         flashinfer_version=args.flashinfer_version,
+        cutlass_dsl_version=args.cutlass_dsl_version,
         source_date_epoch=args.source_date_epoch,
     )
     for path, rpath in runpaths.items():

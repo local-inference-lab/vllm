@@ -42,6 +42,7 @@ docker buildx build \
   --build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}" \
   --build-arg "BUILD_JOBS=${build_jobs}" \
   --build-arg "DEPENDENCY_RECIPE=${dependency_recipe}" \
+  --build-arg "CUTLASS_DSL_VERSION=$(lock_value cutlass-dsl.version)" \
   --build-arg "VLLM_BUILD_CUTLASS_SCALED_MM_C2X=$(lock_value build.cutlass-scaled-mm-c2x)" \
   --target export \
   --output "type=local,dest=${output_dir}/raw" \
@@ -65,6 +66,8 @@ esac
 grep -Fqx "Requires-Dist: torch==$(lock_value pytorch.version)" <<<"${metadata}"
 grep -Fqx "Requires-Dist: torchvision==$(lock_value torchvision.version)" <<<"${metadata}"
 grep -Fqx "Requires-Dist: flashinfer-python==$(lock_value flashinfer.requirement)" \
+  <<<"${metadata}"
+grep -Fqx "Requires-Dist: nvidia-cutlass-dsl[cu13]==$(lock_value cutlass-dsl.version)" \
   <<<"${metadata}"
 if grep -Fq 'Requires-Dist: torchaudio' <<<"${metadata}"; then
   printf 'The normalized wheel must not require the unsupported audio extra.\n' >&2
@@ -104,6 +107,7 @@ jq -n \
   --arg pytorch_commit "$(lock_value pytorch.commit)" \
   --arg cuda_arch_list "$(lock_value cuda.arch-list)" \
   --arg cutlass_scaled_mm_c2x "$(lock_value build.cutlass-scaled-mm-c2x)" \
+  --arg cutlass_dsl "$(lock_value cutlass-dsl.version)" \
   '{schema: "local-inference-vllm-wheel-release/v2", status: $status,
     scope: "vLLM native and Python runtime for Qwen3.8 SM120 serving",
     source: {repository: $repository, commit: $commit, tree: $tree},
@@ -112,6 +116,7 @@ jq -n \
       uv_image: $uv_image, python: $python, cuda: $cuda, pytorch: $pytorch,
       pytorch_commit: $pytorch_commit, cuda_arch_list: $cuda_arch_list,
       cutlass_scaled_mm_c2x: $cutlass_scaled_mm_c2x,
+      cutlass_dsl: $cutlass_dsl,
       unsupported_extras: ["audio", "video"],
       external_device_backends: ["tilelang", "tokenspeed-mla",
         "humming-kernels", "quack-kernels"]},

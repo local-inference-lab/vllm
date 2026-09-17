@@ -20,6 +20,7 @@ ARG SOURCE_DATE_EPOCH
 ARG UV_SHA256
 ARG VLLM_BUILD_CUTLASS_SCALED_MM_C2X
 ARG DEPENDENCY_RECIPE
+ARG CUTLASS_DSL_VERSION
 ENV PATH=/build-venv/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup \
@@ -29,6 +30,7 @@ ENV PATH=/build-venv/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/us
     MAX_JOBS=${BUILD_JOBS} \
     NVCC_THREADS=4 \
     VLLM_BUILD_CUTLASS_SCALED_MM_C2X=${VLLM_BUILD_CUTLASS_SCALED_MM_C2X} \
+    CUTLASS_DSL_VERSION=${CUTLASS_DSL_VERSION} \
     TORCH_NIGHTLY=1
 
 COPY --from=uv /uv /usr/local/bin/uv
@@ -45,6 +47,7 @@ COPY . /src/vllm
 WORKDIR /src/vllm
 RUN /build-venv/bin/python - <<'PY'
 import importlib.metadata
+import os
 import torch
 
 assert importlib.metadata.version("torch") == (
@@ -53,6 +56,7 @@ assert importlib.metadata.version("torch") == (
 assert torch.__version__ == "2.14.0a0+4fdf77b940.nv26.08"
 assert torch.version.cuda == "13.4"
 assert torch._C._GLIBCXX_USE_CXX11_ABI
+assert importlib.metadata.version("nvidia-cutlass-dsl") == os.environ["CUTLASS_DSL_VERSION"]
 PY
 
 RUN --mount=type=cache,id=lil-vllm-native-cu134-torch214-sm120-${DEPENDENCY_RECIPE},target=/src/vllm/build,sharing=locked \
