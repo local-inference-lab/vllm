@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "disable_existing_loggers": false,
+  "formatters": {
+    "vllm": {
+      "class": "vllm.logging_utils.NewLineFormatter",
+      "datefmt": "%m-%d %H:%M:%S",
+      "format": "%(levelname)s %(asctime)s [%(fileinfo)s:%(lineno)d] %(message)s"
+    }
+  },
+  "handlers": {
+    "vllm": {
+      "class": "logging.StreamHandler",
+      "formatter": "vllm",
+      "level": "INFO",
+      "stream": "ext://sys.stderr"
+    }
+  },
+  "loggers": {
+    "vllm": {
+      "handlers": [
+        "vllm"
+      ],
+      "level": "WARNING",
+      "propagate": false
+    },
+    "vllm.v1.metrics.loggers": {
+      "level": "INFO",
+      "propagate": true
+    },
+    "vllm.v1.spec_decode.metrics": {
+      "level": "INFO",
+      "propagate": true
+    }
+  }
+}
