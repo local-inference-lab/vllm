@@ -941,8 +941,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
         # Named choices must be compared with qualified identities before
         # Pydantic serializes function definitions and discards extra fields.
         data = dict(data)
-        if isinstance(data.get("tools"), list):
-            data["tools"] = [normalize_tool_namespace(tool) for tool in data["tools"]]
+        tools = data.get("tools")
+        if isinstance(tools, Iterable) and not isinstance(
+            tools, (str, bytes, bytearray, dict)
+        ):
+            data["tools"] = [normalize_tool_namespace(tool) for tool in tools]
         if isinstance(data.get("tool_choice"), dict):
             data["tool_choice"] = normalize_tool_namespace(data["tool_choice"])
 
