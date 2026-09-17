@@ -217,3 +217,31 @@ def test_dsv4_metadata_free_profile_does_not_reserve_split_attention(
     torch.testing.assert_close(q, original_q, rtol=0, atol=0)
     assert torch.count_nonzero(output) == 0
     assert requested == []
+
+
+def test_dsv4_profile_retains_padded_query_reservation() -> None:
+    from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+    from vllm.models.deepseek_v4.nvidia.b12x import DeepseekV4B12xAttention
+
+    assert (
+        DeepseekV4B12xAttention.reserve_profile_scratch
+        is DeepseekV4Attention.reserve_profile_scratch
+    )
+    layer = DeepseekV4B12xAttention.__new__(DeepseekV4B12xAttention)
+    torch.nn.Module.__init__(layer)
+    layer.kv_cache_torch_dtype = torch.uint8
+    device = torch.device("cuda:0")
+    layer.q_norm = SimpleNamespace(weight=SimpleNamespace(device=device))
+    layer._q_padded_scratch_num_ubatches = 2
+    layer.max_num_batched_tokens = 4096
+    layer.padded_heads = 32
+    layer.head_dim = 512
+    layer._q_padded_scratch_dtype = torch.bfloat16
+    reserved = []
+    layer._reserve_q_padded_scratch_buffer = lambda *args: reserved.append(args)
+
+    layer.reserve_profile_scratch()
+
+    assert reserved == [
+        (4096, 32, 512, torch.bfloat16, device, ubatch) for ubatch in range(2)
+    ]
