@@ -63,7 +63,6 @@ from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 from vllm.triton_utils import tl, triton
 from vllm.utils.b12x import (
-    set_b12x_preparation_provider,
     B12xPreparationUnit,
     B12xWorkload,
     PreparationResourceUnavailableError,
@@ -71,6 +70,7 @@ from vllm.utils.b12x import (
     get_b12x_gdn_prefill,
     get_b12x_projection_workspaces,
     get_b12x_scratch_buffers,
+    set_b12x_preparation_provider,
 )
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -87,7 +87,10 @@ from vllm.v1.worker.workspace import (
 )
 
 if TYPE_CHECKING:
-    from vllm.model_executor.layers.mamba.ops.b12x_gdn_prefill import B12xGdnPrefill
+    from vllm.model_executor.layers.mamba.ops.b12x_gdn_prefill import (
+        B12xGdnPrefill,
+        GdnPrefillStaging,
+    )
 
 
 @dataclass(frozen=True)
@@ -170,6 +173,7 @@ class _B12xGdnDecodeStaging:
             and self.head_dim == head_dim
             and self.mixed_qkv.device == device
         )
+
 
 # Optional ROCm AITER Triton kernels for the GDN decode path.
 # Availability is checked centrally via rocm_aiter_ops; the actual function
@@ -793,16 +797,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._b12x_decode_plan = None
         self._b12x_decode_staging: _B12xGdnDecodeStaging | None = None
         self._b12x_prefill_plans: dict[int, object] = {}
-        self._b12x_prefill_staging = None
+        self._b12x_prefill_staging: GdnPrefillStaging | None = None
         self._b12x_prefill = None
         if self.gdn_decode_kernel == "b12x":
             self._initialize_b12x_gdn_decode(vllm_config)
         if self.gdn_prefill_backend == "b12x":
             self._initialize_b12x_gdn_prefill()
         self._b12x_preparation_prefix = prefix
-        if self._b12x_gdn_api is not None or self._b12x_prefill_api is not None:
-            if not getattr(self, "b12x_preparation_suppressed", False):
-                set_b12x_preparation_provider(self, self)
+        if (
+            self._b12x_gdn_api is not None or self._b12x_prefill_api is not None
+        ) and not getattr(self, "b12x_preparation_suppressed", False):
+            set_b12x_preparation_provider(self, self)
         logger.info_once("GDN decode kernel: %s", self.gdn_decode_kernel)
 
         compilation_config = get_current_vllm_config().compilation_config
@@ -942,16 +947,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if api is None:
             raise RuntimeError("b12x GDN prefill was not initialized")
         recurrent_state = self.kv_cache[1]
-        staging = self._b12x_prefill_staging
-        resident_nbytes = 0
-        if staging is not None and staging.is_compatible(
-            max_tokens=self._b12x_prefill_max_tokens,
-            max_seqs=self._b12x_prefill_max_seqs,
-            key_heads=self._b12x_local_key_heads,
-            value_heads=self._b12x_local_value_heads,
-            device=recurrent_state.device,
-        ):
-            resident_nbytes = staging.nbytes
         caps = api.Caps(
             device=current_platform.current_device(),
             max_tokens=capacity,
@@ -962,8 +957,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             state_dtype=recurrent_state.dtype,
             checkpoint_export=True,
             null_state_index=0,
-            staging_key=(self._b12x_preparation_prefix, "gdn-prefill-staging"),
-            staging_resident_nbytes=resident_nbytes,
         )
         return api.plan(
             caps,
@@ -975,7 +968,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
     def get_b12x_preparation_units(
-        self, layer: torch.nn.Module, workload: B12xWorkload,
+        self,
+        layer: torch.nn.Module,
+        workload: B12xWorkload,
     ) -> tuple[B12xPreparationUnit, ...]:
         if layer is not self:
             raise ValueError("GDN preparation owner mismatch")
@@ -986,28 +981,34 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 prepare_call=self._prepare_b12x_gdn_decode,
                 benchmark_call=self._benchmark_b12x_gdn_decode,
             )
-            units.append(B12xPreparationUnit(
-                name="GDN decode",
-                key=(self._b12x_preparation_prefix, "gdn-decode"),
-                requests=(request,),
-                stage="state",
-                autotune=not workload.eager_only,
-            ))
+            units.append(
+                B12xPreparationUnit(
+                    name="GDN decode",
+                    key=(self._b12x_preparation_prefix, "gdn-decode"),
+                    requests=(request,),
+                    stage="state",
+                    autotune=not workload.eager_only,
+                )
+            )
         for capacity, plan in self._b12x_prefill_plans.items():
             request = plan.request(
                 name=f"{self._b12x_preparation_prefix}.gdn.prefill.{capacity}",
-                prepare_call=lambda state, capacity=capacity:
-                    self._prepare_b12x_gdn_prefill(state, capacity),
-                benchmark_call=lambda state, capacity=capacity:
-                    self._benchmark_b12x_gdn_prefill(state, capacity),
+                prepare_call=lambda state, capacity=capacity: (
+                    self._prepare_b12x_gdn_prefill(state, capacity)
+                ),
+                benchmark_call=lambda state, capacity=capacity: (
+                    self._benchmark_b12x_gdn_prefill(state, capacity)
+                ),
             )
-            units.append(B12xPreparationUnit(
-                name="GDN prefill",
-                key=(self._b12x_preparation_prefix, "gdn-prefill", capacity),
-                requests=(request,),
-                stage="state",
-                autotune=not workload.eager_only,
-            ))
+            units.append(
+                B12xPreparationUnit(
+                    name="GDN prefill",
+                    key=(self._b12x_preparation_prefix, "gdn-prefill", capacity),
+                    requests=(request,),
+                    stage="state",
+                    autotune=not workload.eager_only,
+                )
+            )
         return tuple(units)
 
     @staticmethod
@@ -1080,17 +1081,40 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 slots[slot : slot + 1].copy_(saved_state)
 
         binding = state.bind(
-            scratch=scratch, mixed_qkv=mixed_qkv, a=a, b=b, z=z,
-            A_log=self.A_log, dt_bias=self.dt_bias, norm_weight=self.norm.weight,
-            recurrent_state=slots, query_start_loc=query_start_loc,
-            num_accepted_tokens=accepted, state_indices=state_indices,
-            num_seqs=num_seqs, num_tokens=num_tokens, output=output,
+            scratch=scratch,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            z=z,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            norm_weight=self.norm.weight,
+            recurrent_state=slots,
+            query_start_loc=query_start_loc,
+            num_accepted_tokens=accepted,
+            state_indices=state_indices,
+            num_seqs=num_seqs,
+            num_tokens=num_tokens,
+            output=output,
         )
         return PreparedCall(
-            run=lambda: state.run(binding), produce=produce, reset=reset,
+            run=lambda: state.run(binding),
+            produce=produce,
+            reset=reset,
             restore=reset if saved_state is not None else None,
-            owners=(scratch, mixed_qkv, a, b, z, output, query_start_loc,
-                    accepted, state_indices, num_seqs, num_tokens),
+            owners=(
+                scratch,
+                mixed_qkv,
+                a,
+                b,
+                z,
+                output,
+                query_start_loc,
+                accepted,
+                state_indices,
+                num_seqs,
+                num_tokens,
+            ),
         )
 
     def _prepare_b12x_gdn_prefill(self, state, capacity: int):
@@ -1101,6 +1125,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
     def _b12x_gdn_prefill_call(self, state, capacity: int, *, benchmark: bool):
         from b12x.preparation import PreparedCall
+
         specs = tuple(state.layout.scratch_specs())
         if len(specs) != 1:
             raise RuntimeError("b12x GDN prefill requires one scratch buffer")
@@ -1111,11 +1136,30 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Trial and prepare factories own their scratch; the runtime path in
         # B12xGdnPrefill.run draws from the workspace manager instead.
         scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+        # Priming and candidate races use temporary inputs. Serving binds the
+        # caller's projection and output tensors directly, without retaining
+        # scheduler-capacity activation storage on every layer.
+        mixed_qkv = torch.empty(
+            (
+                capacity,
+                (2 * self._b12x_local_key_heads + self._b12x_local_value_heads) * 128,
+            ),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        a = torch.empty(
+            (capacity, self._b12x_local_value_heads),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        b = torch.empty_like(a)
+        output = torch.empty(
+            (capacity, self._b12x_local_value_heads, 128),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        owners: tuple[torch.Tensor, ...]
         if benchmark:
-            mixed_qkv = torch.empty_like(staging.mixed_qkv[:capacity])
-            a = torch.empty_like(staging.a[:capacity])
-            b = torch.empty_like(staging.b[:capacity])
-            output = torch.empty_like(staging.output[:capacity])
             cu_seqlens = torch.empty_like(staging.query_start_loc)
             indices = torch.full_like(staging.initial_indices, slot)
             final_indices = torch.full_like(staging.final_indices, slot)
@@ -1125,15 +1169,26 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_tokens = torch.empty_like(staging.num_tokens)
             saved_state = self.kv_cache[1][slot : slot + 1].clone()
             owners = (
-                scratch, mixed_qkv, a, b, output, cu_seqlens, indices,
-                final_indices, checkpoint_indices, offsets, num_seqs, num_tokens,
+                scratch,
+                mixed_qkv,
+                a,
+                b,
+                output,
+                cu_seqlens,
+                indices,
+                final_indices,
+                checkpoint_indices,
+                offsets,
+                num_seqs,
+                num_tokens,
             )
         else:
-            mixed_qkv = staging.mixed_qkv[:capacity]
-            a, b, output = staging.a[:capacity], staging.b[:capacity], staging.output[:capacity]
             cu_seqlens = staging.query_start_loc
             indices, final_indices = staging.initial_indices, staging.final_indices
-            checkpoint_indices, offsets = staging.checkpoint_indices, staging.checkpoint_offsets
+            checkpoint_indices, offsets = (
+                staging.checkpoint_indices,
+                staging.checkpoint_offsets,
+            )
             num_seqs, num_tokens = staging.num_seqs, staging.num_tokens
             saved_state = None
             owners = ()
@@ -1166,18 +1221,30 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.kv_cache[1][slot : slot + 1].copy_(saved_state)
 
         binding = state.bind(
-            scratch=scratch, q=q, k=k, v=v, a=a, b=b,
-            A_log=self.A_log, dt_bias=self.dt_bias, recurrent_state=self.kv_cache[1],
-            cu_seqlens=cu_seqlens, initial_state_indices=indices,
+            scratch=scratch,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            recurrent_state=self.kv_cache[1],
+            cu_seqlens=cu_seqlens,
+            initial_state_indices=indices,
             final_state_indices=final_indices,
             checkpoint_state_indices=checkpoint_indices,
-            checkpoint_offsets=offsets, num_seqs=num_seqs, num_tokens=num_tokens,
+            checkpoint_offsets=offsets,
+            num_seqs=num_seqs,
+            num_tokens=num_tokens,
             output=output,
         )
         return PreparedCall(
             run=lambda: state.run(binding, max_live_tokens=capacity, max_live_seqs=1),
-            produce=produce, reset=reset,
-            restore=reset if saved_state is not None else None, owners=owners,
+            produce=produce,
+            reset=reset,
+            restore=reset if saved_state is not None else None,
+            owners=owners,
         )
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
@@ -1192,6 +1259,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 B12xGdnPrefill,
                 prefill_capacities,
             )
+
             self._b12x_prefill_plans = {
                 capacity: self._b12x_gdn_prefill_declaration(capacity)
                 for capacity in prefill_capacities(self._b12x_prefill_max_tokens)
@@ -2269,6 +2337,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     raise RuntimeError(
                         "b12x GDN prefill cache and runtime metadata must be bound"
                     )
+                prefill_output = torch.empty(
+                    (
+                        conv_output_prefill.shape[0],
+                        self._b12x_local_value_heads,
+                        self.head_v_dim,
+                    ),
+                    device=conv_output_prefill.device,
+                    dtype=conv_output_prefill.dtype,
+                )
                 runner.run(
                     mixed_qkv=conv_output_prefill,
                     a=a_prefill,
@@ -2278,12 +2355,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     has_initial_state=prefill_has_initial_state,
                     live_counts=attn_metadata.b12x_prefill_live_counts,
                     checkpoint=attn_metadata.prefill_checkpoint,
-                    output=runner.output,
+                    output=prefill_output,
                     eps=self.layer_norm_epsilon,
                 )
-                core_attn_out_non_spec = runner.output[
-                    : conv_output_prefill.shape[0]
-                ].unsqueeze(0)
+                core_attn_out_non_spec = prefill_output.unsqueeze(0)
             else:
                 initial_state = ssm_state[prefill_state_indices]
                 initial_state[~prefill_has_initial_state, ...] = 0
@@ -2911,6 +2986,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             query_start_loc=metadata.query_start_loc,
             metadata=metadata.convolution_metadata(rows),
         ).transpose(0, 1)
+        prefill_output = torch.empty_like(core_attn_out)
         runner.run(
             mixed_qkv=convolved,
             a=a.index_select(0, non_spec_indices),
@@ -2920,22 +2996,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             has_initial_state=metadata.has_initial_state,
             live_counts=metadata.live_counts,
             checkpoint=metadata.checkpoint,
-            output=runner.output,
+            output=prefill_output,
             eps=self.layer_norm_epsilon,
         )
         self._rms_norm_gated_cuda(
-            runner.output[:rows],
+            prefill_output,
             output_gate.index_select(0, non_spec_indices),
-            runner.output[:rows],
+            prefill_output,
         )
         core_attn_out.zero_()
         width = core_attn_out.shape[-2] * core_attn_out.shape[-1]
         _scatter_b12x_gdn_output[(rows, triton.cdiv(width, 256))](
-            runner.output,
+            prefill_output,
             non_spec_indices,
             metadata.live_counts,
             core_attn_out,
-            SOURCE_STRIDE=runner.output.stride(0),
+            SOURCE_STRIDE=prefill_output.stride(0),
             OUTPUT_STRIDE=core_attn_out.stride(0),
             WIDTH=width,
             BLOCK=256,
