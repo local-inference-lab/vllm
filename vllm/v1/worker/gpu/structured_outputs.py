@@ -17,6 +17,7 @@ def _build_grammar_mapping(
     num_draft_tokens_per_req: np.ndarray | None,
     num_bonus_tokens: int,
     mask_stride: int,
+    num_invalid_spec_tokens: dict[str, int] | None = None,
 ) -> list[int]:
     mapping: list[int] = []
     req_id_to_idx = {req_id: i for i, req_id in enumerate(req_ids)}
@@ -33,6 +34,11 @@ def _build_grammar_mapping(
         mapping.extend(
             req_idx * mask_stride + position for position in range(num_positions)
         )
+        num_invalid = (num_invalid_spec_tokens or {}).get(grammar_req_id, 0)
+        # Negative keys mark input tokens in the invalid draft suffix. The
+        # first logit row consumes the preceding sampled token, not a draft.
+        for offset in range(1, num_invalid + 1):
+            mapping[-offset] = -mapping[-offset] - 1
     return mapping
 
 
@@ -62,6 +68,7 @@ class StructuredOutputsWorker:
         input_batch: InputBatch,
         grammar_req_ids: list[str],
         grammar_bitmask: np.ndarray,
+        num_invalid_spec_tokens: dict[str, int] | None = None,
     ) -> None:
         if not grammar_req_ids:
             return
@@ -83,6 +90,7 @@ class StructuredOutputsWorker:
             input_batch.num_draft_tokens_per_req,
             self.num_bonus_tokens,
             self.mask_stride,
+            num_invalid_spec_tokens,
         )
 
         # Asynchronously copy the mapping to GPU.
@@ -108,6 +116,8 @@ class StructuredOutputsWorker:
             logits.stride(0),
             logits_indices,
             input_batch.cu_num_logits,
+            input_batch.input_ids if num_invalid_spec_tokens else None,
+            input_batch.logits_indices if num_invalid_spec_tokens else None,
             bitmask,
             bitmask.stride(0),
             vocab_size,
@@ -128,6 +138,8 @@ def _apply_grammar_bitmask_kernel(
     logits_stride,
     logits_indices_ptr,
     cu_num_logits_ptr,
+    input_ids_ptr,
+    input_logits_indices_ptr,
     bitmask_ptr,
     bitmask_stride,
     vocab_size,
@@ -136,6 +148,9 @@ def _apply_grammar_bitmask_kernel(
 ):
     bitmask_idx = tl.program_id(0)
     mapping_idx = tl.load(logits_indices_ptr + bitmask_idx)
+    if input_ids_ptr is not None:
+        invalid_draft = mapping_idx < 0
+        mapping_idx = tl.where(invalid_draft, -mapping_idx - 1, mapping_idx)
     req_idx = mapping_idx // MASK_STRIDE
     position_idx = mapping_idx % MASK_STRIDE
     logits_idx = tl.load(cu_num_logits_ptr + req_idx)
@@ -145,6 +160,10 @@ def _apply_grammar_bitmask_kernel(
 
     # Load the bitmask.
     block_id = tl.program_id(1)
+    if input_ids_ptr is not None:  # noqa: SIM102
+        if block_id == 0 and position_is_active and invalid_draft:
+            input_idx = tl.load(input_logits_indices_ptr + logits_idx)
+            tl.store(input_ids_ptr + input_idx, -1)
     bitmask_offset = (block_id * BLOCK_SIZE) // 32 + tl.arange(0, BLOCK_SIZE // 32)
     packed_bitmask = tl.load(
         bitmask_ptr + bitmask_idx * bitmask_stride + bitmask_offset,

@@ -2,15 +2,23 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """grammar_bitmask under spec-decode draft padding (#44006)."""
 
+from types import SimpleNamespace
+
+import numpy as np
 import pytest
+import torch
 from transformers import AutoTokenizer
 
 from vllm.config import StructuredOutputsConfig, VllmConfig
 from vllm.config.model import ModelConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import rejection_sample
+from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 
 TOKENIZER = "gpt2"
 NUM_SPEC_TOKENS = 4
@@ -390,3 +398,93 @@ def test_trim_reasoning_for_advance():
     next_step = [post, post]
     request.append_output_token_ids(next_step)
     assert manager.trim_reasoning_for_advance(request, next_step) == next_step
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("num_verified", [0, 1, 2, 3])
+@pytest.mark.parametrize(
+    ("num_valid", "prefix", "ending"),
+    [
+        (0, '{"a":"b"}', []),
+        (1, '{"a":"b"}', []),
+        (2, '{"a":"b"', ["}"]),
+        (3, '{"a":', ["0", "}"]),
+    ],
+)
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_gpu_sampler_rejects_drafts_after_grammar_termination(
+    num_verified, num_valid, prefix, ending, temperature
+):
+    """Deferred grammar validation must reach the device rejection sampler."""
+    tokenizer, manager, request, prompt = _make_manager_and_request("xgrammar", prefix)
+    grammar = request.structured_output_request.grammar
+    assert grammar.accept_tokens(request.request_id, prompt)
+    eos = tokenizer.eos_token_id
+    space = tokenizer.encode(" ")[0]
+    drafts = [tokenizer.encode(token)[0] for token in ending]
+    if num_valid:
+        drafts.append(eos)
+    drafts += [space] * (3 - num_valid)
+    scheduled = SimpleNamespace(
+        has_structured_output_requests=True,
+        num_scheduled_tokens={request.request_id: 4},
+        scheduled_spec_decode_tokens={request.request_id: [-1] * 3},
+    )
+    scheduler = SimpleNamespace(
+        requests={request.request_id: request}, structured_output_manager=manager
+    )
+    Scheduler.update_draft_token_ids_in_output(
+        scheduler, DraftTokenIds([request.request_id], [drafts.copy()]), scheduled
+    )
+    assert scheduled.num_invalid_spec_tokens.get(request.request_id, 0) == 3 - num_valid
+    grammar_output = Scheduler.get_grammar_bitmask(scheduler, scheduled)
+    assert grammar_output is not None
+
+    # The adjacent unstructured request and non-logit input slots must survive
+    # compaction and grammar rejection unchanged.
+    num_logits = num_verified + 2
+    input_ids = torch.tensor([17, 19, 23, 29, *drafts], device="cuda")
+    logits_indices = torch.tensor([1, *range(3, 4 + num_verified)], device="cuda")
+    batch = SimpleNamespace(
+        req_ids=["unstructured", request.request_id],
+        cu_num_logits_np=np.array([0, 1, num_logits], dtype=np.int32),
+        cu_num_logits=torch.tensor([0, 1, num_logits], device="cuda"),
+        num_draft_tokens_per_req=np.array([0, 3], dtype=np.int32),
+        input_ids=input_ids,
+        logits_indices=logits_indices,
+    )
+    vocab_size = manager.vllm_config.model_config.get_vocab_size()
+    logits = torch.full((num_logits, vocab_size), -100.0, device="cuda")
+    targets = torch.tensor([space, *drafts, eos][:num_logits], device="cuda")
+    logits[torch.arange(num_logits, device="cuda"), targets] = 100.0
+    worker = StructuredOutputsWorker(8, vocab_size, torch.device("cuda"), 4, 1)
+    worker.apply_grammar_bitmask(
+        logits,
+        batch,
+        grammar_output.structured_output_request_ids,
+        grammar_output.grammar_bitmask,
+        grammar_output.num_invalid_spec_tokens,
+    )
+    expected_inputs = [17, 19, 23, 29, *drafts]
+    expected_inputs[4 + num_valid : 4 + num_verified] = [-1] * max(
+        num_verified - num_valid, 0
+    )
+    assert input_ids.tolist() == expected_inputs
+    sampled, lengths = rejection_sample(
+        target_logits=logits,
+        draft_logits=None,
+        draft_sampled=input_ids[logits_indices],
+        cu_num_logits=batch.cu_num_logits,
+        pos=torch.arange(num_logits, device="cuda"),
+        idx_mapping=torch.tensor([0, 1], device="cuda"),
+        expanded_idx_mapping=torch.tensor(
+            [0] + [1] * (num_verified + 1), device="cuda"
+        ),
+        expanded_local_pos=torch.tensor([0, *range(num_verified + 1)], device="cuda"),
+        temperature=torch.full((2,), temperature, device="cuda"),
+        seed=torch.zeros(2, device="cuda", dtype=torch.int64),
+        num_speculative_steps=3,
+    )
+    accepted = min(num_valid, num_verified)
+    assert lengths.tolist() == [1, accepted + 1]
+    assert sampled[1, :accepted].tolist() == drafts[:accepted]

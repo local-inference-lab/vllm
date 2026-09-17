@@ -338,6 +338,13 @@ def _shard_grammar_output(
     return GrammarOutput(
         structured_output_request_ids=local_ids,
         grammar_bitmask=grammar_output.grammar_bitmask[keep_indices],
+        num_invalid_spec_tokens={
+            req_id: num_invalid
+            for req_id, num_invalid in (
+                grammar_output.num_invalid_spec_tokens or {}
+            ).items()
+            if req_id in owned
+        },
     )
 
 

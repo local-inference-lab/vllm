@@ -336,3 +336,5 @@ class GrammarOutput:
     structured_output_request_ids: list[str]
     # Bitmask ordered as structured_output_request_ids.
     grammar_bitmask: "npt.NDArray[np.int32]"
+    # Draft suffixes invalidated after the model inputs were prepared.
+    num_invalid_spec_tokens: dict[str, int] | None = None

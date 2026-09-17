@@ -2595,7 +2595,11 @@ class Scheduler(SchedulerInterface):
             structured_output_request_ids,
             scheduler_output.scheduled_spec_decode_tokens,
         )
-        return GrammarOutput(structured_output_request_ids, bitmask)
+        return GrammarOutput(
+            structured_output_request_ids,
+            bitmask,
+            scheduler_output.num_invalid_spec_tokens,
+        )
 
     def update_from_output(
         self,
@@ -2720,7 +2724,13 @@ class Scheduler(SchedulerInterface):
                     )
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
-                assert num_accepted <= num_draft_tokens
+                assert num_accepted <= num_draft_tokens, (
+                    f"{req_id}: accepted={num_accepted}, "
+                    f"valid_drafts={num_draft_tokens}, "
+                    f"scheduled_drafts={num_scheduled_draft_tokens}, "
+                    f"grammar_invalid="
+                    f"{(scheduler_output.num_invalid_spec_tokens or {}).get(req_id, 0)}"
+                )
                 # Every unaccepted scheduler placeholder must be rolled back,
                 # including drafts omitted by adaptive verification.
                 num_rejected = num_scheduled_draft_tokens - num_accepted
