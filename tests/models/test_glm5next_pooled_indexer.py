@@ -689,6 +689,66 @@ def test_glm53_physical_selection_provider_is_explicit() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "main_blocks, error",
+    [(0, "main cache is not bound"), (1, "physical selection has not been declared")],
+)
+def test_glm53_missing_physical_plan_does_not_mutate_recurrent_cache(
+    monkeypatch, main_blocks, error
+) -> None:
+    from vllm.models.glm5next.nvidia import pooled_indexer as module
+
+    hidden = torch.zeros((1, 128))
+    metadata = SimpleNamespace(
+        num_reqs=1,
+        num_actual_tokens=1,
+        num_decode_tokens=1,
+        num_decodes=1,
+        max_query_len=1,
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+        selector_state_slot_ids=torch.zeros(1, dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        slot_mapping=torch.zeros(1, dtype=torch.int64),
+    )
+    indexer = SimpleNamespace(
+        max_tokens=1,
+        wq_b=lambda value: (torch.zeros((1, 32 * 128)), None),
+        wk=lambda value: (hidden, None),
+        k_norm=lambda value: value,
+        index_kpool_compress_gate=torch.zeros((128, 128)),
+        index_kpool_compress_ape=torch.zeros((4, 128)),
+        _project_head_weights=lambda value: torch.zeros((1, 32)),
+        _q_fp8=torch.empty((1, 32, 128), dtype=torch.float8_e4m3fn),
+        _q_scale=torch.empty((1, 32)),
+        main_layer_name="attention",
+        _index_cache=torch.zeros((1, 64, 132), dtype=torch.uint8),
+        _tail=torch.zeros((1, 2, 4, 128)),
+        _state_slots=Glm5NextPooledIndexer._state_slots,
+        _parent_table_width=1,
+        _parent_stride_pages=1,
+        block_size=256,
+        dcp_world_size=1,
+        _emit_physical_selection=True,
+        _main_cache_num_blocks=main_blocks,
+        _physical_selection_plan=None,
+    )
+    monkeypatch.setattr(module, "fwht128_quant_fp8", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        module,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"attention": metadata}),
+    )
+
+    def reject_cache_update(*args, **kwargs):
+        pytest.fail("Missing physical-selection resources must not update the cache")
+
+    monkeypatch.setattr(module, "update_decode_pools", reject_cache_update)
+    with pytest.raises(RuntimeError, match=error):
+        Glm5NextPooledIndexer.forward(
+            indexer, hidden, hidden, torch.zeros(1, dtype=torch.int64), None
+        )
+
+
 def _packed_main_cache(
     *,
     device: torch.device,
