@@ -236,6 +236,16 @@ class B12xC4SparseIndexer(nn.Module):
         self.topk_tokens = int(topk_tokens)
         self.max_model_len = int(max_model_len)
         self.topk_indices_buffer = topk_indices_buffer
+        from vllm.config import get_current_vllm_config
+
+        config = get_current_vllm_config()
+        spec = config.speculative_config
+        self._decode_query_width = 1 + int(
+            getattr(spec, "num_speculative_tokens", 0) or 0
+        )
+        self._max_cudagraph_capture_size = int(
+            config.compilation_config.max_cudagraph_capture_size or 0
+        )
         self._plans: dict[tuple[str, int], object] = {}
         owner_prefix = (
             prefix or getattr(k_cache, "prefix", None) or b12x_layer_prefix(self)
@@ -414,7 +424,18 @@ class B12xC4SparseIndexer(nn.Module):
         from b12x.preparation import PreparedCall
 
         capacities = {
-            "decode": tuple(sorted({workload.max_seqs, *workload.fixed_token_counts})),
+            "decode": tuple(
+                sorted(
+                    min(workload.max_tokens, rows)
+                    for rows in {
+                        workload.max_seqs,
+                        workload.max_seqs * self._decode_query_width,
+                        self._max_cudagraph_capture_size,
+                        *workload.fixed_token_counts,
+                    }
+                    if rows > 0
+                )
+            ),
             "prefill": (workload.max_tokens,),
         }
         for mode, counts in capacities.items():

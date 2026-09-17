@@ -275,7 +275,10 @@ def test_b12x_dsa_indexer_owns_prefill_width_cap(
     monkeypatch.setattr(b12x_indexer, "_require_b12x_indexer", lambda: module)
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8, max_num_seqs=8),
-        compilation_config=SimpleNamespace(cudagraph_capture_sizes=[1, 2, 4, 8]),
+        compilation_config=SimpleNamespace(
+            cudagraph_capture_sizes=[1, 2, 4, 8], max_cudagraph_capture_size=8
+        ),
+        speculative_config=None,
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=1,
             cp_kv_cache_interleave_size=1,
@@ -330,7 +333,10 @@ def test_b12x_dsa_indexer_reuses_capacity_and_declares_overflow(
     monkeypatch.setattr(b12x_indexer, "_require_b12x_indexer", lambda: module)
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8, max_num_seqs=8),
-        compilation_config=SimpleNamespace(cudagraph_capture_sizes=[1, 2, 4, 8]),
+        compilation_config=SimpleNamespace(
+            cudagraph_capture_sizes=[1, 2, 4, 8], max_cudagraph_capture_size=8
+        ),
+        speculative_config=None,
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=1,
             cp_kv_cache_interleave_size=1,
@@ -386,6 +392,103 @@ def test_b12x_dsa_indexer_reuses_capacity_and_declares_overflow(
     assert indexer._plan("decode", 11) is decode
     # Serving never prepares: the plans materialize their defaults on first use.
     assert prepared == []
+
+
+def test_b12x_dsa_indexer_keeps_small_decode_capacities(monkeypatch) -> None:
+    """Decode rows round up to the smallest prepared capacity."""
+    from vllm.utils.b12x import B12xWorkload
+
+    class _Plan:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def request(self, **kwargs):
+            return SimpleNamespace(name=kwargs["name"], plan=self)
+
+    indexer = object.__new__(b12x_indexer.B12xSparseIndexer)
+    indexer.k_cache = SimpleNamespace(kv_cache=torch.empty(1))
+    indexer._max_num_seqs = 4
+    indexer._decode_query_width = 3
+    indexer._max_cudagraph_capture_size = 8
+    indexer._prefill_max_q_rows = 7
+    indexer._preparation_prefix = "test.indexer"
+    indexer._prepared_plans = {}
+    indexer._page_table_width = lambda max_model_len: 1
+    indexer._caps = lambda mode, rows, width: SimpleNamespace(max_q_rows=rows)
+    indexer._declare_plan = lambda caps: _Plan(caps.max_q_rows)
+    indexer._prepare_call = lambda mode, caps: None
+    workload = B12xWorkload(
+        stage="state",
+        token_counts=(1, 2, 4, 6, 8, 10),
+        fixed_token_counts=(2, 6),
+        output_dtype=torch.bfloat16,
+        max_tokens=10,
+        max_seqs=4,
+        max_model_len=8,
+    )
+
+    indexer.get_b12x_preparation_units(indexer, workload)
+
+    assert {rows for mode, rows in indexer._prepared_plans if mode == "decode"} == {
+        2,
+        4,
+        6,
+        8,
+        10,
+    }
+    assert indexer._plan("decode", 3).rows == 4
+    assert indexer._plan("decode", 7).rows == 8
+    assert indexer._prepared_plans[("prefill", 7)].rows == 7
+
+
+def test_b12x_c4_indexer_keeps_small_decode_capacities() -> None:
+    """C4 pooled selection retains its fixed and eager decode capacities."""
+    from vllm.models.deepseek_v4.nvidia import b12x_indexer as c4_indexer
+    from vllm.utils.b12x import B12xWorkload
+
+    class _Plan:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def request(self, **kwargs):
+            return SimpleNamespace(name=kwargs["name"], plan=self)
+
+    indexer = object.__new__(c4_indexer.B12xC4SparseIndexer)
+    torch.nn.Module.__init__(indexer)
+    indexer._index_cache = torch.empty(1)
+    indexer._index_max_page_table_width = 1
+    indexer.max_model_len = 8
+    indexer._score_output = False
+    indexer._decode_query_width = 3
+    indexer._max_cudagraph_capture_size = 8
+    indexer._preparation_prefix = "test.c4"
+    indexer._plans = {}
+    indexer._caps = lambda **kwargs: SimpleNamespace(max_q_rows=kwargs["rows"])
+    indexer._invocation = lambda caps, scores: None
+    indexer._b12x_indexer = SimpleNamespace(
+        plan=lambda caps, invocation: _Plan(caps.max_q_rows)
+    )
+    workload = B12xWorkload(
+        stage="state",
+        token_counts=(1, 2, 4, 6, 8, 10),
+        fixed_token_counts=(2, 6),
+        output_dtype=torch.bfloat16,
+        max_tokens=10,
+        max_seqs=4,
+        max_model_len=8,
+    )
+
+    indexer.get_b12x_preparation_units(indexer, workload)
+
+    assert {rows for mode, rows in indexer._plans if mode == "decode"} == {
+        2,
+        4,
+        6,
+        8,
+        10,
+    }
+    assert indexer._plan_for("decode", 3).rows == 4
+    assert indexer._plan_for("decode", 7).rows == 8
 
 
 def test_b12x_sparse_mla_prefill_binds_request_sequence_lengths(
@@ -793,6 +896,8 @@ def test_b12x_dsa_indexer_live_rows_reuse_capacity_with_high_page_ids(mode, comp
     monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=max_rows, max_num_seqs=4),
+        compilation_config=SimpleNamespace(max_cudagraph_capture_size=0),
+        speculative_config=None,
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=1, cp_kv_cache_interleave_size=1,
         ),

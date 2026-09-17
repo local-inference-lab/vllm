@@ -27,7 +27,6 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepSeekV32IndexerDecodeMetadata,
     DeepseekV32IndexerMetadata,
     DeepseekV32IndexerMetadataBuilder,
-    get_max_prefill_buffer_size,
     split_indexer_prefill_chunks,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec
@@ -51,13 +50,6 @@ def _prefill_profile_q_rows(max_q_rows: int) -> int:
 
 def _prefill_plan_q_rows(vllm_config: VllmConfig) -> int:
     return _prefill_profile_q_rows(min(vllm_config.scheduler_config.max_num_batched_tokens, get_max_prefill_buffer_size(vllm_config)))
-
-
-def _prefill_plan_q_rows(vllm_config: VllmConfig) -> int:
-    return _prefill_profile_q_rows(min(
-        vllm_config.scheduler_config.max_num_batched_tokens,
-        get_max_prefill_buffer_size(vllm_config),
-    ))
 
 
 def _split_prefill_chunk_rows(
@@ -121,7 +113,7 @@ class B12xIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
             )
         ]
         return _split_prefill_chunk_rows(
-            chunks, _prefill_plan_q_rows(self.vllm_config)
+            chunks, _prefill_profile_q_rows(self.max_prefill_buffer_size)
         )
 
     def build(self, *args, **kwargs) -> DeepseekV32IndexerMetadata:
@@ -327,7 +319,7 @@ class B12xSparseIndexer(nn.Module):
         num_q_heads: int | None = None, output_physical_slots: bool = False,
     ) -> None:
         super().__init__()
-        del quant_block_size, scale_fmt, max_total_seq_len
+        del quant_block_size, scale_fmt
         if not skip_k_cache_insert or use_fp4_cache or compress_ratio != 1:
             raise ValueError("B12X requires the fused FP8 non-compressed DSA cache path.")
         if head_dim != _INDEX_HEAD_DIM or topk_indices_buffer is None:
@@ -344,7 +336,6 @@ class B12xSparseIndexer(nn.Module):
         config = get_current_vllm_config()
         parallel = config.parallel_config
         self._max_num_seqs = int(config.scheduler_config.max_num_seqs)
-        self._prefill_max_q_rows = _prefill_plan_q_rows(config)
         spec = config.speculative_config
         self._decode_query_width = 1 + int(
             getattr(spec, "num_speculative_tokens", 0) or 0

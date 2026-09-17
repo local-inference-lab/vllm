@@ -978,9 +978,21 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
         decode_rows = min(
             workload.max_tokens,
             max(
-                workload.max_seqs,
-                *workload.fixed_token_counts,
+                workload.max_seqs
+                * (
+                    1
+                    + int(
+                        getattr(
+                            self.vllm_config.speculative_config,
+                            "num_speculative_tokens",
+                            0,
+                        )
+                        or 0
+                    )
+                ),
                 _get_dspark_decode_row_capacity(self.vllm_config) or 0,
+                self.vllm_config.compilation_config.max_cudagraph_capture_size or 0,
+                *workload.fixed_token_counts,
             ),
         )
         self._b12x_mla_prefill_rows = workload.max_tokens
