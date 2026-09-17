@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -52,6 +53,49 @@ def test_get_draft_quant_config_without_draft_model():
     result = get_draft_quant_config(mock_vllm_config)
 
     assert result is None
+
+
+def test_dense_exl3_draft_skips_rank_sliced_hydration():
+    quant_config = Mock()
+    quant_config.get_name.return_value = "exl3"
+    draft_model_config = SimpleNamespace(
+        model="dense-exl3-draft",
+        hf_config=SimpleNamespace(),
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(draft_model_config=draft_model_config),
+        load_config=object(),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+    )
+
+    with patch.object(VllmConfig, "get_quantization_config", return_value=quant_config):
+        result = get_draft_quant_config(vllm_config)
+
+    assert result is quant_config
+    quant_config.maybe_update_config.assert_not_called()
+
+
+def test_rank_sliced_exl3_draft_hydrates_from_target_metadata():
+    quant_config = Mock()
+    quant_config.get_name.return_value = "exl3"
+    target_hf = SimpleNamespace(hybrid_tr3_tail={"tp": 4})
+    draft_model_config = SimpleNamespace(
+        model="rank-sliced-draft",
+        hf_config=SimpleNamespace(),
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(draft_model_config=draft_model_config),
+        load_config=object(),
+        model_config=SimpleNamespace(hf_config=target_hf),
+    )
+
+    with patch.object(VllmConfig, "get_quantization_config", return_value=quant_config):
+        result = get_draft_quant_config(vllm_config)
+
+    assert result is quant_config
+    quant_config.maybe_update_config.assert_called_once_with(
+        "rank-sliced-draft", hf_config=target_hf
+    )
 
 
 @torch.inference_mode()
