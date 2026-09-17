@@ -160,8 +160,9 @@ def test_multiple_tool_calls_materialised(num_tool_calls: int):
 @pytest.mark.parametrize("location", ["tool", "function"])
 @pytest.mark.parametrize("namespace", ["inventory", {"name": "inventory"}])
 @pytest.mark.parametrize("iterator", [False, True])
+@pytest.mark.parametrize("tools_collection", [list, tuple, iter])
 def test_namespaces_survive_definitions_choices_and_history(
-    location, namespace, iterator
+    location, namespace, iterator, tools_collection
 ):
     def qualify(item, value):
         target = item if location == "tool" else item["function"]
@@ -185,6 +186,7 @@ def test_namespaces_survive_definitions_choices_and_history(
         ],
     }
     original = copy.deepcopy(payload)
+    payload["tools"] = tools_collection(tools)
     if iterator:
         payload["messages"][1]["tool_calls"] = iter(calls)
     request = ChatCompletionRequest.model_validate(payload)
@@ -200,8 +202,9 @@ def test_namespaces_survive_definitions_choices_and_history(
     assert request.model_dump_json() == serialized
     restored = ChatCompletionRequest.model_validate_json(serialized)
     assert restored.model_dump_json() == serialized
-    if not iterator:
+    if not iterator and tools_collection is list:
         assert payload == original
+    assert tools == original["tools"]
     assert calls == original["messages"][1]["tool_calls"]
 
 
