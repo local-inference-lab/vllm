@@ -69,16 +69,16 @@ def prefill_capacities(max_tokens: int) -> tuple[int, ...]:
 
 @dataclass(frozen=True)
 class GdnPrefillStaging:
-    """Reusable capacity buffers independent of a recurrent-state generation."""
+    """Sequence metadata independent of a recurrent-state generation.
+
+    Activations and outputs remain caller-owned. Native GDN bindings accept
+    fewer rows than a plan's capacity, so no padded activation copies are needed.
+    """
 
     max_tokens: int
     max_seqs: int
     key_heads: int
     value_heads: int
-    mixed_qkv: torch.Tensor
-    a: torch.Tensor
-    b: torch.Tensor
-    output: torch.Tensor
     query_start_loc: torch.Tensor
     initial_indices: torch.Tensor
     final_indices: torch.Tensor
@@ -97,26 +97,12 @@ class GdnPrefillStaging:
         value_heads: int,
         device: torch.device,
     ) -> "GdnPrefillStaging":
-        mixed_qkv = torch.empty(
-            (max_tokens, (2 * key_heads + value_heads) * 128),
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        a = torch.empty((max_tokens, value_heads), dtype=torch.bfloat16, device=device)
         initial_indices = torch.zeros(max_seqs, dtype=torch.int32, device=device)
         return cls(
             max_tokens=max_tokens,
             max_seqs=max_seqs,
             key_heads=key_heads,
             value_heads=value_heads,
-            mixed_qkv=mixed_qkv,
-            a=a,
-            b=torch.empty_like(a),
-            output=torch.empty(
-                (max_tokens, value_heads, 128),
-                dtype=torch.bfloat16,
-                device=device,
-            ),
             query_start_loc=torch.zeros(max_seqs + 1, dtype=torch.int32, device=device),
             initial_indices=initial_indices,
             final_indices=torch.zeros_like(initial_indices),
@@ -140,7 +126,7 @@ class GdnPrefillStaging:
             and self.max_seqs >= max_seqs
             and self.key_heads == key_heads
             and self.value_heads == value_heads
-            and self.mixed_qkv.device == device
+            and self.query_start_loc.device == device
         )
 
     @property
@@ -148,10 +134,6 @@ class GdnPrefillStaging:
         return sum(
             tensor.numel() * tensor.element_size()
             for tensor in (
-                self.mixed_qkv,
-                self.a,
-                self.b,
-                self.output,
                 self.query_start_loc,
                 self.initial_indices,
                 self.final_indices,
@@ -164,10 +146,10 @@ class GdnPrefillStaging:
 
 
 class B12xGdnPrefill:
-    """Layer-held GDN capacity family with reusable staging buffers.
+    """Layer-held GDN capacity family with reusable sequence metadata.
 
     The layer supplies one declared ``Plan`` for every admitted capacity.
-    This helper owns only capacity staging buffers; the recurrent-state pool
+    This helper owns only metadata staging buffers; the recurrent-state pool
     remains a binding-time caller resource and can be invalidated without
     discarding the plans or these buffers.
     """
@@ -217,10 +199,6 @@ class B12xGdnPrefill:
         ):
             raise ValueError("GDN staging buffers do not cover the prepared capacity")
         self.staging = staging
-        self.mixed_qkv = staging.mixed_qkv
-        self.a = staging.a
-        self.b = staging.b
-        self.output = staging.output
         self.query_start_loc = staging.query_start_loc
         self.initial_indices = staging.initial_indices
         self.final_indices = staging.final_indices
@@ -259,9 +237,6 @@ class B12xGdnPrefill:
         capacity = next(capacity for capacity in self.capacities if rows <= capacity)
         plan = self.plans[capacity]
         (scratch,) = get_b12x_scratch_buffers(plan)
-        self.mixed_qkv[:rows].copy_(mixed_qkv)
-        self.a[:rows].copy_(a)
-        self.b[:rows].copy_(b)
         _stage_metadata[(1,)](
             query_start_loc,
             state_indices,
@@ -281,18 +256,18 @@ class B12xGdnPrefill:
             MAX_SEQS=self.max_seqs,
             BLOCK=triton.next_power_of_2(self.max_seqs + 1),
         )
-        q, k, v = self.mixed_qkv[:capacity].split(
+        q, k, v = mixed_qkv.split(
             (self.key_heads * 128, self.key_heads * 128, self.value_heads * 128),
             dim=-1,
         )
         binding = self.api.bind(
             plan,
             scratch=scratch,
-            q=q.view(capacity, self.key_heads, 128),
-            k=k.view(capacity, self.key_heads, 128),
-            v=v.view(capacity, self.value_heads, 128),
-            a=self.a[:capacity],
-            b=self.b[:capacity],
+            q=q.view(rows, self.key_heads, 128),
+            k=k.view(rows, self.key_heads, 128),
+            v=v.view(rows, self.value_heads, 128),
+            a=a,
+            b=b,
             A_log=self.A_log,
             dt_bias=self.dt_bias,
             recurrent_state=self.recurrent_state,
@@ -303,13 +278,12 @@ class B12xGdnPrefill:
             checkpoint_offsets=self.checkpoint_offsets,
             num_seqs=self.num_seqs,
             num_tokens=self.num_tokens,
-            output=self.output[:capacity],
+            output=output[:rows],
         )
         self.api.run(
             binding,
             scale=scale,
             eps=eps,
-            max_live_tokens=capacity,
+            max_live_tokens=rows,
             max_live_seqs=self.max_seqs,
         )
-        output[:rows].copy_(self.output[:rows])
