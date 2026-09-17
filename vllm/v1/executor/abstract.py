@@ -169,6 +169,8 @@ class Executor(ABC):
             self.vllm_config.compilation_config.encoder_compilation_time = max(
                 t.encoder for t in compilation_times
             )
+        if envs.VLLM_B12X_FREEZE_AFTER_STARTUP:
+            self.collective_rpc("freeze_b12x_preparation")
 
     @contextmanager
     def b12x_warmup_control(self):

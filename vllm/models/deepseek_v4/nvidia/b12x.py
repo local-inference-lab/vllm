@@ -32,8 +32,10 @@ from vllm.models.deepseek_v4.sparse_mla import (
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.b12x import (
+    B12xPlanResolver,
     B12xPreparationUnit,
     B12xWorkload,
+    PreparationResourceUnavailableError,
     b12x_layer,
     b12x_layer_prefix,
     get_b12x_compressed_sparse_mla,
@@ -740,7 +742,7 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
         self.vllm_config = vllm_config
         self._b12x_cache_page_views: dict[object, torch.Tensor] = {}
         self._b12x_wo_projection_weights: Any | None = None
-        self._b12x_wo_plans: dict[int, Any] = {}
+        self._b12x_wo_resolver: B12xPlanResolver | None = None
         self._b12x_mla_plans: dict[tuple[str, int, int, int], Plan] = {}
         super().__init__(vllm_config, *args, **kwargs)
 
@@ -825,36 +827,38 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
         self._b12x_wo_layer_name = _encode_layer_name(prefix)
         register_b12x_layer(prefix, self)
 
+    def _declare_b12x_wo_plan(self, rows: int, *, dynamic_tokens: bool):
+        weights = self._b12x_wo_projection_weights
+        if weights is None:
+            raise RuntimeError("B12x WO-A/WO-B weights were not packed after loading.")
+        module = _require_b12x_wo_projection()
+        table = self.rotary_emb.cos_sin_cache
+        return module.plan(
+            module.Caps(
+                device=table.device,
+                max_tokens=rows,
+                groups=weights.groups,
+                group_width=weights.group_width,
+                rank=weights.rank,
+                hidden=weights.hidden,
+            ),
+            invocation=dict(
+                operation="inv_rope",
+                dynamic_tokens=dynamic_tokens,
+                heads_per_group=self.n_local_heads // self.n_local_groups,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+                positions_dtype="int64",
+                cos_sin_dtype=str(table.dtype).removeprefix("torch."),
+            ),
+        )
+
     def _b12x_wo_plan(self, rows: int):
-        plan = self._b12x_wo_plans.get(rows)
-        if plan is None:
-            weights = self._b12x_wo_projection_weights
-            if weights is None:
-                raise RuntimeError(
-                    "B12x WO-A/WO-B weights were not packed after loading."
-                )
-            module = _require_b12x_wo_projection()
-            table = self.rotary_emb.cos_sin_cache
-            plan = module.plan(
-                module.Caps(
-                    device=table.device,
-                    max_tokens=rows,
-                    groups=weights.groups,
-                    group_width=weights.group_width,
-                    rank=weights.rank,
-                    hidden=weights.hidden,
-                ),
-                invocation=dict(
-                    operation="inv_rope",
-                    heads_per_group=self.n_local_heads // self.n_local_groups,
-                    nope_dim=self.nope_head_dim,
-                    rope_dim=self.rope_head_dim,
-                    positions_dtype="int64",
-                    cos_sin_dtype=str(table.dtype).removeprefix("torch."),
-                ),
+        if self._b12x_wo_resolver is None:
+            raise PreparationResourceUnavailableError(
+                f"{self.prefix}: no declared B12x WO projection plans"
             )
-            self._b12x_wo_plans[rows] = plan
-        return plan
+        return self._b12x_wo_resolver.resolve(rows)
 
     def get_b12x_preparation_units(
         self, layer: torch.nn.Module, workload: B12xWorkload
@@ -904,13 +908,24 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
                 owners=(weights, table),
             )
 
+        if self._b12x_wo_resolver is None:
+            self._b12x_wo_resolver = B12xPlanResolver(f"{self.prefix}.wo")
+        resolver = self._b12x_wo_resolver
+        resolver.declare(
+            workload,
+            exact=lambda rows: self._declare_b12x_wo_plan(rows, dynamic_tokens=False),
+            capacity=lambda rows: self._declare_b12x_wo_plan(rows, dynamic_tokens=True),
+        )
         requests = tuple(
-            self._b12x_wo_plan(rows).request(
+            plan.request(
                 name=f"{self.prefix}.wo.m{rows}",
                 prepare_call=prepare,
                 benchmark_call=prepare,
             )
-            for rows in workload.token_counts
+            for rows, plan in (
+                *resolver.exact_plans.items(),
+                *resolver.capacity_plans.items(),
+            )
         )
         return (
             B12xPreparationUnit(

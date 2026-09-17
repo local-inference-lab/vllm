@@ -13,7 +13,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import weakref
-from collections.abc import Hashable, Iterable, Mapping
+from collections.abc import Callable, Hashable, Iterable, Mapping
 from dataclasses import dataclass, fields, is_dataclass, replace
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Literal
@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import torch
 
 import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.utils.torch_utils import (
     LayerNameType,
     _resolve_layer_name,
@@ -33,6 +34,9 @@ if TYPE_CHECKING:
 
 class PreparationResourceUnavailableError(RuntimeError):
     """A native owner cannot describe or run its prepared work."""
+
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -83,6 +87,147 @@ class B12xWorkload:
             raise TypeError("eager_only must be boolean")
         object.__setattr__(self, "token_counts", counts)
         object.__setattr__(self, "fixed_token_counts", fixed)
+
+
+class B12xPlanResolver:
+    """Keep an owner's exact and capacity plans immutable after declaration."""
+
+    def __init__(self, owner: str):
+        self.owner = owner
+        self.exact_plans: dict[int, object] = {}
+        self.capacity_plans: dict[int, object] = {}
+
+    def declare(
+        self,
+        workload: B12xWorkload,
+        *,
+        exact: Callable[[int], object] | None = None,
+        capacity: Callable[[int], object],
+    ) -> None:
+        """Declare fixed plans and one capacity plan, without replacing plans."""
+        self.declare_capacities(
+            fixed_counts=workload.fixed_token_counts,
+            capacities=(workload.max_tokens,),
+            exact=exact,
+            capacity=capacity,
+        )
+
+    def declare_capacities(
+        self,
+        *,
+        fixed_counts: Iterable[int],
+        capacities: Iterable[int],
+        exact: Callable[[int], object] | None = None,
+        capacity: Callable[[int], object],
+    ) -> None:
+        """Declare fixed plans and capacity plans without replacing plans."""
+        fixed_counts = tuple(sorted(set(fixed_counts)))
+        capacities = tuple(sorted(set(capacities)))
+        check_declared_b12x_regimes(
+            self.owner,
+            tuple(self.capacity_plans),
+            tuple(self.exact_plans),
+            capacities,
+            fixed_counts,
+        )
+        if self.capacity_plans:
+            return
+        if exact is not None:
+            self.exact_plans = {rows: exact(rows) for rows in fixed_counts}
+        self.capacity_plans = {rows: capacity(rows) for rows in capacities}
+
+    def resolve(self, rows: int):
+        """Return an exact plan or the smallest declared capacity covering rows."""
+        if plan := self.exact_plans.get(rows):
+            return plan
+        for capacity in sorted(self.capacity_plans):
+            if rows <= capacity:
+                return self.capacity_plans[capacity]
+        raise PreparationResourceUnavailableError(
+            f"{self.owner}: no prepared b12x plan covers {rows} rows"
+        )
+
+
+def check_declared_b12x_regimes(
+    owner: str,
+    declared_capacities: tuple[int, ...],
+    declared_fixed_counts: tuple[int, ...],
+    capacities: tuple[int, ...],
+    fixed_counts: tuple[int, ...],
+) -> None:
+    """Reject changed capacities and report fixed counts omitted initially."""
+    if not declared_capacities:
+        return
+    if declared_capacities != capacities:
+        old = (
+            declared_capacities[0]
+            if len(declared_capacities) == 1
+            else declared_capacities
+        )
+        new = capacities[0] if len(capacities) == 1 else capacities
+        raise ValueError(f"{owner}: b12x capacity changed from {old} to {new}")
+    missing = sorted(set(fixed_counts) - set(declared_fixed_counts))
+    if missing:
+        logger.warning_once(
+            "%s: exact plans for %s were not declared in the first stage; "
+            "capacity plans serve those counts.",
+            owner,
+            tuple(missing),
+        )
+
+
+@dataclass(frozen=True)
+class DeclaredRegimes:
+    """A fixed-operand plan and the workload regimes it was declared for."""
+
+    plan: object
+    key: tuple[int, tuple[int, ...]]
+
+
+def regime_key(workload: B12xWorkload) -> tuple[int, tuple[int, ...]]:
+    return workload.max_tokens, workload.fixed_token_counts
+
+
+def keep_declared_regimes(
+    layer_name: str,
+    declared: tuple[int, tuple[int, ...]],
+    workload: B12xWorkload,
+) -> None:
+    check_declared_b12x_regimes(
+        layer_name,
+        (declared[0],),
+        declared[1],
+        (workload.max_tokens,),
+        workload.fixed_token_counts,
+    )
+
+
+def declare_regimes(
+    layer: torch.nn.Module,
+    attr: str,
+    workload: B12xWorkload,
+    declare: Callable[[int], object],
+):
+    """Declare a composite fixed-operand plan once for one layer."""
+    declared = getattr(layer, attr, None)
+    if declared is not None:
+        keep_declared_regimes(
+            _resolve_layer_name(layer.b12x_layer_name), declared.key, workload
+        )
+        return declared.plan
+    plan = declare(workload.max_tokens)
+    setattr(layer, attr, DeclaredRegimes(plan, regime_key(workload)))
+    return plan
+
+
+def declared_plan(layer: torch.nn.Module, attr: str):
+    declared = getattr(layer, attr, None)
+    if declared is None:
+        raise PreparationResourceUnavailableError(
+            f"{_resolve_layer_name(layer.b12x_layer_name)}: b12x linear has "
+            "no declared plan"
+        )
+    return declared.plan
 
 
 @dataclass(frozen=True)

@@ -264,6 +264,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.b12x import (
+    B12xPlanResolver,
     B12xPreparationUnit,
     B12xWorkload,
     get_b12x_mla_query_projection,
@@ -1463,7 +1464,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 device=weight.device,
             )
         ):
-            self._b12x_query_plans: dict[int, object] = {}
+            self._b12x_query_resolver = B12xPlanResolver(f"{self.layer_name}.mla_query")
             self._b12x_query_prefix = f"{self.layer_name}.mla_query"
             register_b12x_layer(self._b12x_query_prefix, self)
             self._b12x_query_layer_name = _encode_layer_name(self._b12x_query_prefix)
@@ -1515,16 +1516,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         return prepare
 
     def b12x_query_plan(self, tokens: int):
-        """Return the exact-M plan, declaring its default configuration on first use.
-
-        Called from the fused-query custom op body only.
-        """
-        tokens = int(tokens)
-        plan = self._b12x_query_plans.get(tokens)
-        if plan is None:
-            plan = self._declare_b12x_query_plan(tokens)
-            self._b12x_query_plans[tokens] = plan
-        return plan
+        """Return the prepared capacity bucket for the live token count."""
+        return self._b12x_query_resolver.resolve(int(tokens))
 
     def get_b12x_preparation_units(
         self, layer: torch.nn.Module, workload: B12xWorkload
@@ -1539,12 +1532,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if (
             not isinstance(weight, torch.Tensor)
             or weight.is_meta
-            or not hasattr(self, "_b12x_query_plans")
+            or not hasattr(self, "_b12x_query_resolver")
         ):
             return backend_units
-        plans = self._b12x_query_plans
-        requests = []
-        for tokens in workload.token_counts:
+        capacities = []
+        # BF16 plans use a runtime row mask. Exact fixed-M declarations would
+        # duplicate the same 16/32 launchers, so the two capacity buckets are
+        # the complete and smallest useful startup set.
+        for tokens in (16, 32):
             if not can_implement_bf16_mla_query(
                 num_heads=int(weight.shape[0]),
                 max_m=tokens,
@@ -1554,10 +1549,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 device=weight.device,
             ):
                 continue
-            plan = plans.get(tokens)
-            if plan is None:
-                plan = self._declare_b12x_query_plan(tokens)
-                plans[tokens] = plan
+            capacities.append(tokens)
+        if capacities:
+            self._b12x_query_resolver.declare_capacities(
+                fixed_counts=(),
+                capacities=capacities,
+                capacity=self._declare_b12x_query_plan,
+            )
+        requests = []
+        for tokens in capacities:
+            plan = self._b12x_query_resolver.resolve(tokens)
             requests.append(
                 plan.request(
                     name=self._b12x_query_name(tokens),
@@ -1570,7 +1571,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             *backend_units,
             B12xPreparationUnit(
                 name="MLA_QUERY",
-                key=(self._b12x_query_prefix, tuple(sorted(plans))),
+                key=(
+                    self._b12x_query_prefix,
+                    tuple(self._b12x_query_resolver.capacity_plans),
+                ),
                 requests=tuple(requests),
                 stage="weights",
                 autotune=not workload.eager_only,

@@ -18,8 +18,10 @@ from vllm.model_executor.layers.attention import mla_attention
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
-from vllm.utils.b12x import get_b12x_paged_attention
-from vllm.utils.b12x import PreparationResourceUnavailableError
+from vllm.utils.b12x import (
+    PreparationResourceUnavailableError,
+    get_b12x_paged_attention,
+)
 from vllm.v1.attention.backends import b12x
 from vllm.v1.attention.backends.b12x import (
     B12xPagedAttentionBackend,
@@ -121,82 +123,117 @@ def _mla_query_layer() -> MLAAttention:
         torch.empty((8, 192, 512), dtype=torch.bfloat16), requires_grad=False
     )
     layer._b12x_query_prefix = "test.mla_query_plans"
-    layer._b12x_query_plans = {}
+    from vllm.utils.b12x import B12xPlanResolver
+
+    layer._b12x_query_resolver = B12xPlanResolver("test.mla_query_plans")
     return layer
 
 
-def test_mla_query_plan_declares_an_unplanned_row_count_without_preparing(
+def test_mla_query_plan_resolves_prepared_capacity_without_declaring(
     monkeypatch,
 ) -> None:
-    import b12x.preparation as preparation
+    from vllm.utils.b12x import PreparationResourceUnavailableError
 
     layer = _mla_query_layer()
-    planned = object()
-    layer._b12x_query_plans[4] = planned
-    prepared = []
+    declarations = []
+
+    class Plan:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def request(self, name, **kwargs):
+            return SimpleNamespace(name=name, plan=self, **kwargs)
+
+    def declare(rows):
+        declarations.append(rows)
+        return Plan(rows)
+
+    monkeypatch.setattr(layer, "_declare_b12x_query_plan", declare)
     monkeypatch.setattr(
-        preparation, "prepare_default", lambda request: prepared.append(request)
+        mla_attention, "can_implement_bf16_mla_query", lambda **_: True
     )
-
-    assert layer.b12x_query_plan(4) is planned
-    assert prepared == []
-
-    declared = layer.b12x_query_plan(11)
-    assert layer.b12x_query_plan(11) is declared
-    assert layer._b12x_query_plans == {4: planned, 11: declared}
-    assert declared.query.max_rows == 11
-    # Serving never prepares: the plan materializes its default on first use.
-    assert prepared == []
-
-    # The startup unit's prepare call for the same count binds the layer's weight.
-    runs = []
-    state = SimpleNamespace(run=lambda *args: runs.append(args))
-    layer._b12x_query_call(11)(state).run()
-    (q_nope, weight, q_pe, output), = runs
-    assert weight is layer.W_UK_T
-    assert q_nope.shape == (8, 11, 192)
-    assert q_pe.shape == (11, 8, 64)
-    assert output.shape == (11, 8, 576)
+    (unit,) = layer.get_b12x_preparation_units(layer, _mla_query_workload())
+    assert declarations == [16, 32]
+    assert [request.plan.rows for request in unit.requests] == [16, 32]
+    assert all(layer.b12x_query_plan(rows).rows == 16 for rows in range(1, 17))
+    assert all(layer.b12x_query_plan(rows).rows == 32 for rows in range(17, 33))
+    assert declarations == [16, 32]
+    with pytest.raises(PreparationResourceUnavailableError):
+        layer.b12x_query_plan(33)
 
 
-def test_mla_query_preparation_units_declare_the_planned_row_counts(
-    monkeypatch,
-) -> None:
-    import b12x.preparation as preparation
-
+def _mla_query_workload():
     from vllm.utils.b12x import B12xWorkload
 
-    layer = _mla_query_layer()
-    monkeypatch.setattr(
-        mla_attention,
-        "can_implement_bf16_mla_query",
-        lambda **kwargs: 1 <= kwargs["max_m"] <= 32,
-    )
-    prepared = []
-    monkeypatch.setattr(
-        preparation, "prepare_default", lambda request: prepared.append(request)
-    )
-    workload = B12xWorkload(
-        stage="weights",
-        token_counts=(1, 8, 128),
-        fixed_token_counts=(),
+    return B12xWorkload(
+        stage="weights", token_counts=(1, 8, 32), fixed_token_counts=(),
         output_dtype=torch.bfloat16,
-        max_tokens=128,
+        max_tokens=32,
         max_seqs=8,
         max_model_len=1024,
     )
 
-    (unit,) = layer.get_b12x_preparation_units(layer, workload)
 
-    assert unit.name == "MLA_QUERY"
-    assert unit.key == ("test.mla_query_plans", (1, 8))
-    assert [request.name for request in unit.requests] == [
-        "test.mla_query_plans.m1",
-        "test.mla_query_plans.m8",
-    ]
-    assert [request.plan.query.max_rows for request in unit.requests] == [1, 8]
-    assert layer.b12x_query_plan(8) is unit.requests[1].plan
-    assert prepared == []
+def test_mla_query_uses_larger_bucket_when_smaller_bucket_is_unsupported(
+    monkeypatch,
+) -> None:
+    layer = _mla_query_layer()
+    monkeypatch.setattr(
+        mla_attention,
+        "can_implement_bf16_mla_query",
+        lambda **kwargs: kwargs["max_m"] == 32,
+    )
+    declarations = []
+    def declare(rows):
+        declarations.append(rows)
+        return SimpleNamespace(
+            rows=rows,
+            request=lambda name, **kwargs: SimpleNamespace(name=name, **kwargs),
+        )
+
+    monkeypatch.setattr(layer, "_declare_b12x_query_plan", declare)
+    (unit,) = layer.get_b12x_preparation_units(layer, _mla_query_workload())
+    assert [request.name for request in unit.requests] == ["test.mla_query_plans.m32"]
+    assert declarations == [32]
+    assert all(layer.b12x_query_plan(rows).rows == 32 for rows in range(1, 33))
+
+
+@pytest.mark.skipif(not torch.accelerator.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("rows", [1, 7, 16, 17, 32])
+def test_bf16_mla_query_capacity_32_matches_exact_plan(rows) -> None:
+    from b12x.gemm import mla_query_projection
+    from b12x.gemm.mla_query_projection._tuning import ProjectionQuery
+    from b12x.preparation import PreparationSession, PreparedCall
+
+    heads = 11
+    weight = torch.randn((heads, 192, 512), device="cuda", dtype=torch.bfloat16)
+    q_nope = torch.randn((heads, rows, 192), device="cuda", dtype=torch.bfloat16)
+    q_pe = torch.randn((rows, heads, 64), device="cuda", dtype=torch.bfloat16)
+    capacity_out = torch.empty((rows, heads, 576), device="cuda", dtype=torch.bfloat16)
+    exact_out = torch.empty_like(capacity_out)
+
+    def query(max_rows):
+        return ProjectionQuery(heads=heads, max_rows=max_rows, weight_format="bf16",
+                               output_dtype="bfloat16", b_major="n", sf_axis="n")
+
+    plans = {size: mla_query_projection.plan(query(size)) for size in (rows, 32)}
+
+    def prepare(state):
+        size = state.query.max_rows
+        return PreparedCall(run=lambda: state.run(
+            torch.zeros((heads, size, 192), device="cuda", dtype=torch.bfloat16),
+            weight,
+            torch.zeros((size, heads, 64), device="cuda", dtype=torch.bfloat16),
+            torch.empty((size, heads, 576), device="cuda", dtype=torch.bfloat16),
+        ))
+
+    with PreparationSession(autotune=False) as session:
+        session.prepare(tuple(plan.request(name=f"mla.{size}", prepare_call=prepare)
+                              for size, plan in plans.items()))
+        session.freeze()
+        mla_query_projection.run(q_nope, weight, q_pe, capacity_out, plan=plans[32])
+        mla_query_projection.run(q_nope, weight, q_pe, exact_out, plan=plans[rows])
+    torch.testing.assert_close(capacity_out, exact_out, rtol=0, atol=0)
 
 
 def test_mla_preallocates_absorbed_weights_before_dequantization(
@@ -771,11 +808,13 @@ def test_b12x_dsa_indexer_live_rows_reuse_capacity_with_high_page_ids(mode, comp
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.attention import dsa_indexer
     from b12x.attention.dsa_indexer.reference import (
-        pack_index_k_cache_reference, unpack_index_k_cache_reference,
+        pack_index_k_cache_reference,
+        unpack_index_k_cache_reference,
     )
     from b12x.preparation import PreparationSession
-    from vllm.utils.b12x import B12xWorkload
+
     import vllm.v1.worker.workspace as workspace
+    from vllm.utils.b12x import B12xWorkload
 
     if torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("requires SM12x")

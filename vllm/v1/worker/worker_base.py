@@ -139,6 +139,9 @@ class WorkerBase:
         self._b12x_startup_coordinator = coordinator
         return coordinator.status()
 
+    def freeze_b12x_preparation(self) -> None:
+        """Freeze b12x preparation when this worker owns a session."""
+
     def advance_b12x_preparation(
         self, *, cancel_tuning: bool = False
     ) -> dict[str, object]:
