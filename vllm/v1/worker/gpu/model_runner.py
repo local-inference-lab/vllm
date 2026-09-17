@@ -78,6 +78,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     RoutedExpertsTensors,
 )
+from vllm.v1.sample.ops.topk_topp_sampler import register_top_k_top_p_warmups
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.watermarking.spec_decode import (
@@ -472,6 +473,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Initialize samplers. Model states may override via custom_sampler().
         if self.is_last_pp_rank and not self.is_pooling_model:
+            # Seeded and processed-logprob requests use native filtering even
+            # when unseeded warmup requests select FlashInfer sampling.
+            with self.jit_warmup_registry.activate():
+                register_top_k_top_p_warmups()
             sampler_kwargs: dict[str, Any] = {
                 "max_num_reqs": self.max_num_reqs,
                 "vocab_size": self.vocab_size,
