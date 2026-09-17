@@ -751,9 +751,17 @@ def test_glm53_selector_constructs_with_matching_preparation_heads(
     _, main = _packed_main_cache(
         device=torch.device("cpu"), blocks=2, layers=1, block_size=256, layer=0
     )
+    assert indexer._physical_selection_plan is None
+    indexer._physical_selection_plan = object()
     indexer.bind_main_kv_cache(main)
 
     assert indexer.indexer_op._num_q_heads == indexer._q_fp8.shape[1] == 32
+    assert indexer._physical_selection_plan is None
+    indexer._physical_selection_plan = object()
+    indexer.unbind_main_kv_cache()
+    assert indexer._physical_selection_plan is None
+    assert indexer._index_cache is None
+    assert indexer._main_cache_num_blocks == 0
 
 
 def test_glm53_packed_tail_accepts_nvfp4_main_record() -> None:
