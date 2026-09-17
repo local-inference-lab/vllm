@@ -375,7 +375,7 @@ def test_b12x_tensor_fp8_apply_quantizes_and_uses_prepared_plan(
     layer.weight_scale = torch.nn.Parameter(torch.tensor(0.25), requires_grad=False)
     layer.input_scale = torch.nn.Parameter(torch.tensor(0.5), requires_grad=False)
     plan = object()
-    layer.b12x_tensor_fp8_plans = {6: plan}
+    layer.b12x_tensor_fp8_regimes = b12x_mod._Fp8Regimes(plan, (16, (1,)))
     name = "tensor-fp8-apply-probe"
     layer.b12x_layer_name = _encode_layer_name(name)
     register_b12x_layer(name, layer)
@@ -802,6 +802,7 @@ def test_b12x_mxfp8_apply_delegates_to_layer_held_linear_holder(monkeypatch) -> 
 
 
 def test_b12x_block_fp8_apply_uses_prepared_plan(monkeypatch) -> None:
+    """Every row count, planned or not, runs the layer's one declared plan."""
     import vllm.model_executor.kernels.linear.scaled_mm.b12x as b12x_mod
 
     # Bypass the CUDA-only op dispatch key (see the mxfp8 apply test above)
@@ -826,13 +827,12 @@ def test_b12x_block_fp8_apply_uses_prepared_plan(monkeypatch) -> None:
         lambda: types.SimpleNamespace(mm_block_fp8=mm_block_fp8),
     )
 
-    a = torch.empty((6, 128), dtype=torch.float8_e4m3fn)
     weight = torch.empty((256, 128), dtype=torch.float8_e4m3fn)
-    a_scale = torch.empty((6, 1), dtype=torch.float32)
     weight_scale = torch.empty((2, 1), dtype=torch.float32)
     plan = object()
     layer = torch.nn.Module()
-    layer.b12x_block_fp8_plans = {6: plan}
+    regimes = b12x_mod._Fp8Regimes(plan, (16, (6,)))
+    layer.b12x_block_fp8_regimes = regimes
     name = "block-fp8-apply-probe"
     layer.b12x_layer_name = _encode_layer_name(name)
     register_b12x_layer(name, layer)
@@ -840,16 +840,25 @@ def test_b12x_block_fp8_apply_uses_prepared_plan(monkeypatch) -> None:
     kernel.config = types.SimpleNamespace(out_dtype=torch.bfloat16)
     kernel._b12x_block_fp8_owner = layer
 
-    output = kernel.apply_block_scaled_mm(a, weight, a_scale, weight_scale)
+    for rows in (6, 11):
+        a = torch.empty((rows, 128), dtype=torch.float8_e4m3fn)
+        a_scale = torch.empty((rows, 1), dtype=torch.float32)
 
-    assert output.shape == (6, 256)
-    assert output.dtype == torch.bfloat16
-    assert len(calls) == 1
-    assert calls[0] == (
-        (a, a_scale, weight, weight_scale),
-        {"plan": plan, "out_dtype": torch.bfloat16},
-    )
-    torch.testing.assert_close(output, torch.full_like(output, 13.0))
+        output = kernel.apply_block_scaled_mm(a, weight, a_scale, weight_scale)
+
+        assert output.shape == (rows, 256)
+        assert output.dtype == torch.bfloat16
+        assert calls[-1] == (
+            (a, a_scale, weight, weight_scale),
+            {"plan": plan, "out_dtype": torch.bfloat16},
+        )
+        torch.testing.assert_close(output, torch.full_like(output, 13.0))
+    assert len(calls) == 2
+    assert layer.b12x_block_fp8_regimes is regimes
+
+    layer.b12x_block_fp8_regimes = None
+    with pytest.raises(RuntimeError, match="no declared plan"):
+        kernel.apply_block_scaled_mm(a, weight, a_scale, weight_scale)
 
 
 def test_b12x_mxfp4_requires_dynamic_activations() -> None:
@@ -1875,25 +1884,11 @@ def test_b12x_mhc_keeps_plans_across_workloads(monkeypatch) -> None:
     assert mhc._plan_for("post", 100) is mhc._plans[("post", 128)]
 
 
-@pytest.mark.parametrize("kind", ["block", "tensor"])
-def test_b12x_fp8_preparation_units_key_on_their_planned_rows(
-    monkeypatch, kind: str
-) -> None:
-    import vllm.model_executor.kernels.linear.scaled_mm.b12x as b12x_mod
-
+def _fp8_layer(kind: str, name: str):
+    """A registered FP8 layer and kernel with loaded geometry and no declaration."""
     layer = torch.nn.Module()
-    name = f"fp8-{kind}-preparation-key-probe"
     layer.b12x_layer_name = _encode_layer_name(name)
     register_b12x_layer(name, layer)
-    workload = B12xWorkload(
-        stage="weights",
-        token_counts=(1, 8, 64),
-        fixed_token_counts=(),
-        output_dtype=torch.bfloat16,
-        max_tokens=64,
-        max_seqs=1,
-        max_model_len=64,
-    )
     if kind == "block":
         layer.weight = torch.nn.Parameter(
             torch.empty((256, 128), dtype=torch.float8_e4m3fn), requires_grad=False
@@ -1901,38 +1896,97 @@ def test_b12x_fp8_preparation_units_key_on_their_planned_rows(
         layer.weight_scale_inv = torch.nn.Parameter(
             torch.empty((2, 1)), requires_grad=False
         )
-        layer.b12x_block_fp8_plans = {}
-        monkeypatch.setattr(
-            b12x_mod,
-            "_block_fp8_plan",
-            lambda layer, rows, dtype: layer.b12x_block_fp8_plans.setdefault(
-                rows, FakePlan()
-            ),
-        )
+        layer.b12x_block_fp8_regimes = None
         kernel = object.__new__(B12xFp8BlockScaledMMKernel)
     else:
         layer.b12x_tensor_fp8_packed_weight = types.SimpleNamespace(
             values=torch.empty((256, 128), dtype=torch.float8_e4m3fn),
             in_features=128,
+            padded_in_features=128,
+            out_features=256,
         )
-        layer.b12x_tensor_fp8_plans = {}
-        monkeypatch.setattr(
-            b12x_mod,
-            "_tensor_fp8_plan",
-            lambda layer, rows, dtype: layer.b12x_tensor_fp8_plans.setdefault(
-                rows, FakePlan()
-            ),
-        )
+        layer.b12x_tensor_fp8_regimes = None
         kernel = object.__new__(B12xTensorFP8ScaledMMLinearKernel)
-        kernel.config = types.SimpleNamespace(out_dtype=torch.bfloat16)
+    kernel.config = types.SimpleNamespace(out_dtype=torch.bfloat16)
+    return layer, kernel
+
+
+@pytest.mark.parametrize("kind", ["block", "tensor"])
+def test_b12x_fp8_preparation_units_declare_one_capacity_regime(
+    monkeypatch, kind: str
+) -> None:
+    """A layer declares one regime from max_tokens and the fixed counts, once."""
+    from dataclasses import replace
+
+    import vllm.model_executor.kernels.linear.scaled_mm.b12x as b12x_mod
+
+    declarations = []
+
+    class Regimes:
+        def __init__(self, query, exact_m):
+            self.token_counts = (*exact_m, query["max_rows"])
+
+        def request(self, *, name, prepare_calls, benchmark_calls):
+            assert set(prepare_calls) == set(self.token_counts)
+            assert benchmark_calls is prepare_calls
+            return types.SimpleNamespace(name=name, plan=self)
+
+    def plan_regimes(query, *, exact_m):
+        declarations.append((query, exact_m))
+        return Regimes(query, exact_m)
+
+    api = types.SimpleNamespace(
+        FixedBlockscaledQuery=lambda **kwargs: kwargs, plan_regimes=plan_regimes
+    )
+    importer = (
+        "_import_b12x_blockscaled" if kind == "block" else "_import_b12x_tensor_fp8"
+    )
+    monkeypatch.setattr(b12x_mod, importer, lambda: api)
+    name = f"fp8-{kind}-capacity-regime-probe"
+    layer, kernel = _fp8_layer(kind, name)
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(1, 8, 64, 300, 4096),
+        fixed_token_counts=(1, 8),
+        output_dtype=torch.bfloat16,
+        max_tokens=4096,
+        max_seqs=8,
+        max_model_len=8192,
+    )
 
     (unit,) = kernel.get_b12x_preparation_units(layer, workload)
 
+    assert declarations == [
+        (
+            {
+                "recipe": "block_fp8" if kind == "block" else "tensor_fp8",
+                "call_kind": "serialized" if kind == "block" else "packed",
+                "max_rows": 4096,
+                "in_features": 128,
+                "padded_in_features": 128,
+                "out_features": 256,
+                "input_dtype": "float8_e4m3fn",
+                "output_dtype": "bfloat16",
+                "expected_m": None,
+            },
+            (1, 8),
+        )
+    ]
     assert unit.name == f"{kind.upper()}_FP8"
-    assert unit.key == (name, (1, 8, 64))
-    assert tuple(request.name for request in unit.requests) == tuple(
-        f"linear.{kind}_fp8.{name}.m{rows}" for rows in (1, 8, 64)
-    )
+    assert unit.key == (name, 4096, (1, 8), torch.bfloat16)
+    (request,) = unit.requests
+    assert request.name == f"linear.{kind}_fp8.{name}"
+    assert request.plan.token_counts == (1, 8, 4096)
+
+    # A later stage reuses the declaration; its extra fixed count runs on the
+    # capacity regime instead of a new plan.
+    later = replace(workload, stage="state", fixed_token_counts=(1, 8, 64))
+    (again,) = kernel.get_b12x_preparation_units(layer, later)
+    assert len(declarations) == 1
+    assert again.requests[0].plan is request.plan
+    with pytest.raises(ValueError, match="capacity changed from 4096 to 8192"):
+        kernel.get_b12x_preparation_units(layer, replace(workload, max_tokens=8192))
+    assert len(declarations) == 1
 
 
 def _check_v41_vocab_embedding_and_tied_head(device):
@@ -2440,46 +2494,39 @@ def test_b12x_linear_methods_report_their_kernel_scratch_requirement() -> None:
 
 
 @pytest.mark.parametrize("recipe", ["block", "tensor"])
-def test_b12x_fp8_preparation_unit_tracks_requested_rows(recipe):
-    """Collection declares each workload even when the layer retains more plans."""
+def test_b12x_fp8_preparation_unit_declares_the_b12x_capacity_regime(recipe):
+    """The unit carries b12x's composite: exact fixed counts plus one capacity."""
     pytest.importorskip("b12x")
-    layer = torch.nn.Module()
-    layer.b12x_layer_name = _encode_layer_name("fp8-preparation")
-    if recipe == "block":
-        kernel = object.__new__(B12xFp8BlockScaledMMKernel)
-        layer.weight = torch.empty((128, 128), dtype=torch.float8_e4m3fn)
-        layer.weight_scale = torch.ones((1, 1))
-        layer.b12x_block_fp8_plans = {}
-    else:
-        kernel = object.__new__(B12xTensorFP8ScaledMMLinearKernel)
-        layer.b12x_tensor_fp8_packed_weight = types.SimpleNamespace(
-            values=torch.empty((128, 128), dtype=torch.float8_e4m3fn),
-            in_features=128,
-            padded_in_features=128,
-            out_features=128,
-        )
-        layer.b12x_tensor_fp8_plans = {}
-    kernel.config = types.SimpleNamespace(out_dtype=torch.bfloat16)
+    layer, kernel = _fp8_layer(recipe, f"fp8-{recipe}-b12x-regime")
 
-    for counts in ((1, 4), (4,)):
+    for counts, fixed in (((1, 4, 11, 64), (1, 4)), ((1, 4, 5, 64), (1, 4, 5))):
         workload = B12xWorkload(
             stage="weights",
             token_counts=counts,
-            fixed_token_counts=(),
+            fixed_token_counts=fixed,
             output_dtype=torch.bfloat16,
-            max_tokens=4,
-            max_seqs=1,
-            max_model_len=4,
+            max_tokens=64,
+            max_seqs=4,
+            max_model_len=64,
         )
         (unit,) = kernel.get_b12x_preparation_units(layer, workload)
-        assert unit.key == ("fp8-preparation", counts)
-        assert tuple(request.plan.query.max_rows for request in unit.requests) == counts
-        assert all(request.plan.prepared is None for request in unit.requests)
+        (request,) = unit.requests
+        plan = request.plan
+        assert plan.component_id == "gemm.blockscaled.fixed"
+        assert plan.token_counts == (1, 4, 64)
+        assert dict(plan.capacity_metadata) == {"max_rows": 64, "exact_m": (1, 4)}
+        capacity = plan.variants[64].query
+        assert (capacity.max_rows, capacity.expected_m) == (64, None)
+        for rows in (1, 4):
+            query = plan.variants[rows].query
+            assert (query.max_rows, query.expected_m) == (rows, rows)
+        assert plan.prepared is None
 
 
 @pytest.mark.parametrize("recipe", ["block", "tensor"])
 @torch.inference_mode()
-def test_b12x_fp8_eager_unplanned_rows_use_default_and_replay(recipe):
+def test_b12x_fp8_unplanned_rows_use_the_capacity_regime_and_replay(recipe):
+    """Unplanned prefill rows run the prepared capacity regime; no plan is added."""
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.preparation import PreparationSession
 
@@ -2491,7 +2538,7 @@ def test_b12x_fp8_eager_unplanned_rows_use_default_and_replay(recipe):
     device = torch.device("cuda", torch.accelerator.current_device_index())
     n, k, capacity = 512, 256, 128
     values = torch.randn(n, k, device=device).to(torch.float8_e4m3fn)
-    source = torch.randn(capacity, k, device=device).to(torch.float8_e4m3fn)
+    source = torch.randn(capacity + 1, k, device=device).to(torch.float8_e4m3fn)
     layer = torch.nn.Module()
     name = f"fp8-eager-{recipe}-{id(layer):x}"
     layer.b12x_layer_name = _encode_layer_name(name)
@@ -2503,9 +2550,9 @@ def test_b12x_fp8_eager_unplanned_rows_use_default_and_replay(recipe):
         layer.weight_scale = torch.nn.Parameter(
             torch.full((n // 128, k // 128), 0.5, device=device), requires_grad=False
         )
-        layer.b12x_block_fp8_plans = {}
-        plans = layer.b12x_block_fp8_plans
-        scales = torch.full((capacity, k // 128), 0.25, device=device)
+        layer.b12x_block_fp8_regimes = None
+        attr = "b12x_block_fp8_regimes"
+        scales = torch.full((capacity + 1, k // 128), 0.25, device=device)
 
         def run(rows):
             return module.run_b12x_block_fp8_linear(
@@ -2523,8 +2570,8 @@ def test_b12x_fp8_eager_unplanned_rows_use_default_and_replay(recipe):
         layer.b12x_tensor_fp8_packed_weight = api.pack_weight(
             values, torch.tensor([0.125], device=device)
         )
-        layer.b12x_tensor_fp8_plans = {}
-        plans = layer.b12x_tensor_fp8_plans
+        layer.b12x_tensor_fp8_regimes = None
+        attr = "b12x_tensor_fp8_regimes"
 
         def run(rows):
             return module.run_b12x_tensor_fp8_linear(
@@ -2547,17 +2594,18 @@ def test_b12x_fp8_eager_unplanned_rows_use_default_and_replay(recipe):
 
     with PreparationSession(device=device, autotune=False) as session:
         session.prepare(tuple(request for unit in units for request in unit.requests))
-        assert set(plans) == {4, capacity}
-        actual = run(11)
-        assert plans[11].prepared is not None
-        assert plans[11].selection.source == "fixed"
-        torch.testing.assert_close(actual, expected(11), rtol=0.02, atol=0.125)
+        declared = getattr(layer, attr)
+        assert declared.plan.token_counts == (4, capacity)
+        assert declared.plan.prepared is not None
         session.freeze()
-        with kernel_resolution_guard("FP8 prepared exact-M execution"):
-            for rows in (4, 11, capacity):
+        with kernel_resolution_guard("FP8 prepared regime execution"):
+            for rows in (4, 11, 57, capacity):
                 torch.testing.assert_close(
                     run(rows), expected(rows), rtol=0.02, atol=0.125
                 )
+            assert getattr(layer, attr) is declared
+            with pytest.raises(ValueError, match="exceed capacity"):
+                run(capacity + 1)
             graph = torch.cuda.CUDAGraph()
             try:
                 with session.capture(), torch.cuda.graph(graph):

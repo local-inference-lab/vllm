@@ -37,6 +37,40 @@ def _operands(packed, recipe: str):
     return weight.values, weight.scale_mma, None, "none"
 
 
+def regime_key(workload: B12xWorkload) -> tuple[int, tuple[int, ...]]:
+    """The capacity and exact row counts a regime declaration covers."""
+    return workload.max_tokens, workload.fixed_token_counts
+
+
+def keep_declared_regimes(
+    layer_name: str,
+    declared: tuple[int, tuple[int, ...]],
+    workload: B12xWorkload,
+) -> None:
+    """Check a later workload against the regimes a layer already declared.
+
+    The plan is never replaced once declared, so a prepared plan stays
+    installed. A later workload that asks for more exact-M regimes is served
+    by the capacity regime for those counts; a different capacity is an error.
+    """
+    if declared == regime_key(workload):
+        return
+    max_tokens, fixed_token_counts = declared
+    if workload.max_tokens != max_tokens:
+        raise ValueError(
+            f"{layer_name}: b12x linear capacity changed "
+            f"from {max_tokens} to {workload.max_tokens}"
+        )
+    missing = sorted(set(workload.fixed_token_counts) - set(fixed_token_counts))
+    if missing:
+        logger.warning_once(
+            "%s: exact-M regimes for %s were not declared in the weights "
+            "stage; the capacity regime serves those counts.",
+            layer_name,
+            tuple(missing),
+        )
+
+
 class B12xBlockscaledLinear:
     def __init__(
         self,
@@ -55,7 +89,7 @@ class B12xBlockscaledLinear:
         self.layer_name = layer_name
         self.activation_scale = activation_scale
         self.plan = None
-        self._plan_key = None
+        self._plan_key: tuple[int, tuple[int, ...]] | None = None
 
     @property
     def out_features(self) -> int:
@@ -96,21 +130,9 @@ class B12xBlockscaledLinear:
         installed. A later workload that asks for more exact-M regimes is
         served by the capacity regime for those counts.
         """
-        key = (workload.max_tokens, workload.fixed_token_counts)
         if self.plan is not None:
-            if self._plan_key != key:
-                if workload.max_tokens != self._plan_key[0]:
-                    raise ValueError(
-                        f"{self.layer_name}: block-scaled linear capacity changed "
-                        f"from {self._plan_key[0]} to {workload.max_tokens}"
-                    )
-                missing = sorted(set(workload.fixed_token_counts) - set(self._plan_key[1]))
-                if missing:
-                    logger.warning_once(
-                        "%s: exact-M regimes for %s were not declared in the weights "
-                        "stage; the capacity regime serves those counts.",
-                        self.layer_name, tuple(missing),
-                    )
+            assert self._plan_key is not None
+            keep_declared_regimes(self.layer_name, self._plan_key, workload)
             return self.plan
         api = get_b12x_blockscaled()
         assert api is not None
@@ -131,7 +153,7 @@ class B12xBlockscaledLinear:
             expected_m=None,
         )
         self.plan = api.plan_regimes(query, exact_m=workload.fixed_token_counts)
-        self._plan_key = key
+        self._plan_key = regime_key(workload)
         return self.plan
 
     def _call_factory(self, rows: int):
