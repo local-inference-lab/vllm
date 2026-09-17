@@ -29,8 +29,8 @@ from vllm.distributed.parallel_state import (
     get_world_group,
     graph_capture,
 )
-from vllm.utils.b12x import B12xWorkload, PreparationResourceUnavailableError
 from vllm.platforms import current_platform
+from vllm.utils.b12x import B12xWorkload, PreparationResourceUnavailableError
 
 from ..utils import (
     get_open_port,
@@ -57,9 +57,11 @@ def _make_communicator(
     communicator.twoshot_max_bytes = 0
     plan = object()
     communicator._plans = {"prepared": plan}
+    communicator._plan_index = {}
     communicator._routes = {}
     communicator._invocations = {}
     communicator._plan_for = MagicMock(return_value=plan)
+    communicator._lookup_plan = MagicMock(return_value=plan)
     return communicator, runtime
 
 
@@ -271,17 +273,100 @@ def test_large_allreduce_dispatches_dma() -> None:
     )
 
 
-
 def test_dispatch_rejects_missing_exact_preparation() -> None:
     communicator, _ = _make_communicator()
     communicator._plans = {}
     communicator._invocations = {}
+    communicator._lookup_plan.return_value = None
 
     with pytest.raises(
         PreparationResourceUnavailableError,
         match="no declared plan for",
     ):
         B12xPcieAllReduce._plan_for(communicator, torch.randn(2, 4))
+
+
+def _indexed_communicator(invocations):
+    communicator = object.__new__(B12xPcieAllReduce)
+    communicator._invocations = {item.name: item for item in invocations}
+    communicator._plans = {item.name: object() for item in invocations}
+    communicator._index_declared_plans()
+    return communicator
+
+
+def test_declared_plan_index_preserves_complete_fused_identity():
+    operation = "all_reduce_fused_add_rms_norm"
+    weight_a = torch.ones(4)
+    weight_b = weight_a.clone()
+    source = torch.empty((2, 4), dtype=torch.bfloat16)
+    invocations = [
+        b12x_pcie_all_reduce.B12xPcieInvocation(
+            name=name,
+            operation=operation,
+            shape=(2, 4),
+            dtype=source.dtype,
+            norm_weight=weight,
+            epsilon=epsilon,
+        )
+        for name, weight, epsilon in (
+            ("a", weight_a, 1e-6),
+            ("b", weight_b, 1e-6),
+            ("epsilon", weight_a, 1e-5),
+        )
+    ]
+    communicator = _indexed_communicator(invocations)
+    for invocation in invocations:
+        assert (
+            communicator._plan_for(
+                source,
+                operation=operation,
+                weight=invocation.norm_weight,
+                epsilon=invocation.epsilon,
+            )
+            is communicator._plans[invocation.name]
+        )
+    assert not communicator._has_plan_for(source)
+    assert not communicator._has_plan_for(
+        source, operation=operation, weight=weight_a.clone(), epsilon=1e-6
+    )
+    assert not communicator._has_plan_for(
+        source, operation=operation, weight=weight_a, epsilon=1e-4
+    )
+
+
+def test_declared_plan_index_matches_shape_dtype_stride_and_first_declaration():
+    source = torch.empty((2, 4), dtype=torch.bfloat16)
+    invocation = b12x_pcie_all_reduce.B12xPcieInvocation
+    communicator = _indexed_communicator(
+        [
+            invocation("first", "all_reduce", (2, 4), source.dtype),
+            invocation(
+                "equivalent", "all_reduce", (2, 4), source.dtype, strides=(4, 1)
+            ),
+            invocation("strided", "all_reduce", (2, 4), source.dtype, strides=(8, 1)),
+        ]
+    )
+    assert communicator._plan_for(source) is communicator._plans["first"]
+    strided = torch.empty((2, 8), dtype=source.dtype)[:, :4]
+    assert communicator._plan_for(strided) is communicator._plans["strided"]
+    assert not communicator._has_plan_for(source.float())
+    assert not communicator._has_plan_for(source.flatten())
+    communicator._invocations = {}
+    assert communicator._plan_for(source) is communicator._plans["first"]
+    communicator._index_declared_plans()
+    assert not communicator._has_plan_for(source)
+
+
+def test_undeclared_plan_probe_neither_raises_nor_grows_the_index():
+    communicator = _indexed_communicator([])
+    for rows in range(1, 65):
+        source = torch.empty((rows, 4), dtype=torch.bfloat16)
+        assert not communicator._has_plan_for(source)
+        with pytest.raises(
+            PreparationResourceUnavailableError, match="no declared plan"
+        ):
+            communicator._plan_for(source)
+    assert communicator._plan_index == {}
 
 
 def test_fused_allreduce_has_an_independent_cutoff() -> None:
@@ -330,7 +415,9 @@ def test_capture_passes_a_declared_twoshot_plan_and_restores_state(raise_inside)
     selected = object()
     communicator._plans.update({"two": selected, "two_other": object()})
     communicator._routes = {
-        "prepared": "oneshot", "two": "twoshot", "two_other": "twoshot",
+        "prepared": "oneshot",
+        "two": "twoshot",
+        "two_other": "twoshot",
     }
     entered = []
 
@@ -412,8 +499,10 @@ def _reference_fused_add_rms_norm(
 
 def _run_b12x_fused_allreduce_gpu(rank: int, port: int) -> None:
     from b12x.preparation import PreparationSession
+
     from vllm.model_executor.warmup.b12x_prepare import b12x_batches
     from vllm.v1.worker.b12x_startup import B12xPreparationCoordinator
+
     device = torch.device(f"cuda:{rank}")
     torch.accelerator.set_device_index(device)
     config = VllmConfig()
@@ -429,7 +518,9 @@ def _run_b12x_fused_allreduce_gpu(rank: int, port: int) -> None:
         tp_group = get_tp_group()
         communicator = get_b12x_pcie_allreduce()
         assert communicator is not None
-        from vllm.model_executor.layers.fused_moe.b12x import _register_b12x_moe_output_collective
+        from vllm.model_executor.layers.fused_moe.b12x import (
+            _register_b12x_moe_output_collective,
+        )
 
         # Real RoutedExperts expose layer_name, not prefix. Distinct owners
         # remain distinct, while refreshing one owner's describer is idempotent.
@@ -442,9 +533,7 @@ def _run_b12x_fused_allreduce_gpu(rank: int, port: int) -> None:
             _register_b12x_moe_output_collective(owner, hidden_size=hidden_size)
 
         epsilon = 1e-6
-        weight = torch.linspace(
-            0.5, 1.5, 6144, dtype=torch.bfloat16, device=device
-        )
+        weight = torch.linspace(0.5, 1.5, 6144, dtype=torch.bfloat16, device=device)
         alternate_weight = weight.flip(0).contiguous()
         inp = torch.full((4, 6144), rank + 1, dtype=torch.bfloat16, device=device)
         residual = torch.linspace(
@@ -480,13 +569,21 @@ def _run_b12x_fused_allreduce_gpu(rank: int, port: int) -> None:
             ),
         )
         workload = B12xWorkload(
-            stage="weights", token_counts=(1, 4, 16), fixed_token_counts=(),
-            output_dtype=torch.bfloat16, max_tokens=16, max_seqs=2, max_model_len=16,
+            stage="weights",
+            token_counts=(1, 4, 16),
+            fixed_token_counts=(),
+            output_dtype=torch.bfloat16,
+            max_tokens=16,
+            max_seqs=2,
+            max_model_len=16,
         )
         units = list(communicator.get_b12x_preparation_units(communicator, workload))
         for prefix in ("test.oneshot.", "test.fused.", "test.dma."):
-            plans = [plan for name, plan in communicator._plans.items()
-                     if name.startswith(prefix)]
+            plans = [
+                plan
+                for name, plan in communicator._plans.items()
+                if name.startswith(prefix)
+            ]
             assert len(plans) == 40
             assert all(plan is plans[0] for plan in plans)
         batches = b12x_batches(units)
@@ -506,10 +603,16 @@ def _run_b12x_fused_allreduce_gpu(rank: int, port: int) -> None:
         assert session._stop.is_set()
         with session.capture():
             for index, hidden_size in enumerate((2048, 4096)):
-                value = torch.full((16, hidden_size), rank + index + 1,
-                                   dtype=torch.bfloat16, device=device)
+                value = torch.full(
+                    (16, hidden_size),
+                    rank + index + 1,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
                 reduced = tp_group.device_communicator.all_reduce(value)
-                torch.testing.assert_close(reduced, torch.full_like(value, 3 + 2 * index))
+                torch.testing.assert_close(
+                    reduced, torch.full_like(value, 3 + 2 * index)
+                )
 
         oneshot_inp = torch.full(
             (1, 6144), rank + 1, dtype=torch.bfloat16, device=device
@@ -573,9 +676,7 @@ def _run_b12x_fused_allreduce_gpu(rank: int, port: int) -> None:
         torch.testing.assert_close(residual, expected_residual)
         # This size exceeds the configured plain-oneshot limit and stays below
         # DMA's threshold; the existing PYNCCL fallback is deliberately retained.
-        plain_inp = torch.full(
-            (4, 6144), rank + 1, dtype=torch.bfloat16, device=device
-        )
+        plain_inp = torch.full((4, 6144), rank + 1, dtype=torch.bfloat16, device=device)
         expected_plain = plain_inp.clone()
         dist.all_reduce(expected_plain, group=tp_group.device_group)
         plain_out = tp_group.device_communicator.all_reduce(plain_inp)
@@ -593,12 +694,9 @@ def _run_b12x_fused_allreduce_gpu(rank: int, port: int) -> None:
         torch.accelerator.synchronize()
         torch.testing.assert_close(plain_out, expected_plain)
 
-
         dma = communicator._dma
         assert dma is not None
-        dma_inp = torch.full(
-            (16, 4096), rank + 1, dtype=torch.bfloat16, device=device
-        )
+        dma_inp = torch.full((16, 4096), rank + 1, dtype=torch.bfloat16, device=device)
         expected_dma = torch.full_like(dma_inp, 3)
         dma_out = tp_group.device_communicator.all_reduce(dma_inp)
         torch.testing.assert_close(dma_out, expected_dma)
@@ -750,6 +848,7 @@ def _run_b12x_twoshot_gpu(
     rank: int, port: int, device_indices: tuple[int, ...]
 ) -> None:
     from b12x.preparation import PreparationSession
+
     from vllm.model_executor.warmup.b12x_prepare import b12x_batches
     from vllm.v1.worker.b12x_startup import B12xPreparationCoordinator
 
@@ -776,20 +875,30 @@ def _run_b12x_twoshot_gpu(
             lambda requirements: tuple(
                 b12x_pcie_all_reduce.B12xPcieInvocation(
                     name=f"test.twoshot.64x4096.layer{index}",
-                    operation="all_reduce", shape=(64, 4096), dtype=torch.bfloat16,
+                    operation="all_reduce",
+                    shape=(64, 4096),
+                    dtype=torch.bfloat16,
                 )
                 for index in range(40)
             ),
         )
         workload = B12xWorkload(
-            stage="weights", token_counts=(64,), fixed_token_counts=(),
-            output_dtype=torch.bfloat16, max_tokens=64, max_seqs=2, max_model_len=64,
+            stage="weights",
+            token_counts=(64,),
+            fixed_token_counts=(),
+            output_dtype=torch.bfloat16,
+            max_tokens=64,
+            max_seqs=2,
+            max_model_len=64,
         )
         units = communicator.get_b12x_preparation_units(communicator, workload)
         plans = tuple(communicator._plans.values())
         assert len(plans) == 40 and all(plan is plans[0] for plan in plans)
         coordinator = B12xPreparationCoordinator(
-            session, b12x_batches(units), global_rank=rank, world_group=get_world_group(),
+            session,
+            b12x_batches(units),
+            global_rank=rank,
+            world_group=get_world_group(),
         )
         while True:
             outcome = coordinator.advance()
