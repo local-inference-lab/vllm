@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -165,6 +166,122 @@ def test_workspace_lane_validation(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="at least one"):
         workspace.WorkspaceManager(torch.device("cpu"), num_lanes=0)
+
+
+def test_profile_reserves_model_lanes_without_replicating_target_capacity(
+    monkeypatch,
+) -> None:
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    active_ubatch = [0]
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: active_ubatch[0])
+    manager = workspace.WorkspaceManager(
+        torch.device("cpu"), num_ubatches=2, num_lanes=2
+    )
+    monkeypatch.setattr(workspace, "_manager", manager)
+    calls: list[tuple[int, int]] = []
+
+    class ScratchOwner(torch.nn.Module):
+        def __init__(self, size):
+            super().__init__()
+            self.size = size
+
+        def reserve_profile_scratch(self):
+            calls.append((self.size, workspace._workspace_lane.get()))
+            manager.get_simultaneous(((self.size,), torch.uint8))
+
+    target = ScratchOwner(4096)
+    draft = ScratchOwner(512)
+    shared = ScratchOwner(256)
+    target.add_module("shared", shared)
+    draft.add_module("shared", shared)
+    runner = SimpleNamespace(
+        get_model=lambda: target,
+        get_draft_model=lambda: draft,
+        _draft_workspace_lane=1,
+        compilation_config=SimpleNamespace(
+            static_forward_context={
+                "target": target,
+                "alias": target,
+                "draft": draft,
+                "shared": shared,
+            }
+        ),
+    )
+    GPUModelRunner._reserve_profile_scratch(runner)
+
+    assert calls == [(4096, 0), (512, 1), (256, 0), (256, 1)]
+    buffers = [buffer for buffer in manager._current_workspaces if buffer is not None]
+    assert [buffer.numel() for buffer in buffers] == [4096, 512, 4096, 512]
+    pointers = [buffer.data_ptr() for buffer in buffers]
+    assert len(set(pointers)) == 4
+    manager.lock()
+    manager.reserve_by_lane()
+    for ubatch in range(2):
+        active_ubatch[0] = ubatch
+        for lane, size in enumerate((4096, 512)):
+            with workspace.use_workspace_lane(lane):
+                (view,) = manager.get_simultaneous(((size,), torch.uint8))
+            assert view.data_ptr() == pointers[ubatch * 2 + lane]
+
+
+def test_lane_reservation_rejects_unreserved_microbatch_when_locked(monkeypatch):
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    manager = workspace.WorkspaceManager(
+        torch.device("cpu"), num_ubatches=2, num_lanes=2
+    )
+    manager.get_simultaneous(((256,), torch.uint8))
+    manager.lock()
+    with pytest.raises(AssertionError, match="reserve_by_lane"):
+        manager.reserve_by_lane()
+
+
+@pytest.mark.parametrize("scoped", [False, True])
+def test_preparation_reservation_preserves_per_lane_profile_capacity(
+    monkeypatch, scoped
+):
+    from vllm.v1.worker.b12x_startup import B12xPreparationCoordinator
+
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    manager = workspace.WorkspaceManager(
+        torch.device("cpu"), num_ubatches=2, num_lanes=2
+    )
+    manager.get_simultaneous(((4096,), torch.uint8))
+    with workspace.use_workspace_lane(1):
+        manager.get_simultaneous(((256,), torch.uint8))
+    requests = []
+    for name, size in (("target", 1024), ("draft", 512), ("shared", 768)):
+        spec = SimpleNamespace(shape=(size,), dtype=torch.uint8)
+        requests.append(
+            SimpleNamespace(
+                name=name,
+                plan=SimpleNamespace(scratch_specs=lambda spec=spec: (spec,)),
+            )
+        )
+    job = SimpleNamespace(
+        advance=lambda **kwargs: SimpleNamespace(done=True, pending_compilation=False),
+        result=lambda: SimpleNamespace(close=lambda: None),
+        close=lambda: None,
+    )
+    coordinator = B12xPreparationCoordinator(
+        SimpleNamespace(begin=lambda *args, **kwargs: job),
+        [(tuple(requests), False)],
+        global_rank=0,
+        world_group=None,
+        process_local_only=True,
+        workspace=manager,
+        request_workspace_lanes=(
+            {"target": (0,), "draft": (1,), "shared": (0, 1)} if scoped else None
+        ),
+    )
+    result = coordinator.advance()
+    assert result["done"] and result["error"] is None
+    buffers = [buffer for buffer in manager._current_workspaces if buffer is not None]
+    expected = [4096, 768, 4096, 768] if scoped else [4096] * 4
+    assert [buffer.numel() for buffer in buffers] == expected
+    assert len({buffer.data_ptr() for buffer in buffers}) == 4
+    manager.lock()
+    manager.reserve_by_lane()
 
 
 def test_cuda_graph_capture_resources_are_scoped_to_collector() -> None:
