@@ -27,11 +27,11 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
     from b12x.preparation import PreparationSession
 
     from vllm.models.deepseek_v4_1 import attention
-    from vllm.utils.b12x import B12xWorkload
+    from vllm.utils.b12x import B12xWorkload, PreparationResourceUnavailableError
     from vllm.v1.worker.workspace import current_workspace_manager
 
     torch.manual_seed(411)
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", torch.accelerator.current_device_index())
     module = attention.DeepseekV4Attention.__new__(attention.DeepseekV4Attention)
     torch.nn.Module.__init__(module)
     module.prefix = "model.layers.0.attn"
@@ -50,13 +50,17 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
     )
     monkeypatch.setattr(attention, "get_tensor_model_parallel_world_size", lambda: 1)
     compacted = groups == 2
-    capacity = 4096 if compacted else 24
+    capacity = 4096 if compacted else 40
     draft_counts = {*range(7, 57, 7), *range(9, 73, 9)} if compacted else set()
     declared_counts = tuple(sorted({1, 4, 8, 24, capacity, *draft_counts}))
-    counts = (
-        tuple(sorted({*declared_counts, *range(128, 1025, 128)}))
-        if compacted
-        else declared_counts
+    counts = tuple(
+        sorted(
+            {
+                *declared_counts,
+                *range(1, 25),
+                *(range(128, 1025, 128) if compacted else ()),
+            }
+        )
     )
     workload = B12xWorkload(
         stage="weights",
@@ -105,22 +109,13 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
         session.prepare(tuple(request for unit in units for request in unit.requests))
         assert module._ready and module._helper_plan("q").prepared is not None
         assert module.swa_cache_layer.kv_cache.numel() == 0
-        for rows in (3, 17):
-            assert rows not in module._wo_plans
-            actual = module._o_proj(source[:rows], positions[:rows])
-            plan = module._wo_plans[rows]
-            assert plan.query.max_tokens == rows and plan.prepared is not None
-            assert plan.selection.source in ("default", "fixed")
-            assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
-            assert module._wo_plan(rows) is plan
-        counts = tuple(sorted((*counts, 3, 17)))
         for plan in module._wo_plans.values():
             current_workspace_manager().get_simultaneous(
                 *((spec.shape, spec.dtype) for spec in plan.scratch_specs())
             )
         session.freeze()
         cases = [(rows, False, module._wo_plans[rows]) for rows in counts]
-        remainders = (3575, 3582) if compacted else (13, 23)
+        remainders = (3575, 3582) if compacted else (31, 39)
         cases.extend((rows, True, module._wo_plans["prefill"]) for rows in remainders)
         for rows, is_prefill, plan in cases:
             scratch = tuple(
@@ -161,10 +156,10 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
                 source[:rows].neg_()
                 positions[:rows].add_(1).remainder_(table.shape[0])
                 replayed.fill_(float("nan"))
-                allocated = torch.cuda.memory_allocated(device)
+                allocated = torch.accelerator.memory_allocated(device)
                 graph.replay()
-                torch.cuda.synchronize(device)
-                assert torch.cuda.memory_allocated(device) == allocated
+                torch.accelerator.synchronize(device)
+                assert torch.accelerator.memory_allocated(device) == allocated
                 assert replayed.data_ptr() == pointer
                 expected = wo.run_inv_rope(binding=binding, plan=plan)
                 torch.testing.assert_close(replayed, expected, atol=0, rtol=0)
@@ -173,12 +168,9 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
                 )
             finally:
                 graph.reset()
-        with pytest.raises(RuntimeError, match="frozen"):
-            module._o_proj(source[:5], positions[:5])
-    from b12x.preparation.session import _LAZY_SESSIONS
-
-    for rows in (3, 17):
-        _LAZY_SESSIONS[device.index].release(module._wo_plans[rows])
+        with pytest.raises(PreparationResourceUnavailableError, match="not prepared"):
+            module._o_proj(source[:29], positions[:29])
+        assert 29 not in module._wo_plans
 
 
 @pytest.mark.parametrize("context", [32768, 131072, 1048576])
@@ -194,7 +186,7 @@ def test_indexer_declares_bounded_score_rows_at_model_context_capacity(
     from vllm.models.deepseek_v4_1 import attention
     from vllm.utils.b12x import B12xWorkload
 
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", torch.accelerator.current_device_index())
     module = attention.DeepseekV4Attention.__new__(attention.DeepseekV4Attention)
     torch.nn.Module.__init__(module)
     module.prefix = "model.layers.0.attn"
@@ -243,9 +235,9 @@ def test_indexer_declares_bounded_score_rows_at_model_context_capacity(
         max_seqs=8,
         max_model_len=context,
     )
-    allocated = torch.cuda.memory_allocated(device)
+    allocated = torch.accelerator.memory_allocated(device)
     (unit,) = module.get_b12x_preparation_units(module, workload)
-    assert torch.cuda.memory_allocated(device) == allocated
+    assert torch.accelerator.memory_allocated(device) == allocated
     assert unit.requests and all(
         request.collective is None for request in unit.requests
     )
@@ -286,7 +278,7 @@ def test_indexer_declares_bounded_score_rows_at_model_context_capacity(
 
 @pytest.mark.parametrize("layer_id", [2, 12, 14])
 @torch.no_grad()
-def test_indexer_primer_restores_live_cache(layer_id):
+def test_indexer_primer_restores_live_cache(layer_id, workspace_init):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("native b12x indexer requires SM12x")
     from b12x.attention import dsa_indexer
@@ -294,7 +286,7 @@ def test_indexer_primer_restores_live_cache(layer_id):
 
     from vllm.models.deepseek_v4_1 import attention
 
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", torch.accelerator.current_device_index())
     module = attention.DeepseekV4Attention.__new__(attention.DeepseekV4Attention)
     torch.nn.Module.__init__(module)
     module.layer_id, module.candidate_source_layer, module._index_page = (
@@ -351,7 +343,7 @@ def test_indexer_primer_restores_live_cache(layer_id):
                 call.produce()
                 call.reset()
                 call.run()
-                torch.cuda.synchronize(device)
+                torch.accelerator.synchronize(device)
                 assert call.output.shape == (rows, 512)
                 assert ((call.output >= 0) & (call.output < 1024)).all()
                 assert torch.sort(call.output, dim=1).values.diff(dim=1).gt(0).all()
@@ -377,6 +369,9 @@ def test_wo_prefill_remainders_reuse_declared_chunk_capacity():
     module._wo_projection_weights = SimpleNamespace(
         groups=2, group_width=4096, rank=1024, hidden=5120
     )
+    module._attention_declarations = {
+        "decode": SimpleNamespace(query=SimpleNamespace(query_rows=8))
+    }
     module.rotary_emb = SimpleNamespace(
         cos_sin_cache=torch.empty(1, 64, dtype=torch.bfloat16)
     )

@@ -48,6 +48,8 @@ def rewrite_requirements(
     cutlass_dsl_version: str,
 ) -> bytes:
     """Return wheel metadata with dependencies matching the foundation ABI."""
+    if cutlass_dsl_version != "4.6.2":
+        raise ValueError(f"unreviewed CUTLASS DSL foundation: {cutlass_dsl_version}")
     message = BytesParser(policy=compat32).parsebytes(metadata)
     requirements = message.get_all("Requires-Dist", [])
     replacements = {

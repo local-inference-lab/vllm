@@ -5,6 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VLLM_ROOT="${VLLM_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
 B12X_ROOT="${B12X_ROOT:-/home/luke/projects/b12x}"
+B12X_COMPILE_CACHE_DIR="${B12X_COMPILE_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME}/.cache}/b12x/compile/vllm-tp4}"
 NCCL_ROOT="${NCCL_ROOT:-/home/luke/projects/nccl-2.30.7}"
 NCCL_LIB="${NCCL_LIB:-${NCCL_ROOT}/build/lib/libnccl.so.2.30.7}"
 SPARK_ROOT="${SPARK_ROOT:-/home/luke/projects/spark-vllm-docker}"
@@ -30,6 +31,10 @@ HF_CACHE="${HF_CACHE:-${HOME}/.cache/vllm-huggingface}"
 MODEL_ID="${MODEL_ID:-deepseek-ai/DeepSeek-V4-Flash-0731}"
 MODEL_REVISION="${MODEL_REVISION:-9e165c30e2704aec5d9d593cce3eebd58bbef1cb}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-DeepSeek-V4-Flash}"
+TOKENIZER_MODE="${TOKENIZER_MODE:-deepseek_v4}"
+ENGRAM_CONFIG="${ENGRAM_CONFIG:-}"
+LIMIT_MM_PER_PROMPT="${LIMIT_MM_PER_PROMPT:-}"
+SECCOMP_PROFILE="${SECCOMP_PROFILE:-}"
 PORT="${PORT:-8000}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-500000}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
@@ -37,6 +42,9 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
 KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-10737418240}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-7}"
 DSPARK_DRAFT_ATTENTION_BACKEND="${DSPARK_DRAFT_ATTENTION_BACKEND:-auto}"
+DRAFT_SAMPLE_METHOD="${DRAFT_SAMPLE_METHOD:-probabilistic}"
+DSPARK_ADAPTIVE_VERIFICATION="${DSPARK_ADAPTIVE_VERIFICATION:-0}"
+DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE="${DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE:-1.0}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.82}"
 NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 
@@ -65,7 +73,10 @@ Launcher options:
 Environment overrides include HEAD_IP, LUXON_IP, GRAVITON_IP, CHRONITON_IP,
 MODEL_ID, MODEL_REVISION, HF_CACHE, MAX_MODEL_LEN, MAX_NUM_SEQS,
 NUM_SPECULATIVE_TOKENS, KV_CACHE_MEMORY_BYTES, GPU_MEMORY_UTILIZATION,
-B12X_ROOT, NCCL_ROOT, IMAGE_NAME and CONTAINER_MEMORY_GB.
+B12X_ROOT, B12X_COMPILE_CACHE_DIR, NCCL_ROOT, IMAGE_NAME, CONTAINER_MEMORY_GB,
+TOKENIZER_MODE, ENGRAM_CONFIG, LIMIT_MM_PER_PROMPT, SECCOMP_PROFILE,
+DRAFT_SAMPLE_METHOD, DSPARK_ADAPTIVE_VERIFICATION and
+DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE.
 EOF
 }
 
@@ -118,8 +129,10 @@ snapshot="${HF_CACHE}/hub/models--${MODEL_ID//\//--}/snapshots/${MODEL_REVISION}
 for path in \
   "${VLLM_ROOT}" \
   "${B12X_ROOT}" \
+  "${B12X_COMPILE_CACHE_DIR}" \
   "${NCCL_ROOT}" \
   "${HF_CACHE}" \
+  "${SECCOMP_PROFILE}" \
   "${CLUSTER_LAUNCHER}"; do
   if [[ "${path}" == *[[:space:]]* ]]; then
     echo "Spark bind-mount paths cannot contain whitespace: ${path}" >&2
@@ -201,6 +214,19 @@ for worker_ip in "${WORKER_IPS[@]}"; do
   done
 done
 
+loader_check='from importlib.metadata import entry_points; raise SystemExit(not any(ep.name == "b12x_loader" for ep in entry_points(group="vllm.general_plugins")))'
+if ! "${PYTHON_BIN}" -c "${loader_check}"; then
+  echo "Install b12x in ${PYTHON_BIN}'s environment to register its loader." >&2
+  exit 1
+fi
+printf -v remote_loader_check '%q -c %q' "${PYTHON_BIN}" "${loader_check}"
+for worker_ip in "${WORKER_IPS[@]}"; do
+  if ! ssh "${ssh_opts[@]}" "${worker_ip}" "${remote_loader_check}"; then
+    echo "b12x loader registration is missing on ${worker_ip}; install b12x in ${PYTHON_BIN}'s environment." >&2
+    exit 1
+  fi
+done
+
 runtime_digest() {
   LC_ALL=C find \
     "${VLLM_ROOT}/vllm" \
@@ -244,10 +270,27 @@ for worker_ip in "${WORKER_IPS[@]}"; do
   fi
 done
 
+mkdir -p -- "${B12X_COMPILE_CACHE_DIR}"
+printf -v remote_cache_dir '%q' "${B12X_COMPILE_CACHE_DIR}"
+for worker_ip in "${WORKER_IPS[@]}"; do
+  ssh "${ssh_opts[@]}" "${worker_ip}" "mkdir -p -- ${remote_cache_dir}"
+done
+
 mount_args="-v ${VLLM_ROOT}:${VLLM_ROOT}"
 mount_args+=" -v ${B12X_ROOT}:${B12X_ROOT}"
+mount_args+=" -v ${B12X_COMPILE_CACHE_DIR}:${B12X_COMPILE_CACHE_DIR}"
 mount_args+=" -v ${NCCL_ROOT}:${NCCL_ROOT}:ro"
 mount_args+=" -v ${HF_CACHE}:${HF_CACHE}:ro"
+if [[ -n "${SECCOMP_PROFILE}" ]]; then
+  cached_seccomp="${B12X_COMPILE_CACHE_DIR}/serving-seccomp.json"
+  if [[ "${SECCOMP_PROFILE}" != "${cached_seccomp}" ]]; then
+    cp -- "${SECCOMP_PROFILE}" "${cached_seccomp}"
+  fi
+  for worker_ip in "${WORKER_IPS[@]}"; do
+    rsync -a "${cached_seccomp}" "${worker_ip}:${cached_seccomp}"
+  done
+  mount_args+=" --security-opt seccomp=${cached_seccomp}"
+fi
 if [[ -n "${VLLM_SPARK_EXTRA_DOCKER_ARGS:-}" ]]; then
   mount_args+=" ${VLLM_SPARK_EXTRA_DOCKER_ARGS}"
 fi
@@ -274,6 +317,10 @@ cluster_args=(
   --env "TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas"
   --env "CUDA_VISIBLE_DEVICES=0"
   --env "CUTE_DSL_ARCH=sm_121a"
+  --env "B12X_COMPILE_CACHE_DIR=${B12X_COMPILE_CACHE_DIR}"
+  --env "B12X_WEIGHTS_COMPILE_WORKERS=${B12X_WEIGHTS_COMPILE_WORKERS:-${B12X_COMPILE_WORKERS:-16}}"
+  --env "B12X_STATE_COMPILE_WORKERS=${B12X_STATE_COMPILE_WORKERS:-${B12X_COMPILE_WORKERS:-16}}"
+  --env "B12X_BIND_COMPILE_WORKERS=${B12X_BIND_COMPILE_WORKERS:-${B12X_COMPILE_WORKERS:-4}}"
   --env "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
   --env "SAFETENSORS_FAST_GPU=1"
   --env "OMP_NUM_THREADS=16"
@@ -281,7 +328,7 @@ cluster_args=(
   --env "HF_HOME=${HF_CACHE}"
   --env "HF_HUB_OFFLINE=1"
   --env "TRANSFORMERS_OFFLINE=1"
-  --env "VLLM_PLUGINS=${VLLM_PLUGINS:-}"
+  --env "VLLM_PLUGINS=${VLLM_PLUGINS:-b12x_loader}"
   --env "DG_JIT_USE_NVRTC=0"
   --env "USE_CUDNN=1"
   --env "VLLM_ALLOW_LONG_MAX_MODEL_LEN=1"
@@ -349,14 +396,43 @@ compilation_config=$(printf \
 
 speculative_args=()
 if ((NUM_SPECULATIVE_TOKENS > 0)); then
-  draft_attention_json=
-  if [[ "${DSPARK_DRAFT_ATTENTION_BACKEND}" != auto ]]; then
-    draft_attention_json=$(printf ',"attention_backend":"%s"' \
-      "${DSPARK_DRAFT_ATTENTION_BACKEND}")
-  fi
-  speculative_config=$(printf \
-    '{"method":"dspark","num_speculative_tokens":%s,"draft_sample_method":"probabilistic"%s}' \
-    "${NUM_SPECULATIVE_TOKENS}" "${draft_attention_json}")
+  speculative_config="$(
+    "${PYTHON_BIN}" - "${NUM_SPECULATIVE_TOKENS}" \
+      "${DSPARK_DRAFT_ATTENTION_BACKEND}" "${DRAFT_SAMPLE_METHOD}" \
+      "${DSPARK_ADAPTIVE_VERIFICATION}" \
+      "${DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE}" <<'PY'
+import json
+import math
+import sys
+
+tokens, attention, sampling, adaptive, scale = sys.argv[1:]
+if sampling not in {"greedy", "probabilistic"}:
+    raise SystemExit("DRAFT_SAMPLE_METHOD must be greedy or probabilistic")
+booleans = {"1": True, "true": True, "yes": True, "on": True,
+            "0": False, "false": False, "no": False, "off": False}
+if adaptive.lower() not in booleans:
+    raise SystemExit("DSPARK_ADAPTIVE_VERIFICATION must be a boolean")
+adaptive = booleans[adaptive.lower()]
+try:
+    scale = float(scale)
+except ValueError:
+    raise SystemExit("DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE must be positive")
+if not math.isfinite(scale) or scale <= 0 or (not adaptive and scale != 1):
+    raise SystemExit("Verification cost scale must be positive; changing it requires adaptive verification")
+config = {
+    "method": "dspark",
+    "num_speculative_tokens": int(tokens),
+    "draft_tensor_parallel_size": 4,
+    "draft_sample_method": sampling,
+    "rejection_sample_method": "standard",
+    "enable_adaptive_verification": adaptive,
+    "adaptive_verification_cost_scale": scale,
+}
+if attention != "auto":
+    config["attention_backend"] = attention
+print(json.dumps(config))
+PY
+  )"
   speculative_args=(--speculative-config "${speculative_config}")
 fi
 
@@ -372,7 +448,7 @@ vllm_command=(
   --disable-custom-all-reduce
   --kv-cache-dtype fp8
   --block-size 256
-  --load-format fastsafetensors
+  --load-format b12x
   --moe-backend b12x
   --linear-backend b12x
   --attention-backend B12X
@@ -388,7 +464,7 @@ vllm_command=(
   --enable-prefix-caching
   --enable-flashinfer-autotune
   --compilation-config "${compilation_config}"
-  --tokenizer-mode deepseek_v4
+  --tokenizer-mode "${TOKENIZER_MODE}"
   --tool-call-parser deepseek_v4
   --enable-auto-tool-choice
   --reasoning-parser deepseek_v4
@@ -398,6 +474,12 @@ vllm_command=(
   --default-chat-template-kwargs.reasoning_effort=high
 )
 vllm_command+=("${speculative_args[@]}")
+if [[ -n "${ENGRAM_CONFIG}" ]]; then
+  vllm_command+=(--engram-config "${ENGRAM_CONFIG}")
+fi
+if [[ -n "${LIMIT_MM_PER_PROMPT}" ]]; then
+  vllm_command+=(--limit-mm-per-prompt "${LIMIT_MM_PER_PROMPT}")
+fi
 vllm_command+=("${vllm_args[@]}")
 
 if ((NUM_SPECULATIVE_TOKENS > 0)); then

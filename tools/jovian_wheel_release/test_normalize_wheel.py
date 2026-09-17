@@ -15,8 +15,17 @@ from tools.jovian_wheel_release.normalize_wheel import (
 )
 
 
-@pytest.mark.parametrize("source_cutlass", ["4.6.2", "4.7.1", "4.8.0"])
-def test_rewrites_foundation_dependencies(source_cutlass) -> None:
+@pytest.mark.parametrize(
+    "source_cutlass,target_cutlass",
+    [
+        ("4.6.2", "4.6.2"),
+        ("4.7.1", "4.6.2"),
+        ("4.8.0", "4.6.2"),
+        ("4.6.2", "4.7.1"),
+        ("4.6.2", "4.8.0"),
+    ],
+)
+def test_rewrites_foundation_dependencies(source_cutlass, target_cutlass) -> None:
     """Foundation-owned requirements match the exact published wheel set."""
     metadata = b"""Metadata-Version: 2.4
 Name: vllm
@@ -38,14 +47,14 @@ Requires-Dist: humming-kernels[cu13]==0.1.12
 Requires-Dist: click>=8
 
 """.replace(b"CUTLASS_VERSION", source_cutlass.encode())
-    if source_cutlass == "4.8.0":
+    if source_cutlass == "4.8.0" or target_cutlass != "4.6.2":
         with pytest.raises(ValueError, match="unreviewed CUTLASS DSL"):
             rewrite_requirements(
                 metadata,
                 torch_version="2.14.0a0+nv",
                 torchvision_version="0.29.0a0+nv",
                 flashinfer_version="0.6.18",
-                cutlass_dsl_version="4.6.2",
+                cutlass_dsl_version=target_cutlass,
             )
         return
     output = rewrite_requirements(
@@ -53,7 +62,7 @@ Requires-Dist: click>=8
         torch_version="2.14.0a0+nv",
         torchvision_version="0.29.0a0+nv",
         flashinfer_version="0.6.18",
-        cutlass_dsl_version="4.6.2",
+        cutlass_dsl_version=target_cutlass,
     )
     message = BytesParser(policy=compat32).parsebytes(output)
     assert message.get_all("Requires-Dist") == [

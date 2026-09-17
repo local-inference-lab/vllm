@@ -28,6 +28,10 @@ from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadataBuilder,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    use_preallocated_workspace,
+)
 
 
 class Glm5NextKDAMetadataBuilder(GDNAttentionMetadataBuilder):
@@ -137,20 +141,44 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         output = torch.empty_like(hidden_states)
-        if (
-            _GATE_SIDE_STREAM
-            and not self.use_full_rank_gate
-            and _gate_overlap_allowed()
-        ):
-            self._forward_gate_overlap(hidden_states, output)
-        else:
-            super().forward(hidden_states, positions, output)
+        if _GATE_SIDE_STREAM and not self.use_full_rank_gate:
+            # Reserve both branches even in serialized graph warmup, before
+            # workspace growth is forbidden by capture.
+            gate_workspace, main_workspace = self._projection_workspaces(
+                hidden_states.size(0)
+            )
+            if _gate_overlap_allowed():
+                self._forward_gate_overlap(
+                    hidden_states, output, gate_workspace, main_workspace
+                )
+                return output
+        super().forward(hidden_states, positions, output)
         return output
+
+    def _projection_workspaces(
+        self, num_tokens: int
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        def size(projection) -> int:
+            report = getattr(
+                getattr(projection, "quant_method", None), "get_workspace_size", None
+            )
+            return 0 if report is None else report(projection, num_tokens)
+
+        gate_bytes = max(size(self.g_a_proj), size(self.g_b_proj))
+        main_bytes = max(size(self.in_proj_qkvgfab), size(self.f_b_proj))
+        if not (gate_bytes or main_bytes):
+            return None, None
+        gate_workspace, main_workspace = current_workspace_manager().get_simultaneous(
+            ((gate_bytes,), torch.uint8), ((main_bytes,), torch.uint8)
+        )
+        return gate_workspace, main_workspace
 
     def _forward_gate_overlap(
         self,
         hidden_states: torch.Tensor,
         output: torch.Tensor,
+        gate_workspace: torch.Tensor | None,
+        main_workspace: torch.Tensor | None,
     ) -> None:
         num_tokens = hidden_states.size(0)
         main = torch.cuda.current_stream(hidden_states.device)
@@ -161,7 +189,7 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
         # Keep hidden_states alive for the side stream (allocator safety in
         # eager/warmup mode; a no-op inside graph capture).
         hidden_states.record_stream(side)
-        with torch.cuda.stream(side):
+        with torch.cuda.stream(side), use_preallocated_workspace(gate_workspace):
             g_a_states = self.g_a_proj(hidden_states)[0]
             # Some linear backends allocate their caller-owned output before
             # entering the active CUDA stream. Record the asynchronous consumer
@@ -170,21 +198,22 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
             g_a_states.record_stream(side)
             g_proj_states = self.g_b_proj(g_a_states)[0]
 
-        projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
-        # Same optional callback the shared forward offers after its first
-        # projection (e.g. the L2 weight prefetch of o_proj).
-        hook = getattr(self, "_l2_prefetch_hook", None)
-        if hook is not None:
-            hook(num_tokens)
-        mixed_qkv, beta, f_a = projected_qkvgfab.split(
-            [
-                3 * self.local_projection_size,
-                self.local_num_heads,
-                self.head_dim,
-            ],
-            dim=-1,
-        )
-        g1 = self.f_b_proj(f_a)[0]
+        with use_preallocated_workspace(main_workspace):
+            projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
+            # Same optional callback the shared forward offers after its first
+            # projection (e.g. the L2 weight prefetch of o_proj).
+            hook = getattr(self, "_l2_prefetch_hook", None)
+            if hook is not None:
+                hook(num_tokens)
+            mixed_qkv, beta, f_a = projected_qkvgfab.split(
+                [
+                    3 * self.local_projection_size,
+                    self.local_num_heads,
+                    self.head_dim,
+                ],
+                dim=-1,
+            )
+            g1 = self.f_b_proj(f_a)[0]
         beta = beta.unsqueeze(0)
         g1 = rearrange(g1, "n (h d) -> 1 n h d", d=self.head_dim)
 
