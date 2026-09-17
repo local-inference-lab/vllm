@@ -529,6 +529,14 @@ class Worker(WorkerBase):
         if batch is not None:
             batch.release()
 
+    def freeze_b12x_preparation(self) -> None:
+        """Reject new b12x preparation after all startup stages finish."""
+        if not envs.VLLM_B12X_FREEZE_AFTER_STARTUP:
+            return
+        session = getattr(self, "_b12x_session", None)
+        if session is not None:
+            session.freeze()
+
     def advance_b12x_preparation(
         self, *, cancel_tuning: bool = False
     ) -> dict[str, object]:

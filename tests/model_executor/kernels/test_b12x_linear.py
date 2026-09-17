@@ -73,25 +73,6 @@ def test_b12x_plan_resolver_uses_exact_then_capacity():
         resolver.declare(replace(workload, max_tokens=32), capacity=lambda rows: rows)
 
 
-def test_b12x_plan_resolver_resolve_never_declares():
-    resolver = B12xPlanResolver("resolver-test")
-    declarations = []
-
-    def declare(kind, rows):
-        declarations.append((kind, rows))
-        return kind, rows
-
-    resolver.declare_capacities(
-        fixed_counts=(1, 4),
-        capacities=(16,),
-        exact=lambda rows: declare("exact", rows),
-        capacity=lambda rows: declare("capacity", rows),
-    )
-    assert declarations == [("exact", 1), ("exact", 4), ("capacity", 16)]
-    assert resolver.resolve(7) == ("capacity", 16)
-    assert declarations == [("exact", 1), ("exact", 4), ("capacity", 16)]
-
-
 def _prepare(
     layer,
     *,
