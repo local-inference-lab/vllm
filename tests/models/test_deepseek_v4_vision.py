@@ -8,11 +8,12 @@ import pytest
 import torch
 
 from vllm.models.common.ops import sequence_parallel
+from vllm.models.deepseek_v4.common import vl_model
 from vllm.models.deepseek_v4.common.mm_preprocess import (
     IMAGE_PLACEHOLDER,
     DeepseekV4VLProcessingInfo,
 )
-from vllm.models.deepseek_v4.nvidia import mtp, vl_model
+from vllm.models.deepseek_v4.nvidia import mtp
 
 
 @pytest.mark.parametrize("vocabulary", [{}, {IMAGE_PLACEHOLDER: 42}])
@@ -29,9 +30,15 @@ def test_image_placeholder_requires_exact_vocabulary_entry(vocabulary):
         assert DeepseekV4VLProcessingInfo.get_image_placeholder_token_id(info) == 42
 
 
-def test_interleaved_vision_weights_are_streamed_and_finalized_once(monkeypatch):
+@pytest.mark.parametrize("child_finalizes", [False, True])
+def test_interleaved_vision_weights_are_streamed_and_finalized_once(
+    monkeypatch, child_finalizes
+):
     events = []
-    language_model = SimpleNamespace(process_weights_after_loading=Mock())
+    language_model = SimpleNamespace(
+        process_weights_after_loading=Mock(),
+        finalizes_weights_during_load=child_finalizes,
+    )
     model = SimpleNamespace(
         language_model=language_model,
         hf_to_vllm_mapper=SimpleNamespace(apply=iter),
@@ -51,6 +58,14 @@ def test_interleaved_vision_weights_are_streamed_and_finalized_once(monkeypatch)
             return loaded
 
     monkeypatch.setattr(vl_model, "AutoWeightsLoader", Loader)
+
+    def load_language_weights(weights):
+        loaded = Loader(language_model).load_weights(weights)
+        if child_finalizes:
+            language_model.process_weights_after_loading()
+        return loaded
+
+    language_model.load_weights = Mock(side_effect=load_language_weights)
     names = (
         "vision.patch_embed.weight",
         "language_model.model.embed.weight",
@@ -64,12 +79,14 @@ def test_interleaved_vision_weights_are_streamed_and_finalized_once(monkeypatch)
             yield name, torch.empty(1)
 
     loaded = vl_model.DeepseekV4ForConditionalGeneration.load_weights(model, weights())
+    language_model.load_weights.assert_called_once()
     assert loaded == set(names)
     assert events == [
         event
         for name in names
         for event in (("yield", name), ("load", name.removeprefix("language_model.")))
     ]
+    model.process_weights_after_loading()
     model.process_weights_after_loading()
     language_model.process_weights_after_loading.assert_called_once_with()
 
@@ -85,7 +102,9 @@ def test_mtp_routing_ids_match_local_hidden_rows(monkeypatch, num_tokens, rank, 
         sequence_parallel, "get_tensor_model_parallel_rank", lambda: rank
     )
     monkeypatch.setattr(mtp.envs, "VLLM_MOE_SKIP_PADDING", False)
-    monkeypatch.setattr(mtp, "fused_mtp_input_rmsnorm", lambda e, p, h, *args: (e, h))
+    monkeypatch.setattr(
+        mtp, "_FUSED_MTP_INPUT_RMSNORM_KERNEL", lambda e, p, h, *args: (e, h)
+    )
     monkeypatch.setattr(mtp, "sp_all_gather", lambda x: torch.cat([x, x]))
     ids = torch.arange(1, num_tokens + 1)
     expected = sequence_parallel.sp_shard(ids) if use_sp else ids

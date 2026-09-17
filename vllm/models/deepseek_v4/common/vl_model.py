@@ -36,6 +36,7 @@ from vllm.model_executor.models.utils import (
     init_vllm_registered_model,
     maybe_prefix,
 )
+from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalKwargsItem
 
@@ -146,11 +147,13 @@ class DeepseekV4ForConditionalGeneration(
                         self,
                         name,
                         nn.Parameter(
-                            torch.empty(config.hidden_size, dtype=torch.float32)
+                            allocate_weights(
+                                torch.empty, config.hidden_size, dtype=torch.float32
+                            )
                         ),
                     )
-                self.vision.to(dtype=model_config.dtype)
-                self.aligner.to(dtype=model_config.dtype)
+                allocate_weights(self.vision.to, dtype=model_config.dtype)
+                allocate_weights(self.aligner.to, dtype=model_config.dtype)
 
         with self._mark_language_model(vllm_config):
             # The arch convertor routes any config with a vision tower to
@@ -338,10 +341,9 @@ class DeepseekV4ForConditionalGeneration(
                     loaded_params.update(loader.load_weights([(name, weight)]))
 
         # Stream GPU tensors while delegating the text weights in one call.
-        language_loader = AutoWeightsLoader(self.language_model)
         loaded_params.update(
             f"language_model.{name}"
-            for name in language_loader.load_weights(language_weights())
+            for name in self.language_model.load_weights(language_weights())
         )
         self._weights_finalized = child_finalizes
         return loaded_params

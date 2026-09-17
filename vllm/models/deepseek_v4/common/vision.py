@@ -38,6 +38,7 @@ from vllm.model_executor.models.vision import (
     get_load_balance_assignment,
     is_vit_use_data_parallel,
 )
+from vllm.model_executor.weight_transfer import allocate_weights
 
 
 @lru_cache(8)
@@ -62,7 +63,9 @@ class DeepseekV4RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.weight = nn.Parameter(
+            allocate_weights(torch.ones, dim, dtype=torch.float32)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype = x.dtype
