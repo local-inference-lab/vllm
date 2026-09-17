@@ -127,7 +127,9 @@ def test_b12x_indexer_prefill_chunks_match_declared_capacity(
         max_logits_bytes=1 << 30,
     )
 
-    capacity = generic_b12x_indexer._prefill_plan_q_rows(builder.vllm_config)
+    capacity = generic_b12x_indexer._prefill_plan_q_rows(
+        max_num_batched_tokens, builder.max_prefill_buffer_size
+    )
     assert capacity < 100
     assert chunks == [
         (slice(0, 1), slice(start, min(start + capacity, 100)))
@@ -2191,6 +2193,7 @@ def _deepseek_v4_mla_layer(device, compress_ratio):
             use_dspark=lambda: True, num_speculative_tokens=3
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=17, max_num_seqs=2),
+        compilation_config=SimpleNamespace(max_cudagraph_capture_size=0),
     )
     workload = B12xWorkload(
         stage="state",

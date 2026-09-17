@@ -16,10 +16,10 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.triton_utils import tl, triton
 from vllm.utils.b12x import (
+    set_b12x_preparation_provider,
     B12xPreparationUnit,
     B12xWorkload,
     get_b12x_dsa_indexer,
-    set_b12x_preparation_provider,
 )
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.indexer import (
@@ -48,8 +48,18 @@ def _prefill_profile_q_rows(max_q_rows: int) -> int:
     supertile_k = max(supertile_k, 256)
     return min(max(int(max_q_rows), 1), max(1, max_logits_elems // supertile_k))
 
-def _prefill_plan_q_rows(vllm_config: VllmConfig) -> int:
-    return _prefill_profile_q_rows(min(vllm_config.scheduler_config.max_num_batched_tokens, get_max_prefill_buffer_size(vllm_config)))
+
+def _prefill_plan_q_rows(
+    max_num_batched_tokens: int, max_prefill_buffer_size: int
+) -> int:
+    """Rows of the prepared prefill plan, shared by preparation and chunking.
+
+    A prefill chunk never holds more rows than the scheduler's per-step token
+    budget, so the plan is bounded by it as well as by the logits workspace.
+    """
+    return _prefill_profile_q_rows(
+        min(max_num_batched_tokens, max_prefill_buffer_size)
+    )
 
 
 def _split_prefill_chunk_rows(
@@ -112,9 +122,11 @@ class B12xIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
                 request_offset=num_decodes + prefill_idx,
             )
         ]
-        return _split_prefill_chunk_rows(
-            chunks, _prefill_profile_q_rows(self.max_prefill_buffer_size)
+        capacity = _prefill_plan_q_rows(
+            self.vllm_config.scheduler_config.max_num_batched_tokens,
+            self.max_prefill_buffer_size,
         )
+        return _split_prefill_chunk_rows(chunks, capacity)
 
     def build(self, *args, **kwargs) -> DeepseekV32IndexerMetadata:
         metadata = super().build(*args, **kwargs)
@@ -328,12 +340,14 @@ class B12xSparseIndexer(nn.Module):
             raise ValueError("B12X indexing requires a positive index query head count.")
         self._module, self.k_cache = _require_b12x_indexer(), k_cache
         self.topk_tokens, self.max_model_len = int(topk_tokens), int(max_model_len)
-        self._prefill_max_q_rows = _prefill_plan_q_rows(config)
         self.topk_indices_buffer = topk_indices_buffer
         self.output_physical_slots, self.num_q_heads = bool(output_physical_slots), int(num_q_heads)
         self.active_width_cap = torch.full((1,), self.max_model_len, dtype=torch.int32, device=topk_indices_buffer.device)
         from vllm.config import get_current_vllm_config
         config = get_current_vllm_config()
+        self._prefill_max_q_rows = _prefill_plan_q_rows(
+            config.scheduler_config.max_num_batched_tokens, max_total_seq_len
+        )
         parallel = config.parallel_config
         self._max_num_seqs = int(config.scheduler_config.max_num_seqs)
         spec = config.speculative_config
@@ -356,10 +370,8 @@ class B12xSparseIndexer(nn.Module):
     def _register_score_collectives(self) -> None:
         if self.dcp_world_size <= 1:
             return
-        from vllm.distributed.device_communicators.b12x_pcie_all_reduce import (
-            B12xPcieInvocation,
-        )
         from vllm.distributed.parallel_state import register_b12x_collective_describer
+        from vllm.distributed.device_communicators.b12x_pcie_all_reduce import B12xPcieInvocation
         def describe(requirements):
             return tuple(B12xPcieInvocation(name=f"{self._preparation_prefix}.score_all_reduce.m{rows}.lane{requirements.workspace_lane}", operation="all_reduce", shape=(rows, self.topk_tokens), dtype=torch.float32) for rows in requirements.token_counts)
         register_b12x_collective_describer(self, describe, group=get_dcp_group())
@@ -515,3 +527,4 @@ class B12xSparseIndexer(nn.Module):
             if score is not None:
                 _merge_dcp_topk(output, score, self.dcp_rank, self.dcp_world_size, self.cp_kv_cache_interleave_size)
         return self.topk_indices_buffer
+
