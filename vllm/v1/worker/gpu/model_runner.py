@@ -1110,15 +1110,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             _teardown_profiling_state(self)
 
     @torch.inference_mode()
-    def profile_glm_dcp_attention(self) -> None:
+    def profile_glm_dcp_attention(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> None:
         """Measure the GLM DCP query-gather peak before KV cache sizing.
 
         The general activation profile deliberately skips attention and splits
         its token budget across many requests. A GLM sparse-MLA prefill can put
         the complete scheduler budget in one request, causing the DCP query
         all-gather to require substantially more temporary memory. Bind a
-        minimal split cache, execute that shape, then release all temporary
-        cache and backend state before production cache allocation.
+        one-block split cache for that single request, prepare its bound kernel
+        plans, then release the temporary cache before production allocation.
         """
         if (
             self.model_config.architecture != "Glm5NextForConditionalGeneration"
@@ -1126,8 +1128,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ):
             return
 
-        _init_minimal_kv_cache_for_profiling(self)
         try:
+            _init_minimal_kv_cache_for_profiling(self, num_blocks=1)
+            if prepare_profile_state is not None:
+                prepare_profile_state()
             self._dummy_run(
                 self.max_num_tokens,
                 context_len=self.dcp_size * self.cp_interleave,
