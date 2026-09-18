@@ -204,8 +204,16 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
         self.dcp_local_block_size = self.cp_kv_cache_interleave_size
         self.dcp_virtual_block_size = self.dcp_local_block_size * self.dcp_world_size
 
+        attention_layer = vllm_config.compilation_config.static_forward_context[
+            layer_names[0]
+        ]
+        layer_prefill_backend = attention_layer.prefill_backend
+        # Backends with native sparse prefill use their own caller-owned scratch
+        # and never build generic chunked-context metadata.
         self.chunked_prefill_workspace_size = (
             self.determine_chunked_prefill_workspace_size(vllm_config)
+            if layer_prefill_backend is not None
+            else 0
         )
         workspace_head_size = (
             self.mla_dims.kv_lora_rank + self.mla_dims.qk_rope_head_dim
@@ -235,10 +243,6 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
                 dtype=torch.int32,
                 device=device,
             )
-        attention_layer = vllm_config.compilation_config.static_forward_context[
-            layer_names[0]
-        ]
-        layer_prefill_backend = attention_layer.prefill_backend
         self.dcp_manager: MLADCPManager | None = None
         if self.dcp_world_size > 1:
             self.dcp_manager = getattr(attention_layer, "dcp_manager", None)
