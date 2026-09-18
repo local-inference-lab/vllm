@@ -5,6 +5,7 @@ import json
 import math
 import sys
 import types
+import weakref
 from dataclasses import dataclass
 from types import SimpleNamespace
 
