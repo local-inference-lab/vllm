@@ -611,48 +611,14 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._b12x_kda_max_tokens = max_tokens
         self._b12x_kda_max_seqs = max_seqs
         self._b12x_kda_state_index_columns = state_index_columns
-        width = self.local_num_heads * self.head_dim
-        self.register_buffer(
-            "_b12x_kda_mixed_qkv",
-            torch.zeros(
-                (max_tokens, 3 * width), dtype=self.model_config.dtype, device=device
-            ),
-            persistent=False,
-        )
         # KDA consumes one forget-gate value per head dimension in either gate
         # mode. Keep beta's row stride equal to its fused-projection view.
-        raw_beta_row_width = self.in_proj_qkvgfab.output_size_per_partition
-        raw_beta_offset = (
+        self._b12x_kda_beta_row_width = self.in_proj_qkvgfab.output_size_per_partition
+        self._b12x_kda_beta_offset = (
             4 * self.local_projection_size + self.head_dim
             if self.use_full_rank_gate
             else 3 * self.local_projection_size
         )
-        self.register_buffer(
-            "_b12x_kda_raw_beta_storage",
-            torch.zeros(
-                (max_tokens, raw_beta_row_width),
-                dtype=self.model_config.dtype,
-                device=device,
-            ),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_b12x_kda_raw_beta",
-            self._b12x_kda_raw_beta_storage.narrow(
-                1, raw_beta_offset, self.local_num_heads
-            ),
-            persistent=False,
-        )
-        for name, shape in (
-            ("_b12x_kda_raw_g", (max_tokens, self.local_num_heads, self.head_dim)),
-            ("_b12x_kda_z", (max_tokens, self.local_num_heads, self.head_dim)),
-            ("_b12x_kda_output", (max_tokens, self.local_num_heads, self.head_dim)),
-        ):
-            self.register_buffer(
-                name,
-                torch.zeros(shape, dtype=self.model_config.dtype, device=device),
-                persistent=False,
-            )
         self.register_buffer(
             "_b12x_kda_query_start_loc",
             torch.zeros(max_seqs + 1, dtype=torch.int32, device=device),
@@ -681,6 +647,25 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             persistent=False,
         )
 
+    def _b12x_kda_decode_probes(self) -> tuple[torch.Tensor, ...]:
+        """Allocate call-local probes with the live decode operand layouts."""
+        rows, heads, dim = (
+            self._b12x_kda_max_tokens,
+            self.local_num_heads,
+            self.head_dim,
+        )
+        dtype, device = self.model_config.dtype, self._b12x_kda_num_tokens.device
+        mixed_qkv = torch.empty((rows, 3 * heads * dim), dtype=dtype, device=device)
+        beta_storage = torch.empty(
+            (rows, self._b12x_kda_beta_row_width), dtype=dtype, device=device
+        )
+        raw_beta = beta_storage.narrow(1, self._b12x_kda_beta_offset, heads)
+        raw_g, z, output = (
+            torch.empty((rows, heads, dim), dtype=dtype, device=device)
+            for _ in range(3)
+        )
+        return mixed_qkv, raw_g, raw_beta, z, output
+
     def _b12x_kda_decode_declaration(self, max_state_slots: int):
         api = self._b12x_kda_api
         if api is None:
@@ -701,14 +686,15 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             qk_l2norm=True,
             null_state_index=self.b12x_kda_null_state_index,
         )
+        mixed_qkv, raw_g, raw_beta, z, output = self._b12x_kda_decode_probes()
         return api.plan(
             caps,
             invocation=api.invocation_from_tensors(
                 caps,
-                mixed_qkv=self._b12x_kda_mixed_qkv,
-                raw_g=self._b12x_kda_raw_g,
-                raw_beta=self._b12x_kda_raw_beta,
-                z=self._b12x_kda_z,
+                mixed_qkv=mixed_qkv,
+                raw_g=raw_g,
+                raw_beta=raw_beta,
+                z=z,
                 A_log=self.A_log,
                 dt_bias=self.dt_bias.view(self.local_num_heads, self.head_dim),
                 norm_weight=self.o_norm.weight,
@@ -718,7 +704,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 state_indices=self._b12x_kda_state_indices,
                 num_seqs=self._b12x_kda_num_seqs,
                 num_tokens=self._b12x_kda_num_tokens,
-                output=self._b12x_kda_output,
+                output=output,
             ),
         )
 
@@ -939,12 +925,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Trial and prepare factories own their scratch; the runtime binding
         # in _run_b12x_kda_decode_post_conv draws from the workspace manager.
         scratch = torch.empty(spec[0], dtype=spec[1], device=slots.device)
+        mixed_qkv, raw_g, raw_beta, z, output = self._b12x_kda_decode_probes()
         if benchmark:
-            mixed_qkv = self._b12x_trial_tensor(self._b12x_kda_mixed_qkv)
-            raw_g = self._b12x_trial_tensor(self._b12x_kda_raw_g)
-            raw_beta = self._b12x_trial_tensor(self._b12x_kda_raw_beta)
-            z = self._b12x_trial_tensor(self._b12x_kda_z)
-            output = self._b12x_trial_tensor(self._b12x_kda_output)
             query_start_loc = self._b12x_trial_tensor(self._b12x_kda_query_start_loc)
             accepted = self._b12x_trial_tensor(self._b12x_kda_num_accepted_tokens)
             state_indices = self._b12x_trial_tensor(self._b12x_kda_state_indices)
@@ -952,13 +934,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_tokens = self._b12x_trial_tensor(self._b12x_kda_num_tokens)
             saved_state = slots[slot : slot + 1].clone()
         else:
-            mixed_qkv, raw_g, raw_beta, z, output = (
-                self._b12x_kda_mixed_qkv,
-                self._b12x_kda_raw_g,
-                self._b12x_kda_raw_beta,
-                self._b12x_kda_z,
-                self._b12x_kda_output,
-            )
             query_start_loc = self._b12x_kda_query_start_loc
             accepted, state_indices = (
                 self._b12x_kda_num_accepted_tokens,
@@ -1008,19 +983,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             produce=produce,
             reset=reset,
             restore=reset if saved_state is not None else None,
-            owners=(
-                scratch,
-                mixed_qkv,
-                raw_g,
-                raw_beta,
-                z,
-                output,
-                query_start_loc,
-                accepted,
-                state_indices,
-                num_seqs,
-                num_tokens,
-            ),
         )
 
     def _prepare_b12x_kda_prefill(self, state):
