@@ -1537,9 +1537,12 @@ def test_sparse_mla_preparation_borrows_declared_scratch_shape(monkeypatch):
     assert all(probe() is None for probe in probes), published_owners
 
 
-@pytest.mark.parametrize("mode,rows", [("decode", 4), ("extend", 64)])
+@pytest.mark.parametrize(
+    "mode,rows,heads",
+    [("decode", 4, 16), ("extend", 64, 16), ("extend", 4096, 64)],
+)
 @torch.inference_mode()
-def test_sparse_mla_prepared_launcher_rebinds_without_warmup_probes(mode, rows):
+def test_sparse_mla_prepared_launcher_rebinds_without_warmup_probes(mode, rows, heads):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("native B12X sparse MLA requires SM12x")
     from b12x.attention import sparse_mla
@@ -1561,7 +1564,7 @@ def test_sparse_mla_prepared_launcher_rebinds_without_warmup_probes(mode, rows):
     )
     caps = sparse_mla.Caps(
         device=device,
-        num_q_heads=16,
+        num_q_heads=heads,
         max_q_rows=rows,
         max_width=2051,
         softmax_scale=256**-0.5,
@@ -1593,7 +1596,7 @@ def test_sparse_mla_prepared_launcher_rebinds_without_warmup_probes(mode, rows):
             assert plan.prepared.owners == ()
             session.freeze()
             current_workspace_manager().lock()
-            query = torch.zeros((rows, 16, 512), dtype=torch.bfloat16, device=device)
+            query = torch.zeros((rows, heads, 512), dtype=torch.bfloat16, device=device)
             selected = torch.zeros((rows, 2051), dtype=torch.int32, device=device)
             lengths = torch.full((rows,), 64, dtype=torch.int32, device=device)
             selected_lengths = torch.ones(rows, dtype=torch.int32, device=device)
