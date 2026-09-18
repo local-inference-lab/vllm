@@ -80,11 +80,11 @@ class _SerializedFp8Projector(nn.Module):
             requires_grad=False,
         )
         self.pre_norm = nn.LayerNorm(4, dtype=torch.bfloat16)
-        self.input_dtype: torch.dtype | None = None
+        self.inputs: list[torch.Tensor] = []
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        self.input_dtype = inputs.dtype
-        return inputs
+        self.inputs.append(inputs)
+        return inputs + len(self.inputs)
 
 
 def test_kimi_projector_uses_norm_activation_dtype_for_fp8_weights():
@@ -95,9 +95,43 @@ def test_kimi_projector_uses_norm_activation_dtype_for_fp8_weights():
         [torch.randn(2, 4), torch.randn(1, 4)],
     )
 
-    assert projector.input_dtype == torch.bfloat16
+    assert len(projector.inputs) == 2
+    assert [inputs.shape for inputs in projector.inputs] == [(2, 4), (1, 4)]
+    assert all(inputs.dtype == torch.bfloat16 for inputs in projector.inputs)
     assert [output.shape for output in outputs] == [(2, 4), (1, 4)]
     assert all(output.dtype == torch.bfloat16 for output in outputs)
+    assert torch.equal(outputs[0], projector.inputs[0] + 1)
+    assert torch.equal(outputs[1], projector.inputs[1] + 2)
+
+
+def test_kimi_projector_rejects_empty_vision_output():
+    with pytest.raises(
+        ValueError, match="Kimi vision projection requires at least one image feature"
+    ):
+        mm_projector_forward(_SerializedFp8Projector(), [])
+
+
+class _DeterministicProjector(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.pre_norm = nn.LayerNorm(4)
+        self.linear = nn.Linear(4, 3, bias=False)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.linear(self.pre_norm(inputs))
+
+
+def test_kimi_projector_preserves_batched_projection_results():
+    torch.manual_seed(1)
+    projector = _DeterministicProjector()
+    inputs = [torch.randn(2, 4), torch.randn(3, 4)]
+    expected = torch.split(projector(torch.cat(inputs)), [2, 3])
+
+    outputs = mm_projector_forward(projector, inputs)
+
+    assert len(outputs) == len(expected)
+    for output, reference in zip(outputs, expected):
+        torch.testing.assert_close(output, reference)
 
 
 def test_kimi_vision_rope_reuses_packed_qk_buffers():
