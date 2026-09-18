@@ -1521,6 +1521,111 @@ def test_sparse_mla_preparation_borrows_declared_scratch_shape(monkeypatch):
     assert calls == ["prime", "run", "prime", "run"]
     assert reservations == [(((spec.nbytes,), torch.uint8),)] * 2
 
+    probes = [
+        weakref.ref(bound[name])
+        for name in (
+            "q",
+            "selected_indices",
+            "cache_seqlens_int32",
+            "nsa_cache_seqlens_int32",
+        )
+    ]
+    # Publishing retains owners, but must not retain synchronized warmup inputs.
+    published_owners = (*call.owners, *second_call.owners)
+    del call, second_call
+    bound.clear()
+    assert all(probe() is None for probe in probes), published_owners
+
+
+@pytest.mark.parametrize("mode,rows", [("decode", 4), ("extend", 64)])
+@torch.inference_mode()
+def test_sparse_mla_prepared_launcher_rebinds_without_warmup_probes(mode, rows):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("native B12X sparse MLA requires SM12x")
+    from b12x.attention import sparse_mla
+    from b12x.preparation import PreparationSession
+
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        init_workspace_manager,
+        reset_workspace_manager,
+    )
+
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    cache = torch.empty((1, 64, 528), dtype=torch.uint8, device=device)
+    keys = torch.ones((64, 512), dtype=torch.bfloat16, device=device)
+    keys[1].fill_(2)
+    slots = torch.arange(64, dtype=torch.int64, device=device)
+    sparse_mla.concat_and_cache_glm_next_mla_fp8(
+        keys, cache, slots, plan=sparse_mla.plan_cache_writer(keys, cache, slots)
+    )
+    caps = sparse_mla.Caps(
+        device=device,
+        num_q_heads=16,
+        max_q_rows=rows,
+        max_width=2051,
+        softmax_scale=256**-0.5,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.uint8,
+        head_dim=512,
+        v_head_dim=512,
+        model_type=int(sparse_mla.ModelType.GLM_NEXT),
+        mode=mode,
+        max_batch=rows,
+        page_size=64,
+    )
+    plan = sparse_mla.plan(caps)
+    (spec,) = plan.scratch_specs()
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._bound_kv_cache = cache
+    impl._scratch_nbytes = spec.nbytes
+    init_workspace_manager(device)
+    try:
+        with PreparationSession(device=device, autotune=False) as session:
+            session.prepare(
+                (
+                    plan.request(
+                        name=f"probe-lifetime.{mode}",
+                        prepare_call=lambda state: impl._make_prepare_call(state, caps),
+                    ),
+                )
+            )
+            assert plan.prepared.owners == ()
+            session.freeze()
+            current_workspace_manager().lock()
+            query = torch.zeros((rows, 16, 512), dtype=torch.bfloat16, device=device)
+            selected = torch.zeros((rows, 2051), dtype=torch.int32, device=device)
+            lengths = torch.full((rows,), 64, dtype=torch.int32, device=device)
+            selected_lengths = torch.ones(rows, dtype=torch.int32, device=device)
+            scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+            state = plan.prepared.state
+
+            def run():
+                binding = state.bind(
+                    scratch=scratch,
+                    q=query,
+                    selected_indices=selected,
+                    cache_seqlens_int32=lengths,
+                    nsa_cache_seqlens_int32=selected_lengths,
+                    kv_cache=cache,
+                )
+                output = state.run(binding, kv_cache=cache)
+                return output[0] if isinstance(output, tuple) else output
+
+            actual = run()
+            torch.testing.assert_close(actual, torch.ones_like(actual), rtol=0, atol=0)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = run()
+            for index in (1, 0, 1):
+                selected[:, 0].fill_(index)
+                graph.replay()
+                torch.testing.assert_close(
+                    captured, torch.full_like(captured, index + 1), rtol=0, atol=0
+                )
+    finally:
+        reset_workspace_manager()
+
 
 @pytest.mark.parametrize("query_projection", [False, True])
 def test_mla_layer_discovers_backend_and_optional_query_plans(

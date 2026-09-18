@@ -1462,8 +1462,8 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         )
         selected_lengths = torch.ones(rows, dtype=torch.int32, device=caps.device)
         (scratch_spec,) = state.scratch_specs()
-        # Preparation calls execute serially but retain their owners. Borrow
-        # caller-owned scratch so exact-row plans do not each pin a workspace.
+        # Preparation calls execute serially. Borrow caller-owned scratch so
+        # exact-row plans do not each allocate a workspace.
         workspace = current_workspace_manager()
         workspace.reserve_all(((self._scratch_nbytes,), torch.uint8))
         (scratch,) = workspace.get_simultaneous(
@@ -1487,7 +1487,8 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         return PreparedCall(
             run=lambda: state.run(binding, kv_cache=kv_cache),
             produce=produce,
-            owners=(q, selected, cache_lengths, selected_lengths, scratch, binding),
+            # Closures retain probes until preparation has synchronized. The
+            # published launcher binds live inputs and must not pin these probes.
         )
 
     def get_b12x_preparation_units(
