@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the NVFP4 Marlin power-of-2 scale factor helper.
 
-The helper must return the same factor as the previous mask-and-gather
+The helper must return the same factor as the mask-and-gather
 implementation while allocating no tensor-sized temporaries.
 """
 
@@ -21,7 +21,7 @@ UPPER = 448 * (2**7)
 def _reference_scale_factor(
     marlin_scales: torch.Tensor, a_dtype: torch.dtype | None = None
 ) -> float:
-    """The previous implementation, kept verbatim as the oracle."""
+    """Reference reduction over positive scales in FP32."""
     if a_dtype is not None and a_dtype == torch.half:
         return 1.0
     ws_float = marlin_scales.float() * (2**7)
@@ -86,15 +86,33 @@ def test_scale_factor_rejects_nan():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-def test_scale_factor_allocates_no_tensor_temporaries():
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("contiguous", [False, True])
+def test_scale_factor_matches_fp8_scale_domain_on_cuda(dtype, contiguous):
+    """All nonnegative finite E4M3 scales retain their factor after reduction."""
+    values = torch.arange(127, dtype=torch.uint8).view(torch.float8_e4m3fn)
+    scales = values.to(dtype=dtype, device="cuda").repeat(4, 1).T
+    if contiguous:
+        scales = scales.contiguous()
+    for multiplier in (1.0, 2**-7, 2**-10):
+        sample = scales * multiplier
+        assert _nvfp4_compute_scale_factor(sample, torch.bfloat16) == (
+            _reference_scale_factor(sample, torch.bfloat16)
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_scale_factor_allocates_no_tensor_temporaries(record_property):
     device = torch.device("cuda")
     scales = torch.rand((288, 512, 256), dtype=torch.bfloat16, device=device) * 0.01
-    torch.cuda.synchronize(device)
-    torch.cuda.reset_peak_memory_stats(device)
-    baseline = torch.cuda.memory_allocated(device)
+    torch.accelerator.synchronize(device)
+    torch.accelerator.reset_peak_memory_stats(device)
+    baseline = torch.accelerator.memory_allocated(device)
     sf = _nvfp4_compute_scale_factor(scales)
-    torch.cuda.synchronize(device)
-    transient = torch.cuda.max_memory_allocated(device) - baseline
+    torch.accelerator.synchronize(device)
+    transient = torch.accelerator.max_memory_allocated(device) - baseline
+    record_property("transient_bytes", transient)
+    record_property("input_bytes", scales.numel() * scales.element_size())
     assert sf > 1.0
-    # The previous implementation needed ~4.5x the tensor size here.
+    # Scalar reduction must not allocate a scale-tensor-sized temporary.
     assert transient < scales.numel() * scales.element_size() // 64
