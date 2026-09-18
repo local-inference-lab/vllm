@@ -1181,6 +1181,7 @@ def profile_cudagraph_memory(
     partition reclaims the storages of earlier cudagraph recordings once the
     real capture records new ones, leading to use-after-free crashes).
     """
+    runner.cudagraph_native_memory_profile = None
     if runner.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
         return 0
 
@@ -1253,7 +1254,14 @@ def profile_cudagraph_memory(
             mem_samples: list[int] = []
             manager._capture_mem_samples = mem_samples
 
+            native_before_capture = _non_torch_memory_bytes()
             measured = int(runner.capture_model(profile_only=True))
+            native_after_capture = _non_torch_memory_bytes()
+            runner.cudagraph_native_memory_profile = (
+                native_before_capture,
+                native_after_capture,
+                measured,
+            )
 
             # The measured delta covers PIECEWISE, encoder and speculator graphs
             # plus the sampled FULL graphs; swap the sampled FULL cost for the
@@ -1301,6 +1309,13 @@ def profile_cudagraph_memory(
             _teardown_profiling_state(runner)
     finally:
         platform_cls._global_graph_pool = saved_global_pool
+
+
+def _non_torch_memory_bytes() -> int:
+    """Measure device memory not owned by the Torch caching allocator."""
+    torch.accelerator.synchronize()
+    free, total = torch.accelerator.get_memory_info()
+    return total - free - torch.accelerator.memory_reserved()
 
 
 def _extrapolate_full_graph_memory(

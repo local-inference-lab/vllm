@@ -346,7 +346,9 @@ def test_mla_post_load_preserves_runtime_weight_addresses(monkeypatch):
     layer.dcp_q_replicate = False
     layer.quant_config = None
     layer.layer_name = "test"
-    layer.impl = SimpleNamespace(process_weights_after_loading=lambda act_dtype: None)
+    layer.impl = SimpleNamespace(
+        process_weights_after_loading=lambda act_dtype: None, is_sparse=False
+    )
 
     monkeypatch.setattr(
         mla_attention_module, "set_default_quant_scales", lambda *_, **__: None
@@ -368,6 +370,95 @@ def test_mla_post_load_preserves_runtime_weight_addresses(monkeypatch):
     assert layer.W_UK_T.data_ptr() == w_uk_t_ptr
     torch.testing.assert_close(layer.W_UV, old_w_uv + 100)
     torch.testing.assert_close(layer.W_UK_T, old_w_uk_t + 100)
+
+
+@pytest.mark.parametrize("has_mha_prefill", [False, True])
+def test_mla_profile_reserves_only_supported_dense_context(
+    monkeypatch, has_mha_prefill
+):
+    layer = SimpleNamespace(
+        prefill_backend=object() if has_mha_prefill else None,
+        chunked_prefill_workspace_size=128,
+        num_heads=2,
+        qk_nope_head_dim=4,
+        v_head_dim=4,
+    )
+    q = torch.ones(3, 2, 8, dtype=torch.bfloat16)
+    kv_c = torch.ones(3, 8, dtype=torch.bfloat16)
+    output = torch.full((3, 8), float("nan"), dtype=torch.bfloat16)
+    allocations = []
+    empty = torch.empty
+
+    def record_empty(shape, **kwargs):
+        allocations.append(shape)
+        return empty(shape, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", record_empty)
+    actual = MLAAttention.forward_impl(layer, q, kv_c, kv_c, kv_c, None, output)
+    assert actual is output
+    assert torch.count_nonzero(output) == 0
+    assert allocations == ([(128, 2, 8)] if has_mha_prefill else [])
+
+
+@pytest.mark.skipif(not torch.accelerator.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("has_mha_prefill", [False, True])
+@torch.inference_mode()
+def test_mla_absorbed_mxfp8_weights_release_unused_linear_and_reload(
+    monkeypatch, has_mha_prefill
+):
+    from vllm.model_executor.kernels.linear.mxfp8.b12x import B12xMxfp8LinearKernel
+
+    layer = MLAAttention.__new__(MLAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.kv_lora_rank = 32
+    layer.num_heads = 2
+    layer.qk_nope_head_dim = layer.v_head_dim = 8
+    layer.kv_b_proj = torch.nn.Module()
+    layer.kv_b_proj.prefix = "test.absorbed.kv_b_proj"
+    layer.kv_b_proj.quant_method = None
+    layer.is_aiter_triton_fp4_bmm_enabled = False
+    layer.is_aiter_triton_fp8_bmm_enabled = False
+    layer.is_amx_bmm_enabled = False
+    layer.dcp_q_replicate = False
+    layer.quant_config = None
+    layer.layer_name = "test.absorbed"
+    layer.impl = SimpleNamespace(
+        process_weights_after_loading=lambda act_dtype: None, is_sparse=True
+    )
+    layer.prefill_backend = object() if has_mha_prefill else None
+    monkeypatch.setattr(
+        mla_attention_module, "set_default_quant_scales", lambda *_, **__: None
+    )
+    kernel = object.__new__(B12xMxfp8LinearKernel)
+    addresses = None
+    for offset in (0, 1):
+        source = torch.arange(1024, device="cuda").reshape(32, 32).remainder(15)
+        source = (source + offset).to(torch.float8_e4m3fn)
+        scales = torch.full((32, 1), 127, device="cuda", dtype=torch.uint8)
+        layer.kv_b_proj.weight = torch.nn.Parameter(source, requires_grad=False)
+        layer.kv_b_proj.weight_scale = torch.nn.Parameter(scales, requires_grad=False)
+        kernel.process_weights_after_loading(layer.kv_b_proj)
+        packed = layer.kv_b_proj.b12x_mxfp8_packed_weight
+        holder = layer.kv_b_proj.b12x_linear
+        layer.process_weights_after_loading(torch.float32)
+        expected = source.float().T.reshape(32, 2, 16)
+        torch.testing.assert_close(
+            layer.W_UK_T, expected[:, :, :8].permute(1, 2, 0), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            layer.W_UV, expected[:, :, 8:].transpose(0, 1), rtol=0, atol=0
+        )
+        observed = (layer.W_UK_T.data_ptr(), layer.W_UV.data_ptr())
+        if addresses is not None:
+            assert observed == addresses
+        addresses = observed
+        assert layer.kv_b_proj.b12x_mxfp8_packed_weight is (
+            packed if has_mha_prefill else None
+        )
+        assert layer.kv_b_proj.b12x_linear is (holder if has_mha_prefill else None)
+        assert layer.kv_b_proj.b12x_preparation_provider is (
+            kernel if has_mha_prefill else None
+        )
 
 
 # Validate parameter combinations during collection, before GPU fixtures run.

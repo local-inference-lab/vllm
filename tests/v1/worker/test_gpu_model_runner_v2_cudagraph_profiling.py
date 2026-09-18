@@ -141,6 +141,7 @@ def _patch_module(monkeypatch) -> None:
     # retained; default to a constant (nothing retained).
     monkeypatch.setattr(cgu.torch.accelerator, "empty_cache", lambda: None)
     monkeypatch.setattr(cgu.torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(cgu.torch.accelerator, "memory_reserved", lambda: 0)
     monkeypatch.setattr(
         cgu.torch.accelerator, "get_memory_info", lambda: (1 << 30, 1 << 30)
     )
@@ -212,6 +213,49 @@ def test_profile_cudagraph_memory_piecewise_only_returns_measured(monkeypatch):
 
     # No FULL graphs to sample or extrapolate: the measured delta is exact.
     assert result == captured_bytes
+
+
+@pytest.mark.parametrize(
+    "init_native,capture_native,retained_native",
+    [
+        (0, 256, 256),
+        (512, 256, 64),
+        (0, 256, 0),
+        (512, 0, 0),
+        (0, 0, 256),
+        (0, 256, 512),
+    ],
+)
+def test_profile_cudagraph_memory_records_native_growth_inside_capture_only(
+    monkeypatch, init_native, capture_native, retained_native
+):
+    """Worker reconciles capture growth after all prepared plans are released."""
+    _patch_module(monkeypatch)
+    mib = 1 << 20
+    runner = _make_profiling_runner(
+        CUDAGraphMode.FULL_AND_PIECEWISE,
+        piecewise_only=True,
+        captured_bytes=1000 * mib,
+    )
+
+    def memory_info():
+        native = init_native
+        if "teardown" in runner.events:
+            native += retained_native
+        elif "capture" in runner.events:
+            native += capture_native
+        # Torch-owned memory is not native initialization and is fully reserved.
+        return ((4096 - native - 512) * mib, 4096 * mib)
+
+    monkeypatch.setattr(cgu.torch.accelerator, "get_memory_info", memory_info)
+    monkeypatch.setattr(cgu.torch.accelerator, "memory_reserved", lambda: 512 * mib)
+
+    assert cgu.profile_cudagraph_memory(runner) == 1000 * mib
+    assert runner.cudagraph_native_memory_profile == (
+        init_native * mib,
+        (init_native + capture_native) * mib,
+        1000 * mib,
+    )
 
 
 def test_profile_cudagraph_memory_tears_down_on_capture_error(monkeypatch):
@@ -367,6 +411,8 @@ def test_profile_cudagraph_memory_clears_captured_graphs(monkeypatch):
     # CUDA graph executables must be destroyed and synchronized before their
     # B12X channel checkpoints and tensor workspaces are released.
     assert lifecycle == [
+        "synchronize",  # Native-memory measurement before capture.
+        "synchronize",  # Native-memory measurement after capture.
         "synchronize",
         "reset-piecewise",
         "reset-breakable",
@@ -495,8 +541,10 @@ def test_profile_cudagraph_memory_swaps_and_drops_speculator_managers(monkeypatc
 
 @create_new_process_for_each_test("spawn")
 @pytest.mark.skipif(not cgu.current_platform.is_cuda(), reason="requires CUDA")
-def test_profile_cudagraph_memory_frees_throwaway_pool(monkeypatch):
-    """Profiling graph memory must be freed before teardown completes."""
+@pytest.mark.parametrize("native_bytes", [0, 256 << 20])
+def test_profile_cudagraph_memory_frees_throwaway_pool(monkeypatch, native_bytes):
+    """Release profiling graphs and avoid reserving persistent cudaMalloc twice."""
+    from cuda.bindings import runtime
 
     @contextlib.contextmanager
     def _fake_set_current_vllm_config(_cfg):
@@ -513,6 +561,7 @@ def test_profile_cudagraph_memory_frees_throwaway_pool(monkeypatch):
     runner.maybe_remove_all_loras = lambda _: None
     allocation_bytes = 64 << 20
     memory: dict[str, int] = {}
+    native_pointer = None
 
     torch.accelerator.synchronize()
     gc.collect()
@@ -533,6 +582,11 @@ def test_profile_cudagraph_memory_frees_throwaway_pool(monkeypatch):
         )
 
     def _capture_model(*, profile_only: bool = False) -> int:
+        nonlocal native_pointer
+        before_free = torch.accelerator.get_memory_info()[0]
+        if native_bytes:
+            error, native_pointer = runtime.cudaMalloc(native_bytes)
+            assert error == runtime.cudaError_t.cudaSuccess
         for owner in (
             runner.cudagraph_manager,
             runner.speculator.cudagraph_manager,
@@ -545,17 +599,27 @@ def test_profile_cudagraph_memory_frees_throwaway_pool(monkeypatch):
             owner.graph_capture_resources["profile"] = [output]
         torch.accelerator.synchronize()
         memory["captured"] = torch.accelerator.memory_reserved()
-        return memory["captured"] - memory["before"]
+        memory["measured"] = before_free - torch.accelerator.get_memory_info()[0]
+        return memory["measured"]
 
     monkeypatch.setattr(cgu, "set_current_vllm_config", _fake_set_current_vllm_config)
     monkeypatch.setattr(cgu, "_init_minimal_kv_cache_for_profiling", _init)
     runner.capture_model = _capture_model
 
-    cgu.profile_cudagraph_memory(runner)
-    memory["after"] = torch.accelerator.memory_reserved()
+    try:
+        graph_estimate = cgu.profile_cudagraph_memory(runner)
+        memory["after"] = torch.accelerator.memory_reserved()
 
-    assert memory["captured"] - memory["before"] >= 3 * allocation_bytes
-    assert memory["after"] == memory["before"]
+        assert memory["captured"] - memory["before"] >= 3 * allocation_bytes
+        assert memory["after"] == memory["before"]
+        native_before, native_after, measured = runner.cudagraph_native_memory_profile
+        assert measured == graph_estimate == memory["measured"]
+        assert native_after - native_before >= native_bytes
+    finally:
+        if native_pointer is not None:
+            assert (
+                runtime.cudaFree(native_pointer)[0] == runtime.cudaError_t.cudaSuccess
+            )
 
 
 def test_teardown_profiling_state_clears_mamba_align_metadata(monkeypatch):

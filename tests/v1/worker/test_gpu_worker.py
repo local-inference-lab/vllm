@@ -311,12 +311,27 @@ def test_execute_model_waits_previous_pp_send_before_forward(
 )
 @pytest.mark.parametrize("graph_estimate", [0, 4])
 @pytest.mark.parametrize("estimate_graphs", [False, True])
+@pytest.mark.parametrize(
+    "native_profile,final_native,overlap",
+    [
+        (None, 0, 0),  # Runners without native capture measurements retain the budget.
+        ((100, 103, 4), 103, 3),  # Persistent capture initialization.
+        ((100, 103, 4), 101, 1),  # Prepared-plan release frees part of the growth.
+        ((100, 103, 4), 100, 0),  # All native capture storage was temporary.
+        ((103, 103, 4), 107, 0),  # Bootstrap and cleanup growth are not capture cost.
+        ((100, 103, 1), 107, 1),  # The measured capture delta bounds the overlap.
+        ((100, 103, 4), 107, 3),  # Cleanup-only growth cannot increase the discount.
+    ],
+)
 def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
     monkeypatch,
     final_free_memory,
     expected_available_memory,
     graph_estimate,
     estimate_graphs,
+    native_profile,
+    final_native,
+    overlap,
 ):
     """KV admission counts retained allocations, not released profiling blocks."""
     events: list[object] = []
@@ -326,10 +341,19 @@ def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
         events.append("profile_cudagraph_memory")
         return graph_estimate
 
+    def profile_run(prepare_profile_state):
+        prepare_profile_state()
+        events.append("profile_run")
+
+    def profile_glm_dcp_attention(prepare_profile_state):
+        prepare_profile_state()
+        events.append("profile_glm_dcp_attention")
+
     model_runner = SimpleNamespace(
+        cudagraph_native_memory_profile=native_profile,
         model_memory_usage=0,
-        profile_run=lambda prepare: (prepare(), events.append("profile_run")),
-        profile_glm_dcp_attention=lambda: events.append("profile_glm_dcp_attention"),
+        profile_run=profile_run,
+        profile_glm_dcp_attention=profile_glm_dcp_attention,
         profile_cudagraph_memory=profile_cudagraph_memory,
     )
     profile_result = SimpleNamespace(
@@ -373,7 +397,9 @@ def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
     def final_snapshot(**_kwargs):
         assert events[-3:] == ["collect", "synchronize", "empty_cache"]
         events.append("final_snapshot")
-        return SimpleNamespace(free_memory=final_free_memory)
+        return SimpleNamespace(
+            free_memory=final_free_memory, non_torch_memory=final_native
+        )
 
     monkeypatch.setattr(gpu_worker.gc, "collect", lambda: events.append("collect"))
     monkeypatch.setattr(
@@ -408,7 +434,9 @@ def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
         "prepare_b12x_profile_state",
         "profile_run",
         "release_b12x_profile_state",
+        "prepare_b12x_profile_state",
         "profile_glm_dcp_attention",
+        "release_b12x_profile_state",
         "prepare_b12x_profile_state",
         "profile_cudagraph_memory",
         "release_b12x_profile_state",
@@ -417,6 +445,7 @@ def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
         "empty_cache",
         "final_snapshot",
     ]
+    graph_estimate -= min(overlap, graph_estimate, 90 - final_free_memory)
     applied_graph_estimate = graph_estimate if estimate_graphs else 0
     assert available == expected_available_memory - applied_graph_estimate
     assert worker.peak_activation_memory == 5
@@ -478,8 +507,8 @@ def test_post_capture_recommendation_counts_measured_graph_memory_once(
         monkeypatch.setattr(gpu_worker, name, lambda *args: None)
     monkeypatch.setattr("vllm.utils.jit_monitor.activate", lambda **kwargs: None)
 
-    worker._compile_or_warm_up_model_after_preparation = (
-        lambda: gpu_worker.Worker._compile_or_warm_up_model_after_preparation(worker)
+    worker._compile_or_warm_up_model_after_preparation = lambda: (
+        gpu_worker.Worker._compile_or_warm_up_model_after_preparation(worker)
     )
     worker._b12x_session = None
     worker._get_cudagraph_capture_context = nullcontext
