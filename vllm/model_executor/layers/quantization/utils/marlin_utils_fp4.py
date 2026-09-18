@@ -50,8 +50,8 @@ def _nvfp4_compute_scale_factor(
     if marlin_scales.numel() == 0:
         return 1.0
 
-    # Reduce the input directly: the FP32 copy, mask, and gathered copy of the
-    # old path cost several times the tensor size in transient memory.
+    # Reduce before conversion to keep temporary storage independent of the
+    # number of experts. Power-of-two multiplication preserves the maximum.
     max_val = marlin_scales.max().float() * (2**7)
     if torch.isnan(max_val):
         raise ValueError("NVFP4 Marlin scales contain NaN")
