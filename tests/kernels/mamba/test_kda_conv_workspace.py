@@ -15,10 +15,18 @@ from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
 from vllm.v1.worker.workspace import WorkspaceManager
 
 
+@pytest.fixture(autouse=True)
+def forward_metadata(monkeypatch):
+    context = SimpleNamespace(attn_metadata=None)
+    monkeypatch.setattr(kda, "get_forward_context", lambda: context)
+    return context
+
+
 def _layer():
     layer: Any = object.__new__(kda.KimiGatedDeltaNetAttention)
     torch.nn.Module.__init__(layer)
     layer.kda_prefill_backend = "b12x"
+    layer.prefix = "attention"
     layer.get_state_dtype = lambda: (torch.bfloat16, torch.float32)
     layer._b12x_prefill_plan = SimpleNamespace(
         scratch_specs=lambda: [SimpleNamespace(shape=(1024,), dtype=torch.uint8)]
@@ -29,6 +37,21 @@ def _layer():
     layer.local_projection_size = 256
     layer.model_config = SimpleNamespace(dtype=torch.bfloat16)
     return layer
+
+
+@pytest.mark.parametrize("prefills", [None, 0, 1])
+def test_gate_storage_is_reused_only_after_prefill_consumers(
+    forward_metadata, prefills
+):
+    layer = _layer()
+    gate = torch.ones(1, 32, 2, 128, dtype=torch.bfloat16)
+    if prefills is not None:
+        metadata = object.__new__(kda.GDNAttentionMetadata)
+        metadata.num_prefills = prefills
+        forward_metadata.attn_metadata = {layer.prefix: metadata}
+    output = layer._core_attn_buffer(gate)
+    assert output.shape == gate.shape and output.dtype == gate.dtype
+    assert (output.data_ptr() == gate.data_ptr()) == (prefills == 1)
 
 
 @pytest.mark.parametrize("capacity", [1024, 100000])
