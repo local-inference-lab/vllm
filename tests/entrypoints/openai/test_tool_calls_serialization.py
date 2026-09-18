@@ -229,6 +229,36 @@ def test_namespace_description_is_preserved_exactly_once():
     ).model_dump() == (parsed.model_dump())
 
 
+@pytest.mark.parametrize("collection", [list, tuple])
+def test_iterable_history_preserves_namespaced_tool_identity(collection):
+    call = _make_tool_call("call_history", "lookup", "{}")
+    call["namespace"] = "inventory"
+    messages = [{"role": "assistant", "content": None, "tool_calls": [call]}]
+    original = copy.deepcopy(messages)
+    request = ChatCompletionRequest.model_validate(
+        {"model": "test-model", "messages": collection(messages)}
+    )
+    assert request.messages[0]["tool_calls"][0]["function"]["name"] == (
+        "inventory::lookup"
+    )
+    serialized = request.model_dump_json()
+    restored = ChatCompletionRequest.model_validate_json(serialized)
+    assert restored.messages[0]["tool_calls"][0]["function"]["name"] == (
+        "inventory::lookup"
+    )
+    assert request.model_dump_json() == serialized
+    assert messages == original
+
+
+@pytest.mark.parametrize("messages", ["text", b"text", bytearray(b"text"), {}])
+def test_invalid_history_collection_remains_a_client_error(messages):
+    with pytest.raises(ValidationError) as error:
+        ChatCompletionRequest.model_validate(
+            {"model": "test-model", "messages": messages}
+        )
+    assert any(item["loc"] == ("messages",) for item in error.value.errors())
+
+
 @pytest.mark.parametrize("tool_calls", [1, False, 1.5])
 def test_invalid_tool_calls_shape_reports_the_field(tool_calls):
     with pytest.raises(ValidationError) as error:

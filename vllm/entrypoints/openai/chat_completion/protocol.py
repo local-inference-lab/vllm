@@ -552,11 +552,18 @@ class ChatCompletionRequest(OpenAIBaseModel):
         - Renames the deprecated ``reasoning_content`` field to
           ``reasoning`` so downstream code only needs to check one field.
         - Qualifies tool-call namespaces before union validation can drop them.
+
+        Args:
+            data: Unvalidated request payload, including Python message sequences.
+
+        Returns:
+            A copied payload with normalized list/tuple message histories, or
+            the unchanged input when it is not a supported payload shape.
         """
         if not isinstance(data, dict):
             return data
         messages = data.get("messages")
-        if not isinstance(messages, list):
+        if not isinstance(messages, (list, tuple)):
             return data
         data = dict(data)
         messages = [dict(msg) if isinstance(msg, dict) else msg for msg in messages]
