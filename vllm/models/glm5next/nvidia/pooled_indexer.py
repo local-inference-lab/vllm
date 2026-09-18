@@ -395,6 +395,7 @@ class Glm5NextPooledIndexer(nn.Module):
         self.block_size = block_size
 
     def unbind_main_kv_cache(self) -> None:
+        self.indexer_op.clear_b12x_index_cache()
         self._index_cache = None
         self._main_cache_num_blocks = 0
         self._physical_selection_plan = None

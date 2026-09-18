@@ -921,6 +921,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             bind_indexer(self.kv_cache)
 
     def unbind_kv_cache(self) -> None:
+        unbind_impl = getattr(self.impl, "unbind_kv_cache", None)
+        if unbind_impl is not None:
+            unbind_impl()
         unbind_indexer = getattr(self.indexer, "unbind_main_kv_cache", None)
         if unbind_indexer is not None:
             unbind_indexer()
