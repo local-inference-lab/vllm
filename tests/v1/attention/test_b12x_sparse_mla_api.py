@@ -1620,11 +1620,20 @@ def test_sparse_mla_prepared_launcher_rebinds_without_warmup_probes(mode, rows, 
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 captured = run()
-            for index in (1, 0, 1):
+            selected[:, 1].fill_(1)
+            for index, count, query_first, expected in (
+                (1, 1, 0, 2),
+                (0, 1, 0, 1),
+                (0, 2, 0, 1.5),
+                (0, 2, 256, 2),
+                (0, 2, -256, 1),
+            ):
                 selected[:, 0].fill_(index)
+                selected_lengths.fill_(count)
+                query[..., 0].fill_(query_first)
                 graph.replay()
                 torch.testing.assert_close(
-                    captured, torch.full_like(captured, index + 1), rtol=0, atol=0
+                    captured, torch.full_like(captured, expected), rtol=0, atol=0
                 )
     finally:
         reset_workspace_manager()
