@@ -22,6 +22,8 @@ from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.config.speculative import SpeculativeConfig
 
+pytestmark = pytest.mark.skip_global_cleanup
+
 
 def _make_hf_config(**kwargs) -> PretrainedConfig:
     defaults = dict(
@@ -41,6 +43,41 @@ def test_dict_overrides_are_not_forwarded_to_draft():
         {"max_position_embeddings": 1234}
     )
     assert composed is SpeculativeConfig.hf_config_override
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("method", ["mtp", "draft_model"])
+def test_mtp_draft_receives_target_dict_overrides(method: str):
+    """An in-model MTP draft shares the target's positional geometry."""
+    target_hf_overrides = {
+        "architectures": ["Qwen3_8FlashNextForCausalLM"],
+        "model_type": "qwen3_8_flash_next",
+        "text_config": {
+            "max_position_embeddings": 1048576,
+            "rope_parameters": {"rope_type": "yarn", "factor": 4.0},
+        },
+    }
+    override = SpeculativeConfig.get_draft_hf_overrides(method, target_hf_overrides)
+    assert callable(override)
+    text_config = _make_hf_config(
+        max_position_embeddings=262144,
+        rope_parameters={"rope_type": "default"},
+        hc_count=4,
+        mtp_num_hidden_layers=2,
+        num_attention_heads=4,
+    )
+    source = _make_hf_config(
+        architectures=["Qwen3_8FlashNextForCausalLM"],
+        model_type="qwen3_8_flash_next",
+        text_config=text_config,
+    )
+
+    out = override(source)
+
+    assert out.model_type == "qwen4_exp_mtp"
+    assert out.architectures == ["Qwen4ExpMTP"]
+    assert out.text_config.max_position_embeddings == 1048576
+    assert out.text_config.rope_parameters == {"rope_type": "yarn", "factor": 4.0}
 
 
 @pytest.mark.cpu_test
