@@ -2,18 +2,24 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Per-reader attention horizons, low-pressure concurrency, and release fences."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from tests.v1.core import test_boundary_admission as base
 from tests.v1.core.test_boundary_admission import initialize_hash as initialize_hash
+from vllm.v1.core.kv_cache_utils import (
+    _estimate_max_model_len_from_groups,
+    _pool_bytes_per_block,
+)
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
     MLAAttentionSpec,
 )
-from vllm.v1.request import RequestStatus
+from vllm.v1.request import Request, RequestStatus
 
 pytestmark = pytest.mark.cpu_test
 
@@ -89,12 +95,82 @@ def restore(cache, req, lookahead=4, defer=True, pending=()):
     return allocated
 
 
+@pytest.mark.parametrize("num_blocks", [62, 65, 80])
+def test_small_pool_capacity_covers_instruction_checkpoint_restore(num_blocks):
+    """Accepted pool geometry must admit both cold prompts and their restores."""
+    attention = MLAAttentionSpec(
+        block_size=2048,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.uint8,
+        model_version="glm5_next",
+    )
+    recurrent = MambaSpec(
+        block_size=256,
+        shapes=((1,),),
+        dtypes=(torch.uint8,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=3,
+    )
+    groups = [KVCacheGroupSpec([str(i)], recurrent) for i in range(6)]
+    groups.append(KVCacheGroupSpec(["attention"], attention))
+    config = SimpleNamespace(
+        use_request_boundary_checkpoints=True,
+        attention_config=SimpleNamespace(hisparse_config=None),
+        model_config=SimpleNamespace(max_model_len=1048576),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=2),
+        cache_config=SimpleNamespace(mamba_cache_mode="align"),
+    )
+    max_model_len = _estimate_max_model_len_from_groups(
+        config, groups, (num_blocks - 1) * _pool_bytes_per_block(groups)
+    )
+    if num_blocks == 62:
+        # Cold admission fits, but restore needs 64 non-null blocks. Startup
+        # must reject this pool instead of leaving an idle scheduler waiting.
+        assert max_model_len == 0
+        return
+    assert max_model_len >= 6357
+    cache = base.make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=groups
+        ),
+        max_model_len=max_model_len,
+        max_in_flight_tokens=8192,
+        enable_caching=True,
+        use_eagle=True,
+        num_prefill_lookahead=1,
+        dcp_world_size=2,
+        scheduler_block_size=4096,
+        hash_block_size=256,
+        enable_boundary_checkpoints=True,
+    )
+    producer = request("producer", length=6357, cap=1024)
+    producer.recurrent_instruction_boundary = 6345
+    cache.get_computed_blocks(producer)
+    for count in (4096, 2249):
+        cache.new_step_starts()
+        assert cache.allocate_slots(producer, count, num_lookahead_tokens=3)
+        producer.num_computed_tokens += count
+        base.drain(cache)
+    checkpoint = cache.publish_boundary_checkpoint(producer, 6345, kind="instruction")
+    assert checkpoint is not None
+    cache.free(producer)
+    assert cache.block_pool.get_num_free_blocks() == num_blocks - 1
+
+    reader = request("reader", length=6357, cap=1024)
+    reader.recurrent_instruction_boundary = 6345
+    assert restore(cache, reader, lookahead=3) is not None
+    base.drain(cache)
+    cache.free(reader)
+    assert cache.block_pool.get_num_free_blocks() == num_blocks - 1
+
+
 def test_all_16_short_warm_readers_admit_without_checkpoint_loss():
     cache = manager()
     for index in range(16):
         seed(cache, str(index))
     published = set(cache.boundary_checkpoints._entries)
-    active = []
+    active: list[Request] = []
     for index in range(16):
         req = request("warm-" + str(index), str(index))
         allocated = restore(cache, req)

@@ -1077,7 +1077,7 @@ def is_kv_cache_spec_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
 
 
 def _request_boundary_reserve_blocks(vllm_config: VllmConfig, num_groups: int) -> int:
-    """Count private instruction, prompt, and response checkpoint storage."""
+    """Count private endpoints and the immutable checkpoint used by a restore."""
     if not num_groups or not vllm_config.use_request_boundary_checkpoints:
         return 0
 
@@ -1085,7 +1085,10 @@ def _request_boundary_reserve_blocks(vllm_config: VllmConfig, num_groups: int) -
 
     # KVCacheManager.allocate_slots reserves one block per group and one
     # auxiliary block per endpoint, separately from the live sequence state.
-    return NUM_BOUNDARY_CHECKPOINT_SLOTS * (num_groups + 1)
+    # Restoring a checkpoint pins its source until the reader finishes, while
+    # partial-tail CoW creates writable state. One additional bundle covers
+    # these source pages and auxiliary state alongside the private endpoints.
+    return (NUM_BOUNDARY_CHECKPOINT_SLOTS + 1) * (num_groups + 1)
 
 
 def get_max_concurrency_for_kv_cache_config(
