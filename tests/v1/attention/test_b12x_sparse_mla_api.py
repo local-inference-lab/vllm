@@ -1346,6 +1346,43 @@ def test_mla_layer_discovers_backend_and_optional_query_plans(
         assert [request.name for request in units[1].requests] == ["test.query.m8"]
 
 
+@pytest.mark.parametrize("b12x_backend", [False, True])
+def test_mla_unbind_releases_backend_cache_and_allows_rebinding(b12x_backend):
+    """Profiling-cache views must not survive the owning layer's teardown."""
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+    from vllm.v1.worker.utils import clear_layer_kv_caches
+
+    layer = MLAAttention.__new__(MLAAttention)
+    torch.nn.Module.__init__(layer)
+    impl = object.__new__(B12xMLASparseImpl) if b12x_backend else SimpleNamespace()
+    if b12x_backend:
+        impl._uses_glm_dsa_nvfp4_cache = False
+        impl._is_glm_next = False
+    layer.impl = impl
+    layer.indexer = None
+    layer._vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(enable_jit_warmup=False)
+    )
+    cache = torch.empty((2, 1, 64, 528), dtype=torch.uint8)
+    cache_ref = weakref.ref(cache)
+    layer.bind_kv_cache(cache)
+    if b12x_backend:
+        impl._cache_writer_plan = SimpleNamespace(cache=impl._bound_kv_cache)
+    del cache
+
+    clear_layer_kv_caches([layer, layer])
+    assert layer.kv_cache.numel() == 0
+    assert cache_ref() is None
+    if b12x_backend:
+        assert impl._bound_kv_cache is None
+        assert impl._cache_writer_plan is None
+    replacement = torch.empty((3, 1, 64, 528), dtype=torch.uint8)
+    layer.bind_kv_cache(replacement)
+    assert layer.kv_cache.data_ptr() == replacement.data_ptr()
+    if b12x_backend:
+        assert impl._bound_kv_cache is layer.kv_cache
+
+
 def test_b12x_sparse_mla_plan_lookup_declares_unplanned_decode_rows_once(
     monkeypatch,
 ) -> None:

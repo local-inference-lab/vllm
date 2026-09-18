@@ -754,6 +754,14 @@ def test_glm53_selector_constructs_with_matching_preparation_heads(
     indexer.bind_main_kv_cache(main)
 
     assert indexer.indexer_op._num_q_heads == indexer._q_fp8.shape[1] == 32
+    indexer.indexer_op._plans[("decode", 8)] = object()
+    indexer.unbind_main_kv_cache()
+    assert indexer._index_cache is None
+    assert indexer._main_cache_num_blocks == 0
+    assert indexer.indexer_op._index_cache is None
+    assert indexer.indexer_op._plans == {}
+    indexer.bind_main_kv_cache(main)
+    assert indexer.indexer_op._index_cache is indexer._index_cache
 
 
 def test_glm53_packed_tail_accepts_nvfp4_main_record() -> None:

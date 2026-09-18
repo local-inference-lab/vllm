@@ -1731,6 +1731,10 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         self._cache_writer_plan = None
         self._bound_kv_cache = kv_cache
 
+    def unbind_kv_cache(self) -> None:
+        self._cache_writer_plan = None
+        self._bound_kv_cache = None
+
     def do_kv_cache_update(
         self,
         kv_c_normed: torch.Tensor,
