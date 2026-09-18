@@ -2669,7 +2669,7 @@ def test_balanced_glm_boundary_capacity_includes_private_endpoints(
     block_bytes = kv_cache_utils._pool_bytes_per_block(groups)
     live_bytes = kv_cache_utils._max_memory_usage_bytes_from_groups(config, groups)
     live_blocks = live_bytes // block_bytes
-    private_blocks = 3 * (len(groups) + 1)
+    private_blocks = 4 * (len(groups) + 1)
     monkeypatch.setattr(
         VllmConfig, "use_request_boundary_checkpoints", property(lambda self: True)
     )
@@ -4277,9 +4277,9 @@ def test_auto_fit_max_model_len_with_hybrid():
 
 
 @pytest.mark.parametrize("dcp", [1, 2, 4])
-@pytest.mark.parametrize("num_blocks,expected_pages", [(38, 0), (70, 15)])
+@pytest.mark.parametrize("num_blocks,expected_pages", [(38, 0), (62, 0), (70, 7)])
 def test_boundary_capacity_includes_private_endpoints(dcp, num_blocks, expected_pages):
-    """Live MTP state alone does not cover instruction/prompt/response copies."""
+    """Pool sizing includes private endpoints and the immutable restore source."""
     config = SimpleNamespace(
         use_request_boundary_checkpoints=True,
         attention_config=SimpleNamespace(hisparse_config=None),
@@ -4304,8 +4304,8 @@ def test_boundary_capacity_includes_private_endpoints(dcp, num_blocks, expected_
     groups = [KVCacheGroupSpec([f"state-{i}"], state) for i in range(6)]
     groups.append(KVCacheGroupSpec(["attention"], attention))
     block_bytes = kv_cache_utils._pool_bytes_per_block(groups)
-    # Six groups require five live/scratch states each; three endpoints
-    # additionally own eight blocks each. The null block is unavailable.
+    # Six groups require five live/scratch states each; three private endpoints
+    # and a restore source own eight blocks each. The null block is unavailable.
     available = (num_blocks - 1) * block_bytes
     estimate = kv_cache_utils._estimate_max_model_len_from_groups(
         config, groups, available
@@ -4329,7 +4329,7 @@ def test_boundary_capacity_includes_private_endpoints(dcp, num_blocks, expected_
             num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=groups
         )
         assert get_max_concurrency_for_kv_cache_config(config, cache) == (
-            num_blocks / (30 + 24 + expected_pages)
+            num_blocks / (30 + 32 + expected_pages)
         )
 
     # An aligned-policy control has no endpoint reservation. Its capacity
