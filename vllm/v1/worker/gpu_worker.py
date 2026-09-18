@@ -641,7 +641,12 @@ class Worker(WorkerBase):
                 self.model_runner.profile_run(self._prepare_b12x_profile_state)
             finally:
                 self._release_b12x_profile_state()
-            self.model_runner.profile_glm_dcp_attention()
+            try:
+                self.model_runner.profile_glm_dcp_attention(
+                    self._prepare_b12x_profile_state
+                )
+            finally:
+                self._release_b12x_profile_state()
 
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to

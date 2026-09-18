@@ -326,10 +326,18 @@ def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
         events.append("profile_cudagraph_memory")
         return graph_estimate
 
+    def profile_run(prepare_profile_state):
+        prepare_profile_state()
+        events.append("profile_run")
+
+    def profile_glm_dcp_attention(prepare_profile_state):
+        prepare_profile_state()
+        events.append("profile_glm_dcp_attention")
+
     model_runner = SimpleNamespace(
         model_memory_usage=0,
-        profile_run=lambda prepare: (prepare(), events.append("profile_run")),
-        profile_glm_dcp_attention=lambda: events.append("profile_glm_dcp_attention"),
+        profile_run=profile_run,
+        profile_glm_dcp_attention=profile_glm_dcp_attention,
         profile_cudagraph_memory=profile_cudagraph_memory,
     )
     profile_result = SimpleNamespace(
@@ -408,7 +416,9 @@ def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
         "prepare_b12x_profile_state",
         "profile_run",
         "release_b12x_profile_state",
+        "prepare_b12x_profile_state",
         "profile_glm_dcp_attention",
+        "release_b12x_profile_state",
         "prepare_b12x_profile_state",
         "profile_cudagraph_memory",
         "release_b12x_profile_state",
