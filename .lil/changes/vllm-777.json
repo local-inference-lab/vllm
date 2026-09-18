@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-777",
+  "category": "fix",
+  "summary": "Preserve Qwen positional overrides in MTP draft configuration",
+  "models": ["Qwen3.8-Flash-Next"],
+  "compatibility": "YaRN deployments should verify their configured target and draft context limits before serving.",
+  "details": [
+    "Dictionary-based target Hugging Face overrides reach the internally constructed MTP draft after its model type and architecture are normalized.",
+    "QSA prefill plan selection covers the configured one-million-token context ceiling."
+  ],
+  "pull_requests": [777],
+  "requires": []
+}
