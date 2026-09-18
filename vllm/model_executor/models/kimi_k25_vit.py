@@ -93,14 +93,17 @@ def apply_rope(
 
     # Q and K are non-overlapping views of the packed QKV projection. Their
     # unrotated values are dead after this call, so reuse those BF16 buffers
-    # instead of retaining two additional full-size outputs. Processing Q and
-    # K sequentially also permits the allocator to reuse the FP32 temporary.
+    # instead of retaining two additional full-size outputs. Rotate each
+    # FP32/complex conversion buffer in place so the multiplication does not
+    # materialize a second full-size FP32 tensor.
     xq_complex = torch.view_as_complex(xq.float().view(*xq.shape[:-1], -1, 2))
-    xq.copy_(torch.view_as_real(xq_complex * freqs_cis).flatten(-2))
+    xq_complex.mul_(freqs_cis)
+    xq.copy_(torch.view_as_real(xq_complex).flatten(-2))
     del xq_complex
 
     xk_complex = torch.view_as_complex(xk.float().view(*xk.shape[:-1], -1, 2))
-    xk.copy_(torch.view_as_real(xk_complex * freqs_cis).flatten(-2))
+    xk_complex.mul_(freqs_cis)
+    xk.copy_(torch.view_as_real(xk_complex).flatten(-2))
     return xq, xk
 
 
