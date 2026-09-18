@@ -631,7 +631,7 @@ class SharedTopkIndicesBuffer:
         topk_indices_buffer: torch.Tensor | None,
     ) -> None:
         self._indexer = indexer
-        self._topk_indices_buffer = topk_indices_buffer
+        self._topk_indices_buffer = topk_indices_buffer if indexer is None else None
 
     @property
     def topk_indices_buffer(self) -> torch.Tensor | None:
