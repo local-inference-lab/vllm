@@ -646,6 +646,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
     """Sparse MLA base with dense and masked-MHA prefill paths."""
 
     is_sparse = True
+    uses_index_group = True
 
     def __init__(
         self,
@@ -688,9 +689,13 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
         self.init_topk_indices_buffer(indexer, topk_indices_buffer)
         self.index_group: SparseMLAIndexGroup | None = None
         self.index_group_index = 0
-        if index_group_builder is None and self.topk_indices_buffer is not None:
+        if (
+            self.uses_index_group
+            and index_group_builder is None
+            and self.topk_indices_buffer is not None
+        ):
             index_group_builder = SparseMLAIndexGroupBuilder(self.topk_indices_buffer)
-        if index_group_builder is not None:
+        if self.uses_index_group and index_group_builder is not None:
             vllm_config = get_current_vllm_config()
             self.index_group, self.index_group_index = (
                 index_group_builder.register_layer(
