@@ -178,6 +178,23 @@ class WorkspaceManager:
         """Check if workspace is locked."""
         return self._locked
 
+    def available_bytes(self) -> int:
+        """Capacity of the active execution slot, without allocating storage.
+
+        A borrower must ensure that no nested or concurrent operation consumes
+        this slot while its views are live.
+        """
+        ubatch_id = dbo_current_ubatch_id()
+        lane = _workspace_lane.get()
+        if lane >= self._num_lanes:
+            raise RuntimeError(
+                f"Workspace lane {lane} is not configured; manager has "
+                f"{self._num_lanes} lane(s)."
+            )
+        return self._workspace_size_bytes(
+            self._current_workspaces[ubatch_id * self._num_lanes + lane]
+        )
+
     def get_simultaneous(
         self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
     ) -> list[torch.Tensor]:
