@@ -10,6 +10,7 @@ import torch
 from tests.v1.core import test_boundary_admission as base
 from tests.v1.core.test_boundary_admission import initialize_hash as initialize_hash
 from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
     _estimate_max_model_len_from_groups,
     _pool_bytes_per_block,
 )
@@ -161,7 +162,24 @@ def test_small_pool_capacity_covers_instruction_checkpoint_restore(num_blocks):
     reader.recurrent_instruction_boundary = 6345
     assert restore(cache, reader, lookahead=3) is not None
     base.drain(cache)
+    reader.append_output_token_ids([10000])
+    pending = False
+    held: list[KVCacheBlock] = []
+    for step in range(128):
+        cache.new_step_starts()
+        assert cache.allocate_slots(reader, 4, num_lookahead_tokens=3) is not None
+        reader.num_computed_tokens += 4
+        reader.num_in_flight_tokens += 4
+        copies = cache.take_kv_cache_block_copies()[1]
+        if pending:
+            reader.num_in_flight_tokens -= 4
+            reader.append_output_token_ids([10001 + step] * 4)
+        cache.block_pool.free_blocks(held)
+        held = copies
+        pending = True
+        cache.cache_blocks(reader, min(reader.num_computed_tokens, reader.num_tokens))
     cache.free(reader)
+    cache.block_pool.free_blocks(held)
     assert cache.block_pool.get_num_free_blocks() == num_blocks - 1
 
 
