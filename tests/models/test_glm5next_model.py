@@ -1856,6 +1856,7 @@ def test_b12x_kda_trial_buffers_preserve_declared_layout(
     torch.nn.Module.__init__(layer)
     layer.head_dim = 4
     layer.local_num_heads = 3
+    layer.model_config = SimpleNamespace(dtype=torch.float32)
     layer.gate_lower_bound = -5.0
     layer.A_log = torch.empty(3)
     layer.dt_bias = torch.empty(12)
@@ -1874,13 +1875,6 @@ def test_b12x_kda_trial_buffers_preserve_declared_layout(
     layer._b12x_kda_state_indices = torch.empty((1, 1), dtype=torch.int32)
     layer._b12x_kda_num_seqs = torch.empty(1, dtype=torch.int32)
     layer._b12x_kda_num_tokens = torch.empty(1, dtype=torch.int32)
-    layer._b12x_prefill_q = torch.empty((2, 3, 4))
-    layer._b12x_prefill_k = torch.empty((2, 3, 4))
-    layer._b12x_prefill_v = torch.empty((2, 3, 4))
-    layer._b12x_prefill_raw_g = torch.empty((2, 3, 4))
-    prefill_beta_storage = torch.empty((2, beta_width))
-    layer._b12x_prefill_raw_beta = prefill_beta_storage.narrow(1, beta_offset, 3)
-    layer._b12x_prefill_output = torch.empty((2, 3, 4))
     layer._b12x_prefill_cu_seqlens = torch.empty(2, dtype=torch.int32)
     layer._b12x_prefill_initial_indices = torch.empty(1, dtype=torch.int32)
     layer._b12x_prefill_null_indices = torch.empty(1, dtype=torch.int32)
@@ -1922,12 +1916,6 @@ def test_b12x_kda_trial_buffers_preserve_declared_layout(
         "num_tokens": layer._b12x_kda_num_tokens,
     }
     prefill_sources = {
-        "q": layer._b12x_prefill_q,
-        "k": layer._b12x_prefill_k,
-        "v": layer._b12x_prefill_v,
-        "raw_g": layer._b12x_prefill_raw_g,
-        "raw_beta": layer._b12x_prefill_raw_beta,
-        "output": layer._b12x_prefill_output,
         "cu_seqlens": layer._b12x_prefill_cu_seqlens,
         "initial_state_indices": layer._b12x_prefill_initial_indices,
         "checkpoint_state_indices": layer._b12x_prefill_null_indices,
@@ -1949,6 +1937,154 @@ def test_b12x_kda_trial_buffers_preserve_declared_layout(
             source_alignment = min(16, source_pointer & -source_pointer)
             trial_alignment = min(16, trial_pointer & -trial_pointer)
             assert trial_alignment == source_alignment
+    for name in ("q", "k", "v", "raw_g", "output", "raw_beta"):
+        tensor = state.prefill[name]
+        assert tensor.shape == ((2, 3) if name == "raw_beta" else (2, 3, 4))
+        assert tensor.dtype == layer.model_config.dtype
+        assert tensor.is_contiguous()
+
+
+@pytest.mark.parametrize("benchmark", [False, True])
+def test_b12x_kda_prefill_preparation_releases_synthetic_activations(
+    monkeypatch, benchmark
+):
+    """Only live metadata persists after the synchronized preparation call."""
+    monkeypatch.setattr(current_platform, "current_device", lambda: "cpu")
+    monkeypatch.setattr(kimi_gdn_linear_attn, "get_b12x_kda_prefill", lambda: object())
+    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    layer.kda_prefill_backend = "b12x"
+    layer.head_dim, layer.local_num_heads = 128, 2
+    layer.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    layer.A_log = torch.zeros(2)
+    layer.dt_bias = torch.zeros(2, 128)
+    layer.gate_lower_bound = -5.0
+    layer.kv_cache = (torch.empty(1), torch.zeros(2, 2, 128, 128))
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=64, max_num_seqs=4)
+    )
+    layer._initialize_b12x_kda_prefill(config)
+    assert sum(t.numel() * t.element_size() for t in layer.buffers()) < 1024
+    references: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    class State:
+        layout = SimpleNamespace(
+            scratch_specs=lambda: [SimpleNamespace(shape=(128,), dtype=torch.uint8)]
+        )
+
+        def bind(self, **tensors):
+            references.extend(
+                weakref.ref(tensors[name])
+                for name in ("scratch", "q", "k", "v", "raw_g", "raw_beta", "output")
+            )
+            return SimpleNamespace(**tensors)
+
+        def run(self, binding, **kwargs):
+            assert binding.q.shape == (64, 2, 128)
+            assert binding.q.is_contiguous()
+            assert binding.num_tokens.item() == 64
+            binding.output.copy_(binding.q)
+
+    call = layer._b12x_kda_prefill_call(State(), benchmark=benchmark)
+    assert call.owners == ()
+    call.produce()
+    call.run()
+    assert all(reference() is not None for reference in references)
+    del call
+    assert all(reference() is None for reference in references)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+def test_b12x_kda_prefill_live_inputs_after_preparation():
+    """Released synthetic inputs cannot replace live request/state tensors."""
+    from b12x.preparation import PreparationSession
+    from b12x.sequence.kda_prefill.reference import prefill_kda
+
+    api = kimi_gdn_linear_attn.get_b12x_kda_prefill()
+    device = torch.device(current_platform.current_device())
+    if api is None or not api.is_supported(device):
+        pytest.skip("B12X KDA prefill is unavailable")
+    torch.manual_seed(73)
+    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    layer.kda_prefill_backend = "b12x"
+    layer.head_dim, layer.local_num_heads = 128, 2
+    layer.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    layer.cache_config = SimpleNamespace(mamba_cache_dtype="auto")
+    layer.A_log = torch.zeros(2, device=device)
+    layer.dt_bias = torch.zeros(2, 128, device=device)
+    layer.gate_lower_bound = -5.0
+    pool = torch.zeros(8, 2, 128, 128, device=device)
+    layer.kv_cache = (torch.empty(1, device=device), pool)
+    layer._initialize_b12x_kda_prefill(
+        SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=128, max_num_seqs=4)
+        )
+    )
+    plan = layer._b12x_kda_prefill_declaration(8)
+    layer._b12x_prefill_plan = plan
+    request = plan.request(
+        name="glm-kda-prefill-live-inputs",
+        prepare_call=layer._prepare_b12x_kda_prefill,
+        benchmark_call=layer._benchmark_b12x_kda_prefill,
+    )
+    session = PreparationSession(device=device, autotune=False)
+    prepared = session.prepare((request,))
+    try:
+        (spec,) = plan.scratch_specs()
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+        q, k, v, gate = (
+            torch.randn(64, 2, 128, dtype=torch.bfloat16, device=device)
+            for _ in range(4)
+        )
+        beta = torch.randn(64, 2, dtype=q.dtype, device=device)
+        lengths = torch.tensor([0, 64], dtype=torch.int32, device=device)
+        indices = torch.tensor([3], dtype=torch.int32, device=device)
+        offsets = torch.zeros(1, dtype=torch.int32, device=device)
+        initial = torch.ones(1, dtype=torch.bool, device=device)
+        pool.normal_()
+        expected_pool = pool.clone()
+        expected = prefill_kda(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            layer.A_log,
+            layer.dt_bias,
+            expected_pool,
+            lengths,
+            indices,
+            indices,
+            indices,
+            offsets,
+            1,
+            64,
+            lower_bound=-5.0,
+        )
+        output = torch.full_like(q, float("nan"))
+        layer._run_b12x_kda_prefill(
+            scratch=scratch,
+            q=q,
+            k=k,
+            v=v,
+            raw_g=gate,
+            raw_beta=beta,
+            cu_seqlens=lengths,
+            state_indices=indices,
+            has_initial_state=initial,
+            checkpoint=None,
+            recurrent_state=pool,
+            output=output,
+        )
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(output, expected, rtol=0.02, atol=0.02)
+        torch.testing.assert_close(pool[3], expected_pool[3], rtol=0.01, atol=0.005)
+        torch.testing.assert_close(pool[:3], expected_pool[:3], rtol=0, atol=0)
+        torch.testing.assert_close(pool[4:], expected_pool[4:], rtol=0, atol=0)
+    finally:
+        prepared.close()
+        session.close()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

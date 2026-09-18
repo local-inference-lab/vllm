@@ -756,24 +756,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._b12x_prefill_api = api
         self._b12x_prefill_max_tokens = int(scheduler_config.max_num_batched_tokens)
         self._b12x_prefill_max_seqs = int(scheduler_config.max_num_seqs)
-        max_tokens, max_seqs = (
-            self._b12x_prefill_max_tokens,
-            self._b12x_prefill_max_seqs,
-        )
-        shape = (max_tokens, self.local_num_heads, self.head_dim)
-        for name, tensor_shape in (
-            ("_b12x_prefill_q", shape),
-            ("_b12x_prefill_k", shape),
-            ("_b12x_prefill_v", shape),
-            ("_b12x_prefill_raw_g", shape),
-            ("_b12x_prefill_raw_beta", (max_tokens, self.local_num_heads)),
-            ("_b12x_prefill_output", shape),
-        ):
-            self.register_buffer(
-                name,
-                torch.zeros(tensor_shape, dtype=self.model_config.dtype, device=device),
-                persistent=False,
-            )
+        max_seqs = self._b12x_prefill_max_seqs
         self.register_buffer(
             "_b12x_prefill_cu_seqlens",
             torch.zeros(max_seqs + 1, dtype=torch.int32, device=device),
@@ -1055,13 +1038,21 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Trial and prepare factories own their scratch; the runtime binding
         # in _run_b12x_kda_prefill draws from the workspace manager instead.
         scratch = torch.empty(spec[0], dtype=spec[1], device=slots.device)
+        # Synthetic activations belong to one preparation call, not each model
+        # layer or the published plan. Serving binds the live request tensors.
+        shape = (
+            self._b12x_prefill_max_tokens,
+            self.local_num_heads,
+            self.head_dim,
+        )
+        q, k, v, raw_g, output = (
+            torch.empty(shape, dtype=self.model_config.dtype, device=slots.device)
+            for _ in range(5)
+        )
+        raw_beta = torch.empty(
+            shape[:2], dtype=self.model_config.dtype, device=slots.device
+        )
         if benchmark:
-            q = self._b12x_trial_tensor(self._b12x_prefill_q)
-            k = self._b12x_trial_tensor(self._b12x_prefill_k)
-            v = self._b12x_trial_tensor(self._b12x_prefill_v)
-            raw_g = self._b12x_trial_tensor(self._b12x_prefill_raw_g)
-            raw_beta = self._b12x_trial_tensor(self._b12x_prefill_raw_beta)
-            output = self._b12x_trial_tensor(self._b12x_prefill_output)
             cu_seqlens = self._b12x_trial_tensor(self._b12x_prefill_cu_seqlens)
             indices = self._b12x_trial_tensor(self._b12x_prefill_initial_indices)
             checkpoint_indices = self._b12x_trial_tensor(
@@ -1071,32 +1062,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_seqs = self._b12x_trial_tensor(self._b12x_prefill_num_seqs)
             num_tokens = self._b12x_trial_tensor(self._b12x_prefill_num_tokens)
             saved_state = slots[slot : slot + 1].clone()
-            owners: tuple[torch.Tensor, ...] = (
-                scratch,
-                q,
-                k,
-                v,
-                raw_g,
-                raw_beta,
-                output,
-                cu_seqlens,
-                indices,
-                checkpoint_indices,
-                offsets,
-                num_seqs,
-                num_tokens,
-            )
         else:
-            q, k, v = (
-                self._b12x_prefill_q,
-                self._b12x_prefill_k,
-                self._b12x_prefill_v,
-            )
-            raw_g, raw_beta = (
-                self._b12x_prefill_raw_g,
-                self._b12x_prefill_raw_beta,
-            )
-            output = self._b12x_prefill_output
             cu_seqlens = self._b12x_prefill_cu_seqlens
             indices = self._b12x_prefill_initial_indices
             checkpoint_indices = self._b12x_prefill_null_indices
@@ -1106,7 +1072,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self._b12x_prefill_num_tokens,
             )
             saved_state = None
-            owners = (scratch,)
 
         def produce():
             for tensor in (q, k, v, raw_g, raw_beta):
@@ -1152,7 +1117,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             produce=produce,
             reset=reset,
             restore=reset if saved_state is not None else None,
-            owners=owners,
         )
 
     def _run_b12x_kda_prefill(
