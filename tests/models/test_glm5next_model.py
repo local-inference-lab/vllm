@@ -709,21 +709,26 @@ def test_glm5next_loads_mxfp8_fused_projection_scales(
     assert actual_shard_id == shard_id
 
 
-def test_glm5next_kda_adapts_shared_out_buffer_forward(monkeypatch) -> None:
+def test_glm5next_kda_returns_shared_projection_without_a_copy(monkeypatch) -> None:
     layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
     torch.nn.Module.__init__(layer)
     layer.use_full_rank_gate = True
     hidden_states = torch.randn(2, 4)
     positions = torch.arange(2)
 
-    def fake_forward(self, hidden_states, positions, output) -> None:
-        output.copy_(hidden_states + positions[:, None])
+    expected = hidden_states + positions[:, None]
 
-    monkeypatch.setattr(KimiGatedDeltaNetAttention, "forward", fake_forward)
+    def fake_forward(self, hidden_states, positions) -> torch.Tensor:
+        return expected
+
+    monkeypatch.setattr(
+        KimiGatedDeltaNetAttention, "_forward_projections", fake_forward
+    )
 
     actual = layer(hidden_states, positions)
 
     torch.testing.assert_close(actual, hidden_states + positions[:, None])
+    assert actual is expected
 
 
 def test_glm5next_moe_applies_external_gate_once() -> None:
@@ -857,8 +862,9 @@ class _FakeKdaPrefillApi:
 
 
 @pytest.mark.parametrize("prefill_backend", ["triton", "flashkda", "b12x"])
+@pytest.mark.parametrize("reuse_gate", [False, True])
 def test_glm5next_kda_splits_mixed_decode_prefill_batch(
-    monkeypatch, prefill_backend: str
+    monkeypatch, prefill_backend: str, reuse_gate: bool
 ) -> None:
     from vllm.models.kimi_k3.nvidia.ops.third_party import kda as kda_ops
     from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -903,6 +909,7 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(
     layer._b12x_kda_plan = None
     layer._b12x_kda_scratch = None
     layer.model_config = SimpleNamespace(dtype=torch.float32)
+    layer.get_state_dtype = lambda: (torch.float32, torch.float32)
     layer._b12x_prefill_api = None
     layer._b12x_prefill_plan = None
     layer._b12x_prefill_max_tokens = 4
@@ -968,6 +975,9 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(
         def __init__(self) -> None:
             self.storage = torch.empty(1024, dtype=torch.uint8)
 
+        def available_bytes(self):
+            return self.storage.numel()
+
         def get_simultaneous(self, *specs):
             outputs = []
             offset = 0
@@ -1003,10 +1013,14 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(
     monkeypatch.setattr(kda_ops, "fused_recurrent_kda", fake_recurrent)
     monkeypatch.setattr(kda_ops, "chunk_kda_with_fused_gate", fake_chunk)
 
-    core_attn_out = torch.empty(1, 4, 1, 1)
+    gate = torch.ones(1, 4, 1, 1)
+    core_attn_out = (
+        layer._core_attn_buffer(gate) if reuse_gate else torch.empty_like(gate)
+    )
+    assert (core_attn_out.data_ptr() == gate.data_ptr()) == reuse_gate
     layer._forward(
         mixed_qkv=torch.arange(12, dtype=torch.float32).view(4, 3),
-        g1=torch.ones(1, 4, 1, 1),
+        g1=gate,
         g2=torch.ones(4, 1, 1),
         beta=torch.ones(1, 4, 1),
         core_attn_out=core_attn_out,

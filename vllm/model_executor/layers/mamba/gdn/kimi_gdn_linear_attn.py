@@ -1387,7 +1387,24 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         positions: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        num_tokens = hidden_states.size(0)
+        output.copy_(self._forward_projections(hidden_states, positions))
+
+    def _core_attn_buffer(self, gate: torch.Tensor) -> torch.Tensor:
+        """Reuse a consumed gate only when recurrence has separate outputs.
+
+        Prefill and mixed batches finish every gate read, including checkpoint
+        writes, before merging recurrence outputs. Decode kernels can instead
+        write directly into the supplied output while reading the gate.
+        """
+        metadata = get_forward_context().attn_metadata
+        m = metadata.get(self.prefix) if isinstance(metadata, dict) else None
+        if isinstance(m, GDNAttentionMetadata) and m.num_prefills > 0:
+            return gate
+        return torch.empty_like(gate)
+
+    def _forward_projections(
+        self, hidden_states: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
         projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
         # Optional model-installed callback (e.g. GLM-5.3 L2 weight prefetch of
         # o_proj while the small projections and the recurrence run).
@@ -1422,11 +1439,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         g2 = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
 
-        core_attn_out = torch.empty(
-            (1, num_tokens, self.local_num_heads, self.head_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
+        core_attn_out = self._core_attn_buffer(g1)
 
         self._forward(
             mixed_qkv=mixed_qkv,
@@ -1441,7 +1454,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         if self.use_full_rank_gate:
             del projected
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
-        output[:] = self.o_proj(core_attn_out)[0]
+        return self.o_proj(core_attn_out)[0]
 
     @eager_break_during_capture
     def _forward(
@@ -1972,14 +1985,12 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ---------- merge spec and non-spec outputs ----------
         if core_attn_out_spec is not None and core_attn_out_non_spec is not None:
             # Mixed batches require indexed placement in the original order.
-            merged = torch.empty(
-                (1, num_actual_tokens, *core_attn_out_spec.shape[2:]),
-                dtype=core_attn_out_spec.dtype,
-                device=core_attn_out_spec.device,
-            )
+            # Both recurrence results are separate allocations in mixed mode.
+            # All gate reads are complete, so their consumed storage may be
+            # the destination without an additional full-token merge buffer.
+            merged = core_attn_out[:, :num_actual_tokens]
             merged.index_copy_(1, spec_token_indx, core_attn_out_spec)
             merged.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
-            core_attn_out[0, :num_actual_tokens] = merged[0, :num_actual_tokens]
         elif core_attn_out_non_spec is not None:
             core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
                 0, :num_actual_tokens
