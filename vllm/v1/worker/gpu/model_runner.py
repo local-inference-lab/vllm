@@ -202,6 +202,7 @@ logger = init_logger(__name__)
 
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        self.cudagraph_native_memory_profile: tuple[int, int, int] | None = None
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
