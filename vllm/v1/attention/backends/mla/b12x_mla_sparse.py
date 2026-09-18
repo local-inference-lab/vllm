@@ -1172,6 +1172,9 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
     lse_base_on_e = True
     supports_dense_mha_prefill = False
     supports_pcp = False
+    # B12X maps selections into caller-owned scratch or uses the indexer's
+    # prepared physical selection. Generic group buffers are never consumed.
+    uses_index_group = False
 
     def __init__(
         self,

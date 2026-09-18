@@ -71,6 +71,71 @@ class _Workspace:
         return [torch.empty(shape, dtype=dtype) for shape, dtype in shapes_and_dtypes]
 
 
+@pytest.mark.parametrize("grouped_backend", [False, True])
+@pytest.mark.parametrize("explicit_builder", [False, True])
+def test_sparse_backend_allocates_only_its_consumed_index_group(
+    monkeypatch, grouped_backend, explicit_builder
+):
+    from vllm.model_executor.layers.attention import sparse_mla_attention as common
+
+    impl = object.__new__(B12xMLASparseImpl)
+    if grouped_backend:
+        impl.uses_index_group = True
+    indices = torch.zeros((4, 8), dtype=torch.int32)
+    calls: list[object] = []
+    group = SimpleNamespace(
+        set_logical_topk_ready=lambda index: calls.append(("ready", index)),
+        prepare_for_batch=lambda index, metadata: calls.append(("batch", index)),
+    )
+
+    def register(*args, **kwargs):
+        calls.append("allocate")
+        return group, 0
+
+    builder = SimpleNamespace(register_layer=register)
+    monkeypatch.setattr(common, "SparseMLAIndexGroupBuilder", lambda topk: builder)
+
+    def initialize_base(self, *args):
+        self.num_heads, self.qk_nope_head_dim, self.qk_rope_head_dim = 1, 8, 0
+
+    monkeypatch.setattr(common.MLACommonBaseImpl, "__init__", initialize_base)
+    monkeypatch.setattr(common, "has_flashinfer", lambda: False)
+    monkeypatch.setattr(common, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(common, "_is_masked_mha_available", lambda **kwargs: False)
+    monkeypatch.setattr(common, "get_current_vllm_config", lambda: object())
+    common.SparseMLACommonImpl.__init__(
+        impl,
+        num_heads=1,
+        head_size=8,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8_ds_mla",
+        logits_soft_cap=None,
+        attn_type="decoder",
+        kv_sharing_target_layer_name=None,
+        q_lora_rank=None,
+        kv_lora_rank=8,
+        qk_nope_head_dim=8,
+        qk_rope_head_dim=0,
+        qk_head_dim=8,
+        v_head_dim=8,
+        kv_b_proj=None,
+        topk_indices_buffer=indices,
+        index_group_builder=builder if explicit_builder else None,
+    )
+    assert impl.topk_indices_buffer is indices
+    impl.record_logical_topk_ready()
+    impl.prepare_for_batch(None)
+    if grouped_backend:
+        assert impl.index_group is group
+        assert calls == ["allocate", ("ready", 0), ("batch", 0)]
+    else:
+        assert impl.index_group is None
+        assert not calls
+
+
 def test_b12x_selector_routes_supported_attention_families() -> None:
     assert AttentionConfig(backend="b12x").backend == AttentionBackendEnum.B12X
     assert AttentionBackendEnum.B12X.get_class() is B12xPagedAttentionBackend
