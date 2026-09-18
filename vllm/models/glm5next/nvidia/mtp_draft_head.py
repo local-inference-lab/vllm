@@ -30,6 +30,17 @@ _NVFP4_GLOBAL_MAX = 448.0 * 6.0
 _SUPPORTED_MODES = frozenset(("bf16", "nvfp4"))
 
 
+def _nvfp4_weight_global_scale(weight: torch.Tensor) -> torch.Tensor:
+    """Compute the BF16 head's FP32 scale with at most 16 MiB of conversion scratch."""
+    # Each float() result owns its storage; sanitization must not alter the
+    # BF16 target head. Chunk maxima preserve the full FP32 reduction exactly.
+    maxima = [
+        chunk.float().abs_().nan_to_num_().amax()
+        for chunk in weight.view(-1).split(4 * 1024 * 1024)
+    ]
+    return _NVFP4_GLOBAL_MAX / torch.stack(maxima).amax()
+
+
 def configured_draft_head_mode() -> str:
     """Return the validated GLM MTP draft-head storage mode."""
     mode = os.getenv("VLLM_GLM53_MTP_DRAFT_HEAD", "bf16").strip().lower()
@@ -91,9 +102,7 @@ class QuantizedDraftHead(nn.Module):
             )
         import flashinfer
 
-        weight_global_scale = (
-            _NVFP4_GLOBAL_MAX / weight.float().abs().nan_to_num().max()
-        )
+        weight_global_scale = _nvfp4_weight_global_scale(weight)
         weight_fp4, weight_sf = flashinfer.nvfp4_quantize(
             weight,
             weight_global_scale,
