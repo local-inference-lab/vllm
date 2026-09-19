@@ -216,6 +216,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             config.kernel_config.linear_backend if config is not None else "auto"
         )
         self._gemm_impl = dispatch_unquantized_gemm(linear_backend)
+        self._use_b12x = linear_backend == "b12x"
 
     def create_weights(
         self,
@@ -247,6 +248,24 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if (
+            self._use_b12x
+            and current_platform.is_cuda()
+            and isinstance(layer, LinearBase)
+            and layer.weight.dtype == torch.bfloat16
+            and layer.weight.is_contiguous()
+        ):
+            from b12x.gemm import bf16_gemv
+
+            from vllm.model_executor.kernels.linear.b12x_unquantized import (
+                B12xUnquantizedLinear,
+            )
+            from vllm.utils.b12x import set_b12x_preparation_provider
+
+            if bf16_gemv.is_supported(layer.weight.device):
+                owner = B12xUnquantizedLinear(layer)
+                object.__setattr__(layer, "_b12x_unquantized", owner)
+                set_b12x_preparation_provider(layer, owner)
         if current_platform.is_cpu():
             # MLA's kv_b_proj (see `skip_weight_relayout`): not perf-critical,
             # so skip packing and use a plain fallback.
@@ -279,6 +298,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
             current_platform.is_cuda_alike() or current_platform.is_xpu()
         ):
             return linear_batch_invariant(x, layer.weight, bias)
+        owner = getattr(layer, "_b12x_unquantized", None)
+        if owner is not None:
+            return owner.apply(x, layer.weight, bias)
         return self._gemm_impl(layer, x, layer.weight, bias)
 
 
