@@ -126,9 +126,35 @@ def test_shared_fp8_tuning_gate_identity_includes_loaded_geometry(monkeypatch):
     assert list(layer.modules()) == [layer]
 
 
+@pytest.mark.parametrize("parameter", ("swiglu_limit", "alpha", "beta"))
+def test_shared_fp8_tuning_context_tracks_activation_recipe(monkeypatch, parameter):
+    from vllm.config import DeviceConfig
+    from vllm.model_executor.layers.activation import SiluAndMulWithClamp
+    from vllm.utils import deep_gemm
+
+    monkeypatch.setattr(deep_gemm, "is_deep_gemm_e8m0_used", lambda: True)
+    layer, shared = _shared_fp8_tuning_fixture()
+    with set_current_vllm_config(VllmConfig(device_config=DeviceConfig("cpu"))):
+        shared._layer.act_fn = SiluAndMulWithClamp(10.0, compile_native=False)
+    key = b12x._shared_expert_tuning_context(layer, "w4a8_mx", 8)[1]
+    setattr(
+        shared._layer.act_fn, parameter, getattr(shared._layer.act_fn, parameter) + 1
+    )
+    assert key != b12x._shared_expert_tuning_context(layer, "w4a8_mx", 8)[1]
+
+
 @pytest.mark.parametrize(
     "exclusion",
-    ["stream", "internal", "parallel", "collective", "dtype", "width", "quant"],
+    [
+        "stream",
+        "internal",
+        "parallel",
+        "collective",
+        "dtype",
+        "width",
+        "quant",
+        "activation",
+    ],
 )
 def test_shared_fp8_tuning_excludes_unsupported_execution(monkeypatch, exclusion):
     from vllm.utils import deep_gemm
@@ -148,6 +174,9 @@ def test_shared_fp8_tuning_excludes_unsupported_execution(monkeypatch, exclusion
         shared._layer.down_proj.weight = torch.empty((8, 8))
     elif exclusion == "width":
         hidden_size = 16
+    elif exclusion == "activation":
+        del shared._layer.act_fn
+        shared._layer.act_fn = lambda value: value
     else:
         quant_mode = "nvfp4"
     assert b12x._shared_expert_tuning_context(layer, quant_mode, hidden_size) == (
