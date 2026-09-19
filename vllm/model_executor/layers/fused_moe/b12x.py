@@ -253,7 +253,7 @@ def _shared_expert_tuning_context(
     from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
 
     mlp = shared._layer
-    if not callable(getattr(mlp, "act_fn", None)):
+    if not isinstance(getattr(mlp, "act_fn", None), torch.nn.Module):
         return None, None
     projections = []
     for name in ("gate_up_proj", "down_proj"):
@@ -292,10 +292,15 @@ def _shared_expert_tuning_context(
     )
     descriptor = FrozenMapping(
         {
-            "version": 2,
+            "version": 3,
             "backend": "deep_gemm_block_fp8_mlp",
             "projections": projections,
-            "activation": type(mlp.act_fn).__qualname__,
+            "activation": {
+                "type": (
+                    f"{type(mlp.act_fn).__module__}.{type(mlp.act_fn).__qualname__}"
+                ),
+                "parameters": mlp.act_fn.extra_repr(),
+            },
             "ue8m0": is_deep_gemm_e8m0_used(),
             "tma_aligned_scales": envs.VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES,
             "max_tokens": min(8, envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD),
