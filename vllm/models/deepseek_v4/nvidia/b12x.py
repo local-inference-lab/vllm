@@ -856,6 +856,8 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
                     rope_dim=self.rope_head_dim,
                     positions_dtype="int64",
                     cos_sin_dtype=str(table.dtype).removeprefix("torch."),
+                    sfb_k_replicated=weights.sfb_k_replicated,
+                    wo_b_tiled=weights.wo_b.values_tiled is not None,
                 ),
             )
             self._b12x_wo_plans[rows] = plan
