@@ -2165,6 +2165,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         # Run model.
+        cache = getattr(self, "b12x_expert_cache", None)
+        if cache is not None:
+            # The scheduler classifies phase; tensor shape is not a phase label.
+            # Mixed decode/prefill batches are excluded in this first experiment.
+            cache.prepare_observation(
+                0
+                if dummy_run or batch_req_state is None or batch_req_state.has_prefill
+                else input_batch.num_tokens
+            )
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,

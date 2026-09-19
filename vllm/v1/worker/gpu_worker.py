@@ -584,13 +584,34 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             outcome = coordinator.advance(cancel_tuning=cancel_tuning)
         if outcome["done"]:
+            if (
+                isinstance(self.vllm_config.additional_config, dict)
+                and self.vllm_config.additional_config.get("b12x_expert_cache")
+                is not None
+            ):
+                from vllm.model_executor.layers.fused_moe.b12x_cache import (
+                    cache_provider,
+                )
+
+                if not self.use_v2_model_runner:
+                    raise ValueError(
+                        "expert cache phase integration requires the V2 model runner"
+                    )
+                provider = cache_provider(self.vllm_config)
+                if provider is None:
+                    raise RuntimeError(
+                        "expert cache configured but no routed CPU sources were loaded"
+                    )
+                provider.model.attach()
+                self.model_runner.b12x_expert_cache = provider.model
+                self.model_runner.b12x_residency_runtime = provider.model.runtime
             self._b12x_startup_coordinator = None
             self._b12x_stage = None
             # Timing trials leave freed blocks in the caching allocator; return
             # them so memory profiling after the weights stage sees the same
             # free memory as a start that reused cached selections.
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+            torch.accelerator.synchronize()
+            torch.accelerator.empty_cache()
         return outcome
 
     def abort_b12x_preparation(self) -> dict[str, object]:

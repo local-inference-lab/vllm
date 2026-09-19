@@ -244,6 +244,21 @@ class ModelOptQuantConfigBase(QuantizationConfig):
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             return build_linear_method(self, self.quant_method, prefix)
         elif isinstance(layer, RoutedExperts):
+            config = get_current_vllm_config_or_none()
+            if (
+                config is not None
+                and isinstance(config.additional_config, dict)
+                and config.additional_config.get("b12x_expert_cache") is not None
+            ):
+                if not isinstance(self, ModelOptNvFp4Config):
+                    raise ValueError(
+                        "expert cache loader currently supports ModelOpt NVFP4 only"
+                    )
+                from vllm.model_executor.layers.fused_moe.b12x_cache import (
+                    ModelOptNvFp4CacheMoE,
+                )
+
+                return ModelOptNvFp4CacheMoE(self, layer.moe_config, prefix)
             quant_method = self.FusedMoEMethodCls(
                 quant_config=self, moe_config=layer.moe_config
             )
