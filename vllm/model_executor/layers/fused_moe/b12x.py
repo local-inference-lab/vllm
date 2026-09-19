@@ -394,6 +394,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 w2_global_scales=w2_global_scale,
                 input_scale=a1_gscale,
                 intermediate_scale=a2_gscale,
+                # Loaded scales are fixed while prepared plans and their
+                # captured CUDA graphs execute.
+                immutable_input_scales=True,
             ),
         )
 
