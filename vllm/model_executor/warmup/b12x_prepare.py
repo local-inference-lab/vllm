@@ -229,6 +229,7 @@ def _units_from_modules(
     workload: B12xWorkload,
     *,
     seen: set[int] | None = None,
+    module_lanes: dict[int, tuple[int, ...]] | None = None,
 ) -> Iterable[B12xPreparationUnit]:
     if seen is None:
         seen = set()
@@ -255,7 +256,12 @@ def _units_from_modules(
                     f"{type(provider).__qualname__} returned a non-unit "
                     "preparation value"
                 )
-            yield unit
+            lanes = (
+                (workload.lane,)
+                if module_lanes is None
+                else module_lanes.get(id(module), (workload.lane,))
+            )
+            yield replace(unit, workspace_lanes=lanes)
 
 
 def mark_b12x_eager_shapes(worker: Worker) -> None:
@@ -329,26 +335,43 @@ def collect_b12x_units(
     """Collect every unit of one stage from the model, the draft, and comms."""
     mark_b12x_eager_shapes(worker)
     units: list[B12xPreparationUnit] = []
+    model = worker.get_model()
     draft = worker.get_draft_model()
+    lane = _draft_lane(worker) if draft is not None else 0
+    lanes_by_module: dict[int, set[int]] = {}
+    for owner, owner_lane in ((model, 0), (draft, lane)):
+        if owner is not None:
+            for module in owner.modules():
+                lanes_by_module.setdefault(id(module), set()).add(owner_lane)
+    module_lanes = {key: tuple(sorted(lanes)) for key, lanes in lanes_by_module.items()}
     if draft is not None:
-        lane = _draft_lane(worker)
         workload = _draft_workload(worker, workload, lane=0)
     # Target and draft can share the same embedding and output-head modules.
     seen: set[int] = set()
-    units.extend(_units_from_modules(worker.get_model(), workload, seen=seen))
+    units.extend(
+        _units_from_modules(model, workload, seen=seen, module_lanes=module_lanes)
+    )
     if draft is not None:
         draft_workload = replace(workload, lane=lane)
         from vllm.v1.worker.workspace import use_workspace_lane
 
         with use_workspace_lane(lane):
-            draft_units = list(_units_from_modules(draft, draft_workload, seen=seen))
+            draft_units = list(
+                _units_from_modules(
+                    draft, draft_workload, seen=seen, module_lanes=module_lanes
+                )
+            )
         if lane:
             draft_units = [scope_b12x_unit_calls(unit, lane) for unit in draft_units]
         units.extend(draft_units)
     for provider in b12x_unit_providers():
         hook = getattr(provider, "get_b12x_preparation_units", None)
         if callable(hook):
-            units.extend(hook(provider, workload))
+            # Communicators serve target and draft executions independently.
+            units.extend(
+                replace(unit, workspace_lanes=tuple(sorted({0, lane})))
+                for unit in hook(provider, workload)
+            )
     # The state stage also carries the weights-stage units: their prepared
     # plans are skipped by the session, and any plan a layer declared for a
     # count that only the state stage exposes is prepared before capture.
@@ -448,6 +471,14 @@ def b12x_batches(units: Iterable[B12xPreparationUnit], *, autotune: bool = True)
     return batches
 
 
+def _request_workspace_lanes(units: Iterable[B12xPreparationUnit]):
+    return {
+        request.name: unit.workspace_lanes
+        for unit in units
+        for request in unit.requests
+    }
+
+
 def get_b12x_session(worker: Worker):
     """Return the worker's preparation session, creating it on first use."""
     session = getattr(worker, "_b12x_session", None)
@@ -493,10 +524,12 @@ def begin_b12x_preparation(worker: Worker, *, stage: str):
     from vllm.v1.worker.workspace import current_workspace_manager
 
     batches = []
+    units = []
     if b12x_native_supported(worker):
         workload = b12x_workload(worker, stage="state" if stage == "bind" else stage)
+        units = collect_b12x_units(worker, workload)
         batches = b12x_batches(
-            collect_b12x_units(worker, workload),
+            units,
             autotune=(
                 bool(worker.vllm_config.kernel_config.enable_b12x_autotune)
                 and os.environ.get("B12X_AUTOTUNE", "1") != "0"
@@ -532,6 +565,7 @@ def begin_b12x_preparation(worker: Worker, *, stage: str):
         global_rank=int(worker.rank),
         world_group=get_world_group(),
         workspace=current_workspace_manager() if batches else None,
+        request_workspace_lanes=_request_workspace_lanes(units),
     )
 
 
@@ -615,6 +649,7 @@ def prepare_b12x_profile(worker: Worker, *, stage: str) -> B12xPreparedBatch:
     from vllm.v1.worker.workspace import current_workspace_manager
 
     requests: tuple[PreparationRequest, ...] = ()
+    units = []
     if b12x_native_supported(worker):
         workload = b12x_workload(worker, stage=stage)
         units = collect_b12x_units(worker, workload)
@@ -628,6 +663,7 @@ def prepare_b12x_profile(worker: Worker, *, stage: str) -> B12xPreparedBatch:
         global_rank=int(worker.rank),
         world_group=get_world_group(),
         workspace=current_workspace_manager() if requests else None,
+        request_workspace_lanes=_request_workspace_lanes(units),
     )
     outcome = coordinator.status()
     while not outcome["done"]:

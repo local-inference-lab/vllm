@@ -42,11 +42,13 @@ class B12xPreparationCoordinator:
         world_group,
         process_local_only: bool = False,
         workspace=None,
+        request_workspace_lanes: dict[str, tuple[int, ...]] | None = None,
     ) -> None:
         if type(global_rank) is not int or global_rank < 0:
             raise ValueError("global_rank must be a nonnegative integer")
         self.session = session
         self._workspace = workspace
+        self._request_workspace_lanes = request_workspace_lanes
         self._active_requests = ()
         self.global_rank = global_rank
         self.world_group = world_group
@@ -299,13 +301,25 @@ class B12xPreparationCoordinator:
 
         job.result().close()
         if self._workspace is not None:
+            from vllm.v1.worker.workspace import use_workspace_lane
+
             for request in self._active_requests:
                 specs = tuple(request.plan.scratch_specs())
                 if specs:
-                    self._workspace.get_simultaneous(
-                        *((spec.shape, spec.dtype) for spec in specs)
+                    lanes = (
+                        (0,)
+                        if self._request_workspace_lanes is None
+                        else self._request_workspace_lanes[request.name]
                     )
-            self._workspace.reserve_all()
+                    for lane in lanes:
+                        with use_workspace_lane(lane):
+                            self._workspace.get_simultaneous(
+                                *((spec.shape, spec.dtype) for spec in specs)
+                            )
+            if self._request_workspace_lanes is None:
+                self._workspace.reserve_all()
+            else:
+                self._workspace.reserve_by_lane()
         self._active_requests = ()
         self._job = None
         if self._batches:

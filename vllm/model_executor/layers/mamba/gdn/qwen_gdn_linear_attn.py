@@ -959,16 +959,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if api is None:
             raise RuntimeError("b12x GDN prefill was not initialized")
         recurrent_state = self.kv_cache[1]
-        staging = self._b12x_prefill_staging
-        resident_nbytes = 0
-        if staging is not None and staging.is_compatible(
-            max_tokens=self._b12x_prefill_max_tokens,
-            max_seqs=self._b12x_prefill_max_seqs,
-            key_heads=self._b12x_local_key_heads,
-            value_heads=self._b12x_local_value_heads,
-            device=recurrent_state.device,
-        ):
-            resident_nbytes = staging.nbytes
         caps = api.Caps(
             device=current_platform.current_device(),
             max_tokens=capacity,
@@ -979,8 +969,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             state_dtype=recurrent_state.dtype,
             checkpoint_export=True,
             null_state_index=0,
-            staging_key=(self._b12x_preparation_prefix, "gdn-prefill-staging"),
-            staging_resident_nbytes=resident_nbytes,
         )
         return api.plan(
             caps,
@@ -1148,7 +1136,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _b12x_gdn_prefill_call(self, state, capacity: int, *, benchmark: bool):
         from b12x.preparation import PreparedCall
 
-        owners: tuple[torch.Tensor, ...]
         specs = tuple(state.layout.scratch_specs())
         if len(specs) != 1:
             raise RuntimeError("b12x GDN prefill requires one scratch buffer")
@@ -1159,11 +1146,30 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Trial and prepare factories own their scratch; the runtime path in
         # B12xGdnPrefill.run draws from the workspace manager instead.
         scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+        # Priming and candidate races use temporary inputs. Serving binds the
+        # caller's projection and output tensors directly, without retaining
+        # scheduler-capacity activation storage on every layer.
+        mixed_qkv = torch.empty(
+            (
+                capacity,
+                (2 * self._b12x_local_key_heads + self._b12x_local_value_heads) * 128,
+            ),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        a = torch.empty(
+            (capacity, self._b12x_local_value_heads),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        b = torch.empty_like(a)
+        output = torch.empty(
+            (capacity, self._b12x_local_value_heads, 128),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        owners: tuple[torch.Tensor, ...]
         if benchmark:
-            mixed_qkv = torch.empty_like(staging.mixed_qkv[:capacity])
-            a = torch.empty_like(staging.a[:capacity])
-            b = torch.empty_like(staging.b[:capacity])
-            output = torch.empty_like(staging.output[:capacity])
             cu_seqlens = torch.empty_like(staging.query_start_loc)
             indices = torch.full_like(staging.initial_indices, slot)
             final_indices = torch.full_like(staging.final_indices, slot)
@@ -1187,12 +1193,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 num_tokens,
             )
         else:
-            mixed_qkv = staging.mixed_qkv[:capacity]
-            a, b, output = (
-                staging.a[:capacity],
-                staging.b[:capacity],
-                staging.output[:capacity],
-            )
             cu_seqlens = staging.query_start_loc
             indices, final_indices = staging.initial_indices, staging.final_indices
             checkpoint_indices, offsets = (
@@ -2346,6 +2346,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     raise RuntimeError(
                         "b12x GDN prefill cache and runtime metadata must be bound"
                     )
+                prefill_output = torch.empty(
+                    (
+                        conv_output_prefill.shape[0],
+                        self._b12x_local_value_heads,
+                        self.head_v_dim,
+                    ),
+                    device=conv_output_prefill.device,
+                    dtype=conv_output_prefill.dtype,
+                )
                 runner.run(
                     mixed_qkv=conv_output_prefill,
                     a=a_prefill,
@@ -2355,12 +2364,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     has_initial_state=prefill_has_initial_state,
                     live_counts=attn_metadata.b12x_prefill_live_counts,
                     checkpoint=attn_metadata.prefill_checkpoint,
-                    output=runner.output,
+                    output=prefill_output,
                     eps=self.layer_norm_epsilon,
                 )
-                core_attn_out_non_spec = runner.output[
-                    : conv_output_prefill.shape[0]
-                ].unsqueeze(0)
+                core_attn_out_non_spec = prefill_output.unsqueeze(0)
             else:
                 initial_state = ssm_state[prefill_state_indices]
                 initial_state[~prefill_has_initial_state, ...] = 0
@@ -2989,6 +2996,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             query_start_loc=metadata.query_start_loc,
             metadata=metadata.convolution_metadata(rows),
         ).transpose(0, 1)
+        prefill_output = torch.empty_like(core_attn_out)
         runner.run(
             mixed_qkv=convolved,
             a=a.index_select(0, non_spec_indices),
@@ -2998,22 +3006,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             has_initial_state=metadata.has_initial_state,
             live_counts=metadata.live_counts,
             checkpoint=metadata.checkpoint,
-            output=runner.output,
+            output=prefill_output,
             eps=self.layer_norm_epsilon,
         )
         self._rms_norm_gated_cuda(
-            runner.output[:rows],
+            prefill_output,
             output_gate.index_select(0, non_spec_indices),
-            runner.output[:rows],
+            prefill_output,
         )
         core_attn_out.zero_()
         width = core_attn_out.shape[-2] * core_attn_out.shape[-1]
         _scatter_b12x_gdn_output[(rows, triton.cdiv(width, 256))](
-            runner.output,
+            prefill_output,
             non_spec_indices,
             metadata.live_counts,
             core_attn_out,
-            SOURCE_STRIDE=runner.output.stride(0),
+            SOURCE_STRIDE=prefill_output.stride(0),
             OUTPUT_STRIDE=core_attn_out.stride(0),
             WIDTH=width,
             BLOCK=256,

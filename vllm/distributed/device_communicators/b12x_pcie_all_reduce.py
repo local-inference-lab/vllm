@@ -248,6 +248,7 @@ class B12xPcieAllReduce:
             ]
         ] = []
         self._plans: dict[str, object] = {}
+        self._plan_index: dict[tuple, object] = {}
         self._invocations: dict[str, B12xPcieInvocation] = {}
         self._routes: dict[str, str] = {}
         if len(self.global_ranks) != self.world_size:
@@ -596,12 +597,14 @@ class B12xPcieAllReduce:
         plans: dict[str, object] = {}
         routes: dict[str, str] = {}
         collective_ranks = tuple(sorted(self.global_ranks))
-        declarations = {}
+        declarations: dict[tuple, Any] = {}
+        prepare: Callable[..., Any]
         for invocation in invocations:
             route = self._route_invocation(invocation)
             if route is None:
                 continue
             routes[invocation.name] = route
+            assert self._runtime is not None
             target = self._runtime._prepared_channel_for_stream(
                 None, invocation.channel_id
             )
@@ -630,7 +633,7 @@ class B12xPcieAllReduce:
                     plan = _oneshot_preparation.plan(query, runtime=target)
                     declarations[key] = plan
 
-                def prepare(state, invocation=invocation, query=query):
+                def prepare_oneshot(state, invocation=invocation, query=query):
                     registered = bool(query.setup["registered"])
                     inp = self._request_input(invocation, registered=registered)
                     reset, produce, restore, owners = self._oneshot_prime_input(
@@ -665,6 +668,8 @@ class B12xPcieAllReduce:
                         restore=restore,
                         owners=owners,
                     )
+
+                prepare = prepare_oneshot
             elif route == "twoshot":
                 assert self._twoshot is not None
                 query = _twoshot_preparation.query_from_metadata(
@@ -681,13 +686,15 @@ class B12xPcieAllReduce:
                     plan = _twoshot_preparation.plan(query, runtime=self._twoshot)
                     declarations[key] = plan
 
-                def prepare(state, invocation=invocation):
+                def prepare_twoshot(state, invocation=invocation):
                     inp = self._request_input(invocation, registered=False)
                     assert inp is not None
                     inp.fill_(1)
                     return _twoshot_preparation.prepared_call(
                         state, payload=inp, out=torch.empty_like(inp)
                     )
+
+                prepare = prepare_twoshot
             else:
                 assert self._dma is not None
                 query = _dma_preparation.query_from_metadata(
@@ -703,7 +710,7 @@ class B12xPcieAllReduce:
                     plan = _dma_preparation.plan(query, runtime=self._dma)
                     declarations[key] = plan
 
-                def prepare(state, invocation=invocation):
+                def prepare_dma(state, invocation=invocation):
                     inp = self._request_input(invocation, registered=False)
                     assert inp is not None
                     inp.fill_(1)
@@ -711,6 +718,7 @@ class B12xPcieAllReduce:
                         state, inp=inp, out=torch.empty_like(inp)
                     )
 
+                prepare = prepare_dma
             plans[invocation.name] = plan
             requests.append(
                 plan.request(
@@ -732,6 +740,7 @@ class B12xPcieAllReduce:
         }
         self._plans = plans
         self._routes = routes
+        self._index_declared_plans()
         if not requests:
             return ()
         return (
@@ -743,6 +752,47 @@ class B12xPcieAllReduce:
             ),
         )
 
+    @staticmethod
+    def _plan_key(operation, shape, dtype, strides, weight=None, epsilon=None):
+        norm = None if operation == "all_reduce" else (id(weight), epsilon)
+        return operation, tuple(shape), dtype, tuple(strides), norm
+
+    def _index_declared_plans(self) -> None:
+        index: dict[tuple, object] = {}
+        for name, invocation in self._invocations.items():
+            key = self._plan_key(
+                invocation.operation,
+                invocation.shape,
+                invocation.dtype,
+                invocation.strides
+                if invocation.strides is not None
+                else self._contiguous_strides(invocation.shape),
+                invocation.norm_weight,
+                invocation.epsilon,
+            )
+            # Equivalent declarations keep the first plan, matching model order.
+            index.setdefault(key, self._plans[name])
+        self._plan_index = index
+
+    def _lookup_plan(
+        self,
+        inp: torch.Tensor,
+        *,
+        operation: str = "all_reduce",
+        weight: torch.Tensor | None = None,
+        epsilon: float | None = None,
+    ):
+        return self._plan_index.get(
+            self._plan_key(
+                operation,
+                inp.shape,
+                inp.dtype,
+                inp.stride(),
+                weight,
+                epsilon,
+            )
+        )
+
     def _plan_for(
         self,
         inp: torch.Tensor,
@@ -751,32 +801,16 @@ class B12xPcieAllReduce:
         weight: torch.Tensor | None = None,
         epsilon: float | None = None,
     ):
-        strides = tuple(inp.stride())
-        for name, invocation in self._invocations.items():
-            if (
-                invocation.operation == operation
-                and tuple(inp.shape) == invocation.shape
-                and inp.dtype == invocation.dtype
-                and strides
-                == (
-                    self._contiguous_strides(invocation.shape)
-                    if invocation.strides is None
-                    else invocation.strides
-                )
-                and (
-                    operation == "all_reduce"
-                    or (
-                        invocation.norm_weight is weight
-                        and invocation.epsilon == epsilon
-                    )
-                )
-            ):
-                return self._plans[name]
+        plan = self._lookup_plan(
+            inp, operation=operation, weight=weight, epsilon=epsilon
+        )
+        if plan is not None:
+            return plan
         from vllm.utils.b12x import PreparationResourceUnavailableError
 
         raise PreparationResourceUnavailableError(
             f"PCIe collective has no declared plan for {operation} on shape "
-            f"{tuple(inp.shape)} {inp.dtype} strides {strides}; declared: "
+            f"{tuple(inp.shape)} {inp.dtype} strides {tuple(inp.stride())}; declared: "
             + ", ".join(
                 f"{invocation.operation}{invocation.shape}"
                 for invocation in self._invocations.values()
@@ -791,11 +825,7 @@ class B12xPcieAllReduce:
         the captured and planned serving shapes, so an undeclared shape is a
         prefill chunk or warm-up batch outside the graph-replayed set.
         """
-        from vllm.utils.b12x import PreparationResourceUnavailableError
-
-        try:
-            self._plan_for(inp, **kwargs)
-        except PreparationResourceUnavailableError:
+        if self._lookup_plan(inp, **kwargs) is None:
             logger.debug(
                 "b12x PCIe all-reduce declines undeclared shape %s %s",
                 tuple(inp.shape),
@@ -953,6 +983,7 @@ class B12xPcieAllReduce:
             self._runtime.close()
             self._runtime = None
         self._plans.clear()
+        self._plan_index.clear()
         self._invocations.clear()
         self._routes.clear()
         self.disabled = True
