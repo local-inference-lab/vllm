@@ -252,6 +252,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             self._use_b12x
             and current_platform.is_cuda()
             and isinstance(layer, LinearBase)
+            and layer.weight.ndim == 2
             and layer.weight.dtype == torch.bfloat16
             and layer.weight.is_contiguous()
         ):

@@ -4,14 +4,13 @@
 
 from __future__ import annotations
 
-import weakref
-
 import torch
 
-from vllm.utils.b12x import B12xPreparationUnit
-
-_OWNERS: weakref.WeakValueDictionary[str, B12xUnquantizedLinear] = (
-    weakref.WeakValueDictionary()
+from vllm.utils.b12x import (
+    B12xPreparationUnit,
+    b12x_layer,
+    b12x_layer_prefix,
+    register_b12x_layer,
 )
 
 
@@ -22,9 +21,9 @@ class B12xUnquantizedLinear:
         self.projection = bf16_gemv
         self.weight = layer.weight
         self.bias = None if layer.skip_bias_add else layer.bias
-        self.name = layer.prefix
+        self.name = b12x_layer_prefix(layer)
         self.plans = {}
-        _OWNERS[self.name] = self
+        register_b12x_layer(self.name, layer)
 
     def get_b12x_preparation_units(self, layer, workload):
         from b12x.preparation import PreparedCall
@@ -100,7 +99,7 @@ class B12xUnquantizedLinear:
 def b12x_unquantized_linear(
     source: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, owner: str
 ) -> torch.Tensor:
-    return _OWNERS[owner].run(source, weight, bias)
+    return b12x_layer(owner)._b12x_unquantized.run(source, weight, bias)
 
 
 @b12x_unquantized_linear.register_fake
