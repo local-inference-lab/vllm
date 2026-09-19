@@ -306,6 +306,12 @@ class MoERunner(MoERunnerInterface):
                     "shared_experts_for_preparation",
                     weakref.ref(self._shared_experts),
                 )
+                if gate is not None:
+                    object.__setattr__(
+                        routed_experts,
+                        "routing_gate_for_preparation",
+                        weakref.ref(gate),
+                    )
 
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name

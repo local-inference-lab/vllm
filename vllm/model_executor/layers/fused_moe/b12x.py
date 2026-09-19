@@ -68,6 +68,12 @@ def _b12x_activation_name(activation: MoEActivation) -> str:
 
 
 @dataclass(frozen=True)
+class _SharedExpertTuning:
+    shared: Any
+    gate: Any | None = None
+
+
+@dataclass(frozen=True)
 class _PreparedMoECall:
     """Priming tensors for one exact prepared MoE variant.
 
@@ -131,7 +137,8 @@ class _PreparedMoECall:
                 SharedExpertsOrder,
             )
 
-            shared = self.shared_experts
+            shared = self.shared_experts.shared
+            gate = self.shared_experts.gate
             if shared._determine_shared_experts_order(hidden) == (
                 SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
             ):
@@ -142,6 +149,8 @@ class _PreparedMoECall:
                     auxiliary.wait_stream(primary)
                     with torch.cuda.stream(auxiliary):
                         shared_output = shared._layer(hidden)
+                    if gate is not None:
+                        gate(hidden)
                     binding.run()
                     primary.wait_stream(auxiliary)
                     shared_output.record_stream(primary)
@@ -259,18 +268,41 @@ def _shared_expert_tuning_context(
         projections.append((tuple(weight.shape), tuple(scale.shape), str(scale.dtype)))
     if not (projections[0][0][1] == projections[1][0][0] == hidden_size):
         return None, None
+    gate_reference = getattr(layer, "routing_gate_for_preparation", None)
+    gate = None if gate_reference is None else gate_reference()
+    gate_weight = getattr(gate, "weight", None)
+    if not (
+        isinstance(gate_weight, torch.Tensor)
+        and gate_weight.dtype == torch.bfloat16
+        and gate_weight.ndim == 2
+        and gate_weight.shape[1] == hidden_size
+        and getattr(gate, "out_dtype", None) == torch.float32
+        and getattr(gate, "allow_ll_bf16_gemm", False)
+    ):
+        gate = None
+    gate_context = (
+        None
+        if gate is None
+        else {
+            "backend": "ll_bf16_router",
+            "shape": tuple(gate.weight.shape),
+            "dtype": str(gate.weight.dtype),
+            "output_dtype": str(gate.out_dtype),
+        }
+    )
     descriptor = FrozenMapping(
         {
-            "version": 1,
+            "version": 2,
             "backend": "deep_gemm_block_fp8_mlp",
             "projections": projections,
             "activation": type(mlp.act_fn).__qualname__,
             "ue8m0": is_deep_gemm_e8m0_used(),
             "tma_aligned_scales": envs.VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES,
             "max_tokens": min(8, envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD),
+            "gate": gate_context,
         }
     )
-    return shared, descriptor
+    return _SharedExpertTuning(shared, gate), descriptor
 
 
 def _is_current_stream_capturing() -> bool:

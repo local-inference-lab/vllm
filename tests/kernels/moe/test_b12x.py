@@ -95,12 +95,34 @@ def test_shared_fp8_tuning_context_keys_geometry_not_module_identity(monkeypatch
     layer, shared = _shared_fp8_tuning_fixture()
     other_layer, other_shared = _shared_fp8_tuning_fixture()
     found, key = b12x._shared_expert_tuning_context(layer, "w4a8_mx", 8)
-    assert found is shared
+    assert found.shared is shared and found.gate is None
     assert key == b12x._shared_expert_tuning_context(other_layer, "w4a8_mx", 8)[1]
     other_shared._layer.gate_up_proj.weight = torch.empty(
         (32, 8), dtype=torch.float8_e4m3fn
     )
     assert key != b12x._shared_expert_tuning_context(other_layer, "w4a8_mx", 8)[1]
+    assert list(layer.modules()) == [layer]
+
+
+def test_shared_fp8_tuning_gate_identity_includes_loaded_geometry(monkeypatch):
+    from vllm.utils import deep_gemm
+
+    monkeypatch.setattr(deep_gemm, "is_deep_gemm_e8m0_used", lambda: True)
+    layer, shared = _shared_fp8_tuning_fixture()
+    without_gate = b12x._shared_expert_tuning_context(layer, "w4a8_mx", 8)[1]
+    gate = torch.nn.Module()
+    gate.weight = torch.empty((4, 8), dtype=torch.bfloat16)
+    gate.out_dtype = torch.float32
+    gate.allow_ll_bf16_gemm = True
+    layer.routing_gate_for_preparation = weakref.ref(gate)
+    context, key = b12x._shared_expert_tuning_context(layer, "w4a8_mx", 8)
+    assert context.shared is shared and context.gate is gate
+    assert key != without_gate
+    gate.weight = torch.empty((8, 8), dtype=torch.bfloat16)
+    assert key != b12x._shared_expert_tuning_context(layer, "w4a8_mx", 8)[1]
+    gate.allow_ll_bf16_gemm = False
+    context, key = b12x._shared_expert_tuning_context(layer, "w4a8_mx", 8)
+    assert context.gate is None and key == without_gate
     assert list(layer.modules()) == [layer]
 
 
@@ -183,7 +205,12 @@ def test_shared_fp8_tuning_joins_auxiliary_work_before_timing_ends(monkeypatch):
             SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
         ),
     )
-    call = b12x._PreparedMoECall(state, 2, 2, None, torch.bfloat16, shared)
+
+    def gate(hidden):
+        events.append(("gate", tuple(hidden.shape)))
+
+    context = b12x._SharedExpertTuning(shared, gate)
+    call = b12x._PreparedMoECall(state, 2, 2, None, torch.bfloat16, context)
     hidden = torch.zeros((2, 8), dtype=torch.bfloat16)
     ids = torch.zeros((2, 2), dtype=torch.int32)
     weights = torch.ones((2, 2))
@@ -204,6 +231,7 @@ def test_shared_fp8_tuning_joins_auxiliary_work_before_timing_ends(monkeypatch):
         ("enter", "auxiliary"),
         ("shared", (2, 8)),
         ("exit", "auxiliary"),
+        ("gate", (2, 8)),
         "routed",
         ("primary", "wait", "auxiliary"),
         ("record", "primary"),
