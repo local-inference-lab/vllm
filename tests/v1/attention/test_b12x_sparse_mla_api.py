@@ -2409,21 +2409,28 @@ def _deepseek_v4_wo_layer(device, groups=2, heads_per_group=8, rank=128, hidden=
 
 
 @pytest.mark.parametrize("eager_only", [False, True])
-def test_deepseek_v4_wo_declares_exact_rows_before_profiling(monkeypatch, eager_only):
+@pytest.mark.parametrize("tiled", [False, True])
+def test_deepseek_v4_wo_declares_exact_rows_before_profiling(
+    monkeypatch, eager_only, tiled
+):
     from dataclasses import replace
 
     from b12x.gemm import wo_projection
 
     from vllm.utils.b12x import B12xWorkload
 
-    layer = _deepseek_v4_wo_layer(torch.device("cpu"))
+    groups, rank, hidden = (4, 1024, 4096) if tiled else (2, 128, 256)
+    layer = _deepseek_v4_wo_layer(
+        torch.device("cpu"), groups=groups, rank=rank, hidden=hidden
+    )
     layer._b12x_wo_projection_weights = SimpleNamespace(
-        groups=2,
+        groups=groups,
         group_width=4096,
-        rank=128,
-        hidden=256,
+        rank=rank,
+        hidden=hidden,
         sfb_k_replicated=True,
-        wo_b=SimpleNamespace(values_tiled=None),
+        wo_a=SimpleNamespace(values_tiled=object() if tiled else None),
+        wo_b=SimpleNamespace(values_tiled=object() if tiled else None),
     )
     monkeypatch.setattr(b12x_mla, "_require_b12x_wo_projection", lambda: wo_projection)
     workload = B12xWorkload(
@@ -2450,7 +2457,8 @@ def test_deepseek_v4_wo_declares_exact_rows_before_profiling(monkeypatch, eager_
         assert query.operation == "inv_rope" and not query.dynamic_tokens
         assert (query.heads_per_group, query.nope_dim, query.rope_dim) == (8, 448, 64)
         assert query.positions_dtype == "int64" and query.cos_sin_dtype == "bfloat16"
-        assert query.sfb_k_replicated and not query.wo_b_tiled
+        assert query.sfb_k_replicated
+        assert query.wo_a_tiled is tiled and query.wo_b_tiled is tiled
     (repeated,) = layer.get_b12x_preparation_units(layer, workload)
     assert all(a.plan is b.plan for a, b in zip(unit.requests, repeated.requests))
     assert (

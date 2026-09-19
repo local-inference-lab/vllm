@@ -856,6 +856,7 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
                     positions_dtype="int64",
                     cos_sin_dtype=str(table.dtype).removeprefix("torch."),
                     sfb_k_replicated=weights.sfb_k_replicated,
+                    wo_a_tiled=weights.wo_a.values_tiled is not None,
                     wo_b_tiled=weights.wo_b.values_tiled is not None,
                 ),
             )
