@@ -219,6 +219,41 @@ def test_tuning_pool_preserves_final_group_layout_with_less_storage(
         assert after.block_stride == before.block_stride
 
 
+@pytest.mark.parametrize("failure", [False, True])
+def test_tuning_pool_teardown_releases_all_plans_even_on_failure(monkeypatch, failure):
+    from vllm.v1.worker.gpu import cudagraph_utils
+
+    released = []
+
+    def release(plan):
+        released.append(plan)
+        if failure and plan == "second":
+            raise RuntimeError("release failed")
+
+    batch = b12x_prepare.B12xPreparedBatch(
+        SimpleNamespace(release=release), ("first", "second")
+    )
+    worker = SimpleNamespace(
+        _b12x_tuning_cache=True, _b12x_tuning_batch=batch, model_runner=object()
+    )
+    monkeypatch.setattr(
+        cudagraph_utils,
+        "_teardown_profiling_state",
+        lambda _: released.append("pool"),
+    )
+    if failure:
+        with pytest.raises(RuntimeError, match="release failed"):
+            b12x_prepare.release_b12x_tuning_cache(worker)
+    else:
+        b12x_prepare.release_b12x_tuning_cache(worker)
+    assert released == ["second", "first", "pool"]
+    assert not worker._b12x_tuning_cache
+    assert worker._b12x_tuning_batch is None
+    batch.release()
+    b12x_prepare.release_b12x_tuning_cache(worker)
+    assert released == ["second", "first", "pool"]
+
+
 def test_collect_units_filters_by_stage_and_tunes_eager_shapes() -> None:
     record: list[tuple] = []
     weights, state, tower = torch.nn.Module(), torch.nn.Module(), torch.nn.Module()

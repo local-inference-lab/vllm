@@ -14,6 +14,7 @@ import contextlib
 import gc
 from types import SimpleNamespace
 from typing import Any
+from weakref import ref
 
 import pytest
 import torch
@@ -733,6 +734,8 @@ def test_profile_cudagraph_memory_redirects_speculator_managers(monkeypatch):
 
 
 def test_v2_profiling_teardown_runs_cache_lifecycle_hooks(monkeypatch):
+    from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+
     events: list[str] = []
 
     class _Layer:
@@ -752,6 +755,11 @@ def test_v2_profiling_teardown_runs_cache_lifecycle_hooks(monkeypatch):
     class _Speculator:
         def reset_attn(self) -> None:
             events.append("speculator")
+            DraftModelSpeculator.reset_attn(self)
+
+    class _UBatchRunner:
+        def abort_pending_run(self):
+            events.append("ubatch")
 
     layer = _Layer()
     runner = SimpleNamespace(
@@ -762,6 +770,7 @@ def test_v2_profiling_teardown_runs_cache_lifecycle_hooks(monkeypatch):
         block_tables=object(),
         pcp_manager=object(),
         adaptive_verification=object(),
+        ubatch_runner=_UBatchRunner(),
         model_state=_ModelState(),
         speculator=_Speculator(),
         compilation_config=SimpleNamespace(static_forward_context={"layer": layer}),
@@ -769,12 +778,20 @@ def test_v2_profiling_teardown_runs_cache_lifecycle_hooks(monkeypatch):
         lora_config=None,
         maybe_remove_all_loras=lambda _config: events.append("loras"),
     )
+    runner.speculator.pcp_manager = torch.empty(1)
+    pcp_ref = ref(runner.speculator.pcp_manager)
+    ubatch_ref = ref(runner.ubatch_runner)
+
+    def empty_cache():
+        assert pcp_ref() is None
+        assert ubatch_ref() is None
+
     monkeypatch.setattr(cgu.torch.accelerator, "synchronize", lambda: None)
-    monkeypatch.setattr(cgu.torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(cgu.torch.accelerator, "empty_cache", empty_cache)
 
     cgu._teardown_profiling_state(runner)
 
-    assert events == ["layer", "model-state", "speculator", "loras"]
+    assert events == ["ubatch", "layer", "model-state", "speculator", "loras"]
     assert layer.kv_cache is None
     assert runner.kv_caches == []
     assert runner.attn_groups == []
@@ -782,6 +799,7 @@ def test_v2_profiling_teardown_runs_cache_lifecycle_hooks(monkeypatch):
     assert not hasattr(runner, "block_tables")
     assert runner.pcp_manager is None
     assert runner.adaptive_verification is None
+    assert runner.ubatch_runner is None
     assert not hasattr(runner, "kv_cache_config")
     assert runner.cache_config.num_gpu_blocks is None
 

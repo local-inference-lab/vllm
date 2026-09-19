@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import gc
+import weakref
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -865,7 +867,8 @@ def test_b12x_moe_uses_minimax_swiglu_parameters() -> None:
 
 
 @pytest.mark.parametrize(
-    "tokens,topk,num_experts", ((4, 2, 8), (8, 8, 288), (64, 8, 288))
+    "tokens,topk,num_experts",
+    ((1, 6, 384), (4, 6, 384), (6, 6, 384), (8, 6, 384), (64, 8, 288)),
 )
 def test_b12x_moe_candidate_calls_share_bounded_trial_storage(
     tokens: int, topk: int, num_experts: int
@@ -920,14 +923,45 @@ def test_b12x_moe_candidate_calls_share_bounded_trial_storage(
     assert not second_call.capture_safe
     first_call.restore()
     ids = first_state.bound["topk_ids"]
-    # Adjacent rows must not collapse a top-k batch onto tokens+topk-1
-    # experts: that understates the parallel work of distributed routing.
-    assert ids.unique().numel() == min(tokens * topk, num_experts)
+    shared = 2 <= tokens <= 8
+    unique = max(topk, (3 * tokens * topk + 2) // 5) if shared else tokens * topk
+    assert ids.unique().numel() == min(unique, num_experts)
     assert all(row.unique().numel() == topk for row in ids)
     assert torch.isfinite(first_state.bound["a"]).all()
     torch.testing.assert_close(
         first_state.bound["topk_weights"].sum(dim=1), torch.ones(tokens)
     )
+    assert len(first_call.benchmark_producers) == (4 if shared else 1)
+    for first_producer, second_producer in zip(
+        first_call.benchmark_producers,
+        second_call.benchmark_producers,
+        strict=True,
+    ):
+        first_producer()
+        first_ids = ids.clone()
+        assert ids.unique().numel() == min(unique, num_experts)
+        assert all(row.unique().numel() == topk for row in ids)
+        second_producer()
+        torch.testing.assert_close(ids, first_ids)
+
+    # Published plans retain call.owners after discarding their priming calls.
+    published_owners = first_call.owners + second_call.owners
+    trial_refs = [
+        weakref.ref(tensor)
+        for bound in (first_state.bound, second_state.bound)
+        for tensor in (
+            bound["a"],
+            bound["output"],
+            bound["topk_ids"],
+            bound["topk_weights"],
+            *bound["scratch"],
+        )
+    ]
+    first_state.bound = second_state.bound = None
+    del first_call, second_call, first_producer, second_producer, ids, scratch
+    gc.collect()
+    assert all(ref() is None for ref in trial_refs)
+    assert published_owners == ()
 
 
 def test_b12x_source_release_preserves_prepared_storage_owner() -> None:

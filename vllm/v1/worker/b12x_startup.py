@@ -14,6 +14,10 @@ import os
 import pickle
 import time
 from contextlib import nullcontext
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from b12x.preparation import TuningCacheRequirement
 
 _CONTROL_GROUPS: dict[tuple[int, int], object] = {}
 
@@ -72,6 +76,7 @@ class B12xPreparationCoordinator:
             self._control = dist.PrefixStore(f"stage-{sequence}", group.store)
         self._authorized_key: str | None = None
         self._authorized_tuning = None
+        self._authorized_cache: tuple[TuningCacheRequirement, ...] | None = None
         self._stop = False
         self._error: dict[str, object] | None = None
         self._last_progress = None
@@ -148,7 +153,11 @@ class B12xPreparationCoordinator:
             return self._outcome()
 
         if not (
-            self._local_done or self._error or self._ready() or self._ready_tuning()
+            self._local_done
+            or self._error
+            or self._ready()
+            or self._ready_tuning()
+            or self._ready_cache()
         ):
             return self._outcome()
 
@@ -169,6 +178,11 @@ class B12xPreparationCoordinator:
             self._stop = True
             self._safe_close()
         else:
+            cache = self._ready_cache()
+            if cache is not None:
+                self._authorized_cache = (
+                    () if self._stop else decision["caches"][cache.ranks]
+                )
             authorization = decision["collective"]
             self._authorized_key = (
                 authorization[0]
@@ -208,7 +222,12 @@ class B12xPreparationCoordinator:
             except Exception as error:
                 self._record_error(error)
                 decision = dict(
-                    stop=True, error=self._error, collective=None, tuning=(), done=False
+                    stop=True,
+                    error=self._error,
+                    collective=None,
+                    tuning=(),
+                    caches={},
+                    done=False,
                 )
             self._control.set(f"{prefix}/decision", pickle.dumps(decision))
         return pickle.loads(self._control.get(f"{prefix}/decision"))
@@ -221,6 +240,7 @@ class B12xPreparationCoordinator:
         if self._control is not None:
             stop |= self._control.check(["stop"])
         tuning = () if stop else _authorize_tuning(gathered, self.world_ranks)
+        caches = {} if stop else _authorize_caches(gathered, self.world_ranks)
         if not stop:
             authorized = {item[0] for item in tuning}
             pending = {item[0] for entry in gathered for item in entry["tuning"]}
@@ -233,6 +253,7 @@ class B12xPreparationCoordinator:
             error=error,
             collective=None if error else _authorize_ready(gathered, self.world_ranks),
             tuning=tuning,
+            caches=caches,
             done=all(entry["local_done"] for entry in gathered)
             and (error is None or all(entry["cleanup_complete"] for entry in gathered)),
         )
@@ -256,12 +277,15 @@ class B12xPreparationCoordinator:
             raise RuntimeError("active preparation has no job")
         if self._stop:
             job.session.cancel_tuning()
-        progress = job.advance(
-            collective_key=self._authorized_key,
-            tuning=self._authorized_tuning,
+        kwargs = dict(
+            collective_key=self._authorized_key, tuning=self._authorized_tuning
         )
+        if self._authorized_cache is not None:
+            kwargs["cache"] = self._authorized_cache
+        progress = job.advance(**kwargs)
         self._authorized_key = None
         self._authorized_tuning = None
+        self._authorized_cache = None
         self._last_progress = progress
         if progress.pending_compilation:
             pool = job.session._pool
@@ -332,10 +356,14 @@ class B12xPreparationCoordinator:
             "stop": self._stop,
             "ready": self._ready(),
             "tuning": self._ready_tuning(),
+            "cache": self._ready_cache(),
             "local_done": self._local_done,
             "error": self._error,
             "cleanup_complete": self._cleanup_complete,
         }
+
+    def _ready_cache(self):
+        return getattr(self._last_progress, "ready_cache", None)
 
     def _validate_domain(self, gathered: list[dict[str, object]]) -> None:
         if len(gathered) != len(self.world_ranks):
@@ -485,6 +513,27 @@ def _authorize_ready(
         return None
     key = min(choices)
     return key, participants_by_key[key]
+
+
+def _authorize_caches(gathered, world_ranks):
+    groups: dict[tuple[int, ...], dict[int, TuningCacheRequirement]] = {}
+    for entry in gathered:
+        cache = entry.get("cache")
+        if cache is None:
+            continue
+        rank = int(entry["global_rank"])
+        if rank not in cache.ranks or not set(cache.ranks) <= set(world_ranks):
+            raise RuntimeError("preparation tuning cache has an invalid rank set")
+        groups.setdefault(cache.ranks, {})[rank] = cache
+    for ranks, snapshots in groups.items():
+        if set(snapshots) != set(ranks):
+            raise RuntimeError(
+                "preparation ranks reached incompatible tuning cache boundaries"
+            )
+    return {
+        ranks: tuple(snapshots[rank] for rank in ranks)
+        for ranks, snapshots in groups.items()
+    }
 
 
 def _authorize_tuning(

@@ -4,6 +4,7 @@
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
+from weakref import ref
 
 import pytest
 from torch import nn
@@ -164,6 +165,93 @@ def test_startup_plan_apply_gate(plan_env):
 
 
 # Memory accounting of the profiling run (Worker.determine_available_memory).
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_profile_release_collects_cycles_before_flushing_allocator(
+    monkeypatch, failure
+):
+    """The allocator flush must follow plan release and Python cycle collection."""
+
+    class _Batch:
+        def release(self):
+            self.resource = None
+            if failure:
+                raise RuntimeError("release failed")
+
+    class _Temporary:
+        def __init__(self):
+            self.cycle = self
+
+    batch = _Batch()
+    batch.resource = _Temporary()
+    resource_ref = ref(batch.resource)
+    worker = SimpleNamespace(_b12x_profile_batch=batch)
+    del batch
+    events = []
+
+    def empty_cache():
+        assert resource_ref() is None
+        assert worker._b12x_profile_batch is None
+        events.append("empty_cache")
+
+    monkeypatch.setattr(
+        gpu_worker.torch.accelerator, "synchronize", lambda: events.append("sync")
+    )
+    monkeypatch.setattr(gpu_worker.torch.accelerator, "empty_cache", empty_cache)
+    if failure:
+        with pytest.raises(RuntimeError, match="release failed"):
+            gpu_worker.Worker._release_b12x_profile_state(worker)
+    else:
+        gpu_worker.Worker._release_b12x_profile_state(worker)
+    assert events == ["sync", "empty_cache"]
+
+
+def test_serving_kv_allocation_collects_temporary_cycles(monkeypatch):
+    """No profiling garbage or freed allocator blocks survive into KV allocation."""
+
+    class _Temporary:
+        def __init__(self):
+            self.cycle = self
+
+    temporary = _Temporary()
+    temporary_ref = ref(temporary)
+    del temporary
+    events: list[str] = []
+
+    def allocate(*args, **kwargs):
+        assert temporary_ref() is None
+        assert events == ["sync", "empty_cache"]
+        events.append("allocate")
+
+    worker = SimpleNamespace(
+        cache_config=SimpleNamespace(),
+        vllm_config=object(),
+        model_config=SimpleNamespace(enable_return_routed_experts=False),
+        model_runner=SimpleNamespace(initialize_kv_cache=allocate),
+        _maybe_get_memory_pool_context=lambda **kw: nullcontext(),
+    )
+    monkeypatch.setattr(gpu_worker, "set_current_vllm_config", lambda _: nullcontext())
+    monkeypatch.setattr(
+        gpu_worker, "ensure_kv_transfer_initialized", lambda *args: None
+    )
+    monkeypatch.setattr(
+        gpu_worker.torch.accelerator, "synchronize", lambda: events.append("sync")
+    )
+    monkeypatch.setattr(
+        gpu_worker.torch.accelerator,
+        "empty_cache",
+        lambda: events.append("empty_cache"),
+    )
+
+    gpu_worker.Worker.initialize_from_config(
+        worker,
+        SimpleNamespace(
+            num_blocks=32, kv_cache_layout=None, needs_kv_cache_zeroing=False
+        ),
+    )
+    assert events[-1] == "allocate"
+
 
 # The fallback reads only the sign of the measured drop and this process's torch
 # reservation; free memory is only logged, so no amount here is a device size.

@@ -5,6 +5,7 @@
 import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import torch
@@ -101,9 +102,12 @@ class _PreparedMoECall:
             for buffer in scratch:
                 buffer.zero_()
 
-        def produce() -> None:
+        # Keep route_ids alive through the producer for weakref-based trial
+        # reuse, without exporting trial buffers into the serving plan.
+
+        def produce(pattern: int = 0) -> None:
             hidden.copy_(activation_source)
-            ids.copy_(route_ids)
+            ids.copy_(route_ids[pattern])
             weights.copy_(route_weights)
 
         def restore() -> None:
@@ -126,6 +130,9 @@ class _PreparedMoECall:
             reset=reset,
             restore=restore,
             capture_safe=False,
+            benchmark_producers=tuple(
+                partial(produce, pattern) for pattern in range(route_ids.shape[0])
+            ),
         )
 
 
@@ -135,6 +142,8 @@ def _prepared_moe_call_factory(
     shared = None
 
     def factory(state: Any):
+        from b12x.moe.fused_moe.workloads import make_tuning_routes
+
         nonlocal shared
         tensors = None if shared is None else tuple(ref() for ref in shared)
         if tensors is None or any(tensor is None for tensor in tensors):
@@ -144,7 +153,10 @@ def _prepared_moe_call_factory(
                 dtype=prepared.plan.activation.io_dtype,
                 device=device,
             )
-            activation_source = torch.empty_like(hidden).normal_(mean=0.0, std=0.125)
+            generator = torch.Generator(device=device).manual_seed(42)
+            activation_source = torch.empty_like(hidden).normal_(
+                mean=0.0, std=0.125, generator=generator
+            )
             output = torch.empty(hidden.shape, dtype=output_dtype, device=device)
             route_rows = torch.arange(
                 tokens, dtype=torch.int32, device=device
@@ -152,19 +164,15 @@ def _prepared_moe_call_factory(
             route_columns = torch.arange(
                 topk, dtype=torch.int32, device=device
             ).unsqueeze(0)
-            # Distribute routed pairs across the expert set. Sliding adjacent
-            # rows by one expert biases small-batch tuning toward narrow grids.
-            route_ids = (
-                (route_rows * topk + route_columns)
-                .remainder_(int(prepared.num_experts))
-                .contiguous()
+            route_ids = make_tuning_routes(
+                tokens, topk, int(prepared.num_experts), device=device
             )
             route_logits = (
                 route_rows.to(dtype=torch.float32) * 0.03125
                 + route_columns.to(dtype=torch.float32) * 0.125
             )
             route_weights = torch.softmax(route_logits, dim=-1).contiguous()
-            ids = torch.empty_like(route_ids)
+            ids = torch.empty_like(route_ids[0])
             weights = torch.empty_like(route_weights)
             tensors = (
                 hidden,
@@ -613,6 +621,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
     def get_b12x_preparation_units(
         self, layer: torch.nn.Module, workload: B12xWorkload
     ) -> Sequence[B12xPreparationUnit]:
+        from b12x.moe.fused_moe.workloads import TUNING_WORKLOAD_VERSION
         from b12x.preparation import FrozenMapping
 
         if workload.stage != "weights":
@@ -646,7 +655,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 # or unrelated component selections.
                 invocation=FrozenMapping(
                     {
-                        "tuning_route_pattern": "cyclic_disjoint_topk",
+                        "tuning_route_pattern": TUNING_WORKLOAD_VERSION,
                     }
                 ),
             )
