@@ -39,22 +39,36 @@ def _nvfp4_compute_scale_factor(
     marlin_scales: torch.Tensor,
     a_dtype: torch.dtype | None = None,
 ) -> float:
-    """Compute the power-of-2 scale_factor needed so that all non-zero
-    values in marlin_scales * 2^7 are >= 2 after rescaling.
-    Returns a Python float (power of 2, >= 1.0)."""
+    """Compute the power-of-two rescaling factor for NVFP4 Marlin scales.
+
+    Args:
+        marlin_scales: Weight scales in the Marlin layout.
+        a_dtype: Activation dtype. FP16 disables rescaling.
+
+    Returns:
+        A Python power-of-two factor greater than or equal to one, derived
+        from the largest positive scale. Empty or non-positive inputs and
+        FP16 activations return one.
+
+    Raises:
+        ValueError: Scales contain NaN and rescaling is enabled.
+    """
 
     # Since half has a smaller dynamic range compared to bfloat16,
     # no rescaling is applied here if active dtype is half.
     if a_dtype is not None and a_dtype == torch.half:
         return 1.0
+    if marlin_scales.numel() == 0:
+        return 1.0
 
-    ws_float = marlin_scales.float() * (2**7)
-    nonzero_mask = ws_float > 0
-    if nonzero_mask.any():
-        max_val = ws_float[nonzero_mask].max()
-        if max_val < 448 * (2**7):
-            sf = (448 * (2**7) / max_val).log2().floor().exp2()
-            return sf.item()
+    # Reduce before conversion to keep temporary storage independent of the
+    # number of experts. Power-of-two multiplication preserves the maximum.
+    max_val = marlin_scales.max().float() * (2**7)
+    if torch.isnan(max_val):
+        raise ValueError("NVFP4 Marlin scales contain NaN")
+    if 0 < max_val < 448 * (2**7):
+        sf = (448 * (2**7) / max_val).log2().floor().exp2()
+        return sf.item()
     return 1.0
 
 
@@ -376,9 +390,10 @@ def prepare_nvfp4_moe_layer_for_marlin(
         tensor to padded_N rows."""
         if padded_N == N:
             return x
-        x = x.view(E, num_shards, N, x.size(-1))
+        experts = x.size(0)
+        x = x.view(experts, num_shards, N, x.size(-1))
         x = torch.nn.functional.pad(x, (0, 0, 0, padded_N - N))
-        return x.reshape(E, num_shards * padded_N, -1)
+        return x.reshape(experts, num_shards * padded_N, -1)
 
     def pad_w2(x: torch.Tensor, packing: int) -> torch.Tensor:
         """Zero-pad the packed N (last) dim of a (E, K, N / packing)
@@ -420,24 +435,29 @@ def prepare_nvfp4_moe_layer_for_marlin(
     def permute_scales(
         scales: torch.Tensor, g_scales: torch.Tensor, name: str
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        scales = scales.to(param_dtype)
-
-        tensor_list = []
         if "w13" in name:
-            scales = pad_w13(scales)
             size_n, size_k = padded_N * num_shards, K
         else:
-            scales = pad_w2(scales, packing=GROUP_SIZE)
             size_n, size_k = K, padded_N
 
-        # All experts share one global_scale, so compute the max
-        # scale_factor across all experts first, then apply uniformly.
-        combined_scale_factor = _nvfp4_compute_scale_factor(scales, param_dtype)
+        # A shared factor must cover all experts. Convert one expert at a time
+        # so loading never retains a half-precision copy of the entire bank.
+        combined_scale_factor = 1.0
+        if param_dtype != torch.half:
+            maxima = torch.empty(E, device=scales.device, dtype=param_dtype)
+            for i in range(E):
+                torch.amax(scales[i].to(param_dtype), out=maxima[i])
+            combined_scale_factor = _nvfp4_compute_scale_factor(maxima, param_dtype)
 
+        output = None
         for i in range(E):
-            scale = scales[i].T
+            scale = scales[i : i + 1].to(param_dtype)
+            if "w13" in name:
+                scale = pad_w13(scale)
+            else:
+                scale = pad_w2(scale, packing=GROUP_SIZE)
             marlin_scales = marlin_permute_scales(
-                s=scale,
+                s=scale[0].T,
                 size_k=size_k,
                 size_n=size_n,
                 group_size=GROUP_SIZE,
@@ -446,12 +466,18 @@ def prepare_nvfp4_moe_layer_for_marlin(
             marlin_scales, _ = nvfp4_marlin_process_scales(
                 marlin_scales, scale_factor=combined_scale_factor, a_dtype=param_dtype
             )
-            tensor_list.append(marlin_scales)
+            if output is None:
+                output = torch.empty(
+                    (E, *marlin_scales.shape),
+                    device=marlin_scales.device,
+                    dtype=marlin_scales.dtype,
+                )
+            output[i].copy_(marlin_scales)
 
-        scales = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
+        assert output is not None
         g_scales = nvfp4_marlin_process_global_scale(g_scales, param_dtype)
         g_scales = g_scales / combined_scale_factor
-        return scales, g_scales
+        return output, g_scales
 
     w13_scale, w13_scale_2 = permute_scales(w13_scale, w13_scale_2, "w13")
     w2_scale, w2_scale_2 = permute_scales(w2_scale, w2_scale_2, "w2")

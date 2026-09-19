@@ -308,6 +308,82 @@ def test_glm5next_mtp_draft_head_rejects_unknown_mode(monkeypatch) -> None:
         mtp_draft_head.configured_draft_head_mode()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("kind", ["finite", "zeros", "nonfinite", "bf16_bits"])
+def test_glm5next_mtp_head_scale_preserves_fp32_reduction(kind: str) -> None:
+    if kind == "bf16_bits":
+        weight = torch.arange(65536, dtype=torch.int32, device="cuda").to(torch.int16)
+        weight = weight.view(torch.bfloat16).view(256, 256)
+    else:
+        weight = torch.linspace(-8, 6, 512, device="cuda", dtype=torch.bfloat16)
+        weight = weight.view(16, 32)
+        if kind == "zeros":
+            weight.zero_()
+        elif kind == "nonfinite":
+            weight[0, :3] = torch.tensor(
+                [float("nan"), float("inf"), -float("inf")], device="cuda"
+            )
+    original_bits = weight.view(torch.int16).clone()
+    expected = 2688.0 / weight.float().abs().nan_to_num().max()
+
+    actual = mtp_draft_head._nvfp4_weight_global_scale(weight)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(weight.view(torch.int16), original_bits, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_glm5next_mtp_head_scale_bounds_conversion_memory(record_property) -> None:
+    weight = torch.ones((1024, 16384), dtype=torch.bfloat16, device="cuda")
+    weight[-1, -1] = -8
+    mtp_draft_head._nvfp4_weight_global_scale(weight[:1])
+    torch.accelerator.synchronize()
+    torch.accelerator.reset_peak_memory_stats()
+    allocated = torch.accelerator.memory_allocated()
+
+    actual = mtp_draft_head._nvfp4_weight_global_scale(weight)
+
+    torch.accelerator.synchronize()
+    peak = torch.accelerator.max_memory_allocated() - allocated
+    record_property("peak_additional_bytes", peak)
+    torch.testing.assert_close(
+        actual, torch.tensor(336.0, device="cuda"), rtol=0, atol=0
+    )
+    assert weight[-1, -1].item() == -8
+    assert peak < 17 * 1024 * 1024
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(120), reason="requires SM120"
+)
+def test_glm5next_mtp_head_quantization_preserves_packed_weights() -> None:
+    import flashinfer
+
+    source = torch.nn.Linear(256, 256, bias=False, dtype=torch.bfloat16).cuda()
+    source.shard_indices = SimpleNamespace()
+    original = source.weight.detach().clone()
+    scale = 2688.0 / original.float().abs().nan_to_num().max()
+    weight, scales = flashinfer.nvfp4_quantize(
+        original,
+        scale,
+        sfLayout=flashinfer.SfLayout.layout_128x4,
+        do_shuffle=False,
+        backend="cuda",
+    )
+    expected = flashinfer.prepare_bf16_fp4_weights(
+        weight.view(torch.uint8),
+        scales,
+        scale.reciprocal().reshape(1),
+        backend="cute-dsl",
+    )
+
+    actual = mtp_draft_head.QuantizedDraftHead(source, "nvfp4")
+
+    for observed, reference in zip(actual.buffers(), expected, strict=True):
+        torch.testing.assert_close(observed, reference, rtol=0, atol=0)
+    torch.testing.assert_close(source.weight, original, rtol=0, atol=0)
+
+
 def test_glm5next_mtp_prepares_configured_draft_head(monkeypatch) -> None:
     source_head = torch.nn.Linear(4, 8, bias=False)
     quantized_head = torch.nn.Linear(4, 8, bias=False)
