@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import gc
 import weakref
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -63,6 +64,151 @@ from vllm.utils.torch_utils import set_random_seed
 
 if TYPE_CHECKING:
     from b12x.preparation import PreparationSession
+
+
+def _shared_fp8_tuning_fixture():
+    mlp = torch.nn.Module()
+    mlp.act_fn = torch.nn.SiLU()
+    for name, shape in (("gate_up_proj", (16, 8)), ("down_proj", (8, 8))):
+        linear = torch.nn.Module()
+        linear.weight = torch.empty(shape, dtype=torch.float8_e4m3fn)
+        linear.scale = torch.ones((1, 1))
+        linear.reduce_results = False
+        linear.deep_gemm_warmup_provider = SimpleNamespace(
+            get_deep_gemm_warmup_weights=lambda layer: (layer.weight, layer.scale)
+        )
+        setattr(mlp, name, linear)
+    shared = torch.nn.Module()
+    shared._layer = mlp
+    shared._stream = object()
+    shared._disable_shared_experts_overlap = False
+    shared._mk_can_overlap_shared_experts = lambda: False
+    layer = torch.nn.Module()
+    layer.shared_experts_for_preparation = weakref.ref(shared)
+    return layer, shared
+
+
+def test_shared_fp8_tuning_context_keys_geometry_not_module_identity(monkeypatch):
+    from vllm.utils import deep_gemm
+
+    monkeypatch.setattr(deep_gemm, "is_deep_gemm_e8m0_used", lambda: True)
+    layer, shared = _shared_fp8_tuning_fixture()
+    other_layer, other_shared = _shared_fp8_tuning_fixture()
+    found, key = b12x._shared_expert_tuning_context(layer, "w4a8_mx", 8)
+    assert found is shared
+    assert key == b12x._shared_expert_tuning_context(other_layer, "w4a8_mx", 8)[1]
+    other_shared._layer.gate_up_proj.weight = torch.empty(
+        (32, 8), dtype=torch.float8_e4m3fn
+    )
+    assert key != b12x._shared_expert_tuning_context(other_layer, "w4a8_mx", 8)[1]
+    assert list(layer.modules()) == [layer]
+
+
+@pytest.mark.parametrize(
+    "exclusion",
+    ["stream", "internal", "parallel", "collective", "dtype", "width", "quant"],
+)
+def test_shared_fp8_tuning_excludes_unsupported_execution(monkeypatch, exclusion):
+    from vllm.utils import deep_gemm
+
+    monkeypatch.setattr(deep_gemm, "is_deep_gemm_e8m0_used", lambda: True)
+    layer, shared = _shared_fp8_tuning_fixture()
+    quant_mode, hidden_size = "w4a8_mx", 8
+    if exclusion == "stream":
+        shared._stream = None
+    elif exclusion == "internal":
+        shared._mk_can_overlap_shared_experts = lambda: True
+    elif exclusion == "parallel":
+        shared._disable_shared_experts_overlap = True
+    elif exclusion == "collective":
+        shared._layer.down_proj.reduce_results = True
+    elif exclusion == "dtype":
+        shared._layer.down_proj.weight = torch.empty((8, 8))
+    elif exclusion == "width":
+        hidden_size = 16
+    else:
+        quant_mode = "nvfp4"
+    assert b12x._shared_expert_tuning_context(layer, quant_mode, hidden_size) == (
+        None,
+        None,
+    )
+
+
+def test_shared_fp8_tuning_joins_auxiliary_work_before_timing_ends(monkeypatch):
+    from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+        SharedExpertsOrder,
+    )
+
+    events: list[object] = []
+
+    class Stream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_stream(self, other):
+            events.append((self.name, "wait", other.name))
+
+    primary, auxiliary = Stream("primary"), Stream("auxiliary")
+
+    @contextmanager
+    def use_stream(stream):
+        events.append(("enter", stream.name))
+        yield
+        events.append(("exit", stream.name))
+
+    class Output:
+        def record_stream(self, stream):
+            events.append(("record", stream.name))
+
+    def shared_forward(hidden):
+        events.append(("shared", tuple(hidden.shape)))
+        return Output()
+
+    def bind(**kwargs):
+        def run():
+            events.append("routed")
+            kwargs["output"].fill_(1)
+
+        return SimpleNamespace(run=run)
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: primary)
+    monkeypatch.setattr(torch.cuda, "stream", use_stream)
+    state = SimpleNamespace(
+        scratch=SimpleNamespace(scratch_specs=lambda: ()), bind=bind
+    )
+    shared = SimpleNamespace(
+        _stream=auxiliary,
+        _layer=shared_forward,
+        _determine_shared_experts_order=lambda _: (
+            SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+        ),
+    )
+    call = b12x._PreparedMoECall(state, 2, 2, None, torch.bfloat16, shared)
+    hidden = torch.zeros((2, 8), dtype=torch.bfloat16)
+    ids = torch.zeros((2, 2), dtype=torch.int32)
+    weights = torch.ones((2, 2))
+    prepared = call.make(
+        (
+            hidden,
+            hidden.clone(),
+            torch.empty_like(hidden),
+            ids[None],
+            weights,
+            ids,
+            weights,
+        )
+    )
+    prepared.run()
+    assert events == [
+        ("auxiliary", "wait", "primary"),
+        ("enter", "auxiliary"),
+        ("shared", (2, 8)),
+        ("exit", "auxiliary"),
+        "routed",
+        ("primary", "wait", "auxiliary"),
+        ("record", "primary"),
+    ]
+    assert torch.all(prepared.output == 1)
 
 
 def _prepare(
