@@ -711,8 +711,9 @@ def _packed_main_cache(
     return raw, main
 
 
+@pytest.mark.parametrize("release_first_pool", [False, True])
 def test_glm53_selector_constructs_with_matching_preparation_heads(
-    monkeypatch: pytest.MonkeyPatch, default_vllm_config
+    monkeypatch: pytest.MonkeyPatch, default_vllm_config, release_first_pool
 ) -> None:
     from vllm.model_executor import parameter
     from vllm.model_executor.layers import linear
@@ -748,20 +749,23 @@ def test_glm53_selector_constructs_with_matching_preparation_heads(
         main_layer_name="model.layers.0.self_attn",
         prefix="model.layers.0.self_attn.indexer",
     )
+    if release_first_pool:
+        _, initial = _packed_main_cache(
+            device=torch.device("cpu"), blocks=1, layers=1, block_size=256, layer=0
+        )
+        indexer.bind_main_kv_cache(initial)
+        indexer.indexer_op._plans[("decode", 8)] = object()
+        indexer.unbind_main_kv_cache()
+        assert indexer._index_cache is None
+        assert indexer._main_cache_num_blocks == 0
+        assert indexer.indexer_op._index_cache is None
+        assert indexer.indexer_op._plans == {}
     _, main = _packed_main_cache(
         device=torch.device("cpu"), blocks=2, layers=1, block_size=256, layer=0
     )
     indexer.bind_main_kv_cache(main)
 
     assert indexer.indexer_op._num_q_heads == indexer._q_fp8.shape[1] == 32
-    indexer.indexer_op._plans[("decode", 8)] = object()
-    indexer.unbind_main_kv_cache()
-    assert indexer._index_cache is None
-    assert indexer._main_cache_num_blocks == 0
-    assert indexer.indexer_op._index_cache is None
-    assert indexer.indexer_op._plans == {}
-    indexer.bind_main_kv_cache(main)
-    assert indexer.indexer_op._index_cache is indexer._index_cache
 
 
 def test_glm53_packed_tail_accepts_nvfp4_main_record() -> None:
