@@ -117,6 +117,7 @@ def test_small_pool_capacity_covers_instruction_checkpoint_restore(num_blocks):
     groups.append(KVCacheGroupSpec(["attention"], attention))
     config = SimpleNamespace(
         use_request_boundary_checkpoints=True,
+        scheduler_config=SimpleNamespace(max_num_scheduled_tokens=4096),
         attention_config=SimpleNamespace(hisparse_config=None),
         model_config=SimpleNamespace(max_model_len=1048576),
         parallel_config=SimpleNamespace(decode_context_parallel_size=2),

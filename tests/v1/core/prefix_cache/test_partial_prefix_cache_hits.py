@@ -16,6 +16,7 @@ import torch
 from tests.v1.core.test_prefix_caching import make_kv_cache_manager, make_request
 from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
 from vllm.utils.hashing import sha256
+from vllm.v1.core.boundary_checkpoint import get_prefill_tail_checkpoint_position
 from vllm.v1.core.kv_cache_utils import (
     KVCacheBlockCopy,
     get_block_hash,
@@ -2698,6 +2699,111 @@ def test_request_boundaries_split_prefill_at_instruction_endpoint():
     assert Scheduler._mamba_block_aligned_split(scheduler, request, 4096) == 3000
     request.num_computed_tokens = 3000
     assert Scheduler._mamba_block_aligned_split(scheduler, request, 4096) == 4096
+
+
+@pytest.mark.parametrize(
+    "prompt,budget,instruction,expected",
+    [
+        (8191, 4096, None, None),
+        (8192, 4096, None, 4096),
+        (10000, 4096, None, 4096),
+        (520013, 3072, None, 516096),
+        (12000, 4096, 5000, None),
+        (16000, 4096, 5000, 8192),
+    ],
+)
+def test_prefill_tail_leaves_a_bounded_suffix_without_duplicating_instructions(
+    prompt, budget, instruction, expected
+):
+    assert get_prefill_tail_checkpoint_position(prompt, budget, instruction) == expected
+
+
+def test_request_boundaries_stop_at_instruction_and_prefill_tail_once():
+    request = make_request("chat", [0] * 9000, 32, sha256)
+    request.use_boundary_checkpoints = True
+    request.recurrent_instruction_boundary = 3000
+    request.recurrent_prefill_tail_boundary = 4096
+    scheduler = SimpleNamespace()
+    for start, expected in ((0, 3000), (3000, 1096), (4096, 4096)):
+        request.num_computed_tokens = start
+        assert (
+            Scheduler._mamba_block_aligned_split(scheduler, request, 4096) == expected
+        )
+    request.num_computed_tokens = 0
+    assert (
+        Scheduler._mamba_block_aligned_split(
+            scheduler, request, 4096, num_external_computed_tokens=4096
+        )
+        == 4096
+    )
+
+
+@pytest.mark.parametrize("instruction", [None, 5])
+@pytest.mark.parametrize("tail", [None, 12])
+def test_optional_boundary_slots_allocate_only_active_bundles(instruction, tail):
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=4,
+        num_blocks=64,
+        enable_boundary_checkpoints=True,
+    )
+    free = manager.block_pool.get_num_free_blocks()
+    request = make_request("producer", list(range(17)), 4, sha256)
+    request.recurrent_instruction_boundary = instruction
+    request.recurrent_prefill_tail_boundary = tail
+    manager.get_computed_blocks(request)
+    assert manager.allocate_slots(request, 17) is not None
+    slots = request.boundary_checkpoint_blocks
+    assert slots is not None
+    width = manager.num_kv_cache_groups + 1
+    assert (
+        sum(block != 0 for slot in slots for block in slot)
+        == (2 + int(instruction is not None) + int(tail is not None)) * width
+    )
+    if tail is not None and instruction is None:
+        assert slots[2] == (0,) * width
+        assert all(slots[3])
+    manager.free(request)
+    assert manager.reset_prefix_cache()
+    assert manager.block_pool.get_num_free_blocks() == free
+
+
+@pytest.mark.parametrize("dcp", [1, 2, 4])
+def test_prefill_tail_recovers_suffix_edits_but_never_earlier_divergence(dcp):
+    manager = make_full_mamba_manager(
+        dcp_world_size=dcp,
+        hash_block_size=4,
+        num_blocks=128,
+        enable_boundary_checkpoints=True,
+        use_eagle=True,
+    )
+    tokens = list(range(29))
+    producer = make_request("producer", tokens, 4, sha256)
+    producer.recurrent_prefill_tail_boundary = 17
+    manager.get_computed_blocks(producer)
+    assert manager.allocate_slots(producer, 17) is not None
+    tail = manager.publish_boundary_checkpoint(producer, 17, kind="prefill_tail")
+    assert tail is not None and tail.kind == "prefill_tail"
+    producer.num_computed_tokens = 17
+    assert manager.allocate_slots(producer, 12) is not None
+    assert manager.publish_boundary_checkpoint(producer, 29, kind="prompt") is not None
+    manager.free(producer)
+
+    for name, suffix, expected in (
+        ("extended", tokens + [80, 81], 29),
+        ("tail-edit", tokens[:27] + [80, 81, 82], 17),
+        ("earlier-edit", tokens[:16] + [80] + tokens[17:], 0),
+    ):
+        consumer = make_request(name, suffix, 4, sha256)
+        blocks, hit, _ = manager.get_computed_blocks(consumer)
+        assert hit == expected
+        assert (
+            manager.allocate_slots(consumer, len(suffix) - hit, hit, blocks) is not None
+        )
+        manager.free(consumer)
+    _, retained = manager.take_kv_cache_block_copies()
+    manager.block_pool.free_blocks(retained)
+    assert manager.reset_prefix_cache()
 
 
 def test_internal_checkpoint_requires_block_aligned_start():

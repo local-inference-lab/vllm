@@ -150,6 +150,9 @@ class Request:
                 "The recurrent instruction boundary must be inside the prompt"
             )
         self.recurrent_instruction_boundary = recurrent_instruction_boundary
+        # The scheduler fixes this once from its prefill budget. Preemption
+        # must not move the endpoint while workers own its private storage.
+        self.recurrent_prefill_tail_boundary: int | None = None
         self._output_token_ids: list[int] = []
         if self.prompt_token_ids is None:
             self._all_token_ids: list[int] = [0] * self.num_prompt_tokens
