@@ -1050,6 +1050,7 @@ def test_b12x_moe_candidate_calls_share_bounded_trial_storage(
     """Repeated candidate calls reuse one activation/output tensor set (a
     weakref cache), while each call's scratch is a fresh, correctly shaped
     trial-only allocation rather than a caller-owned workspace region."""
+    from b12x.moe.fused_moe.workloads import make_tuning_routes
 
     class FakeState:
         def __init__(self):
@@ -1097,23 +1098,23 @@ def test_b12x_moe_candidate_calls_share_bounded_trial_storage(
     assert not second_call.capture_safe
     first_call.restore()
     ids = first_state.bound["topk_ids"]
-    shared = 2 <= tokens <= 8
-    unique = max(topk, (3 * tokens * topk + 2) // 5) if shared else tokens * topk
-    assert ids.unique().numel() == min(unique, num_experts)
+    expected_routes = make_tuning_routes(tokens, topk, num_experts, device="cpu")
+    torch.testing.assert_close(ids, expected_routes[0])
     assert all(row.unique().numel() == topk for row in ids)
     assert torch.isfinite(first_state.bound["a"]).all()
     torch.testing.assert_close(
         first_state.bound["topk_weights"].sum(dim=1), torch.ones(tokens)
     )
-    assert len(first_call.benchmark_producers) == (4 if shared else 1)
-    for first_producer, second_producer in zip(
+    assert len(first_call.benchmark_producers) == len(expected_routes)
+    for first_producer, second_producer, expected_ids in zip(
         first_call.benchmark_producers,
         second_call.benchmark_producers,
+        expected_routes,
         strict=True,
     ):
         first_producer()
         first_ids = ids.clone()
-        assert ids.unique().numel() == min(unique, num_experts)
+        torch.testing.assert_close(ids, expected_ids)
         assert all(row.unique().numel() == topk for row in ids)
         second_producer()
         torch.testing.assert_close(ids, first_ids)
