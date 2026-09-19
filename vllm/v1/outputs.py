@@ -376,8 +376,8 @@ class ModelRunnerOutput:
 
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
-    # Per request: completed prompt, response, and leading-instruction
-    # checkpoint token counts, or 0.
+    # Per request: completed prompt, response, leading-instruction, and
+    # prefill-tail checkpoint token counts, or 0 for an uncaptured endpoint.
     boundary_checkpoint_tokens: list[list[int]] | None = None
 
     @staticmethod

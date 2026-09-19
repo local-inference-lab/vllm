@@ -2654,11 +2654,13 @@ def test_get_kv_cache_config_kpool_tail_coowns_indexer_tensor():
 
 
 @pytest.mark.parametrize("with_tail", [False, True])
+@pytest.mark.parametrize("chunk_budget,private_bundles", [(8192, 4), (4096, 5)])
 def test_balanced_glm_boundary_capacity_includes_private_endpoints(
-    monkeypatch, with_tail
+    monkeypatch, with_tail, chunk_budget, private_bundles
 ):
     """The GLM slot-sharing layout still reserves distinct endpoint block IDs."""
     config = VllmConfig(model_config=ModelConfig(max_model_len=8192))
+    config.scheduler_config.max_num_scheduled_tokens = chunk_budget
     specs = (
         _glm5_like_kv_cache_spec_with_tail()
         if with_tail
@@ -2669,7 +2671,7 @@ def test_balanced_glm_boundary_capacity_includes_private_endpoints(
     block_bytes = kv_cache_utils._pool_bytes_per_block(groups)
     live_bytes = kv_cache_utils._max_memory_usage_bytes_from_groups(config, groups)
     live_blocks = live_bytes // block_bytes
-    private_blocks = 4 * (len(groups) + 1)
+    private_blocks = private_bundles * (len(groups) + 1)
     monkeypatch.setattr(
         VllmConfig, "use_request_boundary_checkpoints", property(lambda self: True)
     )
@@ -4277,11 +4279,17 @@ def test_auto_fit_max_model_len_with_hybrid():
 
 
 @pytest.mark.parametrize("dcp", [1, 2, 4])
-@pytest.mark.parametrize("num_blocks,expected_pages", [(38, 0), (62, 0), (70, 7)])
-def test_boundary_capacity_includes_private_endpoints(dcp, num_blocks, expected_pages):
+@pytest.mark.parametrize(
+    "num_blocks,expected_pages,chunk_budget",
+    [(38, 0, 1048576), (62, 0, 1048576), (70, 7, 1048576), (78, 7, 256)],
+)
+def test_boundary_capacity_includes_private_endpoints(
+    dcp, num_blocks, expected_pages, chunk_budget
+):
     """Pool sizing includes private endpoints and the immutable restore source."""
     config = SimpleNamespace(
         use_request_boundary_checkpoints=True,
+        scheduler_config=SimpleNamespace(max_num_scheduled_tokens=chunk_budget),
         attention_config=SimpleNamespace(hisparse_config=None),
         model_config=SimpleNamespace(max_model_len=1048576),
         parallel_config=SimpleNamespace(decode_context_parallel_size=dcp),
@@ -4304,8 +4312,9 @@ def test_boundary_capacity_includes_private_endpoints(dcp, num_blocks, expected_
     groups = [KVCacheGroupSpec([f"state-{i}"], state) for i in range(6)]
     groups.append(KVCacheGroupSpec(["attention"], attention))
     block_bytes = kv_cache_utils._pool_bytes_per_block(groups)
-    # Six groups require five live/scratch states each; three private endpoints
-    # and a restore source own eight blocks each. The null block is unavailable.
+    # Six groups require five live/scratch states each. Three semantic endpoints
+    # and a restore source own eight blocks each; enabling the prefill-tail
+    # endpoint costs another eight. The null block is unavailable.
     available = (num_blocks - 1) * block_bytes
     estimate = kv_cache_utils._estimate_max_model_len_from_groups(
         config, groups, available
@@ -4329,7 +4338,7 @@ def test_boundary_capacity_includes_private_endpoints(dcp, num_blocks, expected_
             num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=groups
         )
         assert get_max_concurrency_for_kv_cache_config(config, cache) == (
-            num_blocks / (30 + 32 + expected_pages)
+            num_blocks / (30 + (40 if chunk_budget == 256 else 32) + expected_pages)
         )
 
     # An aligned-policy control has no endpoint reservation. Its capacity

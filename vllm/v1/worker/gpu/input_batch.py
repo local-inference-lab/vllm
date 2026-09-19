@@ -575,6 +575,7 @@ def _post_update_kernel(
     boundary_capture_bias_ptr=None,
     boundary_capture_rows_ptr=None,
     NUM_CAPTURES: tl.constexpr = 0,
+    BOUNDARY_METADATA_WIDTH: tl.constexpr = 0,
 ):
     req_id = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_id)
@@ -616,7 +617,7 @@ def _post_update_kernel(
             boundary_capture_rows_ptr,
             STOP_CAPACITY=128,
             NUM_CAPTURES=NUM_CAPTURES,
-            METADATA_WIDTH=6,
+            METADATA_WIDTH=BOUNDARY_METADATA_WIDTH,
         )
         tl.store(num_sampled_ptr + req_id, num_sampled)
         tl.store(num_rejected_ptr + req_id, num_rejected)
@@ -695,6 +696,9 @@ def post_update(
         boundary_capture[2] if boundary_capture is not None else None,
         NUM_CAPTURES=(
             NUM_BOUNDARY_CHECKPOINT_SLOTS if boundary_capture is not None else 0
+        ),
+        BOUNDARY_METADATA_WIDTH=(
+            boundary_state.metadata.shape[1] if boundary_state is not None else 0
         ),
         num_warps=1,
     )

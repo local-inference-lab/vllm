@@ -14,14 +14,34 @@ if TYPE_CHECKING:
 
 MAX_BOUNDARY_STOP_TOKENS = 128
 
-# Prompt and response retain their original slots so cached request state and
-# worker metadata remain compatible when an instruction checkpoint is absent.
+# Optional checkpoints have fixed slots; absent slots contain no KV blocks.
 PROMPT_CHECKPOINT_SLOT = 0
 RESPONSE_CHECKPOINT_SLOT = 1
 INSTRUCTION_CHECKPOINT_SLOT = 2
-NUM_BOUNDARY_CHECKPOINT_SLOTS = 3
+PREFILL_TAIL_CHECKPOINT_SLOT = 3
+NUM_BOUNDARY_CHECKPOINT_SLOTS = 4
 
-BoundaryCheckpointKind = Literal["instruction", "prompt", "response"]
+BoundaryCheckpointKind = Literal["instruction", "prompt", "response", "prefill_tail"]
+
+
+def get_prefill_tail_checkpoint_position(
+    prompt_tokens: int, chunk_budget: int, instruction_boundary: int | None
+) -> int | None:
+    """Leave one to two prefill chunks after a bounded suffix-recovery point."""
+    if chunk_budget <= 0:
+        return None
+    position = (prompt_tokens // chunk_budget - 1) * chunk_budget
+    return position if position > (instruction_boundary or 0) else None
+
+
+def boundary_checkpoint_slots(request: Request) -> tuple[int, ...]:
+    """Allocate only the endpoints that this request can publish."""
+    slots: tuple[int, ...] = (PROMPT_CHECKPOINT_SLOT, RESPONSE_CHECKPOINT_SLOT)
+    if request.recurrent_instruction_boundary is not None:
+        slots += (INSTRUCTION_CHECKPOINT_SLOT,)
+    if request.recurrent_prefill_tail_boundary is not None:
+        slots += (PREFILL_TAIL_CHECKPOINT_SLOT,)
+    return slots
 
 
 @dataclass(frozen=True)

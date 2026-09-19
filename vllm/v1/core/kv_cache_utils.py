@@ -1081,14 +1081,32 @@ def _request_boundary_reserve_blocks(vllm_config: VllmConfig, num_groups: int) -
     if not num_groups or not vllm_config.use_request_boundary_checkpoints:
         return 0
 
-    from vllm.v1.core.boundary_checkpoint import NUM_BOUNDARY_CHECKPOINT_SLOTS
+    from vllm.v1.core.boundary_checkpoint import (
+        NUM_BOUNDARY_CHECKPOINT_SLOTS,
+        get_prefill_tail_checkpoint_position,
+    )
 
     # KVCacheManager.allocate_slots reserves one block per group and one
     # auxiliary block per endpoint, separately from the live sequence state.
     # Restoring a checkpoint pins its source until the reader finishes, while
     # partial-tail CoW creates writable state. One additional bundle covers
     # these source pages and auxiliary state alongside the private endpoints.
-    return (NUM_BOUNDARY_CHECKPOINT_SLOTS + 1) * (num_groups + 1)
+    scheduler = vllm_config.scheduler_config
+    chunk_budget = (
+        scheduler.max_num_scheduled_tokens
+        if scheduler.max_num_scheduled_tokens is not None
+        else scheduler.max_num_batched_tokens
+    )
+    has_prefill_tail = (
+        get_prefill_tail_checkpoint_position(
+            vllm_config.model_config.max_model_len, chunk_budget, None
+        )
+        is not None
+    )
+    # Short-context capacity must not reserve a tail endpoint that no request
+    # can reach. The capacity search calls this for each candidate context.
+    slots = NUM_BOUNDARY_CHECKPOINT_SLOTS - int(not has_prefill_tail)
+    return (slots + 1) * (num_groups + 1)
 
 
 def get_max_concurrency_for_kv_cache_config(
