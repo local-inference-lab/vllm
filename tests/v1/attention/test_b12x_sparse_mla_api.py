@@ -2418,7 +2418,12 @@ def test_deepseek_v4_wo_declares_exact_rows_before_profiling(monkeypatch, eager_
 
     layer = _deepseek_v4_wo_layer(torch.device("cpu"))
     layer._b12x_wo_projection_weights = SimpleNamespace(
-        groups=2, group_width=4096, rank=128, hidden=256
+        groups=2,
+        group_width=4096,
+        rank=128,
+        hidden=256,
+        sfb_k_replicated=True,
+        wo_b=SimpleNamespace(values_tiled=None),
     )
     monkeypatch.setattr(b12x_mla, "_require_b12x_wo_projection", lambda: wo_projection)
     workload = B12xWorkload(
@@ -2445,6 +2450,7 @@ def test_deepseek_v4_wo_declares_exact_rows_before_profiling(monkeypatch, eager_
         assert query.operation == "inv_rope" and not query.dynamic_tokens
         assert (query.heads_per_group, query.nope_dim, query.rope_dim) == (8, 448, 64)
         assert query.positions_dtype == "int64" and query.cos_sin_dtype == "bfloat16"
+        assert query.sfb_k_replicated and not query.wo_b_tiled
     (repeated,) = layer.get_b12x_preparation_units(layer, workload)
     assert all(a.plan is b.plan for a, b in zip(unit.requests, repeated.requests))
     assert (
@@ -2619,7 +2625,7 @@ def test_mhc_prepares_model_operands_and_first_layer_broadcast(
     layer = _deepseek_v4_mhc_layer(first_layer)
     hidden = layer.attn_norm.weight.numel()
     operands = None
-    operations = ("post_pre", "post_pre_bf16", "post")
+    operations: tuple[str, ...] = ("post_pre", "post_pre_bf16", "post")
     if glm_operands:
         layer.input_layernorm = layer.attn_norm
         layer.post_attention_layernorm = layer.ffn_norm
