@@ -929,18 +929,175 @@ def test_b12x_glm5_next_full_ckv_workspaces_follow_cache_format(
     impl._ckv_local_capacity = 128
     impl.dcp_world_size = 4
     impl._cache_record_bytes = record_bytes
+    impl._plans = {
+        ("ckv_extend", 32): SimpleNamespace(
+            scratch_specs=lambda: (SimpleNamespace(nbytes=8),)
+        )
+    }
     specs = impl._workspace_specs(input_num_heads=8, include_ckv=True)
 
-    assert specs[-2:] == (
-        ((128, record_bytes), torch.uint8),
-        ((512, record_bytes), torch.uint8),
+    assert len(specs) == 3
+    assert specs[1] == ((8,), torch.uint8)
+    assert specs[-1] == ((512, record_bytes), torch.uint8)
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_glm_dcp_prefill_query_reuses_scratch_without_aliasing_output(
+    monkeypatch, world_size: int, transposed: bool
+) -> None:
+    from vllm.v1.worker.workspace import WorkspaceManager
+
+    manager = WorkspaceManager(torch.device("cpu"))
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = True
+    impl._decode_max_rows = 4
+    impl._max_tokens = 32
+    impl._input_num_heads = world_size * 4
+    impl._q_head_dim = 8
+    impl._scratch_nbytes = 32 * impl._input_num_heads * 8 * 2
+    impl._decode_plan = object()
+    impl._ckv_local_capacity = 0
+    impl._cache_record_bytes = 528
+    impl.dcp_world_size = world_size
+    monkeypatch.setattr(b12x_mla_sparse, "current_workspace_manager", lambda: manager)
+    q_buffer, scratch = impl._borrow_workspaces()
+    manager.lock()
+    for rank in range(world_size):
+        group = SimpleNamespace(world_size=world_size, rank_in_group=rank)
+        monkeypatch.setattr(b12x_mla_sparse, "get_dcp_group", lambda group=group: group)
+        for rows in (19, 7, 23):
+            local_queries = []
+            for source in range(world_size):
+                values = (torch.arange(rows * 4 * 8) % 127 + source).to(torch.bfloat16)
+                local_queries.append(
+                    values.view(4, rows, 8).transpose(0, 1)
+                    if transposed
+                    else values.view(rows, 4, 8)
+                )
+
+            def gather(
+                _group, send, receive, rank=rank, rows=rows, local_queries=local_queries
+            ):
+                assert send.data_ptr() == receive.data_ptr() + rank * send.nbytes
+                assert torch.equal(send.view(rows, 4, 8), local_queries[rank])
+                receive.view(world_size, rows, 4, 8).copy_(torch.stack(local_queries))
+
+            monkeypatch.setattr(
+                b12x_mla_sparse, "_dcp_all_gather_current_stream", gather
+            )
+            actual = impl.gather_dcp_query(local_queries[rank])
+            assert actual.data_ptr() == q_buffer.data_ptr()
+            expected = torch.cat(local_queries, dim=1)
+            assert torch.equal(actual, expected)
+            scratch.fill_(255)
+            assert torch.equal(actual, expected)
+
+
+def test_glm_dcp_decode_keeps_the_transport_collective(monkeypatch) -> None:
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = True
+    impl._decode_max_rows = 16
+    query = torch.empty((16, 4, 8), dtype=torch.bfloat16)
+    expected = torch.empty((16, 8, 8), dtype=torch.bfloat16)
+    calls = []
+
+    def gather(value, dim):
+        calls.append((value, dim))
+        return expected
+
+    monkeypatch.setattr(
+        b12x_mla_sparse, "get_dcp_group", lambda: SimpleNamespace(all_gather=gather)
     )
+    assert impl.gather_dcp_query(query) is expected
+    assert calls == [(query, 1)]
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_glm_dcp_output_reuses_query_storage_with_head_major_rank_slices(
+    monkeypatch, world_size: int
+) -> None:
+    from vllm.v1.worker.workspace import WorkspaceManager
+
+    manager = WorkspaceManager(torch.device("cpu"))
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = True
+    impl._decode_max_rows = 4
+    impl._max_tokens = 32
+    impl._input_num_heads = world_size * 4
+    impl._q_head_dim = 8
+    impl._scratch_nbytes = 32 * impl._input_num_heads * 8 * 2
+    impl._decode_plan = object()
+    impl._ckv_local_capacity = 0
+    impl._cache_record_bytes = 528
+    impl.dcp_world_size = world_size
+    monkeypatch.setattr(b12x_mla_sparse, "current_workspace_manager", lambda: manager)
+    monkeypatch.setattr(b12x_mla_sparse, "should_nccl_symm_mem_ag_rs", lambda: False)
+    q_buffer, scratch = impl._borrow_workspaces()
+    manager.lock()
+    for rank in range(world_size):
+        for rows in (19, 7, 23):
+            partial = (
+                scratch[: rows * impl._input_num_heads * 8 * 2]
+                .view(torch.bfloat16)
+                .view(rows, impl._input_num_heads, 8)
+            )
+            partial.copy_(torch.arange(partial.numel()).view_as(partial) % 127)
+            original = partial.clone()
+
+            def reduce_scatter(local, packed, rank=rank, original=original):
+                assert packed.data_ptr() == q_buffer.data_ptr()
+                assert local.data_ptr() == packed.data_ptr() + rank * local.nbytes
+                assert local.is_contiguous() and packed.is_contiguous()
+                assert torch.equal(packed, original.transpose(0, 1))
+                local.mul_(world_size)
+
+            comm = SimpleNamespace(disabled=False, reduce_scatter=reduce_scatter)
+            group = SimpleNamespace(
+                rank_in_group=rank,
+                device_communicator=SimpleNamespace(pynccl_comm=comm),
+            )
+            monkeypatch.setattr(
+                b12x_mla_sparse, "get_dcp_group", lambda group=group: group
+            )
+            actual = impl.reduce_scatter_dcp_output(partial)
+            expected = original[:, rank * 4 : (rank + 1) * 4] * world_size
+            assert torch.equal(actual, expected)
+            assert torch.equal(partial, original)
+            assert actual.transpose(0, 1).is_contiguous()
+            scratch.fill_(255)
+            assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "rows,disabled,symmetric", [(4, False, False), (8, True, False), (8, False, True)]
+)
+def test_glm_dcp_output_preserves_decode_and_special_transport_paths(
+    monkeypatch, rows, disabled, symmetric
+) -> None:
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = True
+    impl._decode_max_rows = 4
+    comm = SimpleNamespace(disabled=disabled)
+    monkeypatch.setattr(
+        b12x_mla_sparse,
+        "get_dcp_group",
+        lambda: SimpleNamespace(device_communicator=SimpleNamespace(pynccl_comm=comm)),
+    )
+    monkeypatch.setattr(
+        b12x_mla_sparse, "should_nccl_symm_mem_ag_rs", lambda: symmetric
+    )
+    assert impl.reduce_scatter_dcp_output(torch.empty(rows, 8, 8)) is None
 
 
 @pytest.mark.parametrize("record_bytes", [528, 304])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("padded_tokens", [2, 4])
 def test_b12x_glm5_next_full_ckv_gather_preserves_native_records(
     monkeypatch: pytest.MonkeyPatch,
     record_bytes: int,
+    rank: int,
+    padded_tokens: int,
 ) -> None:
     impl = object.__new__(B12xMLASparseImpl)
     impl._kernel_page_size = 2
@@ -954,37 +1111,48 @@ def test_b12x_glm5_next_full_ckv_gather_preserves_native_records(
         .to(torch.uint8)
         .view(2, 2, record_bytes)
     )
-    local_buffer = torch.full((4, record_bytes), 255, dtype=torch.uint8)
-    gathered_buffer = torch.empty((8, record_bytes), dtype=torch.uint8)
+    gathered_buffer = torch.full((8, record_bytes), 255, dtype=torch.uint8)
+    local_tokens = padded_tokens - 1
     metadata = SimpleNamespace(
-        num_actual_tokens=3,
-        dcp_local_total_tokens=3,
-        dcp_padded_total_tokens=4,
-        dcp_local_cu_seq_lens=torch.tensor([0, 3], dtype=torch.int32),
+        num_actual_tokens=local_tokens,
+        dcp_local_total_tokens=local_tokens,
+        dcp_padded_total_tokens=padded_tokens,
+        dcp_local_cu_seq_lens=torch.tensor([0, local_tokens], dtype=torch.int32),
         block_table=torch.tensor([[0, 1]], dtype=torch.int32),
         num_reqs=1,
     )
 
     def fake_cp_gather_cache(**kwargs: Any) -> None:
-        kwargs["dst"].copy_(kwargs["src_cache"].view(-1, record_bytes)[:3])
+        kwargs["dst"].copy_(kwargs["src_cache"].view(-1, record_bytes)[:local_tokens])
 
     def fake_all_gather(_group: Any, src: torch.Tensor, dst: torch.Tensor) -> None:
+        assert src.data_ptr() == dst.data_ptr() + rank * padded_tokens * record_bytes
         dst.copy_(src.repeat(2))
 
     monkeypatch.setattr(b12x_mla_sparse.ops, "cp_gather_cache", fake_cp_gather_cache)
     monkeypatch.setattr(
         b12x_mla_sparse, "_dcp_all_gather_current_stream", fake_all_gather
     )
-    monkeypatch.setattr(b12x_mla_sparse, "get_dcp_group", lambda: object())
+    monkeypatch.setattr(
+        b12x_mla_sparse,
+        "get_dcp_group",
+        lambda: SimpleNamespace(rank_in_group=rank, world_size=2),
+    )
 
-    gathered = impl._gather_full_ckv(kv_cache, metadata, local_buffer, gathered_buffer)
+    gathered = impl._gather_full_ckv(kv_cache, metadata, gathered_buffer)
 
     expected_rank = torch.cat(
-        (kv_cache.view(-1, record_bytes)[:3], torch.zeros((1, record_bytes))),
+        (
+            kv_cache.view(-1, record_bytes)[:local_tokens],
+            torch.zeros((1, record_bytes), dtype=torch.uint8),
+        ),
         dim=0,
     )
     assert gathered.shape == (4, 2, record_bytes)
-    assert torch.equal(gathered.view(-1, record_bytes), expected_rank.repeat(2, 1))
+    assert torch.equal(
+        gathered.view(-1, record_bytes)[: 2 * padded_tokens], expected_rank.repeat(2, 1)
+    )
+    assert torch.all(gathered.view(-1, record_bytes)[2 * padded_tokens :] == 255)
 
 
 def test_b12x_glm5_next_full_ckv_gather_rejects_wrong_record_width() -> None:
@@ -1000,7 +1168,6 @@ def test_b12x_glm5_next_full_ckv_gather_rejects_wrong_record_width() -> None:
         impl._gather_full_ckv(
             torch.empty((2, 2, 528), dtype=torch.uint8),
             metadata,
-            torch.empty((4, 304), dtype=torch.uint8),
             torch.empty((8, 304), dtype=torch.uint8),
         )
 
