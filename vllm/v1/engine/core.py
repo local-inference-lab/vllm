@@ -950,7 +950,10 @@ class EngineCore:
     def _finish_pause(self, clear_cache: bool) -> None:
         # A completed pause promises an idle device: nothing else waits on
         # the last dummy batch an idle DP rank launches.
+        start = time.perf_counter_ns()
         self.model_executor.collective_rpc("synchronize_device")
+        if getattr(self, "_residency_active", False):
+            self._residency_device_drain_ns = time.perf_counter_ns() - start
         if clear_cache:
             self._reset_caches()
 
@@ -970,6 +973,10 @@ class EngineCore:
         - ``keep``: Set PAUSED_ALL; return a Future that completes when the
           output queue is empty.
         """
+        if getattr(self, "_residency_active", False) and not getattr(
+            self, "_requesting_residency_pause", False
+        ):
+            raise RuntimeError("residency maintenance owns the scheduler boundary")
         if mode not in get_args(PauseMode):
             raise ValueError(f"Invalid pause mode: {mode}")
         if mode == "wait":
@@ -986,7 +993,90 @@ class EngineCore:
 
     def resume_scheduler(self) -> None:
         """Resume the scheduler and flush any requests queued while paused."""
+        if getattr(self, "_residency_active", False) or getattr(
+            self, "_residency_failed", False
+        ):
+            raise RuntimeError("residency maintenance is pending or requires reload")
         self.scheduler.set_pause_state(PauseState.UNPAUSED)
+
+    def residency_maintenance(self, config: dict[str, Any]) -> Future:
+        """Run opt-in residency work after the normal scheduler/device drain.
+
+        Output delivery remains live. The engine owns completion even if the
+        client disconnects. Failure keeps scheduling paused until worker reload.
+        The single-rank worker owns policy; distributed updates retain their
+        separate all-rank transaction protocol.
+        """
+        additional = self.vllm_config.additional_config
+        parallel = self.vllm_config.parallel_config
+        if (
+            not isinstance(additional, dict)
+            or additional.get("b12x_expert_cache", {}).get("mode") != "adaptive"
+            or parallel.tensor_parallel_size != 1
+            or parallel.data_parallel_size != 1
+            or parallel.pipeline_parallel_size != 1
+            or parallel.enable_expert_parallel
+        ):
+            raise ValueError(
+                "residency maintenance requires an opted-in single-rank cache"
+            )
+        if self.is_scheduler_paused() or getattr(self, "_residency_active", False):
+            raise RuntimeError("residency maintenance cannot acquire a paused engine")
+        if getattr(self, "_residency_failed", False):
+            raise RuntimeError("residency maintenance requires worker reload")
+        self._residency_active = True
+        self._residency_device_drain_ns = 0
+        started = time.perf_counter_ns()
+        result: Future = Future()
+
+        def complete(paused: Future | None = None) -> None:
+            try:
+                if paused is not None:
+                    paused.result()
+                drained = time.perf_counter_ns()
+                replies = self.model_executor.collective_rpc(
+                    "b12x_residency_maintenance", args=(config,)
+                )
+                applied = time.perf_counter_ns()
+                if len(replies) != 1 or replies[0].get("status") != "complete":
+                    raise RuntimeError("residency worker did not complete maintenance")
+                self._residency_active = False
+                self.resume_scheduler()
+                finished = time.perf_counter_ns()
+                result.set_result(
+                    {
+                        "worker": replies[0],
+                        "engine_stages_ns": {
+                            "scheduler_drain": drained - started,
+                            "device_drain": self._residency_device_drain_ns,
+                            "worker_rpc": applied - drained,
+                            "resume": finished - applied,
+                        },
+                        "engine_wall_ns": finished - started,
+                    }
+                )
+            except BaseException as error:
+                self._residency_active = False
+                self._residency_failed = True
+                self.scheduler.set_pause_state(PauseState.PAUSED_ALL)
+                result.set_exception(error)
+
+        try:
+            self._requesting_residency_pause = True
+            try:
+                pause = self.pause_scheduler(mode="keep", clear_cache=False)
+            finally:
+                self._requesting_residency_pause = False
+            if pause is None:
+                complete()
+            else:
+                pause.add_done_callback(complete)
+        except BaseException as error:
+            self._residency_active = False
+            self._residency_failed = True
+            self.scheduler.set_pause_state(PauseState.PAUSED_ALL)
+            result.set_exception(error)
+        return result
 
     def is_scheduler_paused(self) -> bool:
         """Return whether the scheduler is in any pause state."""
@@ -1549,6 +1639,10 @@ class EngineCoreProc(EngineCore):
         while not self.has_work() and self.is_running():
             # Notify callbacks waiting for engine to become idle.
             self._notify_idle_state_callbacks()
+            # A maintenance callback can resume existing requests without a
+            # new client message. Recheck before blocking on the input queue.
+            if self.has_work():
+                break
             if self.input_queue.empty():
                 # Drain aborts queue; all aborts are also processed via input_queue.
                 with self.aborts_queue.mutex:
@@ -2047,6 +2141,10 @@ class EngineCoreProc(EngineCore):
         - ``keep``: Set PAUSED_ALL; return a Future that completes when the
           output queue is empty.
         """
+        if getattr(self, "_residency_active", False) and not getattr(
+            self, "_requesting_residency_pause", False
+        ):
+            raise RuntimeError("residency maintenance owns the scheduler boundary")
         if mode not in get_args(PauseMode):
             raise ValueError(f"Invalid pause mode: {mode}")
 

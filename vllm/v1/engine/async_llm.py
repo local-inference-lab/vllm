@@ -922,7 +922,9 @@ class AsyncLLM(EngineClient):
             mode = "wait"
         if clear_cache:
             await self.renderer.clear_mm_cache_async()
+        started = time.perf_counter_ns()
         await self.engine_core.pause_scheduler_async(mode=mode, clear_cache=clear_cache)
+        drained = time.perf_counter_ns()
         # Small sleep to help ensure that final outputs from any in-flight requests are
         # returned prior to this method returning. These outputs come out of the engine
         # prior to the wait-for-idle completion event, but involve additional async
@@ -930,10 +932,30 @@ class AsyncLLM(EngineClient):
         # Note that this is not required for correctness, just more intuitive ordering
         # of events from caller's pov.
         await asyncio.sleep(0.02)
+        self.last_pause_timings_ns = {
+            "scheduler_drain_roundtrip": drained - started,
+            "output_settling": time.perf_counter_ns() - drained,
+        }
 
     async def resume_generation(self) -> None:
         """Resume generation after :meth:`pause_generation`."""
         await self.engine_core.resume_scheduler_async()
+
+    async def residency_maintenance(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Drain graph readers, run one residency transaction, and resume.
+
+        Unlike administrative pause, this does not wait for output-delivery
+        ordering. GPU drain and generation publication remain engine-owned.
+        Cancellation waits for the submitted transaction before propagating.
+        """
+        operation = asyncio.create_task(
+            self.engine_core.residency_maintenance_async(config)
+        )
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            await operation
+            raise
 
     async def is_paused(self) -> bool:
         """Return whether the engine is currently paused."""
