@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import weakref
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, cast
@@ -297,6 +298,20 @@ class MoERunner(MoERunnerInterface):
                 enable_dbo=enable_dbo,
                 mk_can_overlap_shared_experts=can_overlap,
             )
+            if routed_input_transform is None and shared_expert_gate is None:
+                # Preparation can time the independent branch without registering
+                # its parameters a second time or extending the runner's lifetime.
+                object.__setattr__(
+                    routed_experts,
+                    "shared_experts_for_preparation",
+                    weakref.ref(self._shared_experts),
+                )
+                if gate is not None:
+                    object.__setattr__(
+                        routed_experts,
+                        "routing_gate_for_preparation",
+                        weakref.ref(gate),
+                    )
 
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name
