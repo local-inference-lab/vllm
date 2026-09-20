@@ -526,6 +526,17 @@ class Worker(WorkerBase):
         return self.worker_sentinel.handle_command(ft_request)
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        additional = self.vllm_config.additional_config
+        if (
+            isinstance(additional, dict)
+            and additional.get("b12x_expert_cache") is not None
+        ):
+            if not self.use_v2_model_runner or load_dummy_weights:
+                raise ValueError("expert cache requires real weights and the V2 runner")
+            from vllm.model_executor.layers.fused_moe.b12x_cache import cache_provider
+
+            cache_provider(self.vllm_config, create=True)
+        self._record_b12x_lifecycle("before_model_loading")
         with (
             self._maybe_get_memory_pool_context(tag="weights"),
             set_current_vllm_config(self.vllm_config),
@@ -533,6 +544,7 @@ class Worker(WorkerBase):
             self._scoped_allocator_max_split(max_split_size_mb=20),
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+        self._record_b12x_lifecycle("after_model_loading")
 
         if has_ec_transfer():
             get_ec_transfer().start_worker_services()
@@ -612,6 +624,7 @@ class Worker(WorkerBase):
             # free memory as a start that reused cached selections.
             torch.accelerator.synchronize()
             torch.accelerator.empty_cache()
+            self._record_b12x_lifecycle("after_cache_preparation")
         return outcome
 
     def abort_b12x_preparation(self) -> dict[str, object]:
@@ -1700,6 +1713,7 @@ class Worker(WorkerBase):
             self.model_runner.reset_lora_state()
 
     def shutdown(self) -> None:
+        self._record_b12x_lifecycle("before_worker_shutdown")
         gc.unfreeze()
 
         # has_kv_transfer_group can be None during interpreter shutdown.
@@ -1724,6 +1738,12 @@ class Worker(WorkerBase):
         if session := getattr(self, "_b12x_session", None):
             session.close()
             self._b12x_session = None
+        provider = getattr(self.vllm_config, "_b12x_expert_cache_provider", None)
+        if provider is not None:
+            provider.model.close()
+            object.__setattr__(self.vllm_config, "_b12x_expert_cache_provider", None)
+        if hasattr(self, "model_runner"):
+            del self.model_runner
 
         # Release kept-alive cumem pools while the pluggable allocator wrappers
         # and callbacks are still alive, so MemPool teardown is not deferred to
@@ -1733,6 +1753,17 @@ class Worker(WorkerBase):
 
             if CuMemAllocator.instance is not None:
                 CuMemAllocator.instance.release_pools()
+        del model_runner
+        gc.collect()
+        torch.accelerator.empty_cache()
+        self._record_b12x_lifecycle("after_worker_shutdown")
+
+    def _record_b12x_lifecycle(self, stage: str) -> None:
+        path = os.environ.get("B12X_LIFECYCLE_OUTPUT")
+        if path:
+            from b12x.testing.lifecycle import record_worker_resources
+
+            record_worker_resources(self, stage, path)
 
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)

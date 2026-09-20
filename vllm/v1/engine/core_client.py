@@ -340,6 +340,9 @@ class EngineCoreClient(ABC):
     ) -> dict[str, Any]:
         raise NotImplementedError
 
+    async def prepare_shutdown_async(self) -> None:
+        raise NotImplementedError
+
     async def handle_fault(
         self, fault_tolerance_request: FaultToleranceRequest
     ) -> FaultToleranceResult:
@@ -1265,6 +1268,9 @@ class AsyncMPClient(MPClient):
         self, config: dict[str, Any]
     ) -> dict[str, Any]:
         return await self.call_utility_async("residency_maintenance", config)
+
+    async def prepare_shutdown_async(self) -> None:
+        await self.call_utility_async("prepare_shutdown")
 
     async def resume_scheduler_async(self) -> None:
         await self.call_utility_async("resume_scheduler")

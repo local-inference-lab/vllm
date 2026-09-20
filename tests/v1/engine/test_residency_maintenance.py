@@ -5,13 +5,75 @@
 import asyncio
 from concurrent.futures import Future
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.core import EngineCoreProc, EngineShutdownState
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_shutdown_acknowledges_release_only_after_completed_drain(deferred):
+    value = core()
+    pause: Future[None] | None = Future() if deferred else None
+    value.pause_scheduler = MagicMock(return_value=pause)
+    executor = value.model_executor
+    result = value.prepare_shutdown()
+    assert value.prepare_shutdown() is result
+    if deferred:
+        assert pause is not None
+        executor.shutdown.assert_not_called()
+        pause.set_result(None)
+    assert result.result() is None
+    executor.shutdown.assert_called_once()
+    assert value.model_executor is None
+    with pytest.raises(RuntimeError, match="closing"):
+        value.resume_scheduler()
+    with pytest.raises(RuntimeError, match="closing"):
+        value.residency_maintenance({})
+
+
+def test_failed_worker_close_stays_paused_and_reports_failure():
+    value = core()
+    value.pause_scheduler = MagicMock(return_value=None)
+    value.model_executor.shutdown.side_effect = RuntimeError("release failed")
+    with pytest.raises(RuntimeError, match="release failed"):
+        value.prepare_shutdown().result()
+    assert value.scheduler.pause_state == PauseState.PAUSED_ALL
+    with pytest.raises(RuntimeError, match="closing"):
+        value.resume_scheduler()
+
+
+def test_async_close_waits_through_cancellation_and_closes_once(monkeypatch):
+    async def scenario():
+        value = object.__new__(AsyncLLM)
+        released = asyncio.Event()
+        value.engine_core = MagicMock()
+        value.engine_core.prepare_shutdown_async = AsyncMock(side_effect=released.wait)
+        value.renderer = MagicMock()
+        prometheus = MagicMock()
+        monkeypatch.setattr("vllm.v1.engine.async_llm.shutdown_prometheus", prometheus)
+        task = asyncio.create_task(value.shutdown_async())
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        value.engine_core.shutdown.assert_not_called()
+        released.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        value.engine_core.shutdown.assert_called_once()
+        value.renderer.shutdown.assert_called_once()
+        # Explicit completion must not call module globals during finalization.
+        monkeypatch.setattr("vllm.v1.engine.async_llm.shutdown_prometheus", None)
+        value.shutdown()
+        value.__del__()
+        prometheus.assert_called_once()
+
+    asyncio.run(scenario())
 
 
 def core(deferred=False):
@@ -126,6 +188,8 @@ def test_client_cancellation_waits_for_engine_owned_transaction():
         await started.wait()
         task.cancel()
         await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
         assert not task.done()
         release.set()
         with pytest.raises(asyncio.CancelledError):
@@ -133,3 +197,12 @@ def test_client_cancellation_waits_for_engine_owned_transaction():
         assert finished == [True]
 
     asyncio.run(run())
+
+
+def test_shutdown_drain_failure_never_releases_live_worker():
+    value = core()
+    value.pause_scheduler = MagicMock(side_effect=RuntimeError("drain failed"))
+    with pytest.raises(RuntimeError, match="drain failed"):
+        value.prepare_shutdown().result()
+    value.model_executor.shutdown.assert_not_called()
+    assert value.scheduler.pause_state == PauseState.PAUSED_ALL

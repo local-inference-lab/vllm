@@ -21,6 +21,14 @@ class _CacheProvider:
         )
         from b12x.moe.fused_moe.cache_source import checkpoint_fingerprint
 
+        if (
+            config.model_config.quantization != "modelopt_fp4"
+            or config.model_config.dtype != torch.bfloat16
+            or config.kernel_config.moe_backend != "b12x"
+        ):
+            raise ValueError(
+                "expert cache requires ModelOpt NVFP4, BF16 and the b12x MoE backend"
+            )
         parallel = config.parallel_config
         if (
             parallel.tensor_parallel_size != 1

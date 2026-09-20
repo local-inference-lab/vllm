@@ -457,6 +457,8 @@ class EngineCore:
         `request_wave`: indicate which wave of requests this is expected to
         belong to in DP case
         """
+        if getattr(self, "_closing", False):
+            raise RuntimeError("engine resources are closing")
         # Validate the request_id type.
         if not isinstance(request.request_id, str):
             raise TypeError(
@@ -993,11 +995,47 @@ class EngineCore:
 
     def resume_scheduler(self) -> None:
         """Resume the scheduler and flush any requests queued while paused."""
+        if getattr(self, "_closing", False):
+            raise RuntimeError("engine resources are closing")
         if getattr(self, "_residency_active", False) or getattr(
             self, "_residency_failed", False
         ):
             raise RuntimeError("residency maintenance is pending or requires reload")
         self.scheduler.set_pause_state(PauseState.UNPAUSED)
+
+    def prepare_shutdown(self) -> Future:
+        """Acknowledge worker release after the scheduler/device drain."""
+        pending = getattr(self, "_shutdown_resources", None)
+        if pending is not None:
+            return pending
+        if getattr(self, "_residency_active", False):
+            raise RuntimeError("await residency maintenance before closing")
+        self._closing = True
+        self._shutdown_resources: Future[None] = Future()
+        result = self._shutdown_resources
+
+        def complete(paused=None):
+            try:
+                if paused is not None:
+                    paused.result()
+                self.scheduler.set_pause_state(PauseState.PAUSED_ALL)
+                self.model_executor.shutdown()
+                self.model_executor = None
+                result.set_result(None)
+            except BaseException as error:
+                self.scheduler.set_pause_state(PauseState.PAUSED_ALL)
+                result.set_exception(error)
+
+        try:
+            pause = self.pause_scheduler(mode="abort", clear_cache=False)
+            if pause is None:
+                complete()
+            else:
+                pause.add_done_callback(complete)
+        except BaseException as error:
+            self.scheduler.set_pause_state(PauseState.PAUSED_ALL)
+            result.set_exception(error)
+        return result
 
     def residency_maintenance(self, config: dict[str, Any]) -> Future:
         """Run opt-in residency work after the normal scheduler/device drain.
@@ -1007,6 +1045,8 @@ class EngineCore:
         The single-rank worker owns policy; distributed updates retain their
         separate all-rank transaction protocol.
         """
+        if getattr(self, "_closing", False):
+            raise RuntimeError("engine resources are closing")
         additional = self.vllm_config.additional_config
         parallel = self.vllm_config.parallel_config
         if (

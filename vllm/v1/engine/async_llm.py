@@ -276,6 +276,9 @@ class AsyncLLM(EngineClient):
 
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown, cleaning up the background proc and IPC."""
+        if getattr(self, "_shutdown_complete", False):
+            return
+        self._closing = True
         shutdown_prometheus()
 
         if renderer := getattr(self, "renderer", None):
@@ -287,6 +290,44 @@ class AsyncLLM(EngineClient):
         handler = getattr(self, "output_handler", None)
         if handler is not None:
             cancel_task_threadsafe(handler)
+        self._shutdown_complete = True
+
+    async def shutdown_async(self, timeout: float = 30.0) -> None:
+        """Retire worker resources before terminating the engine process.
+
+        Callers must stop and await their request/control producers first.
+        Cancellation waits for the engine-owned close. A failed or timed-out
+        acknowledgement uses the existing process teardown, never resume.
+        """
+        if timeout <= 0:
+            raise ValueError("shutdown timeout must be positive")
+        if getattr(self, "_shutdown_complete", False):
+            return
+        self._closing = True
+
+        async def close():
+            try:
+                await asyncio.wait_for(
+                    self.engine_core.prepare_shutdown_async(), timeout
+                )
+            finally:
+                self.shutdown()
+                handler = getattr(self, "output_handler", None)
+                if handler is not None:
+                    await asyncio.gather(handler, return_exceptions=True)
+
+        operation = getattr(self, "_shutdown_task", None)
+        if operation is None:
+            operation = self._shutdown_task = asyncio.create_task(close())
+        cancelled = False
+        while not operation.done():
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                cancelled = True
+        operation.result()
+        if cancelled:
+            raise asyncio.CancelledError
 
     def get_num_unfinished_requests(self) -> int:
         return self.output_processor.get_num_unfinished_requests()
@@ -379,6 +420,8 @@ class AsyncLLM(EngineClient):
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
 
+        if getattr(self, "_closing", False):
+            raise RuntimeError("engine is closing")
         if self.errored:
             raise EngineDeadError()
 
@@ -948,13 +991,20 @@ class AsyncLLM(EngineClient):
         ordering. GPU drain and generation publication remain engine-owned.
         Cancellation waits for the submitted transaction before propagating.
         """
+        if getattr(self, "_closing", False):
+            raise RuntimeError("engine is closing")
         operation = asyncio.create_task(
             self.engine_core.residency_maintenance_async(config)
         )
         try:
             return await asyncio.shield(operation)
         except asyncio.CancelledError:
-            await operation
+            while not operation.done():
+                try:  # Repeated caller cancellation must not cancel owned work.
+                    await asyncio.shield(operation)
+                except asyncio.CancelledError:
+                    continue
+            operation.result()
             raise
 
     async def is_paused(self) -> bool:
@@ -1147,6 +1197,8 @@ class AsyncLLM(EngineClient):
         """
         Perform a collective RPC call to the given path.
         """
+        if getattr(self, "_closing", False):
+            raise RuntimeError("engine is closing")
         return await self.engine_core.collective_rpc_async(
             method, timeout, args, kwargs
         )

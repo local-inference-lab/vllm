@@ -79,3 +79,23 @@ def test_loader_rejects_global_scale_reconciliation():
 def test_custom_additional_config_does_not_enable_cache():
     config = SimpleNamespace(additional_config=object())
     assert cache_provider(config) is None
+
+
+@pytest.mark.parametrize(
+    "quantization,dtype,backend",
+    [
+        ("awq", torch.bfloat16, "b12x"),
+        ("modelopt_fp4", torch.float16, "b12x"),
+        ("modelopt_fp4", torch.bfloat16, "flashinfer_cutlass"),
+    ],
+)
+def test_incompatible_recipe_is_rejected_before_checkpoint_access(
+    quantization, dtype, backend
+):
+    config = SimpleNamespace(
+        additional_config={"b12x_expert_cache": {}},
+        model_config=SimpleNamespace(quantization=quantization, dtype=dtype),
+        kernel_config=SimpleNamespace(moe_backend=backend),
+    )
+    with pytest.raises(ValueError, match="ModelOpt NVFP4"):
+        cache_provider(config, create=True)
