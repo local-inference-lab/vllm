@@ -650,7 +650,12 @@ class Worker(WorkerBase):
                 self.model_runner.profile_run(self._prepare_b12x_profile_state)
             finally:
                 self._release_b12x_profile_state()
-            self.model_runner.profile_glm_dcp_attention()
+            try:
+                self.model_runner.profile_glm_dcp_attention(
+                    self._prepare_b12x_profile_state
+                )
+            finally:
+                self._release_b12x_profile_state()
 
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
@@ -673,13 +678,6 @@ class Worker(WorkerBase):
             finally:
                 self._release_b12x_profile_state()
 
-        # Respect the opt-in flag as originally designed.
-        cudagraph_memory_estimate_applied = (
-            cudagraph_memory_estimate
-            if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
-            else 0
-        )
-
         # Prepared plans can retain profiling tensors beyond graph teardown.
         # Reclaim their released allocator blocks before measuring persistence.
         gc.collect()
@@ -695,6 +693,30 @@ class Worker(WorkerBase):
             profile_result.after_profile.free_memory
             - final_profile_snapshot.free_memory,
             0,
+        )
+        native_profile = getattr(
+            self.model_runner, "cudagraph_native_memory_profile", None
+        )
+        if native_profile is not None:
+            native_before, native_after, measured = native_profile
+            # Count capture-initialized modules/communication storage once.
+            # Sample retention only after prepared plans have been released;
+            # bootstrap-only and cleanup-only growth do not discount graphs.
+            retained_native_capture = max(
+                min(native_after, final_profile_snapshot.non_torch_memory)
+                - native_before,
+                0,
+            )
+            cudagraph_memory_estimate -= min(
+                retained_native_capture,
+                late_persistent_memory,
+                max(measured, 0),
+                cudagraph_memory_estimate,
+            )
+        cudagraph_memory_estimate_applied = (
+            cudagraph_memory_estimate
+            if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+            else 0
         )
         init_free_memory = self.init_snapshot.free_memory
         free_gpu_memory = final_profile_snapshot.free_memory
