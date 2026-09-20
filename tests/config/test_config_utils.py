@@ -8,6 +8,7 @@ import pytest
 
 from vllm.config.cache import CacheConfig
 from vllm.config.scheduler import SchedulerConfig
+from vllm.config.speculative import SpeculativeConfig
 from vllm.config.utils import get_hash_factors, hash_factors, normalize_value
 
 # Helpers
@@ -233,6 +234,18 @@ def test_scheduler_config_hash_includes_max_num_seqs():
     ).compute_hash()
 
     assert larger_batch_hash != base_hash
+
+
+def test_speculative_config_hash_includes_graph_shape():
+    def config(method: str, num_speculative_tokens: int) -> SpeculativeConfig:
+        return SpeculativeConfig(
+            method=method,
+            num_speculative_tokens=num_speculative_tokens,
+            prompt_lookup_max=num_speculative_tokens,
+        )
+
+    assert config("ngram", 1).compute_hash() != config("ngram", 3).compute_hash()
+    assert config("ngram", 3).compute_hash() != config("ngram_gpu", 3).compute_hash()
 
 
 def test_cache_config_hash_ignores_prefix_cache_retention_interval():
