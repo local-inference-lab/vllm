@@ -25,6 +25,7 @@ from vllm.models.qwen4_exp.nvidia.b12x_qsa import (
 )
 from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
 from vllm.platforms import current_platform
+from vllm.platforms.interface import Platform
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.worker.utils import select_common_block_size
@@ -90,6 +91,76 @@ def test_qsa_backend_platform_probe_uses_b12x_selector_geometry(
     ]
 
 
+@pytest.mark.parametrize(
+    (
+        "dcp_size",
+        "initial_block_size",
+        "expected_block_size",
+        "expected_page_size",
+    ),
+    [
+        (1, 64, 1472, 847_872),
+        (2, 64, 1472, 847_872),
+        (4, 64, 768, 835_584),
+        (4, 16, 752, 818_176),
+    ],
+)
+def test_qsa_hybrid_alignment_uses_materialized_dcp_heads(
+    monkeypatch,
+    dcp_size: int,
+    initial_block_size: int,
+    expected_block_size: int,
+    expected_page_size: int,
+) -> None:
+    monkeypatch.setattr(
+        qsa_cache_module,
+        "get_b12x_qsa",
+        lambda: SimpleNamespace(
+            cache_requirements=lambda **kwargs: SimpleNamespace(
+                compressed_page_nbytes=256
+            )
+        ),
+    )
+    model_cls = SimpleNamespace(
+        get_mamba_state_shape_from_config=lambda config: ((817_152,),),
+        get_mamba_state_dtype_from_config=lambda config: (torch.uint8,),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.ModelRegistry.resolve_model_cls",
+        lambda *args, **kwargs: (model_cls, None),
+    )
+    model_config = SimpleNamespace(
+        architecture="Qwen4ExpForConditionalGeneration",
+        dtype=torch.bfloat16,
+        use_mla=False,
+        get_head_size=lambda: 256,
+        get_num_kv_heads=lambda parallel_config: 1,
+        get_total_num_kv_heads=lambda: 2,
+    )
+    cache_config = SimpleNamespace(
+        block_size=initial_block_size,
+        cache_dtype="fp8",
+        mamba_block_size=None,
+        user_specified_mamba_block_size=False,
+        mamba_cache_mode="align",
+        mamba_page_size_padded=None,
+    )
+    config = SimpleNamespace(
+        model_config=model_config,
+        cache_config=cache_config,
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=4,
+            decode_context_parallel_size=dcp_size,
+        ),
+    )
+
+    Platform._align_hybrid_block_size(config, Qwen4ExpQSABackend)
+
+    assert cache_config.block_size == expected_block_size
+    assert cache_config.mamba_block_size == expected_block_size
+    assert cache_config.mamba_page_size_padded == expected_page_size
+
+
 def test_qsa_backend_selects_the_manager_block_without_dense_page_limits() -> None:
     assert select_common_block_size(384, [Qwen4ExpQSABackend]) == 384
     assert select_common_block_size(512, [Qwen4ExpQSABackend]) == 512
@@ -97,6 +168,252 @@ def test_qsa_backend_selects_the_manager_block_without_dense_page_limits() -> No
     assert Qwen4ExpQSABackend.supports_block_size(512)
     assert not Qwen4ExpQSABackend.supports_block_size(12)
     assert Qwen4ExpQSABackend.get_preferred_block_size(70) == 72
+
+
+def test_qsa_dcp_packs_qkv_into_one_collective() -> None:
+    layer = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.dcp_size = 4
+    layer.dcp_num_heads = 24
+    layer.dcp_num_kv_heads = 2
+    layer.dcp_kv_replicas = 2
+    layer.num_heads = 6
+    layer.total_num_heads = 24
+    layer.num_projected_kv_heads = 1
+    layer.total_num_kv_heads = 2
+    layer.head_dim = 3
+
+    rank_packs = []
+    for rank in range(4):
+        rank_query = torch.full((2, 6, 3), rank, dtype=torch.float32)
+        kv_head = rank // 2
+        rank_key = torch.full((2, 1, 3), 10 + kv_head, dtype=torch.float32)
+        rank_value = torch.full((2, 1, 3), 20 + kv_head, dtype=torch.float32)
+        rank_packs.append(torch.cat((rank_query, rank_key, rank_value), dim=1))
+
+    calls = []
+
+    def gather(packed):
+        calls.append(packed)
+        return torch.cat(rank_packs, dim=1)
+
+    layer._gather_dcp_heads = gather
+    local_query = rank_packs[0][:, :6]
+    local_key = rank_packs[0][:, 6:7]
+    local_value = rank_packs[0][:, 7:8]
+
+    query, key, value = layer._gather_dcp_qkv(local_query, local_key, local_value)
+
+    assert len(calls) == 1
+    torch.testing.assert_close(calls[0], rank_packs[0])
+    assert query.shape == (2, 24, 3)
+    assert key.shape == value.shape == (2, 2, 3)
+    for rank in range(4):
+        assert torch.all(query[:, rank * 6 : (rank + 1) * 6] == rank)
+    assert torch.all(key[:, 0] == 10)
+    assert torch.all(key[:, 1] == 11)
+    assert torch.all(value[:, 0] == 20)
+    assert torch.all(value[:, 1] == 21)
+
+
+def test_qsa_dcp_subgroup_deduplicates_replicated_kv_heads() -> None:
+    layer = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.dcp_size = 2
+    layer.dcp_num_heads = 12
+    layer.dcp_num_kv_heads = 1
+    layer.dcp_kv_replicas = 2
+    layer.num_heads = 6
+    layer.total_num_heads = 24
+    layer.num_projected_kv_heads = 1
+    layer.total_num_kv_heads = 2
+    layer.head_dim = 3
+
+    rank_packs = []
+    for rank in range(2):
+        query = torch.full((2, 6, 3), rank, dtype=torch.float32)
+        key = torch.full((2, 1, 3), 10, dtype=torch.float32)
+        value = torch.full((2, 1, 3), 20, dtype=torch.float32)
+        rank_packs.append(torch.cat((query, key, value), dim=1))
+
+    layer._gather_dcp_heads = lambda _packed: torch.cat(rank_packs, dim=1)
+    query, key, value = layer._gather_dcp_qkv(
+        rank_packs[0][:, :6],
+        rank_packs[0][:, 6:7],
+        rank_packs[0][:, 7:8],
+    )
+
+    assert query.shape == (2, 12, 3)
+    assert key.shape == value.shape == (2, 1, 3)
+    assert torch.all(key == 10)
+    assert torch.all(value == 20)
+
+
+def test_qsa_dcp_fp32_combine_weights_before_reduce_scatter(monkeypatch) -> None:
+    layer = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.dcp_size = 2
+    layer.max_decode_rows = 8
+
+    remote_lse = torch.tensor(
+        [[1.0, 0.0, -1.0, 2.0], [0.5, -0.5, 1.5, -1.5]],
+        dtype=torch.float32,
+    )
+
+    class Group:
+        def all_gather(self, tensor, dim):
+            assert dim == 0
+            return torch.cat((tensor, remote_lse), dim=0)
+
+        def reduce_scatter(self, tensor, dim):
+            assert dim == 0
+            assert tensor.dtype == torch.float32
+            return tensor[: tensor.shape[0] // 2]
+
+    monkeypatch.setattr(qsa_module, "get_dcp_group", lambda: Group())
+    output = torch.arange(24, dtype=torch.bfloat16).view(2, 4, 3)
+    local_lse = torch.tensor(
+        [[0.0, 1.0, 2.0, -1.0], [1.5, 0.5, -0.5, 1.0]],
+        dtype=torch.float32,
+    )
+    staged = SimpleNamespace(
+        sequence_lengths=torch.ones(2, dtype=torch.int32),
+        query_start_loc=torch.arange(3, dtype=torch.int32),
+    )
+
+    actual = layer._combine_dcp_output(output, local_lse, staged)
+
+    global_lse = torch.logsumexp(torch.stack((local_lse, remote_lse)), dim=0)
+    expected = (
+        output[:, :2].float()
+        * torch.exp(local_lse[:, :2] - global_lse[:, :2]).unsqueeze(-1)
+    ).to(torch.bfloat16)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_qsa_dcp_falls_back_to_manager_above_decode_row_limit() -> None:
+    layer = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
+    torch.nn.Module.__init__(layer)
+    expected = torch.empty(9, 6, 256)
+    calls = []
+    layer.max_decode_rows = 8
+    layer.dcp_manager = SimpleNamespace(
+        combine=lambda *args, **kwargs: calls.append((args, kwargs)) or expected
+    )
+    output = torch.empty(9, 24, 256)
+    lse = torch.empty(9, 24)
+    staged = SimpleNamespace(
+        sequence_lengths=torch.ones(9, dtype=torch.int32),
+        query_start_loc=torch.arange(10, dtype=torch.int32),
+    )
+
+    actual = layer._combine_dcp_output(output, lse, staged)
+
+    assert actual is expected
+    assert calls == [
+        (
+            (output, lse),
+            {
+                "seq_lens": staged.sequence_lengths,
+                "query_start_loc": staged.query_start_loc,
+            },
+        )
+    ]
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+def test_qsa_dcp_fused_pack_unpack_kernels_preserve_heads() -> None:
+    rows = 2
+    query_heads = 4
+    kv_heads = 1
+    total_query_heads = 16
+    total_kv_heads = 2
+    head_dim = 256
+    local_heads = query_heads + 2 * kv_heads
+    output_heads = total_query_heads + 2 * total_kv_heads
+    device = torch.device("cuda")
+
+    rank_packs = []
+    for rank in range(4):
+        query = torch.full(
+            (rows, query_heads, head_dim), rank, dtype=torch.bfloat16, device=device
+        )
+        key = (
+            torch.arange(head_dim, dtype=torch.bfloat16, device=device).expand(
+                rows, 1, -1
+            )
+            + (rank // 2) * 1000
+        )
+        value = key + 100
+        rank_packs.append(
+            torch.cat((query, key, value), dim=1).transpose(0, 1).contiguous()
+        )
+
+    local = rank_packs[0].transpose(0, 1).contiguous()
+    query = local[:, :query_heads].flatten(1)
+    key = local[:, query_heads : query_heads + kv_heads].flatten(1)
+    value = local[:, query_heads + kv_heads :].flatten(1)
+    packed = torch.empty(
+        local_heads, rows, head_dim, dtype=torch.bfloat16, device=device
+    )
+    qsa_module._pack_dcp_qkv_kernel[(local_heads, rows)](
+        query,
+        key,
+        value,
+        packed,
+        query.stride(0),
+        key.stride(0),
+        value.stride(0),
+        rows,
+        NUM_QUERY_HEADS=query_heads,
+        NUM_KV_HEADS=kv_heads,
+        HEAD_DIM=head_dim,
+        BLOCK_DIM=head_dim,
+        num_warps=4,
+    )
+    torch.testing.assert_close(packed, rank_packs[0], rtol=0, atol=0)
+
+    gathered = torch.cat(rank_packs, dim=0).contiguous()
+    output = torch.empty(
+        rows * output_heads * head_dim, dtype=torch.bfloat16, device=device
+    )
+    qsa_module._unpack_dcp_qkv_kernel[(output_heads, rows)](
+        gathered,
+        output,
+        rows,
+        NUM_QUERY_HEADS=query_heads,
+        NUM_PROJECTED_KV_HEADS=kv_heads,
+        TOTAL_QUERY_HEADS=total_query_heads,
+        TOTAL_KV_HEADS=total_kv_heads,
+        KV_REPLICAS=2,
+        HEAD_DIM=head_dim,
+        BLOCK_DIM=head_dim,
+        num_warps=4,
+    )
+    query_elements = rows * total_query_heads * head_dim
+    kv_elements = rows * total_kv_heads * head_dim
+    actual_query = output[:query_elements].view(rows, total_query_heads, head_dim)
+    actual_key = output[query_elements : query_elements + kv_elements].view(
+        rows, total_kv_heads, head_dim
+    )
+    actual_value = output[query_elements + kv_elements :].view_as(actual_key)
+    expected_query = torch.cat(
+        [rank_pack[:query_heads].transpose(0, 1) for rank_pack in rank_packs],
+        dim=1,
+    )
+    expected_key = torch.stack(
+        [rank_packs[0][query_heads], rank_packs[2][query_heads]], dim=1
+    )
+    expected_value = torch.stack(
+        [
+            rank_packs[0][query_heads + kv_heads],
+            rank_packs[2][query_heads + kv_heads],
+        ],
+        dim=1,
+    )
+    torch.testing.assert_close(actual_query, expected_query, rtol=0, atol=0)
+    torch.testing.assert_close(actual_key, expected_key, rtol=0, atol=0)
+    torch.testing.assert_close(actual_value, expected_value, rtol=0, atol=0)
 
 
 def test_qsa_selector_tail_is_zero_copy_in_block_outer_layer_pages() -> None:
@@ -513,6 +830,17 @@ def test_qsa_prefill_context_capacities_cover_the_configured_limit() -> None:
     )
 
 
+def test_qsa_compressed_dcp_interleave_keeps_dcp1_local() -> None:
+    assert qsa_module._compressed_dcp_interleave(1, 1, 4) == 1
+    assert qsa_module._compressed_dcp_interleave(4, 4, 4) == 1
+
+
+def test_qsa_dcp_group_kv_geometry_tracks_replica_subgroups() -> None:
+    assert qsa_module._qsa_dcp_group_kv_geometry(2, 2, 2) == (2, 1)
+    assert qsa_module._qsa_dcp_group_kv_geometry(4, 2, 2) == (1, 2)
+    assert qsa_module._qsa_dcp_group_kv_geometry(4, 4, 2) == (2, 2)
+
+
 def test_qsa_run_consumes_projection_views_and_writes_live_output(monkeypatch) -> None:
     rows = 2
     query = torch.randn(rows, 6, 256, dtype=torch.bfloat16)
@@ -546,6 +874,7 @@ def test_qsa_run_consumes_projection_views_and_writes_live_output(monkeypatch) -
         binding.output.fill_(7)
 
     owner = SimpleNamespace(
+        dcp_manager=None,
         _qsa_binding_for_workload=lambda **_: context,
         _prepare_qsa_metadata=lambda *_: staged,
         _shared_qsa_rope_positions=lambda *_: positions,
@@ -1535,6 +1864,7 @@ def test_reused_qsa_passes_live_anchor_map_after_kv_update(monkeypatch) -> None:
     layer = SimpleNamespace(
         layer_name="qsa",
         max_seqs=2,
+        dcp_manager=None,
         _mtp_source_rows=source_rows,
         _qsa_binding_for_workload=lambda **_: context,
         _stage_runtime_metadata=lambda *_args, **_kwargs: staged,
