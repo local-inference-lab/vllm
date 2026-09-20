@@ -15,7 +15,7 @@ from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.config.compilation import CUDAGraphMode
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_dcp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention.attention import set_default_quant_scales
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -61,6 +61,8 @@ from vllm.v1.attention.backends.b12x import (
     B12xPagedMetadata,
     B12xPagedMetadataBuilder,
 )
+from vllm.v1.attention.backends.mla.b12x_indexer import _merge_dcp_topk
+from vllm.v1.attention.ops.dcp import MLADCPManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
@@ -107,6 +109,33 @@ def _qsa_prefill_context_capacities(
         capacity *= 2
     capacities.append(max_seq_len)
     return tuple(capacities)
+
+
+def _dcp_local_length(length: int, size: int, rank: int, interleave: int) -> int:
+    round_width = size * interleave
+    full_rounds, remainder = divmod(length, round_width)
+    return full_rounds * interleave + min(
+        max(remainder - rank * interleave, 0), interleave
+    )
+
+
+def _compressed_dcp_interleave(size: int, interleave: int, ratio: int) -> int:
+    if size == 1:
+        return 1
+    return interleave // ratio
+
+
+def _qsa_dcp_group_kv_geometry(
+    tp_size: int,
+    dcp_size: int,
+    total_kv_heads: int,
+) -> tuple[int, int]:
+    projected_kv_heads = max(1, total_kv_heads // tp_size)
+    replicas_per_kv_head = max(1, tp_size // total_kv_heads)
+    if max(dcp_size, replicas_per_kv_head) % min(dcp_size, replicas_per_kv_head):
+        raise ValueError("QSA DCP groups must align with replicated KV heads")
+    replicas_in_group = min(dcp_size, replicas_per_kv_head)
+    return dcp_size * projected_kv_heads // replicas_in_group, replicas_in_group
 
 
 def _register_qsa_compilation_context(
@@ -315,6 +344,26 @@ class Qwen4ExpQSABackend(B12xPagedAttentionBackend):
         )
 
     @classmethod
+    def customize_hybrid_kv_cache_spec(
+        cls,
+        spec: AttentionSpec,
+        vllm_config: VllmConfig,
+    ) -> AttentionSpec:
+        parallel = vllm_config.parallel_config
+        dcp_size = parallel.decode_context_parallel_size
+        if dcp_size > 1:
+            num_kv_heads, _ = _qsa_dcp_group_kv_geometry(
+                parallel.tensor_parallel_size,
+                dcp_size,
+                vllm_config.model_config.get_total_num_kv_heads(),
+            )
+            spec = replace(
+                spec,
+                num_kv_heads=num_kv_heads,
+            )
+        return cls.customize_spec(spec)
+
+    @classmethod
     def get_impl_cls(cls) -> type[Qwen4ExpQSAImpl]:
         return Qwen4ExpQSAImpl
 
@@ -397,7 +446,9 @@ class Qwen4ExpQSAImpl(AttentionImpl[Qwen4ExpQSAMetadata]):
 
     is_sparse: ClassVar[bool] = True
     supports_dense_mha_prefill: ClassVar[bool] = False
-    supports_dcp: bool = False
+    can_return_lse_for_decode: bool = True
+    supports_dcp: bool = True
+    supports_mtp_with_cp_non_trivial_interleave_size: bool = True
 
     def __init__(
         self,
@@ -429,8 +480,6 @@ class Qwen4ExpQSAImpl(AttentionImpl[Qwen4ExpQSAMetadata]):
             raise ValueError("QSA requires head_dim=256 and valid grouped-query heads")
         if not math.isclose(scale, head_size**-0.5, rel_tol=1e-5, abs_tol=1e-7):
             raise ValueError("QSA requires canonical head_dim**-0.5 scaling")
-        if self.total_cp_world_size > 1:
-            raise NotImplementedError("QSA does not support context parallelism")
         self.num_heads = int(num_heads)
         self.head_size = int(head_size)
         self.output_head_size = self.head_size
@@ -676,10 +725,113 @@ def _stage_qsa_rope_positions_kernel(
     )
 
 
+@triton.jit
+def _pack_dcp_qkv_kernel(
+    query,
+    key,
+    value,
+    packed,
+    query_row_stride,
+    key_row_stride,
+    value_row_stride,
+    rows,
+    NUM_QUERY_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+) -> None:
+    head = tl.program_id(0)
+    row = tl.program_id(1)
+    dims = tl.arange(0, BLOCK_DIM)
+    dim_mask = dims < HEAD_DIM
+    is_query = head < NUM_QUERY_HEADS
+    is_key = (head >= NUM_QUERY_HEADS) & (head < NUM_QUERY_HEADS + NUM_KV_HEADS)
+    kv_head = head - NUM_QUERY_HEADS
+    value_head = kv_head - NUM_KV_HEADS
+    data = tl.load(
+        query + row * query_row_stride + head * HEAD_DIM + dims,
+        mask=is_query & dim_mask,
+        other=0.0,
+    )
+    data += tl.load(
+        key + row * key_row_stride + kv_head * HEAD_DIM + dims,
+        mask=is_key & dim_mask,
+        other=0.0,
+    )
+    data += tl.load(
+        value + row * value_row_stride + value_head * HEAD_DIM + dims,
+        mask=~(is_query | is_key) & dim_mask,
+        other=0.0,
+    )
+    tl.store(
+        packed + (head * rows + row) * HEAD_DIM + dims,
+        data,
+        mask=dim_mask,
+    )
+
+
+@triton.jit
+def _unpack_dcp_qkv_kernel(
+    gathered,
+    output,
+    rows,
+    NUM_QUERY_HEADS: tl.constexpr,
+    NUM_PROJECTED_KV_HEADS: tl.constexpr,
+    TOTAL_QUERY_HEADS: tl.constexpr,
+    TOTAL_KV_HEADS: tl.constexpr,
+    KV_REPLICAS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+) -> None:
+    output_head = tl.program_id(0)
+    row = tl.program_id(1)
+    dims = tl.arange(0, BLOCK_DIM)
+    dim_mask = dims < HEAD_DIM
+    local_heads = NUM_QUERY_HEADS + 2 * NUM_PROJECTED_KV_HEADS
+    is_query = output_head < TOTAL_QUERY_HEADS
+    is_key = (output_head >= TOTAL_QUERY_HEADS) & (
+        output_head < TOTAL_QUERY_HEADS + TOTAL_KV_HEADS
+    )
+
+    query_rank = output_head // NUM_QUERY_HEADS
+    query_head = output_head % NUM_QUERY_HEADS
+    kv_head = output_head - TOTAL_QUERY_HEADS
+    value_head = kv_head - TOTAL_KV_HEADS
+    selected_kv_head = tl.where(is_key, kv_head, value_head) * KV_REPLICAS
+    kv_rank = selected_kv_head // NUM_PROJECTED_KV_HEADS
+    local_kv_head = selected_kv_head % NUM_PROJECTED_KV_HEADS
+    source_head = tl.where(
+        is_query,
+        query_rank * local_heads + query_head,
+        kv_rank * local_heads
+        + NUM_QUERY_HEADS
+        + local_kv_head
+        + tl.where(is_key, 0, NUM_PROJECTED_KV_HEADS),
+    )
+    data = tl.load(
+        gathered + (source_head * rows + row) * HEAD_DIM + dims,
+        mask=dim_mask,
+    )
+
+    query_elements = rows * TOTAL_QUERY_HEADS * HEAD_DIM
+    key_elements = rows * TOTAL_KV_HEADS * HEAD_DIM
+    query_offset = (row * TOTAL_QUERY_HEADS + output_head) * HEAD_DIM
+    key_offset = query_elements + (row * TOTAL_KV_HEADS + kv_head) * HEAD_DIM
+    value_offset = (
+        query_elements + key_elements + (row * TOTAL_KV_HEADS + value_head) * HEAD_DIM
+    )
+    output_offset = tl.where(
+        is_query,
+        query_offset,
+        tl.where(is_key, key_offset, value_offset),
+    )
+    tl.store(output + output_offset + dims, data, mask=dim_mask)
+
+
 class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
     """Merged main attention, selector state, and b12x QSA transaction."""
 
-    supports_dcp = False
+    supports_dcp = True
 
     def __init__(
         self,
@@ -708,11 +860,10 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("QSA does not support KV-cache quantization")
         parallel = vllm_config.parallel_config
-        if (
-            parallel.prefill_context_parallel_size > 1
-            or parallel.decode_context_parallel_size > 1
-        ):
-            raise NotImplementedError("QSA does not support context parallelism")
+        if parallel.prefill_context_parallel_size > 1:
+            raise NotImplementedError(
+                "QSA does not support prefill context parallelism"
+            )
         if not getattr(config, "is_causal", True):
             raise NotImplementedError("QSA requires causal decoder attention")
         if getattr(config, "dual_chunk_attention_config", None) is not None:
@@ -733,6 +884,16 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
             aux_stream()
         self.hidden_size = int(config.hidden_size)
         tp_size = get_tensor_model_parallel_world_size()
+        self.dcp_size = int(parallel.decode_context_parallel_size)
+        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
+        self.cp_kv_cache_interleave_size = int(parallel.cp_kv_cache_interleave_size)
+        if self.dcp_size > 1:
+            if self.cp_kv_cache_interleave_size % _QSA_COMPRESS_RATIO:
+                raise ValueError(
+                    "QSA DCP requires cp_kv_cache_interleave_size divisible by "
+                    f"{_QSA_COMPRESS_RATIO}"
+                )
+            self.overlap_input_projections = False
         self.total_num_heads = int(config.num_attention_heads)
         if self.total_num_heads % tp_size:
             raise ValueError("QSA query heads must divide across TP ranks")
@@ -743,12 +904,21 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
                 raise ValueError("QSA KV heads must divide across TP ranks")
         elif tp_size % self.total_num_kv_heads:
             raise ValueError("TP size must divide replicated QSA KV heads")
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.num_projected_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.dcp_num_heads = self.num_heads * self.dcp_size
+        self.dcp_num_kv_heads, self.dcp_kv_replicas = _qsa_dcp_group_kv_geometry(
+            tp_size,
+            self.dcp_size,
+            self.total_num_kv_heads,
+        )
+        self.num_kv_heads = (
+            self.dcp_num_kv_heads if self.dcp_size > 1 else self.num_projected_kv_heads
+        )
         self.head_dim = int(config.head_dim)
         if self.head_dim != 256:
             raise NotImplementedError("The SM12x QSA integration requires head_dim=256")
         self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
+        self.kv_size = self.num_projected_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.attn_output_gate = True
 
@@ -841,6 +1011,22 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
         self.max_decode_rows = self.max_seqs * (1 + self.max_speculative_tokens)
         device = torch.device("cuda", torch.accelerator.current_device_index())
         self.device = device
+        self.dcp_manager = (
+            MLADCPManager(
+                vllm_config=vllm_config,
+                device=device,
+                num_heads=self.num_heads,
+                query_head_dim=self.head_dim,
+                output_head_dim=self.head_dim,
+                query_dtype=torch.bfloat16,
+                output_dtype=torch.bfloat16,
+                padded_num_heads=None,
+                is_lse_base_on_e=True,
+                use_pcp=False,
+            )
+            if self.dcp_size > 1
+            else None
+        )
         self._selector_done = (
             torch.cuda.Event() if self.overlap_input_projections else None
         )
@@ -913,7 +1099,7 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
             "_qsa_output",
             torch.empty(
                 self.max_tokens,
-                self.num_heads,
+                self.dcp_num_heads if self.dcp_size > 1 else self.num_heads,
                 self.head_dim,
                 dtype=torch.bfloat16,
                 device=device,
@@ -1003,7 +1189,7 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
             max_batch=self.max_seqs,
             max_raw_state_slots=self.max_seqs,
             max_speculative_tokens=self.max_speculative_tokens,
-            q_heads=self.num_heads,
+            q_heads=(self.dcp_num_heads if self.dcp_size > 1 else self.num_heads),
             kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
             index_heads=self.index_heads,
@@ -1020,6 +1206,9 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
             rms_norm_eps=float(self.indexer.q_layernorm.variance_epsilon),
             dtype=torch.bfloat16,
             kv_dtype=self.kv_cache_kernel_dtype,
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
+            cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             **geometry,
         )
 
@@ -1210,10 +1399,24 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
                 raise PreparationResourceUnavailableError(
                     "QSA primer requires a live cache page"
                 )
-            main_pages = triton.cdiv(rows, caps.main_page_size)
-            compressed_pages = triton.cdiv(
-                rows // caps.compress_ratio, caps.compressed_page_size
+            local_rows = _dcp_local_length(
+                rows,
+                caps.dcp_size,
+                caps.dcp_rank,
+                caps.cp_kv_cache_interleave_size,
             )
+            local_groups = _dcp_local_length(
+                rows // caps.compress_ratio,
+                caps.dcp_size,
+                caps.dcp_rank,
+                _compressed_dcp_interleave(
+                    caps.dcp_size,
+                    caps.cp_kv_cache_interleave_size,
+                    caps.compress_ratio,
+                ),
+            )
+            main_pages = triton.cdiv(local_rows, caps.main_page_size)
+            compressed_pages = triton.cdiv(local_groups, caps.compressed_page_size)
             output = torch.empty(
                 (rows, caps.q_heads, caps.head_dim), dtype=torch.bfloat16, device=device
             )
@@ -1391,10 +1594,163 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
         query, gate = q_gate.chunk(2, dim=-1)
         query = self.q_norm(query).flatten(-2)
         key = self.k_norm(
-            key.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            key.unflatten(-1, (self.num_projected_kv_heads, self.head_dim))
         ).flatten(-2)
         query, key = self.rotary_emb(positions, query, key)
         return query, key, value, gate.flatten(-2)
+
+    def _combine_dcp_output(
+        self,
+        partial_output: torch.Tensor,
+        partial_lse: torch.Tensor,
+        staged: _StagedQSAMetadata,
+    ) -> torch.Tensor:
+        if partial_output.shape[0] <= self.max_decode_rows:
+            from vllm.v1.attention.ops.dcp import mask_dcp_empty_shards_
+
+            mask_dcp_empty_shards_(
+                partial_lse,
+                staged.sequence_lengths,
+                staged.query_start_loc,
+            )
+            group = get_dcp_group()
+            lses = group.all_gather(partial_lse.contiguous(), dim=0).view(
+                self.dcp_size, *partial_lse.shape
+            )
+            lses = torch.where(
+                torch.isfinite(lses), lses, lses.new_full((), float("-inf"))
+            )
+            global_lse = torch.logsumexp(lses, dim=0)
+            weights = torch.exp(partial_lse - global_lse)
+            weights = torch.where(torch.isfinite(weights), weights, 0.0)
+            corrected = partial_output.float() * weights.unsqueeze(-1)
+            combined = group.reduce_scatter(
+                corrected.transpose(0, 1).contiguous(), dim=0
+            )
+            return combined.transpose(0, 1).to(partial_output.dtype)
+        assert self.dcp_manager is not None
+        return self.dcp_manager.combine(
+            partial_output,
+            partial_lse,
+            seq_lens=staged.sequence_lengths,
+            query_start_loc=staged.query_start_loc,
+        )
+
+    def _gather_dcp_heads(self, tensor: torch.Tensor) -> torch.Tensor:
+        gathered = get_dcp_group().all_gather(
+            tensor.transpose(0, 1).contiguous(), dim=0
+        )
+        return gathered.transpose(0, 1).contiguous()
+
+    def _gather_dcp_qkv_fused_cuda(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        query = query.flatten(1)
+        key = key.flatten(1)
+        value = value.flatten(1)
+        rows = int(query.shape[0])
+        local_heads = self.num_heads + 2 * self.num_projected_kv_heads
+        packed = torch.empty(
+            (local_heads, rows, self.head_dim),
+            dtype=query.dtype,
+            device=query.device,
+        )
+        block_dim = triton.next_power_of_2(self.head_dim)
+        _pack_dcp_qkv_kernel[(local_heads, rows)](
+            query,
+            key,
+            value,
+            packed,
+            query.stride(0),
+            key.stride(0),
+            value.stride(0),
+            rows,
+            NUM_QUERY_HEADS=self.num_heads,
+            NUM_KV_HEADS=self.num_projected_kv_heads,
+            HEAD_DIM=self.head_dim,
+            BLOCK_DIM=block_dim,
+            num_warps=4,
+        )
+        gathered = get_dcp_group().all_gather(packed, dim=0)
+        output_heads = self.dcp_num_heads + 2 * self.dcp_num_kv_heads
+        output = torch.empty(
+            rows * output_heads * self.head_dim,
+            dtype=query.dtype,
+            device=query.device,
+        )
+        _unpack_dcp_qkv_kernel[(output_heads, rows)](
+            gathered,
+            output,
+            rows,
+            NUM_QUERY_HEADS=self.num_heads,
+            NUM_PROJECTED_KV_HEADS=self.num_projected_kv_heads,
+            TOTAL_QUERY_HEADS=self.dcp_num_heads,
+            TOTAL_KV_HEADS=self.dcp_num_kv_heads,
+            KV_REPLICAS=self.dcp_kv_replicas,
+            HEAD_DIM=self.head_dim,
+            BLOCK_DIM=block_dim,
+            num_warps=4,
+        )
+        query_elements = rows * self.dcp_num_heads * self.head_dim
+        kv_elements = rows * self.dcp_num_kv_heads * self.head_dim
+        query = output[:query_elements].view(rows, self.dcp_num_heads, self.head_dim)
+        key = output[query_elements : query_elements + kv_elements].view(
+            rows, self.dcp_num_kv_heads, self.head_dim
+        )
+        value = output[query_elements + kv_elements :].view_as(key)
+        return query, key, value
+
+    def _gather_dcp_qkv(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gather Q/K/V and remove replicated KV heads."""
+
+        if query.is_cuda and query.shape[0] <= self.max_decode_rows:
+            return self._gather_dcp_qkv_fused_cuda(query, key, value)
+        if not query.is_cuda:
+            local_heads = self.num_heads + 2 * self.num_projected_kv_heads
+            packed = torch.cat((query, key, value), dim=1)
+            gathered = self._gather_dcp_heads(packed).view(
+                query.shape[0], self.dcp_size, local_heads, self.head_dim
+            )
+            query = (
+                gathered[:, :, : self.num_heads]
+                .contiguous()
+                .view(query.shape[0], self.dcp_num_heads, self.head_dim)
+            )
+            kv_start = self.num_heads
+            key = (
+                gathered[:, :, kv_start : kv_start + self.num_projected_kv_heads]
+                .contiguous()
+                .view(query.shape[0], -1, self.head_dim)
+            )
+            value = (
+                gathered[:, :, kv_start + self.num_projected_kv_heads :]
+                .contiguous()
+                .view(query.shape[0], -1, self.head_dim)
+            )
+        else:
+            query = self._gather_dcp_heads(query)
+            key = self._gather_dcp_heads(key)
+            value = self._gather_dcp_heads(value)
+        if key.ndim == 2:
+            key = key.view(
+                query.shape[0],
+                self.dcp_size * self.num_projected_kv_heads,
+                self.head_dim,
+            )
+            value = value.view_as(key)
+        return (
+            query,
+            key[:, :: self.dcp_kv_replicas].contiguous(),
+            value[:, :: self.dcp_kv_replicas].contiguous(),
+        )
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         super().bind_kv_cache(kv_cache)
@@ -1430,9 +1786,18 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
             // self.compress_ratio
             * self.compress_ratio
         )
-        table_width = math.ceil(qsa_max_seq_len / main_page_size)
+        dcp_round = self.dcp_size * self.cp_kv_cache_interleave_size
+        full_rounds, remainder = divmod(qsa_max_seq_len, dcp_round)
+        local_max_seq_len = full_rounds * self.cp_kv_cache_interleave_size + min(
+            max(
+                remainder - self.dcp_rank * self.cp_kv_cache_interleave_size,
+                0,
+            ),
+            self.cp_kv_cache_interleave_size,
+        )
+        table_width = math.ceil(local_max_seq_len / main_page_size)
         compressed_table_width = math.ceil(
-            (qsa_max_seq_len // self.compress_ratio) / compressed_page_size
+            (local_max_seq_len // self.compress_ratio) / compressed_page_size
         )
         if compressed_table_width != table_width:
             raise RuntimeError(
@@ -1941,6 +2306,10 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
             compressed_block_table=context.compressed_block_table,
         )
         self._b12x_diagnostic_request_ids = staged.request_ids
+        if self.dcp_manager is not None:
+            query, key, value = self._gather_dcp_qkv(
+                query[:rows], key[:rows], value[:rows]
+            )
         impl = cast(Qwen4ExpQSAImpl, self.impl)
         impl.do_kv_cache_update(
             self, key[:rows], value[:rows], self.kv_cache, metadata.slot_mapping[:rows]
@@ -1948,13 +2317,26 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
         qsa = get_b12x_qsa()
         if qsa is None:
             raise RuntimeError("b12x QSA is unavailable for MTP selection reuse")
-        qsa.run(
-            self._bind_qsa_context(context, staged, output[:rows]),
-            query=query[:rows],
-            request_ids=staged.request_ids,
-            query_positions=staged.logical_positions,
-            reuse=qsa.DraftSelectionReuse(source_rows=self._mtp_source_rows),
-        )
+        reuse = qsa.DraftSelectionReuse(source_rows=self._mtp_source_rows)
+        if self.dcp_manager is None:
+            qsa.run(
+                self._bind_qsa_context(context, staged, output[:rows]),
+                query=query[:rows],
+                request_ids=staged.request_ids,
+                query_positions=staged.logical_positions,
+                reuse=reuse,
+            )
+        else:
+            binding = self._bind_qsa_context(context, staged, self._qsa_output[:rows])
+            partial_output, partial_lse = qsa.attend_reuse(
+                binding,
+                query=query,
+                request_ids=staged.request_ids,
+                query_positions=staged.logical_positions,
+                reuse=reuse,
+            )
+            combined = self._combine_dcp_output(partial_output, partial_lse, staged)
+            output[:rows].copy_(combined)
         if rows < output.shape[0]:
             output[rows:].zero_()
 
@@ -2148,6 +2530,10 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
         rope_positions = self._shared_qsa_rope_positions(
             positions, staged.request_ids, rows
         )
+        if self.dcp_manager is not None:
+            query, key, value = self._gather_dcp_qkv(
+                query[:rows], key[:rows], value[:rows]
+            )
         impl = cast(Qwen4ExpQSAImpl, self.impl)
         impl.do_kv_cache_update(
             self,
@@ -2159,20 +2545,56 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
         qsa = get_b12x_qsa()
         if qsa is None:
             raise RuntimeError("b12x QSA disappeared after cache binding")
-        binding = self._bind_qsa_context(context, staged, output[:rows])
-        qsa.run(
-            binding,
-            query=query[:rows],
-            index_query=index_query[:rows],
-            raw_index_key=raw_index_key[:rows],
-            request_ids=staged.request_ids,
-            query_positions=staged.logical_positions,
-            rope_positions=rope_positions,
-            sequence_lengths=staged.sequence_lengths,
-            query_start_loc=staged.query_start_loc,
-            num_accepted_tokens=staged.num_accepted_tokens,
-            is_prefilling=staged.is_prefilling,
-        )
+        if self.dcp_manager is None:
+            binding = self._bind_qsa_context(context, staged, output[:rows])
+            qsa.run(
+                binding,
+                query=query[:rows],
+                index_query=index_query[:rows],
+                raw_index_key=raw_index_key[:rows],
+                request_ids=staged.request_ids,
+                query_positions=staged.logical_positions,
+                rope_positions=rope_positions,
+                sequence_lengths=staged.sequence_lengths,
+                query_start_loc=staged.query_start_loc,
+                num_accepted_tokens=staged.num_accepted_tokens,
+                is_prefilling=staged.is_prefilling,
+            )
+        else:
+            binding = self._bind_qsa_context(context, staged, self._qsa_output[:rows])
+            selection = qsa.select(
+                binding,
+                query=query,
+                index_query=index_query[:rows],
+                raw_index_key=raw_index_key[:rows],
+                request_ids=staged.request_ids,
+                query_positions=staged.logical_positions,
+                rope_positions=rope_positions,
+                sequence_lengths=staged.sequence_lengths,
+                query_start_loc=staged.query_start_loc,
+                num_accepted_tokens=staged.num_accepted_tokens,
+                is_prefilling=staged.is_prefilling,
+            )
+            _merge_dcp_topk(
+                selection.group_ids,
+                selection.scores,
+                self.dcp_rank,
+                self.dcp_size,
+                _compressed_dcp_interleave(
+                    self.dcp_size,
+                    self.cp_kv_cache_interleave_size,
+                    self.compress_ratio,
+                ),
+            )
+            partial_output, partial_lse = qsa.attend(
+                binding,
+                query=query,
+                request_ids=staged.request_ids,
+                query_positions=staged.logical_positions,
+                selection=selection,
+            )
+            combined = self._combine_dcp_output(partial_output, partial_lse, staged)
+            output[:rows].copy_(combined)
         if rows < output.shape[0]:
             output[rows:].zero_()
 
@@ -2247,8 +2669,8 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
             query, key, value, gate = self._project_qkv_gate(qkv, positions)
             rows = int(hidden_states.shape[0])
             query = query.view(rows, self.num_heads, self.head_dim)
-            key = key.view(rows, self.num_kv_heads, self.head_dim)
-            value = value.view(rows, self.num_kv_heads, self.head_dim)
+            key = key.view(rows, self.num_projected_kv_heads, self.head_dim)
+            value = value.view(rows, self.num_projected_kv_heads, self.head_dim)
             output = torch.empty_like(query)
             torch.ops.vllm.qwen4_exp_b12x_qsa_run_projected(
                 positions,
@@ -2267,8 +2689,8 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
         index_query, raw_index_key = self.indexer.project(hidden_states)
         num_tokens = int(hidden_states.shape[0])
         query = query.view(num_tokens, self.num_heads, self.head_dim)
-        key = key.view(num_tokens, self.num_kv_heads, self.head_dim)
-        value = value.view(num_tokens, self.num_kv_heads, self.head_dim)
+        key = key.view(num_tokens, self.num_projected_kv_heads, self.head_dim)
+        value = value.view(num_tokens, self.num_projected_kv_heads, self.head_dim)
         output = torch.empty_like(query)
         layer_name = _encode_layer_name(self.layer_name)
         if current_platform.opaque_attention_op():
