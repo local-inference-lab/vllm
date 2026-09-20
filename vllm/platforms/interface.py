@@ -975,8 +975,8 @@ class Platform:
                 dtype=kv_cache_dtype,
                 kv_quant_mode=kv_quant_mode,
             )
-            attn_page_size_1_token = backend_cls.customize_spec(
-                attn_spec
+            attn_page_size_1_token = backend_cls.customize_hybrid_kv_cache_spec(
+                attn_spec, vllm_config
             ).page_size_bytes
 
         # Compute mamba page size

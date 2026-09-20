@@ -22,6 +22,7 @@ class Qwen3_8FlashNextVisionConfig(Qwen4ExpVisionConfig):
 
 class Qwen3_8FlashNextTextConfig(Qwen4ExpTextConfig):
     model_type = "qwen3_8_flash_next_text"
+    supports_full_tp_dcp_with_kv_gather = True
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)

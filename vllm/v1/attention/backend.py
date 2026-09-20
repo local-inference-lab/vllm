@@ -151,6 +151,15 @@ class AttentionBackend(ABC):
         return spec
 
     @classmethod
+    def customize_hybrid_kv_cache_spec(
+        cls,
+        spec: "AttentionSpec",
+        vllm_config: "VllmConfig",
+    ) -> "AttentionSpec":
+        """Adjust the probe used to size attention against recurrent state."""
+        return cls.customize_spec(spec)
+
+    @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
         supported_sizes = cls.get_supported_kernel_block_sizes()
         if not supported_sizes:
