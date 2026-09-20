@@ -165,7 +165,8 @@ class CacheConfig:
     Applies only to sliding-window and Mamba cache groups."""
     recurrent_checkpoint_policy: RecurrentCheckpointPolicy = "auto"
     """Retention policy for reusable recurrent state. ``request_boundaries``
-    retains a verified leading chat-instruction prefix, the completed prompt,
+    retains a verified leading chat-instruction prefix, one prefill checkpoint
+    before the final chunk of a long prompt, the completed prompt,
     and the committed response endpoint, disabling arbitrary intermediate
     checkpoints. ``aligned`` preserves block-aligned retention. ``auto`` selects
     request boundaries for supported configurations and aligned retention
