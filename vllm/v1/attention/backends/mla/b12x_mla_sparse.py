@@ -1169,6 +1169,9 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
     lse_base_on_e = True
     supports_dense_mha_prefill = False
     supports_pcp = False
+    # B12X maps selections into caller-owned scratch or uses the indexer's
+    # prepared physical selection. Generic group buffers are never consumed.
+    uses_index_group = False
 
     def __init__(
         self,
@@ -1504,28 +1507,37 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             )
         if self._is_glm_next:
             from b12x.preparation import PreparedCall
+            from torch._subclasses.fake_tensor import FakeTensorMode
 
-            kv_probe = torch.empty(
-                (self._max_tokens, self.kv_lora_rank),
-                dtype=torch.bfloat16,
-                device=self._bound_kv_cache.device,
-            )
-            ignored_slots = torch.full(
-                (self._max_tokens,),
-                -1,
-                dtype=torch.int64,
-                device=self._bound_kv_cache.device,
-            )
+            # The declaration retains tensor formats for compilation, not
+            # live inputs. Allocate execution probes only inside each call.
+            with FakeTensorMode():
+                kv_probe = torch.empty(
+                    (self._max_tokens, self.kv_lora_rank),
+                    dtype=torch.bfloat16,
+                    device=self._bound_kv_cache.device,
+                )
+                ignored_slots = torch.empty(
+                    (self._max_tokens,),
+                    dtype=torch.int64,
+                    device=self._bound_kv_cache.device,
+                )
             writer_plan = self._module.plan_cache_writer(
                 kv_probe, self._bound_kv_cache, ignored_slots
             )
             self._cache_writer_plan = writer_plan
 
             def prepare_writer(state):
-                probe = torch.empty_like(kv_probe)
+                probe = torch.empty(
+                    (self._max_tokens, self.kv_lora_rank),
+                    dtype=torch.bfloat16,
+                    device=state.kv_cache.device,
+                )
                 # The writer touches only slot zero; retain that single page
                 # for restoration instead of cloning the serving KV pool.
-                slots = torch.zeros_like(ignored_slots)
+                slots = torch.zeros(
+                    (self._max_tokens,), dtype=torch.int64, device=state.kv_cache.device
+                )
                 saved_page = state.kv_cache[0].clone()
 
                 def produce():
@@ -1538,7 +1550,9 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     run=lambda: state.run(probe, state.kv_cache, slots),
                     produce=produce,
                     restore=restore,
-                    owners=(probe, slots, saved_page),
+                    # Closures own these tensors until preparation completes.
+                    # Published launchers rebind live inputs and must not keep
+                    # the probes or the temporary cache-page backup alive.
                 )
 
             requests.append(
@@ -1731,6 +1745,10 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         # get_b12x_preparation_units declares a fresh one for the new pool.
         self._cache_writer_plan = None
         self._bound_kv_cache = kv_cache
+
+    def unbind_kv_cache(self) -> None:
+        self._cache_writer_plan = None
+        self._bound_kv_cache = None
 
     def do_kv_cache_update(
         self,

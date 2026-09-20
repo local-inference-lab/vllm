@@ -3,6 +3,7 @@
 """Unit tests for the sparse MLA backends and utilities."""
 
 import math
+import weakref
 from collections import deque
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
@@ -3768,7 +3769,8 @@ def test_hisparse_fp8_prefill_gather_uses_dedicated_stream(monkeypatch):
     assert ensure_args[1] == 4
 
 
-def test_sparse_impl_observes_repointed_indexer_buffer():
+@pytest.mark.parametrize("explicit_initial_buffer", [False, True])
+def test_sparse_impl_observes_repointed_indexer_buffer(explicit_initial_buffer):
     """The MTP proposer repoints the draft's indexer at the target model's buffer
     after the backend impl is built, so the impl must resolve the buffer per read.
     Snapshotting it in __init__ leaves the layer reading indices nothing writes."""
@@ -3776,13 +3778,16 @@ def test_sparse_impl_observes_repointed_indexer_buffer():
     own = torch.zeros(4, 8, dtype=torch.int32)
     target = torch.ones(4, 8, dtype=torch.int32)
     indexer = SimpleNamespace(topk_indices_buffer=own)
-    impl.init_topk_indices_buffer(indexer, None)
+    impl.init_topk_indices_buffer(indexer, own if explicit_initial_buffer else None)
 
     assert impl.topk_indices_buffer is own
 
     indexer.topk_indices_buffer = target
 
     assert impl.topk_indices_buffer is target
+    released = weakref.ref(own)
+    del own
+    assert released() is None
 
 
 def test_explicit_topk_buffer_supersedes_indexer():

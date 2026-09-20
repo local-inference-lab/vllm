@@ -917,6 +917,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             bind_indexer(self.kv_cache)
 
     def unbind_kv_cache(self) -> None:
+        unbind_impl = getattr(self.impl, "unbind_kv_cache", None)
+        if unbind_impl is not None:
+            unbind_impl()
         unbind_indexer = getattr(self.indexer, "unbind_main_kv_cache", None)
         if unbind_indexer is not None:
             unbind_indexer()
@@ -1138,18 +1141,18 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
 
         if attn_metadata is None:
-            # During the profile run try to simulate to worse case output size
-            # for `self.kv_b_proj(kv_c_normed)` in `_compute_prefill_context`
-            # since this can be large
-            _ = torch.empty(
-                (
-                    self.chunked_prefill_workspace_size,
-                    self.num_heads,
-                    self.qk_nope_head_dim + self.v_head_dim,
-                ),
-                device=k_c_normed.device,
-                dtype=k_c_normed.dtype,
-            )
+            if self.prefill_backend is not None:
+                # Dense MHA expands compressed keys through kv_b_proj. An
+                # MQA-only backend never materializes this context-sized tensor.
+                _ = torch.empty(
+                    (
+                        self.chunked_prefill_workspace_size,
+                        self.num_heads,
+                        self.qk_nope_head_dim + self.v_head_dim,
+                    ),
+                    device=k_c_normed.device,
+                    dtype=k_c_normed.dtype,
+                )
 
             # The zero fill is required when used with DP + EP
             # to ensure all ranks within a DP group compute the
@@ -1613,6 +1616,18 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             register_b12x_layer(self._b12x_query_prefix, self)
             self._b12x_query_layer_name = _encode_layer_name(self._b12x_query_prefix)
             set_b12x_preparation_provider(self, self)
+
+        if (
+            self.impl.is_sparse
+            and self.prefill_backend is None
+            and getattr(self.kv_b_proj, "b12x_mxfp8_packed_weight", None) is not None
+        ):
+            # MQA-only execution owns W_UK_T/W_UV and never calls this linear.
+            # Release both packed-weight owners and its preparation provider.
+            # A weight reload repacks the linear before refreshing these matrices.
+            self.kv_b_proj.b12x_mxfp8_packed_weight = None
+            self.kv_b_proj.b12x_linear = None
+            set_b12x_preparation_provider(self.kv_b_proj, None)
 
     def _b12x_query_name(self, tokens: int) -> str:
         return f"{self._b12x_query_prefix}.m{tokens}"
