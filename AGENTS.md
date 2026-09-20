@@ -156,3 +156,10 @@ vulnerability process.
 - **Editing these instructions**:
   [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)
   — Rules for modifying AGENTS.md or any domain-specific guide it references.
+
+## LIL integration container changelog
+
+Before pushing or importing a runtime-affecting change into an
+`integration/*` branch, read [`.lil/README.md`](.lil/README.md) and add the
+required `.lil/changes/<id>.json` fragment to the same commit series. Preserve
+published fragments unchanged; corrections use a new fragment.
