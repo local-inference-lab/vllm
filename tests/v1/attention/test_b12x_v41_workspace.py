@@ -445,7 +445,6 @@ def test_mhc_capture_retains_scratch_not_caller_activations(
 ):
     """Intermediate MHC outputs must be reusable across shared-pool graphs."""
     from b12x.preparation import PreparationSession
-    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 
     from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
     from vllm.models.deepseek_v4_1 import b12x_layers
