@@ -236,7 +236,17 @@ def _prepared_moe_call_factory(
 def _shared_expert_tuning_context(
     layer: torch.nn.Module, quant_mode: str, hidden_size: int
 ):
-    """Describe the independently executable block-FP8 MLP used during tuning."""
+    """Describe the independently executable block-FP8 MLP used during tuning.
+
+    Args:
+        layer: Routed MoE layer holding shared-expert and router references.
+        quant_mode: B12X quantization scheme of the routed experts.
+        hidden_size: Local input and output width shared by both expert paths.
+
+    Returns:
+        The shared-expert tuning binding and immutable cache descriptor, or
+        ``(None, None)`` when the layer cannot provide this overlap context.
+    """
     if quant_mode != "w4a8_mx":
         return None, None
     reference = getattr(layer, "shared_experts_for_preparation", None)
