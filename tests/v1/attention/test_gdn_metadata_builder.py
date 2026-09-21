@@ -16,6 +16,7 @@ from tests.v1.attention.utils import (
 )
 from vllm.config import SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.attention.backends.b12x_gdn_metadata import B12xGdnMixedMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
@@ -170,6 +171,26 @@ GDN_BUILD_TEST_CASES = {
         num_decode_draft_tokens=None,
         num_speculative_tokens=0,
         expected_num_decodes=3,
+        expected_num_prefills=0,
+        expected_num_prefill_tokens=0,
+        expected_num_spec_decodes=0,
+    ),
+    "long_prefill_with_zero_draft_profile_marker": GDNBuildTestCase(
+        seq_lens=[4112],
+        query_lens=[4096],
+        num_decode_draft_tokens=[0],
+        num_speculative_tokens=3,
+        expected_num_decodes=0,
+        expected_num_prefills=1,
+        expected_num_prefill_tokens=4096,
+        expected_num_spec_decodes=0,
+    ),
+    "single_token_zero_draft_decode": GDNBuildTestCase(
+        seq_lens=[33],
+        query_lens=[1],
+        num_decode_draft_tokens=[0],
+        num_speculative_tokens=3,
+        expected_num_decodes=1,
         expected_num_prefills=0,
         expected_num_prefill_tokens=0,
         expected_num_spec_decodes=0,
@@ -440,6 +461,24 @@ def test_gdn_build_classification(test_case: GDNBuildTestCase):
     assert meta.num_prefills == test_case.expected_num_prefills
     assert meta.num_prefill_tokens == test_case.expected_num_prefill_tokens
     assert meta.num_spec_decodes == test_case.expected_num_spec_decodes
+
+
+def test_b12x_mixed_metadata_keeps_zero_draft_profile_in_prefill() -> None:
+    builder = _create_gdn_builder(num_speculative_tokens=3)
+    builder._b12x_mixed = B12xGdnMixedMetadata(
+        max_tokens=4096, max_seqs=1, state_columns=4, device=DEVICE
+    )
+    metadata = _build(
+        builder,
+        BatchSpec(seq_lens=[4112], query_lens=[4096]),
+        num_decode_draft_tokens=[0],
+    )
+
+    assert metadata.num_prefills == 1
+    assert metadata.num_spec_decodes == 0
+    assert metadata.b12x_mixed is not None
+    assert metadata.b12x_mixed._num_non_spec == 1
+    assert metadata.b12x_mixed._num_spec == 0
 
 
 def test_fresh_single_token_prompt_uses_prefill_state_initialization() -> None:

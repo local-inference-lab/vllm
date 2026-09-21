@@ -100,7 +100,11 @@ class B12xGdnMixedMetadata:
         for row, (start, end) in enumerate(zip(starts, starts[1:])):
             if end == start:
                 continue
-            if drafts is not None and drafts[row] >= 0 and end - start > 1:
+            if (
+                drafts is not None
+                and drafts[row] >= 0
+                and end - start == drafts[row] + 1
+            ):
                 if end - start > self.state_columns:
                     raise ValueError("GDN verification exceeds planned state columns")
                 spec_rows.append(row)
