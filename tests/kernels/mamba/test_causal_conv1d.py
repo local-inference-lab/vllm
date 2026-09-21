@@ -122,6 +122,63 @@ def causal_conv1d_update_ref(
     return (out if activation is None else F.silu(out)).to(dtype=dtype_in)
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA is required")
+def test_prefill_reuses_kernel_for_sliced_cache_indices_and_large_pool(monkeypatch):
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+        _causal_conv1d_fwd_kernel,
+    )
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    dim, width, tokens = 9728, 4, 29
+    pool_stride = 1638400
+    high_page = (1 << 31) // pool_stride + 3
+    states = torch.empty_strided(
+        (high_page + 1, dim, width - 1),
+        (pool_stride, 1, dim),
+        device=device,
+        dtype=dtype,
+    )
+    initial = torch.randn(dim, width - 1, device=device, dtype=dtype)
+    projected = torch.randn(tokens, 18048, device=device, dtype=dtype)
+    x = projected[:, 8192 : 8192 + dim].t()
+    weight = torch.randn(dim, width, device=device, dtype=dtype)
+    bias = torch.randn(dim, device=device, dtype=dtype)
+    expected, final_state = causal_conv1d_ref(
+        x[None].float(),
+        weight.float(),
+        bias.float(),
+        initial[None].float(),
+        return_final_states=True,
+    )
+    index_storage = torch.full((4,), high_page, device=device, dtype=torch.int32)
+    starts = torch.tensor([0, tokens], device=device, dtype=torch.int32)
+    has_initial = torch.ones(1, device=device, dtype=torch.bool)
+
+    def reject_compile(*args, **kwargs):
+        pytest.fail("slicing cache indices changed the compiled kernel")
+
+    for offset in range(4):
+        states[high_page].copy_(initial)
+        actual = causal_conv1d_fn(
+            x,
+            weight,
+            bias,
+            states,
+            starts,
+            cache_indices=index_storage[offset : offset + 1],
+            has_initial_state=has_initial,
+            block_size_to_align=3200,
+            validate_data=True,
+        )
+        torch.testing.assert_close(actual.float(), expected[0], rtol=1e-2, atol=5e-2)
+        torch.testing.assert_close(states[high_page].float(), final_state[0])
+        if offset == 0:
+            monkeypatch.setattr(
+                _causal_conv1d_fwd_kernel, "_do_compile", reject_compile
+            )
+
+
 @pytest.mark.parametrize("itype", [torch.bfloat16, torch.float])
 @pytest.mark.parametrize("silu_activation", [True])
 @pytest.mark.parametrize("has_bias", [True])

@@ -16,6 +16,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     get_temporal_copy_spec,
 )
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -281,11 +282,74 @@ def test_aligned_state_indices_graph_replay_masks_padding_and_refreshes_blocks()
     with torch.cuda.graph(graph):
         compute()
     graph.replay()
-    assert indices[:, :, 0].tolist() == [[0, 5, -1, -1], [100, 105, -1, -1]]
+    assert indices[:, :, 0].tolist() == [[0, 5, 0, 0], [100, 105, 0, 0]]
 
     seq_lens.copy_(torch.tensor([17, 0, 33, 0], dtype=torch.int32, device="cuda"))
     graph.replay()
-    assert indices[:, :, 0].tolist() == [[1, -1, 10, -1], [101, -1, 110, -1]]
+    assert indices[:, :, 0].tolist() == [[1, 0, 10, 0], [101, 0, 110, 0]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("high_state_ids", [False, True])
+def test_aligned_state_indices_feed_convolution_with_padded_graph_rows(high_state_ids):
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
+
+    dim, state_len, batch = 32, 3, 4
+    first = (2**31 // (dim * state_len)) + 1 if high_state_ids else 1
+    pool = torch.empty(
+        (first + batch, dim, state_len), dtype=torch.bfloat16, device="cuda"
+    )
+    pool[NULL_BLOCK_ID].fill_(-7)
+    initial = (
+        torch.arange(batch * dim * state_len).reshape(batch, dim, state_len) % 13
+    ).to(torch.bfloat16) / 8
+    x_cpu = (torch.arange(batch * dim).reshape(batch, dim) % 7).to(torch.bfloat16) / 8
+    x = x_cpu.cuda()
+    out = torch.empty_like(x)
+    weight = torch.full((dim, state_len + 1), 0.25, dtype=x.dtype, device="cuda")
+    table = torch.arange(first, first + batch, dtype=torch.int32, device="cuda")
+    indices = torch.empty((1, batch, 1), dtype=torch.int32, device="cuda")
+    seq_lens = torch.ones(batch, dtype=torch.int32, device="cuda")
+    ctx = SimpleNamespace(
+        is_initialized=True,
+        aligned_state_indices=indices,
+        block_table_ptrs=torch.tensor(
+            [_reinterpret_u64_as_i64(table.data_ptr())],
+            dtype=torch.int64,
+            device="cuda",
+        ),
+        block_table_stride_req=1,
+        block_size=16,
+        num_groups=1,
+    )
+
+    def step():
+        MambaSpecDecodeGPUContext.compute_aligned_state_indices(ctx, seq_lens, batch)
+        causal_conv1d_update(
+            x, pool, weight, conv_state_indices=indices[0, :, 0], out=out
+        )
+
+    pool[first:].copy_(initial)
+    step()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+    for live in (4, 3, 1, 2, 4):
+        pool[first:].copy_(initial)
+        out.fill_(-99)
+        seq_lens.zero_()
+        seq_lens[:live].fill_(1)
+        graph.replay()
+        expected = ((initial[:live].float().sum(-1) + x_cpu[:live].float()) * 0.25).to(
+            x.dtype
+        )
+        torch.testing.assert_close(out[:live].cpu(), expected, rtol=0, atol=0)
+        assert torch.all(indices[0, live:, 0] == NULL_BLOCK_ID)
+        assert torch.all(out[live:] == -99)
+        assert torch.all(pool[NULL_BLOCK_ID] == -7)
+        torch.testing.assert_close(pool[first + live :].cpu(), initial[live:])
+        updated = torch.cat((initial[:live, :, 1:], x_cpu[:live, :, None]), dim=-1)
+        torch.testing.assert_close(pool[first : first + live].cpu(), updated)
 
 
 def test_gpu_context_reinterprets_high_data_ptrs_for_int64_metadata():

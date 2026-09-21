@@ -20,6 +20,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.boundary_checkpoint import NUM_BOUNDARY_CHECKPOINT_SLOTS
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -55,6 +56,7 @@ def get_aligned_state_indices_multi_group_kernel(
     NUM_STATE_SLOTS: tl.constexpr,
     BLOCK_STATE_SLOTS: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
+    NULL_BLOCK: tl.constexpr,
 ):
     rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
     valid_row = rows < num_requests
@@ -88,7 +90,7 @@ def get_aligned_state_indices_multi_group_kernel(
             & (seq_lens[None, :, None] > 0)
             & valid_state_slot[None, None, :]
         ),
-        other=-1,
+        other=NULL_BLOCK,
     )
     tl.store(
         state_indices_ptr
@@ -1310,6 +1312,7 @@ class MambaSpecDecodeGPUContext:
             NUM_STATE_SLOTS=num_state_slots,
             BLOCK_STATE_SLOTS=triton.next_power_of_2(num_state_slots),
             BLOCK_ROWS=block_rows,
+            NULL_BLOCK=NULL_BLOCK_ID,
             num_warps=1,
         )
         return self.aligned_state_indices[:, :num_reqs]

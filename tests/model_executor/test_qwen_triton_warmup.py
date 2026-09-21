@@ -10,6 +10,7 @@ from vllm.model_executor.warmup.qwen_triton_warmup import (
     _warm_causal_conv1d_fwd_kernel,
     _warm_fused_post_conv_kernel,
     _warm_gated_rms_norm_kernel,
+    _warm_layer_norm_kernel,
 )
 from vllm.platforms import current_platform
 
@@ -39,6 +40,10 @@ def _cuda_gdn_config() -> _QwenGDNWarmupConfig:
         dt_bias=torch.zeros(hv, dtype=torch.float32, device=device),
         state_stride_token=hv * v * k,
         state_dtype=torch.float32,
+        norm_weight=torch.ones(v, dtype=torch.bfloat16, device=device),
+        norm_bias=None,
+        norm_eps=1e-6,
+        norm_group_size=v,
     )
 
 
@@ -51,5 +56,6 @@ def test_qwen_gdn_prefill_warmup_kernels_compile_on_gpu() -> None:
     )
     _warm_causal_conv1d_fwd_kernel(device, config)
     _warm_fused_post_conv_kernel(device, config)
+    _warm_layer_norm_kernel(device, config)
     assert _FLA_POST_CONV_WARMUP_LENGTHS == (1, 2, 16)
     torch.accelerator.synchronize(device)

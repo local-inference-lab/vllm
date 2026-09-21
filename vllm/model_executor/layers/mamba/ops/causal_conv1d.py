@@ -26,7 +26,7 @@ _UPDATE_HOIST_MAX_SEQLEN = 8
 _UPDATE_HOIST_BLOCK_N = 64
 
 
-@triton.jit(do_not_specialize_on_alignment=["num_cache_lines"])
+@triton.jit(do_not_specialize_on_alignment=["num_cache_lines", "cache_indices_ptr"])
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
     x_ptr,  # (dim, cu_seqlen) holding `batch` of actual sequences + padded sequences

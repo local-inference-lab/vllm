@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import sys
 from typing import TYPE_CHECKING
 
 import torch
@@ -19,7 +20,10 @@ logger = init_logger(__name__)
 
 
 def _get_kda_layer(worker: Worker) -> KimiK3DeltaAttention | None:
-    from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
+    module = sys.modules.get("vllm.models.kimi_k3.nvidia.kda")
+    if module is None:
+        return None
+    KimiK3DeltaAttention = module.KimiK3DeltaAttention
 
     compilation_config = getattr(
         worker.model_runner,
