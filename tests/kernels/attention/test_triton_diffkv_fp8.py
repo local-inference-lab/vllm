@@ -97,8 +97,13 @@ def _reference(c):
     """Independently quantize input, scatter by slot, then use FP32 attention."""
     if c.dtype == torch.uint8:
         fp8 = c.impl.fp8_dtype
-        key = (c.key.float() / c.layer._k_scale).to(fp8).float()
-        value = (c.value.float() / c.layer._v_scale).to(fp8).float()
+        limit = torch.finfo(fp8).max
+        # CUDA's FP8 conversion saturates finite overflow. PyTorch's plain
+        # cast returns NaN there, so model the finite conversion explicitly.
+        key = (c.key.float() / c.layer._k_scale).clamp(-limit, limit).to(fp8).float()
+        value = (
+            (c.value.float() / c.layer._v_scale).clamp(-limit, limit).to(fp8).float()
+        )
     else:
         key, value = c.key.float(), c.value.float()
     packed = torch.zeros(
@@ -162,6 +167,22 @@ def test_diffkv_torch_reference(cache_dtype, path, num_kv_heads, window, sinks, 
     assert c.cache.untyped_storage().nbytes() == logical_elements * (
         1 if c.dtype == torch.uint8 else 2
     )
+
+
+@pytest.mark.parametrize("path", ["mixed", "decode3d"])
+@torch.inference_mode()
+def test_diffkv_fp8_finite_saturation(path):
+    c = _case("fp8_e4m3", path, 2, 128, True, "HND")
+    for values, scale in ((c.key, c.layer._k_scale), (c.value, c.layer._v_scale)):
+        values[..., 0] = 512 * scale
+        values[..., 1] = -512 * scale
+    c.query.mul_(0.001)
+    _run(c)
+    cached = c.cache.view(c.impl.fp8_dtype).float()
+    assert torch.isfinite(cached).all()
+    assert cached.max().item() == torch.finfo(c.impl.fp8_dtype).max
+    assert cached.min().item() == -torch.finfo(c.impl.fp8_dtype).max
+    torch.testing.assert_close(c.output, _reference(c), atol=0.02, rtol=0.02)
 
 
 @pytest.mark.parametrize("cache_dtype", ["bfloat16", "fp8_e4m3"])
