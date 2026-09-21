@@ -618,6 +618,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             or not api.is_supported(device)
         ):
             return
+        if self.cache_config.use_kda_recoverssm and not hasattr(api, "bind_kda_commit"):
+            raise RuntimeError(
+                "GLM KDA state recovery requires B12X record/commit support"
+            )
         max_seqs = int(vllm_config.scheduler_config.max_num_seqs)
         state_index_columns = max(1, self.num_spec + 1)
         if state_index_columns > 8:
@@ -716,6 +720,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             gate_activation="sigmoid",
             qk_l2norm=True,
             null_state_index=self.b12x_kda_null_state_index,
+            recover_speculative_state=self.cache_config.use_kda_recoverssm,
         )
         return api.plan(
             caps,
@@ -1030,6 +1035,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_seqs=num_seqs,
             num_tokens=num_tokens,
             output=output,
+            **self._b12x_recovery_records(),
         )
         return PreparedCall(
             run=lambda: state.run(
@@ -1301,8 +1307,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
 
     def _can_use_b12x_kda_decode(self, m: GDNAttentionMetadata) -> bool:
         if (
-            self.cache_config.use_kda_recoverssm
-            or self._b12x_kda_plan is None
+            self._b12x_kda_plan is None
             or m.num_prefills != 0
             or (m.num_decodes == 0 and m.num_spec_decodes == 0)
         ):
@@ -1334,6 +1339,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         query_start_loc: torch.Tensor,
         num_accepted_tokens: torch.Tensor | None,
         num_requests: int,
+        apply_output_norm: bool = True,
     ) -> None:
         """Execute B12X KDA after the convolution projection.
 
@@ -1431,13 +1437,20 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_seqs=num_seqs,
             num_tokens=num_tokens_tensor,
             output=output,
+            **self._b12x_recovery_records(),
         )
         api.run_kda(
             binding,
             lower_bound=self.gate_lower_bound,
             eps=self.o_norm.eps,
             scale=self.head_dim**-0.5,
+            apply_output_norm=apply_output_norm,
         )
+
+    def _b12x_recovery_records(self) -> dict[str, torch.Tensor]:
+        if not self.cache_config.use_kda_recoverssm:
+            return {}
+        return {"correction_cache": self.kv_cache[2], "kg_cache": self.kv_cache[3]}
 
     def forward(
         self,
@@ -1655,7 +1668,24 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     if m.num_prefills == 0 and m.num_decodes == 0
                     else None
                 )
-                if self.cache_config.use_kda_recoverssm:
+                if self.cache_config.use_kda_recoverssm and self.enable_b12x_kda_decode:
+                    if spec_out is None:
+                        spec_out = torch.empty_like(v_spec)
+                    self._run_b12x_kda_decode_post_conv(
+                        metadata=m,
+                        mixed_qkv=mixed_qkv_spec,
+                        raw_g=g1_spec[0],
+                        raw_beta=beta_spec[0],
+                        z=g1_spec[0],
+                        output=spec_out[0],
+                        state_indices=spec_state_indices_tensor,
+                        query_start_loc=spec_cu_seqlens,
+                        num_accepted_tokens=num_accepted_tokens,
+                        num_requests=m.num_spec_decodes,
+                        apply_output_norm=False,
+                    )
+                    core_attn_out_spec = spec_out
+                elif self.cache_config.use_kda_recoverssm:
                     from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
                         kda_recoverssm_verify,
                     )

@@ -102,12 +102,12 @@ class Glm5NextRecoverKDAMetadataBuilder(Glm5NextKDAMetadataBuilder):
 
     def _get_recoverssm_context(self) -> "KDARecoverSSMCommitContext":
         if self._recoverssm_context is None:
-            from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
-                KDARecoverSSMCommitContext,
+            from vllm.models.glm5next.nvidia.ops.recoverssm import (
+                B12XKDARecoverSSMCommitContext,
             )
 
             layers = self.vllm_config.compilation_config.static_forward_context
-            self._recoverssm_context = KDARecoverSSMCommitContext.create(
+            self._recoverssm_context = B12XKDARecoverSSMCommitContext.create(
                 [layers[name] for name in self.layer_names],
                 spec_query_len=self.num_spec + 1,
                 max_num_reqs=self.vllm_config.scheduler_config.max_num_seqs,
@@ -229,7 +229,6 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
     b12x_kda_null_state_index = 0
 
     def __init__(self, config, vllm_config: VllmConfig, prefix: str = "") -> None:
-        self.enable_b12x_kda_decode = not vllm_config.cache_config.use_kda_recoverssm
         quant_config = vllm_config.quant_config
         if (
             quant_config is not None
