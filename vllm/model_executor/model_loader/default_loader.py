@@ -95,6 +95,7 @@ class DefaultModelLoader(BaseModelLoader):
             "enable_multithread_load",
             "num_threads",
             "enable_weights_track",
+            "tensor_coverage_path",
         }
         unexpected_keys = set(extra_config.keys()) - allowed_keys
 
@@ -488,7 +489,17 @@ class DefaultModelLoader(BaseModelLoader):
 
         self._init_ep_weight_filter(model_config)
 
-        loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
+        weights = self.get_all_weights(model_config, model)
+        coverage_path = self.load_config.model_loader_extra_config.get(
+            "tensor_coverage_path"
+        )
+        if coverage_path is not None:
+            from vllm.model_executor.model_loader.coverage import tensor_coverage
+
+            with tensor_coverage(model, weights, coverage_path) as traced:
+                loaded_weights = model.load_weights(traced)
+        else:
+            loaded_weights = model.load_weights(weights)
         finish_weight_transfers()
 
         self.counter_after_loading_weights = time.perf_counter()
