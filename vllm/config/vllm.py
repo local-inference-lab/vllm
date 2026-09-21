@@ -3395,8 +3395,12 @@ class VllmConfig:
             if self.model_config is not None and self.model_config.architecture not in (
                 "KimiLinearForCausalLM",
                 "KimiK3ForConditionalGeneration",
+                "Glm5NextForCausalLM",
+                "Glm5NextForConditionalGeneration",
             ):
-                raise ValueError("RecoverSSM is only supported for Kimi-K3 KDA")
+                raise ValueError(
+                    "RecoverSSM is only supported for Kimi-K3 and GLM-5.3 KDA"
+                )
             if self.mamba_config.enable_stochastic_rounding:
                 raise ValueError(
                     "RecoverSSM supports bfloat16/float32 "
