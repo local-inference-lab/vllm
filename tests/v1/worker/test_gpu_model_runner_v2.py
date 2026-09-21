@@ -23,7 +23,10 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 
 @pytest.mark.parametrize("recovery", [False, True])
-def test_boundary_capture_uses_recovered_accepted_state(monkeypatch, recovery):
+@pytest.mark.parametrize("logits_only", [False, True])
+def test_boundary_capture_uses_recovered_accepted_state(
+    monkeypatch, recovery, logits_only
+):
     """A stop inside a draft window must be applied before checkpoint export."""
     events = []
     runner = GPUModelRunner.__new__(GPUModelRunner)
@@ -38,10 +41,12 @@ def test_boundary_capture_uses_recovered_accepted_state(monkeypatch, recovery):
     sampled = torch.tensor([4])
 
     def update(*args):
-        sampled.fill_(2)  # The second accepted token terminates the response.
+        # A restored prompt can terminate after sampling its first token.
+        sampled.fill_(1 if logits_only else 2)
         events.append("trim")
 
     def commit(*args):
+        assert not logits_only
         assert sampled.item() == 2
         events.append("commit")
 
@@ -58,10 +63,14 @@ def test_boundary_capture_uses_recovered_accepted_state(monkeypatch, recovery):
         sampled,
         torch.tensor([0]),
         boundary_capture=torch.empty(3, 1, 3),
+        logits_only=logits_only,
     )
-    assert events == (
-        ["trim", "commit", "capture"] if recovery else ["trim", "capture", "commit"]
-    )
+    if logits_only:
+        assert events == ["trim", "capture"]
+    else:
+        assert events == (
+            ["trim", "commit", "capture"] if recovery else ["trim", "capture", "commit"]
+        )
 
 
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
