@@ -210,6 +210,13 @@ class SchedulerConfig:
     auto mode.
     """
 
+    max_num_prefill_tokens_per_step: int = Field(default=0, ge=0)
+    """Maximum local prefill tokens in a contended compute-share step.
+
+    Zero keeps the normal batched-token budget. Decode-only and uncontended
+    prefill steps are unchanged.
+    """
+
     max_parallel_prefills: MaxParallelPrefills = 1
     """Maximum local prefills that may share one model step.
 
@@ -336,6 +343,18 @@ class SchedulerConfig:
             raise ValueError(
                 "prefill_compute_share cannot be combined with "
                 "prefill_schedule_interval greater than one"
+            )
+        if (
+            self.max_num_prefill_tokens_per_step > 0
+            and self.prefill_compute_share is None
+        ):
+            raise ValueError(
+                "max_num_prefill_tokens_per_step requires prefill_compute_share"
+            )
+        if self.max_num_prefill_tokens_per_step > self.max_num_batched_tokens:
+            raise ValueError(
+                "max_num_prefill_tokens_per_step cannot exceed "
+                "max_num_batched_tokens"
             )
         if (
             isinstance(self.max_parallel_prefills, int)
