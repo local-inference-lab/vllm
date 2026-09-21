@@ -70,7 +70,7 @@ def _make_gate(
             probe.setattr(
                 torch.cuda,
                 "get_device_properties",
-                lambda *args, **kwargs: SimpleNamespace(gcnArchName="gfx950"),
+                lambda *args, **kwargs: SimpleNamespace(gcnArchName=""),
             )
             import vllm.platforms.rocm as rocm_platform
 
