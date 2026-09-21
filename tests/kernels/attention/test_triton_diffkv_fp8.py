@@ -17,11 +17,16 @@ pytestmark = pytest.mark.skip_global_cleanup
 def _case(cache_dtype, path, num_kv_heads, window, sinks, layout):
     device = "cuda"
     torch.manual_seed(31)
-    q_lens = [1, 3, 17] if path == "mixed" else [1, 1, 1]
-    kv_lens = [17, 129, 259]
+    kv_lens = [87, 319, 513] if path == "prefill" else [17, 129, 259]
+    if path == "prefill":
+        q_lens = kv_lens
+    elif path == "mixed":
+        q_lens = [1, 3, 17]
+    else:
+        q_lens = [1, 1, 1]
     block_size, heads, hq, hv = 16, 16, 192, 128
     # The serving block table is padded to the configured context capacity.
-    columns = 18
+    columns = max(18, (max(kv_lens) + block_size - 1) // block_size + 2)
     blocks = columns * len(kv_lens)
     table = torch.randperm(blocks, device=device).view(3, columns).int()
     dtype = torch.uint8 if cache_dtype.startswith("fp8") else torch.bfloat16
@@ -151,7 +156,7 @@ def _reference(c):
 
 
 @pytest.mark.parametrize("cache_dtype", ["bfloat16", "fp8", "fp8_e4m3"])
-@pytest.mark.parametrize("path", ["mixed", "decode2d", "decode3d"])
+@pytest.mark.parametrize("path", ["prefill", "mixed", "decode2d", "decode3d"])
 @pytest.mark.parametrize("num_kv_heads", [1, 2])
 @pytest.mark.parametrize("window", [None, 128])
 @pytest.mark.parametrize("sinks", [False, True])
