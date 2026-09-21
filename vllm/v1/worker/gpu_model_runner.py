@@ -782,7 +782,7 @@ class GPUModelRunner(
                 is_pooling_model=self.is_pooling_model,
                 cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
                 reasoning_config=self.vllm_config.reasoning_config,
-                use_replayssm=self.cache_config.use_replayssm,
+                use_replayssm=bool(self.cache_config.use_replayssm),
             )
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
@@ -7473,7 +7473,7 @@ class GPUModelRunner(
                     is_pooling_model=self.is_pooling_model,
                     cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
                     reasoning_config=self.vllm_config.reasoning_config,
-                    use_replayssm=self.cache_config.use_replayssm,
+                    use_replayssm=bool(self.cache_config.use_replayssm),
                     slot_mapping_modes=slot_mapping_modes,
                 )
 
@@ -7589,7 +7589,7 @@ class GPUModelRunner(
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config,
             self.kv_cache_config,
-            use_replayssm=self.vllm_config.cache_config.use_replayssm,
+            use_replayssm=bool(self.vllm_config.cache_config.use_replayssm),
         )
         # The kernel block size for all KV cache groups. For example, if
         # kv_cache_manager uses block_size 256 for a given group, but the attention

@@ -817,7 +817,7 @@ class EngineArgs:
         CacheConfig.enable_mamba_fine_grained_prefix_cache
     )
     replayssm_buffer_len: int = CacheConfig.replayssm_buffer_len
-    use_replayssm: bool = CacheConfig.use_replayssm
+    use_replayssm: bool | None = CacheConfig.use_replayssm
 
     mamba_backend: MambaBackendEnum = MambaBackendEnum.TRITON
     mamba_ssu_algorithm: MambaSSUAlgorithm | None = None

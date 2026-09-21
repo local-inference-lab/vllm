@@ -11,7 +11,9 @@ from tests.v1.attention.utils import (
     BatchSpec,
     create_common_attn_metadata,
 )
+from vllm.config import CacheConfig, VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.mamba import MambaBackendEnum
 from vllm.models.glm5next.nvidia.kda import (
     Glm5NextRecoverKDAMetadataBuilder,
 )
@@ -24,6 +26,83 @@ from vllm.v1.kv_cache_interface import MambaSpec
 def disable_pinned_host_staging(monkeypatch):
     monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
     monkeypatch.setattr("vllm.v1.attention.backends.utils.PIN_MEMORY", False)
+
+
+def _recovery_config(monkeypatch):
+    monkeypatch.setattr("vllm.platforms.current_platform.is_cuda", lambda: True)
+    monkeypatch.setattr(
+        "vllm.platforms.current_platform.get_device_capability",
+        lambda: SimpleNamespace(major=12),
+    )
+    monkeypatch.setattr(
+        "vllm.utils.b12x.get_b12x_gdn_decode",
+        lambda: SimpleNamespace(bind_kda_commit=Mock(), is_supported=lambda: True),
+    )
+    return SimpleNamespace(
+        cache_config=CacheConfig(mamba_cache_mode="align"),
+        model_config=SimpleNamespace(
+            architecture="Glm5NextForConditionalGeneration",
+            supports_replayssm=True,
+            dtype=torch.bfloat16,
+            hf_text_config=SimpleNamespace(linear_head_dim=128),
+        ),
+        speculative_config=SimpleNamespace(method="mtp"),
+        num_speculative_tokens=3,
+        use_v2_model_runner=True,
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        mamba_config=SimpleNamespace(
+            backend=MambaBackendEnum.TRITON, enable_stochastic_rounding=False
+        ),
+        kv_transfer_config=None,
+        use_request_boundary_checkpoints=True,
+    )
+
+
+@pytest.mark.parametrize("method,depth", [("mtp", 3), ("dflash", 7)])
+@pytest.mark.parametrize("external", [False, True])
+def test_glm_recovery_defaults_to_native_with_atomic_cache(
+    monkeypatch, method, depth, external
+):
+    config = _recovery_config(monkeypatch)
+    config.speculative_config.method = method
+    config.num_speculative_tokens = depth
+    if external:
+        config.kv_transfer_config = SimpleNamespace(is_kv_transfer_instance=True)
+    VllmConfig.validate_mamba_cached_kernel(config)
+    assert config.cache_config.use_replayssm is True
+    assert config.cache_config.use_kda_recoverssm is True
+
+
+@pytest.mark.parametrize("unsupported", ["depth", "connector", "state", "v1", "b12x"])
+def test_glm_recovery_leaves_unsupported_configs_unchanged(monkeypatch, unsupported):
+    config = _recovery_config(monkeypatch)
+    if unsupported == "depth":
+        config.num_speculative_tokens = 10
+    elif unsupported == "connector":
+        config.kv_transfer_config = SimpleNamespace(is_kv_transfer_instance=True)
+        config.use_request_boundary_checkpoints = False
+    elif unsupported == "state":
+        config.cache_config.mamba_ssm_cache_dtype = "bfloat16"
+    elif unsupported == "v1":
+        config.use_v2_model_runner = False
+    else:
+        monkeypatch.setattr("vllm.utils.b12x.get_b12x_gdn_decode", lambda: None)
+    VllmConfig.validate_mamba_cached_kernel(config)
+    assert not config.cache_config.use_kda_recoverssm
+    config.cache_config.use_replayssm = True
+    with pytest.raises(ValueError, match="GLM KDA recovery requires"):
+        VllmConfig.validate_mamba_cached_kernel(config)
+
+
+def test_glm_recovery_respects_opt_out_and_other_model_defaults(monkeypatch):
+    config = _recovery_config(monkeypatch)
+    config.cache_config.use_replayssm = False
+    VllmConfig.validate_mamba_cached_kernel(config)
+    assert not config.cache_config.use_kda_recoverssm
+    config.cache_config.use_replayssm = None
+    config.model_config.architecture = "KimiLinearForCausalLM"
+    VllmConfig.validate_mamba_cached_kernel(config)
+    assert not config.cache_config.use_kda_recoverssm
 
 
 def test_glm_recoverssm_reserves_one_recurrent_state_per_draft_window():

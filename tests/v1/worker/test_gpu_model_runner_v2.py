@@ -22,6 +22,48 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 
+@pytest.mark.parametrize("recovery", [False, True])
+def test_boundary_capture_uses_recovered_accepted_state(monkeypatch, recovery):
+    """A stop inside a draft window must be applied before checkpoint export."""
+    events = []
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.is_last_pp_rank = False
+    runner.cache_config = SimpleNamespace(use_kda_recoverssm=recovery)
+    runner.req_states = SimpleNamespace(
+        num_computed_tokens=SimpleNamespace(gpu=torch.tensor([19])),
+        last_sampled_tokens=None,
+        all_token_ids=SimpleNamespace(gpu=None),
+        total_len=SimpleNamespace(gpu=None),
+    )
+    sampled = torch.tensor([4])
+
+    def update(*args):
+        sampled.fill_(2)  # The second accepted token terminates the response.
+        events.append("trim")
+
+    def commit(*args):
+        assert sampled.item() == 2
+        events.append("commit")
+
+    def capture(*args, accepted_state_committed=False):
+        assert accepted_state_committed is recovery
+        events.append("capture")
+
+    monkeypatch.setattr(model_runner_module, "post_update", update)
+    runner.model_state = SimpleNamespace(postprocess_state=commit)
+    runner.boundary_checkpoint_state = SimpleNamespace(capture_mamba=capture)
+    runner.postprocess_sampled(
+        torch.tensor([0]),
+        torch.tensor([[1, 2, 3, 4]]),
+        sampled,
+        torch.tensor([0]),
+        boundary_capture=torch.empty(3, 1, 3),
+    )
+    assert events == (
+        ["trim", "commit", "capture"] if recovery else ["trim", "capture", "commit"]
+    )
+
+
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.max_model_len = 262144

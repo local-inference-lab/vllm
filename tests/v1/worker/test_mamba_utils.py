@@ -1072,7 +1072,10 @@ def _run_gpu_postprocess(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_boundary_checkpoint_copies_only_selected_committed_states(monkeypatch):
+@pytest.mark.parametrize("accepted_state_committed", [False, True])
+def test_boundary_checkpoint_copies_only_selected_committed_states(
+    monkeypatch, accepted_state_committed
+):
     """Prompt/response copies respect request slots and speculative rollback."""
     monkeypatch.setattr(
         "vllm.v1.worker.mamba_utils.is_conv_state_dim_first", lambda: False
@@ -1100,7 +1103,14 @@ def test_boundary_checkpoint_copies_only_selected_committed_states(monkeypatch):
     bias = t([[0, 2, 0], [0, 1, 0]])
 
     def copy():
-        ctx.checkpoint_request_boundaries(idx, states, capture, bias, destinations)
+        ctx.checkpoint_request_boundaries(
+            idx,
+            states,
+            capture,
+            bias,
+            destinations,
+            accepted_state_committed=accepted_state_committed,
+        )
 
     copy()
     graph = torch.cuda.CUDAGraph()
@@ -1109,6 +1119,8 @@ def test_boundary_checkpoint_copies_only_selected_committed_states(monkeypatch):
     graph.replay()
     for layer in range(len(names)):
         for dst, src, shift in ((20, 1, 0), (21, 1, 2), (23, 15, 1)):
+            if accepted_state_committed:
+                shift = 0
             torch.testing.assert_close(
                 conv[layer][dst, : cfg.conv_width - shift],
                 conv_ref[layer][src, shift:],

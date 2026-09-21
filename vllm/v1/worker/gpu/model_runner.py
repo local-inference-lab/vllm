@@ -726,7 +726,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config,
             self.kv_cache_config,
-            use_replayssm=self.cache_config.use_replayssm,
+            use_replayssm=bool(self.cache_config.use_replayssm),
         )
         piecewise_capture_available = bool(
             envs.VLLM_USE_BREAKABLE_CUDAGRAPH or has_compiled_submodule(self.model)
@@ -1788,7 +1788,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             boundary_capture,
         )
 
-        if boundary_capture is not None:
+        # Full-checkpoint kernels retain every speculative state, so capture
+        # selects an accepted column before postprocessing compacts it. Recovery
+        # kernels only materialize the accepted state during postprocessing.
+        recover_state = self.cache_config.use_kda_recoverssm
+        if boundary_capture is not None and not recover_state:
             assert self.boundary_checkpoint_state is not None
             self.boundary_checkpoint_state.capture_mamba(idx_mapping, boundary_capture)
 
@@ -1798,6 +1802,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.model_state.postprocess_state(
             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
         )
+        if boundary_capture is not None and recover_state:
+            assert self.boundary_checkpoint_state is not None
+            self.boundary_checkpoint_state.capture_mamba(
+                idx_mapping, boundary_capture, accepted_state_committed=True
+            )
 
     def _merge_ec_connector_no_forward(
         self, scheduler_output: SchedulerOutput, output: ModelRunnerOutput
