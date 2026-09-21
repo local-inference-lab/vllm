@@ -259,7 +259,9 @@ def test_fused_qkv_loaders(monkeypatch, loader, tp_size, scale_first):
     module = target if loader == "target" else mtp
     monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: tp_size)
     for rank in range(tp_size):
-        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda rank=rank: rank)
+        monkeypatch.setattr(
+            module, "get_tensor_model_parallel_rank", lambda rank=rank: rank
+        )
         local_rows = (64 // tp_size) * 192 + (8 // tp_size) * 320
         attn = torch.nn.Module()
         attn.total_num_heads, attn.total_num_kv_heads = 64, 8
