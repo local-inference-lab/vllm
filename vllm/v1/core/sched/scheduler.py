@@ -427,8 +427,13 @@ class Scheduler(SchedulerInterface):
             or (
                 speculative_config.method == "mtp"
                 and speculative_config.draft_model_config is not None
-                and "Glm5NextMTPModel"
-                in (speculative_config.draft_model_config.hf_config.architectures or ())
+                and bool(
+                    {"Glm5NextMTPModel", "Qwen4ExpMTP"}
+                    & set(
+                        speculative_config.draft_model_config.hf_config.architectures
+                        or ()
+                    )
+                )
             )
         )
         self.mamba_has_prefill_checkpoint_blocks = (
