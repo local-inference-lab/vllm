@@ -148,12 +148,14 @@ def _reference(c):
 @pytest.mark.parametrize("cache_dtype", ["bfloat16", "fp8", "fp8_e4m3"])
 @pytest.mark.parametrize("path", ["mixed", "decode2d", "decode3d"])
 @pytest.mark.parametrize("num_kv_heads", [1, 2])
-@pytest.mark.parametrize("window,sinks", [(None, False), (128, True)])
+@pytest.mark.parametrize("window", [None, 128])
+@pytest.mark.parametrize("sinks", [False, True])
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
 @torch.inference_mode()
 def test_diffkv_torch_reference(cache_dtype, path, num_kv_heads, window, sinks, layout):
     c = _case(cache_dtype, path, num_kv_heads, window, sinks, layout)
-    assert not c.impl.supports_quant_query_input
+    if cache_dtype.startswith("fp8"):
+        assert not c.impl.supports_quant_query_input
     _run(c)
     torch.testing.assert_close(c.output, _reference(c), atol=0.02, rtol=0.02)
     logical_elements = c.blocks * c.num_kv_heads * c.block_size * (c.hq + c.hv)

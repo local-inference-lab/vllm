@@ -5,6 +5,7 @@
 import pytest
 import torch
 
+from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.v1.attention.backends.triton_attn_diffkv import (
     TritonAttentionDiffKVBackend,
     TritonAttentionDiffKVImpl,
@@ -66,3 +67,32 @@ def test_diffkv_requires_scalar_descales(scale):
             k_descale=scale,
             v_descale=scale,
         )
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "fp8_e4m3"])
+@pytest.mark.parametrize("checkpoint_scales", [None, (0.037, 0.061)])
+def test_cache_scales_initialize_once_and_remain_stable(dtype, checkpoint_scales):
+    layer = torch.nn.Module()
+    layer.kv_cache_dtype = dtype
+    for name in ("_k_scale", "_v_scale", "_q_scale", "_prob_scale"):
+        layer.register_buffer(name, torch.tensor(1.0))
+    layer._k_scale_cpu = torch.tensor(1.0)
+    layer._v_scale_cpu = torch.tensor(1.0)
+    method = BaseKVCacheMethod(None)
+    method.create_weights(layer)
+    if checkpoint_scales is not None:
+        for name, value in zip(("k_scale", "v_scale"), checkpoint_scales):
+            parameter = getattr(layer, name)
+            parameter.weight_loader(parameter, torch.tensor([value]))
+    method.process_weights_after_loading(layer)
+    expected = (
+        checkpoint_scales
+        if dtype == "fp8_e4m3" and checkpoint_scales is not None
+        else (1.0, 1.0)
+    )
+    for name, value in zip(("_k_scale", "_v_scale"), expected):
+        torch.testing.assert_close(getattr(layer, name), torch.tensor(value))
+    # Repeated initialization must not change scales for already populated pages.
+    method.process_weights_after_loading(layer)
+    for name, value in zip(("_k_scale", "_v_scale"), expected):
+        torch.testing.assert_close(getattr(layer, name), torch.tensor(value))
