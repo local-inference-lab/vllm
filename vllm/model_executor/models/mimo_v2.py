@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
+from copy import copy
 from itertools import islice
 
 import torch
@@ -292,6 +293,15 @@ class MiMoV2Attention(nn.Module):
         )
 
         sliding_window = sliding_window_size if sliding_window_size > -1 else None
+        if (
+            sliding_window is None
+            and cache_config is not None
+            and cache_config.sliding_window is not None
+        ):
+            # MiMo declares each layer's window explicitly. Do not let the
+            # model-wide SWA default turn a global layer into sliding attention.
+            cache_config = copy(cache_config)
+            cache_config.sliding_window = None
 
         # Use DiffKV backend when V has a different head dim than K.
         # Auto-pick FA-DiffKV when FA3/4 is usable on this device, else fall
