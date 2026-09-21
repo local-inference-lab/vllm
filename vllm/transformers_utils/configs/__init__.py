@@ -15,6 +15,7 @@ from __future__ import annotations
 import importlib
 
 _CLASS_TO_MODULE: dict[str, str] = {
+    "NemotronHPuzzleConfig": "vllm.transformers_utils.configs.nemotron_h_puzzle",
     "AfmoeConfig": "vllm.transformers_utils.configs.afmoe",
     "AXK1Config": "vllm.transformers_utils.configs.AXK1",
     "BagelConfig": "vllm.transformers_utils.configs.bagel",

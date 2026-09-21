@@ -52,6 +52,7 @@ from vllm.v1.kv_cache_interface import (
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
+    from vllm.v1.attention.backends.b12x import B12xPagedAttentionImpl
 
 logger = init_logger(__name__)
 
@@ -253,6 +254,7 @@ class Attention(nn.Module, AttentionLayerBase):
         mm_prefix_clamp_sliding_window: bool = False,
         attn_backend: type[AttentionBackend] | None = None,
         head_size_v: int | None = None,
+        query_row_stride: int | None = None,
         **extra_impl_args,
     ) -> None:
         """
@@ -332,6 +334,8 @@ class Attention(nn.Module, AttentionLayerBase):
 
         self.num_heads = num_heads
         self.head_size = head_size
+        # Static Q layout metadata for backends that prepare before execution.
+        self.query_row_stride = query_row_stride
         self.head_size_v = self.head_size if head_size_v is None else head_size_v
         self.num_kv_heads = num_kv_heads
         self.sliding_window = sliding_window
@@ -497,12 +501,12 @@ class Attention(nn.Module, AttentionLayerBase):
             # Plans hold views of the bound cache. Drop them before the base
             # class publishes a replacement; the next preparation collection
             # declares plans against the new cache.
-            self.impl._plans = {}
+            cast("B12xPagedAttentionImpl", self.impl)._plans = {}
         super().bind_kv_cache(kv_cache)
 
     def unbind_kv_cache(self) -> None:
         if self._uses_b12x_paged_preparation():
-            self.impl._plans = {}
+            cast("B12xPagedAttentionImpl", self.impl)._plans = {}
         super().unbind_kv_cache()
 
     def forward(

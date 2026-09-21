@@ -54,6 +54,49 @@ class _Workspace:
         return [torch.empty(shape, dtype=dtype) for shape, dtype in shapes_and_dtypes]
 
 
+@pytest.mark.parametrize("fused_qkv", [False, True])
+@pytest.mark.parametrize("rows", [1, 16])
+def test_paged_preparation_matches_query_projection_layout(fused_qkv, rows):
+    impl = object.__new__(B12xPagedAttentionImpl)
+    impl.num_heads, impl.num_kv_heads = 32, 2
+    impl.head_size = impl.output_head_size = 128
+    impl.device = torch.device("cpu")
+    impl.dtype = impl.kv_torch_dtype = torch.bfloat16
+    impl.kv_cache_dtype = "auto"
+    impl.window_left = -1
+    impl.sinks = None
+    impl._max_page_table_widths = {128: 1}
+    impl._caps = lambda **kwargs: object()
+    impl._paged_attention = SimpleNamespace(
+        extend_graph_capacity=lambda **kwargs: SimpleNamespace(max_work_items=1),
+        invocation_from_descriptors=lambda caps, **kwargs: kwargs,
+        plan=lambda caps, **kwargs: kwargs["invocation"],
+    )
+    owner = SimpleNamespace(query_row_stride=4608 if fused_qkv else None)
+    projected = torch.empty((rows, 4608 if fused_qkv else 4096))
+    query = projected[:, :4096].view(rows, 32, 128)
+    caches = [torch.empty((1, 128, 2, 128), dtype=torch.bfloat16) for _ in range(2)]
+    declaration = impl._declaration(
+        page_size=128,
+        mode="extend",
+        batch=1,
+        total_q=rows,
+        key_cache=caches[0],
+        value_cache=caches[1],
+        owner=owner,
+    )
+    bindings = []
+    state = SimpleNamespace(
+        scratch_plan=SimpleNamespace(scratch_specs=lambda: ()),
+        bind=lambda **kwargs: bindings.append(kwargs),
+    )
+    impl._prepared_call(
+        owner, state, ("extend", 128, 1, rows), benchmark=False, caches=caches
+    )
+    assert declaration["operands"]["q"]["strides"] == query.stride()
+    assert bindings[0]["q"].stride() == query.stride()
+
+
 def test_b12x_bf16_mla_query_uses_public_run_api(monkeypatch) -> None:
     from vllm.utils.b12x import register_b12x_layer
 
@@ -581,8 +624,9 @@ def test_b12x_attention_uses_two_plane_nhd_cache() -> None:
 
 
 def test_b12x_attention_hybrid_cache_capacity_includes_expansion() -> None:
-    assert _max_page_table_width(4096, 128, 4096, False) == 32
-    assert _max_page_table_width(4096, 128, 4096, True) == 64
+    assert _max_page_table_width(4096, 128, 128) == 32
+    assert _max_page_table_width(8192, 128, 1152) == 72
+    assert _max_page_table_width(8192, 64, 1152) == 144
 
 
 def test_b12x_attention_runtime_page_size_comes_from_cache() -> None:
@@ -795,7 +839,7 @@ def test_b12x_dsa_indexer_live_rows_reuse_capacity_with_high_page_ids(
 
     if torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("requires SM12x")
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", torch.accelerator.current_device_index())
     torch.manual_seed(71)
     heads, topk, max_rows, width = 16, 512, 128, 16
     packed = pack_index_k_cache_reference(torch.randn(1024, 128, device=device))
@@ -925,7 +969,7 @@ def test_b12x_dsa_indexer_live_rows_reuse_capacity_with_high_page_ids(
                     run(live_rows)
                 q.copy_((-q.float()).to(q.dtype))
                 graph.replay()
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 torch.testing.assert_close(
                     output[:live_rows].sort(dim=1).values,
                     expected(live_rows),

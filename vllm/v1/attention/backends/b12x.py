@@ -8,7 +8,7 @@ import copy
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 
@@ -43,6 +43,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout, KVCacheSpec
+from vllm.v1.worker.block_table import get_block_table_width
 
 logger = init_logger(__name__)
 
@@ -59,17 +60,14 @@ _B12X_SUPPORTED_KV_CACHE_DTYPES: tuple[CacheDType, ...] = (
 
 def _max_page_table_width(
     max_model_len: int,
-    block_size: int,
-    max_num_batched_tokens: int,
-    is_hybrid: bool,
+    kernel_block_size: int,
+    storage_block_size: int,
 ) -> int:
-    width = max(cdiv(max(max_model_len, 1), block_size), 1)
-    if is_hybrid:
-        # Hybrid cache setup can enlarge the storage block after attention
-        # layers are initialized. Its expansion into kernel-sized blocks adds
-        # at most one storage block of trailing page-table capacity.
-        width += cdiv(max_num_batched_tokens, block_size)
-    return width
+    return get_block_table_width(
+        cdiv(max(max_model_len, 1), storage_block_size),
+        storage_block_size,
+        kernel_block_size,
+    )
 
 
 def _kv_page_size(key_cache: torch.Tensor, value_cache: torch.Tensor) -> int:
@@ -418,8 +416,7 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
             page_size: _max_page_table_width(
                 max_model_len,
                 page_size,
-                max_batched,
-                model_config.is_hybrid,
+                max(default_block_size, page_size),
             )
             for page_size in _B12X_SUPPORTED_PAGE_SIZES
         }
@@ -446,6 +443,7 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         self._max_batched = max_batched
         self._max_num_seqs = max_num_seqs
         self._max_model_len = max_model_len
+        self._cache_config = cache_config
         self._max_page_table_widths = max_page_table_widths
         self._verify_q_per_req = (
             1 + int(getattr(spec_config, "num_speculative_tokens", None) or 0)
@@ -524,6 +522,12 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
             "alignment": 16,
         }
 
+    def _query_strides(self, owner: object, rows: int) -> tuple[int, int, int]:
+        row_stride = getattr(owner, "query_row_stride", None)
+        if row_stride is None or rows == 1:
+            row_stride = self.num_heads * self.head_size
+        return (row_stride, self.head_size, 1)
+
     def _declaration(
         self,
         *,
@@ -533,7 +537,7 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         total_q: int,
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
-        owner: object,
+        owner: Any,
     ):
         width = self._max_page_table_widths[page_size]
         if mode == "decode":
@@ -611,7 +615,7 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         operands = {
             "q": self._descriptor(
                 q_shape,
-                (self.num_heads * self.head_size, self.head_size, 1),
+                self._query_strides(owner, total_q),
                 self.dtype,
             ),
             "k_cache": {
@@ -672,6 +676,10 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
             return ()
         key_cache, value_cache = self._kv_cache_views(kv_cache)
         page_size = _kv_page_size(key_cache, value_cache)
+        # Hybrid cache setup finalizes storage blocks after model construction.
+        self._max_page_table_widths[page_size] = _max_page_table_width(
+            self._max_model_len, page_size, int(self._cache_config.block_size)
+        )
         if workload.output_dtype != self.dtype:
             raise ValueError("b12x paged output dtype differs from its loaded contract")
         plans: dict[tuple[str, int, int, int], object] = {}
@@ -783,8 +791,8 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
 
     def _prepared_call(
         self,
-        owner: object,
-        state: object,
+        owner: Any,
+        state: Any,
         key,
         *,
         benchmark: bool,
@@ -808,8 +816,9 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
             torch.empty(spec.shape, dtype=spec.dtype, device=self.device)
             for spec in specs
         )
-        q = torch.empty(
+        q = torch.empty_strided(
             (total_q, self.num_heads, self.head_size),
+            self._query_strides(owner, total_q),
             dtype=self.dtype,
             device=self.device,
         )
@@ -1016,8 +1025,8 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         )
         if num_actual_tokens <= 0:
             return output
-        q = query[:num_actual_tokens]
-        out = output[:num_actual_tokens]
+        q = canonicalize_singleton_dim_strides(query[:num_actual_tokens])
+        out = canonicalize_singleton_dim_strides(output[:num_actual_tokens])
         if q.dtype != self.dtype or out.dtype != self.dtype:
             raise TypeError(
                 f"b12x plan expects dtype {self.dtype}, got "

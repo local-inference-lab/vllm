@@ -55,7 +55,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.model_executor.weight_transfer import copy_weight
+from vllm.model_executor.weight_transfer import allocate_weights, copy_weight
 from vllm.platforms import current_platform
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import (
@@ -99,7 +99,9 @@ class Mixer2RMSNormGated(CustomOp):
         self.use_rms_norm = use_rms_norm
         if self.use_rms_norm:
             # Register norm weight only if we're actually applying RMSNorm
-            self.weight = nn.Parameter(torch.ones(self.per_rank_hidden_size))
+            self.weight = nn.Parameter(
+                allocate_weights(torch.ones, self.per_rank_hidden_size)
+            )
             set_weight_attrs(self.weight, {"weight_loader": sharded_weight_loader(0)})
         else:
             # Avoid checkpoint mismatch by skipping unused parameter
@@ -453,21 +455,20 @@ class MambaMixer2(MambaBase, PluggableLayer):
         # `ColumnParallelLinear` and `MergedColumnParallelLinear`,
         # and `set_weight_attrs` doesn't allow to override it
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
-        conv_weights = self.conv1d.weight.view(
-            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
-        )
-        self.register_buffer("conv_weights", conv_weights, persistent=False)
 
         # - these are TPed by heads to reduce the size of the
         #   temporal shape
         self.A = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 divide(num_heads, self.tp_size),
                 dtype=torch.float32,
             )
         )
-        self.D = nn.Parameter(torch.ones(num_heads // self.tp_size))
-        self.dt_bias = nn.Parameter(torch.ones(num_heads // self.tp_size))
+        self.D = nn.Parameter(allocate_weights(torch.ones, num_heads // self.tp_size))
+        self.dt_bias = nn.Parameter(
+            allocate_weights(torch.ones, num_heads // self.tp_size)
+        )
         self.use_rms_norm = use_rms_norm
 
         set_weight_attrs(self.D, {"weight_loader": sharded_weight_loader(0)})
@@ -557,6 +558,12 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         # Check if running on Blackwell (SM100+) for kernel tuning
         self.is_blackwell = current_platform.is_device_capability_family(100)
+
+    @property
+    def conv_weights(self):
+        return self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
 
     def forward(
         self,

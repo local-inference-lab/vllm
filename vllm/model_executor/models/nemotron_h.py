@@ -85,6 +85,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
     sequence_parallel_chunk,
 )
+from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
 
@@ -161,7 +162,7 @@ class NemotronHMoE(nn.Module):
         )
 
         self.gate.e_score_correction_bias = nn.Parameter(
-            torch.empty(config.n_routed_experts, dtype=torch.float32)
+            allocate_weights(torch.empty, config.n_routed_experts, dtype=torch.float32)
         )
         # Load balancing settings.
         self.enable_eplb = parallel_config.enable_eplb
@@ -480,6 +481,7 @@ class NemotronHAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
             per_layer_sliding_window=sliding_window,
+            query_row_stride=self.q_size + 2 * self.kv_size,
         )
 
     def forward(

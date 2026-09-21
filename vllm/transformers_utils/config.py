@@ -137,6 +137,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     eagle="EAGLEConfig",
     speculators="SpeculatorsConfig",
     nemotron="NemotronConfig",
+    nemotron_h_puzzle="NemotronHPuzzleConfig",
     olmo_hybrid="OlmoHybridConfig",
     openvla="OpenVLAConfig",
     ovis="OvisConfig",
