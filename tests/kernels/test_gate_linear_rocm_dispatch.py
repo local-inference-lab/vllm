@@ -192,7 +192,7 @@ def test_sm120_enables_bf16_fp32_paths_without_datacenter_kernels(monkeypatch):
 
     assert gate.allow_ll_bf16_gemm
     assert not gate.allow_specialized_router_gemm
-    assert not gate.allow_dsv3_router_gemm
+    assert not gate.allow_fp32_router_gemm
     assert gate.allow_cublas_router_gemm
 
 
@@ -276,6 +276,11 @@ def test_sm120_capture_preserves_router_graph_pool_layout(monkeypatch):
         lambda: object(),
     )
     monkeypatch.setattr(torch, "mm", lambda *args, **kwargs: expected)
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "sm120_cublas_router_gemm",
+        gate_linear_mod.sm120_cublas_router_gemm_impl,
+    )
 
     output, output_bias = gate(x)
 
