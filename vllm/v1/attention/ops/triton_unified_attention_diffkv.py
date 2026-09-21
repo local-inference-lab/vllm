@@ -61,6 +61,9 @@ def kernel_unified_attention_diffkv(
     key_cache_ptr,  # view of packed cache: [..., :head_size_qk]
     value_cache_ptr,  # view of packed cache: [..., head_size_qk:hqk+hv]
     sink_ptr,
+    k_descale_ptr,
+    v_descale_ptr,
+    FP8_KV_CACHE: tl.constexpr,
     block_tables_ptr,
     seq_lens_ptr,
     alibi_slopes_ptr,
@@ -154,6 +157,10 @@ def kernel_unified_attention_diffkv(
         other=0.0,
     )
 
+    if FP8_KV_CACHE:
+        k_descale = tl.load(k_descale_ptr)
+        v_descale = tl.load(v_descale_ptr)
+
     block_table_offset = seq_idx * block_table_stride
 
     M = init_softmax_M(
@@ -212,14 +219,20 @@ def kernel_unified_attention_diffkv(
             mask=dim_mask_qk[:, None] & tile_mask[None, :],
             other=0.0,
         )
-        K = K_load.to(Q.dtype)
+        if FP8_KV_CACHE:
+            K = (K_load.to(tl.float32) * k_descale).to(Q.dtype)
+        else:
+            K = K_load.to(Q.dtype)
         # V : (TILE_SIZE, HEAD_SIZE_V_PADDED)
         V_load = tl.load(
             value_cache_ptr + v_offset,
             mask=dim_mask_v[None, :] & tile_mask[:, None],
             other=0.0,
         )
-        V = V_load.to(Q.dtype)
+        if FP8_KV_CACHE:
+            V = (V_load.to(tl.float32) * v_descale).to(Q.dtype)
+        else:
+            V = V_load.to(Q.dtype)
 
         query_abs_pos = context_len + query_pos[:, None]
         seq_mask = compute_kv_seq_mask(
@@ -403,8 +416,19 @@ def unified_attention_diffkv(
     softmax_segm_output: torch.Tensor | None = None,
     softmax_segm_max: torch.Tensor | None = None,
     softmax_segm_expsum: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
 ):
     assert causal, "Only causal attention is supported"
+    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    fp8_kv_cache = k.dtype in fp8_dtypes
+    if fp8_kv_cache:
+        if v.dtype != k.dtype or q.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("FP8 DiffKV requires matching E4M3 K/V and FP16/BF16 Q")
+        if k_descale is None or v_descale is None:
+            raise ValueError("FP8 DiffKV requires separate K and V descale tensors")
+        if k_descale.numel() != 1 or v_descale.numel() != 1:
+            raise ValueError("FP8 DiffKV only supports per-tensor K/V scales")
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -471,6 +495,9 @@ def unified_attention_diffkv(
         key_cache_ptr=k,
         value_cache_ptr=v,
         sink_ptr=sinks,
+        k_descale_ptr=k_descale,
+        v_descale_ptr=v_descale,
+        FP8_KV_CACHE=fp8_kv_cache,
         block_tables_ptr=block_table,
         seq_lens_ptr=seqused_k,
         alibi_slopes_ptr=alibi_slopes,
