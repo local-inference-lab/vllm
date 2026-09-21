@@ -1,0 +1,20 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-821",
+  "category": "feature",
+  "summary": "Reduce GLM speculative recurrent-state reservations while retaining atomic LMCache restores.",
+  "models": ["GLM-5.3-Flash"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Eligible SM12x Model Runner V2 configurations select B12X state recovery automatically for MTP or DFlash with one to seven draft tokens.",
+    "LMCache checkpoints capture the accepted recurrent state after recovery and convolution compaction; changed prompt tails and generated-response continuation remain reusable.",
+    "In the qualified TP2 Spark MTP3 LMCache configuration, fixed per-request reservation falls by approximately 188 MiB per GPU; maximum single-request context is unchanged.",
+    "The existing atomic LMCache adapter remains text-only; multimodal generation and native GPU prefix caching are unchanged.",
+    "Use --no-use-replayssm for the full-state diagnostic path."
+  ],
+  "pull_requests": [821],
+  "requires": ["b12x-408"],
+  "evidence": [
+    "https://github.com/local-inference-lab/rtx6kpro/blob/master/benchmarks/glm53-kda-recovery-lmcache.md"
+  ]
+}

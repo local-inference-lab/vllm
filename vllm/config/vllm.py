@@ -68,6 +68,60 @@ else:
 
 logger = init_logger(__name__)
 
+
+def _glm_kda_recovery_unavailable(config: "VllmConfig") -> str | None:
+    """Describe why GLM cannot use the native checkpoint/record contract."""
+    from vllm.platforms import current_platform
+
+    cache = config.cache_config
+    model = config.model_config
+    spec = config.speculative_config
+    if model is None or model.architecture not in (
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+    ):
+        return "requires a GLM-5.3 target"
+    if (
+        spec is None
+        or spec.method not in ("mtp", "dflash")
+        or not (1 <= config.num_speculative_tokens <= 7)
+    ):
+        return "requires MTP or DFlash with 1 to 7 draft tokens"
+    if (
+        model.dtype != torch.bfloat16
+        or model.hf_text_config.linear_head_dim != 128
+        or cache.mamba_ssm_cache_dtype not in ("auto", "float32")
+    ):
+        return "requires BF16 activations, 128-wide heads and FP32 recurrent state"
+    if config.mamba_config.enable_stochastic_rounding:
+        return "does not support stochastic recurrent-state rounding"
+    if cache.mamba_cache_mode not in ("none", "align"):
+        return "requires none or align Mamba cache mode"
+    if not config.use_v2_model_runner:
+        return "requires Model Runner V2"
+    if config.parallel_config.pipeline_parallel_size != 1:
+        return "requires pipeline_parallel_size=1"
+    if config.mamba_config.backend != MambaBackendEnum.TRITON:
+        return "requires the triton Mamba metadata backend"
+    if (
+        config.kv_transfer_config is not None
+        and config.kv_transfer_config.is_kv_transfer_instance
+        and not config.use_request_boundary_checkpoints
+    ):
+        return "requires an atomic request-boundary external-cache connector"
+    if not current_platform.is_cuda():
+        return "requires CUDA"
+    capability = current_platform.get_device_capability()
+    if capability is None or capability.major != 12:
+        return "requires an SM12x GPU"
+    from vllm.utils.b12x import get_b12x_gdn_decode
+
+    api = get_b12x_gdn_decode()
+    if api is None or not hasattr(api, "bind_kda_commit") or not api.is_supported():
+        return "requires B12X speculative KDA verification and commit support"
+    return None
+
+
 # TODO(rocm): These models are either unsupported by MRV2 or slower with
 # MRV2 on AMD GPUs.
 ROCM_DEFAULT_MRV1_ARCHITECTURES = frozenset(
@@ -3381,10 +3435,28 @@ class VllmConfig:
 
     @model_validator(mode="after")
     def validate_mamba_cached_kernel(self) -> "VllmConfig":
+        if self.cache_config.use_replayssm is None:
+            self.cache_config.use_replayssm = (
+                _glm_kda_recovery_unavailable(self) is None
+            )
+            if self.cache_config.use_replayssm:
+                logger.info(
+                    "GLM speculative KDA uses B12X checkpoint recovery with FP32 "
+                    "recurrent state. Use --no-use-replayssm to retain full "
+                    "speculative states."
+                )
         if not self.cache_config.use_replayssm:
             self.cache_config.use_kda_recoverssm = False
             return self
         self.cache_config.use_kda_recoverssm = self.num_speculative_tokens > 0
+
+        if self.model_config is not None and self.model_config.architecture in (
+            "Glm5NextForCausalLM",
+            "Glm5NextForConditionalGeneration",
+        ):
+            reason = _glm_kda_recovery_unavailable(self)
+            if reason is not None:
+                raise ValueError(f"GLM KDA recovery {reason}")
 
         if self.model_config is not None and not self.model_config.supports_replayssm:
             raise ValueError(
@@ -3395,8 +3467,12 @@ class VllmConfig:
             if self.model_config is not None and self.model_config.architecture not in (
                 "KimiLinearForCausalLM",
                 "KimiK3ForConditionalGeneration",
+                "Glm5NextForCausalLM",
+                "Glm5NextForConditionalGeneration",
             ):
-                raise ValueError("RecoverSSM is only supported for Kimi-K3 KDA")
+                raise ValueError(
+                    "RecoverSSM is only supported for Kimi-K3 and GLM-5.3 KDA"
+                )
             if self.mamba_config.enable_stochastic_rounding:
                 raise ValueError(
                     "RecoverSSM supports bfloat16/float32 "
@@ -3443,10 +3519,18 @@ class VllmConfig:
         if (
             self.kv_transfer_config is not None
             and self.kv_transfer_config.is_kv_transfer_instance
+            and not (
+                self.cache_config.use_kda_recoverssm
+                and self.model_config is not None
+                and self.model_config.architecture
+                in ("Glm5NextForCausalLM", "Glm5NextForConditionalGeneration")
+                and self.use_request_boundary_checkpoints
+            )
         ):
             raise ValueError(
                 "--use-replayssm is incompatible with KV connectors "
-                "(P/D disaggregation, KV cache offload)"
+                "except GLM KDA recovery with an atomic request-boundary "
+                "checkpoint connector"
             )
         return self
 

@@ -361,23 +361,39 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
 
     def get_state_dtype(
         self,
-    ) -> tuple[torch.dtype, torch.dtype]:
+    ) -> tuple[torch.dtype, ...]:
         if self.model_config is None or self.cache_config is None:
             raise ValueError("model_config and cache_config must be set")
-        return MambaStateDtypeCalculator.kda_state_dtype(
-            self.model_config.dtype, self.cache_config.mamba_cache_dtype
+        dtypes = MambaStateDtypeCalculator.kda_state_dtype(
+            self.model_config.dtype,
+            self.cache_config.mamba_cache_dtype,
+            self.cache_config.mamba_ssm_cache_dtype,
         )
+        if self.cache_config.use_kda_recoverssm:
+            return MambaStateDtypeCalculator.append_kda_recoverssm_record(
+                dtypes, self.model_config.dtype
+            )
+        return dtypes
 
     def get_state_shape(
         self,
-    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        return MambaStateShapeCalculator.kda_state_shape(
+    ) -> tuple[tuple[int, ...], ...]:
+        shapes = MambaStateShapeCalculator.kda_state_shape(
             self.tp_size,
             self.num_heads,
             self.head_dim,
             conv_kernel_size=self.conv_size,
             num_spec=self.num_spec,
         )
+        if self.cache_config.use_kda_recoverssm:
+            return MambaStateShapeCalculator.append_kda_recoverssm_record(
+                shapes,
+                self.num_heads,
+                self.head_dim,
+                tp_world_size=self.tp_size,
+                spec_query_len=1 + self.num_spec,
+            )
+        return shapes
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
         spec = super().get_kv_cache_spec(vllm_config)
@@ -603,6 +619,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             or not api.is_supported(device)
         ):
             return
+        if self.cache_config.use_kda_recoverssm and not hasattr(api, "bind_kda_commit"):
+            raise RuntimeError(
+                "GLM KDA state recovery requires B12X record/commit support"
+            )
         max_seqs = int(vllm_config.scheduler_config.max_num_seqs)
         state_index_columns = max(1, self.num_spec + 1)
         if state_index_columns > 8:
@@ -686,6 +706,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             gate_activation="sigmoid",
             qk_l2norm=True,
             null_state_index=self.b12x_kda_null_state_index,
+            recover_speculative_state=self.cache_config.use_kda_recoverssm,
         )
         mixed_qkv, raw_g, raw_beta, z, output = self._b12x_kda_decode_probes()
         return api.plan(
@@ -1005,6 +1026,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_seqs=num_seqs,
             num_tokens=num_tokens,
             output=output,
+            **self._b12x_recovery_records(),
         )
         return PreparedCall(
             run=lambda: state.run(
@@ -1276,6 +1298,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         query_start_loc: torch.Tensor,
         num_accepted_tokens: torch.Tensor | None,
         num_requests: int,
+        apply_output_norm: bool = True,
     ) -> None:
         """Execute B12X KDA after the convolution projection.
 
@@ -1373,13 +1396,20 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_seqs=num_seqs,
             num_tokens=num_tokens_tensor,
             output=output,
+            **self._b12x_recovery_records(),
         )
         api.run_kda(
             binding,
             lower_bound=self.gate_lower_bound,
             eps=self.o_norm.eps,
             scale=self.head_dim**-0.5,
+            apply_output_norm=apply_output_norm,
         )
+
+    def _b12x_recovery_records(self) -> dict[str, torch.Tensor]:
+        if not self.cache_config.use_kda_recoverssm:
+            return {}
+        return {"correction_cache": self.kv_cache[2], "kg_cache": self.kv_cache[3]}
 
     def forward(
         self,
@@ -1518,9 +1548,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         g2_actual = g2[:num_actual_tokens]
         use_b12x_kda = self._can_use_b12x_kda_decode(m)
 
-        constant_caches = self.kv_cache
-
-        conv_state, recurrent_state = constant_caches
+        conv_state, recurrent_state = self.kv_cache[:2]
+        recoverssm_records = self.kv_cache[2:]
         # conv_state must be (..., dim, width-1) for the conv kernels.
         # DS layout stores it that way directly; SD layout needs a transpose.
         if not is_conv_state_dim_first():
@@ -1588,7 +1617,11 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert spec_state_indices_tensor is not None
             assert spec_query_start_loc is not None
             spec_conv_indices = spec_state_indices_tensor[:, 0][: m.num_spec_decodes]
-            spec_max_query_len = spec_state_indices_tensor.size(-1)
+            spec_max_query_len = (
+                self.num_spec + 1
+                if self.cache_config.use_kda_recoverssm
+                else spec_state_indices_tensor.size(-1)
+            )
 
             # Sibling beta and, for full-rank gates, output-gate views remain
             # live, so write the convolution output separately.
@@ -1637,21 +1670,67 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     if m.num_prefills == 0 and m.num_decodes == 0
                     else None
                 )
-                core_attn_out_spec, _ = fused_recurrent_kda(
-                    q=q_spec,
-                    k=k_spec,
-                    v=v_spec,
-                    raw_g=g1_spec,
-                    raw_beta=beta_spec,
-                    A_log=self.A_log,
-                    dt_bias=self.dt_bias,
-                    lower_bound=self.gate_lower_bound,
-                    initial_state=recurrent_state,
-                    cu_seqlens=spec_cu_seqlens,
-                    ssm_state_indices=spec_state_indices_tensor,
-                    num_accepted_tokens=num_accepted_tokens,
-                    out=spec_out,
-                )
+                if self.cache_config.use_kda_recoverssm and self.enable_b12x_kda_decode:
+                    if spec_out is None:
+                        spec_out = torch.empty_like(v_spec)
+                    self._run_b12x_kda_decode_post_conv(
+                        metadata=m,
+                        mixed_qkv=mixed_qkv_spec,
+                        raw_g=g1_spec[0],
+                        raw_beta=beta_spec[0],
+                        z=g1_spec[0],
+                        output=spec_out[0],
+                        state_indices=spec_state_indices_tensor,
+                        query_start_loc=spec_cu_seqlens,
+                        num_accepted_tokens=num_accepted_tokens,
+                        num_requests=m.num_spec_decodes,
+                        apply_output_norm=False,
+                    )
+                    core_attn_out_spec = spec_out
+                elif self.cache_config.use_kda_recoverssm:
+                    from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
+                        kda_recoverssm_verify,
+                    )
+
+                    if len(recoverssm_records) != 2:
+                        raise ValueError(
+                            "KDA RecoverSSM requires correction and key/gate buffers"
+                        )
+                    core_attn_out_spec = kda_recoverssm_verify(
+                        q=q_spec,
+                        k=k_spec,
+                        v=v_spec,
+                        raw_g=g1_spec,
+                        raw_beta=beta_spec,
+                        A_log=self.A_log,
+                        dt_bias=self.dt_bias,
+                        lower_bound=self.gate_lower_bound,
+                        checkpoint_state=recurrent_state,
+                        correction_cache=recoverssm_records[0],
+                        kg_cache=recoverssm_records[1],
+                        query_start_loc=spec_cu_seqlens,
+                        state_indices=spec_state_indices_tensor[
+                            : m.num_spec_decodes, 0
+                        ],
+                        spec_query_len=self.num_spec + 1,
+                        out=spec_out,
+                    )
+                else:
+                    core_attn_out_spec, _ = fused_recurrent_kda(
+                        q=q_spec,
+                        k=k_spec,
+                        v=v_spec,
+                        raw_g=g1_spec,
+                        raw_beta=beta_spec,
+                        A_log=self.A_log,
+                        dt_bias=self.dt_bias,
+                        lower_bound=self.gate_lower_bound,
+                        initial_state=recurrent_state,
+                        cu_seqlens=spec_cu_seqlens,
+                        ssm_state_indices=spec_state_indices_tensor,
+                        num_accepted_tokens=num_accepted_tokens,
+                        out=spec_out,
+                    )
 
         # ---------- non-spec path (prefill or plain decode) ----------
         core_attn_out_non_spec = None

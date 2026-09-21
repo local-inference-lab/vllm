@@ -8,10 +8,17 @@ token-strided rather than contiguous. The kernel must read them in place,
 match a pure-PyTorch recurrence, and reject layouts it cannot address.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.models.glm5next.nvidia.ops.third_party.kda import fused_recurrent_kda
+from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
+    KDARecoverSSMCommitContext,
+    kda_recoverssm_verify,
+)
 from vllm.platforms import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -184,3 +191,79 @@ def test_fused_recurrent_kda_rejects_unaddressable_layouts():
         broken["cu_seqlens"] = None if q.shape[0] > 1 else inputs["cu_seqlens"]
         with pytest.raises(AssertionError, match=r"torch.Size"):
             run_kernel(broken, state)
+
+
+@torch.inference_mode()
+def test_recoverssm_matches_glm_recurrence_and_accepted_state():
+    torch.manual_seed(7)
+    num_seqs, query_len = 2, 3
+    device = torch.device("cuda")
+    inputs, baseline_state = make_inputs(num_seqs, query_len, device)
+    initial_state = baseline_state.clone()
+    inputs["num_accepted_tokens"] = torch.ones(
+        num_seqs, dtype=torch.int32, device=device
+    )
+    baseline_output = run_kernel(inputs, baseline_state)
+
+    correction = torch.empty(
+        initial_state.shape[0], H, query_len, D, dtype=torch.float32, device=device
+    )
+    key_gate = torch.empty(
+        initial_state.shape[0],
+        H,
+        query_len,
+        2 * D,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    recovery_indices = inputs["ssm_state_indices"][:, 0].contiguous()
+    recovered_output = kda_recoverssm_verify(
+        q=inputs["q"],
+        k=inputs["k"],
+        v=inputs["v"],
+        raw_g=inputs["g"],
+        raw_beta=inputs["beta"],
+        A_log=inputs["a_log"],
+        dt_bias=inputs["g_bias"],
+        lower_bound=LOWER_BOUND,
+        checkpoint_state=initial_state,
+        correction_cache=correction,
+        kg_cache=key_gate,
+        query_start_loc=inputs["cu_seqlens"],
+        state_indices=recovery_indices,
+        spec_query_len=query_len,
+    )
+    torch.testing.assert_close(recovered_output, baseline_output, rtol=3e-2, atol=3e-2)
+
+    history = 3
+    conv_shape = (
+        (initial_state.shape[0], 12, history + query_len - 1)
+        if is_conv_state_dim_first()
+        else (initial_state.shape[0], history + query_len - 1, 12)
+    )
+    layer = SimpleNamespace(
+        kv_cache=(
+            torch.zeros(conv_shape, dtype=torch.bfloat16, device=device),
+            initial_state,
+            correction,
+            key_gate,
+        ),
+        A_log=inputs["a_log"],
+        dt_bias=inputs["g_bias"],
+        local_num_heads=H,
+        head_dim=D,
+        gate_lower_bound=LOWER_BOUND,
+    )
+    context = KDARecoverSSMCommitContext.create(
+        [layer], spec_query_len=query_len, max_num_reqs=num_seqs
+    )
+    accepted = torch.tensor([1, 3], dtype=torch.int32, device=device)
+    context.commit(accepted, recovery_indices, inputs["cu_seqlens"])
+    for seq, count in enumerate(accepted.tolist()):
+        baseline_index = inputs["ssm_state_indices"][seq, count - 1]
+        torch.testing.assert_close(
+            initial_state[recovery_indices[seq]],
+            baseline_state[baseline_index],
+            rtol=3e-3,
+            atol=3e-3,
+        )

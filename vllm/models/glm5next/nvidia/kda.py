@@ -14,6 +14,8 @@ uses ``wait_stream``, which CUDA graph capture records as dependency edges.
 
 import os
 from copy import copy
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from einops import rearrange
@@ -22,7 +24,13 @@ from vllm.config import VllmConfig
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
     KimiGatedDeltaNetAttention,
 )
-from vllm.v1.attention.backend import AttentionBackend
+from vllm.models.kimi_k3.nvidia.kda_metadata import (
+    KDARecoverSSMAlignMetadata,
+    KDARecoverSSMCommitMetadata,
+    KimiK3KDAMetadata,
+)
+from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.v1.attention.backend import AttentionBackend, CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionBackend,
     GDNAttentionMetadataBuilder,
@@ -32,6 +40,11 @@ from vllm.v1.worker.workspace import (
     current_workspace_manager,
     use_preallocated_workspace,
 )
+
+if TYPE_CHECKING:
+    from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
+        KDARecoverSSMCommitContext,
+    )
 
 
 class Glm5NextKDAMetadataBuilder(GDNAttentionMetadataBuilder):
@@ -62,6 +75,110 @@ class Glm5NextKDAAttentionBackend(GDNAttentionBackend):
     @classmethod
     def supports_device_cpu_query_lens_mismatch(cls) -> bool:
         return True
+
+
+@dataclass
+class Glm5NextRecoverKDAMetadata(KimiK3KDAMetadata):
+    """GLM prefill metadata with KDA speculative-state recovery."""
+
+
+class Glm5NextRecoverKDAMetadataBuilder(Glm5NextKDAMetadataBuilder):
+    supports_update_block_table = False
+
+    def __init__(
+        self,
+        kv_cache_spec: MambaSpec,
+        layer_names: list[str],
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ) -> None:
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self._neutral_accepted = torch.ones(
+            vllm_config.scheduler_config.max_num_seqs,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._recoverssm_context: KDARecoverSSMCommitContext | None = None
+
+    def _get_recoverssm_context(self) -> "KDARecoverSSMCommitContext":
+        if self._recoverssm_context is None:
+            from vllm.models.glm5next.nvidia.ops.recoverssm import (
+                B12XKDARecoverSSMCommitContext,
+            )
+
+            layers = self.vllm_config.compilation_config.static_forward_context
+            self._recoverssm_context = B12XKDARecoverSSMCommitContext.create(
+                [layers[name] for name in self.layer_names],
+                spec_query_len=self.num_spec + 1,
+                max_num_reqs=self.vllm_config.scheduler_config.max_num_seqs,
+            )
+        return self._recoverssm_context
+
+    def build(  # type: ignore[override]
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_accepted_tokens: torch.Tensor | None = None,
+        num_decode_draft_tokens_cpu: torch.Tensor | None = None,
+        fast_build: bool = False,
+    ) -> Glm5NextRecoverKDAMetadata:
+        common = common_attn_metadata
+        if num_decode_draft_tokens_cpu is not None:
+            assert common.is_prefilling is not None
+            active_decodes = (~common.is_prefilling) & (
+                common.query_start_loc_cpu.diff() > 0
+            )
+            missing = active_decodes & (num_decode_draft_tokens_cpu < 0)
+            if bool(torch.any(missing)):
+                num_decode_draft_tokens_cpu = num_decode_draft_tokens_cpu.clone()
+                num_decode_draft_tokens_cpu[missing] = 0
+        metadata = super().build(
+            common_prefix_len,
+            common,
+            num_accepted_tokens=self._neutral_accepted[: common.num_reqs],
+            num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            fast_build=fast_build,
+        )
+        commit = None
+        if metadata.num_spec_decodes > 0:
+            assert metadata.spec_sequence_masks_cpu is not None
+            assert metadata.spec_state_indices_tensor is not None
+            assert metadata.spec_query_start_loc is not None
+            request_indices = async_tensor_h2d(
+                metadata.spec_sequence_masks_cpu.nonzero(as_tuple=True)[0],
+                dtype=torch.int32,
+                device=common.query_start_loc.device,
+            )
+            align = None
+            if self.kv_cache_spec.mamba_cache_mode == "align":
+                align = KDARecoverSSMAlignMetadata(
+                    block_table=common.block_table_tensor,
+                    num_computed_tokens=common.compute_num_computed_tokens(),
+                    block_size=self.kv_cache_spec.block_size,
+                )
+            commit = KDARecoverSSMCommitMetadata(
+                state_indices=metadata.spec_state_indices_tensor,
+                query_start_loc=metadata.spec_query_start_loc,
+                request_indices=request_indices,
+                align=align,
+            )
+        return Glm5NextRecoverKDAMetadata(
+            **vars(metadata),
+            recoverssm_commit=commit,
+            recoverssm_context=(
+                self._get_recoverssm_context() if commit is not None else None
+            ),
+        )
+
+
+class Glm5NextRecoverKDAAttentionBackend(Glm5NextKDAAttentionBackend):
+    @staticmethod
+    def get_name() -> str:
+        return "GLM5NEXT_RECOVER_KDA"
+
+    @staticmethod
+    def get_builder_cls() -> type[Glm5NextRecoverKDAMetadataBuilder]:
+        return Glm5NextRecoverKDAMetadataBuilder
 
 
 _GATE_SIDE_STREAM = os.getenv("VLLM_GLM53_KDA_GATE_SIDE_STREAM", "1") != "0"
@@ -127,6 +244,8 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
         super().__init__(config, vllm_config, prefix)
 
     def get_attn_backend(self) -> type[AttentionBackend]:
+        if self.cache_config.use_kda_recoverssm:
+            return Glm5NextRecoverKDAAttentionBackend
         if (
             self.speculative_config is not None
             and self.speculative_config.enable_adaptive_verification

@@ -395,6 +395,7 @@ def checkpoint_mamba_states_kernel(
     NUM_CAPTURES: tl.constexpr,
     CONV_STATE_DIM_FIRST: tl.constexpr,
     TEMPORAL_TILES: tl.constexpr,
+    ACCEPTED_STATE_COMMITTED: tl.constexpr,
 ):
     batch_idx = tl.program_id(0) // NUM_CAPTURES
     kind = tl.program_id(0) % NUM_CAPTURES
@@ -406,7 +407,9 @@ def checkpoint_mamba_states_kernel(
     if req_idx < 0:
         return
     src_col = tl.load(state_idx_ptr + req_idx)
-    token_bias = tl.load(capture_bias_ptr + batch_idx * NUM_CAPTURES + kind)
+    token_bias = 0
+    if not ACCEPTED_STATE_COMMITTED:
+        token_bias = tl.load(capture_bias_ptr + batch_idx * NUM_CAPTURES + kind)
     group_idx = tl.load(state_group_indices_ptr + state_idx)
     destination = tl.load(
         destination_blocks_ptr
@@ -1425,8 +1428,14 @@ class MambaSpecDecodeGPUContext:
         capture_tokens: torch.Tensor,
         capture_bias: torch.Tensor,
         destination_blocks: torch.Tensor,
+        *,
+        accepted_state_committed: bool = False,
     ) -> None:
-        """Copy only requested endpoints, selecting the committed spec state."""
+        """Copy endpoints from speculative columns or an already recovered state.
+
+        Recovery commits and compacts both convolution and recurrent state.
+        Applying the original acceptance offset again would copy a stale page.
+        """
         assert self.is_initialized
         num_reqs = idx_mapping.numel()
         assert (
@@ -1469,6 +1478,7 @@ class MambaSpecDecodeGPUContext:
             NUM_CAPTURES=NUM_BOUNDARY_CHECKPOINT_SLOTS,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             TEMPORAL_TILES=_TEMPORAL_TILES,
+            ACCEPTED_STATE_COMMITTED=accepted_state_committed,
         )
 
     def run_fused_postprocess_align(

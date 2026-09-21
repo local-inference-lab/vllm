@@ -16,6 +16,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     get_temporal_copy_spec,
 )
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.core.boundary_checkpoint import NUM_BOUNDARY_CHECKPOINT_SLOTS
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -1072,7 +1073,10 @@ def _run_gpu_postprocess(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_boundary_checkpoint_copies_only_selected_committed_states(monkeypatch):
+@pytest.mark.parametrize("accepted_state_committed", [False, True])
+def test_boundary_checkpoint_copies_only_selected_committed_states(
+    monkeypatch, accepted_state_committed
+):
     """Prompt/response copies respect request slots and speculative rollback."""
     monkeypatch.setattr(
         "vllm.v1.worker.mamba_utils.is_conv_state_dim_first", lambda: False
@@ -1091,16 +1095,29 @@ def test_boundary_checkpoint_copies_only_selected_committed_states(monkeypatch):
 
     tables = t([[1, 2, 3, 4, 5, 6], [14, 15, 16, 17, 18, 19]])
     ctx.initialize_from_forward_context(config, context, _COPY_FUNCS, [tables])
-    destinations = torch.zeros((8, 3, 1), device=device, dtype=torch.int32)
-    destinations[3, :, 0] = t([20, 21, 0])
-    destinations[1, :, 0] = t([22, 23, 0])
+    destinations = torch.zeros(
+        (8, NUM_BOUNDARY_CHECKPOINT_SLOTS, 1), device=device, dtype=torch.int32
+    )
+    destinations[3, :2, 0] = t([20, 21])
+    destinations[1, :2, 0] = t([22, 23])
     idx = t([3, 1])
     states = t([0, 1, 0, 0, 0, 0, 0, 0])
-    capture = t([[7, 9, 0], [0, 23, 0]])
-    bias = t([[0, 2, 0], [0, 1, 0]])
+    capture = torch.zeros(
+        (2, NUM_BOUNDARY_CHECKPOINT_SLOTS), device=device, dtype=torch.int32
+    )
+    bias = torch.zeros_like(capture)
+    capture[:, :2] = t([[7, 9], [0, 23]])
+    bias[:, :2] = t([[0, 2], [0, 1]])
 
     def copy():
-        ctx.checkpoint_request_boundaries(idx, states, capture, bias, destinations)
+        ctx.checkpoint_request_boundaries(
+            idx,
+            states,
+            capture,
+            bias,
+            destinations,
+            accepted_state_committed=accepted_state_committed,
+        )
 
     copy()
     graph = torch.cuda.CUDAGraph()
@@ -1109,6 +1126,8 @@ def test_boundary_checkpoint_copies_only_selected_committed_states(monkeypatch):
     graph.replay()
     for layer in range(len(names)):
         for dst, src, shift in ((20, 1, 0), (21, 1, 2), (23, 15, 1)):
+            if accepted_state_committed:
+                shift = 0
             torch.testing.assert_close(
                 conv[layer][dst, : cfg.conv_width - shift],
                 conv_ref[layer][src, shift:],
