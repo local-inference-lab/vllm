@@ -1817,12 +1817,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert self.boundary_checkpoint_state is not None
             self.boundary_checkpoint_state.capture_mamba(idx_mapping, boundary_capture)
 
-        # A logits-only restore already has committed state and no recovery
-        # records to apply, but a terminating sample still needs export.
-        if not logits_only:
-            self.model_state.postprocess_state(
-                idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
-            )
+        if logits_only:
+            return
+
+        self.model_state.postprocess_state(
+            idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
+        )
         if boundary_capture is not None and recover_state:
             assert self.boundary_checkpoint_state is not None
             self.boundary_checkpoint_state.capture_mamba(
