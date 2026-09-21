@@ -389,6 +389,9 @@ class Scheduler(SchedulerInterface):
             if prefill_compute_share is not None
             else None
         )
+        self.prefill_fairness_max_tokens = (
+            self.scheduler_config.max_num_prefill_tokens_per_step or None
+        )
         self._decode_compute_seconds = 0.0
         self._prefill_compute_seconds = 0.0
         self.prefill_interleave_controller = PrefillInterleaveController()
@@ -904,6 +907,17 @@ class Scheduler(SchedulerInterface):
             )
             compute_contention = has_eligible_decode and has_prefill_candidate
             compute_contention_started = compute_contention and not prior_contention
+
+        if (
+            selected_compute_class == "prefill"
+            and compute_contention
+            and self.prefill_fairness_max_tokens is not None
+        ):
+            token_budget = min(token_budget, self.prefill_fairness_max_tokens)
+            input_budget = min(
+                input_budget,
+                self.prefill_fairness_max_tokens + draft_slots,
+            )
 
         legacy_defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
@@ -1510,6 +1524,14 @@ class Scheduler(SchedulerInterface):
                             # its resource checks. Fall back immediately.
                             adaptive_defer_prefills = False
                             defer_prefills = legacy_defer_prefills
+                            if self.prefill_fairness_max_tokens is not None:
+                                token_budget = min(
+                                    token_budget, self.prefill_fairness_max_tokens
+                                )
+                                input_budget = min(
+                                    input_budget,
+                                    self.prefill_fairness_max_tokens + draft_slots,
+                                )
                         else:
                             # DP prefill balancing: defer this step's local
                             # prefill compute to a cadence-aligned step.
@@ -1872,6 +1894,12 @@ class Scheduler(SchedulerInterface):
         ):
             adaptive_defer_prefills = False
             defer_prefills = False
+            if self.prefill_fairness_max_tokens is not None:
+                token_budget = min(token_budget, self.prefill_fairness_max_tokens)
+                input_budget = min(
+                    input_budget,
+                    self.prefill_fairness_max_tokens + draft_slots,
+                )
             schedule_running_requests("prefill")
 
         # A prefill turn gives prefills first use of the model-step capacity.
@@ -2149,6 +2177,9 @@ class Scheduler(SchedulerInterface):
             "prefill_compute_share": self.scheduler_config.prefill_compute_share,
             "prefill_compute_half_life": (
                 self.scheduler_config.prefill_compute_half_life
+            ),
+            "max_num_prefill_tokens_per_step": (
+                self.scheduler_config.max_num_prefill_tokens_per_step
             ),
             "effective_prefill_compute_half_life_seconds": (
                 controller.effective_prefill_compute_half_life
