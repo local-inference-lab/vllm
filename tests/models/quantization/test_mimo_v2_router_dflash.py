@@ -14,6 +14,17 @@ pytestmark = pytest.mark.cpu_test
 
 
 def test_bf16_router_emits_fp32_logits(monkeypatch):
+    # Exercise the CPU fallback without selecting a CUDA/ROCm kernel merely
+    # because the test process runs on a GPU host.
+    from vllm.model_executor.layers.fused_moe.router import gate_linear
+
+    for name in (
+        "is_cuda",
+        "is_rocm",
+        "is_device_capability",
+        "is_device_capability_family",
+    ):
+        monkeypatch.setattr(gate_linear.current_platform, name, lambda *a, **k: False)
     for module in (
         mimo,
         __import__("vllm.model_executor.layers.linear", fromlist=["_"]),
@@ -67,8 +78,10 @@ def test_bf16_router_emits_fp32_logits(monkeypatch):
     assert module.gate.weight.dtype == torch.bfloat16
     assert captured["router_logits_dtype"] == torch.float32
     assert module.gate.e_score_correction_bias.dtype == torch.float32
-    reference = torch.nn.functional.linear(hidden, module.gate.weight).float()
-    torch.testing.assert_close(captured["logits"], reference)
+    reference = torch.nn.functional.linear(hidden.float(), module.gate.weight.float())
+    # The CPU fallback rounds to BF16 before casting the result to FP32.
+    # SM120 accumulation is checked independently by the graph replay test.
+    torch.testing.assert_close(captured["logits"], reference, atol=0.01, rtol=0.004)
     torch.testing.assert_close(result, hidden)
 
 
