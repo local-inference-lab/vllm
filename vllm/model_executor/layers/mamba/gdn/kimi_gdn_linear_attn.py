@@ -1355,6 +1355,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_accepted_tokens: Accepted speculative-token counts, or ``None``
                 for one-token decode requests.
             num_requests: Number of packed requests.
+            apply_output_norm: Whether to apply output normalization in the
+                KDA operation. Defaults to True.
 
         Raises:
             PreparationResourceUnavailableError: If KDA was not prepared for

@@ -18,6 +18,8 @@ from vllm.models.glm5next.nvidia.kda import (
     Glm5NextRecoverKDAMetadataBuilder,
 )
 from vllm.models.glm5next.nvidia.model import Glm5NextForCausalLM
+from vllm.models.kimi_k3.amd.kda_metadata import KimiK3ROCmKDAMetadataBuilder
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -152,7 +154,7 @@ def test_glm_recoverssm_reserves_one_recurrent_state_per_draft_window():
     )
 
 
-def _builder() -> Glm5NextRecoverKDAMetadataBuilder:
+def _builder(builder_cls=Glm5NextRecoverKDAMetadataBuilder):
     config = SimpleNamespace(
         model_config=SimpleNamespace(
             hf_text_config=SimpleNamespace(model_type="glm5_next")
@@ -186,7 +188,7 @@ def _builder() -> Glm5NextRecoverKDAMetadataBuilder:
         mamba_cache_mode="none",
         num_speculative_blocks=0,
     )
-    builder = Glm5NextRecoverKDAMetadataBuilder(
+    builder = builder_cls(
         spec,
         ["layer.0"],
         config,
@@ -194,6 +196,29 @@ def _builder() -> Glm5NextRecoverKDAMetadataBuilder:
     )
     builder._recoverssm_context = Mock()
     return builder
+
+
+@pytest.mark.parametrize(
+    "builder_cls", [GDNAttentionMetadataBuilder, KimiK3ROCmKDAMetadataBuilder]
+)
+def test_full_state_backends_keep_every_speculative_state_column(builder_cls):
+    """A global recovery flag cannot narrow metadata for full-state kernels."""
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[50, 30], query_lens=[3, 3]),
+        16,
+        torch.device("cpu"),
+    )
+    builder = _builder(builder_cls)
+    metadata = builder.build(
+        0,
+        common,
+        num_decode_draft_tokens_cpu=torch.tensor([2, 2]),
+        num_accepted_tokens=torch.tensor([3, 2]),
+    )
+    assert builder.spec_state_indices_tensor.shape[1] == 3
+    torch.testing.assert_close(
+        metadata.spec_state_indices_tensor, common.block_table_tensor[:, :3]
+    )
 
 
 def test_glm_recoverssm_mixed_prefill_and_decode_keeps_one_state_slot():

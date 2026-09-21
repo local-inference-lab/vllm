@@ -84,6 +84,7 @@ class Glm5NextRecoverKDAMetadata(KimiK3KDAMetadata):
 
 class Glm5NextRecoverKDAMetadataBuilder(Glm5NextKDAMetadataBuilder):
     supports_update_block_table = False
+    supports_kda_state_recovery = True
 
     def __init__(
         self,
