@@ -160,32 +160,31 @@ def test_fused_qkv_proj_sharding(geometry, tp_size):
 
 
 @pytest.mark.parametrize("geometry", ["ga", "swa"])
-@pytest.mark.parametrize("tp_size", [1, 2, 4])
-def test_exact_chunk_matches_checkpoint(geometry, tp_size):
-    """At tp_size <= ckpt_tp the chunk count is the only thing that matters."""
+@pytest.mark.parametrize("tp_rank", [0, 1, 2, 3])
+def test_exact_chunk_matches_checkpoint(geometry, tp_rank):
+    """Every TP4 rank retains its exported bytes and scale grid exactly."""
     num_heads, num_kv_heads, head_dim, v_head_dim, ckpt_tp = GEOMETRIES[geometry]
     rows_per_chunk = _chunk_rows(num_heads, num_kv_heads, head_dim, v_head_dim, ckpt_tp)
     truth = torch.randn(ckpt_tp * rows_per_chunk, COLS)
     weight, scale = _quantize_chunks(
         truth, num_heads, num_kv_heads, head_dim, v_head_dim, ckpt_tp
     )
-    if tp_size == ckpt_tp:
-        w_rank, s_rank = _shard_fp8_qkv_proj(
-            weight,
-            scale,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            v_head_dim=v_head_dim,
-            tp_rank=0,
-            tp_size=tp_size,
-            ckpt_tp=ckpt_tp,
-        )
-        # The checkpoint chunk *is* the rank's slice: no re-quantization.
-        # (torch.equal has no fp8 kernel, so compare the underlying bytes.)
-        expected_w = weight.chunk(tp_size, dim=0)[0]
-        assert torch.equal(w_rank.view(torch.uint8), expected_w.view(torch.uint8))
-        assert torch.equal(s_rank, scale.chunk(tp_size, dim=0)[0])
+    w_rank, s_rank = _shard_fp8_qkv_proj(
+        weight,
+        scale,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        v_head_dim=v_head_dim,
+        tp_rank=tp_rank,
+        tp_size=ckpt_tp,
+        ckpt_tp=ckpt_tp,
+    )
+    # The checkpoint chunk is the rank's slice, without re-quantization.
+    # torch.equal has no FP8 kernel, so compare the underlying bytes.
+    expected_w = weight.chunk(ckpt_tp, dim=0)[tp_rank]
+    assert torch.equal(w_rank.view(torch.uint8), expected_w.view(torch.uint8))
+    assert torch.equal(s_rank, scale.chunk(ckpt_tp, dim=0)[tp_rank])
 
 
 def test_wrong_chunk_count_is_detected():
