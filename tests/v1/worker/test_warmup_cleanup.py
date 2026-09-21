@@ -34,3 +34,37 @@ def test_successful_warmup_keeps_worker_alive(monkeypatch):
     )
     assert gpu_worker.Worker.compile_or_warm_up_model(worker) == "ready"
     worker.shutdown.assert_not_called()
+
+
+@pytest.mark.parametrize("offload_gb", [0, 27])
+def test_offload_pool_is_released_before_shutdown_acknowledgement(
+    monkeypatch, offload_gb
+):
+    events = []
+    monkeypatch.setattr(gpu_worker, "ensure_kv_transfer_shutdown", None)
+    monkeypatch.setattr(gpu_worker, "ensure_ec_transfer_shutdown", None)
+    monkeypatch.setattr(gpu_worker.current_platform, "is_cuda_alike", lambda: False)
+    monkeypatch.setattr(gpu_worker.gc, "unfreeze", lambda: None)
+    monkeypatch.setattr(gpu_worker.gc, "collect", lambda: events.append("collect"))
+    monkeypatch.setattr(gpu_worker.torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        gpu_worker.torch.accelerator,
+        "empty_host_cache",
+        lambda: events.append("host_pool"),
+    )
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            offload_config=SimpleNamespace(
+                uva=SimpleNamespace(cpu_offload_gb=offload_gb)
+            )
+        ),
+        profiler=None,
+        elastic_ep_executor=SimpleNamespace(shutdown=lambda: None),
+        model_runner=SimpleNamespace(shutdown=lambda: events.append("readers_owners")),
+        _record_b12x_lifecycle=lambda stage: events.append(stage),
+    )
+    gpu_worker.Worker.shutdown(worker)
+    expected = ["before_worker_shutdown", "readers_owners", "collect"]
+    if offload_gb:
+        expected.append("host_pool")
+    assert events == expected + ["after_worker_shutdown"]

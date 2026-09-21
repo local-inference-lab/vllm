@@ -1765,6 +1765,11 @@ class Worker(WorkerBase):
         del model_runner
         gc.collect()
         torch.accelerator.empty_cache()
+        if self.vllm_config.offload_config.uva.cpu_offload_gb:
+            # Offloaded weights can leave tens of GiB in the pinned allocator
+            # after their live owners are gone. Retire that cache before the
+            # explicit shutdown acknowledgement, not during process finalization.
+            torch.accelerator.empty_host_cache()
         self._record_b12x_lifecycle("after_worker_shutdown")
 
     def _record_b12x_lifecycle(self, stage: str) -> None:
