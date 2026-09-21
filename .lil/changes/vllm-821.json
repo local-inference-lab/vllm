@@ -9,6 +9,7 @@
     "Eligible SM12x Model Runner V2 configurations select B12X state recovery automatically for MTP or DFlash with one to seven draft tokens.",
     "LMCache checkpoints capture the accepted recurrent state after recovery and convolution compaction; changed prompt tails and generated-response continuation remain reusable.",
     "In the qualified TP2 Spark MTP3 LMCache configuration, fixed per-request reservation falls by approximately 188 MiB per GPU; maximum single-request context is unchanged.",
+    "Matched TP4 LMCache measurements show MTP3 C1 output -3.1%, C8 output -1.8% and prefill -0.3%; DFlash2 prefill changes -0.1% with similar decode throughput. This is a memory optimization, not a speedup claim.",
     "The existing atomic LMCache adapter remains text-only; multimodal generation and native GPU prefix caching are unchanged.",
     "Use --no-use-replayssm for the full-state diagnostic path."
   ],
