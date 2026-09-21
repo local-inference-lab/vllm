@@ -1356,30 +1356,47 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_tokens_tensor,
         ) = bound_metadata
 
-        binding = api.bind_kda(
-            plan,
-            scratch=scratch,
-            mixed_qkv=mixed_qkv,
-            raw_g=raw_g,
-            raw_beta=raw_beta,
-            z=z,
-            A_log=self.A_log,
-            dt_bias=self.dt_bias.view(self.local_num_heads, self.head_dim),
-            norm_weight=self.o_norm.weight,
-            recurrent_state=self.kv_cache[1],
-            query_start_loc=query_start_loc,
-            num_accepted_tokens=accepted_tokens,
-            state_indices=state_indices[:num_requests, :state_columns],
-            num_seqs=num_seqs,
-            num_tokens=num_tokens_tensor,
-            output=output,
-        )
+        def bind(destination: torch.Tensor) -> Any:
+            return api.bind_kda(
+                plan,
+                scratch=scratch,
+                mixed_qkv=mixed_qkv,
+                raw_g=raw_g,
+                raw_beta=raw_beta,
+                z=z,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias.view(self.local_num_heads, self.head_dim),
+                norm_weight=self.o_norm.weight,
+                recurrent_state=self.kv_cache[1],
+                query_start_loc=query_start_loc,
+                num_accepted_tokens=accepted_tokens,
+                state_indices=state_indices[:num_requests, :state_columns],
+                num_seqs=num_seqs,
+                num_tokens=num_tokens_tensor,
+                output=destination,
+            )
+
+        destination = output
+        try:
+            binding = bind(destination)
+        except ValueError as error:
+            if str(error) != (
+                "mutable buffer output must not overlap read-only tensor raw_g"
+            ):
+                raise
+            # An overlapping destination cannot be used while B12X reads the
+            # gate. Copy back only after recurrence has consumed that input;
+            # disjoint destinations keep the allocation-free path.
+            destination = torch.empty_like(output)
+            binding = bind(destination)
         api.run_kda(
             binding,
             lower_bound=self.gate_lower_bound,
             eps=self.o_norm.eps,
             scale=self.head_dim**-0.5,
         )
+        if destination is not output:
+            output.copy_(destination)
 
     def forward(
         self,
