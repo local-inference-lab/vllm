@@ -104,6 +104,7 @@ def _build_config(
     kv_connector_extra_config: dict | None = None,
     enable_sleep_mode: bool = False,
     enable_cumem_allocator: bool = False,
+    model_type: str | None = None,
 ) -> VllmConfig:
     """Build a model-free config for KV-transfer compatibility checks.
 
@@ -112,6 +113,7 @@ def _build_config(
         kv_connector_extra_config: Optional connector-specific configuration.
         enable_sleep_mode: Whether sleep mode is enabled.
         enable_cumem_allocator: Whether the cuMem allocator is enabled.
+        model_type: Optional Hugging Face model type.
 
     Returns:
         A VllmConfig suitable for exercising KV-transfer compatibility checks.
@@ -135,9 +137,33 @@ def _build_config(
     cfg.model_config = SimpleNamespace(
         enable_sleep_mode=enable_sleep_mode,
         enable_cumem_allocator=(enable_cumem_allocator or enable_sleep_mode),
+        hf_text_config=SimpleNamespace(model_type=model_type),
     )
     cfg._verify_kv_transfer_compat()
     return cfg
+
+
+@pytest.mark.parametrize("supports_atomic_checkpoints", [False, True])
+def test_qwen_qsa_requires_atomic_checkpoint_connector(
+    monkeypatch, supports_atomic_checkpoints
+):
+    class _StubConnector:
+        @classmethod
+        def supports_request_boundary_checkpoints(cls, config):
+            del config
+            return supports_atomic_checkpoints
+
+    monkeypatch.setattr(
+        KVConnectorFactory,
+        "get_connector_class",
+        lambda config: _StubConnector,
+    )
+
+    if supports_atomic_checkpoints:
+        _build_config(kv_connector="stub", model_type="qwen3_8_flash_next_text")
+    else:
+        with pytest.raises(ValueError, match="atomic request-boundary"):
+            _build_config(kv_connector="stub", model_type="qwen3_8_flash_next_text")
 
 
 @pytest.mark.parametrize(
