@@ -1527,6 +1527,18 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         super().__init__(exclude_modules)
         self.kv_cache_quant_method = kv_cache_quant_method
         self.quantized_layers = quantized_layers
+        for prefix, recipe in quantized_layers.items():
+            if recipe.get("quant_algo", "").upper() == "IQ2_XS" and any(
+                recipe.get(key) != value
+                for key, value in {
+                    "group_size": 256,
+                    "block_payload_bytes": 74,
+                    "packing": "ggml",
+                }.items()
+            ):
+                raise ValueError(
+                    f"unsupported IQ2_XS block contract for {prefix}: {recipe}"
+                )
         self.fp8_config = fp8_config
         self.nvfp4_config = nvfp4_config
         self.w4a16_nvfp4_config = w4a16_nvfp4_config
@@ -1775,6 +1787,18 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             return None
 
         quant_algo = self._resolve_quant_algo(prefix)
+
+        if quant_algo == "IQ2_XS":
+            from vllm.model_executor.layers.quantization.modelopt_iq2_xs import (
+                ModelOptIQ2XSLinearMethod,
+                ModelOptIQ2XSMoEMethod,
+            )
+
+            if isinstance(layer, RoutedExperts):
+                return ModelOptIQ2XSMoEMethod(layer.moe_config)
+            if isinstance(layer, LinearBase):
+                return ModelOptIQ2XSLinearMethod()
+            raise ValueError("IQ2_XS requires a dense linear or routed experts")
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             # Per-prefix algo -> its sub-config, then the generic linear method.
