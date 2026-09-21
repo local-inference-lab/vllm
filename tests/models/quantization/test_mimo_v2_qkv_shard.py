@@ -231,8 +231,13 @@ def test_malformed_scale_grid_rejected(scale_rows):
         _shard_fp8_qkv_proj(
             torch.zeros(14848, COLS, dtype=FP8_DTYPE),
             torch.ones(scale_rows, 1),
-            num_heads=64, num_kv_heads=8, head_dim=192, v_head_dim=128,
-            tp_rank=0, tp_size=4, ckpt_tp=4,
+            num_heads=64,
+            num_kv_heads=8,
+            head_dim=192,
+            v_head_dim=128,
+            tp_rank=0,
+            tp_size=4,
+            ckpt_tp=4,
         )
 
 
@@ -254,7 +259,7 @@ def test_fused_qkv_loaders(monkeypatch, loader, tp_size, scale_first):
     module = target if loader == "target" else mtp
     monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: tp_size)
     for rank in range(tp_size):
-        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: rank)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda rank=rank: rank)
         local_rows = (64 // tp_size) * 192 + (8 // tp_size) * 320
         attn = torch.nn.Module()
         attn.total_num_heads, attn.total_num_kv_heads = 64, 8
