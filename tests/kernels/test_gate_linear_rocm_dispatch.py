@@ -11,6 +11,8 @@ ROCm's fused ``torch.mm`` branch and SM120's router branches are both guarded on
 ``not bias`` so a biased gate cannot silently drop its bias term.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -62,7 +64,15 @@ def _make_gate(
             lambda: True,
         )
     if is_rocm:
-        import vllm.platforms.rocm as rocm_platform
+        # The module resolves its architecture at import time. Mock that
+        # hardware probe too, so eligibility tests remain device-free.
+        with monkeypatch.context() as probe:
+            probe.setattr(
+                torch.cuda,
+                "get_device_properties",
+                lambda *args, **kwargs: SimpleNamespace(gcnArchName="gfx950"),
+            )
+            import vllm.platforms.rocm as rocm_platform
 
         monkeypatch.setattr(rocm_platform, "on_gfx950", lambda: on_gfx950)
 
