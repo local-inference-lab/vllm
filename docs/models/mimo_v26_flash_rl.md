@@ -4,7 +4,9 @@ This recipe targets `XiaomiMiMo/MiMo-V2.6-Flash-RL` at revision
 `3b38d063180c3e4aed9691fdc735f3d10b266ee4`. On `dev/karmic-kraken`, include
 [the QKV/MTP loader backport](https://github.com/local-inference-lab/vllm/pull/828)
 and [the router/DFlash backport](https://github.com/local-inference-lab/vllm/pull/829)
-for this checkpoint. Hardware qualification of this recipe is pending.
+for this checkpoint. Also include [the SM120 compilation fix](https://github.com/local-inference-lab/vllm/pull/831)
+and [target/MTP cache-policy propagation](https://github.com/local-inference-lab/vllm/pull/832).
+Hardware qualification of this combined recipe is pending.
 
 The model combines 9 global and 39 sliding-window decoder layers. Global layers
 have 64 query heads and 4 KV heads; sliding layers have 64 query heads and 8 KV
@@ -94,7 +96,14 @@ VLLM_USE_V2_MODEL_RUNNER=1 vllm serve models/mimo-v26-flash-rl \
   --hf-overrides "$MIMO_PROCESSOR_OVERRIDE"
 ```
 
-For E4M3 KV, replace only `--kv-cache-dtype bfloat16` with
+On SM120, MiMo automatically selects `TRITON_ATTN_DIFFKV` for its unequal K/V
+heads. Confirm `Using TRITON_ATTN_DIFFKV for attention.` in the startup log.
+The generic `TRITON_ATTN` option above serves the multimodal encoders; it does
+not force the decoder backend. On SM90/SM100 the decoder can choose FA DiffKV
+instead, which is outside this recipe's SM120 qualification. A global
+`TRITON_ATTN_DIFFKV` option cannot serve the equal-head-dimension encoders.
+
+With the cache-policy propagation fix present, for E4M3 KV replace only `--kv-cache-dtype bfloat16` with
 `--kv-cache-dtype fp8_e4m3`. Record actual buffers and scale values; an accepted
 CLI option alone is not proof of one-byte storage or acceptable model quality.
 The standard scale loader uses checkpoint K/V scales when supplied and fixed
@@ -106,7 +115,7 @@ For DFlash K7, add:
 --speculative-config '{"method":"dflash","model":"models/mimo-v26-flash-rl/dflash","num_speculative_tokens":7}'
 ```
 
-The separate draft has five layers and block size eight. Record draft cache
+The separate draft has five layers and speculative block size eight (seven draft tokens). Record draft cache
 precision independently of the target. The three embedded MTP layers are a
 different artifact; the fork's supported native MTP mode uses one layer and
 `--speculative-config '{"method":"mtp","num_speculative_tokens":1}'`.
@@ -121,6 +130,7 @@ request; only successful long-context inference establishes a tested limit.
 ```sh
 python3 -m pytest tests/models/quantization/test_mimo_v2_qkv_shard.py \
   tests/models/quantization/test_mimo_v2_router_dflash.py \
+  tests/models/quantization/test_mimo_v2_cache_config.py \
   tests/v1/attention/test_triton_diffkv_config.py -q
 python3 -m pytest tests/kernels/attention/test_triton_diffkv_fp8.py -q
 python3 -m pytest tests/models/multimodal/test_mimo_v2_omni.py -q
