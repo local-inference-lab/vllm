@@ -939,8 +939,17 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
-        with set_current_vllm_config(self.vllm_config):
-            return self._compile_or_warm_up_model_after_preparation()
+        try:
+            with set_current_vllm_config(self.vllm_config):
+                return self._compile_or_warm_up_model_after_preparation()
+        except BaseException:
+            # EngineCore is not yet constructed, so its normal shutdown owner
+            # cannot retire graphs, prepared storage, or CPU weight sources.
+            try:
+                self.shutdown()
+            except Exception:
+                logger.exception("Worker teardown failed after warmup failure")
+            raise
 
     def _compile_or_warm_up_model_after_preparation(self) -> CompilationTimes:
         warmup_sizes: list[int] = []
