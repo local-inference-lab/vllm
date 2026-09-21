@@ -6,8 +6,7 @@
   "models": ["Qwen3.8-Flash-Next"],
   "compatibility": "YaRN deployments should verify their configured target and draft context limits before serving.",
   "details": [
-    "Dictionary-based target Hugging Face overrides reach the internally constructed MTP draft after its model type and architecture are normalized.",
-    "QSA prefill plan selection covers the configured one-million-token context ceiling."
+    "Dictionary-based target Hugging Face overrides reach the internally constructed MTP draft after its model type and architecture are normalized."
   ],
   "pull_requests": [777],
   "requires": []
