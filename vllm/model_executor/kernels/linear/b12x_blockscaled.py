@@ -31,6 +31,8 @@ logger = init_logger(__name__)
 
 
 def _operands(packed, recipe: str):
+    if recipe == "iq2_xs":
+        return packed.values, packed.metadata, None, "none"
     if recipe == "nvfp4":
         return (
             packed.values,
@@ -52,15 +54,17 @@ class B12xBlockscaledLinear:
         layer_name: str,
         activation_scale: torch.Tensor | None = None,
     ) -> None:
-        if recipe not in ("nvfp4", "mxfp8"):
-            raise ValueError("block-scaled linear recipe must be nvfp4 or mxfp8")
+        if recipe not in ("nvfp4", "mxfp8", "iq2_xs"):
+            raise ValueError(
+                "block-scaled linear recipe must be nvfp4, mxfp8 or iq2_xs"
+            )
         self.packed = packed
         self.recipe = recipe
         self.activation_mode = activation_mode
         self.layer_name = layer_name
         self.activation_scale = activation_scale
         self.plan = None
-        self._plan_key = None
+        self._plan_key: tuple[int, tuple[int, ...]] | None = None
 
     @property
     def out_features(self) -> int:
@@ -108,6 +112,7 @@ class B12xBlockscaledLinear:
         """
         key = (workload.max_tokens, workload.fixed_token_counts)
         if self.plan is not None:
+            assert self._plan_key is not None
             if self._plan_key != key:
                 if workload.max_tokens != self._plan_key[0]:
                     raise ValueError(

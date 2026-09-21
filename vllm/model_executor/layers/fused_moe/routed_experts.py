@@ -850,14 +850,13 @@ class RoutedExperts(PluggableLayer):
                 per_expert_mapping.setdefault(prefix, []).append(mapping)
         for expert_name, loaded_weight in weights:
             qual_name = f"{self.layer_name}.{expert_name}"
-            # Fused expert weights can be identified by their 3D tensors
-            is_fused = loaded_weight.dim() == 3
+            named_expert_mapping = per_expert_mapping.get(expert_name.partition(".")[0])
+            # Block-encoded per-expert tensors can also have three dimensions.
+            is_fused = loaded_weight.dim() == 3 and named_expert_mapping is None
             mappings = expert_mapping
             if not is_fused:
                 # Retain every physical replica and both halves of packed gate/up.
-                mappings = per_expert_mapping.get(
-                    expert_name.partition(".")[0], expert_mapping
-                )
+                mappings = named_expert_mapping or expert_mapping
             matched = False
             for param_name, weight_name, expert_id, shard_id in mappings:
                 if weight_name not in qual_name:
