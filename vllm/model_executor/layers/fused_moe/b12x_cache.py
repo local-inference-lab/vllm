@@ -50,6 +50,20 @@ class _CacheProvider:
             raise ValueError(
                 "experimental canonical expert-cache loader requires SM120"
             )
+        # Validate every target expert before layer construction can allocate
+        # sources. MTP is optional draft storage, not part of this target lane.
+        if getattr(config.model_config.hf_config, "model_type", None) == "qwen3_next":
+            from b12x.integration.vllm.checkpoint import audit
+
+            self.checkpoint_audit = audit(config.model_config.model, check_values=True)
+            if (
+                self.checkpoint_audit["host_expert_lower_bound_bytes"]
+                + settings.host_safety_bytes
+                > settings.host_bytes
+            ):
+                raise ValueError(
+                    "CPU expert sources plus mapped backing exceed the host envelope"
+                )
         self.model = ExpertCacheModel(
             settings,
             checkpoint_fingerprint(config.model_config.model),
@@ -225,9 +239,12 @@ class ModelOptNvFp4CacheMoE(ModelOptNvFp4FusedMoE):
     ):
         from b12x.moe import fused_moe as moe
 
-        if shared_experts is not None or workspace is not None:
+        # MoERunner owns external shared execution, stream ordering and output
+        # combination. This method returns only routed output and never invokes
+        # the shared wrapper. Its prepared routed scratch cannot be borrowed.
+        if workspace is not None:
             raise ValueError(
-                "experimental cache backend does not own shared-expert scratch"
+                "experimental cache backend does not accept caller-owned scratch"
             )
         model = self.provider.model
         binding = moe.bind(
