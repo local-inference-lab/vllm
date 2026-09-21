@@ -67,3 +67,54 @@ def test_mimo_attention_receives_cache_policy(monkeypatch, kind, dtype):
     # The whole policy must reach Attention, including scale calibration and
     # intentional skip layers, not just a copied dtype string.
     assert observed[0] is cache_config
+
+
+@pytest.mark.parametrize("window", [-1, 128])
+@pytest.mark.parametrize("skip_layer", [False, True])
+def test_mimo_preserves_per_layer_window_and_cache_spec(
+    monkeypatch, window, skip_layer
+):
+    from vllm.config import CacheConfig, set_current_vllm_config
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+    monkeypatch.setattr(mimo, "get_tensor_model_parallel_world_size", lambda: 4)
+    for name in ("QKVParallelLinear", "RowParallelLinear", "get_rope"):
+        monkeypatch.setattr(mimo, name, lambda *a, **k: torch.nn.Identity())
+    cache_config = CacheConfig(
+        cache_dtype="bfloat16",
+        block_size=16,
+        sliding_window=128,
+        kv_cache_dtype_skip_layers=["0"] if skip_layer else [],
+    )
+    vconfig = SimpleNamespace(
+        model_config=SimpleNamespace(dtype=torch.bfloat16, is_mm_prefix_lm=False),
+        cache_config=cache_config,
+        attention_config=SimpleNamespace(
+            backend=AttentionBackendEnum.TRITON_ATTN_DIFFKV
+        ),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    with set_current_vllm_config(vconfig):
+        layer = mimo.MiMoV2Attention(
+            hidden_size=4096,
+            num_heads=64,
+            num_kv_heads=8 if window == 128 else 4,
+            head_dim=192,
+            v_head_dim=128,
+            sliding_window_size=window,
+            cache_config=cache_config,
+            prefix="model.layers.0.self_attn",
+        )
+        spec = layer.attn.get_kv_cache_spec(vconfig)
+    assert cache_config.sliding_window == 128
+    assert layer.attn.kv_cache_dtype == ("auto" if skip_layer else "bfloat16")
+    assert layer.attn.query_quant is None
+    assert spec.dtype == torch.bfloat16
+    if window == -1:
+        assert layer.attn.sliding_window is None
+        assert type(spec) is FullAttentionSpec
+    else:
+        assert layer.attn.sliding_window == 128
+        assert type(spec) is SlidingWindowSpec
+        assert spec.sliding_window == 128
