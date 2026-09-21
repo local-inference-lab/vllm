@@ -572,8 +572,15 @@ class Worker(WorkerBase):
 
     def _release_b12x_profile_state(self) -> None:
         batch, self._b12x_profile_batch = self._b12x_profile_batch, None
-        if batch is not None:
-            batch.release()
+        try:
+            if batch is not None:
+                batch.release()
+        finally:
+            # Plans can outlive the runner's profiling-pool teardown.
+            del batch
+            gc.collect()
+            torch.accelerator.synchronize()
+            torch.accelerator.empty_cache()
 
     def advance_b12x_preparation(
         self, *, cancel_tuning: bool = False
@@ -589,8 +596,10 @@ class Worker(WorkerBase):
             # Timing trials leave freed blocks in the caching allocator; return
             # them so memory profiling after the weights stage sees the same
             # free memory as a start that reused cached selections.
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+            del coordinator
+            gc.collect()
+            torch.accelerator.synchronize()
+            torch.accelerator.empty_cache()
         return outcome
 
     def abort_b12x_preparation(self) -> dict[str, object]:
@@ -850,6 +859,12 @@ class Worker(WorkerBase):
     @instrument(span_name="Allocate KV cache")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
+
+        # Reclaim temporary profiling/tuning allocations on every rank before
+        # allocating the serving pool, including when its size is explicit.
+        gc.collect()
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
 
         # Update local config with adjusted num blocks after profiling,
         # so that it's available to the warmup stage.

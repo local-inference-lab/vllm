@@ -309,6 +309,7 @@ class DraftModelSpeculator(BaseSpeculator):
 
     def reset_attn(self) -> None:
         """Release attention builders, tables, and graphs created by set_attn."""
+        self.pcp_manager = None
         for name in (
             "model_state",
             "kv_cache_config",

@@ -347,6 +347,11 @@ class B12xC4SparseIndexer(nn.Module):
                 self, describe, group=get_dcp_group()
             )
 
+    def clear_b12x_index_cache(self) -> None:
+        """Detach pool-derived views and plans before releasing the KV pool."""
+        self._plans.clear()
+        self._index_cache = None
+
     @property
     def _num_q_heads(self) -> int:
         return self._index_num_q_heads or int(getattr(self.k_cache, "num_q_heads", 1))

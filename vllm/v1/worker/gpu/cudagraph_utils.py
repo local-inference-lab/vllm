@@ -1387,6 +1387,11 @@ def _init_minimal_kv_cache_for_profiling(
 def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
     """Release the profiling KV cache and captured graphs while keeping model
     weights, so the real ``initialize_kv_cache`` starts from a clean slate."""
+    ubatch_runner = getattr(runner, "ubatch_runner", None)
+    if ubatch_runner is not None:
+        ubatch_runner.abort_pending_run()
+        runner.ubatch_runner = None
+    del ubatch_runner
     torch.accelerator.synchronize()
     if hasattr(runner.model_state, "_mamba_ctx"):
         runner.model_state._mamba_ctx = None

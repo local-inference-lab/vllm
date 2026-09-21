@@ -6,6 +6,9 @@ Compares chunk_kda against a naive recurrent reference (float32).
 Uses torch.rand for q/k/v to match FLA's test pattern.
 """
 
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -1141,6 +1144,58 @@ def test_fused_kda_decode_rejects_speculative_conv_state():
         input_dtype=torch.bfloat16,
         conv_state_dtype=torch.bfloat16,
         recurrent_state_dtype=torch.float32,
+    )
+
+
+def test_flashkda_sm120_local_copy_preserves_cuda_stack_limit():
+    """CTA-local workspace loads must not reserve a cluster-copy syscall stack."""
+    capability = current_platform.get_device_capability()
+    if not current_platform.is_cuda() or capability is None or capability.major != 12:
+        pytest.skip("This regression concerns the SM120 bulk-copy lowering")
+    if not is_flashkda_supported(128, torch.bfloat16, torch.float32, -5.0):
+        pytest.skip("FlashKDA is not supported on this platform")
+
+    # A fresh context prevents another kernel's retained stack from hiding the
+    # first-launch reservation. No model weights or memory-pressure allocation.
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent("""
+                import torch
+                import vllm._flashkda_C
+                from cuda.bindings import runtime
+
+                def stack_limit():
+                    status, limit = runtime.cudaDeviceGetLimit(
+                        runtime.cudaLimit.cudaLimitStackSize)
+                    assert int(status) == 0
+                    return limit
+
+                q = torch.zeros((1, 32, 2, 128), dtype=torch.bfloat16, device="cuda")
+                beta = torch.zeros((1, 32, 2), dtype=q.dtype, device=q.device)
+                state = torch.zeros((1, 2, 128, 128), device=q.device)
+                final = torch.full_like(state, float("nan"))
+                out = torch.full_like(q, float("nan"))
+                a_log = torch.zeros(2, device=q.device)
+                bias = torch.zeros((2, 128), device=q.device)
+                lengths = torch.tensor([0, 32], dtype=torch.int32, device=q.device)
+                scratch = torch.empty(
+                    torch.ops._flashkda_C.get_workspace_size(32, 2, 1),
+                    dtype=torch.uint8, device=q.device)
+                torch.accelerator.synchronize()
+                before = stack_limit()
+                torch.ops._flashkda_C.fwd(
+                    q, q, q, q, beta, 128**-0.5, out, scratch,
+                    a_log, bias, -5.0, state, final, lengths)
+                torch.accelerator.synchronize()
+                after = stack_limit()
+                assert (out == 0).all() and (final == 0).all()
+                assert after <= before, f"CUDA stack grew: {before} -> {after}"
+            """),
+        ],
+        check=True,
+        timeout=120,
     )
 
 
