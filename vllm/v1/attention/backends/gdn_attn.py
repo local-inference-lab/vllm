@@ -149,6 +149,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
     kv_cache_spec: MambaSpec
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     supports_update_block_table: bool = True
+    supports_kda_state_recovery: bool = False
 
     # Runner-owned stable storage, with NULL_BLOCK_ID in padded request rows.
     mamba_aligned_state_indices: torch.Tensor | None = None
@@ -198,9 +199,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         else:
             self.num_spec = 0
         self.use_spec_decode: bool = self.num_spec > 0
-        self.state_index_columns = (
-            1 if vllm_config.cache_config.use_kda_recoverssm else self.num_spec + 1
+        use_kda_state_recovery = (
+            self.supports_kda_state_recovery
+            and vllm_config.cache_config.use_kda_recoverssm
         )
+        self.state_index_columns = 1 if use_kda_state_recovery else self.num_spec + 1
         self._b12x_mixed = (
             B12xGdnMixedMetadata(
                 max_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
@@ -208,8 +211,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 state_columns=self.num_spec + 1,
                 device=device,
             )
-            if self.gdn_prefill_backend == "b12x"
-            and not vllm_config.cache_config.use_kda_recoverssm
+            if self.gdn_prefill_backend == "b12x" and not use_kda_state_recovery
             else None
         )
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
@@ -269,8 +271,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self._decode_state_indices_source: torch.Tensor | None = None
         self._decode_state_indices_view: torch.Tensor | None = None
         self._reuse_spec_decode_inputs = (
-            envs.VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH
-            and not vllm_config.cache_config.use_kda_recoverssm
+            envs.VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH and not use_kda_state_recovery
         )
         # Constant sources for the uniform spec-decode fast path. They are
         # copied into the builder-owned graph buffers above, never handed to
