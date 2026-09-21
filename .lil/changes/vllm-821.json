@@ -14,7 +14,7 @@
     "Use --no-use-replayssm for the full-state diagnostic path."
   ],
   "pull_requests": [821],
-  "requires": ["b12x-408"],
+  "requires": ["b12x-408", "b12x-409"],
   "evidence": [
     "https://github.com/local-inference-lab/rtx6kpro/blob/master/benchmarks/glm53-kda-recovery-lmcache.md"
   ]
