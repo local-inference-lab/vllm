@@ -21,17 +21,30 @@ def test_bf16_router_emits_fp32_logits(monkeypatch):
     ):
         monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
         monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(mimo, "get_ep_group", lambda: SimpleNamespace(
-        device_group=SimpleNamespace(size=lambda: 1)))
+    monkeypatch.setattr(
+        mimo,
+        "get_ep_group",
+        lambda: SimpleNamespace(device_group=SimpleNamespace(size=lambda: 1)),
+    )
     config = SimpleNamespace(
-        hidden_size=32, n_routed_experts=8, hidden_act="silu",
-        moe_router_dtype="bfloat16", num_experts_per_tok=2,
-        moe_intermediate_size=64, norm_topk_prob=True, n_group=1, topk_group=1,
+        hidden_size=32,
+        n_routed_experts=8,
+        hidden_act="silu",
+        moe_router_dtype="bfloat16",
+        num_experts_per_tok=2,
+        moe_intermediate_size=64,
+        norm_topk_prob=True,
+        n_group=1,
+        topk_group=1,
     )
     vconfig = SimpleNamespace(
-        model_config=SimpleNamespace(hf_text_config=config), quant_config=None,
-        parallel_config=SimpleNamespace(use_sequence_parallel_moe=False,
-            enable_eplb=False, eplb_config=SimpleNamespace(num_redundant_experts=0)),
+        model_config=SimpleNamespace(hf_text_config=config),
+        quant_config=None,
+        parallel_config=SimpleNamespace(
+            use_sequence_parallel_moe=False,
+            enable_eplb=False,
+            eplb_config=SimpleNamespace(num_redundant_experts=0),
+        ),
     )
     monkeypatch.setattr(mimo, "get_current_vllm_config", lambda: vconfig)
     captured = {}
@@ -69,10 +82,16 @@ def test_dflash_query_values_scaled_once(value_scale):
         return v
 
     module = SimpleNamespace(
-        qkv_proj=lambda _: (qkv, None), q_size=4, kv_size=4, head_dim=2,
-        q_norm=lambda x: x, k_norm=lambda x: x,
-        rotary_emb=lambda positions, q, k: (q, k), attn=attention,
-        o_proj=lambda x: (x, None), v_scale=value_scale,
+        qkv_proj=lambda _: (qkv, None),
+        q_size=4,
+        kv_size=4,
+        head_dim=2,
+        q_norm=lambda x: x,
+        k_norm=lambda x: x,
+        rotary_emb=lambda positions, q, k: (q, k),
+        attn=attention,
+        o_proj=lambda x: (x, None),
+        v_scale=value_scale,
     )
     output = dflash.DFlashQwen3Attention.forward(
         module, torch.arange(2), torch.empty(2, 4)
@@ -90,18 +109,32 @@ def test_dflash_context_values_scaled_once(monkeypatch, value_scale, per_layer):
     monkeypatch.setattr(dflash.ops, "rotary_embedding", lambda *args: None)
     original = torch.arange(48, dtype=torch.float32).view(2, 3, 2, 4)
     captures = []
-    inner = [SimpleNamespace(
-        kv_cache=torch.empty(0), impl=SimpleNamespace(
-            do_kv_cache_update=lambda layer, k, v, cache, slots:
-                captures.append((v.clone(), slots.clone())))) for _ in range(2)]
+    inner = [
+        SimpleNamespace(
+            kv_cache=torch.empty(0),
+            impl=SimpleNamespace(
+                do_kv_cache_update=lambda layer, k, v, cache, slots: captures.append(
+                    (v.clone(), slots.clone())
+                )
+            ),
+        )
+        for _ in range(2)
+    ]
     module = SimpleNamespace(
-        _num_attn_layers=2, _kv_size=8, _head_dim=4, _num_kv_heads=2,
+        _num_attn_layers=2,
+        _kv_size=8,
+        _head_dim=4,
+        _num_kv_heads=2,
         _project_context_kv=lambda *_: (original.clone(), original.clone()),
         _normalize_context_k=lambda x: x,
-        _rope_cos_sin_cache=torch.zeros(8, 4), _rope_head_size=4,
-        _rope_is_neox=True, _attn_layers=inner,
-        layers=[SimpleNamespace(self_attn=SimpleNamespace(v_scale=value_scale))
-                for _ in range(2)],
+        _rope_cos_sin_cache=torch.zeros(8, 4),
+        _rope_head_size=4,
+        _rope_is_neox=True,
+        _attn_layers=inner,
+        layers=[
+            SimpleNamespace(self_attn=SimpleNamespace(v_scale=value_scale))
+            for _ in range(2)
+        ],
     )
     slots = [torch.tensor([0, 1, -1]), torch.tensor([7, -1, -1])]
     mapping = slots if per_layer else slots[0]
@@ -112,4 +145,6 @@ def test_dflash_context_values_scaled_once(monkeypatch, value_scale, per_layer):
     for index, (values, actual_slots) in enumerate(captures):
         expected = original[index] * (1 if value_scale is None else value_scale)
         torch.testing.assert_close(values, expected)
-        torch.testing.assert_close(actual_slots, slots[index] if per_layer else slots[0])
+        torch.testing.assert_close(
+            actual_slots, slots[index] if per_layer else slots[0]
+        )
