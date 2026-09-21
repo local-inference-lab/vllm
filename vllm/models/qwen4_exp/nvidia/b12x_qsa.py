@@ -408,7 +408,7 @@ class Qwen4ExpQSABackend(B12xPagedAttentionBackend):
 
     @classmethod
     def supports_kv_connector(cls) -> bool:
-        return False
+        return True
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
