@@ -223,3 +223,70 @@ def test_wrong_chunk_count_is_detected():
     )
     assert _relative_l2(_dequantize(*correct), expected) <= TOL
     assert _relative_l2(_dequantize(*wrong), expected) > 5 * TOL
+
+
+@pytest.mark.parametrize("scale_rows", [115, 117])
+def test_malformed_scale_grid_rejected(scale_rows):
+    with pytest.raises(ValueError, match="scale has"):
+        _shard_fp8_qkv_proj(
+            torch.zeros(14848, COLS, dtype=FP8_DTYPE),
+            torch.ones(scale_rows, 1),
+            num_heads=64, num_kv_heads=8, head_dim=192, v_head_dim=128,
+            tp_rank=0, tp_size=4, ckpt_tp=4,
+        )
+
+
+@pytest.mark.parametrize("loader", ["target", "mtp"])
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("scale_first", [False, True])
+def test_fused_qkv_loaders(monkeypatch, loader, tp_size, scale_first):
+    """Both real loading callers must use export chunks, in either file order."""
+    from types import MethodType, SimpleNamespace
+
+    import vllm.model_executor.models.mimo_v2 as target
+    import vllm.model_executor.models.mimo_v2_mtp as mtp
+
+    torch.manual_seed(17)
+    geometry = GEOMETRIES["swa"]
+    truth = torch.randn(14848, COLS)
+    truth *= torch.linspace(0.25, 4.0, 14848).unsqueeze(1)
+    weight, scale = _quantize_chunks(truth, *geometry)
+    module = target if loader == "target" else mtp
+    monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: tp_size)
+    for rank in range(tp_size):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: rank)
+        local_rows = (64 // tp_size) * 192 + (8 // tp_size) * 320
+        attn = torch.nn.Module()
+        attn.total_num_heads, attn.total_num_kv_heads = 64, 8
+        attn.head_dim, attn.v_head_dim = 192, 128
+        attn.qkv_proj = torch.nn.Module()
+        attn.qkv_proj.weight = torch.nn.Parameter(
+            torch.empty(local_rows, COLS, dtype=FP8_DTYPE), requires_grad=False
+        )
+        attn.qkv_proj.weight_scale_inv = torch.nn.Parameter(
+            torch.empty(cdiv(local_rows, BLOCK), 1), requires_grad=False
+        )
+        layer = torch.nn.Module()
+        layer.self_attn = attn
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(num_key_value_heads=4)
+        if loader == "target":
+            model.layers = torch.nn.ModuleList([layer])
+            model.get_expert_mapping = lambda: []
+            model._try_load_fp8_qkv_proj = MethodType(
+                target.MiMoV2Model._try_load_fp8_qkv_proj, model
+            )
+            prefix = "layers.0.self_attn.qkv_proj"
+            load = target.MiMoV2Model.load_weights
+        else:
+            model.model = torch.nn.Module()
+            model.model.mtp = torch.nn.Module()
+            model.model.mtp.layers = torch.nn.ModuleList([layer])
+            prefix = "model.mtp.layers.0.self_attn.qkv_proj"
+            load = mtp.MiMoV2MTP.load_weights
+        tensors = [(prefix + ".weight", weight), (prefix + ".weight_scale_inv", scale)]
+        loaded = load(model, reversed(tensors) if scale_first else tensors)
+        assert loaded == {name for name, _ in tensors}
+        got = _dequantize(attn.qkv_proj.weight, attn.qkv_proj.weight_scale_inv)
+        expected = _owned_rows(truth, *geometry, rank, tp_size)
+        assert _relative_l2(got, expected) <= TOL
