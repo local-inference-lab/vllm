@@ -25,8 +25,9 @@ save_generated_sources() {
     | xargs -0 -r cp --preserve=timestamps --target-directory="${moe_cache}"
 }
 
-restore_generated_sources
-trap save_generated_sources EXIT
+if [[ ${VLLM_USE_PRECOMPILED:-0} != 1 ]]; then
+  restore_generated_sources
+  trap save_generated_sources EXIT
 
 # CMake records generator hashes in its persistent cache. A clean source tree
 # lacks generated files, so discard only its configuration when the generated
@@ -36,6 +37,7 @@ if ! test -f "${dense_source}/kernel_selector.h" \
   while IFS= read -r -d '' cmake_cache; do
     rm -f -- "${cmake_cache}"
   done < <(find "${source_root}/build" -type f -name CMakeCache.txt -print0)
+fi
 fi
 
 env -u PYTHONPATH \
