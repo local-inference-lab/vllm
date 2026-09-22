@@ -83,15 +83,18 @@ def _b12x_module(name: str) -> Any:
     return api
 
 
-def _resolve_ple_table_memory(additional_config: Any) -> str:
+def _resolve_ple_table_memory(
+    additional_config: Any, embedding_dtype: str = "bfloat16"
+) -> str:
     """Translate the public offload policy into a b12x storage mode."""
     if isinstance(additional_config, dict) and "ple_table_memory" in additional_config:
         table_memory = additional_config["ple_table_memory"]
     else:
         table_memory = envs.VLLM_PLE_TABLE_MEMORY
         if table_memory is None:
-            offload = envs.is_set("VLLM_PLE_CPU_OFFLOAD") and envs.VLLM_PLE_CPU_OFFLOAD
-            return "mapped_host" if offload else "device"
+            if envs.is_set("VLLM_PLE_CPU_OFFLOAD"):
+                return "mapped_host" if envs.VLLM_PLE_CPU_OFFLOAD else "device"
+            return "io_uring" if embedding_dtype == "bfloat16" else "device"
     if table_memory == "ram":
         return "mapped_host"
     if table_memory == "disk":

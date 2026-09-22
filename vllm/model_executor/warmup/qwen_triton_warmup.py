@@ -45,10 +45,6 @@ class _QwenGDNWarmupConfig:
     dt_bias: torch.Tensor
     state_stride_token: int
     state_dtype: torch.dtype
-    norm_weight: torch.Tensor
-    norm_bias: torch.Tensor | None
-    norm_eps: float
-    norm_group_size: int
 
     @property
     def conv_dim(self) -> int:
@@ -138,10 +134,6 @@ def _qwen_gdn_warmup_config(
             dt_bias=layer.dt_bias,
             state_stride_token=int(ssm_state.stride(0)),
             state_dtype=ssm_state.dtype,
-            norm_weight=layer.norm.weight,
-            norm_bias=layer.norm.bias,
-            norm_eps=float(layer.norm.eps),
-            norm_group_size=int(norm.group_size or layer.head_v_dim),
         )
 
     if found_layer:
@@ -240,32 +232,6 @@ def _warm_fused_post_conv_kernel(
         )
 
 
-def _warm_layer_norm_kernel(device: torch.device, config: _QwenGDNWarmupConfig) -> None:
-    from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
-        layer_norm_fwd,
-    )
-
-    lengths = (1, 2, 16, 32, 128, 1024)
-    for length in lengths:
-        x = torch.empty(
-            (length * config.hv, config.v), dtype=config.conv_dtype, device=device
-        )
-        z = torch.empty_like(x)
-        out = torch.empty_like(x)
-        layer_norm_fwd(
-            x,
-            config.norm_weight,
-            config.norm_bias,
-            config.norm_eps,
-            z=z,
-            out=out,
-            group_size=config.norm_group_size,
-            norm_before_gate=config.norm_before_gate,
-            is_rms_norm=True,
-            activation=config.norm_activation,
-        )
-
-
 def _warm_fused_sigmoid_gating_delta_rule_update_kernel(
     device: torch.device,
     config: _QwenGDNWarmupConfig,
@@ -337,7 +303,6 @@ def qwen_triton_warmup(
     _warm_gated_rms_norm_kernel(device, gdn_config, max_num_tokens, model_config.dtype)
     _warm_causal_conv1d_fwd_kernel(device, gdn_config)
     _warm_fused_post_conv_kernel(device, gdn_config)
-    _warm_layer_norm_kernel(device, gdn_config)
     # Pooling only runs full prefills; the decode update kernel is unused.
     if not runner.is_pooling_model:
         _warm_fused_sigmoid_gating_delta_rule_update_kernel(device, gdn_config)

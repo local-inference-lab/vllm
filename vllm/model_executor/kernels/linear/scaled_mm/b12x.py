@@ -166,13 +166,19 @@ class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         out_features, in_features = config.weight_shape
         if in_features <= 0 or in_features % 128 != 0:
             return False, "Input features must be a positive multiple of 128"
-        if out_features <= 0 or out_features % 128 != 0:
-            return False, "Output features must be a positive multiple of 128"
+        if out_features <= 0:
+            return False, "Output features must be positive"
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
         params = self._get_layer_params(layer)
+        n, k = params.weight.shape
+        if n % 128:
+            # Complete the final scale block without changing its FP8 values.
+            padded = params.weight.new_zeros(((n + 127) // 128 * 128, k))
+            padded[:n].copy_(params.weight)
+            replace_parameter(layer, params.WEIGHT, padded)
         if params.weight_scale_inv is not None:
             weight_scale = params.weight_scale_inv
             scale_attr = params.WEIGHT_SCALE_INV
@@ -281,6 +287,19 @@ class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
                 stage="weights",
             ),
         )
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        output = super().apply_weights(layer, x, bias=None, **kwargs)
+        output = output[..., : self.config.weight_shape[0]]
+        if bias is not None:
+            output = (output + bias).to(self.config.out_dtype)
+        return output
 
     def apply_block_scaled_mm(
         self,
