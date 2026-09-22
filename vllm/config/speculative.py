@@ -1394,7 +1394,9 @@ class SpeculativeConfig:
                     max_logprobs=self.target_model_config.max_logprobs,
                     hf_overrides=draft_hf_overrides,
                     config_format=self.target_model_config.config_format,
-                    enable_cumem_allocator=self.target_model_config.enable_cumem_allocator,
+                    enable_cumem_allocator=(
+                        self.target_model_config.enable_cumem_allocator
+                    ),
                 )
 
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
