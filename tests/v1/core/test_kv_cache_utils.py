@@ -3727,6 +3727,191 @@ def test_glm_dspark_cache_groups_preserve_recurrent_target_and_draft_layers():
     assert draft_group.kv_cache_spec == draft
 
 
+@pytest.mark.parametrize(
+    "group_size,model_type,non_causal,method,expected_width",
+    [
+        (0, "kimi_k3", True, "dspark", 24),
+        (3, "kimi_k3", True, "dspark", 3),
+        (6, "kimi_k3", True, "dspark", 6),
+        (6, "other", True, "dspark", 24),
+        (6, "kimi_k3", False, "dspark", 24),
+        (0, "kimi_k3", False, "dflash", 24),
+        (3, "kimi_k3", False, "dflash", 3),
+        (6, "kimi_k3", False, "dflash", 6),
+    ],
+)
+def test_kimi_parallel_draft_full_depth_cache_admission(
+    monkeypatch, group_size, model_type, non_causal, method, expected_width
+):
+    """A replicated draft tail must not reserve 24-layer target-sized blocks."""
+    monkeypatch.setenv("VLLM_K3_KV_GROUP_SIZE", str(group_size))
+    mla = MLAAttentionSpec(
+        block_size=768,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8",
+    )
+    recurrent = MambaSpec(
+        block_size=12288,
+        shapes=((2304, 10), (6, 128, 128)),
+        dtypes=(torch.bfloat16, torch.float32),
+        page_size_padded=mla.page_size_bytes,
+        mamba_cache_mode="align",
+        num_speculative_blocks=7,
+    )
+    draft = SlidingWindowMLASpec(
+        block_size=768,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8",
+        sliding_window=32768,
+        dcp_replicated=True,
+        non_causal_multi_token_decode=non_causal,
+    )
+    config = _grouping_config()
+    if method == "dflash":
+        draft = SlidingWindowSpec(
+            block_size=768,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+            sliding_window=4096,
+            extra_retained_tokens=4096,
+            dcp_replicated=True,
+        )
+        config.cache_config.kv_cache_layout = "BLHNC"
+    config.speculative_config = SimpleNamespace(
+        method=method,
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="k3_dspark")
+        ),
+        use_eagle=lambda: True,
+        use_eagle_block_drop=lambda: False,
+    )
+    config.cache_config.mamba_cache_mode = "align"
+    config.model_config = SimpleNamespace(
+        max_model_len=950000,
+        hf_config=SimpleNamespace(model_type=model_type),
+        get_num_layers=lambda _: 93,
+    )
+    config.attention_config = SimpleNamespace(hisparse_config=None)
+    config.parallel_config = SimpleNamespace(
+        decode_context_parallel_size=16,
+        prefill_context_parallel_size=1,
+        pipeline_parallel_size=1,
+    )
+    config.max_in_flight_tokens = 8192
+    config.use_request_boundary_checkpoints = False
+    full_layers = set(range(3, 92, 4)) | {92}
+    specs = {
+        f"model.layers.{i}.attn": mla if i in full_layers else recurrent
+        for i in range(93)
+    }
+    draft_layers = 6 if method == "dflash" else 5
+    specs.update(
+        {f"draft.layers.{i}.attn": draft for i in range(93, 93 + draft_layers)}
+    )
+    groups = get_kv_cache_groups(config, specs)
+    allocated = kv_cache_utils.get_kv_cache_config_from_groups(
+        config, groups, 1325000000
+    )
+    pool_stride = kv_cache_utils._pool_bytes_per_block(groups)
+    needed = kv_cache_utils._max_memory_usage_bytes_from_groups(config, groups)
+
+    bounded = expected_width < 24
+    assert len(groups) == {3: 33, 6: 17, 24: 5}[expected_width]
+    assert pool_stride == mla.page_size_bytes * expected_width
+    assert (needed + pool_stride <= 1325000000) == bounded
+    assert set(name for group in groups for name in group.layer_names) == set(specs)
+    assert sum(len(group.layer_names) for group in groups) == len(specs)
+    scheduler = generate_scheduler_kv_cache_config([allocated])
+    assert get_kv_cache_capacity(config, scheduler) == get_kv_cache_capacity(
+        config, allocated
+    )
+    for group in groups:
+        original = specs[group.layer_names[0]]
+        assert group.kv_cache_spec == original
+    if bounded:
+        assert get_kv_cache_capacity(config, allocated)[0] >= 950000
+    if expected_width == 3 and method == "dspark":
+        # This budget rounds into 60 allocator mapping blocks of 20 MiB;
+        # a six-layer group needs a 61st mapping block for the same context.
+        assert needed + pool_stride <= 1255000000
+        compact = kv_cache_utils.get_kv_cache_config_from_groups(
+            config, groups, 1255000000
+        )
+        assert get_kv_cache_capacity(config, compact)[0] >= 950000
+
+
+@pytest.mark.parametrize("group_size", [0, 3])
+def test_kimi_mla_dflash2_full_context_cache_admission(monkeypatch, group_size):
+    """A full-context draft layer must not inherit a 24-layer pool stride."""
+    monkeypatch.setenv("VLLM_K3_KV_GROUP_SIZE", str(group_size))
+    config = _grouping_config()
+    config.model_config = SimpleNamespace(
+        max_model_len=950000,
+        hf_config=SimpleNamespace(model_type="kimi_k3"),
+        get_num_layers=lambda _: 93,
+    )
+    config.parallel_config = SimpleNamespace(
+        decode_context_parallel_size=10,
+        prefill_context_parallel_size=1,
+        pipeline_parallel_size=1,
+    )
+    config.speculative_config = SimpleNamespace(
+        method="dflash", use_eagle=lambda: True, use_eagle_block_drop=lambda: False
+    )
+    config.attention_config = SimpleNamespace(hisparse_config=None)
+    config.cache_config.mamba_cache_mode = "align"
+    config.max_in_flight_tokens = 8192
+    config.use_request_boundary_checkpoints = False
+    mla = MLAAttentionSpec(
+        block_size=1280,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8",
+    )
+    recurrent = MambaSpec(
+        block_size=12800,
+        shapes=((3840, 10), (10, 128, 128)),
+        dtypes=(torch.bfloat16, torch.float32),
+        page_size_padded=mla.page_size_bytes,
+        mamba_cache_mode="align",
+        num_speculative_blocks=7,
+    )
+    full_draft = replace(mla, dcp_replicated=True, non_causal_multi_token_decode=True)
+    sliding_draft = SlidingWindowMLASpec(
+        block_size=1280,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8",
+        sliding_window=4096,
+        dcp_replicated=True,
+        non_causal_multi_token_decode=True,
+    )
+    full_layers = set(range(3, 92, 4)) | {92}
+    specs = {
+        f"model.layers.{i}.attn": mla if i in full_layers else recurrent
+        for i in range(93)
+    }
+    specs.update({f"draft.layers.{i}.attn": sliding_draft for i in range(93, 97)})
+    specs["draft.layers.97.attn"] = full_draft
+    groups = get_kv_cache_groups(config, specs)
+    needed = kv_cache_utils._max_memory_usage_bytes_from_groups(config, groups)
+    stride = kv_cache_utils._pool_bytes_per_block(groups)
+    assert (needed + stride <= 4 * 1024**3) == (group_size == 3)
+    assert stride == mla.page_size_bytes * (group_size or 24)
+    # Grouping may change allocation width, never the attention window or owner.
+    for group in groups:
+        for name in group.layer_names:
+            assert group.kv_cache_spec == specs[name]
+    assert {name for group in groups for name in group.layer_names} == set(specs)
+
+
 def test_hidden_state_group_preserves_hybrid_prefix_cache_granularity():
     block_size = 544
     full_spec = FullAttentionSpec(
@@ -4978,6 +5163,13 @@ def test_unidentifiable_draft_without_mamba_does_not_warn(caplog_vllm):
     groups = get_kv_cache_groups(_spec_decode_grouping_config(), specs)
 
     assert not any(g.is_eagle_group for g in groups)
+    assert "could be identified as the draft model's" not in caplog_vllm.text
+
+
+def test_independent_dspark_cache_does_not_require_eagle_block_drop(caplog_vllm):
+    config = _spec_decode_grouping_config()
+    config.speculative_config.use_eagle_block_drop = lambda: False
+    get_kv_cache_groups(config, _hybrid_specs_with_draft(draft=True))
     assert "could be identified as the draft model's" not in caplog_vllm.text
 
 
