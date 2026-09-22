@@ -10,6 +10,7 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -67,6 +68,12 @@ def _b12x_activation_name(activation: MoEActivation) -> str:
 
 
 @dataclass(frozen=True)
+class _SharedExpertTuning:
+    shared: Any
+    gate: Any | None = None
+
+
+@dataclass(frozen=True)
 class _PreparedMoECall:
     """Priming tensors for one exact prepared MoE variant.
 
@@ -79,6 +86,7 @@ class _PreparedMoECall:
     topk: int
     prepared: Any
     output_dtype: torch.dtype
+    shared_experts: Any | None = None
 
     def make(self, tensors):
         from b12x.preparation import PreparedCall
@@ -123,8 +131,32 @@ class _PreparedMoECall:
             output=output,
             input_scales_static=True,
         )
+        run = binding.run
+        if self.shared_experts is not None:
+            from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+                SharedExpertsOrder,
+            )
+
+            shared = self.shared_experts.shared
+            gate = self.shared_experts.gate
+            if shared._determine_shared_experts_order(hidden) == (
+                SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+            ):
+
+                def run() -> None:
+                    primary = torch.cuda.current_stream()
+                    auxiliary = shared._stream
+                    auxiliary.wait_stream(primary)
+                    with torch.cuda.stream(auxiliary):
+                        shared_output = shared._layer(hidden)
+                    if gate is not None:
+                        gate(hidden)
+                    binding.run()
+                    primary.wait_stream(auxiliary)
+                    shared_output.record_stream(primary)
+
         return PreparedCall(
-            run=binding.run,
+            run=run,
             output=output,
             produce=produce,
             reset=reset,
@@ -137,7 +169,12 @@ class _PreparedMoECall:
 
 
 def _prepared_moe_call_factory(
-    *, tokens: int, topk: int, prepared: Any, output_dtype: torch.dtype
+    *,
+    tokens: int,
+    topk: int,
+    prepared: Any,
+    output_dtype: torch.dtype,
+    shared_experts: Any | None = None,
 ):
     shared = None
 
@@ -190,9 +227,97 @@ def _prepared_moe_call_factory(
             topk=topk,
             prepared=prepared,
             output_dtype=output_dtype,
+            shared_experts=shared_experts if tokens <= 8 else None,
         ).make(tensors)
 
     return factory
+
+
+def _shared_expert_tuning_context(
+    layer: torch.nn.Module, quant_mode: str, hidden_size: int
+):
+    """Describe the independently executable block-FP8 MLP used during tuning.
+
+    Args:
+        layer: Routed MoE layer holding shared-expert and router references.
+        quant_mode: B12X quantization scheme of the routed experts.
+        hidden_size: Local input and output width shared by both expert paths.
+
+    Returns:
+        The shared-expert tuning binding and immutable cache descriptor, or
+        ``(None, None)`` when the layer cannot provide this overlap context.
+    """
+    if quant_mode != "w4a8_mx":
+        return None, None
+    reference = getattr(layer, "shared_experts_for_preparation", None)
+    shared = None if reference is None else reference()
+    if (
+        shared is None
+        or shared._stream is None
+        or shared._disable_shared_experts_overlap
+        or shared._mk_can_overlap_shared_experts()
+    ):
+        return None, None
+    from b12x.preparation import FrozenMapping
+
+    from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
+
+    mlp = shared._layer
+    if not isinstance(getattr(mlp, "act_fn", None), torch.nn.Module):
+        return None, None
+    projections = []
+    for name in ("gate_up_proj", "down_proj"):
+        linear = getattr(mlp, name, None)
+        provider = getattr(linear, "deep_gemm_warmup_provider", None)
+        get_weights = getattr(provider, "get_deep_gemm_warmup_weights", None)
+        if not callable(get_weights) or getattr(linear, "reduce_results", False):
+            return None, None
+        weight, scale = get_weights(linear)
+        if weight.dtype != torch.float8_e4m3fn or weight.ndim != 2:
+            return None, None
+        projections.append((tuple(weight.shape), tuple(scale.shape), str(scale.dtype)))
+    if not (projections[0][0][1] == projections[1][0][0] == hidden_size):
+        return None, None
+    gate_reference = getattr(layer, "routing_gate_for_preparation", None)
+    gate = None if gate_reference is None else gate_reference()
+    gate_weight = getattr(gate, "weight", None)
+    if not (
+        isinstance(gate_weight, torch.Tensor)
+        and gate_weight.dtype == torch.bfloat16
+        and gate_weight.ndim == 2
+        and gate_weight.shape[1] == hidden_size
+        and getattr(gate, "out_dtype", None) == torch.float32
+        and getattr(gate, "allow_ll_bf16_gemm", False)
+    ):
+        gate = None
+    gate_context = (
+        None
+        if gate is None
+        else {
+            "backend": "ll_bf16_router",
+            "shape": tuple(gate.weight.shape),
+            "dtype": str(gate.weight.dtype),
+            "output_dtype": str(gate.out_dtype),
+        }
+    )
+    descriptor = FrozenMapping(
+        {
+            "version": 3,
+            "backend": "deep_gemm_block_fp8_mlp",
+            "projections": projections,
+            "activation": {
+                "type": (
+                    f"{type(mlp.act_fn).__module__}.{type(mlp.act_fn).__qualname__}"
+                ),
+                "parameters": mlp.act_fn.extra_repr(),
+            },
+            "ue8m0": is_deep_gemm_e8m0_used(),
+            "tma_aligned_scales": envs.VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES,
+            "max_tokens": min(8, envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD),
+            "gate": gate_context,
+        }
+    )
+    return _SharedExpertTuning(shared, gate), descriptor
 
 
 def _is_current_stream_capturing() -> bool:
@@ -637,9 +762,17 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         topk = int(self.moe_config.experts_per_token)
         route_on_input = bool(layer.apply_router_weight_on_input)
         fused_moe = _require_b12x_fused_moe()
-        plan_key = (counts, activation, route_on_input, id(prepared))
+        shared, shared_context = _shared_expert_tuning_context(
+            layer, self._quant_mode, int(prepared.hidden_size)
+        )
+        plan_key = (counts, activation, route_on_input, id(prepared), shared_context)
         plan = self._plan if getattr(self, "_plan_key", None) == plan_key else None
         if plan is None:
+            invocation: dict[str, Any] = {
+                "tuning_route_pattern": TUNING_WORKLOAD_VERSION
+            }
+            if shared_context is not None:
+                invocation["shared_expert_context"] = shared_context
             # The layer holds one plan for its serving shapes; a later call with
             # the same workload reuses it so the prepared state stays installed.
             plan = fused_moe.plan_execution(
@@ -656,11 +789,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 # Tuning choices depend on the routing corpus. Invalidate only
                 # MoE choices when its distribution changes, not compiled code
                 # or unrelated component selections.
-                invocation=FrozenMapping(
-                    {
-                        "tuning_route_pattern": TUNING_WORKLOAD_VERSION,
-                    }
-                ),
+                invocation=FrozenMapping(invocation),
             )
             self._plan = plan
             self._plan_key = plan_key
@@ -683,6 +812,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                     topk=topk,
                     prepared=prepared,
                     output_dtype=self.output_dtype,
+                    shared_experts=shared,
                 )
                 for count in plan.token_counts
             }
@@ -703,6 +833,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 topk=topk,
                 prepared=prepared,
                 output_dtype=self.output_dtype,
+                shared_experts=shared,
             )
             request = plan.request(
                 name=name,
@@ -717,6 +848,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             route_on_input,
             counts,
             workload.output_dtype,
+            shared_context,
         )
         return (
             B12xPreparationUnit(
