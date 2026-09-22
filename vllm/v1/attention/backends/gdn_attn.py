@@ -483,7 +483,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_sequence_masks = None
             num_spec_decodes = 0
         else:
-            spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
+            # A speculative row contains exactly one target token followed by
+            # its draft tokens. Profiling may provide a zero-draft marker for
+            # a long prefill, which must not enter the bounded decode kernel.
+            query_lens_cpu = query_start_loc_cpu.diff()
+            spec_sequence_masks_cpu = (
+                (num_decode_draft_tokens_cpu >= 0)
+                & (num_decode_draft_tokens_cpu <= self.num_spec)
+                & (query_lens_cpu == num_decode_draft_tokens_cpu + 1)
+            )
             num_spec_decodes = spec_sequence_masks_cpu.sum().item()
             # A zero-draft varlen batch still recovers the previous step's
             # accepted recurrent state before consuming its bonus tokens.

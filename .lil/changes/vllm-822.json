@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-822",
+  "category": "fix",
+  "summary": "Keep long GLM DCP profile prefills out of bounded KDA decode",
+  "models": ["GLM-5.3-Flash"],
+  "compatibility": "No configuration change is required. Valid MTP decode rows retain the B12X KDA decode path.",
+  "details": [
+    "A row enters speculative KDA decode only when its length is one target token plus its declared draft count.",
+    "This prevents a zero-draft marker on a long memory-profile prefill from exceeding the decode kernel capacity during TP4/DCP4 startup."
+  ],
+  "pull_requests": [822],
+  "authors": ["Local Inference Lab"],
+  "evidence": ["https://github.com/local-inference-lab/vllm/pull/822"],
+  "requires": []
+}
