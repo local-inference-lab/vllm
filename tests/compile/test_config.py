@@ -890,8 +890,8 @@ def test_acceptance_only_adaptation_sizes_like_fixed_depth(max_num_seqs):
     With `adaptive_speculative_tokens_window` set and no batch-size schedule,
     `uses_dynamic_speculative_decoding()` is true but there is no schedule to
     read tiers from. The controller narrows the whole batch to a depth of
-    1..num_speculative_tokens, so the sizes are the fixed-depth ones and the
-    manager reaches every narrower width by rounding them.
+    1..num_speculative_tokens. Keep the fixed-depth grid; the manager derives
+    narrower-width graphs from these sizes, with fallback if none fits.
     """
     num_speculative_tokens = 7
     sizes_by_window = {}
