@@ -238,9 +238,7 @@ class B12xNoncausalAttention:
             if not isinstance(scale, torch.Tensor):
                 raise TypeError(f"Noncausal FP8 {name} must be a tensor.")
             if scale.ndim > 1 or scale.numel() != 1:
-                raise ValueError(
-                    f"Noncausal FP8 {name} must be scalar or shape (1,)."
-                )
+                raise ValueError(f"Noncausal FP8 {name} must be scalar or shape (1,).")
         return self.impl._prepare_fp8_descales(layer, 1, key_cache.device)
 
     def gather(self, key_cache, value_cache, pages, lengths, starts, *, layer):

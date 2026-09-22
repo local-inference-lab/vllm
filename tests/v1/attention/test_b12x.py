@@ -1585,8 +1585,13 @@ def test_b12x_noncausal_fp8_cache_and_graph(
     config.attention_config.use_non_causal = True
     sinks = torch.linspace(5, 8, 16, dtype=torch.float32, device=device)
     impl = B12xPagedAttentionImpl(
-        num_heads=16, head_size=128, scale=128**-0.5, num_kv_heads=2,
-        alibi_slopes=None, sliding_window=1024, kv_cache_dtype=cache_dtype,
+        num_heads=16,
+        head_size=128,
+        scale=128**-0.5,
+        num_kv_heads=2,
+        alibi_slopes=None,
+        sliding_window=1024,
+        kv_cache_dtype=cache_dtype,
         sinks=sinks,
     )
     impl.process_weights_after_loading(torch.bfloat16)
@@ -1607,7 +1612,8 @@ def test_b12x_noncausal_fp8_cache_and_graph(
     peer_before = peer.clone()
     pages = torch.randperm(page_count, device=device).to(torch.int32).reshape(batch, -1)
     layer = SimpleNamespace(
-        kv_cache=cache, _k_scale=torch.tensor(0.375, device=device),
+        kv_cache=cache,
+        _k_scale=torch.tensor(0.375, device=device),
         _v_scale=torch.tensor([1.75], device=device),
     )
     qlens = [8, 7, 3, 1][:batch]
@@ -1618,17 +1624,24 @@ def test_b12x_noncausal_fp8_cache_and_graph(
     query = qkv[:, :16]
     output = torch.empty_like(query)
     metadata = b12x.B12xPagedMetadata(
-        num_actual_tokens=sum(qlens), max_query_len=8,
+        num_actual_tokens=sum(qlens),
+        max_query_len=8,
         query_start_loc=torch.tensor(starts, dtype=torch.int32, device=device),
         max_seq_len=2560,
         seq_lens=torch.full((batch,), 8, dtype=torch.int32, device=device),
-        block_table=pages, slot_mapping=torch.empty(0, dtype=torch.int64, device=device),
+        block_table=pages,
+        slot_mapping=torch.empty(0, dtype=torch.int64, device=device),
         causal=False,
     )
     workload = B12xWorkload(
-        stage="state", token_counts=(8, 16, 32, 64),
-        fixed_token_counts=(8, 16, 32), output_dtype=torch.bfloat16,
-        max_tokens=64, max_seqs=4, max_model_len=2560, speculative_tokens=7,
+        stage="state",
+        token_counts=(8, 16, 32, 64),
+        fixed_token_counts=(8, 16, 32),
+        output_dtype=torch.bfloat16,
+        max_tokens=64,
+        max_seqs=4,
+        max_model_len=2560,
+        speculative_tokens=7,
     )
     # max_k=1031 is not a multiple of the gather tile size (16). C1 also
     # pads to four requests, exercising masked FP8 loads during preparation.
@@ -1644,7 +1657,7 @@ def test_b12x_noncausal_fp8_cache_and_graph(
             positions = torch.arange(length, device=device)
             physical = pages[request, positions // page_size].long()
 
-            def gather(view, scale):
+            def gather(view, scale, physical=physical, positions=positions):
                 if dtype == torch.float8_e4m3fn:
                     # Byte indexing avoids relying on float8 advanced indexing.
                     value = view.view(torch.uint8)[physical, positions % page_size]
@@ -1656,7 +1669,7 @@ def test_b12x_noncausal_fp8_cache_and_graph(
             kept = min(length, 1023 + nq)
             packed_k.append(k[-kept:].bfloat16())
             packed_v.append(v[-kept:].bfloat16())
-            q = query[starts[request]:starts[request + 1]].float()
+            q = query[starts[request] : starts[request + 1]].float()
             k = k.repeat_interleave(8, dim=1)
             v = v.repeat_interleave(8, dim=1)
             scores = torch.einsum("qhd,khd->qhk", q, k) * 128**-0.5
@@ -1679,12 +1692,17 @@ def test_b12x_noncausal_fp8_cache_and_graph(
         try:
             with (
                 kernel_resolution_guard("FP8 noncausal replay"),
-                session.capture(), torch.cuda.graph(graph),
+                session.capture(),
+                torch.cuda.graph(graph),
             ):
                 run()
-            for replay, lengths in enumerate(([8, 129, 1032, 2049], [2049, 1024, 255, 8])):
+            for replay, lengths in enumerate(
+                ([8, 129, 1032, 2049], [2049, 1024, 255, 8])
+            ):
                 lengths = lengths[:batch]
-                metadata.seq_lens.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
+                metadata.seq_lens.copy_(
+                    torch.tensor(lengths, dtype=torch.int32, device=device)
+                )
                 if replay:
                     layer._k_scale.fill_(1.25)
                     layer._v_scale.fill_(0.625)
@@ -1694,14 +1712,16 @@ def test_b12x_noncausal_fp8_cache_and_graph(
                 graph.replay()
                 expected, k, v = reference(lengths)
                 packed = impl._noncausal
-                torch.testing.assert_close(packed.k[:len(k)], k, atol=0, rtol=0)
-                torch.testing.assert_close(packed.v[:len(v)], v, atol=0, rtol=0)
+                torch.testing.assert_close(packed.k[: len(k)], k, atol=0, rtol=0)
+                torch.testing.assert_close(packed.v[: len(v)], v, atol=0, rtol=0)
                 error = output.float() - expected
                 assert error.abs().max().item() <= 0.02
                 assert (error.norm() / expected.norm().clamp_min(1e-9)).item() <= 0.015
                 torch.testing.assert_close(
-                    peer.view(torch.uint8), peer_before.view(torch.uint8),
-                    atol=0, rtol=0,
+                    peer.view(torch.uint8),
+                    peer_before.view(torch.uint8),
+                    atol=0,
+                    rtol=0,
                 )
         finally:
             graph.reset()
