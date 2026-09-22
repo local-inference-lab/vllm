@@ -191,7 +191,9 @@ def kernel_unified_attention_diffkv(
         tile_mask = seq_offset < max_seq_prefix_len
 
         physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE,
+            mask=tile_mask,
+            other=0,
         ).to(tl.int64)
 
         v_offset = (
@@ -329,6 +331,12 @@ def kernel_reduce_segments_diffkv(
     """
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
+
+    # Graph buffers may contain trailing tokens beyond the real query prefix.
+    # Do not resolve those tokens to a zero-length padding sequence or divide
+    # by its zero tiles_per_segment below.
+    if query_token_idx >= tl.load(query_start_len_ptr + num_seqs):
+        return
 
     seq_idx = find_seq_idx(
         query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
