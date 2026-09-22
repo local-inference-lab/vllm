@@ -133,15 +133,43 @@ def execute(c):
 @pytest.mark.parametrize("cache_dtype", CACHE_DTYPES)
 @pytest.mark.parametrize("heads_kv", [1, 2])
 @pytest.mark.parametrize("window", [None, 128])
+@pytest.mark.parametrize("q_lens", [(1, 1, 1, 257), (8, 3, 1, 257)])
 @torch.inference_mode()
-def test_mixed_reference_and_page_reuse(cache_dtype, heads_kv, window):
-    c = make_case(cache_dtype, heads_kv, window)
+def test_mixed_reference_and_page_reuse(cache_dtype, heads_kv, window, q_lens):
+    c = make_case(cache_dtype, heads_kv, window, q_lens=q_lens)
+    decode_rows = sum(q_lens[:-1])
+    decode_metadata = c.metadata.partitions[0]
+    # Compare dispatch with the same short queries in isolation. Single-token
+    # decode is always split-KV; multi-token decode gains that path with #839.
+    # Probe only inside the test, never during collection or module import.
+    c.impl.forward(
+        c.layer,
+        c.q[:decode_rows],
+        None,
+        None,
+        c.packed,
+        decode_metadata,
+        c.out[:decode_rows],
+    )
+    expected_split = bool(
+        torch.isfinite(c.builder.softmax_segm_expsum[:decode_rows, :, 0]).all()
+    )
+    if max(q_lens[:-1]) == 1:
+        assert expected_split
+    c.builder.softmax_segm_output.fill_(float("nan"))
+    c.builder.softmax_segm_max.fill_(float("nan"))
+    c.builder.softmax_segm_expsum.fill_(float("nan"))
     for _ in range(2):
         execute(c)
         torch.testing.assert_close(c.out, reference(c), atol=0.02, rtol=0.02)
-        assert torch.isfinite(c.builder.softmax_segm_expsum[:12, :, 0]).all()
+        assert (
+            bool(
+                torch.isfinite(c.builder.softmax_segm_expsum[:decode_rows, :, 0]).all()
+            )
+            == expected_split
+        )
         # No prefill row may overwrite the decode workspace.
-        assert torch.isnan(c.builder.softmax_segm_expsum[12:]).all()
+        assert torch.isnan(c.builder.softmax_segm_expsum[decode_rows:]).all()
         c.q.normal_()
         c.table.copy_(c.table.roll(1, dims=1))
         c.lengths.sub_(1)

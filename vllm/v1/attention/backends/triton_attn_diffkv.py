@@ -59,6 +59,9 @@ class TritonAttentionDiffKVMetadataBuilder(TritonAttentionMetadataBuilder):
     # The partition boundary is host metadata and can vary at a fixed batch
     # size. Mixed batches must not replay a full graph with stale partitions.
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    # Adaptive verification preserves the total decode-prefix token count;
+    # pure decode still uses device offsets in one launch. See the backend
+    # supports_device_cpu_query_lens_mismatch contract.
     supports_varlen_decode_cudagraph: ClassVar[bool] = True
 
     def __init__(

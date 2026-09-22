@@ -83,6 +83,11 @@ def run_forward(monkeypatch, metadata):
     for call in calls:
         assert call["window_size"] == (127, 0)
         assert call["sinks"] is impl.sinks
+        if "fp8_e4m3" in backend.TritonAttentionDiffKVBackend.supported_kv_cache_dtypes:
+            # Also guards merging this change with the E4M3 backend: omitting
+            # either descale in the new loop must fail, not silently pass.
+            assert call["k_descale"] is layer._k_scale
+            assert call["v_descale"] is layer._v_scale
         assert (
             call["k"].untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
         )
@@ -110,7 +115,9 @@ def test_mixed_batch_separates_short_queries(builder, monkeypatch, decode_lens):
     assert prefill["max_seqlen_q"] == 257
 
 
-@pytest.mark.parametrize("q_lens", [[8, 3, 1], [257, 129], [8, 16], [0, 8, 0]])
+@pytest.mark.parametrize(
+    "q_lens", [[8, 3, 1], [257, 129], [8, 16], [0, 8, 0], [257, 8], [8] * 17 + [257]]
+)
 def test_single_launch_when_partition_cannot_help(builder, monkeypatch, q_lens):
     calls = run_forward(monkeypatch, builder.build(0, common(q_lens)))
     assert len(calls) == 1
@@ -171,3 +178,11 @@ def test_draft_metadata_update_keeps_live_single_launch_views(builder):
     builder.update_draft_decode_metadata(metadata)
     assert metadata.seq_lens.data_ptr() == c.seq_lens.data_ptr()
     torch.testing.assert_close(metadata.seq_lens, c.seq_lens)
+
+
+def test_uniform_capture_has_no_host_partitions(builder):
+    c = common([8] * 16)
+    metadata = builder.build_for_cudagraph_capture(c)
+    assert not getattr(metadata, "partitions", ())
+    assert metadata.seq_lens.data_ptr() == c.seq_lens.data_ptr()
+    assert (metadata.seq_lens == 1).all()
