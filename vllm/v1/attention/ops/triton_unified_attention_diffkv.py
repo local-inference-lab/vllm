@@ -429,9 +429,12 @@ def unified_attention_diffkv(
     sliding_window_val = 1 + window_size[0] if window_size[0] >= 0 else 0
 
     # Decide between 2D and 3D launch.
-    # Partial outputs and reduction scalars are indexed by query token, not
-    # sequence. Short multi-token verification batches can use split-KV when
-    # every query token fits the workspace; larger prefills retain the 2D path.
+    # The builder derives seq_threshold_3D from a 2D grid occupancy heuristic
+    # and uses it as the first dimension of all three split-KV workspaces.
+    # Partials and reduction scalars are indexed by query token, not sequence.
+    # Count tokens to keep short multi-token batches within that allocation;
+    # exceeding either the threshold or any actual buffer capacity keeps 2D.
+    # This does not extend split-KV to every speculative batch size.
     use_3d = not (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
