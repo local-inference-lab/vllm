@@ -867,6 +867,16 @@ def get_config(
                     scale_fmt,
                 )
 
+    if config.model_type in {
+        "qwen4_exp",
+        "qwen4_exp_text",
+        "qwen3_8_flash_next",
+        "qwen3_8_flash_next_text",
+    }:
+        from vllm.models.qwen4_exp.config import resolve_ple_embedding_dtype
+
+        resolve_ple_embedding_dtype(config, config_dict, model, revision)
+
     if hf_overrides_kw:
         logger.debug("Overriding HF config with %s", hf_overrides_kw)
         config.update(hf_overrides_kw)

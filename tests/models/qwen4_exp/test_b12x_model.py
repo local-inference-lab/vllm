@@ -774,7 +774,12 @@ def test_disk_ple_preparation_refreshes_graph_output(tmp_path, monkeypatch) -> N
             memory,
         )
 
-    embedding = make_embedding("io_uring")
+    monkeypatch.delenv("VLLM_PLE_TABLE_MEMORY", raising=False)
+    monkeypatch.delenv("VLLM_PLE_CPU_OFFLOAD", raising=False)
+    embedding = make_embedding(
+        ple_embedding_module._resolve_ple_table_memory({}, config.ple_embedding_dtype)
+    )
+    assert embedding.requires_disk_preparation
     resident = make_embedding("device")
     rows = embedding._table_layout.padded_vocab_size
     table = torch.arange(rows * 32).reshape(rows, 32).remainder(251).to(torch.bfloat16)
@@ -941,16 +946,51 @@ def _allocate_aligned_mamba_cache(
     )[layer_name]
 
 
+@pytest.mark.parametrize("embedding_dtype", ["bfloat16", "float8_e4m3fn", "nvfp4"])
 @pytest.mark.parametrize(
-    ("enabled", "backend"), [(None, "device"), ("0", "device"), ("1", "mapped_host")]
+    ("enabled", "backend"), [(None, None), ("0", "device"), ("1", "mapped_host")]
 )
-def test_ple_cpu_offload_env_alias(monkeypatch, enabled, backend) -> None:
+def test_ple_cpu_offload_env_alias(
+    monkeypatch, embedding_dtype, enabled, backend
+) -> None:
     monkeypatch.delenv("VLLM_PLE_TABLE_MEMORY", raising=False)
     if enabled is None:
         monkeypatch.delenv("VLLM_PLE_CPU_OFFLOAD", raising=False)
     else:
         monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", enabled)
-    assert ple_embedding_module._resolve_ple_table_memory(None) == backend
+    if backend is None:
+        backend = "io_uring" if embedding_dtype == "bfloat16" else "device"
+    assert (
+        ple_embedding_module._resolve_ple_table_memory(None, embedding_dtype) == backend
+    )
+
+
+@pytest.mark.parametrize("embedding_dtype", ["bfloat16", "float8_e4m3fn", "nvfp4"])
+@pytest.mark.parametrize("policy", [None, "device", "ram", "disk"])
+def test_ple_checkpoint_file_filter_matches_storage_policy(
+    monkeypatch, embedding_dtype, policy
+) -> None:
+    monkeypatch.delenv("VLLM_PLE_TABLE_MEMORY", raising=False)
+    monkeypatch.delenv("VLLM_PLE_CPU_OFFLOAD", raising=False)
+    model = model_module.Qwen4ExpForCausalLM.__new__(model_module.Qwen4ExpForCausalLM)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        ple_layer_ids=[2], ple_embedding_dtype=embedding_dtype
+    )
+    model.vllm_config = SimpleNamespace(
+        additional_config={} if policy is None else {"ple_table_memory": policy},
+        kernel_config=SimpleNamespace(linear_backend="b12x", moe_backend="b12x"),
+    )
+    selector = model.checkpoint_file_weight_filter
+    if policy == "disk" or (policy is None and embedding_dtype == "bfloat16"):
+        assert selector is not None
+        assert selector(
+            "model.language_model.layers.1.ple.ple_embedding."
+            "ngram_embedding.shard_0.weight"
+        )
+        assert not selector("model.language_model.layers.1.ple.key_proj.weight")
+    else:
+        assert selector is None
 
 
 @pytest.mark.parametrize(

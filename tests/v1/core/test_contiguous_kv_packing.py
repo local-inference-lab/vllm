@@ -663,6 +663,39 @@ class TestCompressorRingGroup:
         assert len(manager.coordinator.single_type_managers) == len(groups)
 
 
+@pytest.mark.parametrize("draft_head_size", [128, 192])
+def test_layout_resolution_handles_target_and_draft_page_sizes(
+    monkeypatch, draft_head_size
+):
+    from vllm import envs
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
+    monkeypatch.setattr(envs, "VLLM_KV_CACHE_LAYOUT", None)
+    config = _mock_vllm_config(None)
+    config.kv_transfer_config = None
+    target = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=192,
+        head_size_v=128,
+        dtype=torch.bfloat16,
+    )
+    draft = replace(target, head_size=draft_head_size)
+    layout = resolve_kv_cache_layout(config, [["LBHNC", "BLHNC"]], [target, draft])
+    expected = KVCacheLayout.BLHNC if draft_head_size != 192 else KVCacheLayout.LBHNC
+    assert layout == expected
+    groups = [
+        KVCacheGroupSpec(layer_names=["target"], kv_cache_spec=target),
+        KVCacheGroupSpec(layer_names=["draft"], kv_cache_spec=draft),
+    ]
+    cache = get_kv_cache_config_from_groups(config, groups, MEMORY)
+    views = _bind(cache, layout.name)
+    views["target"][0].fill_(1)
+    views["draft"][1].fill_(2)
+    assert (views["target"][0] == 1).all()
+    assert (views["draft"][1] == 2).all()
+
+
 def test_v41_mixed_cache_pages_preserve_request_partial_states(monkeypatch):
     from vllm import envs
     from vllm.models.deepseek_v4_1.compressor import (

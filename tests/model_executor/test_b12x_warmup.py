@@ -135,6 +135,97 @@ def test_collective_describers_reject_process_local_identity(
         describers[0](workload)
 
 
+@pytest.mark.parametrize(
+    "module_name,class_name",
+    [
+        ("qwen3_5", "Qwen3_5Model"),
+        ("qwen3_5_mtp", "Qwen3_5MultiTokenPredictor"),
+        ("qwen3_next", "Qwen3NextModel"),
+        ("qwen3_next_mtp", "Qwen3NextMultiTokenPredictor"),
+        ("nemotron_h", "NemotronHModel"),
+        ("nemotron_h_mtp", "NemotronHMultiTokenPredictor"),
+    ],
+)
+@pytest.mark.parametrize("prefix", ["", "language_model.model", "mtp"])
+@pytest.mark.usefixtures("default_vllm_config")
+def test_embedding_collectives_have_rank_stable_names(
+    monkeypatch, module_name, class_name, prefix
+) -> None:
+    import importlib
+
+    from vllm.config import CompilationMode
+    from vllm.model_executor.layers import vocab_parallel_embedding as embedding
+
+    module = importlib.import_module(f"vllm.model_executor.models.{module_name}")
+    hf = SimpleNamespace(
+        vocab_size=128,
+        hidden_size=64,
+        num_hidden_layers=0,
+        mtp_num_hidden_layers=0,
+        num_nextn_predict_layers=0,
+        rms_norm_eps=1e-6,
+        layer_norm_epsilon=1e-5,
+        hybrid_override_pattern="",
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=hf, hf_text_config=hf),
+        parallel_config=SimpleNamespace(
+            eplb_config=SimpleNamespace(num_redundant_experts=0)
+        ),
+        quant_config=None,
+        compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
+        cache_config=None,
+    )
+    if module_name == "nemotron_h_mtp":
+        hf.num_nextn_predict_layers = 1
+        hf.mtp_hybrid_override_pattern = "*"
+        config.speculative_config = SimpleNamespace(
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(get_text_config=lambda: hf)
+            )
+        )
+        monkeypatch.setattr(module, "get_draft_quant_config", lambda _: None)
+        monkeypatch.setattr(
+            module,
+            "NemotronHMTPAttentionDecoderLayer",
+            lambda **kw: torch.nn.Identity(),
+        )
+    if hasattr(module, "make_layers"):
+        monkeypatch.setattr(
+            module, "make_layers", lambda *a, **kw: (0, 0, torch.nn.ModuleList())
+        )
+    if hasattr(module, "ColumnParallelLinear"):
+        monkeypatch.setattr(
+            module, "ColumnParallelLinear", lambda *a, **kw: torch.nn.Identity()
+        )
+    if hasattr(module, "get_pp_group"):
+        monkeypatch.setattr(
+            module, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        )
+    monkeypatch.setattr(embedding, "get_tensor_model_parallel_world_size", lambda: 2)
+    describers = []
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.register_b12x_collective_describer",
+        lambda owner, describe: describers.append(describe),
+    )
+    qualified_name = f"{prefix}.embed_tokens" if prefix else "embed_tokens"
+    workload = _workload(token_counts=(1, 4), fixed_token_counts=(1, 4))
+    for rank in (0, 1):
+        describers.clear()
+        monkeypatch.setattr(
+            embedding, "get_tensor_model_parallel_rank", lambda rank=rank: rank
+        )
+        model = getattr(module, class_name)(vllm_config=config, prefix=prefix)
+        assert model.embed_tokens.tp_size == 2
+        assert len(describers) == 1
+        invocations = describers[0](workload)
+        assert [item.name for item in invocations] == [
+            f"{qualified_name}.embedding_all_reduce.m1",
+            f"{qualified_name}.embedding_all_reduce.m4",
+        ]
+        assert [item.shape for item in invocations] == [(1, 64), (4, 64)]
+
+
 def test_preparation_token_counts_cover_every_serving_regime() -> None:
     counts = b12x_preparation_token_counts(
         max_tokens=32,
@@ -287,19 +378,30 @@ def test_collect_units_filters_by_stage_and_tunes_eager_shapes() -> None:
     assert id(tower) not in {id(layer) for layer, _ in record}
 
 
-def test_qwen_vision_preparation_uses_encoder_and_connector_token_counts(
+@pytest.mark.parametrize("model_type", ["qwen3_vl", "mimo_v2"])
+def test_vision_preparation_uses_encoder_and_connector_token_counts(
     monkeypatch,
+    model_type,
 ) -> None:
+    from vllm.model_executor.models.mimo_v2_omni import MiMoV2OmniForCausalLM
     from vllm.model_executor.models.qwen3_vl import Qwen3VLForConditionalGeneration
     from vllm.multimodal import encoder_budget
 
-    model = Qwen3VLForConditionalGeneration.__new__(Qwen3VLForConditionalGeneration)
+    cls = (
+        Qwen3VLForConditionalGeneration
+        if model_type == "qwen3_vl"
+        else MiMoV2OmniForCausalLM
+    )
+    model = cls.__new__(cls)
     torch.nn.Module.__init__(model)
     model.config = SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2))
     model.visual = torch.nn.Module()
+    model.visual.spatial_merge_unit = 4
     model.visual.blocks = torch.nn.Sequential(torch.nn.Identity())
     model.visual.merger = torch.nn.Identity()
-    model.visual.deepstack_merger_list = torch.nn.ModuleList([torch.nn.Identity()])
+    model.visual.deepstack_merger_list = torch.nn.ModuleList(
+        [torch.nn.Identity()] if model_type == "qwen3_vl" else []
+    )
     worker = _worker(model)
     worker.vllm_config = object()
     worker.model_runner.mm_registry = object()
@@ -673,6 +775,26 @@ def test_workload_declares_the_same_decode_counts_in_both_stages() -> None:
         4,
         128,
     )
+
+
+def test_state_workload_uses_allocated_block_table_widths_per_layer() -> None:
+    worker = _config_worker(capture_sizes=(1, 2, 4), max_seqs=2, speculative_tokens=0)
+    worker.model_runner.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(layer_names=["target.attn.0", "target.attn.1"]),
+            SimpleNamespace(layer_names=["draft.attn"]),
+        ]
+    )
+    worker.model_runner.block_tables = SimpleNamespace(
+        input_block_tables=[
+            torch.empty((2, 2112), device="meta", dtype=torch.int32),
+            torch.empty((2, 4224), device="meta", dtype=torch.int32),
+        ]
+    )
+    assert not b12x_prepare.b12x_workload(worker, stage="weights").block_table_widths
+    assert dict(
+        b12x_prepare.b12x_workload(worker, stage="state").block_table_widths
+    ) == {"target.attn.0": 2112, "target.attn.1": 2112, "draft.attn": 4224}
 
 
 def test_provider_attachment_never_registers_a_child_module() -> None:

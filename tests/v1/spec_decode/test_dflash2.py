@@ -13,7 +13,12 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 
 
-def test_dflash_loader_honors_draft_load_config(monkeypatch):
+@pytest.mark.parametrize(
+    ("target_format", "draft_format"), [("fastsafetensors", "auto"), ("b12x", "b12x")]
+)
+def test_dflash_loader_honors_draft_load_config(
+    monkeypatch, target_format, draft_format
+):
     from vllm.config import LoadConfig
 
     draft_load_config = object()
@@ -27,7 +32,7 @@ def test_dflash_loader_honors_draft_load_config(monkeypatch):
     vllm_config = SimpleNamespace(
         attention_config=SimpleNamespace(),
         cache_config=SimpleNamespace(),
-        load_config=LoadConfig(load_format="fastsafetensors"),
+        load_config=LoadConfig(load_format=target_format),
         speculative_config=speculative_config,
     )
     loaded = SimpleNamespace(model=SimpleNamespace())
@@ -44,6 +49,7 @@ def test_dflash_loader_honors_draft_load_config(monkeypatch):
 
     monkeypatch.setattr(dflash_utils, "replace", fake_replace)
     monkeypatch.setattr(dflash_utils, "get_model", fake_get_model)
+    monkeypatch.setattr(dflash_utils, "maybe_share_target_embed", lambda *_args: None)
     monkeypatch.setattr(
         "vllm.v1.worker.gpu.spec_decode.utils.get_pp_group",
         lambda: SimpleNamespace(world_size=2),
@@ -63,8 +69,8 @@ def test_dflash_loader_honors_draft_load_config(monkeypatch):
 
     assert dflash_utils.load_dflash_model(SimpleNamespace(), vllm_config) is loaded
     assert captured["load_config"] is draft_load_config
-    assert captured["vllm_config"].load_config.load_format == "auto"
-    assert vllm_config.load_config.load_format == "fastsafetensors"
+    assert captured["vllm_config"].load_config.load_format == draft_format
+    assert vllm_config.load_config.load_format == target_format
 
 
 def test_dflash_reset_attn_releases_cache_layout_state():

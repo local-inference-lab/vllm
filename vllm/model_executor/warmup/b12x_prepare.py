@@ -189,6 +189,18 @@ def b12x_workload(worker: Worker, *, stage: str, lane: int = 0) -> B12xWorkload:
     dtype = worker.model_config.dtype
     if dtype not in (torch.bfloat16, torch.float16):
         dtype = torch.bfloat16
+    block_table_widths: tuple[tuple[str, int], ...] = ()
+    block_tables = getattr(worker.model_runner, "block_tables", None)
+    if stage == "state" and block_tables is not None:
+        block_table_widths = tuple(
+            (layer_name, int(table.shape[1]))
+            for group, table in zip(
+                worker.model_runner.kv_cache_config.kv_cache_groups,
+                block_tables.input_block_tables,
+                strict=True,
+            )
+            for layer_name in group.layer_names
+        )
     return B12xWorkload(
         stage=cast(Literal["weights", "state"], stage),
         token_counts=token_counts,
@@ -199,6 +211,7 @@ def b12x_workload(worker: Worker, *, stage: str, lane: int = 0) -> B12xWorkload:
         max_model_len=int(worker.model_config.max_model_len),
         speculative_tokens=speculative_tokens,
         lane=lane,
+        block_table_widths=block_table_widths,
     )
 
 

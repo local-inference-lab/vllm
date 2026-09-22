@@ -4,6 +4,7 @@
 import copy
 import functools
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from pydantic import Field, SkipValidation, field_validator, model_validator
@@ -385,6 +386,8 @@ class SpeculativeConfig:
     model: str | None = None
     """The name of the draft model, eagle head, or additional weights, if
     provided."""
+    model_subfolder: str | None = None
+    """Relative directory containing the draft config and weights inside model."""
     method: SpeculativeMethod | None = None
     """The name of the speculative method to use. If users provide and set the
     `model` param, the speculative method type will be detected automatically
@@ -1362,6 +1365,32 @@ class SpeculativeConfig:
             self.prompt_lookup_min = 0
 
             if self.model is not None:
+                draft_model = self.model
+                if self.model_subfolder is not None:
+                    from huggingface_hub.constants import HF_HUB_OFFLINE
+
+                    from vllm.transformers_utils.repo_utils import hf_api
+
+                    subfolder = Path(self.model_subfolder)
+                    if (
+                        not subfolder.parts
+                        or subfolder.is_absolute()
+                        or ".." in subfolder.parts
+                    ):
+                        raise ValueError("model_subfolder must be a relative directory")
+                    root = Path(self.model)
+                    if not root.is_dir():
+                        root = Path(
+                            hf_api().snapshot_download(
+                                repo_id=self.model,
+                                revision=self.revision,
+                                allow_patterns=f"{subfolder.as_posix()}/*",
+                                local_files_only=HF_HUB_OFFLINE,
+                            )
+                        )
+                    draft_model = str(root / subfolder)
+                    if not (Path(draft_model) / "config.json").is_file():
+                        raise ValueError(f"Draft config not found in {draft_model}")
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
                 # lack a model_type key in config.json, so AutoConfig cannot
                 # detect them. When the method is explicitly "medusa", inject
@@ -1371,7 +1400,7 @@ class SpeculativeConfig:
                     self.method, self.target_model_config.hf_overrides
                 )
                 self.draft_model_config = ModelConfig(
-                    model=self.model,
+                    model=draft_model,
                     runner="draft",
                     tokenizer=(
                         self.model

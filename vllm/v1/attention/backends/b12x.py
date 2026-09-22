@@ -8,7 +8,7 @@ import copy
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 
@@ -45,6 +45,8 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout, KVCacheSpec
 
 logger = init_logger(__name__)
+
+_PagedPlanKey = tuple[str, int, int, int, tuple[int, ...], tuple[int, ...]]
 
 _B12X_SUPPORTED_PAGE_SIZES = (64, 128)
 _B12X_PREFERRED_PAGE_SIZE = 128
@@ -152,11 +154,8 @@ class B12xPagedAttentionBackend(AttentionBackend):
 
     @classmethod
     def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
-        if spec.state_content_bytes is not None:
+        if spec.state_content_bytes is not None or spec.head_size != spec.head_size_v:
             return spec
-        assert spec.head_size == spec.head_size_v, (
-            "Separate K/V planes require symmetric K/V head sizes."
-        )
         return replace(
             spec,
             num_head_slots=2,
@@ -201,6 +200,10 @@ class B12xPagedAttentionBackend(AttentionBackend):
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
         return [64, 128, 192, 256]
+
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        return True
 
     @classmethod
     def supports_sink(cls) -> bool:
@@ -342,6 +345,7 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         attn_type: AttentionType = AttentionType.DECODER,
         kv_sharing_target_layer_name: str | None = None,
         sinks: torch.Tensor | None = None,
+        head_size_v: int | None = None,
     ) -> None:
         if alibi_slopes is not None:
             raise NotImplementedError("b12x does not support ALiBi.")
@@ -373,7 +377,9 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
 
         self.num_heads = int(num_heads)
         self.head_size = int(head_size)
-        self.output_head_size = self.head_size
+        self.output_head_size = (
+            self.head_size if head_size_v is None else int(head_size_v)
+        )
         self.scale = float(scale)
         self.num_kv_heads = int(num_kv_heads)
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
@@ -463,8 +469,19 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
                 }
             )
         )
-        self._plans: dict[tuple[str, int, int, int], object] = {}
+        self._query_stride = (self.num_heads * self.head_size, self.head_size, 1)
+        self._output_stride = (
+            self.num_heads * self.output_head_size,
+            self.output_head_size,
+            1,
+        )
+        self._plans: dict[_PagedPlanKey, object] = {}
         self.supports_quant_query_input = False
+        self._noncausal = None
+        if vllm_config.attention_config.use_non_causal:
+            from vllm.v1.attention.ops.b12x_noncausal import B12xNoncausalAttention
+
+            self._noncausal = B12xNoncausalAttention(self)
 
         logger.info_once(
             "Using b12x with q_heads=%d kv_heads=%d head_dim_qk=%d "
@@ -479,9 +496,12 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
             self._extend_q_capacities,
         )
 
-    def _request_name(self, owner: object, key: tuple[str, int, int, int]) -> str:
-        mode, page_size, batch, total_q = key
-        return f"attention.paged.{id(owner):x}.{mode}.p{page_size}.b{batch}.q{total_q}"
+    def _request_name(self, owner: object, key: _PagedPlanKey) -> str:
+        mode, page_size, batch, total_q, q_stride, out_stride = key
+        return (
+            f"attention.paged.{id(owner):x}.{mode}.p{page_size}.b{batch}.q{total_q}"
+            f".qs{q_stride}.os{out_stride}"
+        )
 
     def _caps(
         self,
@@ -533,7 +553,9 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         total_q: int,
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
-        owner: object,
+        owner: AttentionLayer,
+        query_stride: tuple[int, ...],
+        output_stride: tuple[int, ...],
     ):
         width = self._max_page_table_widths[page_size]
         if mode == "decode":
@@ -611,7 +633,7 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         operands = {
             "q": self._descriptor(
                 q_shape,
-                (self.num_heads * self.head_size, self.head_size, 1),
+                query_stride,
                 self.dtype,
             ),
             "k_cache": {
@@ -636,7 +658,7 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
             },
             "output": self._descriptor(
                 out_shape,
-                (self.num_heads * self.output_head_size, self.output_head_size, 1),
+                output_stride,
                 self.dtype,
             ),
             "page_table": self._descriptor((batch, width), (width, 1), torch.int32),
@@ -672,9 +694,19 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
             return ()
         key_cache, value_cache = self._kv_cache_views(kv_cache)
         page_size = _kv_page_size(key_cache, value_cache)
+        table_width = dict(workload.block_table_widths).get(
+            getattr(layer, "layer_name", "")
+        )
+        if table_width is not None:
+            # Storage blocks can expand beyond the constructor's hybrid estimate.
+            self._max_page_table_widths[page_size] = table_width
         if workload.output_dtype != self.dtype:
             raise ValueError("b12x paged output dtype differs from its loaded contract")
-        plans: dict[tuple[str, int, int, int], object] = {}
+        if self._noncausal is not None:
+            return self._noncausal.preparation_units(
+                layer, key_cache, value_cache, self._max_page_table_widths[page_size]
+            )
+        plans: dict[_PagedPlanKey, object] = {}
         requests = []
         batches = tuple(
             sorted(
@@ -683,11 +715,25 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
                     for count in workload.token_counts
                     if count <= self._max_num_seqs
                 )
+                | {
+                    count // self._verify_q_per_req
+                    for count in workload.token_counts
+                    if self._verify_q_per_req > 1
+                    and count % self._verify_q_per_req == 0
+                    and count <= self._max_num_seqs * self._verify_q_per_req
+                }
                 | {self._max_num_seqs}
             )
         )
         for batch in batches:
-            key = ("decode", page_size, batch, batch)
+            key = (
+                "decode",
+                page_size,
+                batch,
+                batch,
+                self._query_stride,
+                self._output_stride,
+            )
             declaration = self._declaration(
                 page_size=page_size,
                 mode="decode",
@@ -696,6 +742,8 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
                 key_cache=key_cache,
                 value_cache=value_cache,
                 owner=layer,
+                query_stride=self._query_stride,
+                output_stride=self._output_stride,
             )
             plans[key] = declaration
             requests.append(
@@ -713,7 +761,14 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
             )
             if self._verify_q_per_req > 1:
                 total_q = batch * self._verify_q_per_req
-                key = ("verify", page_size, batch, total_q)
+                key = (
+                    "verify",
+                    page_size,
+                    batch,
+                    total_q,
+                    self._query_stride,
+                    self._output_stride,
+                )
                 declaration = self._declaration(
                     page_size=page_size,
                     mode="verify",
@@ -722,6 +777,8 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
                     key_cache=key_cache,
                     value_cache=value_cache,
                     owner=layer,
+                    query_stride=self._query_stride,
+                    output_stride=self._output_stride,
                 )
                 plans[key] = declaration
                 requests.append(
@@ -743,7 +800,14 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
             for total_q in self._extend_q_capacities:
                 if batch >= total_q:
                     continue
-                key = ("extend", page_size, batch, total_q)
+                key = (
+                    "extend",
+                    page_size,
+                    batch,
+                    total_q,
+                    self._query_stride,
+                    self._output_stride,
+                )
                 declaration = self._declaration(
                     page_size=page_size,
                     mode="extend",
@@ -752,6 +816,8 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
                     key_cache=key_cache,
                     value_cache=value_cache,
                     owner=layer,
+                    query_stride=self._query_stride,
+                    output_stride=self._output_stride,
                 )
                 plans[key] = declaration
                 requests.append(
@@ -783,8 +849,8 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
 
     def _prepared_call(
         self,
-        owner: object,
-        state: object,
+        owner: torch.nn.Module,
+        state: Any,
         key,
         *,
         benchmark: bool,
@@ -792,7 +858,7 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
     ):
         from b12x.preparation import PreparedCall
 
-        mode, page_size, batch, total_q = key
+        mode, page_size, batch, total_q, query_stride, output_stride = key
         if caches is None:
             key_cache, value_cache = self._kv_cache_views(owner.kv_cache)
         else:
@@ -808,13 +874,15 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
             torch.empty(spec.shape, dtype=spec.dtype, device=self.device)
             for spec in specs
         )
-        q = torch.empty(
+        q = torch.empty_strided(
             (total_q, self.num_heads, self.head_size),
+            query_stride,
             dtype=self.dtype,
             device=self.device,
         )
-        output = torch.empty(
+        output = torch.empty_strided(
             (total_q, self.num_heads, self.output_head_size),
+            output_stride,
             dtype=self.dtype,
             device=self.device,
         )
@@ -847,7 +915,6 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         return PreparedCall(
             run=lambda: state.run(binding),
             produce=lambda: q.zero_(),
-            owners=(scratch, q, output, page_table, cache_seqlens, cu_seqlens_q),
         )
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
@@ -896,9 +963,16 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         self,
         kv_cache: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        key_cache, value_cache = kv_cache.unbind(1)
-        key_cache = key_cache.unflatten(-1, (self.num_kv_heads, self.head_size))
-        value_cache = value_cache.unflatten(-1, (self.num_kv_heads, self.head_size))
+        if self.head_size != self.output_head_size:
+            key_cache, value_cache = kv_cache.transpose(1, 2).split(
+                (self.head_size, self.output_head_size), dim=-1
+            )
+        else:
+            key_cache, value_cache = kv_cache.unbind(1)
+            key_cache = key_cache.unflatten(-1, (self.num_kv_heads, self.head_size))
+            value_cache = value_cache.unflatten(
+                -1, (self.num_kv_heads, self.output_head_size)
+            )
         key_cache = canonicalize_singleton_dim_strides(key_cache)
         value_cache = canonicalize_singleton_dim_strides(value_cache)
         if _is_b12x_fp8_kv_cache(self.kv_cache_dtype):
@@ -925,18 +999,20 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         num_reqs: int,
         page_size: int,
         *,
+        query_stride: tuple[int, ...],
+        output_stride: tuple[int, ...],
         key_cache: torch.Tensor | None = None,
         value_cache: torch.Tensor | None = None,
-        layer: object | None = None,
-    ) -> tuple[object, tuple[str, int, int, int]]:
+        layer: AttentionLayer | None = None,
+    ) -> tuple[object, _PagedPlanKey]:
         if attn_metadata.max_query_len <= 1 and total_q == num_reqs:
-            key = ("decode", page_size, total_q, total_q)
+            shape_key = ("decode", page_size, total_q, total_q)
         elif (
             self._verify_q_per_req > 1
             and attn_metadata.max_query_len == self._verify_q_per_req
             and total_q == num_reqs * self._verify_q_per_req
         ):
-            key = ("verify", page_size, num_reqs, total_q)
+            shape_key = ("verify", page_size, num_reqs, total_q)
         else:
             capacity = next(
                 (
@@ -951,18 +1027,19 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
                     f"b12x extend Q capacity {q_capacity} exceeds prepared "
                     f"maximum {self._extend_q_capacities[-1]}."
                 )
-            key = ("extend", page_size, num_reqs, capacity)
+            shape_key = ("extend", page_size, num_reqs, capacity)
+        key: _PagedPlanKey = (*shape_key, query_stride, output_stride)
         plan = self._plans.get(key)
         if plan is not None:
             return plan, key
         # A variant the preparation pass did not declare is declared here with
         # its default configuration and materialized on first use.
-        if key_cache is None or value_cache is None:
+        if key_cache is None or value_cache is None or layer is None:
             raise PreparationResourceUnavailableError(
                 "b12x paged plan is not prepared for cache generation "
                 f"and variant {key!r}"
             )
-        mode, _, batch, total = key
+        mode, _, batch, total, _, _ = key
         plan = self._declaration(
             page_size=page_size,
             mode=mode,
@@ -971,6 +1048,8 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
             key_cache=key_cache,
             value_cache=value_cache,
             owner=layer,
+            query_stride=query_stride,
+            output_stride=output_stride,
         )
         self._plans[key] = plan
         return plan, key
@@ -993,6 +1072,9 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
                 "b12x does not support fused output quantization."
             )
         if attn_metadata is None:
+            # Profiling observes projection views before state preparation.
+            self._query_stride = tuple(query.stride())
+            self._output_stride = tuple(output.stride())
             return output.fill_(0)
         if output.shape[-1] != self.output_head_size:
             raise ValueError(
@@ -1027,7 +1109,10 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         key_cache, value_cache = self._kv_cache_views(kv_cache)
         page_size = _kv_page_size(key_cache, value_cache)
         if not attn_metadata.causal:
-            raise NotImplementedError("b12x supports causal attention only.")
+            if self._noncausal is None:
+                raise ValueError("B12X noncausal attention was not configured.")
+            self._noncausal.forward(q, out, key_cache, value_cache, attn_metadata)
+            return output
 
         page_table = _ensure_i32_contiguous(attn_metadata.block_table, "block_table")
         cache_seqlens = _ensure_i32_contiguous(attn_metadata.seq_lens, "seq_lens")
@@ -1052,6 +1137,8 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
             q_capacity,
             num_reqs,
             page_size,
+            query_stride=tuple(q.stride()),
+            output_stride=tuple(out.stride()),
             key_cache=key_cache,
             value_cache=value_cache,
             layer=layer,
@@ -1085,6 +1172,21 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         slot_mapping: torch.Tensor,
     ) -> None:
         if kv_cache.numel() == 0:
+            return
+        if self.head_size != self.output_head_size:
+            from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+                triton_reshape_and_cache_flash_diffkv,
+            )
+
+            triton_reshape_and_cache_flash_diffkv(
+                key,
+                value,
+                kv_cache.transpose(1, 2),
+                slot_mapping,
+                self.kv_cache_dtype,
+                layer._k_scale,
+                layer._v_scale,
+            )
             return
         key_cache, value_cache = self._kv_cache_views(kv_cache)
         torch.ops._C_cache_ops.reshape_and_cache_flash(
