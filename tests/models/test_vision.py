@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -25,6 +26,54 @@ from vllm.utils.system_utils import update_environment_variables
 from vllm.utils.torch_utils import set_random_seed
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_merged_vision_gather_preserves_image_order_without_empty_rank_padding(
+    monkeypatch, rank
+):
+    from vllm.model_executor.models import vision
+
+    pixels = torch.arange(84, dtype=torch.float32).reshape(28, 3)
+    model = SimpleNamespace(
+        merge_kernel_size=(2, 2), config=SimpleNamespace(hidden_size=3)
+    )
+
+    class Encoder(torch.nn.Module):
+        merge_kernel_size = model.merge_kernel_size
+        config = model.config
+
+        def forward(self, values, grids, *, projection_workspace):
+            assert projection_workspace is scratch
+            return list(
+                values.reshape(-1, 4, 3).split(
+                    [math.prod(g) // 4 for g in grids.tolist()]
+                )
+            )
+
+    monkeypatch.setattr(vision, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(vision, "get_tensor_model_parallel_rank", lambda: rank)
+    expected_gather = torch.cat((pixels[8:], pixels[:8])).reshape(7, 4, 3)
+
+    def gather(local, sizes, dim):
+        assert sizes == [5, 2, 0, 0] and dim == 0
+        offset = sum(sizes[:rank])
+        torch.testing.assert_close(
+            local, expected_gather[offset : offset + sizes[rank]]
+        )
+        return expected_gather
+
+    monkeypatch.setattr(vision, "tensor_model_parallel_all_gatherv", gather)
+    scratch = torch.empty(16)
+    outputs = run_dp_sharded_mrope_vision_model(
+        Encoder(),
+        pixels,
+        [[1, 2, 4], [1, 4, 5]],
+        rope_type="rope_2d",
+        vision_model_kwargs={"projection_workspace": scratch},
+    )
+    torch.testing.assert_close(outputs[0], pixels[:8].reshape(2, 4, 3))
+    torch.testing.assert_close(outputs[1], pixels[8:].reshape(5, 4, 3))
 
 
 @pytest.mark.parametrize(

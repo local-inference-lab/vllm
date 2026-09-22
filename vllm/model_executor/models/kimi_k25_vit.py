@@ -42,11 +42,108 @@ from vllm.utils.torch_utils import async_tensor_h2d
 logger = init_logger(__name__)
 
 
+def _vision_projection_width(layer) -> int:
+    """Return the physical output width for a caller-storage-capable projection."""
+    from vllm.model_executor.kernels.linear.mxfp8.marlin import (
+        MarlinMxfp8LinearKernel,
+    )
+
+    kernel = getattr(getattr(layer, "quant_method", None), "kernel", None)
+    if (
+        not isinstance(kernel, MarlinMxfp8LinearKernel)
+        or not layer.disable_tp
+        or layer.skip_bias_add
+    ):
+        return 0
+
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        marlin_repacked_nk,
+    )
+
+    return marlin_repacked_nk(layer.weight, num_bits=8)[0]
+
+
+def _project_vision_intermediate(layer, x, workspace):
+    """Use caller-owned storage until the next projection in this encoder block."""
+    if workspace is None or torch.is_grad_enabled():
+        return layer(x)[0]
+
+    rows = x.numel() // x.shape[-1]
+    padded_n = _vision_projection_width(layer)
+    if padded_n == 0 or workspace.numel() < rows * padded_n:
+        return layer(x)[0]
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
+        apply_mxfp8_marlin_linear,
+    )
+
+    output = workspace[: rows * padded_n].view(rows, padded_n)
+    return apply_mxfp8_marlin_linear(
+        input=x,
+        weight=layer.weight,
+        weight_scale=layer.weight_scale,
+        workspace=layer.workspace,
+        size_n=layer.output_size_per_partition,
+        size_k=layer.input_size_per_partition,
+        bias=layer.bias,
+        output=output,
+    )
+
+
 def _apply_rope_input_validation(x, freqs_cis):
     assert x.ndim == freqs_cis.ndim + 1, (x.shape, freqs_cis.shape)
     assert x.shape[:-2] == freqs_cis.shape[:-1], (x.shape, freqs_cis.shape)
     assert x.shape[-1] == 2 * freqs_cis.shape[-1], (x.shape, freqs_cis.shape)
     assert freqs_cis.dtype == torch.complex64, freqs_cis.dtype
+
+
+def apply_rope_into_packed_qk(xq, xk, freqs_cis, *, workspace=None):
+    """Rotate consumed packed Q/K views with bounded FP32 conversion storage.
+
+    Query and key must be non-overlapping views whose unrotated contents have
+    no remaining consumer. Complex multiplication preserves the checkpoint's
+    FP32 rotary arithmetic before writing back into the activation dtype.
+    An optional contiguous FP32 workspace is exclusively owned until return.
+    """
+    _apply_rope_input_validation(xq, freqs_cis)
+    _apply_rope_input_validation(xk, freqs_cis)
+    if workspace is not None:
+        if (
+            workspace.dtype != torch.float32
+            or workspace.device != xq.device
+            or not workspace.is_contiguous()
+        ):
+            raise ValueError(
+                "RoPE workspace must be contiguous FP32 on the input device"
+            )
+        workspace = workspace.view(-1)
+    frequencies = freqs_cis.unsqueeze(-2)
+    if xq.ndim == 2:
+        frequencies = frequencies.unsqueeze(0)
+    for value in (xq, xk):
+        view = value.unsqueeze(0) if value.ndim == 2 else value
+        rows = view.shape[-3]
+        if rows == 0:
+            continue
+        row_bytes = (view.numel() // rows) * 4
+        capacity = 64 * 1024 * 1024 if workspace is None else workspace.numel() * 4
+        if workspace is not None and capacity < row_bytes:
+            raise ValueError("RoPE workspace must hold at least one sequence row")
+        rows_per_chunk = max(1, capacity // max(1, row_bytes))
+        for start in range(0, rows, rows_per_chunk):
+            count = min(rows_per_chunk, rows - start)
+            chunk = view.narrow(-3, start, count)
+            if workspace is None:
+                float_chunk = chunk.float()
+            else:
+                float_chunk = workspace[: chunk.numel()].view(chunk.shape)
+                float_chunk.copy_(chunk)
+            converted = torch.view_as_complex(
+                float_chunk.view(*chunk.shape[:-1], -1, 2)
+            )
+            converted.mul_(frequencies.narrow(-3, start, count))
+            chunk.copy_(torch.view_as_real(converted).flatten(-2))
+            del converted, float_chunk
+    return xq, xk
 
 
 def get_rope_shape_decorate(func):
@@ -347,11 +444,33 @@ class MLP2(nn.Module):
         )
         self.activation = activation
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x, _ = self.fc0(x)
-        x = self.activation(x)
-        x, _ = self.fc1(x)
-        return x
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        projection_workspace: torch.Tensor | None = None,
+        consume_input: bool = False,
+    ) -> torch.Tensor:
+        # Encoder normalization owns this activation independently of the
+        # residual. Its contents are dead after fc0; fc1 may replace them.
+        output_storage = (
+            x.view(-1)
+            if consume_input and not torch.is_grad_enabled() and x.is_contiguous()
+            else None
+        )
+        x = _project_vision_intermediate(self.fc0, x, projection_workspace)
+        if not torch.is_grad_enabled() and (
+            self.activation is F.gelu or type(self.activation) is nn.GELU
+        ):
+            # fc0 owns this intermediate; no residual or other consumer needs
+            # its pre-activation values. Keep ATen GELU math without a second
+            # image-patch-sized allocation.
+            torch.ops.aten.gelu.out(
+                x, approximate=getattr(self.activation, "approximate", "none"), out=x
+            )
+        else:
+            x = self.activation(x)
+        return _project_vision_intermediate(self.fc1, x, output_storage)
 
 
 def _make_vision_norm(norm_type: str, hidden_dim: int) -> nn.Module:
@@ -443,6 +562,8 @@ class MoonViTEncoderLayer(nn.Module):
         rope_freqs_cis: torch.Tensor,
         max_seqlen: torch.Tensor | None = None,
         sequence_lengths: torch.Tensor | None = None,
+        projection_workspace: torch.Tensor | None = None,
+        output_workspace: torch.Tensor | None = None,
     ):
         """Compute self-attention with packed QKV.
 
@@ -451,7 +572,8 @@ class MoonViTEncoderLayer(nn.Module):
             cu_seqlens (torch.Tensor): cumulative sequence lengths
         """
         seq_length = x.size(0)
-        xqkv, _ = self.wqkv(x)
+        xqkv = _project_vision_intermediate(self.wqkv, x, projection_workspace)
+        del x
 
         qkv_shape = xqkv.size()[:-1] + (
             3,
@@ -462,12 +584,26 @@ class MoonViTEncoderLayer(nn.Module):
         xqkv = xqkv.view(*qkv_shape)
         xq, xk, xv = torch.unbind(xqkv, dim=-3)
 
-        _apply_rope_input_validation(xq, rope_freqs_cis)
-        _apply_rope_input_validation(xk, rope_freqs_cis)
-        rope_cos = rope_freqs_cis.real.contiguous()
-        rope_sin = rope_freqs_cis.imag.contiguous()
-        xq = self.apply_rotary_emb(xq, rope_cos, rope_sin)
-        xk = self.apply_rotary_emb(xk, rope_cos, rope_sin)
+        if not torch.is_grad_enabled() and xq.dtype in (torch.bfloat16, torch.float16):
+            from vllm.v1.worker.workspace import current_workspace_manager
+
+            # The encoder and language model execute serially in one workspace
+            # lane. Reuse its pre-reserved storage instead of raising the vision
+            # peak after KV cache admission.
+            (rope_scratch,) = current_workspace_manager().get_simultaneous(
+                ((min(xq.numel(), 16 * 1024 * 1024),), torch.float32)
+            )
+            xq, xk = apply_rope_into_packed_qk(
+                xq, xk, rope_freqs_cis, workspace=rope_scratch
+            )
+            del rope_scratch
+        else:
+            _apply_rope_input_validation(xq, rope_freqs_cis)
+            _apply_rope_input_validation(xk, rope_freqs_cis)
+            rope_cos = rope_freqs_cis.real.contiguous()
+            rope_sin = rope_freqs_cis.imag.contiguous()
+            xq = self.apply_rotary_emb(xq, rope_cos, rope_sin)
+            xk = self.apply_rotary_emb(xk, rope_cos, rope_sin)
 
         if max_seqlen is None:
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
@@ -479,13 +615,15 @@ class MoonViTEncoderLayer(nn.Module):
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
         )
+        # Attention has consumed Q/K/V. Drop every view of their packed
+        # storage before allocating the output projection and its scratch.
+        del xqkv, xq, xk, xv
         attn_out = attn_out.reshape(
             seq_length,
             self.num_attention_heads_per_partition
             * self.hidden_size_per_attention_head,
         )
-        attn_out, _ = self.wo(attn_out)
-        return attn_out
+        return _project_vision_intermediate(self.wo, attn_out, output_workspace)
 
     def forward(
         self,
@@ -494,23 +632,53 @@ class MoonViTEncoderLayer(nn.Module):
         rope_freqs_cis: torch.Tensor,
         max_seqlen: torch.Tensor | None = None,
         sequence_lengths: torch.Tensor | None = None,
+        projection_workspace: torch.Tensor | None = None,
     ):
+        attention_output_workspace = None
+        if projection_workspace is not None and not torch.is_grad_enabled():
+            widths = [
+                _vision_projection_width(layer)
+                for layer in (self.wqkv, self.wo, getattr(self.mlp, "fc0", None))
+            ]
+            rows = hidden_states.shape[0]
+            intermediate_size = rows * max(widths[0], widths[2])
+            output_size = rows * widths[1]
+            if all(widths) and projection_workspace.numel() >= (
+                intermediate_size + output_size
+            ):
+                # The attention residual remains live during fc0. Give it a
+                # disjoint tail, while QKV and fc0 share the preceding extent.
+                attention_output_workspace = projection_workspace.narrow(
+                    0, intermediate_size, output_size
+                )
+                projection_workspace = projection_workspace[:intermediate_size]
         residual = hidden_states
-        hidden_states = self.norm0(hidden_states)
-
         hidden_states = self.attention_qkvpacked(
-            hidden_states,
+            self.norm0(hidden_states),
             cu_seqlens,
             rope_freqs_cis,
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
+            projection_workspace=projection_workspace,
+            output_workspace=attention_output_workspace,
         )
-        hidden_states = residual + hidden_states
+        if projection_workspace is not None and not torch.is_grad_enabled():
+            # Projection outputs have no other consumer. Do not overwrite the
+            # residual, which can still belong to the encoder's caller.
+            torch.add(residual, hidden_states, out=hidden_states)
+        else:
+            hidden_states = residual + hidden_states
 
         residual = hidden_states
-        hidden_states = self.norm1(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = self.mlp(
+            self.norm1(hidden_states),
+            projection_workspace=projection_workspace,
+            consume_input=True,
+        )
+        if projection_workspace is not None and not torch.is_grad_enabled():
+            torch.add(residual, hidden_states, out=hidden_states)
+        else:
+            hidden_states = residual + hidden_states
 
         return hidden_states
 
@@ -608,6 +776,7 @@ class MoonViT3dEncoder(nn.Module):
         grid_thws: torch.Tensor | list[list[int]] | None,
         *,
         encoder_metadata: dict[str, torch.Tensor | None] | None = None,
+        projection_workspace: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if encoder_metadata is None:
             assert grid_thws is not None
@@ -633,6 +802,7 @@ class MoonViT3dEncoder(nn.Module):
                 rope_freqs_cis=rope_freqs_cis,
                 max_seqlen=max_seqlen,
                 sequence_lengths=sequence_lengths,
+                projection_workspace=projection_workspace,
             )
 
         hidden_states = self.final_layernorm(hidden_states)
@@ -752,6 +922,7 @@ class MoonViT3dPretrainedModel(nn.Module):
         grid_thws: torch.Tensor | list[list[int]] | None,
         *,
         encoder_metadata: dict[str, torch.Tensor | None] | None = None,
+        projection_workspace: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -771,6 +942,7 @@ class MoonViT3dPretrainedModel(nn.Module):
                 hidden_states,
                 None,
                 encoder_metadata=encoder_metadata,
+                projection_workspace=projection_workspace,
             )
             merge_gather_idx = encoder_metadata["merge_gather_idx"]
             assert merge_gather_idx is not None
@@ -788,6 +960,7 @@ class MoonViT3dPretrainedModel(nn.Module):
             hidden_states,
             grid_thw_list,
             encoder_metadata=encoder_metadata,
+            projection_workspace=projection_workspace,
         )
         if (
             self.merge_type == "sd2_tpool"
@@ -828,16 +1001,22 @@ class MoonViT3dPretrainedModel(nn.Module):
 
 @torch.inference_mode()
 def mm_projector_forward(mm_projector: torch.nn.Module, vt_output: list[torch.Tensor]):
-    """Apply MM projector to vision tower outputs."""
-    num_embedding_list = [x.shape[0] for x in vt_output]
-    batched = torch.cat(vt_output, dim=0)
-    projector_dtype = next(mm_projector.parameters()).dtype
-    if batched.dtype != projector_dtype:
-        batched = batched.to(projector_dtype)
-    proj_out = mm_projector(batched)
-    proj_out = proj_out.reshape(-1, proj_out.shape[-1])
-    proj_out = torch.split(proj_out, num_embedding_list)
-    return proj_out
+    """Project independent images without copying their combined feature batch."""
+    if not vt_output:
+        raise ValueError("Kimi vision projection requires at least one image feature")
+    norm = getattr(mm_projector, "pre_norm", None)
+    if norm is None:
+        norm = getattr(mm_projector, "post_norm", None)
+    # Quantized linear storage can be FP8 or packed integers, not the
+    # activation dtype required by the projector's normalization layers.
+    projector_dtype = norm.weight.dtype if norm is not None else None
+    outputs = []
+    for features in vt_output:
+        if projector_dtype is not None and features.dtype != projector_dtype:
+            features = features.to(projector_dtype)
+        output = mm_projector(features)
+        outputs.append(output.reshape(-1, output.shape[-1]))
+    return tuple(outputs)
 
 
 @torch.inference_mode()
@@ -847,12 +1026,18 @@ def vision_tower_forward(
     grid_thw: torch.Tensor,
     mm_projector: Any,
     use_data_parallel: bool,
+    projection_workspace: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """DP-sharded vision tower forward with mrope.
 
     Uses vLLM's standard data parallelism utility to shard the batch
     across available GPUs, enabling parallel processing of vision features.
     """
+    model_kwargs = (
+        {"projection_workspace": projection_workspace}
+        if projection_workspace is not None
+        else {}
+    )
     if use_data_parallel:
         grid_thw_list = grid_thw.tolist()
         vt_outputs = run_dp_sharded_mrope_vision_model(
@@ -860,6 +1045,7 @@ def vision_tower_forward(
             pixel_values=pixel_values,
             grid_thw_list=grid_thw_list,
             rope_type="rope_2d",
+            vision_model_kwargs=model_kwargs,
         )
     else:
         grid_thw_list = grid_thw.tolist()
@@ -870,6 +1056,7 @@ def vision_tower_forward(
             pixel_values,
             grid_thw_list,
             encoder_metadata=encoder_metadata,
+            **model_kwargs,
         )
     tensors = mm_projector_forward(mm_projector, list(vt_outputs))
     return list(tensors)
@@ -938,6 +1125,13 @@ class KimiK25MultiModalProjector(nn.Module):
             hidden_states, _ = self.linear_1(hidden_states)
             hidden_states = self.act(hidden_states)
             hidden_states, _ = self.linear_2(hidden_states)
+            if not torch.is_grad_enabled() and hidden_states.shape[0] > 1024:
+                # RMSNorm reduces each row independently. Normalize bounded
+                # slices into the consumed projection output, preserving ATen
+                # arithmetic without a full-image normalization temporary.
+                for chunk in hidden_states.split(1024, dim=0):
+                    chunk.copy_(self.post_norm(chunk))
+                return hidden_states
             return self.post_norm(hidden_states)
 
         hidden_states = self.pre_norm(image_features).view(-1, self.hidden_size)

@@ -561,13 +561,15 @@ class L2Prefetcher:
 
     _instances: dict[int, L2Prefetcher] = {}
 
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, persisting_l2_request: str | None = None):
         self.device = device
         self.side = torch.cuda.Stream(device=device)
         self.pending = False
         # Before the first prefetch (and therefore before any graph capture):
         # a context limit, not a captured operation.
-        self.persisting_l2_bytes = configure_persisting_l2(device)
+        self.persisting_l2_bytes = configure_persisting_l2(
+            device, request=persisting_l2_request
+        )
 
     @classmethod
     def get(cls, device: torch.device | None = None) -> L2Prefetcher:
