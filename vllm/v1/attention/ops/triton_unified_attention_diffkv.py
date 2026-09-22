@@ -431,6 +431,11 @@ def unified_attention_diffkv(
     # Decide between 2D and 3D launch.  Mirrors the standard launcher:
     # 3D requires preallocated softmax buffers, decode-only batches, and
     # a small number of sequences (otherwise 2D already saturates the SM).
+    # Window pruning leaves only a few 32-token tiles for windows up to 128.
+    # With at least eight requests, avoid splitting that bounded work across
+    # segments plus a reduction launch. Smaller batches can still benefit from
+    # split-KV at short contexts. Keep wider windows and global attention on the
+    # existing policy; use only shape/static metadata for graph-safe selection.
     use_3d = not (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
@@ -440,6 +445,7 @@ def unified_attention_diffkv(
         or max_seqlen_q > 1
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
+        or (0 < sliding_window_val <= 128 and num_seqs >= 8)
     )
 
     # Tile size: 32 for prefill-class kernels.  Decode (small Q) prefers
