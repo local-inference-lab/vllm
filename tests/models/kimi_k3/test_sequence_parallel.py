@@ -17,6 +17,379 @@ from vllm.models.kimi_k3.nvidia import mtp as kimi_mtp
 from vllm.platforms import current_platform
 
 
+@torch.inference_mode()
+@pytest.mark.parametrize("rows", [1, 1024, 4096])
+def test_prefill_projection_donation_preserves_storage_and_decode(rows, monkeypatch):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.models.kimi_k3.nvidia import tp_projection
+
+    layer = SimpleNamespace(
+        quant_method=UnquantizedLinearMethod(),
+        weight=torch.randn(16, 8),
+        input_is_parallel=True,
+        bias=None,
+        output_size=16,
+        input_size_per_partition=8,
+        reduce_results=True,
+        tp_size=2,
+    )
+    activation = torch.randn(rows, 8)
+    output = torch.empty(rows, 16)
+    eligible = tp_projection.can_reuse_projection_output(layer, output)
+    assert eligible == (rows >= 1024)
+    if not eligible:
+        return
+    expected = torch.mm(activation, layer.weight.T) * 2
+    monkeypatch.setattr(
+        tp_projection,
+        "tensor_model_parallel_all_reduce_in_place",
+        lambda value: value.mul_(2),
+    )
+    actual = tp_projection.project_into_consumed_output(layer, activation, output)
+    assert actual is output
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="disjoint"):
+        tp_projection.project_into_consumed_output(layer, output[:, :8], output)
+
+
+def test_in_place_allreduce_donates_pynccl_output():
+    from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
+    from vllm.distributed.parallel_state import GroupCoordinator
+
+    group = GroupCoordinator.__new__(GroupCoordinator)
+    group.world_size = 2
+    comm = CudaCommunicator.__new__(CudaCommunicator)
+    comm.pynccl_comm = Mock(disabled=False)
+    group.device_communicator = comm
+    values = torch.arange(16, dtype=torch.float32)
+
+    def reduce(inp, *, out_tensor):
+        assert inp is values and out_tensor is inp
+        return out_tensor.mul_(2)
+
+    comm.pynccl_comm.all_reduce.side_effect = reduce
+    assert group.all_reduce_in_place(values) is values
+    torch.testing.assert_close(values, torch.arange(16, dtype=torch.float32) * 2)
+
+
+@pytest.mark.parametrize("padding", [False, True])
+def test_precomputed_routing_preserves_ids_weights_capture_and_padding(
+    monkeypatch, padding
+):
+    router = kimi_model.KimiPrecomputedTopKRouter(
+        top_k=16,
+        global_num_experts=896,
+        e_score_correction_bias=torch.zeros(896),
+    )
+    payload = torch.empty(6, 16)
+    weights = torch.rand(3, 16)
+    weights /= weights.sum(-1, keepdim=True)
+    ids = torch.arange(48, dtype=torch.int32).view(3, 16)
+    payload[:3].copy_(weights)
+    payload[3:].view(torch.int32).copy_(ids)
+    mask = torch.tensor([False, padding, False])
+    monkeypatch.setattr(kimi_model.envs, "VLLM_MOE_SKIP_PADDING", True)
+    monkeypatch.setattr(kimi_model, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(
+        kimi_model, "get_forward_context", lambda: SimpleNamespace(is_padding=mask)
+    )
+    capture = Mock()
+    router.capture_fn = capture
+    actual_weights, actual_ids = router._select_experts(
+        torch.empty(3, 4), payload, torch.int32
+    )
+    expected_ids = ids.masked_fill(mask[:, None], -1)
+    torch.testing.assert_close(actual_weights, weights, rtol=0, atol=0)
+    torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
+    assert actual_weights.data_ptr() == payload.data_ptr()
+    assert actual_ids.data_ptr() == payload[3:].data_ptr()
+    capture.assert_called_once_with(actual_ids)
+
+
+def test_precomputed_router_preserves_full_logit_prefill(monkeypatch):
+    router = kimi_model.KimiPrecomputedTopKRouter(
+        top_k=16,
+        global_num_experts=896,
+        e_score_correction_bias=torch.zeros(896),
+    )
+    expected = (torch.ones(9, 16), torch.zeros(9, 16, dtype=torch.int32))
+    fallback = Mock(return_value=expected)
+    monkeypatch.setattr(kimi_model.FusedTopKBiasRouter, "_compute_routing", fallback)
+    hidden, logits = torch.empty(9, 4), torch.zeros(9, 896)
+    actual = router._compute_routing(hidden, logits, torch.int32)
+    assert actual is expected
+    fallback.assert_called_once_with(hidden, logits, torch.int32, input_ids=None)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("rows", [1024, 4096])
+def test_routed_prefill_donation_matches_allocating_bf16_path(
+    rows,
+    monkeypatch,
+    default_vllm_config,
+):
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+    from vllm.model_executor.layers.layernorm import RMSNorm
+    from vllm.models.kimi_k3.nvidia import tp_projection
+
+    for module in (linear, parameter, tp_projection):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 16)
+    for module in (linear, parameter):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 15)
+    torch.manual_seed(141)
+    projection = tp_projection.KimiPaddedRowParallelLinear(3584, 7168, "test.up")
+    projection = projection.to(device="cuda", dtype=torch.bfloat16)
+    projection.weight.copy_(torch.randn_like(projection.weight) * 0.02)
+    projection.quant_method.process_weights_after_loading(projection)
+    transform = kimi_model.KimiRoutedOutputTransform(
+        RMSNorm(3584).to(device="cuda", dtype=torch.bfloat16),
+        projection,
+    )
+    latent = torch.randn(rows, 3584, device="cuda", dtype=torch.bfloat16)
+    expected = transform(latent.clone())
+    output = torch.empty(rows, 7168, device="cuda", dtype=torch.bfloat16)
+    actual = transform(latent.clone(), output=output)
+    assert actual is output
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tp_size", [2, 8, 12, 16])
+@pytest.mark.parametrize("shard_latents", [False, True])
+@pytest.mark.parametrize("prepared_transport", [False, True])
+def test_merged_mla_projection_preserves_latent_and_local_gate_order(
+    tp_size, shard_latents, prepared_transport, monkeypatch, default_vllm_config
+):
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+
+    monkeypatch.setattr(linear, "get_tensor_model_parallel_world_size", lambda: tp_size)
+    rank = tp_size - 1
+    monkeypatch.setattr(linear, "get_tensor_model_parallel_rank", lambda: rank)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: rank)
+    monkeypatch.setattr(
+        parameter, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+    torch.manual_seed(811)
+    widths = [1536, 576, 96 * 128]
+    weights = [torch.randn(width, 32) for width in widths]
+    x = torch.randn(3, 32)
+    expected = [torch.nn.functional.linear(x, weight) for weight in weights]
+    layer = linear.KimiK3MergedQKVGateLinear(
+        32, 1536, 512, 64, 96, 128, shard_latents=shard_latents
+    )
+    for shard, weight in enumerate(weights):
+        layer.weight.weight_loader(layer.weight, weight, shard)
+    layer.quant_method.process_weights_after_loading(layer)
+
+    def gather(local, dim):
+        assert dim == -1
+        pieces = [value.chunk(tp_size, dim=-1) for value in expected[:2]]
+        torch.testing.assert_close(local, torch.cat([p[rank] for p in pieces], -1))
+        return torch.cat(
+            [torch.cat([p[r] for p in pieces], -1) for r in range(tp_size)], -1
+        )
+
+    monkeypatch.setattr(linear, "tensor_model_parallel_all_gather", gather)
+    if prepared_transport and shard_latents:
+        local_width = sum(widths[:2]) // tp_size
+        padded_width = (local_width + 7) // 8 * 8
+
+        def gather_heads(query):
+            assert query.shape == (x.shape[0], 1, padded_width)
+            assert not query[..., local_width:].count_nonzero()
+            result = gather(query[:, 0, :local_width], -1).unflatten(
+                -1, (tp_size, local_width)
+            )
+            return torch.nn.functional.pad(result, (0, padded_width - local_width))
+
+        layer._latent_transport = SimpleNamespace(
+            query_dim=padded_width, gather=gather_heads
+        )
+    actual, bias = layer(x)
+    assert bias is None
+    torch.testing.assert_close(
+        actual,
+        torch.cat([*expected[:2], expected[2].chunk(tp_size, dim=-1)[rank]], -1),
+    )
+    expected_rows = (
+        sum(widths) // tp_size
+        if shard_latents
+        else sum(widths[:2]) + widths[2] // tp_size
+    )
+    assert layer.weight.shape == (expected_rows, 32)
+
+
+@pytest.mark.parametrize("tp_size", [8, 9, 10, 12, 16])
+@pytest.mark.parametrize("projection", ["gate", "down", "up"])
+def test_padded_auxiliary_projections_reconstruct_checkpoint(
+    tp_size, projection, monkeypatch, default_vllm_config
+):
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+    from vllm.models.kimi_k3.nvidia import tp_projection
+
+    for module in (linear, parameter, tp_projection):
+        monkeypatch.setattr(
+            module, "get_tensor_model_parallel_world_size", lambda: tp_size
+        )
+    torch.manual_seed(243)
+    input_size, output_size = (
+        (3584, 32)
+        if projection == "up"
+        else (32, 896 if projection == "gate" else 3584)
+    )
+    weight = torch.randn(output_size, input_size)
+    x = torch.randn(3, input_size)
+    constructor = {
+        "gate": tp_projection.KimiColumnParallelGate,
+        "down": tp_projection.KimiPaddedColumnParallelLinear,
+        "up": tp_projection.KimiPaddedRowParallelLinear,
+    }[projection]
+    parts = []
+    layers = []
+    for rank in range(tp_size):
+        for module in (linear, parameter):
+            monkeypatch.setattr(
+                module, "get_tensor_model_parallel_rank", lambda rank=rank: rank
+            )
+        layer = constructor(input_size, output_size, prefix="test.projection")
+        layer.weight.weight_loader(layer.weight, weight)
+        axis = 1 if projection == "up" else 0
+        width = layer.weight.shape[axis]
+        available = max(0, min(weight.shape[axis] - rank * width, width))
+        if available < width:
+            assert (
+                torch.count_nonzero(
+                    layer.weight.narrow(axis, available, width - available)
+                )
+                == 0
+            )
+        layer.quant_method.process_weights_after_loading(layer)
+        result, bias = layer(x) if projection == "up" else layer.forward_local(x)
+        assert bias is None and result.dtype == torch.float32
+        parts.append(result)
+        if projection == "up":
+            with torch.inference_mode():
+                donated = torch.empty_like(result)
+                actual, _ = layer.forward_into(x, donated)
+                assert actual is donated
+                torch.testing.assert_close(actual, result, rtol=0, atol=0)
+        layers.append(layer)
+    expected = torch.nn.functional.linear(x, weight)
+    if projection == "up":
+        actual = torch.stack(parts).sum(0)
+        assert all(layer.reduce_results is False for layer in layers)
+    else:
+        gathered = torch.cat(parts, -1)
+        monkeypatch.setattr(
+            tp_projection,
+            "tensor_model_parallel_all_gather",
+            lambda tensor, dim: gathered,
+        )
+        actual, _ = layers[-1](x)
+        assert actual.shape == expected.shape
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("tp_size", [9, 10, 12])
+@pytest.mark.parametrize("last_rank", [False, True])
+def test_aligned_auxiliary_decode_preserves_weights_and_fp64_accuracy(
+    tp_size, last_rank, monkeypatch, default_vllm_config
+):
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+    from vllm.models.kimi_k3.nvidia import tp_projection as tp
+
+    rank = tp_size - 1 if last_rank else 0
+    for module in (linear, parameter, tp):
+        monkeypatch.setattr(
+            module, "get_tensor_model_parallel_world_size", lambda: tp_size
+        )
+    for module in (linear, parameter):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: rank)
+    torch.manual_seed(189 + rank)
+    down = tp.KimiPaddedColumnParallelLinear(7168, 3584, "test.down")
+    gate = tp.KimiColumnParallelGate(7168, 896, "test.gate")
+    up = tp.KimiPaddedRowParallelLinear(3584, 7168, "test.up")
+    for layer in (down, gate, up):
+        layer.to(device="cuda", dtype=torch.bfloat16)
+        layer.weight.normal_(std=0.02)
+    saved = [layer.weight.clone() for layer in (down, gate, up)]
+    control_x = torch.randn(9, 7168, device="cuda", dtype=torch.bfloat16)
+    control_up = torch.randn(9, 3584, device="cuda", dtype=torch.bfloat16)
+    control_d, _ = down.forward_local(control_x)
+    control_g, _ = gate.forward_local(control_x)
+    control_u, _ = up(control_up)
+    paired = tp.prepare_paired_decode_projection(down, gate)
+    tp.prepare_aligned_decode_projection(up)
+    for layer, original in zip((down, gate, up), saved):
+        assert torch.equal(layer.weight, original)
+        assert layer.weight.is_contiguous()
+    assert (
+        down.weight.untyped_storage().data_ptr() == paired.untyped_storage().data_ptr()
+    )
+    assert (
+        gate.weight.untyped_storage().data_ptr() == paired.untyped_storage().data_ptr()
+    )
+    assert (
+        torch.count_nonzero(paired[down.weight.shape[0] + gate.weight.shape[0] :]) == 0
+    )
+    assert torch.equal(down.forward_local(control_x)[0], control_d)
+    assert torch.equal(gate.forward_local(control_x)[0], control_g)
+    assert torch.equal(up(control_up)[0], control_u)
+
+    for rows in (3, 4, 6, 8):
+        x = control_x[:rows].clone()
+        latent = control_up[:rows].clone()
+
+        def call(x=x, latent=latent):
+            d, g = tp.paired_decode_projection(
+                x, paired, saved[0].shape[0], saved[1].shape[0]
+            )
+            u, _ = up(latent)
+            return d, g, u
+
+        call()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs = call()
+        for mutation in range(3):
+            x.normal_()
+            latent.normal_()
+            local = torch.nn.functional.pad(latent, (0, up.input_pad))[
+                :,
+                rank * up.input_size_per_partition : (rank + 1)
+                * up.input_size_per_partition,
+            ]
+            oracles = [
+                x.double() @ saved[0].double().T,
+                x.double() @ saved[1].double().T,
+                local.double() @ saved[2].double().T,
+            ]
+            for output in outputs:
+                output.fill_(float("nan"))
+            allocated = torch.cuda.memory_allocated()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated() == allocated
+            repeats = [output.clone() for output in outputs]
+            for output, oracle in zip(outputs, oracles):
+                assert torch.isfinite(output).all() and torch.count_nonzero(output)
+                relative = (output.double() - oracle).norm() / oracle.norm()
+                assert relative < (0.0018 if output.dtype == torch.bfloat16 else 2e-6)
+            for _ in range(5):
+                graph.replay()
+            torch.cuda.synchronize()
+            assert all(torch.equal(a, b) for a, b in zip(outputs, repeats))
+        graph.reset()
+
+
 class _IdentityNorm(nn.Module):
     def __init__(self, hidden_size: int = 2) -> None:
         super().__init__()
@@ -177,6 +550,7 @@ def test_kimi_attn_residual_states_stay_sequence_sharded(monkeypatch):
     layer = object.__new__(kimi_model.KimiDecoderLayer)
     nn.Module.__init__(layer)
     layer.use_attn_res = True
+    layer.reuse_attn_res_output = False
     layer.use_sequence_parallel = True
     layer.prev_valid_blocks = 0
     layer.block_write_idx = 0

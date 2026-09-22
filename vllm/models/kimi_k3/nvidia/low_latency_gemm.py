@@ -972,7 +972,7 @@ def _enable_kda_projection_overlap(module: nn.Module) -> bool:
     for child in module.modules():
         if not isinstance(child, KimiK3DeltaAttention):
             continue
-        if child.tp_size != _KDA_TP_SIZE:
+        if child.tp_size != _KDA_TP_SIZE or child.split_mixed_precision_input:
             continue
         packed_weight = child.in_proj_qkvgfab.weight
         f_b_weight = child.f_b_proj.weight

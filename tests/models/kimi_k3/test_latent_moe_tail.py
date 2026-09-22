@@ -8,6 +8,7 @@ import ray
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from tests.utils import (
     init_test_distributed_environment,
@@ -24,11 +25,43 @@ from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.models.kimi_k3.nvidia import latent_moe_runner
 from vllm.models.kimi_k3.nvidia.ops.latent_moe_tail import KimiK3LatentMoETailOp
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import LayerName
 
 HIDDEN_SIZE = 7168
 LATENT_SIZE = 3584
 EPS = 0.1
 TOP_K = 8
+
+
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
+def test_replicated_latent_forward_preserves_output_dtype(output_dtype) -> None:
+    """The replicated tail must satisfy the opaque MoE output contract."""
+    runner = SimpleNamespace(
+        moe_config=SimpleNamespace(
+            hidden_dim_unpadded=4,
+            should_defer_moe_finalize=lambda rows: False,
+        ),
+        _quant_method=SimpleNamespace(
+            has_unpadded_output=False, output_dtype=output_dtype
+        ),
+        _maybe_pad_hidden_states=lambda shared, hidden: (hidden, None, None),
+        _forward_entry=torch.ops.vllm.moe_forward_shared,
+        _encode_layer_name=lambda: LayerName("latent-output-contract"),
+        _select_tail_tier=lambda fused, shared: (
+            latent_moe_runner.LatentTailTier.ALLREDUCE_OVERLAP
+        ),
+        _overlap_allreduce_tail=lambda fused, shared, trunc: fused,
+        _maybe_add_zero_expert_output=lambda result: result,
+    )
+    with FakeTensorMode():
+        hidden = torch.empty(2, 4, dtype=torch.bfloat16)
+        shared = torch.empty(2, 8, dtype=torch.bfloat16)
+        logits = torch.empty(2, 16)
+        output = latent_moe_runner.LatentMoERunner._fused_forward(
+            runner, hidden, logits, shared_experts_input=shared
+        )
+    assert output.shape == hidden.shape
+    assert output.dtype == output_dtype
 
 
 def test_deferred_finalize_enabled_before_moe_kernel_setup(
