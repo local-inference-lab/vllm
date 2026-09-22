@@ -250,7 +250,16 @@ def kernel_unified_attention_diffkv(
                 S, alibi_slope, seq_offset, context_len, query_pos, USE_ALIBI_SQRT
             )
 
+        previous_M, previous_L = M, L
         M, L, P, alpha = softmax_step(S, M, L)
+        if IS_3D and BLOCK_M == 32 and BLOCK_Q == 2 and SLIDING_WINDOW == 0:
+            # Query reuse can visit the next row's first tile while this row
+            # has no causal keys in it. Preserve the original empty-segment
+            # state instead of introducing a finite maximum into the reducer.
+            has_causal_keys = context_len + query_pos >= j * TILE_SIZE
+            M = tl.where(has_causal_keys, M, previous_M)
+            L = tl.where(has_causal_keys, L, previous_L)
+            alpha = tl.where(has_causal_keys, alpha, 1.0)
         acc = acc * alpha[:, None]
 
         if SLIDING_WINDOW:
