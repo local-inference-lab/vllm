@@ -14,6 +14,7 @@ from vllm.config import (
 )
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.v1.attention.backend import (
@@ -283,13 +284,17 @@ def init_attn_backend(
 
     # Phase 3: create metadata builders and determine cudagraph support.
     attn_backend_workspace: torch.Tensor | None = None
+    mla_prefill_workspaces: dict[
+        tuple[int, int, torch.Size, torch.dtype], torch.Tensor
+    ] = {}
     for kv_cache_group_id, groups in enumerate(attn_groups):
         kernel_block_size = None
         if kv_cache_group_id < len(kernel_block_sizes):
             kernel_block_size = kernel_block_sizes[kv_cache_group_id]
         for group in groups:
+            layer_config = layer_vllm_configs.get(group.layer_names[0], vllm_config)
             group.create_metadata_builders(
-                vllm_config=layer_vllm_configs.get(group.layer_names[0], vllm_config),
+                vllm_config=layer_config,
                 device=device,
                 kernel_block_size=kernel_block_size,
                 # Microbatches build attention metadata concurrently, and some
@@ -300,7 +305,21 @@ def init_attn_backend(
             # The microbatches' builders share the workspace: they all issue
             # attention on the one compute stream the threads hand off, so the
             # buffer is written serially, as it already is across steps.
-            for builder in group.metadata_builders:
+            for ubatch_id, builder in enumerate(group.metadata_builders):
+                if isinstance(builder, MLACommonMetadataBuilder):
+                    # Context gathering writes this scratch only during layer
+                    # execution. Sequential cache groups can reuse it, but
+                    # concurrent target/draft lanes and microbatches cannot.
+                    workspace = builder.chunked_prefill_workspace
+                    key = (
+                        id(layer_config),
+                        ubatch_id,
+                        workspace.shape,
+                        workspace.dtype,
+                    )
+                    builder.chunked_prefill_workspace = (
+                        mla_prefill_workspaces.setdefault(key, workspace)
+                    )
                 if attn_backend_workspace is None:
                     if hasattr(builder, "_get_workspace_buffer"):
                         attn_backend_workspace = builder._get_workspace_buffer()
