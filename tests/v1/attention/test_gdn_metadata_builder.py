@@ -1111,3 +1111,91 @@ def test_b12x_mixed_metadata_reuse_preserves_group_owned_buffers(
                 assert work.checkpoint.checkpoint_offsets[1] == 32
                 assert work.checkpoint.state_indices[1] == tables[group][1, 1]
             builder.mamba_aligned_state_indices.add_(20)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("num_spec", [0, 3])
+def test_b12x_mixed_refresh_keeps_graph_inputs_across_batch_changes(num_spec):
+    """Fused copies preserve padded worklists and each group's checkpoint IDs."""
+    from vllm.v1.attention.backends.b12x_gdn_metadata import B12xGdnMixedMetadata
+
+    device = torch.device("cuda")
+    owners = [
+        B12xGdnMixedMetadata(
+            max_tokens=257, max_seqs=3, state_columns=num_spec + 1, device=device
+        )
+        for _ in range(3)
+    ]
+    source, actual, expected = owners
+    states = torch.arange(
+        3 * (num_spec + 4) * 2, dtype=torch.int32, device=device
+    ).reshape(3, -1)[:, ::2]
+    states[0, 0] = -1
+    table = torch.arange(30, dtype=torch.int32, device=device).reshape(3, 10)[:, ::2]
+    group_states = (
+        torch.empty_strided(
+            states.shape, states.stride(), dtype=states.dtype, device=device
+        )
+        .copy_(states)
+        .add_(100)
+    )
+    group_table = (
+        torch.empty_strided(
+            table.shape, table.stride(), dtype=table.dtype, device=device
+        )
+        .copy_(table)
+        .add_(1000)
+    )
+
+    def tensors(owner):
+        return (
+            *owner._worklists,
+            owner.state_indices,
+            owner.spec_state_indices,
+            owner.checkpoint.state_indices,
+        )
+
+    captured = tensors(actual)
+    pointers = [tensor.data_ptr() for tensor in captured]
+    outputs = [torch.empty_like(tensor) for tensor in captured]
+    actual.copy_and_refresh_from(source, states, table)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for output, tensor in zip(outputs, captured):
+            output.copy_(tensor)
+
+    for query_lens, seq_lens, drafts in (
+        ([1, 4, 33], [41, 24, 33], [-1, 3, -1]),
+        ([4, 4, 0], [44, 44, 0], [3, 3, -1]),
+        ([1, 0, 0], [45, 0, 0], [-1, -1, -1]),
+        ([0, 0, 0], [0, 0, 0], [-1, -1, -1]),
+        ([1, 4, 33], [41, 24, 33], [-1, 3, -1]),
+    ):
+        starts = torch.tensor([0, *query_lens], dtype=torch.int32).cumsum(0)
+        common = SimpleNamespace(
+            num_reqs=3,
+            query_start_loc_cpu=starts,
+            query_start_loc=starts.to(device),
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+            seq_lens_cpu_upper_bound=torch.tensor(seq_lens, dtype=torch.int32),
+            block_table_tensor=table,
+        )
+        source.stage(
+            common,
+            states,
+            torch.tensor([1, 2, 1], dtype=torch.int32, device=device),
+            torch.tensor(drafts) if num_spec else None,
+            checkpoint_block_size=16,
+        )
+        expected.copy_worklists_from(source)
+        expected.refresh_state_indices(group_states, group_table)
+        allocations = torch.accelerator.memory_stats()["allocation.all.allocated"]
+        actual.copy_and_refresh_from(source, group_states, group_table)
+        graph.replay()
+        torch.accelerator.synchronize()
+        assert (
+            torch.accelerator.memory_stats()["allocation.all.allocated"] == allocations
+        )
+        assert [tensor.data_ptr() for tensor in tensors(actual)] == pointers
+        for observed, reference in zip(outputs, tensors(expected)):
+            torch.testing.assert_close(observed, reference, atol=0, rtol=0)

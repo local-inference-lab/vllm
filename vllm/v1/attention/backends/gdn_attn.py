@@ -938,8 +938,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         if metadata.b12x_mixed is not None:
             mixed = self._b12x_mixed
             assert mixed is not None
-            mixed.copy_worklists_from(metadata.b12x_mixed)
-            mixed.refresh_state_indices(
+            mixed.copy_and_refresh_from(
+                metadata.b12x_mixed,
                 self._get_state_indices(
                     blk_table, metadata.seq_lens, metadata.num_reqs
                 ),

@@ -6,7 +6,73 @@ from types import SimpleNamespace
 
 import torch
 
+from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import PIN_MEMORY
+
+
+@triton.jit(
+    do_not_specialize=[
+        "num_non_spec",
+        "num_spec",
+        "state_stride",
+        "state_column_stride",
+        "table_stride",
+        "table_column_stride",
+    ]
+)
+def _copy_worklists_and_refresh_states(
+    sources,
+    destinations,
+    request_rows,
+    spec_request_rows,
+    checkpoint_columns,
+    checkpoint_offsets,
+    states,
+    table,
+    output_states,
+    output_spec_states,
+    output_checkpoint_states,
+    num_non_spec,
+    num_spec,
+    state_stride,
+    state_column_stride,
+    table_stride,
+    table_column_stride,
+    SIZES: tl.constexpr,
+    MAX_SEQS: tl.constexpr,
+    STATE_COLUMNS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    for field in tl.static_range(len(SIZES)):
+        value = tl.load(sources[field] + index, index < SIZES[field], other=0)
+        tl.store(destinations[field] + index, value, index < SIZES[field])
+
+    row = tl.load(request_rows + index, index < num_non_spec, other=0).to(tl.int64)
+    state = tl.load(states + row * state_stride, index < num_non_spec, other=0)
+    tl.store(output_states + index, state, index < MAX_SEQS)
+    column = tl.load(checkpoint_columns + index, index < num_non_spec, other=0).to(
+        tl.int64
+    )
+    offset = tl.load(checkpoint_offsets + index, index < num_non_spec, other=0)
+    checkpoint = tl.load(
+        table + row * table_stride + column * table_column_stride,
+        (index < num_non_spec) & (offset > 0),
+        other=0,
+    )
+    tl.store(output_checkpoint_states + index, checkpoint, index < MAX_SEQS)
+
+    spec_row = index // STATE_COLUMNS
+    spec_column = index % STATE_COLUMNS
+    row = tl.load(spec_request_rows + spec_row, spec_row < num_spec, other=0).to(
+        tl.int64
+    )
+    state = tl.load(
+        states + row * state_stride + spec_column * state_column_stride,
+        spec_row < num_spec,
+        other=0,
+    )
+    tl.store(output_spec_states + index, state, spec_row < MAX_SEQS)
 
 
 class B12xGdnMixedMetadata:
@@ -63,6 +129,11 @@ class B12xGdnMixedMetadata:
             self.batch_ptr,
             self.token_chunk_offset_ptr,
             self.checkpoint.checkpoint_offsets,
+        )
+        self._worklists = worklists
+        self._worklist_sizes = tuple(value.numel() for value in worklists)
+        self._refresh_blocks = triton.cdiv(
+            max(*self._worklist_sizes, self.spec_state_indices.numel()), 256
         )
         self._worklists_by_dtype = tuple(
             tuple(value for value in worklists if value.dtype == dtype)
@@ -199,6 +270,49 @@ class B12xGdnMixedMetadata:
             self._worklists_by_dtype, source._worklists_by_dtype
         ):
             torch._foreach_copy_(destination, inputs, non_blocking=True)
+
+    def copy_and_refresh_from(
+        self,
+        source: "B12xGdnMixedMetadata",
+        state_indices: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> None:
+        """Keep captured group buffers while refreshing them in one GPU launch."""
+        if source is self or not self.state_indices.is_cuda:
+            self.copy_worklists_from(source)
+            self.refresh_state_indices(state_indices, block_table)
+            return
+        if (self.max_tokens, self.max_seqs, self.state_columns) != (
+            source.max_tokens,
+            source.max_seqs,
+            source.state_columns,
+        ):
+            raise ValueError("GDN metadata reuse requires matching planned capacities")
+        self._num_non_spec = source._num_non_spec
+        self._num_spec = source._num_spec
+        _copy_worklists_and_refresh_states[(self._refresh_blocks,)](
+            source._worklists,
+            self._worklists,
+            source.request_rows,
+            source.spec_request_rows,
+            source.checkpoint_columns,
+            source.checkpoint.checkpoint_offsets,
+            state_indices,
+            block_table,
+            self.state_indices,
+            self.spec_state_indices,
+            self.checkpoint.state_indices,
+            self._num_non_spec,
+            self._num_spec,
+            state_indices.stride(0),
+            state_indices.stride(1),
+            block_table.stride(0),
+            block_table.stride(1),
+            SIZES=self._worklist_sizes,
+            MAX_SEQS=self.max_seqs,
+            STATE_COLUMNS=self.state_columns,
+            BLOCK=256,
+        )
 
     def refresh_state_indices(self, state_indices, block_table) -> None:
         self.state_indices.zero_()
