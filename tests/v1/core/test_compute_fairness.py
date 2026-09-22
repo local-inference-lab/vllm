@@ -75,6 +75,101 @@ def test_contention_transitions_reset_credit():
     assert controller.select(decode_runnable=True, prefill_runnable=True) == "decode"
 
 
+def test_contention_end_with_inflight_reservation_discards_settled_credit():
+    controller = PrefillComputeShareController(0.5)
+    # Follow real controller selections through a depth-two async queue.
+    assert controller.select(decode_runnable=True, prefill_runnable=True) == "decode"
+    controller.dispatch("decode", contended=True)
+    assert controller.select(decode_runnable=True, prefill_runnable=True) == "prefill"
+    controller.dispatch("prefill", contended=True)
+    controller.record("decode", 0.05, contended=True)
+    controller.record("prefill", 0.5, contended=True)
+    assert controller.select(decode_runnable=True, prefill_runnable=True) == "decode"
+    controller.dispatch("decode", contended=True)
+
+    # The prefill class drains while an async decode quantum is still in flight,
+    # then the quantum completes and a new contention starts on the next step.
+    assert controller.select(decode_runnable=True, prefill_runnable=False) == "decode"
+    contention_active_during_gap = controller.contention_active
+    # This completion costs more than its estimate, leaving a decode lead.
+    controller.record("decode", 0.1, contended=True)
+    assert not controller.has_pending_reservations
+
+    # A fresh contention starts even, so the tie goes to decode. Inheriting
+    # the old window's decode lead would hand prefill the first turn.
+    assert controller.select(decode_runnable=True, prefill_runnable=True) == "decode"
+    assert controller.contention_active
+    assert controller.decode_virtual_runtime == 0.0
+    assert controller.prefill_virtual_runtime == 0.0
+
+    # The gap reported the end of contention, which the scheduler reads as
+    # prior_contention to derive contention_started for auto mode.
+    assert not contention_active_during_gap
+
+
+def test_new_contention_before_inflight_quanta_of_both_classes_settle():
+    controller = PrefillComputeShareController(0.5)
+    controller.select(decode_runnable=True, prefill_runnable=True)
+    # Equal 0.5 s quanta: prefill settles one, decode settles two, so decode
+    # leads by exactly one normalized quantum when the window ends.
+    controller.dispatch("prefill", contended=True)
+    controller.record("prefill", 0.5, contended=True)
+    for _ in range(2):
+        controller.dispatch("decode", contended=True)
+        controller.record("decode", 0.5, contended=True)
+    assert controller.decode_virtual_runtime == pytest.approx(2.0)
+    assert controller.prefill_virtual_runtime == pytest.approx(1.0)
+    # One quantum of each class is in flight, as an async depth-two queue
+    # holding one decode step and one prefill chunk does.
+    controller.dispatch("decode", contended=True)
+    controller.dispatch("prefill", contended=True)
+    assert list(controller.decode_reservations) == [(1.0, 0.5)]
+    assert list(controller.prefill_reservations) == [(1.0, 0.5)]
+
+    assert controller.select(decode_runnable=True, prefill_runnable=False) == "decode"
+    contention_active_during_gap = controller.contention_active
+
+    # Contention resumes before either in-flight quantum completes. Only the
+    # reservations carry over, so the fresh window starts as a tie.
+    assert controller.select(decode_runnable=True, prefill_runnable=True) == "decode"
+    assert controller.contention_active
+    assert not contention_active_during_gap
+    assert controller.decode_virtual_runtime == pytest.approx(1.0)
+    assert controller.prefill_virtual_runtime == pytest.approx(1.0)
+    assert list(controller.decode_reservations) == [(1.0, 0.5)]
+    assert list(controller.prefill_reservations) == [(1.0, 0.5)]
+
+    # Both quanta settle against their retained reservations, not below zero.
+    controller.record("decode", 0.5, contended=True)
+    controller.record("prefill", 0.5, contended=True)
+    assert not controller.has_pending_reservations
+    assert controller.decode_virtual_runtime == pytest.approx(1.0)
+    assert controller.prefill_virtual_runtime == pytest.approx(1.0)
+    assert controller.select(decode_runnable=True, prefill_runnable=True) == "decode"
+
+
+def test_contention_end_reset_keeps_reservations_settling_to_zero():
+    controller = PrefillComputeShareController(
+        0.5, last_decode_seconds=0.1, last_prefill_seconds=1.0
+    )
+    controller.select(decode_runnable=True, prefill_runnable=True)
+    controller.dispatch("decode", contended=True)
+    controller.dispatch("prefill", contended=True)
+    controller.decode_virtual_runtime += 40.0
+    controller.prefill_virtual_runtime += 40.0
+
+    assert controller.select(decode_runnable=False, prefill_runnable=True) == "prefill"
+
+    assert controller.decode_virtual_runtime == pytest.approx(0.2)
+    assert controller.prefill_virtual_runtime == pytest.approx(2.0)
+
+    controller.record("decode", 0.0, contended=True)
+    controller.record("prefill", 0.0, contended=True)
+    assert not controller.has_pending_reservations
+    assert controller.decode_virtual_runtime == pytest.approx(0.0)
+    assert controller.prefill_virtual_runtime == pytest.approx(0.0)
+
+
 def test_single_runnable_class_receives_full_service():
     controller = PrefillComputeShareController(0.5)
 

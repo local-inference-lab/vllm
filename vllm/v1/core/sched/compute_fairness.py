@@ -108,14 +108,8 @@ class PrefillComputeShareController:
         )
 
         # Discard completed-policy debt while retaining reservations for work
-        # that was already dispatched. Each reservation carries the share used
-        # at dispatch and therefore settles correctly after a live update.
-        self.decode_virtual_runtime = sum(
-            reservation for reservation, _ in self.decode_reservations
-        )
-        self.prefill_virtual_runtime = sum(
-            reservation for reservation, _ in self.prefill_reservations
-        )
+        # that was already dispatched.
+        self._discard_settled_credit()
         self.contention_active = self.has_pending_reservations
         self.last_adjustment_at = None
 
@@ -208,8 +202,7 @@ class PrefillComputeShareController:
     ) -> ComputeServiceClass | None:
         """Select the next runnable service class."""
         if not decode_runnable or not prefill_runnable:
-            if not self.has_pending_reservations:
-                self.reset()
+            self.reset()
             if decode_runnable:
                 return "decode"
             if prefill_runnable:
@@ -217,8 +210,7 @@ class PrefillComputeShareController:
             return None
 
         if not self.contention_active:
-            self.decode_virtual_runtime = 0.0
-            self.prefill_virtual_runtime = 0.0
+            self._discard_settled_credit()
             self.contention_active = True
 
         # Until a class has one measured completion, allow only one of its
@@ -322,8 +314,27 @@ class PrefillComputeShareController:
             if self.decode_virtual_runtime - self.prefill_virtual_runtime > charge:
                 self.prefill_virtual_runtime = self.decode_virtual_runtime - charge
 
+    def _discard_settled_credit(self) -> None:
+        """Drop settled credit while retaining reservations for dispatched work.
+
+        A reservation is subtracted again when its quantum completes, so the
+        runtime must keep holding it; only credit from completed quanta is
+        discarded. Each reservation carries its dispatch share and therefore
+        still settles correctly against a fresh contention window.
+        """
+        self.decode_virtual_runtime = sum(
+            reservation for reservation, _ in self.decode_reservations
+        )
+        self.prefill_virtual_runtime = sum(
+            reservation for reservation, _ in self.prefill_reservations
+        )
+
     def reset(self) -> None:
-        """Discard credit when both classes are no longer runnable."""
-        self.decode_virtual_runtime = 0.0
-        self.prefill_virtual_runtime = 0.0
+        """Discard settled credit when a class is no longer runnable.
+
+        Contention ends even while dispatched quanta are still in flight, so
+        the next contention window starts from a clean slate instead of
+        inheriting credit that the previous window already settled.
+        """
+        self._discard_settled_credit()
         self.contention_active = False
