@@ -50,6 +50,37 @@ def test_none_overrides_fall_back_to_arch_mapping():
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize("method", ["dspark", "dflash"])
+def test_draft_online_quantization_preserves_projection_exclusions(method):
+    from vllm.config.quantization import resolve_quantization_config
+
+    overrides = {"linear": "mxfp8", "ignore": ["re:.*fused_qkv_a_proj$"]}
+    target = MagicMock(
+        model="target", max_model_len=128, quantization="mxfp4", hf_overrides={}
+    )
+    with (
+        patch(
+            "vllm.config.speculative.ModelConfig",
+            side_effect=RuntimeError("draft constructor boundary"),
+        ) as constructor,
+        pytest.raises(RuntimeError, match="draft constructor boundary"),
+    ):
+        SpeculativeConfig(
+            model="draft",
+            method=method,
+            num_speculative_tokens=7,
+            quantization="mxfp8",
+            quantization_config=overrides,
+            target_model_config=target,
+            target_parallel_config=ParallelConfig(),
+        )
+    assert constructor.call_args.kwargs["quantization_config"] == (
+        resolve_quantization_config("mxfp8", overrides)
+    )
+    assert target.quantization == "mxfp4"
+
+
+@pytest.mark.cpu_test
 def test_callable_overrides_reach_the_draft_config():
     """A callable override (config-to-config transform) composes with the
     architecture-mapping override and is applied to the draft config."""

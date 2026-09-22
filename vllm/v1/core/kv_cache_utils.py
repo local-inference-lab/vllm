@@ -1548,6 +1548,7 @@ def _get_kv_cache_groups_uniform_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
     *,
     log_padding: bool = True,
+    group_size_override: int | None = None,
 ) -> list[KVCacheGroupSpec]:
     """
     Generates the KV cache groups for hybrid models with multiple
@@ -1608,6 +1609,8 @@ def _get_kv_cache_groups_uniform_page_size(
 
     Args:
         kv_cache_spec: The KVCacheSpec of each attention layer in the model
+        log_padding: Whether to report padding introduced by grouping.
+        group_size_override: Maximum layers per group, or the default heuristic.
     Returns:
         The generated KVCacheGroupSpecs
     """
@@ -1637,6 +1640,10 @@ def _get_kv_cache_groups_uniform_page_size(
         # layers while accommodating speculative decoding drafters that add
         # extra layers to one attention type.
         group_size = max_num_layers
+    if group_size_override is not None:
+        if group_size_override <= 0:
+            raise ValueError("KV cache group size override must be positive")
+        group_size = group_size_override
     group_counts = []
     for layers in layer_buckets:
         num_padding_layers = group_size - len(layers) % group_size
@@ -2503,7 +2510,7 @@ def _warn_if_unannotated_eagle_mamba(
         kv_cache_groups: Groups as they will be handed to consumers.
     """
     spec_config = vllm_config.speculative_config
-    if spec_config is None or not spec_config.use_eagle():
+    if spec_config is None or not spec_config.use_eagle_block_drop():
         return
     if any(group.is_eagle_group for group in kv_cache_groups):
         return
@@ -2625,6 +2632,51 @@ def get_kv_cache_groups(
         # This returns an empty list to allow for the KVCacheManager to handle
         # attention free models.
         return []
+
+    group_size = envs.VLLM_K3_KV_GROUP_SIZE
+    model_type = getattr(
+        getattr(getattr(vllm_config, "model_config", None), "hf_config", None),
+        "model_type",
+        None,
+    )
+    if (
+        group_size > 0
+        and model_type == "kimi_k3"
+        and any(isinstance(spec, MambaSpec) for spec in kv_cache_spec.values())
+        and (
+            any(
+                isinstance(spec, SlidingWindowMLASpec)
+                and spec.non_causal_multi_token_decode
+                for spec in kv_cache_spec.values()
+            )
+            or (
+                getattr(vllm_config.speculative_config, "method", None) == "dflash"
+                and any(
+                    isinstance(spec, SlidingWindowSpec) and spec.dcp_replicated
+                    for spec in kv_cache_spec.values()
+                )
+            )
+        )
+    ):
+        # All groups draw from one pool sized by its widest group. Bound the
+        # target and draft widths together so a short draft tail does not
+        # consume blocks sized for all target attention layers.
+        layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+        aligned_specs = (
+            kv_cache_spec
+            if layout.is_block_outermost
+            else unify_kv_cache_spec_page_size(kv_cache_spec)
+        )
+        groups = _get_kv_cache_groups_uniform_page_size(
+            aligned_specs, group_size_override=group_size
+        )
+        _annotate_eagle_groups(vllm_config, aligned_specs, groups)
+        logger.info_once(
+            "Kimi-K3 uses hybrid KV group size %d (%d groups).",
+            group_size,
+            len(groups),
+        )
+        return groups
 
     target_specs, draft_specs = _partition_parallel_draft_specs(
         vllm_config, kv_cache_spec

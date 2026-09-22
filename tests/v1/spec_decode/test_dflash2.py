@@ -190,6 +190,117 @@ def test_dflash_context_projection_rejects_mixed_quantization(mxfp8_layer: int):
         model._build_context_kv_buffers(layers_attn, has_bias=False)
 
 
+def test_dflash_bf16_context_projection_preserves_weights():
+    from torch import nn
+
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
+
+    torch.manual_seed(7)
+    layers_attn = [
+        SimpleNamespace(
+            q_size=4,
+            qkv_proj=SimpleNamespace(
+                quant_method=UnquantizedLinearMethod(),
+                weight=torch.randn(8, 32, dtype=torch.bfloat16),
+            ),
+            k_norm=SimpleNamespace(weight=torch.ones(2, dtype=torch.bfloat16)),
+        )
+        for _ in range(2)
+    ]
+    model = object.__new__(DFlashQwen3Model)
+    nn.Module.__init__(model)
+    model.hidden_norm = SimpleNamespace(weight=torch.ones(32, dtype=torch.bfloat16))
+    model.layers = [SimpleNamespace(self_attn=attn) for attn in layers_attn]
+    model._build_context_kv_buffers(layers_attn, has_bias=False)
+    expected = torch.cat([attn.qkv_proj.weight[4:] for attn in layers_attn])
+    torch.testing.assert_close(model._fused_kv_weight, expected, rtol=0, atol=0)
+    assert model._fused_kv_weight_scale is None
+    model.process_weights_after_loading()
+    torch.testing.assert_close(model._fused_kv_weight, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_dflash_serialized_mxfp8_context_has_independent_kernel(monkeypatch):
+    from torch import nn
+
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.quantization.modelopt import (
+        build_linear_method,
+    )
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    monkeypatch.setenv(
+        "VLLM_DISABLED_KERNELS",
+        "B12xMxfp8LinearKernel,FlashInferCutedslMxfp8LinearKernel,FlashInferCutlassMxfp8LinearKernel",
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 1
+    )
+    torch.manual_seed(9)
+    layers_attn = []
+    expected_weights = []
+    with (
+        set_current_vllm_config(VllmConfig()),
+        set_default_torch_dtype(torch.bfloat16),
+        torch.device("cuda"),
+    ):
+        for _ in range(2):
+            method = build_linear_method(None, "MXFP8", "")
+            linear = nn.Module()
+            linear.quant_method = method
+            method.create_weights(linear, 512, [512], 512, 512, torch.bfloat16)
+            linear.weight.data.copy_(torch.randn(512, 512).to(torch.float8_e4m3fn))
+            linear.weight_scale.data.fill_(127)
+            expected_weights.append(linear.weight[256:].to(torch.bfloat16))
+            layers_attn.append(
+                SimpleNamespace(
+                    q_size=256,
+                    qkv_proj=linear,
+                    k_norm=SimpleNamespace(weight=torch.ones(128)),
+                )
+            )
+        model = object.__new__(DFlashQwen3Model)
+        nn.Module.__init__(model)
+        model.hidden_norm = SimpleNamespace(weight=torch.ones(512))
+        model.layers = [SimpleNamespace(self_attn=attn) for attn in layers_attn]
+        model._fused_kv_linear = nn.Module()
+        model._build_context_kv_buffers(layers_attn, has_bias=False)
+        for attn in layers_attn:
+            attn.qkv_proj.quant_method.process_weights_after_loading(attn.qkv_proj)
+        source_kernel = layers_attn[0].qkv_proj.quant_method.kernel
+        source_weight = layers_attn[0].qkv_proj.weight.clone()
+        model.process_weights_after_loading()
+        assert model._fused_kv_quant_method.kernel is not source_kernel
+        torch.testing.assert_close(
+            layers_attn[0].qkv_proj.weight, source_weight, rtol=0, atol=0
+        )
+        expected_weight = torch.cat(expected_weights)
+        for rows in (1, 7, 256):
+            x = torch.randn(rows, 512)
+
+            def run(x=x):
+                return model._fused_kv_quant_method.apply(model._fused_kv_linear, x)
+
+            run()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                actual = run()
+            for _ in range(2):
+                x.normal_()
+                graph.replay()
+                expected = torch.nn.functional.linear(x, expected_weight)
+                assert torch.isfinite(actual).all() and actual.abs().max() > 0
+                cosine = torch.nn.functional.cosine_similarity(
+                    actual.float().flatten(), expected.float().flatten(), dim=0
+                )
+                assert cosine > 0.9999
+
+
 @pytest.mark.parametrize("mxfp8", [False, True])
 @pytest.mark.parametrize("has_bias", [False, True])
 def test_fused_context_projection_owns_its_linear_method(monkeypatch, mxfp8, has_bias):

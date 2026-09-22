@@ -154,6 +154,25 @@ def test_kv_connector_rejects_expandable_segments(monkeypatch, kv_connector):
         _build_config(kv_connector=kv_connector)
 
 
+@pytest.mark.parametrize("spec_name", [None, "CPUOffloadingSpec"])
+def test_cpu_offload_allows_expandable_segments(monkeypatch, spec_name):
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    _build_config(
+        kv_connector="OffloadingConnector",
+        kv_connector_extra_config={} if spec_name is None else {"spec_name": spec_name},
+    )
+
+
+@pytest.mark.parametrize("spec_name", ["TieringOffloadingSpec", "ExternalSpec"])
+def test_nonlocal_offload_rejects_expandable_segments(monkeypatch, spec_name):
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    with pytest.raises(ValueError, match="expandable_segments"):
+        _build_config(
+            kv_connector="OffloadingConnector",
+            kv_connector_extra_config={"spec_name": spec_name},
+        )
+
+
 def test_lmcache_mp_engine_driven_allows_expandable_segments(monkeypatch):
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     _build_config(

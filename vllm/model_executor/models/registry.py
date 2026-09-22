@@ -643,6 +643,10 @@ _SPECULATIVE_DECODING_MODELS = {
     "EagleMiniCPMForCausalLM": ("minicpm_eagle", "EagleMiniCPMForCausalLM"),
     "DFlashDraftModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
     "DFlash2DraftModel": ("qwen3_dflash2", "DFlash2Qwen3ForCausalLM"),
+    "DFlash2KimiK3Model": (
+        "vllm.models.kimi_k3.nvidia.dflash2_mla",
+        "DFlash2KimiK3ForCausalLM",
+    ),
     # Muse Glimmer's DFlash draft head, reusing the generic qwen3_dflash
     # implementation. EAGLEConfig rewrites a dflash draft's architecture to
     # DFlash{arch} unless it already starts or ends with "DFlash" (see

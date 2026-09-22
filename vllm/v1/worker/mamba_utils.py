@@ -66,8 +66,7 @@ def get_aligned_state_indices_multi_group_kernel(
     )
     first_state_slot = tl.maximum((seq_lens - 1) // CACHE_BLOCK_SIZE, 0)
 
-    # load multiple block table for each group
-    groups = tl.arange(0, BLOCK_GROUPS)
+    groups = tl.program_id(1) * BLOCK_GROUPS + tl.arange(0, BLOCK_GROUPS)
     valid_group = groups < NUM_GROUPS
     group_base_addrs = tl.load(
         block_table_ptrs_ptr + groups,
@@ -1292,8 +1291,21 @@ class MambaSpecDecodeGPUContext:
             return self.aligned_state_indices[:, :0]
 
         num_state_slots = self.aligned_state_indices.shape[2]
-        block_rows = 32
-        grid = (triton.cdiv(num_reqs, block_rows),)
+        block_state_slots = triton.next_power_of_2(num_state_slots)
+        # Bound each program's gather tile: large group counts otherwise spill
+        # registers and reserve hundreds of MiB of device-local backing memory.
+        block_rows = min(
+            32, triton.next_power_of_2(num_reqs), max(1, 1024 // block_state_slots)
+        )
+        block_groups = min(
+            8,
+            triton.next_power_of_2(self.num_groups),
+            max(1, 1024 // (block_rows * block_state_slots)),
+        )
+        grid = (
+            triton.cdiv(num_reqs, block_rows),
+            triton.cdiv(self.num_groups, block_groups),
+        )
         get_aligned_state_indices_multi_group_kernel[grid](
             self.block_table_ptrs,
             seq_lens,
@@ -1306,9 +1318,9 @@ class MambaSpecDecodeGPUContext:
             num_reqs,
             CACHE_BLOCK_SIZE=self.block_size,
             NUM_GROUPS=self.num_groups,
-            BLOCK_GROUPS=triton.next_power_of_2(self.num_groups),
+            BLOCK_GROUPS=block_groups,
             NUM_STATE_SLOTS=num_state_slots,
-            BLOCK_STATE_SLOTS=triton.next_power_of_2(num_state_slots),
+            BLOCK_STATE_SLOTS=block_state_slots,
             BLOCK_ROWS=block_rows,
             num_warps=1,
         )
