@@ -10,7 +10,7 @@ from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import replace
 from functools import cached_property
-from typing import TYPE_CHECKING, Literal, TypeVar, overload
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
@@ -238,8 +238,9 @@ class Executor(ABC):
 
         from vllm.utils.network_utils import get_ip
 
-        display = output = None
-        local_output = SimpleQueue()
+        display: Any = None
+        output = None
+        local_output: SimpleQueue[str] = SimpleQueue()
         begun = False
         completed = False
 
@@ -253,7 +254,7 @@ class Executor(ABC):
 
         try:
             begun = True
-            outcomes = self.collective_rpc(
+            outcomes: list[dict[str, Any]] = self.collective_rpc(
                 "begin_b12x_preparation",
                 kwargs={"stage": stage},
             )
@@ -372,9 +373,22 @@ class Executor(ABC):
         except BaseException as error:
             if begun and not completed:
                 try:
-                    self.collective_rpc("abort_b12x_preparation")
+                    self.collective_rpc("abort_b12x_preparation", timeout=10)
                 except BaseException as cleanup_error:
-                    error.add_note(f"b12x preparation abort failed: {cleanup_error!r}")
+                    if hasattr(error, "add_note"):
+                        error.add_note(
+                            f"b12x preparation abort failed: {cleanup_error!r}"
+                        )
+                # EngineCore construction has not returned an owner yet. Do not
+                # leave its child processes to interpreter finalization after
+                # a failed admission or preparation transaction.
+                try:
+                    self.shutdown()
+                except BaseException as cleanup_error:
+                    if hasattr(error, "add_note"):
+                        error.add_note(
+                            f"b12x executor shutdown failed: {cleanup_error!r}"
+                        )
             raise
         finally:
             try:

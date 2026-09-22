@@ -62,6 +62,8 @@ CHECK_IMPORTS = {
             "benchmarks/fused_kernels/layernorm_rms_benchmarks.py",
             "benchmarks/cutlass_benchmarks/w8a8_benchmarks.py",
             "benchmarks/cutlass_benchmarks/sparse_benchmarks.py",
+            # Existing trusted worker preparation progress over the executor store.
+            "vllm/v1/executor/abstract.py",
             # cloudpickle
             "vllm/v1/executor/multiproc_executor.py",
             "vllm/v1/executor/ray_executor.py",

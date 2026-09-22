@@ -10,6 +10,46 @@ import pytest
 from vllm.v1.executor.multiproc_executor import WorkerProc
 
 
+@pytest.mark.parametrize("world", [1, 2, 3, 4])
+def test_failed_broadcast_drains_every_reply_before_abort(world):
+    from collections import deque
+    from unittest.mock import MagicMock
+
+    from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+
+    success, failure = (
+        WorkerProc.ResponseStatus.SUCCESS,
+        WorkerProc.ResponseStatus.FAILURE,
+    )
+    for failed_rank in range(world):
+        queues = [
+            MagicMock(
+                dequeue=MagicMock(
+                    side_effect=[
+                        (failure, "admission")
+                        if rank == failed_rank
+                        else (success, "prepared"),
+                        (success, "aborted"),
+                    ]
+                )
+            )
+            for rank in range(world)
+        ]
+        executor = SimpleNamespace(
+            rpc_broadcast_mq=MagicMock(),
+            is_failed=False,
+            response_mqs=queues,
+            futures_queue=deque(),
+        )
+        with pytest.raises(RuntimeError, match="admission"):
+            MultiprocExecutor.collective_rpc(executor, "prepare", timeout=1)
+        assert (
+            MultiprocExecutor.collective_rpc(executor, "abort", timeout=1)
+            == ["aborted"] * world
+        )
+        assert all(queue.dequeue.call_count == 2 for queue in queues)
+
+
 class _ExitWorkerLoop(RuntimeError):
     pass
 
