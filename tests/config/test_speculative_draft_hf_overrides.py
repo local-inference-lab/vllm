@@ -225,3 +225,49 @@ def test_mtp_index_share_override(
         speculative_config.draft_model_config.hf_config.index_share_for_mtp_iteration
         is expected
     )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("hub_model", [False, True])
+def test_draft_subfolder_resolves_config_and_weight_directory(tmp_path, hub_model):
+    from transformers import Qwen3Config
+
+    hf_config = Qwen3Config(
+        architectures=["Qwen3ForCausalLM"],
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        vocab_size=32,
+        max_position_embeddings=128,
+    )
+    hf_config.save_pretrained(tmp_path)
+    target = ModelConfig(str(tmp_path), dtype="bfloat16")
+    draft_dir = tmp_path / "dflash"
+    hf_config.architectures = ["DFlashDraftModel"]
+    hf_config.save_pretrained(draft_dir)
+    model = "owner/target" if hub_model else str(tmp_path)
+    revision = "a" * 40
+    with patch("vllm.transformers_utils.repo_utils.hf_api") as api:
+        api.return_value.snapshot_download.return_value = str(tmp_path)
+        config = SpeculativeConfig(
+            model=model,
+            model_subfolder="dflash",
+            revision=revision,
+            method="dflash",
+            num_speculative_tokens=7,
+            target_model_config=target,
+            target_parallel_config=ParallelConfig(),
+        )
+        assert config.draft_model_config.model == str(draft_dir)
+        assert config.draft_model_config.tokenizer == target.tokenizer
+        assert config.draft_model_config.architectures == ["DFlashDraftModel"]
+        if hub_model:
+            kwargs = api.return_value.snapshot_download.call_args.kwargs
+            assert kwargs["repo_id"] == model
+            assert kwargs["revision"] == revision
+            assert kwargs["allow_patterns"] == "dflash/*"
+        else:
+            api.assert_not_called()

@@ -42,7 +42,8 @@ class B12xWorkload:
     ``stage`` selects the lifecycle point: ``weights`` runs after model load
     and before memory profiling; ``state`` runs after the KV and state pools
     exist. ``eager_only`` marks multimodal-encoder shapes that are executed
-    eagerly and never captured.
+    eagerly and never captured. ``block_table_widths`` supplies allocated
+    kernel-page table widths by layer name for state preparation.
     """
 
     stage: Literal["weights", "state"]
@@ -55,6 +56,7 @@ class B12xWorkload:
     speculative_tokens: int = 0
     lane: int = 0
     eager_only: bool = False
+    block_table_widths: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self):
         if self.stage not in ("weights", "state"):

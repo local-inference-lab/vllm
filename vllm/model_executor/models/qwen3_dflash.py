@@ -27,11 +27,14 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.modelopt import ModelOptLinearMethod
+from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Static
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.weight_transfer import allocate_weights, flush_weight_transfers
 from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
@@ -60,17 +63,6 @@ logger = init_logger(__name__)
 
 
 _SLIDING_ATTENTION = "sliding_attention"
-
-
-def _is_mxfp8_linear(method) -> bool:
-    from vllm.model_executor.layers.quantization.modelopt import (
-        ModelOptLinearMethod,
-        kMxfp8Static,
-    )
-
-    return (
-        isinstance(method, ModelOptLinearMethod) and method.spec.weight == kMxfp8Static
-    )
 
 
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
@@ -266,7 +258,9 @@ class DFlashQwen3Attention(nn.Module):
         )
 
         self.attention_sink_bias = (
-            torch.nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
+            torch.nn.Parameter(
+                allocate_weights(torch.empty, self.num_heads), requires_grad=False
+            )
             if add_swa_attention_sink_bias
             else None
         )
@@ -462,7 +456,11 @@ class DFlashQwen3Model(nn.Module):
             "mask_token_id", getattr(self.config, "mask_token_id", None)
         )
         self.mask_embedding = nn.Parameter(
-            torch.zeros(self.config.hidden_size, dtype=vllm_config.model_config.dtype),
+            allocate_weights(
+                torch.zeros,
+                self.config.hidden_size,
+                dtype=vllm_config.model_config.dtype,
+            ),
             requires_grad=False,
         )
         self.has_separate_mask_embedding = False
@@ -523,7 +521,11 @@ class DFlashQwen3Model(nn.Module):
         has_bias: bool,
     ) -> None:
         quant_methods = [a.qkv_proj.quant_method for a in layers_attn]
-        uses_mxfp8 = [_is_mxfp8_linear(method) for method in quant_methods]
+        uses_mxfp8 = [
+            isinstance(method, ModelOptLinearMethod)
+            and method.spec.weight == kMxfp8Static
+            for method in quant_methods
+        ]
         if any(uses_mxfp8) and not all(uses_mxfp8):
             raise ValueError(
                 "Every DFlash attention layer must use the same MXFP8 "
@@ -599,7 +601,10 @@ class DFlashQwen3Model(nn.Module):
     def process_weights_after_loading(self) -> None:
         """Pack the serialized MXFP8 context projection for its GEMM backend."""
         quant_method = self.layers[0].self_attn.qkv_proj.quant_method
-        if not _is_mxfp8_linear(quant_method):
+        if (
+            not isinstance(quant_method, ModelOptLinearMethod)
+            or quant_method.spec.weight != kMxfp8Static
+        ):
             return
         if self._fused_kv_weight is None or self._fused_kv_weight_scale is None:
             raise RuntimeError(
@@ -826,7 +831,9 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         target_vocab_size = vllm_config.model_config.get_vocab_size()
         if self.config.draft_vocab_size != target_vocab_size:
             self.draft_id_to_target_id = nn.Parameter(
-                torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
+                allocate_weights(
+                    torch.zeros, self.config.draft_vocab_size, dtype=torch.long
+                ),
                 requires_grad=False,
             )
         else:
@@ -951,6 +958,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         mapper = WeightsMapper(orig_to_new_substr=orig_to_new_substr)
         loader = AutoWeightsLoader(self)
         loader.load_weights(model_weights.items(), mapper=mapper)
+        flush_weight_transfers()
         self.model._build_fused_kv_buffers()
 
     def _read_mask_embedding(self) -> torch.Tensor | None:

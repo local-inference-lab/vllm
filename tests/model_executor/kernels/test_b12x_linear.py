@@ -260,7 +260,7 @@ def test_b12x_block_fp8_requires_matching_supported_dtypes() -> None:
     assert reason is None
 
 
-def test_b12x_block_fp8_requires_aligned_features() -> None:
+def test_b12x_block_fp8_requires_aligned_inputs_and_positive_outputs() -> None:
     def can_implement(weight_shape: tuple[int, int]):
         config = FP8ScaledMMLinearLayerConfig(
             activation_quant_key=kFp8Dynamic128Sym,
@@ -275,10 +275,11 @@ def test_b12x_block_fp8_requires_aligned_features() -> None:
         False,
         "Input features must be a positive multiple of 128",
     )
-    assert can_implement((192, 256)) == (
+    assert can_implement((0, 256)) == (
         False,
-        "Output features must be a positive multiple of 128",
+        "Output features must be positive",
     )
+    assert can_implement((3392, 4096)) == (True, None)
 
 
 def test_b12x_tensor_fp8_process_weights_packs_modelopt_layout(
@@ -526,6 +527,55 @@ def test_b12x_mxfp8_dequantizes_before_serving_plan_preparation(out_dtype) -> No
     )
     torch.testing.assert_close(actual, expected.to(out_dtype), rtol=0, atol=0)
     assert layer.b12x_linear.plan is None
+
+
+@pytest.mark.parametrize("in_features", [160, 256])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_b12x_mxfp8_dequantizes_weights_before_plan_preparation(
+    in_features, out_dtype
+) -> None:
+    from vllm.model_executor.kernels.linear.b12x_blockscaled import (
+        B12xBlockscaledLinear,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        get_and_maybe_dequant_weights,
+    )
+
+    values = torch.tensor([-0.001953125, -0.5, 1.0, 448.0]).repeat(2, 64)
+    values = values.to(torch.float8_e4m3fn)
+    scales = torch.tensor(
+        [
+            [0, 124, 126, 127, 128, 129, 130, 131],
+            [131, 130, 129, 128, 127, 126, 124, 0],
+        ],
+        dtype=torch.uint8,
+    )
+    packed = types.SimpleNamespace(
+        weight=types.SimpleNamespace(values=values, scale_rows=scales.unsqueeze(0)),
+        in_features=in_features,
+        padded_in_features=256,
+        out_features=2,
+    )
+    holder = B12xBlockscaledLinear(
+        packed, recipe="mxfp8", activation_mode="auto", layer_name="kv_b_proj"
+    )
+    layer = types.SimpleNamespace(
+        weight=torch.empty(0, dtype=torch.float8_e4m3fn),
+        weight_scale=torch.empty(0, dtype=torch.uint8),
+        input_size_per_partition=in_features,
+        b12x_mxfp8_packed_weight=packed,
+        quant_method=types.SimpleNamespace(
+            apply=lambda layer, x, bias: holder.run(x, bias)
+        ),
+    )
+
+    actual = get_and_maybe_dequant_weights(layer, out_dtype=out_dtype)
+    expected = torch.ldexp(
+        values.float(), (scales.int() - 127).repeat_interleave(32, dim=-1)
+    )[:, :in_features].to(out_dtype)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert holder.plan is None
 
 
 def test_b12x_mxfp8_reload_reuses_packed_tensor_addresses(monkeypatch) -> None:
@@ -788,6 +838,74 @@ def test_b12x_block_fp8_upcasts_e8m0_weight_scales(scale_dtype) -> None:
         layer.weight_scale_inv,
         torch.tensor([[0.25]], dtype=torch.float32),
     )
+
+
+@pytest.mark.parametrize("n,use_bias", [(3392, False), (3392, True), (3712, False)])
+@torch.inference_mode()
+def test_b12x_block_fp8_partial_output_block_graph_replay(
+    default_vllm_config, monkeypatch, tmp_path, n, use_bias
+) -> None:
+    """MiMo TP4 projections retain their logical width and values through replay."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("requires SM12x")
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    k, counts = 4096, (4, 129)
+    torch.manual_seed(39)
+    values = torch.randn(n, k, device=device).to(torch.float8_e4m3fn)
+    scales = torch.rand((n + 127) // 128, k // 128, device=device) * 0.1 + 0.01
+    decoded = values.float() * scales.repeat_interleave(128, 0)[:n].repeat_interleave(
+        128, 1
+    )
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(values, requires_grad=False)
+    layer.weight_scale_inv = torch.nn.Parameter(scales, requires_grad=False)
+    config = FP8ScaledMMLinearLayerConfig(
+        activation_quant_key=kFp8Dynamic128Sym,
+        weight_quant_key=kFp8Static128BlockSym,
+        weight_shape=(n, k),
+        input_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+    )
+    kernel = B12xFp8BlockScaledMMKernel(config)
+    kernel.process_weights_after_loading(layer)
+    bias = torch.randn(n, device=device, dtype=torch.bfloat16) if use_bias else None
+    session, _ = _prepare(layer, device=device, counts=counts, cache_dir=tmp_path)
+    session.freeze()
+    weight_pointer = layer.weight.data_ptr()
+
+    def check(source, actual):
+        quantized, scale = kernel.quant_fp8(source)
+        expected = (
+            (quantized.float() * scale.repeat_interleave(128, 1)) @ decoded.T
+        ).bfloat16()
+        if bias is not None:
+            expected = expected + bias
+        assert actual.shape == (*source.shape[:-1], n)
+        # BF16 split-K reductions accumulate rounding error near zero.
+        error = actual.float() - expected.float()
+        assert error.norm() / expected.float().norm() < 0.004
+        torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.125)
+
+    with session, kernel_resolution_guard("prepared block-FP8 output padding"):
+        for rows in counts:
+            source = torch.randn(rows, k, device=device, dtype=torch.bfloat16)
+            check(source, kernel.apply_weights(layer, source, bias))
+            graph = torch.cuda.CUDAGraph()
+            try:
+                with session.capture(), torch.cuda.graph(graph):
+                    actual = kernel.apply_weights(layer, source, bias)
+                output_pointer = actual.data_ptr()
+                source.neg_()
+                graph.replay()
+                torch.accelerator.synchronize()
+                assert actual.data_ptr() == output_pointer
+                assert layer.weight.data_ptr() == weight_pointer
+                check(source, actual)
+            finally:
+                graph.reset()
 
 
 def test_b12x_mxfp8_apply_delegates_to_layer_held_linear_holder(monkeypatch) -> None:

@@ -145,7 +145,9 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 prefix,
                 f"{prefix}.ple_embedding",
                 model_config.dtype,
-                _resolve_ple_table_memory(vllm_config.additional_config),
+                _resolve_ple_table_memory(
+                    vllm_config.additional_config, config.ple_embedding_dtype
+                ),
             )
         else:
             self.ple_embedding = Qwen4ExpNGramEmbedding(
