@@ -78,6 +78,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     RoutedExpertsTensors,
 )
+from vllm.v1.sample.ops.topk_topp_sampler import register_top_k_top_p_warmups
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.watermarking.spec_decode import (
@@ -473,6 +474,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Initialize samplers. Model states may override via custom_sampler().
         if self.is_last_pp_rank and not self.is_pooling_model:
+            # Seeded and processed-logprob requests use native filtering even
+            # when unseeded warmup requests select FlashInfer sampling.
+            with self.jit_warmup_registry.activate():
+                register_top_k_top_p_warmups()
             sampler_kwargs: dict[str, Any] = {
                 "max_num_reqs": self.max_num_reqs,
                 "vocab_size": self.vocab_size,
@@ -1005,15 +1010,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.pooling_runner.dummy_pooler_run(hidden_states)
 
     def _reserve_profile_scratch(self) -> None:
-        seen: set[int] = set()
+        model_lanes: dict[int, set[int]] = {}
+        for model, lane in (
+            (self.get_model(), 0),
+            (self.get_draft_model(), self._draft_workspace_lane),
+        ):
+            if model is not None:
+                for module in model.modules():
+                    model_lanes.setdefault(id(module), set()).add(lane)
+        seen: set[tuple[int, int]] = set()
         for module in self.compilation_config.static_forward_context.values():
-            if id(module) in seen:
-                continue
-            seen.add(id(module))
-            reserve = getattr(module, "reserve_profile_scratch", None)
-            if reserve is not None:
-                reserve()
-        current_workspace_manager().reserve_all()
+            for lane in sorted(model_lanes.get(id(module), {0})):
+                key = (id(module), lane)
+                if key in seen:
+                    continue
+                seen.add(key)
+                reserve = getattr(module, "reserve_profile_scratch", None)
+                if reserve is not None:
+                    with use_workspace_lane(lane):
+                        reserve()
+        current_workspace_manager().reserve_by_lane()
 
     @torch.inference_mode()
     def profile_run(
@@ -1055,7 +1071,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         torch.accelerator.synchronize()
         del hidden_states, sample_hidden_states
         self._profile_deepseek_v4_attention(prepare_profile_state)
-        current_workspace_manager().reserve_all()
+        current_workspace_manager().reserve_by_lane()
         self.reset_encoder_cache()
         gc.collect()
 

@@ -4,9 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, replace
-from functools import cache
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
@@ -60,7 +58,6 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadataBuilder,
 )
 from vllm.v1.worker.workspace import (
-    current_workspace_manager,
     retain_cuda_graph_capture_resource,
 )
 
@@ -435,6 +432,24 @@ class B12xMHCResidual:
                 dtype=torch.float32,
                 device=device,
             )
+            # Each candidate owns one output set. Functional allocations inside
+            # repeated capture samples would reserve additional graph-pool copies
+            # that are absent from the tuner's primed-residency measurement.
+            residual_out = torch.empty(
+                (tokens, self.hc_mult, self.hidden_size),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            outputs = (
+                {}
+                if operation == "post"
+                else {
+                    "residual_out": residual_out,
+                    "y_out": torch.empty_like(x),
+                    "post_out": torch.empty_like(post),
+                    "comb_out": torch.empty_like(comb),
+                }
+            )
 
             def produce():
                 residual.normal_()
@@ -455,6 +470,7 @@ class B12xMHCResidual:
                     norm_weight=attn_norm.weight,
                     norm_eps=float(attn_norm.variance_epsilon),
                     _state=state,
+                    **outputs,
                 )
             elif operation in ("post_pre", "post_pre_bf16"):
                 if operation == "post_pre":
@@ -488,10 +504,11 @@ class B12xMHCResidual:
                     norm_weight=norm.weight,
                     norm_eps=float(norm.variance_epsilon),
                     _state=state,
+                    **outputs,
                 )
             else:
                 run = lambda: _impl._b12x_mhc_post_impl(
-                    x, residual, post, comb, _state=state
+                    x, residual, post, comb, out=residual_out, _state=state
                 )
 
             def execute():
@@ -536,24 +553,6 @@ def _c128a_profile_widths(max_width: int) -> tuple[int, ...]:
         widths.add(width)
         width *= 2
     return tuple(sorted(widths))
-
-
-@cache
-def _max_q_chunks(
-    max_rows: int,
-    width: int,
-    split_chunks_for_contract: Callable[..., int],
-    decode_row_capacity: int | None,
-) -> int:
-    return max(
-        rows
-        * split_chunks_for_contract(
-            rows=rows,
-            width=width,
-            decode_row_capacity=decode_row_capacity,
-        )
-        for rows in range(1, max(int(max_rows), 1) + 1)
-    )
 
 
 def _cache_page_view(
@@ -1272,16 +1271,6 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
             out = tensor_model_parallel_all_reduce(out)
         return out
 
-    def reserve_profile_scratch(self) -> None:
-        super().reserve_profile_scratch()
-        device = self.q_norm.weight.device
-        if device.type == "cuda":
-            # Reserve every layer type before compiled profile execution can
-            # skip its attention body. This tensor describes heads/device only.
-            self._reserve_profile_workspace(
-                torch.empty((0, self.padded_heads, _DSV4_HEAD_DIM), device=device)
-            )
-
     def _get_cache_page_view(
         self,
         cache: torch.Tensor,
@@ -1294,81 +1283,6 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
             view = _cache_page_view(cache, page_size, name)
             self._b12x_cache_page_views[key] = view
         return view
-
-    def _reserve_profile_workspace(self, q: torch.Tensor) -> None:
-        from b12x.attention.compressed_sparse_mla._scratch import (
-            plan_compressed_sparse_mla_scratch,
-        )
-
-        module = _require_b12x_compressed_sparse_mla()
-        indexed_width = 0
-        if self.compress_ratio == 4:
-            if self.topk_indices_buffer is not None:
-                indexed_width = int(self.topk_indices_buffer.shape[-1])
-            elif self.indexer is not None:
-                indexed_width = int(self.indexer.topk_tokens)
-        elif self.compress_ratio > 1:
-            indexed_width = _c128a_topk_width(
-                self.max_model_len,
-                self.compress_ratio,
-            )
-
-        indexed_widths = (
-            _c128a_profile_widths(indexed_width)
-            if self.compress_ratio > 4
-            else (indexed_width,)
-        )
-        swa_widths = {
-            int(self.window_size),
-            int(self.window_size) + self.max_image_tokens,
-        }
-        speculative_config = self.vllm_config.speculative_config
-        if speculative_config is not None and speculative_config.use_dspark():
-            swa_widths.add(
-                get_dspark_swa_index_width(
-                    int(self.window_size),
-                    speculative_config.num_speculative_tokens or 0,
-                )
-            )
-        swa_width = max(swa_widths)
-        width = max(swa_width + indexed_width, 1)
-        rows = max(int(self.max_num_batched_tokens), 1)
-        decode_row_capacity = _get_dspark_decode_row_capacity(self.vllm_config)
-        max_chunks_per_row = module.split_chunks_for_contract(
-            rows=rows,
-            width=width,
-            decode_row_capacity=decode_row_capacity,
-        )
-        # Split count is not monotonic in index width: a shorter prefix may
-        # use 12-token chunks while a longer prefix uses 64-token chunks.
-        # Cover every metadata width, not only the longest supported context.
-        max_q_chunks = max(
-            _max_q_chunks(
-                rows,
-                max(swa + indexed, 1),
-                module.split_chunks_for_contract,
-                decode_row_capacity,
-            )
-            for swa in swa_widths
-            for indexed in indexed_widths
-        )
-        # Allocation profiling needs geometry, not an executable declaration
-        # tied to live cache storage or an autotuning preparation session.
-        plan = plan_compressed_sparse_mla_scratch(
-            module.Caps(
-                device=q.device,
-                num_q_heads=int(q.shape[1]),
-                max_q_rows=rows,
-                max_width=width,
-                head_dim=_DSV4_HEAD_DIM,
-                v_head_dim=_DSV4_HEAD_DIM,
-                page_size=int(self.swa_cache_layer.block_size),
-                max_chunks_per_row=max_chunks_per_row,
-                max_q_chunks=max_q_chunks,
-                decode_row_capacity=decode_row_capacity,
-            )
-        )
-        current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
 
     def forward_mqa(
         self,
@@ -1387,7 +1301,8 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
         attn_metadata = get_forward_context().attn_metadata
         if attn_metadata is None:
             output.zero_()
-            self._reserve_profile_workspace(q)
+            # State preparation reserves each declared operation's scratch
+            # before KV admission. This metadata-free pass skips attention.
             return
 
         assert isinstance(attn_metadata, dict)

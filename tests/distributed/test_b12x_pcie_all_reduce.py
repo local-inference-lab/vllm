@@ -58,9 +58,11 @@ def _make_communicator(
     communicator.twoshot_max_bytes = 0
     plan = object()
     communicator._plans = {"prepared": plan}
+    communicator._plan_index = {}
     communicator._routes = {}
     communicator._invocations = {}
     communicator._plan_for = MagicMock(return_value=plan)
+    communicator._lookup_plan = MagicMock(return_value=plan)
     return communicator, runtime
 
 
@@ -323,12 +325,96 @@ def test_dispatch_rejects_missing_exact_preparation() -> None:
     communicator, _ = _make_communicator()
     communicator._plans = {}
     communicator._invocations = {}
+    communicator._lookup_plan.return_value = None
 
     with pytest.raises(
         PreparationResourceUnavailableError,
         match="no declared plan for",
     ):
         B12xPcieAllReduce._plan_for(communicator, torch.randn(2, 4))
+
+
+def _indexed_communicator(invocations):
+    communicator = object.__new__(B12xPcieAllReduce)
+    communicator._invocations = {item.name: item for item in invocations}
+    communicator._plans = {item.name: object() for item in invocations}
+    communicator._index_declared_plans()
+    return communicator
+
+
+def test_declared_plan_index_preserves_complete_fused_identity():
+    operation = "all_reduce_fused_add_rms_norm"
+    weight_a = torch.ones(4)
+    weight_b = weight_a.clone()
+    source = torch.empty((2, 4), dtype=torch.bfloat16)
+    invocations = [
+        b12x_pcie_all_reduce.B12xPcieInvocation(
+            name=name,
+            operation=operation,
+            shape=(2, 4),
+            dtype=source.dtype,
+            norm_weight=weight,
+            epsilon=epsilon,
+        )
+        for name, weight, epsilon in (
+            ("a", weight_a, 1e-6),
+            ("b", weight_b, 1e-6),
+            ("epsilon", weight_a, 1e-5),
+        )
+    ]
+    communicator = _indexed_communicator(invocations)
+    for invocation in invocations:
+        assert (
+            communicator._plan_for(
+                source,
+                operation=operation,
+                weight=invocation.norm_weight,
+                epsilon=invocation.epsilon,
+            )
+            is communicator._plans[invocation.name]
+        )
+    assert not communicator._has_plan_for(source)
+    assert not communicator._has_plan_for(
+        source, operation=operation, weight=weight_a.clone(), epsilon=1e-6
+    )
+    assert not communicator._has_plan_for(
+        source, operation=operation, weight=weight_a, epsilon=1e-4
+    )
+
+
+def test_declared_plan_index_matches_shape_dtype_stride_and_first_declaration():
+    source = torch.empty((2, 4), dtype=torch.bfloat16)
+    invocation = b12x_pcie_all_reduce.B12xPcieInvocation
+    communicator = _indexed_communicator(
+        [
+            invocation("first", "all_reduce", (2, 4), source.dtype),
+            invocation(
+                "equivalent", "all_reduce", (2, 4), source.dtype, strides=(4, 1)
+            ),
+            invocation("strided", "all_reduce", (2, 4), source.dtype, strides=(8, 1)),
+        ]
+    )
+    assert communicator._plan_for(source) is communicator._plans["first"]
+    strided = torch.empty((2, 8), dtype=source.dtype)[:, :4]
+    assert communicator._plan_for(strided) is communicator._plans["strided"]
+    assert not communicator._has_plan_for(source.float())
+    assert not communicator._has_plan_for(source.flatten())
+    communicator._invocations = {}
+    assert communicator._plan_for(source) is communicator._plans["first"]
+    communicator._index_declared_plans()
+    assert not communicator._has_plan_for(source)
+
+
+def test_undeclared_plan_probe_neither_raises_nor_grows_the_index():
+    communicator = _indexed_communicator([])
+    for rows in range(1, 65):
+        source = torch.empty((rows, 4), dtype=torch.bfloat16)
+        assert not communicator._has_plan_for(source)
+        with pytest.raises(
+            PreparationResourceUnavailableError, match="no declared plan"
+        ):
+            communicator._plan_for(source)
+    assert communicator._plan_index == {}
 
 
 def test_fused_allreduce_has_an_independent_cutoff() -> None:
