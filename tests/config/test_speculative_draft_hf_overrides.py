@@ -218,6 +218,7 @@ def test_composed_override_is_picklable():
 def _make_mtp_speculative_config(
     override: bool | None,
     checkpoint_value: bool,
+    enable_cumem_allocator: bool = False,
 ) -> SpeculativeConfig:
     draft_hf_config = _make_hf_config(
         architectures=["Qwen4ExpMTP"],
@@ -236,10 +237,13 @@ def _make_mtp_speculative_config(
         max_model_len=128,
         quantization=None,
         hf_overrides={},
+        enable_cumem_allocator=enable_cumem_allocator,
     )
 
-    with patch("vllm.config.speculative.ModelConfig", return_value=draft_model_config):
-        return SpeculativeConfig(
+    with patch(
+        "vllm.config.speculative.ModelConfig", return_value=draft_model_config
+    ) as draft_constructor:
+        config = SpeculativeConfig(
             model="draft",
             method="mtp",
             num_speculative_tokens=1,
@@ -247,6 +251,18 @@ def _make_mtp_speculative_config(
             target_model_config=target_model_config,
             target_parallel_config=ParallelConfig(),
         )
+        assert (
+            draft_constructor.call_args.kwargs["enable_cumem_allocator"]
+            is enable_cumem_allocator
+        )
+        return config
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("enabled", [False, True])
+def test_mtp_draft_inherits_cumem_allocator_permission(enabled):
+    """The draft shares the process allocator used by native CPU KV offload."""
+    _make_mtp_speculative_config(None, False, enable_cumem_allocator=enabled)
 
 
 @pytest.mark.cpu_test
