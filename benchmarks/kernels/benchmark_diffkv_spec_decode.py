@@ -7,6 +7,7 @@ support. Results include exact shapes and numerical agreement, not a speed gate.
 """
 
 import argparse
+import inspect
 import json
 from pathlib import Path
 
@@ -36,6 +37,14 @@ def main():
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         run = module.unified_attention_diffkv
+    if (
+        args.dtype == "fp8_e4m3"
+        and "k_descale" not in inspect.signature(run).parameters
+    ):
+        parser.error(
+            "This vLLM source lacks FP8 DiffKV support; "
+            "apply the FP8 reader change first"
+        )
     rows = []
     torch.manual_seed(19)
     for batch in args.concurrency:
@@ -91,7 +100,11 @@ def main():
             expected = out.clone()
             run(**kw)
             torch.testing.assert_close(out, expected, atol=0.02, rtol=0.02)
-            split_used = bool(torch.isfinite(expsum[: batch * q_len]).all())
+            relative_error = (
+                (out.float() - expected.float()).norm() / expected.float().norm()
+            ).item()
+            assert relative_error < 0.01, relative_error
+            split_used = bool(torch.isfinite(expsum[: batch * q_len, :, 0]).all())
             two_d = triton.testing.do_bench(
                 lambda kw=kw: run(**dict(kw, seq_threshold_3D=0)), warmup=25, rep=100
             )
@@ -108,6 +121,7 @@ def main():
                 speedup=two_d / auto,
                 split_used=split_used,
                 correct=True,
+                relative_error=relative_error,
             )
             rows.append(row)
             print(json.dumps(row), flush=True)

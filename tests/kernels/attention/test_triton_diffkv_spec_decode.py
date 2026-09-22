@@ -97,18 +97,26 @@ def reference(c):
     return torch.cat(results).bfloat16()
 
 
+def assert_reference(c):
+    expected = reference(c)
+    actual = c.out[: sum(c.q_lens)]
+    torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
+    relative = (actual.float() - expected.float()).norm() / expected.float().norm()
+    assert relative < 0.01, relative.item()
+
+
 @pytest.mark.parametrize(
-    "q_lens,kv_lens", [([8], [2111]), ([1, 3, 8], [19, 319, 2111])]
+    "q_lens,kv_lens", [([8], [8]), ([8], [2111]), ([1, 3, 8], [19, 319, 2111])]
 )
 @pytest.mark.parametrize("heads_kv", [1, 2])
-@pytest.mark.parametrize("window", [None, 128])
+@pytest.mark.parametrize("window", [None, 4, 128])
 @pytest.mark.parametrize("sinks", [False, True])
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
 @torch.inference_mode()
 def test_short_queries_use_split_kv(q_lens, kv_lens, heads_kv, window, sinks, layout):
     c = make_case(q_lens, kv_lens, heads_kv, window, sinks, layout=layout)
     unified_attention_diffkv(**c.args)
-    torch.testing.assert_close(c.out, reference(c), atol=0.02, rtol=0.02)
+    assert_reference(c)
     # A real split launch writes intermediate results for every query token.
     assert torch.isfinite(c.expsum[: sum(q_lens), :, 0]).all()
 
@@ -118,13 +126,13 @@ def test_short_queries_use_split_kv(q_lens, kv_lens, heads_kv, window, sinks, la
 def test_small_scratch_falls_back_without_writes(capacity):
     c = make_case([8, 8], [319, 2111], capacity=capacity)
     unified_attention_diffkv(**c.args)
-    torch.testing.assert_close(c.out, reference(c), atol=0.02, rtol=0.02)
+    assert_reference(c)
     assert torch.isnan(c.partial).all()
     assert torch.isnan(c.maximum).all()
     assert torch.isnan(c.expsum).all()
 
 
-@pytest.mark.parametrize("window", [None, 128])
+@pytest.mark.parametrize("window", [None, 4, 128])
 @torch.inference_mode()
 def test_short_query_graph_replay_changes_pages(window):
     c = make_case([8, 3, 1], [319, 511, 2111], window=window, sinks=True)
@@ -144,4 +152,50 @@ def test_short_query_graph_replay_changes_pages(window):
             torch.tensor([300 + step, 490 + step, 2090 + step], device="cuda")
         )
         graph.replay()
-        torch.testing.assert_close(c.out, reference(c), atol=0.02, rtol=0.02)
+        assert_reference(c)
+
+
+@pytest.mark.parametrize("threshold,split", [(15, False), (16, True), (17, True)])
+@torch.inference_mode()
+def test_token_threshold_boundary(threshold, split):
+    c = make_case([8, 8], [319, 2111])
+    c.args["seq_threshold_3D"] = threshold
+    unified_attention_diffkv(**c.args)
+    assert_reference(c)
+    assert bool(torch.isfinite(c.expsum[:16, :, 0]).all()) is split
+
+
+@pytest.mark.parametrize(
+    "buffer", ["softmax_segm_output", "softmax_segm_max", "softmax_segm_expsum"]
+)
+@torch.inference_mode()
+def test_each_scratch_capacity_is_checked(buffer):
+    c = make_case([8, 8], [319, 2111])
+    c.args[buffer] = c.args[buffer][:4]
+    unified_attention_diffkv(**c.args)
+    assert_reference(c)
+    assert torch.isnan(c.partial).all()
+    assert torch.isnan(c.maximum).all()
+    assert torch.isnan(c.expsum).all()
+
+
+@torch.inference_mode()
+def test_graph_padding_preserves_real_query_rows():
+    c = make_case([8, 3, 1, 0], [319, 511, 2111, 0], sinks=True)
+    c.q = torch.cat([c.q, torch.zeros_like(c.q[:4])])
+    c.out = torch.empty(16, c.heads, c.hv, device="cuda", dtype=torch.bfloat16)
+    c.args.update(q=c.q, out=c.out)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            unified_attention_diffkv(**c.args)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        unified_attention_diffkv(**c.args)
+    for _ in range(3):
+        c.q.normal_()
+        c.table.copy_(c.table.roll(1, dims=1))
+        graph.replay()
+        assert_reference(c)
