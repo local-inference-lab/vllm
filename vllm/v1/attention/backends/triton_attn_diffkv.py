@@ -36,7 +36,7 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
 from vllm.v1.attention.ops.triton_unified_attention_diffkv import (
     unified_attention_diffkv,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 
 logger = init_logger(__name__)
 
@@ -73,6 +73,42 @@ class TritonAttentionDiffKVMetadataBuilder(TritonAttentionMetadataBuilder):
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+
+        # Split-KV scratch is indexed by query token, including verification
+        # tokens. Bound the extension by configured concurrency and the existing
+        # token/capture ceilings; never multiply the parent's sequence heuristic.
+        assert self.reorder_batch_threshold is not None
+        # Keep local attention at its inherited capacity: a short window may
+        # not amortize the extra split-KV launches and reduction. Full specs
+        # can also represent local attention when the hybrid allocator is off.
+        if (
+            self.reorder_batch_threshold > 1
+            and isinstance(kv_cache_spec, FullAttentionSpec)
+            and kv_cache_spec.sliding_window is None
+            and kv_cache_spec.attention_chunk_size is None
+        ):
+            scheduler = vllm_config.scheduler_config
+            verification_rows = min(
+                scheduler.max_num_seqs * self.reorder_batch_threshold,
+                scheduler.max_num_batched_tokens,
+            )
+            if self.decode_cudagraph_enabled:
+                capture_sizes = vllm_config.compilation_config.cudagraph_capture_sizes
+                assert capture_sizes
+                verification_rows = min(verification_rows, max(capture_sizes))
+            if verification_rows > self.seq_threshold_3D:
+                self.seq_threshold_3D = verification_rows
+                scalar_shape = (
+                    self.seq_threshold_3D,
+                    self.num_heads_q,
+                    self.num_par_softmax_segments,
+                )
+                self.softmax_segm_max = torch.empty(
+                    scalar_shape, dtype=torch.float32, device=device
+                )
+                self.softmax_segm_expsum = torch.empty(
+                    scalar_shape, dtype=torch.float32, device=device
+                )
 
         head_size_v = TritonAttentionDiffKVBackend.head_size_v
         head_size_v_padded = next_power_of_2(head_size_v)

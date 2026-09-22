@@ -11,30 +11,72 @@ from vllm.config import CUDAGraphMode
 from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends import triton_attn
 from vllm.v1.attention.backends import triton_attn_diffkv as backend
+from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
 pytestmark = pytest.mark.cpu_test
 
 
 @pytest.fixture
-def builder(monkeypatch):
+def builder_factory(monkeypatch):
     monkeypatch.setattr(
         triton_attn, "get_num_attention_heads_from_layers", lambda *a: 16
     )
-    config = SimpleNamespace(
-        model_config=SimpleNamespace(
-            get_num_kv_heads=lambda _: 1,
-            get_head_size=lambda: 192,
-            rswa_window=None,
-        ),
-        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
-        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
-        speculative_config=SimpleNamespace(
-            num_speculative_tokens=7, parallel_drafting=False
-        ),
-    )
-    return backend.TritonAttentionDiffKVMetadataBuilder(
-        SimpleNamespace(block_size=16), [], config, torch.device("cpu")
-    )
+
+    def make(
+        max_seqs=16,
+        spec_tokens=7,
+        token_budget=4096,
+        captures=(),
+        parallel_drafting=False,
+        dcp=1,
+        kv_heads=1,
+        spec_kind="full",
+    ):
+        config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                get_num_kv_heads=lambda _: kv_heads,
+                get_head_size=lambda: 192,
+                rswa_window=None,
+            ),
+            parallel_config=SimpleNamespace(decode_context_parallel_size=dcp),
+            compilation_config=SimpleNamespace(
+                cudagraph_mode=CUDAGraphMode.FULL if captures else CUDAGraphMode.NONE,
+                cudagraph_capture_sizes=list(captures),
+            ),
+            scheduler_config=SimpleNamespace(
+                max_num_seqs=max_seqs, max_num_batched_tokens=token_budget
+            ),
+            speculative_config=SimpleNamespace(
+                num_speculative_tokens=spec_tokens, parallel_drafting=parallel_drafting
+            )
+            if spec_tokens
+            else None,
+        )
+        spec_args = dict(
+            block_size=16,
+            num_kv_heads=kv_heads,
+            head_size=192,
+            head_size_v=128,
+            dtype=torch.bfloat16,
+        )
+        if spec_kind == "sliding":
+            spec = SlidingWindowSpec(**spec_args, sliding_window=128)
+        else:
+            spec = FullAttentionSpec(
+                **spec_args,
+                sliding_window=128 if spec_kind == "full-sliding" else None,
+                attention_chunk_size=128 if spec_kind == "full-chunked" else None,
+            )
+        return backend.TritonAttentionDiffKVMetadataBuilder(
+            spec, [], config, torch.device("cpu")
+        )
+
+    return make
+
+
+@pytest.fixture
+def builder(builder_factory):
+    return builder_factory()
 
 
 def common(q_lens):
@@ -146,7 +188,8 @@ def test_rebuilt_metadata_tracks_changed_request_boundary(builder, monkeypatch):
         assert calls[0]["q"].shape[0] == expected_decode
 
 
-def test_single_token_decode_dispatches_split_kv_in_mixed_batch(builder, monkeypatch):
+@pytest.fixture
+def dispatcher_spy(monkeypatch):
     from vllm.v1.attention.ops import triton_unified_attention_diffkv as ops
 
     launches = []
@@ -160,7 +203,13 @@ def test_single_token_decode_dispatches_split_kv_in_mixed_batch(builder, monkeyp
 
     monkeypatch.setattr(ops, "kernel_unified_attention_diffkv", KernelSpy())
     monkeypatch.setattr(ops, "kernel_reduce_segments_diffkv", KernelSpy())
-    real_attention = backend.unified_attention_diffkv
+    return backend.unified_attention_diffkv, launches
+
+
+def test_single_token_decode_dispatches_split_kv_in_mixed_batch(
+    builder, monkeypatch, dispatcher_spy
+):
+    real_attention, launches = dispatcher_spy
     metadata = builder.build(0, common([1, 257]))
     # run_forward owns the output-placement spy. Invoke the real dispatcher
     # separately on each observed call, with every GPU launch intercepted.
@@ -186,3 +235,108 @@ def test_uniform_capture_has_no_host_partitions(builder):
     assert not getattr(metadata, "partitions", ())
     assert metadata.seq_lens.data_ptr() == c.seq_lens.data_ptr()
     assert (metadata.seq_lens == 1).all()
+
+
+@pytest.mark.parametrize(
+    "config,capacity",
+    [
+        pytest.param(dict(max_seqs=32), 256, id="c32-eager"),
+        pytest.param(dict(max_seqs=32, spec_kind="sliding"), 128, id="swa-eager"),
+        pytest.param(
+            dict(max_seqs=32, spec_kind="sliding", captures=(1, 128, 256, 512)),
+            128,
+            id="swa-graphs",
+        ),
+        pytest.param(
+            dict(max_seqs=32, spec_kind="full-sliding"),
+            128,
+            id="swa-with-full-allocation",
+        ),
+        pytest.param(
+            dict(max_seqs=32, spec_kind="full-chunked"),
+            128,
+            id="chunked-with-full-allocation",
+        ),
+        pytest.param(
+            dict(max_seqs=32, captures=(1, 128, 256, 512)), 256, id="c32-graphs"
+        ),
+        pytest.param(dict(max_seqs=24), 192, id="actual-concurrency"),
+        pytest.param(dict(max_seqs=32, spec_tokens=3), 128, id="shorter-verification"),
+        pytest.param(dict(max_seqs=32, spec_tokens=0), 128, id="no-speculation"),
+        pytest.param(dict(max_seqs=32, token_budget=200), 200, id="token-budget"),
+        pytest.param(
+            dict(max_seqs=32, captures=(1, 128, 192)), 192, id="capture-ceiling"
+        ),
+        pytest.param(
+            dict(max_seqs=32, captures=(1, 64)), 64, id="small-capture-ceiling"
+        ),
+        pytest.param(
+            dict(max_seqs=32, parallel_drafting=True), 480, id="parallel-drafting"
+        ),
+        pytest.param(dict(max_seqs=32, dcp=2), 128, id="unsupported-dcp"),
+        pytest.param(dict(max_seqs=32, kv_heads=2), 256, id="two-kv-heads"),
+    ],
+)
+def test_speculative_workspace_capacity(builder_factory, config, capacity):
+    builder = builder_factory(**config)
+    assert builder.seq_threshold_3D == capacity
+    for tensor, shape in (
+        (builder.softmax_segm_output, (capacity, 16, 16, 128)),
+        (builder.softmax_segm_max, (capacity, 16, 16)),
+        (builder.softmax_segm_expsum, (capacity, 16, 16)),
+    ):
+        assert tensor.shape == shape
+        assert tensor.dtype == torch.float32
+        assert tensor.device.type == "cpu"
+
+
+@pytest.mark.parametrize(
+    "captures,q_lens,expected_rows",
+    [
+        ((1, 128, 256, 512), [8] * 32, [256]),
+        ((1, 128, 256, 512), [8, 7, 3, 1] * 8, [152]),
+        ((1, 128, 192), [8] * 24, [192]),
+        ((1, 128, 192), [8] * 24 + [1], [193]),
+        ((1, 128, 192), [8] * 32, [256]),
+        ((1, 128, 256, 512), [8] * 31 + [1024], [248, 1024]),
+        ((1, 128, 256, 512), [1024], [1024]),
+    ],
+)
+def test_speculative_workspace_forward_metadata(
+    builder_factory, monkeypatch, captures, q_lens, expected_rows
+):
+    builder = builder_factory(max_seqs=32, captures=captures)
+    metadata = builder.build(0, common(q_lens))
+    calls = run_forward(monkeypatch, metadata)
+    assert [call["q"].shape[0] for call in calls] == expected_rows
+    for call in calls:
+        assert call["seq_threshold_3D"] == builder.seq_threshold_3D
+        for name in ("softmax_segm_output", "softmax_segm_max", "softmax_segm_expsum"):
+            assert call[name] is getattr(builder, name)
+
+
+@pytest.mark.parametrize(
+    "buffer", ["softmax_segm_output", "softmax_segm_max", "softmax_segm_expsum"]
+)
+def test_c32_partition_checks_each_workspace(builder_factory, monkeypatch, buffer):
+    builder = builder_factory(max_seqs=32)
+    setattr(builder, buffer, getattr(builder, buffer)[:247])
+    metadata = builder.build(0, common([8] * 31 + [1024]))
+    assert not metadata.partitions
+    calls = run_forward(monkeypatch, metadata)
+    assert [call["q"].shape[0] for call in calls] == [1272]
+
+
+@pytest.mark.parametrize("spec_kind", ["sliding", "full-sliding"])
+@pytest.mark.parametrize("q_lens", [[8] * 16, [8] * 32, [8] * 31 + [1024]])
+def test_local_attention_retains_inherited_capacity(
+    builder_factory, monkeypatch, spec_kind, q_lens
+):
+    builder = builder_factory(
+        max_seqs=32, captures=(1, 128, 256, 512), spec_kind=spec_kind
+    )
+    assert builder.seq_threshold_3D == 128
+    metadata = builder.build(0, common(q_lens))
+    assert not metadata.partitions
+    for call in run_forward(monkeypatch, metadata):
+        assert call["seq_threshold_3D"] == 128
