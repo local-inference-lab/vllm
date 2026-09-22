@@ -31,17 +31,19 @@ class _CacheProvider:
             )
         parallel = config.parallel_config
         if (
-            parallel.tensor_parallel_size != 1
-            or parallel.data_parallel_size != 1
+            parallel.data_parallel_size != 1
             or parallel.pipeline_parallel_size != 1
             or parallel.enable_expert_parallel
             or parallel.enable_dbo
+            or parallel.use_sequence_parallel_moe
+            or parallel.decode_context_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
             or config.speculative_config is not None
             or config.lora_config is not None
         ):
             raise ValueError(
-                "experimental expert-cache loader requires TP/DP/PP=1 "
-                "without EP, DBO, speculation or LoRA"
+                "expert-cache loader requires one TP group with DP/PP=1 "
+                "without EP, sequence/context parallelism, DBO, speculation or LoRA"
             )
         settings = ExpertCacheServingConfig(
             **config.additional_config["b12x_expert_cache"]
@@ -56,18 +58,38 @@ class _CacheProvider:
             from b12x.integration.vllm.checkpoint import audit
 
             self.checkpoint_audit = audit(config.model_config.model, check_values=True)
-            if (
-                self.checkpoint_audit["host_expert_lower_bound_bytes"]
-                + settings.host_safety_bytes
-                > settings.host_bytes
-            ):
+            host_lower_bound = self.checkpoint_audit["host_expert_lower_bound_bytes"]
+            if parallel.tensor_parallel_size > 1:
+                geometry = self.checkpoint_audit["geometry"]
+                local_i, remainder = divmod(
+                    geometry["intermediate"], parallel.tensor_parallel_size
+                )
+                if remainder or local_i % 128:
+                    raise ValueError(
+                        "TP shard requires an integral intermediate dimension "
+                        "divisible by 128"
+                    )
+                e, h, layers = (
+                    geometry["experts"],
+                    geometry["hidden"],
+                    geometry["layers"],
+                )
+                payload = e * (3 * h * local_i // 2 + 3 * h * local_i // 16)
+                # Source retains two gate/up global/input scales; canonical
+                # execution needs one global scalar for each matrix pair.
+                host_lower_bound = layers * (2 * payload + e * (24 + 8))
+            if host_lower_bound + settings.host_safety_bytes > settings.host_bytes:
                 raise ValueError(
                     "CPU expert sources plus mapped backing exceed the host envelope"
                 )
+        from vllm.distributed import get_tensor_model_parallel_rank
+
         self.model = ExpertCacheModel(
             settings,
             checkpoint_fingerprint(config.model_config.model),
             torch.device("cuda", torch.accelerator.current_device_index()),
+            tp_rank=get_tensor_model_parallel_rank(),
+            tp_size=parallel.tensor_parallel_size,
         )
         self.top_k = None
         register_b12x_unit_provider(self)
@@ -176,6 +198,7 @@ class ModelOptNvFp4CacheMoE(ModelOptNvFp4FusedMoE):
 
     def process_weights_after_loading(self, layer):
         from b12x.moe import fused_moe as moe
+        from b12x.moe.residency import ExpertShard
 
         if (
             layer.apply_router_weight_on_input
@@ -207,6 +230,15 @@ class ModelOptNvFp4CacheMoE(ModelOptNvFp4FusedMoE):
         )
         source = moe.ExpertWeightSource(
             plan=plan,
+            shard=ExpertShard(
+                experts=e,
+                hidden=packed_h * 2,
+                intermediate=rows // 2,
+                global_intermediate=rows // 2 * self.provider.model.tp_size,
+                intermediate_start=rows // 2 * self.provider.model.tp_rank,
+                rank=self.provider.model.tp_rank,
+                world_size=self.provider.model.tp_size,
+            ),
             weights=moe.PackedWeights(
                 w13=layer.w13_weight,
                 w2=layer.w2_weight,

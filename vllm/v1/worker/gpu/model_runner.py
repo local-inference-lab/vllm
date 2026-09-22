@@ -2165,14 +2165,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         # Run model.
+        phase_timing = getattr(self, "b12x_phase_timing", None)
+        if phase_timing is not None and not dummy_run:
+            phase_timing.start(input_batch)
         cache = getattr(self, "b12x_expert_cache", None)
         if cache is not None:
+            phase_ranges = ()
+            if cache.config.phase_observations and not dummy_run:
+                from b12x.testing.phase_timing import observation_ranges
+
+                phase_ranges = observation_ranges(
+                    input_batch.num_scheduled_tokens,
+                    input_batch.num_computed_tokens_np,
+                    input_batch.prefill_len_np,
+                )
             # The scheduler classifies phase; tensor shape is not a phase label.
             # Mixed decode/prefill batches are excluded in this first experiment.
             cache.prepare_observation(
                 0
                 if dummy_run or batch_req_state is None or batch_req_state.has_prefill
-                else input_batch.num_tokens
+                else input_batch.num_tokens,
+                phase_ranges=phase_ranges,
             )
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -2230,6 +2243,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
+        if phase_timing is not None and not dummy_run:
+            phase_timing.end()
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:

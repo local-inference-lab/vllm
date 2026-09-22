@@ -1052,13 +1052,12 @@ class EngineCore:
         if (
             not isinstance(additional, dict)
             or additional.get("b12x_expert_cache", {}).get("mode") != "adaptive"
-            or parallel.tensor_parallel_size != 1
             or parallel.data_parallel_size != 1
             or parallel.pipeline_parallel_size != 1
             or parallel.enable_expert_parallel
         ):
             raise ValueError(
-                "residency maintenance requires an opted-in single-rank cache"
+                "residency maintenance requires an opted-in cache in one TP group"
             )
         if self.is_scheduler_paused() or getattr(self, "_residency_active", False):
             raise RuntimeError("residency maintenance cannot acquire a paused engine")
@@ -1074,9 +1073,24 @@ class EngineCore:
                 if paused is not None:
                     paused.result()
                 drained = time.perf_counter_ns()
-                replies = self.model_executor.collective_rpc(
-                    "b12x_residency_maintenance", args=(config,)
-                )
+                if parallel.tensor_parallel_size == 1:
+                    replies = self.model_executor.collective_rpc(
+                        "b12x_residency_maintenance", args=(config,)
+                    )
+                else:
+                    from b12x.integration.vllm.tp_residency import (
+                        TensorParallelResidencyMaintenance,
+                    )
+
+                    control = getattr(self, "_b12x_tp_maintenance", None)
+                    if control is None:
+                        control = TensorParallelResidencyMaintenance(
+                            config, parallel.tensor_parallel_size
+                        )
+                        self._b12x_tp_maintenance = control
+                    elif control.config != config:
+                        raise ValueError("TP maintenance configuration changed")
+                    replies = [control.run(self.model_executor.collective_rpc)]
                 applied = time.perf_counter_ns()
                 if len(replies) != 1 or replies[0].get("status") != "complete":
                     raise RuntimeError("residency worker did not complete maintenance")

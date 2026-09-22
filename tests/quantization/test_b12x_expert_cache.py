@@ -31,7 +31,9 @@ def method_and_layer():
     )
     method.moe = SimpleNamespace(is_act_and_mul=True)
     method.use_global_sf = False
-    method.provider = SimpleNamespace(model=Mock(checkpoint_id="a" * 64))
+    method.provider = SimpleNamespace(
+        model=Mock(checkpoint_id="a" * 64, tp_rank=0, tp_size=1)
+    )
     method.prefix = "model.layers.0.mlp.experts"
     layer = torch.nn.Module()
     layer.apply_router_weight_on_input = False
@@ -212,6 +214,9 @@ def test_next_host_lower_bound_rejects_before_fingerprint_or_model_allocation(
             pipeline_parallel_size=1,
             enable_expert_parallel=False,
             enable_dbo=False,
+            use_sequence_parallel_moe=False,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
         ),
         speculative_config=None,
         lora_config=None,

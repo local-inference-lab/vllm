@@ -17,6 +17,21 @@ def tensor_coverage(model, weights, path):
     infer successful loading merely because a checkpoint iterator yielded a
     tensor. Original parameter callbacks are restored before postprocessing.
     """
+    import torch.distributed as dist
+
+    from vllm.distributed import (
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+    )
+
+    rank, world = (
+        (get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size())
+        if dist.is_initialized()
+        else (0, 1)
+    )
+    if world > 1 and "{rank}" not in str(path):
+        raise ValueError("TP loader coverage requires a {rank} placeholder")
+    path = str(path).replace("{rank}", str(rank))
     records, origins, restored = {}, {}, []
 
     def key(tensor):
@@ -51,6 +66,8 @@ def tensor_coverage(model, weights, path):
                 dict(
                     parameter=destination,
                     device=str(parameter.device),
+                    local_shape=list(parameter.shape),
+                    local_parameter_bytes=parameter.numel() * parameter.element_size(),
                     expert_id=kwargs.get("expert_id"),
                     shard_id=kwargs.get("shard_id", args[2] if len(args) > 2 else None),
                     accepted=result is not False,
@@ -76,5 +93,8 @@ def tensor_coverage(model, weights, path):
                 parameter.weight_loader = original
         # Never overwrite a failed attempt or another worker's receipt.
         with Path(path).open("x") as stream:
-            json.dump(dict(status=status, tensors=records), stream)
+            json.dump(
+                dict(status=status, tp_rank=rank, tp_size=world, tensors=records),
+                stream,
+            )
             stream.write("\n")
