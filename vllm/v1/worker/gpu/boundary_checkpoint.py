@@ -13,6 +13,7 @@ from vllm.v1.core.boundary_checkpoint import (
     INSTRUCTION_CHECKPOINT_SLOT,
     MAX_BOUNDARY_STOP_TOKENS,
     NUM_BOUNDARY_CHECKPOINT_SLOTS,
+    PREFILL_TAIL_CHECKPOINT_SLOT,
     PROMPT_CHECKPOINT_SLOT,
     RESPONSE_CHECKPOINT_SLOT,
 )
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
 _PROMPT_CHECKPOINT_SLOT = tl.constexpr(PROMPT_CHECKPOINT_SLOT)
 _RESPONSE_CHECKPOINT_SLOT = tl.constexpr(RESPONSE_CHECKPOINT_SLOT)
 _INSTRUCTION_CHECKPOINT_SLOT = tl.constexpr(INSTRUCTION_CHECKPOINT_SLOT)
+_PREFILL_TAIL_CHECKPOINT_SLOT = tl.constexpr(PREFILL_TAIL_CHECKPOINT_SLOT)
 
 
 @triton.jit
@@ -58,12 +60,14 @@ def prepare_boundary_capture(
     prompt_capture = 0
     response_capture = 0
     instruction_capture = 0
+    prefill_tail_capture = 0
     if enabled:
         prompt_len = tl.load(metadata_ptr + metadata_offset + 1)
         instruction_len = tl.load(metadata_ptr + metadata_offset + 2)
         min_len = tl.load(metadata_ptr + metadata_offset + 3)
         max_len = tl.load(metadata_ptr + metadata_offset + 4)
         num_stops = tl.load(metadata_ptr + metadata_offset + 5)
+        prefill_tail_len = tl.load(metadata_ptr + metadata_offset + 6)
         offsets = tl.arange(0, STOP_CAPACITY)
         stops = tl.load(
             stop_tokens_ptr + req_idx * STOP_CAPACITY + offsets,
@@ -106,6 +110,19 @@ def prepare_boundary_capture(
                 seen_ptr + req_idx * NUM_CAPTURES + _INSTRUCTION_CHECKPOINT_SLOT, 1
             )
         if (
+            prefill_tail_len > 0
+            and num_computed < prefill_tail_len
+            and computed_after == prefill_tail_len
+            and tl.load(
+                seen_ptr + req_idx * NUM_CAPTURES + _PREFILL_TAIL_CHECKPOINT_SLOT
+            )
+            == 0
+        ):
+            prefill_tail_capture = prefill_tail_len
+            tl.store(
+                seen_ptr + req_idx * NUM_CAPTURES + _PREFILL_TAIL_CHECKPOINT_SLOT, 1
+            )
+        if (
             stopped
             and tl.load(seen_ptr + req_idx * NUM_CAPTURES + _RESPONSE_CHECKPOINT_SLOT)
             == 0
@@ -131,6 +148,15 @@ def prepare_boundary_capture(
         tl.maximum(num_sampled - 1, 0),
     )
     tl.store(capture_bias_ptr + output_offset + _INSTRUCTION_CHECKPOINT_SLOT, 0)
+    tl.store(
+        capture_tokens_ptr + output_offset + _PREFILL_TAIL_CHECKPOINT_SLOT,
+        prefill_tail_capture,
+    )
+    tl.store(capture_bias_ptr + output_offset + _PREFILL_TAIL_CHECKPOINT_SLOT, 0)
+    tl.store(
+        capture_rows_ptr + output_offset + _PREFILL_TAIL_CHECKPOINT_SLOT,
+        query_start + prefill_tail_capture - num_computed - 1,
+    )
     tl.store(
         capture_rows_ptr + output_offset + _PROMPT_CHECKPOINT_SLOT,
         query_start + prompt_capture - num_computed - 1,
@@ -295,7 +321,7 @@ class BoundaryCheckpointState:
             for group in kv_cache_config.kv_cache_groups
         ]
         self.metadata = torch.zeros(
-            (self.max_reqs, 6), dtype=torch.int32, device=self.device
+            (self.max_reqs, 7), dtype=torch.int32, device=self.device
         )
         self.stop_tokens = torch.full(
             (self.max_reqs, MAX_BOUNDARY_STOP_TOKENS),
@@ -600,6 +626,7 @@ class BoundaryCheckpointState:
                         self.model_state.model_config.max_model_len,
                     ),
                     len(stops),
+                    request.recurrent_prefill_tail_boundary or 0,
                 ],
                 dtype=torch.int32,
                 device=self.device,
@@ -631,6 +658,11 @@ class BoundaryCheckpointState:
                 and checkpoint.num_tokens >= request.recurrent_instruction_boundary
             ):
                 self.seen[slot, INSTRUCTION_CHECKPOINT_SLOT] = 1
+            if (
+                request.recurrent_prefill_tail_boundary is not None
+                and checkpoint.num_tokens >= request.recurrent_prefill_tail_boundary
+            ):
+                self.seen[slot, PREFILL_TAIL_CHECKPOINT_SLOT] = 1
             _restore_auxiliary_state_kernel[(self.auxiliary_metadata.shape[0],)](
                 self.auxiliary_metadata,
                 self.pool,

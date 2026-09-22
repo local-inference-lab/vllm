@@ -260,7 +260,6 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        output = torch.empty_like(hidden_states)
         if _GATE_SIDE_STREAM and not self.use_full_rank_gate:
             # Reserve both branches even in serialized graph warmup, before
             # workspace growth is forbidden by capture.
@@ -268,12 +267,10 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
                 hidden_states.size(0)
             )
             if _gate_overlap_allowed():
-                self._forward_gate_overlap(
-                    hidden_states, output, gate_workspace, main_workspace
+                return self._forward_gate_overlap(
+                    hidden_states, gate_workspace, main_workspace
                 )
-                return output
-        super().forward(hidden_states, positions, output)
-        return output
+        return self._forward_projections(hidden_states, positions)
 
     def _projection_workspaces(
         self, num_tokens: int
@@ -296,10 +293,9 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
     def _forward_gate_overlap(
         self,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
         gate_workspace: torch.Tensor | None,
         main_workspace: torch.Tensor | None,
-    ) -> None:
+    ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
         main = torch.cuda.current_stream(hidden_states.device)
         side = _gate_stream(hidden_states.device)
@@ -342,11 +338,7 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
         g_proj_states.record_stream(main)
         g2 = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
 
-        core_attn_out = torch.empty(
-            (1, num_tokens, self.local_num_heads, self.head_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
+        core_attn_out = self._core_attn_buffer(g1)
         self._forward(
             mixed_qkv=mixed_qkv,
             g1=g1,
@@ -354,8 +346,12 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
             beta=beta,
             core_attn_out=core_attn_out,
         )
+        # The main stream has consumed both branches. Release every projection
+        # owner before the output GEMM; stream records still protect pending
+        # device reads when Python releases the last reference.
+        del mixed_qkv, g1, g2, beta, g_proj_states, f_a, projected_qkvgfab, g_a_states
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
-        output[:] = self.o_proj(core_attn_out)[0]
+        return self.o_proj(core_attn_out)[0]
 
 
 __all__ = ["Glm5NextLinearAttention"]

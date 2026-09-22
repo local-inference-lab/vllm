@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Behavior checks for the B12x sparse MLA adapters."""
 
+import gc
 import weakref
 from types import SimpleNamespace
 from typing import Any
@@ -69,6 +70,133 @@ from vllm.v1.worker.utils import select_common_block_size
 class _Workspace:
     def get_simultaneous(self, *shapes_and_dtypes):
         return [torch.empty(shape, dtype=dtype) for shape, dtype in shapes_and_dtypes]
+
+
+@pytest.mark.parametrize("has_prefill_backend", [False, True])
+@pytest.mark.parametrize("dcp", [1, 2])
+def test_sparse_chunked_workspace_requires_generic_prefill(
+    monkeypatch, has_prefill_backend, dcp
+):
+    from vllm.model_executor.layers.attention import sparse_mla_attention as common
+    from vllm.v1.attention.ops.dcp import MLADCPManager
+
+    gathers = []
+    dcp_manager = object.__new__(MLADCPManager)
+    dcp_manager.init_kv_gather = lambda buf, rows: gathers.append((buf, rows))
+    prefill = SimpleNamespace(clone=lambda: "generic-prefill")
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                index_topk=2048,
+                kv_lora_rank=512,
+                qk_rope_head_dim=0,
+                qk_nope_head_dim=128,
+                v_head_dim=128,
+            ),
+            model_arch_config=SimpleNamespace(total_num_attention_heads=64),
+            dtype=torch.bfloat16,
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=3072, max_num_seqs=4),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        ),
+        compilation_config=SimpleNamespace(
+            static_forward_context={
+                "layer": SimpleNamespace(
+                    prefill_backend=prefill if has_prefill_backend else None,
+                    dcp_manager=dcp_manager,
+                ),
+            }
+        ),
+        cache_config=SimpleNamespace(cache_dtype="fp8"),
+    )
+    monkeypatch.setattr(
+        common, "get_dcp_group", lambda: SimpleNamespace(world_size=dcp)
+    )
+    monkeypatch.setattr(common, "_is_masked_mha_available", lambda *args: False)
+    monkeypatch.setattr(
+        SparseMLACommonMetadataBuilder,
+        "determine_chunked_prefill_workspace_size",
+        staticmethod(lambda config: 8192),
+    )
+    builder = SparseMLACommonMetadataBuilder(
+        SimpleNamespace(block_size=64), ["layer"], config, torch.device("cpu")
+    )
+    rows = (8192 + (8192 // dcp if dcp > 1 else 0)) if has_prefill_backend else 0
+    assert builder.chunked_prefill_workspace.shape == (rows, 512)
+    assert builder.chunked_prefill_workspace_size == (
+        8192 if has_prefill_backend else 0
+    )
+    assert len(gathers) == int(has_prefill_backend and dcp > 1)
+    if gathers:
+        assert gathers[0][0] is builder.chunked_prefill_workspace
+        assert gathers[0][1] == 8192
+
+
+@pytest.mark.parametrize("grouped_backend", [False, True])
+@pytest.mark.parametrize("explicit_builder", [False, True])
+def test_sparse_backend_allocates_only_its_consumed_index_group(
+    monkeypatch, grouped_backend, explicit_builder
+):
+    from vllm.model_executor.layers.attention import sparse_mla_attention as common
+
+    impl = object.__new__(B12xMLASparseImpl)
+    if grouped_backend:
+        impl.uses_index_group = True
+    indices = torch.zeros((4, 8), dtype=torch.int32)
+    calls: list[object] = []
+    group = SimpleNamespace(
+        set_logical_topk_ready=lambda index: calls.append(("ready", index)),
+        prepare_for_batch=lambda index, metadata: calls.append(("batch", index)),
+    )
+
+    def register(*args, **kwargs):
+        calls.append("allocate")
+        return group, 0
+
+    builder = SimpleNamespace(register_layer=register)
+    monkeypatch.setattr(common, "SparseMLAIndexGroupBuilder", lambda topk: builder)
+
+    def initialize_base(self, *args):
+        self.num_heads, self.qk_nope_head_dim, self.qk_rope_head_dim = 1, 8, 0
+
+    monkeypatch.setattr(common.MLACommonBaseImpl, "__init__", initialize_base)
+    monkeypatch.setattr(common, "has_flashinfer", lambda: False)
+    monkeypatch.setattr(common, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(common, "_is_masked_mha_available", lambda **kwargs: False)
+    monkeypatch.setattr(common, "get_current_vllm_config", lambda: object())
+    common.SparseMLACommonImpl.__init__(
+        impl,
+        num_heads=1,
+        head_size=8,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8_ds_mla",
+        logits_soft_cap=None,
+        attn_type="decoder",
+        kv_sharing_target_layer_name=None,
+        q_lora_rank=None,
+        kv_lora_rank=8,
+        qk_nope_head_dim=8,
+        qk_rope_head_dim=0,
+        qk_head_dim=8,
+        v_head_dim=8,
+        kv_b_proj=None,
+        topk_indices_buffer=indices,
+        index_group_builder=builder if explicit_builder else None,
+    )
+    assert impl.topk_indices_buffer is indices
+    impl.record_logical_topk_ready()
+    impl.prepare_for_batch(None)
+    if grouped_backend:
+        assert impl.index_group is group
+        assert calls == ["allocate", ("ready", 0), ("batch", 0)]
+    else:
+        assert impl.index_group is None
+        assert not calls
 
 
 def test_b12x_selector_routes_supported_attention_families() -> None:
@@ -801,18 +929,175 @@ def test_b12x_glm5_next_full_ckv_workspaces_follow_cache_format(
     impl._ckv_local_capacity = 128
     impl.dcp_world_size = 4
     impl._cache_record_bytes = record_bytes
+    impl._plans = {
+        ("ckv_extend", 32): SimpleNamespace(
+            scratch_specs=lambda: (SimpleNamespace(nbytes=8),)
+        )
+    }
     specs = impl._workspace_specs(input_num_heads=8, include_ckv=True)
 
-    assert specs[-2:] == (
-        ((128, record_bytes), torch.uint8),
-        ((512, record_bytes), torch.uint8),
+    assert len(specs) == 3
+    assert specs[1] == ((8,), torch.uint8)
+    assert specs[-1] == ((512, record_bytes), torch.uint8)
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_glm_dcp_prefill_query_reuses_scratch_without_aliasing_output(
+    monkeypatch, world_size: int, transposed: bool
+) -> None:
+    from vllm.v1.worker.workspace import WorkspaceManager
+
+    manager = WorkspaceManager(torch.device("cpu"))
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = True
+    impl._decode_max_rows = 4
+    impl._max_tokens = 32
+    impl._input_num_heads = world_size * 4
+    impl._q_head_dim = 8
+    impl._scratch_nbytes = 32 * impl._input_num_heads * 8 * 2
+    impl._decode_plan = object()
+    impl._ckv_local_capacity = 0
+    impl._cache_record_bytes = 528
+    impl.dcp_world_size = world_size
+    monkeypatch.setattr(b12x_mla_sparse, "current_workspace_manager", lambda: manager)
+    q_buffer, scratch = impl._borrow_workspaces()
+    manager.lock()
+    for rank in range(world_size):
+        group = SimpleNamespace(world_size=world_size, rank_in_group=rank)
+        monkeypatch.setattr(b12x_mla_sparse, "get_dcp_group", lambda group=group: group)
+        for rows in (19, 7, 23):
+            local_queries = []
+            for source in range(world_size):
+                values = (torch.arange(rows * 4 * 8) % 127 + source).to(torch.bfloat16)
+                local_queries.append(
+                    values.view(4, rows, 8).transpose(0, 1)
+                    if transposed
+                    else values.view(rows, 4, 8)
+                )
+
+            def gather(
+                _group, send, receive, rank=rank, rows=rows, local_queries=local_queries
+            ):
+                assert send.data_ptr() == receive.data_ptr() + rank * send.nbytes
+                assert torch.equal(send.view(rows, 4, 8), local_queries[rank])
+                receive.view(world_size, rows, 4, 8).copy_(torch.stack(local_queries))
+
+            monkeypatch.setattr(
+                b12x_mla_sparse, "_dcp_all_gather_current_stream", gather
+            )
+            actual = impl.gather_dcp_query(local_queries[rank])
+            assert actual.data_ptr() == q_buffer.data_ptr()
+            expected = torch.cat(local_queries, dim=1)
+            assert torch.equal(actual, expected)
+            scratch.fill_(255)
+            assert torch.equal(actual, expected)
+
+
+def test_glm_dcp_decode_keeps_the_transport_collective(monkeypatch) -> None:
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = True
+    impl._decode_max_rows = 16
+    query = torch.empty((16, 4, 8), dtype=torch.bfloat16)
+    expected = torch.empty((16, 8, 8), dtype=torch.bfloat16)
+    calls = []
+
+    def gather(value, dim):
+        calls.append((value, dim))
+        return expected
+
+    monkeypatch.setattr(
+        b12x_mla_sparse, "get_dcp_group", lambda: SimpleNamespace(all_gather=gather)
     )
+    assert impl.gather_dcp_query(query) is expected
+    assert calls == [(query, 1)]
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_glm_dcp_output_reuses_query_storage_with_head_major_rank_slices(
+    monkeypatch, world_size: int
+) -> None:
+    from vllm.v1.worker.workspace import WorkspaceManager
+
+    manager = WorkspaceManager(torch.device("cpu"))
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = True
+    impl._decode_max_rows = 4
+    impl._max_tokens = 32
+    impl._input_num_heads = world_size * 4
+    impl._q_head_dim = 8
+    impl._scratch_nbytes = 32 * impl._input_num_heads * 8 * 2
+    impl._decode_plan = object()
+    impl._ckv_local_capacity = 0
+    impl._cache_record_bytes = 528
+    impl.dcp_world_size = world_size
+    monkeypatch.setattr(b12x_mla_sparse, "current_workspace_manager", lambda: manager)
+    monkeypatch.setattr(b12x_mla_sparse, "should_nccl_symm_mem_ag_rs", lambda: False)
+    q_buffer, scratch = impl._borrow_workspaces()
+    manager.lock()
+    for rank in range(world_size):
+        for rows in (19, 7, 23):
+            partial = (
+                scratch[: rows * impl._input_num_heads * 8 * 2]
+                .view(torch.bfloat16)
+                .view(rows, impl._input_num_heads, 8)
+            )
+            partial.copy_(torch.arange(partial.numel()).view_as(partial) % 127)
+            original = partial.clone()
+
+            def reduce_scatter(local, packed, rank=rank, original=original):
+                assert packed.data_ptr() == q_buffer.data_ptr()
+                assert local.data_ptr() == packed.data_ptr() + rank * local.nbytes
+                assert local.is_contiguous() and packed.is_contiguous()
+                assert torch.equal(packed, original.transpose(0, 1))
+                local.mul_(world_size)
+
+            comm = SimpleNamespace(disabled=False, reduce_scatter=reduce_scatter)
+            group = SimpleNamespace(
+                rank_in_group=rank,
+                device_communicator=SimpleNamespace(pynccl_comm=comm),
+            )
+            monkeypatch.setattr(
+                b12x_mla_sparse, "get_dcp_group", lambda group=group: group
+            )
+            actual = impl.reduce_scatter_dcp_output(partial)
+            expected = original[:, rank * 4 : (rank + 1) * 4] * world_size
+            assert torch.equal(actual, expected)
+            assert torch.equal(partial, original)
+            assert actual.transpose(0, 1).is_contiguous()
+            scratch.fill_(255)
+            assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "rows,disabled,symmetric", [(4, False, False), (8, True, False), (8, False, True)]
+)
+def test_glm_dcp_output_preserves_decode_and_special_transport_paths(
+    monkeypatch, rows, disabled, symmetric
+) -> None:
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = True
+    impl._decode_max_rows = 4
+    comm = SimpleNamespace(disabled=disabled)
+    monkeypatch.setattr(
+        b12x_mla_sparse,
+        "get_dcp_group",
+        lambda: SimpleNamespace(device_communicator=SimpleNamespace(pynccl_comm=comm)),
+    )
+    monkeypatch.setattr(
+        b12x_mla_sparse, "should_nccl_symm_mem_ag_rs", lambda: symmetric
+    )
+    assert impl.reduce_scatter_dcp_output(torch.empty(rows, 8, 8)) is None
 
 
 @pytest.mark.parametrize("record_bytes", [528, 304])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("padded_tokens", [2, 4])
 def test_b12x_glm5_next_full_ckv_gather_preserves_native_records(
     monkeypatch: pytest.MonkeyPatch,
     record_bytes: int,
+    rank: int,
+    padded_tokens: int,
 ) -> None:
     impl = object.__new__(B12xMLASparseImpl)
     impl._kernel_page_size = 2
@@ -826,37 +1111,48 @@ def test_b12x_glm5_next_full_ckv_gather_preserves_native_records(
         .to(torch.uint8)
         .view(2, 2, record_bytes)
     )
-    local_buffer = torch.full((4, record_bytes), 255, dtype=torch.uint8)
-    gathered_buffer = torch.empty((8, record_bytes), dtype=torch.uint8)
+    gathered_buffer = torch.full((8, record_bytes), 255, dtype=torch.uint8)
+    local_tokens = padded_tokens - 1
     metadata = SimpleNamespace(
-        num_actual_tokens=3,
-        dcp_local_total_tokens=3,
-        dcp_padded_total_tokens=4,
-        dcp_local_cu_seq_lens=torch.tensor([0, 3], dtype=torch.int32),
+        num_actual_tokens=local_tokens,
+        dcp_local_total_tokens=local_tokens,
+        dcp_padded_total_tokens=padded_tokens,
+        dcp_local_cu_seq_lens=torch.tensor([0, local_tokens], dtype=torch.int32),
         block_table=torch.tensor([[0, 1]], dtype=torch.int32),
         num_reqs=1,
     )
 
     def fake_cp_gather_cache(**kwargs: Any) -> None:
-        kwargs["dst"].copy_(kwargs["src_cache"].view(-1, record_bytes)[:3])
+        kwargs["dst"].copy_(kwargs["src_cache"].view(-1, record_bytes)[:local_tokens])
 
     def fake_all_gather(_group: Any, src: torch.Tensor, dst: torch.Tensor) -> None:
+        assert src.data_ptr() == dst.data_ptr() + rank * padded_tokens * record_bytes
         dst.copy_(src.repeat(2))
 
     monkeypatch.setattr(b12x_mla_sparse.ops, "cp_gather_cache", fake_cp_gather_cache)
     monkeypatch.setattr(
         b12x_mla_sparse, "_dcp_all_gather_current_stream", fake_all_gather
     )
-    monkeypatch.setattr(b12x_mla_sparse, "get_dcp_group", lambda: object())
+    monkeypatch.setattr(
+        b12x_mla_sparse,
+        "get_dcp_group",
+        lambda: SimpleNamespace(rank_in_group=rank, world_size=2),
+    )
 
-    gathered = impl._gather_full_ckv(kv_cache, metadata, local_buffer, gathered_buffer)
+    gathered = impl._gather_full_ckv(kv_cache, metadata, gathered_buffer)
 
     expected_rank = torch.cat(
-        (kv_cache.view(-1, record_bytes)[:3], torch.zeros((1, record_bytes))),
+        (
+            kv_cache.view(-1, record_bytes)[:local_tokens],
+            torch.zeros((1, record_bytes), dtype=torch.uint8),
+        ),
         dim=0,
     )
     assert gathered.shape == (4, 2, record_bytes)
-    assert torch.equal(gathered.view(-1, record_bytes), expected_rank.repeat(2, 1))
+    assert torch.equal(
+        gathered.view(-1, record_bytes)[: 2 * padded_tokens], expected_rank.repeat(2, 1)
+    )
+    assert torch.all(gathered.view(-1, record_bytes)[2 * padded_tokens :] == 255)
 
 
 def test_b12x_glm5_next_full_ckv_gather_rejects_wrong_record_width() -> None:
@@ -872,7 +1168,6 @@ def test_b12x_glm5_next_full_ckv_gather_rejects_wrong_record_width() -> None:
         impl._gather_full_ckv(
             torch.empty((2, 2, 528), dtype=torch.uint8),
             metadata,
-            torch.empty((4, 304), dtype=torch.uint8),
             torch.empty((8, 304), dtype=torch.uint8),
         )
 
@@ -1289,6 +1584,180 @@ def test_sparse_mla_preparation_borrows_declared_scratch_shape(monkeypatch):
     assert calls == ["prime", "run", "prime", "run"]
     assert reservations == [(((spec.nbytes,), torch.uint8),)] * 2
 
+    probes = [
+        weakref.ref(bound[name])
+        for name in (
+            "q",
+            "selected_indices",
+            "cache_seqlens_int32",
+            "nsa_cache_seqlens_int32",
+        )
+    ]
+    # Publishing retains owners, but must not retain synchronized warmup inputs.
+    published_owners = (*call.owners, *second_call.owners)
+    del call, second_call
+    bound.clear()
+    assert all(probe() is None for probe in probes), published_owners
+
+
+@pytest.mark.parametrize("record_bytes", [528, 304])
+@pytest.mark.parametrize("rows", [4, 3072])
+@torch.inference_mode()
+def test_cache_writer_preparation_releases_probes_and_rebinds_live_inputs(
+    record_bytes, rows
+):
+    """Compilation owns formats; only the serving cache survives preparation."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("native B12X cache writer requires SM12x")
+    from b12x.attention import sparse_mla
+    from b12x.preparation import PreparationSession
+
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    cache = torch.full((2, 64, record_bytes), 17, dtype=torch.uint8, device=device)
+    original = cache.clone()
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._bound_kv_cache = cache
+    impl._plans = {}
+    impl._is_glm_next = True
+    impl._max_tokens = rows
+    impl.kv_lora_rank = 512
+    impl._module = sparse_mla
+    impl.dcp_world_size = 2
+    impl._preparation_prefix = lambda: "test.cache-writer-lifetime"
+    gc.collect()
+    torch.accelerator.synchronize()
+    before = torch.accelerator.memory_allocated(device)
+    (unit,) = impl.get_b12x_preparation_units(impl, SimpleNamespace(token_counts=()))
+    # Retained declaration metadata must not allocate token-sized GPU inputs.
+    assert torch.accelerator.memory_allocated(device) == before
+    with PreparationSession(device=device, autotune=False) as session:
+        session.prepare(unit.requests)
+        session.freeze()
+        torch.accelerator.synchronize()
+        assert impl._cache_writer_plan.prepared.owners == ()
+        assert torch.accelerator.memory_allocated(device) == before
+        torch.testing.assert_close(cache, original, rtol=0, atol=0)
+
+        keys = torch.randn((4, 512), dtype=torch.bfloat16, device=device)
+        slots = torch.tensor([1, 4, 9, 63], dtype=torch.int64, device=device)
+        state = impl._cache_writer_plan.prepared.state
+        state.run(keys, cache, slots)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            state.run(keys, cache, slots)
+        for offset in (0, 1, 64):
+            keys.normal_()
+            slots.copy_(torch.tensor([0, 3, 8, 62], device=device) + offset)
+            cache.copy_(original)
+            state.run(keys, cache, slots)
+            expected = cache.clone()
+            cache.copy_(original)
+            graph.replay()
+            torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+            assert not torch.equal(cache, original)
+
+
+@pytest.mark.parametrize(
+    "mode,rows,heads",
+    [("decode", 4, 16), ("extend", 64, 16), ("extend", 4096, 64)],
+)
+@torch.inference_mode()
+def test_sparse_mla_prepared_launcher_rebinds_without_warmup_probes(mode, rows, heads):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("native B12X sparse MLA requires SM12x")
+    from b12x.attention import sparse_mla
+    from b12x.preparation import PreparationSession
+
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        init_workspace_manager,
+        reset_workspace_manager,
+    )
+
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    cache = torch.empty((1, 64, 528), dtype=torch.uint8, device=device)
+    keys = torch.ones((64, 512), dtype=torch.bfloat16, device=device)
+    keys[1].fill_(2)
+    slots = torch.arange(64, dtype=torch.int64, device=device)
+    sparse_mla.concat_and_cache_glm_next_mla_fp8(
+        keys, cache, slots, plan=sparse_mla.plan_cache_writer(keys, cache, slots)
+    )
+    caps = sparse_mla.Caps(
+        device=device,
+        num_q_heads=heads,
+        max_q_rows=rows,
+        max_width=2051,
+        softmax_scale=256**-0.5,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.uint8,
+        head_dim=512,
+        v_head_dim=512,
+        model_type=int(sparse_mla.ModelType.GLM_NEXT),
+        mode=mode,
+        max_batch=rows,
+        page_size=64,
+    )
+    plan = sparse_mla.plan(caps)
+    (spec,) = plan.scratch_specs()
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._bound_kv_cache = cache
+    impl._scratch_nbytes = spec.nbytes
+    init_workspace_manager(device)
+    try:
+        with PreparationSession(device=device, autotune=False) as session:
+            session.prepare(
+                (
+                    plan.request(
+                        name=f"probe-lifetime.{mode}",
+                        prepare_call=lambda state: impl._make_prepare_call(state, caps),
+                    ),
+                )
+            )
+            assert plan.prepared.owners == ()
+            session.freeze()
+            current_workspace_manager().lock()
+            query = torch.zeros((rows, heads, 512), dtype=torch.bfloat16, device=device)
+            selected = torch.zeros((rows, 2051), dtype=torch.int32, device=device)
+            lengths = torch.full((rows,), 64, dtype=torch.int32, device=device)
+            selected_lengths = torch.ones(rows, dtype=torch.int32, device=device)
+            scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+            state = plan.prepared.state
+
+            def run():
+                binding = state.bind(
+                    scratch=scratch,
+                    q=query,
+                    selected_indices=selected,
+                    cache_seqlens_int32=lengths,
+                    nsa_cache_seqlens_int32=selected_lengths,
+                    kv_cache=cache,
+                )
+                output = state.run(binding, kv_cache=cache)
+                return output[0] if isinstance(output, tuple) else output
+
+            actual = run()
+            torch.testing.assert_close(actual, torch.ones_like(actual), rtol=0, atol=0)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = run()
+            selected[:, 1].fill_(1)
+            for index, count, query_first, expected in (
+                (1, 1, 0, 2),
+                (0, 1, 0, 1),
+                (0, 2, 0, 1.5),
+                (0, 2, 256, 2),
+                (0, 2, -256, 1),
+            ):
+                selected[:, 0].fill_(index)
+                selected_lengths.fill_(count)
+                query[..., 0].fill_(query_first)
+                graph.replay()
+                torch.testing.assert_close(
+                    captured, torch.full_like(captured, expected), rtol=0, atol=0
+                )
+    finally:
+        reset_workspace_manager()
+
 
 @pytest.mark.parametrize("query_projection", [False, True])
 def test_mla_layer_discovers_backend_and_optional_query_plans(
@@ -1344,6 +1813,43 @@ def test_mla_layer_discovers_backend_and_optional_query_plans(
     if query_projection:
         assert units[1].name == "MLA_QUERY"
         assert [request.name for request in units[1].requests] == ["test.query.m8"]
+
+
+@pytest.mark.parametrize("b12x_backend", [False, True])
+def test_mla_unbind_releases_backend_cache_and_allows_rebinding(b12x_backend):
+    """Profiling-cache views must not survive the owning layer's teardown."""
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+    from vllm.v1.worker.utils import clear_layer_kv_caches
+
+    layer = MLAAttention.__new__(MLAAttention)
+    torch.nn.Module.__init__(layer)
+    impl = object.__new__(B12xMLASparseImpl) if b12x_backend else SimpleNamespace()
+    if b12x_backend:
+        impl._uses_glm_dsa_nvfp4_cache = False
+        impl._is_glm_next = False
+    layer.impl = impl
+    layer.indexer = None
+    layer._vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(enable_jit_warmup=False)
+    )
+    cache = torch.empty((2, 1, 64, 528), dtype=torch.uint8)
+    cache_ref = weakref.ref(cache)
+    layer.bind_kv_cache(cache)
+    if b12x_backend:
+        impl._cache_writer_plan = SimpleNamespace(cache=impl._bound_kv_cache)
+    del cache
+
+    clear_layer_kv_caches([layer, layer])
+    assert layer.kv_cache.numel() == 0
+    assert cache_ref() is None
+    if b12x_backend:
+        assert impl._bound_kv_cache is None
+        assert impl._cache_writer_plan is None
+    replacement = torch.empty((3, 1, 64, 528), dtype=torch.uint8)
+    layer.bind_kv_cache(replacement)
+    assert layer.kv_cache.data_ptr() == replacement.data_ptr()
+    if b12x_backend:
+        assert impl._bound_kv_cache is layer.kv_cache
 
 
 def test_b12x_sparse_mla_plan_lookup_declares_unplanned_decode_rows_once(
@@ -1903,16 +2409,28 @@ def _deepseek_v4_wo_layer(device, groups=2, heads_per_group=8, rank=128, hidden=
 
 
 @pytest.mark.parametrize("eager_only", [False, True])
-def test_deepseek_v4_wo_declares_exact_rows_before_profiling(monkeypatch, eager_only):
+@pytest.mark.parametrize("tiled", [False, True])
+def test_deepseek_v4_wo_declares_exact_rows_before_profiling(
+    monkeypatch, eager_only, tiled
+):
     from dataclasses import replace
 
     from b12x.gemm import wo_projection
 
     from vllm.utils.b12x import B12xWorkload
 
-    layer = _deepseek_v4_wo_layer(torch.device("cpu"))
+    groups, rank, hidden = (4, 1024, 4096) if tiled else (2, 128, 256)
+    layer = _deepseek_v4_wo_layer(
+        torch.device("cpu"), groups=groups, rank=rank, hidden=hidden
+    )
     layer._b12x_wo_projection_weights = SimpleNamespace(
-        groups=2, group_width=4096, rank=128, hidden=256
+        groups=groups,
+        group_width=4096,
+        rank=rank,
+        hidden=hidden,
+        sfb_k_replicated=True,
+        wo_a=SimpleNamespace(values_tiled=object() if tiled else None),
+        wo_b=SimpleNamespace(values_tiled=object() if tiled else None),
     )
     monkeypatch.setattr(b12x_mla, "_require_b12x_wo_projection", lambda: wo_projection)
     workload = B12xWorkload(
@@ -1939,6 +2457,8 @@ def test_deepseek_v4_wo_declares_exact_rows_before_profiling(monkeypatch, eager_
         assert query.operation == "inv_rope" and not query.dynamic_tokens
         assert (query.heads_per_group, query.nope_dim, query.rope_dim) == (8, 448, 64)
         assert query.positions_dtype == "int64" and query.cos_sin_dtype == "bfloat16"
+        assert query.sfb_k_replicated
+        assert query.wo_a_tiled is tiled and query.wo_b_tiled is tiled
     (repeated,) = layer.get_b12x_preparation_units(layer, workload)
     assert all(a.plan is b.plan for a, b in zip(unit.requests, repeated.requests))
     assert (
@@ -2113,7 +2633,7 @@ def test_mhc_prepares_model_operands_and_first_layer_broadcast(
     layer = _deepseek_v4_mhc_layer(first_layer)
     hidden = layer.attn_norm.weight.numel()
     operands = None
-    operations = ("post_pre", "post_pre_bf16", "post")
+    operations: tuple[str, ...] = ("post_pre", "post_pre_bf16", "post")
     if glm_operands:
         layer.input_layernorm = layer.attn_norm
         layer.post_attention_layernorm = layer.ffn_norm

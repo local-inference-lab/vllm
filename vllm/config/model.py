@@ -1461,7 +1461,15 @@ class ModelConfig:
         decode_context_parallel_size = parallel_config.decode_context_parallel_size
         if decode_context_parallel_size > 1 and not self.use_mla:
             total_num_kv_heads = self.get_total_num_kv_heads()
-            if tensor_parallel_size <= total_num_kv_heads:
+            supports_full_tp_dcp = bool(
+                getattr(
+                    self.hf_text_config,
+                    "supports_full_tp_dcp_with_kv_gather",
+                    False,
+                )
+                and decode_context_parallel_size == tensor_parallel_size
+            )
+            if tensor_parallel_size <= total_num_kv_heads and not supports_full_tp_dcp:
                 raise ValueError(
                     "Decode context parallelism for GQA/MQA requires "
                     f"`--tensor-parallel-size` ({tensor_parallel_size}) to be "
@@ -1471,7 +1479,7 @@ class ModelConfig:
                 )
 
             max_dcp_size = tensor_parallel_size // total_num_kv_heads
-            if decode_context_parallel_size > max_dcp_size:
+            if decode_context_parallel_size > max_dcp_size and not supports_full_tp_dcp:
                 raise ValueError(
                     "`--decode-context-parallel-size` "
                     f"({decode_context_parallel_size}) exceeds the maximum "

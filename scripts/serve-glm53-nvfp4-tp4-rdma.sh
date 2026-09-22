@@ -18,9 +18,12 @@ CHRONITON_IP="${CHRONITON_IP:-192.168.42.78}"
 WORKER_IPS=("${LUXON_IP}" "${GRAVITON_IP}" "${CHRONITON_IP}")
 NODE_IPS="${HEAD_IP},${LUXON_IP},${GRAVITON_IP},${CHRONITON_IP}"
 ETH_IF="${ETH_IF:-enP7s7}"
-IB_IF="${IB_IF:-rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1}"
-NCCL_IB_HCA="${NCCL_IB_HCA:-=rocep1s0f0:1:0:0,roceP2p1s0f0:1:0:1,rocep1s0f1:1:1:0,roceP2p1s0f1:1:1:1}"
+IB_IF="${IB_IF:-rocep1s0f0,roceP2p1s0f0}"
+NCCL_IB_HCA="${NCCL_IB_HCA:-${IB_IF}}"
 NCCL_IB_MERGE_NICS="${NCCL_IB_MERGE_NICS:-1}"
+ALLREDUCE="${ALLREDUCE:-rocenante}"
+ROCE_ALLREDUCE_MAX_SIZE="${ROCE_ALLREDUCE_MAX_SIZE:-2MB}"
+ROCE_ALLGATHER_MAX_SIZE="${ROCE_ALLGATHER_MAX_SIZE:-16MB}"
 MASTER_PORT="${MASTER_PORT:-29654}"
 CONTAINER_NAME="${CONTAINER_NAME:-vllm_glm53_nvfp4_tp4}"
 IMAGE_NAME="${IMAGE_NAME:-vllm-node-eugr-20260712:latest}"
@@ -75,8 +78,9 @@ Usage: $0 [launcher options] [-- vLLM options]
 
 Launch GLM-5.3 NVFP4 with TP=4 across tachyon, luxon, graviton, and chroniton.
 The Spark cluster launcher starts one native vLLM rank per node, uses the
-management LAN for bootstrap, and exposes both RoCE twins on both physical
-ring links to NCCL. No external scheduler is used. MTP is opt-in by
+management LAN for bootstrap, and uses both RoCE interfaces through the switch.
+ALLREDUCE=rocenante (default) uses b12x collectives; ALLREDUCE=nccl uses NCCL.
+MTP is opt-in by
 setting NUM_SPECULATIVE_TOKENS to a positive value.
 
 Launcher options:
@@ -100,7 +104,8 @@ Launcher options:
                 Write uncompressed trace files.
   -h, --help    Show this help.
 
-Environment overrides include MODEL_PATH, MAX_MODEL_LEN, MTP_MOE_BACKEND,
+Environment overrides include ALLREDUCE, ROCE_ALLREDUCE_MAX_SIZE,
+ROCE_ALLGATHER_MAX_SIZE, MODEL_PATH, MAX_MODEL_LEN, MTP_MOE_BACKEND,
 KV_CACHE_MEMORY_BYTES, HEAD_IP, LUXON_IP, GRAVITON_IP, CHRONITON_IP, ETH_IF,
 IB_IF, NCCL_ROOT, IMAGE_NAME, CONTAINER_MEMORY_GB, and
 NUM_SPECULATIVE_TOKENS.
@@ -194,6 +199,14 @@ TORCH_PROFILE_WITH_FLOPS=$(bool_value \
 TORCH_PROFILE_USE_GZIP=$(bool_value \
   TORCH_PROFILE_USE_GZIP "${TORCH_PROFILE_USE_GZIP}")
 
+
+case "${ALLREDUCE}" in
+  rocenante|nccl) ;;
+  *)
+    echo "ALLREDUCE must be rocenante or nccl; got '${ALLREDUCE}'" >&2
+    exit 2
+    ;;
+esac
 
 case "${NCCL_DEBUG}" in
   VERSION|WARN|INFO|TRACE) ;;
@@ -462,27 +475,33 @@ cluster_args=(
   --env "NCCL_NET_PLUGIN=none"
   --env "LD_PRELOAD=${NCCL_LIB}"
   --env "VLLM_NCCL_SO_PATH=${NCCL_LIB}"
-  --env "NCCL_SKIP_TREE_CONNECT=1"
-  --env "NCCL_FORCE_RANK_ORDER_RING=1"
   --env "NCCL_NET=IB"
   --env "NCCL_IB_DISABLE=0"
   --env "NCCL_IB_HCA=${NCCL_IB_HCA}"
   --env "NCCL_IB_GID_INDEX=3"
+  --env "NCCL_IB_TC=${NCCL_IB_TC:-106}"
+  --env "B12X_ROCE_TRAFFIC_CLASS=${B12X_ROCE_TRAFFIC_CLASS:-${NCCL_IB_TC:-106}}"
   --env "NCCL_IB_MERGE_NICS=${NCCL_IB_MERGE_NICS}"
-  --env "NCCL_NET_MERGE_POLICY=RAIL"
+  --env "NCCL_NET_MERGE_POLICY=ALL"
   --env "NCCL_NET_MERGE_LEVEL=SYS"
-  --env "NCCL_IB_SUBNET_PREFIX_LEN=30"
-  --env "NCCL_IB_SUBNET_AWARE_ROUTING=1"
-  --env "NCCL_ALGO=Ring"
-  --env "NCCL_PROTO=LL,LL128,Simple"
-  --env "NCCL_MIN_NCHANNELS=4"
-  --env "NCCL_MAX_NCHANNELS=4"
-  --env "NCCL_CROSS_NIC=1"
   --env "NCCL_CUMEM_ENABLE=0"
   --env "NCCL_RUNTIME_CONNECT=1"
   --env "NCCL_P2P_LEVEL=SYS"
   --env "NCCL_IGNORE_CPU_AFFINITY=1"
 )
+
+allreduce_args=()
+if [[ "${ALLREDUCE}" == rocenante ]]; then
+  cluster_args+=(
+    --env "VLLM_ENABLE_ROCE_ALLREDUCE=1"
+    --env "VLLM_ROCE_ALLREDUCE_MAX_SIZE=${ROCE_ALLREDUCE_MAX_SIZE}"
+    --env "VLLM_ROCE_ALLGATHER_MAX_SIZE=${ROCE_ALLGATHER_MAX_SIZE}"
+    --env "B12X_ROCE_CACHE_DIR=/root/.cache/vllm/b12x-roce"
+  )
+else
+  cluster_args+=(--env "VLLM_ENABLE_ROCE_ALLREDUCE=0")
+  allreduce_args+=(--disable-custom-all-reduce)
+fi
 
 if ((check_only)); then
   exec "${CLUSTER_LAUNCHER}" "${cluster_args[@]}" --check-config
@@ -507,7 +526,7 @@ vllm_command=(
   --tensor-parallel-size 4
   --pipeline-parallel-size 1
   --decode-context-parallel-size 1
-  --disable-custom-all-reduce
+  "${allreduce_args[@]}"
   --mamba-cache-mode align
   --enable-prefix-caching
   --enable-chunked-prefill

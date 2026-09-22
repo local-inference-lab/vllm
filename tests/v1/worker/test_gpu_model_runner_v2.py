@@ -447,10 +447,10 @@ def test_boundary_logits_only_dispatches_pending_cache_tasks(
     assert input_batch.positions.item() == 3
 
 
-@pytest.mark.parametrize("dummy_run_fails", [False, True])
+@pytest.mark.parametrize("failure_stage", [None, "init", "prepare", "forward"])
 def test_glm_dcp_attention_profile_uses_single_request_and_cleans_up(
     monkeypatch: pytest.MonkeyPatch,
-    dummy_run_fails: bool,
+    failure_stage: str | None,
 ):
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.model_config = SimpleNamespace(
@@ -461,10 +461,21 @@ def test_glm_dcp_attention_profile_uses_single_request_and_cleans_up(
     runner.max_num_tokens = 4096
     events: list[object] = []
 
+    def initialize(_, *, num_blocks):
+        assert num_blocks == 1
+        events.append("init-kv")
+        if failure_stage == "init":
+            raise RuntimeError("expected DCP profile failure")
+
+    def prepare():
+        events.append("prepare")
+        if failure_stage == "prepare":
+            raise RuntimeError("expected DCP profile failure")
+
     monkeypatch.setattr(
         model_runner_module,
         "_init_minimal_kv_cache_for_profiling",
-        lambda _: events.append("init-kv"),
+        initialize,
     )
     monkeypatch.setattr(
         model_runner_module,
@@ -474,21 +485,29 @@ def test_glm_dcp_attention_profile_uses_single_request_and_cleans_up(
 
     def dummy_run(*args, **kwargs):
         events.append(("dummy-run", args, kwargs))
-        if dummy_run_fails:
+        if failure_stage == "forward":
             raise RuntimeError("expected DCP profile failure")
         return torch.empty(1), torch.empty(1)
 
     runner._dummy_run = dummy_run
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
 
-    if dummy_run_fails:
+    if failure_stage is not None:
         with pytest.raises(RuntimeError, match="expected DCP profile failure"):
-            runner.profile_glm_dcp_attention()
+            runner.profile_glm_dcp_attention(prepare)
     else:
-        runner.profile_glm_dcp_attention()
+        runner.profile_glm_dcp_attention(prepare)
 
     assert events[0] == "init-kv"
-    assert events[1] == (
+    assert events[-1] == "cleanup"
+    if failure_stage == "init":
+        assert events == ["init-kv", "cleanup"]
+        return
+    assert events[1] == "prepare"
+    if failure_stage == "prepare":
+        assert events == ["init-kv", "prepare", "cleanup"]
+        return
+    assert events[2] == (
         "dummy-run",
         (4096,),
         {
@@ -499,8 +518,7 @@ def test_glm_dcp_attention_profile_uses_single_request_and_cleans_up(
             "profile_all_kv_cache_groups": True,
         },
     )
-    assert events[-1] == "cleanup"
-    if not dummy_run_fails:
+    if failure_stage is None:
         assert events[-2] == "sync"
 
 

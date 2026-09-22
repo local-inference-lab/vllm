@@ -2653,6 +2653,44 @@ def test_get_kv_cache_config_kpool_tail_coowns_indexer_tensor():
     )
 
 
+@pytest.mark.parametrize("with_tail", [False, True])
+@pytest.mark.parametrize("chunk_budget,private_bundles", [(8192, 4), (4096, 5)])
+def test_balanced_glm_boundary_capacity_includes_private_endpoints(
+    monkeypatch, with_tail, chunk_budget, private_bundles
+):
+    """The GLM slot-sharing layout still reserves distinct endpoint block IDs."""
+    config = VllmConfig(model_config=ModelConfig(max_model_len=8192))
+    config.scheduler_config.max_num_scheduled_tokens = chunk_budget
+    specs = (
+        _glm5_like_kv_cache_spec_with_tail()
+        if with_tail
+        else _glm5_like_kv_cache_spec()[0]
+    )
+    groups = get_kv_cache_groups(config, specs)
+    assert kv_cache_utils._glm5_next_tensor_layout(groups) is not None
+    block_bytes = kv_cache_utils._pool_bytes_per_block(groups)
+    live_bytes = kv_cache_utils._max_memory_usage_bytes_from_groups(config, groups)
+    live_blocks = live_bytes // block_bytes
+    private_blocks = private_bundles * (len(groups) + 1)
+    monkeypatch.setattr(
+        VllmConfig, "use_request_boundary_checkpoints", property(lambda self: True)
+    )
+
+    required = (live_blocks + private_blocks) * block_bytes
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(config, groups) == required
+    )
+    assert (
+        kv_cache_utils._get_kv_cache_group_allocation_cost(config, groups) == required
+    )
+    pool = kv_cache_utils.get_kv_cache_config_from_groups(config, groups, required)
+    assert get_max_concurrency_for_kv_cache_config(config, pool) == 1
+    assert (
+        kv_cache_utils._estimate_max_model_len_from_groups(config, groups, live_bytes)
+        < config.model_config.max_model_len
+    )
+
+
 def test_glm5_kpool_tail_does_not_drag_hash_block_size():
     """The tail's kpool-sized scratch block (4 tokens) must not constrain the
     prefix-cache hash granularity: participating groups alone decide it."""
@@ -3243,6 +3281,7 @@ def test_glm5next_split_cache_preserves_physical_pages(
 
 def _glm5next_split_config() -> SimpleNamespace:
     return SimpleNamespace(
+        use_request_boundary_checkpoints=False,
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
         speculative_config=None,
         model_config=SimpleNamespace(max_model_len=202_752),
@@ -3380,6 +3419,7 @@ def test_glm5next_nvfp4_auto_geometry_capacity() -> None:
         prefix_cache_retention_interval=4096,
     )
     vllm_config = SimpleNamespace(
+        use_request_boundary_checkpoints=False,
         model_config=SimpleNamespace(max_model_len=202_752),
         parallel_config=SimpleNamespace(decode_context_parallel_size=4),
         cache_config=SimpleNamespace(mamba_cache_mode="align"),
@@ -4236,6 +4276,79 @@ def test_auto_fit_max_model_len_with_hybrid():
         vllm_config, [kv_cache_specs], [available_memory]
     )
     assert vllm_config.model_config.max_model_len == 1024
+
+
+@pytest.mark.parametrize("dcp", [1, 2, 4])
+@pytest.mark.parametrize(
+    "num_blocks,expected_pages,chunk_budget",
+    [(38, 0, 1048576), (62, 0, 1048576), (70, 7, 1048576), (78, 7, 256)],
+)
+def test_boundary_capacity_includes_private_endpoints(
+    dcp, num_blocks, expected_pages, chunk_budget
+):
+    """Pool sizing includes private endpoints and the immutable restore source."""
+    config = SimpleNamespace(
+        use_request_boundary_checkpoints=True,
+        scheduler_config=SimpleNamespace(max_num_scheduled_tokens=chunk_budget),
+        attention_config=SimpleNamespace(hisparse_config=None),
+        model_config=SimpleNamespace(max_model_len=1048576),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp),
+        cache_config=SimpleNamespace(mamba_cache_mode="align"),
+    )
+    attention = MLAAttentionSpec(
+        block_size=2048,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.uint8,
+        model_version="glm5_next",
+    )
+    state = MambaSpec(
+        block_size=2048,
+        shapes=((1,),),
+        dtypes=(torch.uint8,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=3,
+    )
+    groups = [KVCacheGroupSpec([f"state-{i}"], state) for i in range(6)]
+    groups.append(KVCacheGroupSpec(["attention"], attention))
+    block_bytes = kv_cache_utils._pool_bytes_per_block(groups)
+    # Six groups require five live/scratch states each. Three semantic endpoints
+    # and a restore source own eight blocks each; enabling the prefill-tail
+    # endpoint costs another eight. The null block is unavailable.
+    available = (num_blocks - 1) * block_bytes
+    estimate = kv_cache_utils._estimate_max_model_len_from_groups(
+        config, groups, available
+    )
+    assert estimate == expected_pages * 2048 * dcp
+    assert config.model_config.max_model_len == 1048576
+
+    if expected_pages == 0:
+        with pytest.raises(ValueError, match="even a single token"):
+            kv_cache_utils._auto_fit_max_model_len(config, [groups], [available])
+    else:
+        kv_cache_utils._auto_fit_max_model_len(config, [groups], [available])
+        assert config.model_config.max_model_len == estimate
+        assert kv_cache_utils._max_memory_usage_bytes_from_groups(config, groups) == (
+            available
+        )
+        assert kv_cache_utils._get_kv_cache_group_allocation_cost(config, groups) == (
+            available
+        )
+        cache = KVCacheConfig(
+            num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=groups
+        )
+        assert get_max_concurrency_for_kv_cache_config(config, cache) == (
+            num_blocks / (30 + (40 if chunk_budget == 256 else 32) + expected_pages)
+        )
+
+    # An aligned-policy control has no endpoint reservation. Its capacity
+    # calculation must keep the ordinary live-state contract.
+    config.use_request_boundary_checkpoints = False
+    config.model_config.max_model_len = 1048576
+    control = kv_cache_utils._estimate_max_model_len_from_groups(
+        config, groups, available
+    )
+    assert control == (num_blocks - 1 - 30) * 2048 * dcp
 
 
 def test_auto_fit_max_model_len_not_triggered():

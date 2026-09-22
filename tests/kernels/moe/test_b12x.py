@@ -795,6 +795,60 @@ def test_b12x_nvfp4_layer_max_input_scales_are_independent(
     torch.testing.assert_close(prepared[7], expected_a2_scale)
 
 
+@pytest.mark.parametrize("uniform", [True, False])
+def test_b12x_nvfp4_preparation_preserves_static_scale_contract(
+    monkeypatch: pytest.MonkeyPatch, uniform: bool
+) -> None:
+    """Loaded uniform scales admit shared quantization without losing the vector."""
+    fused_moe = pytest.importorskip("b12x.moe.fused_moe")
+    from b12x.moe.fused_moe._impl import B12XFP4ExpertWeights
+
+    # Keep the real scale-ownership check; only CUDA weight packing is excluded.
+    def prepare_weights(*, plan, weights):
+        return B12XFP4ExpertWeights(
+            plan=plan._impl,
+            a1_gscale=weights.input_scale,
+            a2_gscale=weights.intermediate_scale,
+            w1_fp4=weights.w13,
+            w1_blockscale=weights.w13_block_scales,
+            w1_alphas=weights.w13_global_scales,
+            w2_fp4=weights.w2,
+            w2_blockscale=weights.w2_block_scales,
+            w2_alphas=weights.w2_global_scales,
+            immutable_input_scales=weights.immutable_input_scales,
+        )
+
+    monkeypatch.setattr(fused_moe, "prepare_weights", prepare_weights)
+    monkeypatch.setattr(b12x, "_require_b12x_fused_moe", lambda: fused_moe)
+    monkeypatch.setattr(b12x, "_is_current_stream_capturing", lambda: False)
+    scales = torch.ones(4)
+    if not uniform:
+        scales[-1] = torch.nextafter(scales[-1], torch.tensor(float("inf")))
+    config = make_dummy_moe_config(num_experts=4, hidden_dim=128, intermediate_size=128)
+    quant = FusedMoEQuantConfig.make(
+        "nvfp4",
+        w1_scale=torch.ones(4, 256, 8, dtype=torch.float8_e4m3fn),
+        w2_scale=torch.ones(4, 128, 8, dtype=torch.float8_e4m3fn),
+        g1_alphas=torch.ones(4),
+        g2_alphas=torch.ones(4),
+        a1_gscale=scales,
+        a2_gscale=torch.ones(4),
+    )
+    experts = B12xExperts(config, quant)
+    prepared = experts._prepare_experts(
+        w1=torch.empty(4, 256, 64, dtype=torch.uint8),
+        w2=torch.empty(4, 128, 64, dtype=torch.uint8),
+        activation=MoEActivation.SILU,
+        params_dtype=torch.bfloat16,
+    )
+
+    assert prepared.a1_gscale is scales
+    assert prepared.can_share_input(input_scales_static=True) is uniform
+    assert not prepared.can_share_input(input_scales_static=False)
+    scales[-1] = 2.0
+    assert not prepared.can_share_input(input_scales_static=True)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_b12x_nvfp4_preparation_pads_each_gated_half() -> None:
     device = torch.device("cuda")
