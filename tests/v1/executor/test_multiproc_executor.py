@@ -50,6 +50,46 @@ def test_failed_broadcast_drains_every_reply_before_abort(world):
         assert all(queue.dequeue.call_count == 2 for queue in queues)
 
 
+@pytest.mark.parametrize("release_fails", [False, True])
+def test_resource_release_precedes_worker_termination(release_fails):
+    from unittest.mock import MagicMock
+
+    from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+
+    events = []
+
+    def release(method, timeout):
+        assert method == "shutdown" and timeout == 60
+        events.append("release")
+        if release_fails:
+            raise RuntimeError("release rejected")
+        return [None, None, None]
+
+    workers = [
+        SimpleNamespace(
+            death_writer=MagicMock(close=lambda: events.append("retire")),
+            proc=MagicMock(),
+            worker_response_mq=MagicMock(),
+        )
+        for _ in range(3)
+    ]
+    executor = SimpleNamespace(
+        workers=workers,
+        response_mqs=[MagicMock()] * 3,
+        rpc_broadcast_mq=MagicMock(),
+        is_failed=False,
+        collective_rpc=release,
+        _ensure_worker_termination=lambda _: events.append("terminated"),
+    )
+    if release_fails:
+        with pytest.raises(RuntimeError, match="not acknowledged"):
+            MultiprocExecutor.shutdown(executor)
+    else:
+        MultiprocExecutor.shutdown(executor)
+        MultiprocExecutor.shutdown(executor)
+    assert events == ["release", "retire", "retire", "retire", "terminated"]
+
+
 class _ExitWorkerLoop(RuntimeError):
     pass
 

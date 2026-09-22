@@ -1722,6 +1722,8 @@ class Worker(WorkerBase):
             self.model_runner.reset_lora_state()
 
     def shutdown(self) -> None:
+        if getattr(self, "_resources_released", False):
+            return
         self._record_b12x_lifecycle("before_worker_shutdown")
         gc.unfreeze()
 
@@ -1771,6 +1773,7 @@ class Worker(WorkerBase):
             # explicit shutdown acknowledgement, not during process finalization.
             torch.accelerator.empty_host_cache()
         self._record_b12x_lifecycle("after_worker_shutdown")
+        self._resources_released = True
 
     def _record_b12x_lifecycle(self, stage: str) -> None:
         path = os.environ.get("B12X_LIFECYCLE_OUTPUT")

@@ -514,6 +514,20 @@ class MultiprocExecutor(Executor):
             )
             self.shutting_down = True
 
+            release_error = None
+            if (
+                getattr(self, "response_mqs", None)
+                and getattr(self, "rpc_broadcast_mq", None) is not None
+                and not getattr(self, "is_failed", False)
+            ):
+                try:
+                    # Retire graphs, streams and mapped owners while the RPC
+                    # channel is alive. Process termination is not a resource
+                    # release acknowledgement, especially for large host maps.
+                    self.collective_rpc("shutdown", timeout=60)
+                except Exception as error:
+                    release_error = error
+
             # Make sure all the worker processes are terminated first.
             if workers := getattr(self, "workers", None):
                 for w in workers:
@@ -529,6 +543,10 @@ class MultiprocExecutor(Executor):
                         w.worker_response_mq.shutdown()
                         w.worker_response_mq = None
 
+            if release_error is not None:
+                logger.error("Worker resource release failed: %s", release_error)
+                self._worker_release_error = release_error
+
         if rpc_broadcast_mq := getattr(self, "rpc_broadcast_mq", None):
             rpc_broadcast_mq.shutdown()
             self.rpc_broadcast_mq = None
@@ -538,6 +556,10 @@ class MultiprocExecutor(Executor):
             self.response_mqs = []
 
         logger.debug_once("[shutdown] Executor: complete")
+        if release_failure := getattr(self, "_worker_release_error", None):
+            raise RuntimeError(
+                "worker resource release was not acknowledged"
+            ) from release_failure
 
     def check_health(self) -> None:
         self.collective_rpc("check_health", timeout=10)
