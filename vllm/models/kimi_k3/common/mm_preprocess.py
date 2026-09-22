@@ -4,6 +4,7 @@
 
 import math
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from typing import Any, cast
 
 import torch
@@ -30,8 +31,66 @@ from vllm.multimodal.processing import (
 from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.processor import cached_get_image_processor
 from vllm.transformers_utils.processors.kimi_k3 import KimiK3Processor
+from vllm.transformers_utils.processors.kimi_k25_vision_fused import (
+    KimiK25FusedVisionProcessor,
+)
+from vllm.utils.import_utils import is_numba_available
 
 logger = init_logger(__name__)
+
+
+_PATCH_LIMIT_KEYS = ("in_patch_limit", "patch_limit_on_one_side")
+
+
+def _apply_image_patch_limits(
+    image_processor: Any,
+    processor_kwargs: Mapping[str, object],
+) -> Any:
+    """Apply deployment-wide image limits without mutating the cached processor.
+
+    Both startup profiling and request processing must use the same limits.
+    Overrides can restrict, but cannot enlarge, checkpoint geometry.
+    """
+    overrides = {
+        key: processor_kwargs[key]
+        for key in _PATCH_LIMIT_KEYS
+        if key in processor_kwargs
+    }
+    if not overrides:
+        return image_processor
+
+    media_proc_cfg = getattr(image_processor, "media_proc_cfg", None)
+    if not isinstance(media_proc_cfg, Mapping):
+        raise ValueError(
+            "Kimi-K3 image patch limits require an image processor with "
+            "a media_proc_cfg mapping"
+        )
+
+    bounded_cfg = dict(media_proc_cfg)
+    for key, value in overrides.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"Kimi-K3 {key} must be a positive integer")
+        checkpoint_limit = bounded_cfg.get(key)
+        if not isinstance(checkpoint_limit, int) or checkpoint_limit <= 0:
+            raise ValueError(
+                f"Kimi-K3 checkpoint does not define a positive {key} limit"
+            )
+        if value > checkpoint_limit:
+            raise ValueError(
+                f"Kimi-K3 {key}={value} exceeds the checkpoint limit "
+                f"of {checkpoint_limit}"
+            )
+        bounded_cfg[key] = value
+
+    bounded_processor = deepcopy(image_processor)
+    bounded_processor.media_proc_cfg = bounded_cfg
+    logger.info(
+        "Kimi-K3 image processing limits: in_patch_limit=%d, "
+        "patch_limit_on_one_side=%d",
+        bounded_cfg["in_patch_limit"],
+        bounded_cfg["patch_limit_on_one_side"],
+    )
+    return bounded_processor
 
 
 def navit_resize_image(
@@ -102,10 +161,20 @@ class KimiK3ProcessingInfo(BaseProcessingInfo):
         self.hf_config = hf_config = self.get_hf_config()
 
         tokenizer = self.get_tokenizer()
+        processor_cls = KimiK25FusedVisionProcessor if is_numba_available() else None
+        logger.info_once(
+            "Using %s image preprocessing for Kimi-K3 images.",
+            "fused CPU" if processor_cls is not None else "remote HF",
+        )
         image_processor = cached_get_image_processor(
             self.ctx.model_config.model,
             revision=self.ctx.model_config.revision,
             trust_remote_code=self.ctx.model_config.trust_remote_code,
+            processor_cls_overrides=processor_cls,
+        )
+        mm_config = self.ctx.model_config.get_multimodal_config()
+        image_processor = _apply_image_patch_limits(
+            image_processor, mm_config.mm_processor_kwargs or {}
         )
 
         # Resolve token ID from the tokenizer because transformers v5

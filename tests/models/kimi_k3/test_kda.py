@@ -68,6 +68,20 @@ PACKED_DECODE_IMPLS = {
 }
 
 
+@pytest.mark.parametrize("padding", [0, 10])
+def test_kda_declares_checkpoint_omitted_projection_padding(padding):
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(torch.ones(3216, 32), requires_grad=False)
+    nvidia_kda.initialize_kda_input_projection_padding(layer, padding, 32)
+    if padding:
+        assert layer._vllm_online_processing_unloaded == {"weight": padding * 32}
+        assert torch.count_nonzero(layer.weight[-padding:]) == 0
+        assert torch.all(layer.weight[:-padding] == 1)
+    else:
+        assert not hasattr(layer, "_vllm_online_processing_unloaded")
+        assert torch.all(layer.weight == 1)
+
+
 def test_kda_warmup_skips_missing_metadata(monkeypatch):
     monkeypatch.setattr(
         nvidia_kda,

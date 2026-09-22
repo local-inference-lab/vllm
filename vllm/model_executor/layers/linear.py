@@ -1608,9 +1608,9 @@ class KimiK3MergedQKVGateLinear(MergedColumnParallelLinear):
     linear layer. It lives here alongside ``MergedColumnParallelLinear``, whose
     sharding and weight-loading machinery it reuses.
 
-    The per-rank shard layout is ``[q_a | kv_a | gate]``. The latent shards
-    stay replicated across tensor-parallel ranks while the gate shard is
-    tensor-parallel, matching the standalone projections they replace.
+    The per-rank shard layout is ``[q_a | kv_a | gate]``. Latent weights are
+    replicated unless ``shard_latents`` is enabled. Sharded latent results
+    are gathered in logical Q/KV order; the gate remains rank-local.
     """
 
     def __init__(
@@ -1624,14 +1624,18 @@ class KimiK3MergedQKVGateLinear(MergedColumnParallelLinear):
         bias: bool = False,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        shard_latents: bool = False,
     ) -> None:
         tp_size = get_tensor_model_parallel_world_size()
+        self.shard_latents = shard_latents and tp_size > 1
+        self.latent_output_sizes = [q_lora_rank, kv_lora_rank + qk_rope_head_dim]
 
         # MergedColumnParallelLinear divides every logical shard by TP size.
         # Inflate the replicated latent shards to retain their checkpoint widths.
+        replication = 1 if self.shard_latents else tp_size
         output_sizes = [
-            q_lora_rank * tp_size,
-            (kv_lora_rank + qk_rope_head_dim) * tp_size,
+            q_lora_rank * replication,
+            (kv_lora_rank + qk_rope_head_dim) * replication,
             total_num_heads * v_head_dim,
         ]
         super().__init__(
@@ -1641,6 +1645,26 @@ class KimiK3MergedQKVGateLinear(MergedColumnParallelLinear):
             quant_config=quant_config,
             prefix=prefix,
         )
+        self._latent_transport = None
+        config = get_current_vllm_config_or_none()
+        if (
+            self.shard_latents
+            and envs.VLLM_USE_B12X_DCP_A2A
+            and config is not None
+            and config.model_config.dtype == torch.bfloat16
+            and not config.parallel_config.use_ubatching
+        ):
+            from vllm.distributed import get_tp_group
+            from vllm.distributed.device_communicators.b12x_dcp import (
+                get_b12x_kimi_projection_transport,
+            )
+
+            width = sum(self.latent_output_sizes) // tp_size
+            self._latent_transport = get_b12x_kimi_projection_transport(
+                get_tp_group(),
+                next(self.parameters()).device,
+                latent_width=(width + 7) // 8 * 8,
+            )
 
     def _load_with_replicated_latents(
         self,
@@ -1649,7 +1673,11 @@ class KimiK3MergedQKVGateLinear(MergedColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: tuple[int, ...] | int | None,
     ) -> None:
-        is_replicated = isinstance(loaded_shard_id, int) and loaded_shard_id < 2
+        is_replicated = (
+            not self.shard_latents
+            and isinstance(loaded_shard_id, int)
+            and loaded_shard_id < 2
+        )
         if not is_replicated:
             loader(param, loaded_weight, loaded_shard_id)
             return
@@ -1687,6 +1715,31 @@ class KimiK3MergedQKVGateLinear(MergedColumnParallelLinear):
         self._load_with_replicated_latents(
             super().weight_loader_v2, param, loaded_weight, loaded_shard_id
         )
+
+    def forward(self, x: torch.Tensor):
+        output, bias = super().forward(x)
+        if not self.shard_latents:
+            return output, bias
+        local_sizes = [size // self.tp_size for size in self.latent_output_sizes]
+        latent_rows = sum(local_sizes)
+        local_latents = output[..., :latent_rows].contiguous()
+        if self._latent_transport is not None and 0 < x.shape[0] <= 8:
+            transport = self._latent_transport
+            query = (
+                torch.nn.functional.pad(
+                    local_latents, (0, transport.query_dim - latent_rows)
+                )
+                if transport.query_dim != latent_rows
+                else local_latents
+            )
+            rank_major = transport.gather(query.unsqueeze(1))[..., :latent_rows]
+        else:
+            gathered = tensor_model_parallel_all_gather(local_latents, dim=-1)
+            rank_major = gathered.unflatten(-1, (self.tp_size, latent_rows))
+        query, kv = rank_major.split(local_sizes, dim=-1)
+        return torch.cat(
+            [query.flatten(-2), kv.flatten(-2), output[..., latent_rows:]], dim=-1
+        ), bias
 
 
 # --8<-- [start:row_parallel_linear]

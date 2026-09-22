@@ -14,6 +14,7 @@ from vllm.distributed import (
     get_pcp_group,
     tensor_model_parallel_all_reduce,
 )
+from vllm.distributed.communication_op import tensor_model_parallel_all_reduce_in_place
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import (
     ForwardContext,
@@ -490,6 +491,8 @@ class MoERunner(MoERunnerInterface):
         states: torch.Tensor,
         trunc_size: int | None,
         output_is_reduced: bool | None = None,
+        *,
+        in_place: bool = False,
     ) -> torch.Tensor:
         """All-reduce the combined output if needed.
 
@@ -522,7 +525,11 @@ class MoERunner(MoERunnerInterface):
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not output_is_reduced
         ):
-            states = tensor_model_parallel_all_reduce(states)
+            states = (
+                tensor_model_parallel_all_reduce_in_place(states)
+                if in_place
+                else tensor_model_parallel_all_reduce(states)
+            )
 
         return states[..., :trunc_size] if trunc_size is not None else states
 
@@ -809,27 +816,70 @@ class MoERunner(MoERunnerInterface):
             )
         )
 
-        # If routed output is already reduced, reduce shared to match.
+        # A sharded output transform turns the reduced latent into partial
+        # hidden states. Keep shared output partial for their final joint sum.
+        output_transform_is_tp_partial = bool(
+            self.routed_output_transform is not None
+            and getattr(self.routed_output_transform, "output_is_tp_partial", False)
+        )
+        # If routed output stays reduced, reduce shared to match.
         # See note above re: the two all-reduce points.
         shared_output = self._maybe_reduce_shared_expert_output(
-            shared_output, fused_output_is_reduced
+            shared_output,
+            fused_output_is_reduced and not output_transform_is_tp_partial,
         )
 
         shared_output, fused_output = self._maybe_apply_routed_scale_to_output(
             shared_output, fused_output
         )
 
-        # Apply output transform (e.g. latent -> full dim)
-        fused_output = self.apply_routed_output_transform(fused_output)
+        # Shared experts have finished reading their input. A model-declared
+        # prefill transform may reuse that consumed buffer outside the opaque
+        # MoE custom op, preserving the op's non-aliasing return contract.
+        can_write_output = getattr(
+            self.routed_output_transform, "can_write_output", None
+        )
+        reuse_output = bool(
+            shared_experts_input is not None
+            and not self.moe_config.is_sequence_parallel
+            and can_write_output is not None
+            and can_write_output(fused_output, shared_experts_input)
+            and (
+                shared_output is None
+                or shared_output.untyped_storage().data_ptr()
+                != shared_experts_input.untyped_storage().data_ptr()
+            )
+        )
+        if reuse_output:
+            fused_output = self.routed_output_transform(
+                fused_output,
+                output=shared_experts_input,
+            )
+        else:
+            fused_output = self.apply_routed_output_transform(fused_output)
+        if output_transform_is_tp_partial:
+            fused_output_is_reduced = False
 
         if shared_output is not None:
-            result = shared_output + fused_output
+            result = (
+                fused_output.add_(shared_output)
+                if reuse_output
+                else shared_output + fused_output
+            )
         else:
             result = fused_output
 
-        result = self._maybe_reduce_final_output(
-            result, og_hidden_dim_post_xform, fused_output_is_reduced
-        )
+        if reuse_output:
+            result = self._maybe_reduce_final_output(
+                result,
+                og_hidden_dim_post_xform,
+                fused_output_is_reduced,
+                in_place=True,
+            )
+        else:
+            result = self._maybe_reduce_final_output(
+                result, og_hidden_dim_post_xform, fused_output_is_reduced
+            )
 
         return self._maybe_add_zero_expert_output(result)
 
