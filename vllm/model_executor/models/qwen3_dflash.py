@@ -62,6 +62,17 @@ logger = init_logger(__name__)
 _SLIDING_ATTENTION = "sliding_attention"
 
 
+def _is_mxfp8_linear(method) -> bool:
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptLinearMethod,
+        kMxfp8Static,
+    )
+
+    return (
+        isinstance(method, ModelOptLinearMethod) and method.spec.weight == kMxfp8Static
+    )
+
+
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
     """Resolve explicit causality before falling back to legacy layer defaults."""
     is_causal = getattr(config, "is_causal", None)
@@ -511,14 +522,8 @@ class DFlashQwen3Model(nn.Module):
         layers_attn: list[nn.Module],
         has_bias: bool,
     ) -> None:
-        from vllm.model_executor.layers.quantization.modelopt import (
-            ModelOptMxFp8LinearMethod,
-        )
-
         quant_methods = [a.qkv_proj.quant_method for a in layers_attn]
-        uses_mxfp8 = [
-            isinstance(method, ModelOptMxFp8LinearMethod) for method in quant_methods
-        ]
+        uses_mxfp8 = [_is_mxfp8_linear(method) for method in quant_methods]
         if any(uses_mxfp8) and not all(uses_mxfp8):
             raise ValueError(
                 "Every DFlash attention layer must use the same MXFP8 "
@@ -593,12 +598,8 @@ class DFlashQwen3Model(nn.Module):
 
     def process_weights_after_loading(self) -> None:
         """Pack the serialized MXFP8 context projection for its GEMM backend."""
-        from vllm.model_executor.layers.quantization.modelopt import (
-            ModelOptMxFp8LinearMethod,
-        )
-
         quant_method = self.layers[0].self_attn.qkv_proj.quant_method
-        if not isinstance(quant_method, ModelOptMxFp8LinearMethod):
+        if not _is_mxfp8_linear(quant_method):
             return
         if self._fused_kv_weight is None or self._fused_kv_weight_scale is None:
             raise RuntimeError(
@@ -610,6 +611,9 @@ class DFlashQwen3Model(nn.Module):
         self._fused_kv_linear.input_size_per_partition = input_size
         self._fused_kv_linear.output_size_per_partition = output_size
         self._fused_kv_linear.logical_widths = [output_size]
+        self._fused_kv_linear.output_partition_sizes = [output_size]
+        self._fused_kv_linear.has_bias = self._fused_kv_bias is not None
+        self._fused_kv_linear.weight_block_size = [1, 32]
         self._fused_kv_linear.register_parameter(
             "weight", nn.Parameter(self._fused_kv_weight, requires_grad=False)
         )

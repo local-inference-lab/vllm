@@ -158,7 +158,7 @@ def test_dflash_context_projection_rejects_mixed_quantization(mxfp8_layer: int):
     from torch import nn
 
     from vllm.model_executor.layers.quantization.modelopt import (
-        ModelOptMxFp8LinearMethod,
+        build_linear_method,
     )
     from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
 
@@ -166,7 +166,7 @@ def test_dflash_context_projection_rejects_mixed_quantization(mxfp8_layer: int):
         def __getitem__(self, _key):
             raise AssertionError("weights must not be read before validation")
 
-    mxfp8_method = object.__new__(ModelOptMxFp8LinearMethod)
+    mxfp8_method = build_linear_method(SimpleNamespace(), "MXFP8", "draft")
     methods = [None, None]
     methods[mxfp8_layer] = mxfp8_method
     layers_attn = [
