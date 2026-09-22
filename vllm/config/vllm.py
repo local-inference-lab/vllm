@@ -2384,20 +2384,22 @@ class VllmConfig:
                     # tier's query length and drops it once the implied request
                     # count exceeds max_num_seqs, so at query length 3 sizes
                     # built from 17 stop covering at 227 of 256 requests.
+                    #
+                    # Acceptance-only adaptation has no batch-size schedule.
+                    # Keep the fixed-depth sizes; the graph manager enumerates
+                    # narrower widths and falls back when no graph fits.
                     decode_tiers = [(decode_query_len, max_num_seqs)]
                     speculative_config = self.speculative_config
-                    if (
-                        speculative_config is not None
-                        and speculative_config.uses_dynamic_speculative_decoding()
-                    ):
+                    schedule = (
+                        speculative_config.num_speculative_tokens_per_batch_size
+                        if speculative_config is not None
+                        else None
+                    )
+                    if schedule is not None:
                         from vllm.v1.spec_decode.dynamic.utils import (
                             build_dynamic_sd_schedule_lookup,
                         )
 
-                        schedule = (
-                            speculative_config.num_speculative_tokens_per_batch_size
-                        )
-                        assert schedule is not None
                         # Read the tiers off the dense lookup the scheduler
                         # runs on, so the clamp against num_speculative_tokens
                         # and the carry-forward through gaps and the tail
