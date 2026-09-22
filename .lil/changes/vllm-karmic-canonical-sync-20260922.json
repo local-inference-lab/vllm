@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-karmic-canonical-sync-20260922",
+  "category": "compatibility",
+  "summary": "Carry canonical Qwen tensor-parallel preparation and Spark launch contracts into beta",
+  "models": ["Qwen3.8-Flash-Next", "DeepSeek-V4-Flash", "DeepSeek-V4.1-Flash", "GLM-5.3-Flash"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Distribute eligible Qwen residual-mixing projections across tensor-parallel ranks.",
+    "Preserve per-head GDN normalization geometry during warmup and use the declared B12X QSA capacity API.",
+    "Retain canonical Spark switched-RoCE and DeepSeek TP3 launcher settings."
+  ],
+  "authors": ["lukealonso"],
+  "requires": []
+}
