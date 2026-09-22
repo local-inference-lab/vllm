@@ -227,7 +227,7 @@ def test_kda_recoverssm_derivation_is_revalidated():
     config.cache_config.mamba_cache_mode = "none"
 
     config.model_config.architecture = "NemotronHForCausalLM"
-    with pytest.raises(ValueError, match="only supported for Kimi-K3 KDA"):
+    with pytest.raises(ValueError, match="only supported for Kimi-K3 and GLM-5.3 KDA"):
         VllmConfig.validate_mamba_cached_kernel(config)
 
     config.model_config.architecture = "KimiLinearForCausalLM"

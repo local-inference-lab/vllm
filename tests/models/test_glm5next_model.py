@@ -2416,6 +2416,7 @@ def test_b12x_kda_shares_counts_but_preserves_each_layers_state_indices(
         layer.dt_bias = torch.ones(1)
         layer.o_norm = SimpleNamespace(eps=1e-6, weight=torch.ones(1))
         layer.kv_cache = [None, torch.empty(32, 1, 1, 1)]
+        layer.cache_config = SimpleNamespace(use_kda_recoverssm=False)
         return layer
 
     layers = [make_layer(), make_layer()]
@@ -2473,6 +2474,77 @@ def test_b12x_kda_shares_counts_but_preserves_each_layers_state_indices(
     assert layers[0]._b12x_kda_num_tokens.item() == 2
     assert layers[1]._b12x_kda_num_seqs.item() == 0
     assert layers[1]._b12x_kda_num_tokens.item() == 0
+
+
+def test_b12x_kda_decode_keeps_overlapping_gate_read_only(monkeypatch) -> None:
+    gate = torch.arange(2, dtype=torch.float32).view(2, 1, 1)
+    original_gate = gate.clone()
+    bound_outputs: list[torch.Tensor] = []
+
+    class FakeApi:
+        @staticmethod
+        def bind_kda(plan, **kwargs):
+            output = kwargs["output"]
+            bound_outputs.append(output)
+            if output.untyped_storage().data_ptr() == gate.untyped_storage().data_ptr():
+                raise ValueError(
+                    "mutable buffer output must not overlap read-only tensor raw_g"
+                )
+            return SimpleNamespace(**kwargs)
+
+        @staticmethod
+        def run_kda(binding, **kwargs):
+            torch.testing.assert_close(binding.raw_g, original_gate)
+            binding.output.fill_(7)
+
+    monkeypatch.setattr(
+        kimi_gdn_linear_attn,
+        "get_forward_context",
+        lambda: SimpleNamespace(additional_kwargs={}),
+    )
+    layer = KimiGatedDeltaNetAttention.__new__(KimiGatedDeltaNetAttention)
+    torch.nn.Module.__init__(layer)
+    layer._b12x_kda_api = FakeApi()
+    layer._b12x_kda_plan = SimpleNamespace(
+        caps=SimpleNamespace(max_state_slots=2),
+        scratch_specs=lambda: (),
+    )
+    layer._b12x_kda_num_accepted_tokens = torch.zeros(1, dtype=torch.int32)
+    layer._b12x_kda_num_seqs = torch.zeros(1, dtype=torch.int32)
+    layer._b12x_kda_num_tokens = torch.zeros(1, dtype=torch.int32)
+    layer._b12x_kda_max_tokens = 2
+    layer._b12x_kda_max_seqs = 1
+    layer._b12x_kda_state_index_columns = 2
+    layer.gate_lower_bound = -5.0
+    layer.local_num_heads = 1
+    layer.head_dim = 1
+    layer.A_log = torch.ones(1)
+    layer.dt_bias = torch.ones(1)
+    layer.o_norm = SimpleNamespace(eps=1e-6, weight=torch.ones(1))
+    layer.kv_cache = [None, torch.empty(2, 1, 1, 1)]
+    layer.cache_config = SimpleNamespace(use_kda_recoverssm=False)
+    monkeypatch.setattr(layer, "_get_b12x_kda_workspace", lambda: torch.empty(1))
+
+    layer._run_b12x_kda_decode_post_conv(
+        metadata=SimpleNamespace(is_uniform_spec_decode=False),
+        mixed_qkv=torch.zeros(2, 3),
+        raw_g=gate,
+        raw_beta=torch.zeros(2, 1),
+        z=torch.zeros(2, 1, 1),
+        output=gate,
+        state_indices=torch.zeros(1, 2, dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        num_accepted_tokens=None,
+        num_requests=1,
+    )
+
+    assert len(bound_outputs) == 2
+    assert bound_outputs[0] is gate
+    assert (
+        bound_outputs[1].untyped_storage().data_ptr()
+        != gate.untyped_storage().data_ptr()
+    )
+    assert torch.equal(gate, torch.full_like(gate, 7))
 
 
 @pytest.mark.parametrize("is_mtp_layer", [False, True])

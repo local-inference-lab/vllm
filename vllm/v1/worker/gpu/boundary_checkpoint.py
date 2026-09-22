@@ -680,7 +680,13 @@ class BoundaryCheckpointState:
                         slot, checkpoint.num_tokens - 1
                     )
 
-    def capture_mamba(self, idx_mapping: torch.Tensor, capture: torch.Tensor) -> None:
+    def capture_mamba(
+        self,
+        idx_mapping: torch.Tensor,
+        capture: torch.Tensor,
+        *,
+        accepted_state_committed: bool = False,
+    ) -> None:
         state = self.model_state
         if state._mamba_ctx is not None:
             state._mamba_ctx.checkpoint_request_boundaries(
@@ -689,6 +695,7 @@ class BoundaryCheckpointState:
                 capture[0],
                 capture[1],
                 self.mamba_blocks,
+                accepted_state_committed=accepted_state_committed,
             )
 
     def capture_auxiliary(

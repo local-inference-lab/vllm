@@ -313,6 +313,7 @@ class KimiK3KDAMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
 
 class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
     supports_update_block_table = False
+    supports_kda_state_recovery = True
     mamba_aligned_state_indices: torch.Tensor | None = None
 
     def __init__(
