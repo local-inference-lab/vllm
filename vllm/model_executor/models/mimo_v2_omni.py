@@ -240,7 +240,7 @@ class MiMoVisionAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor,
     ) -> torch.Tensor:
-        """Window attention with per-head null logits in the softmax denominator."""
+        """Window attention with per-head bias on the first key of each chunk."""
         from vllm.v1.attention.ops.triton_prefill_attention import (
             context_attention_fwd,
         )
@@ -266,6 +266,7 @@ class MiMoVisionAttention(nn.Module):
             sliding_window_q=w,
             sliding_window_k=w,
             sinks=sinks,
+            sinks_bias_key0=True,
         )
         return output
 

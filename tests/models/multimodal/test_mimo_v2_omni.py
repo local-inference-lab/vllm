@@ -18,9 +18,9 @@ from vllm.utils.network_utils import get_open_port
 EMBED_DIM = 256
 NUM_HEADS = 4
 HEAD_DIM = 64
-WINDOW = 8
-# One sequence shorter than the window, one longer.
-SEQ_LENS = [5, 37]
+WINDOW = 64
+# Retain a short chunk and cross multiple 128-token Triton tiles.
+SEQ_LENS = [5, 300]
 
 
 @pytest.mark.skip_global_cleanup
@@ -60,7 +60,12 @@ def vision_attn_env():
 
 
 def _reference(q, k, v, cu_seqlens, sinks, scale):
-    """Dense windowed softmax with an extra zero-valued sink per head."""
+    """Checkpoint vision attention: bias key 0, retaining its value contribution.
+
+    XiaomiMiMo/MiMo-V2.6-Flash-RL, revision
+    3b38d063180c3e4aed9691fdc735f3d10b266ee4,
+    modeling_mimo_v2.py:716-721 (sink_bias[..., 0] before SDPA).
+    """
     groups = q.shape[1] // k.shape[1]
     out = torch.empty_like(q, dtype=torch.float32)
     for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
@@ -70,16 +75,47 @@ def _reference(q, k, v, cu_seqlens, sinks, scale):
         scores = torch.einsum("qhd,khd->hqk", qs, ks) * scale
         pos = torch.arange(end - start, device=q.device)
         outside = (pos.view(-1, 1) - pos.view(1, -1)).abs() > WINDOW
+        scores[..., 0] += sinks.float().view(-1, 1)
         scores.masked_fill_(outside, -torch.inf)
-        sink_logits = sinks.float().view(-1, 1, 1).expand(-1, end - start, 1)
-        probabilities = torch.cat((scores, sink_logits), dim=-1).softmax(-1)[..., :-1]
+        probabilities = scores.softmax(-1)
         out[start:end] = torch.einsum("hqk,khd->qhd", probabilities, vs)
     return out
 
 
+@pytest.mark.parametrize("num_kv_heads", [NUM_HEADS, NUM_HEADS // 2])
+def test_window_sink_reference_preserves_key_zero_value(num_kv_heads):
+    # Zero Q/K gives unit weights except key 0, whose weight is exp(sink).
+    # A singleton must return its value regardless of sink. The second chunk
+    # also checks that the bias starts afresh and cannot unmask a distant key.
+    lengths = [1, WINDOW + 3]
+    total = sum(lengths)
+    q = torch.zeros(total, NUM_HEADS, HEAD_DIM)
+    k = torch.zeros(total, num_kv_heads, HEAD_DIM)
+    v = torch.ones_like(k)
+    v[0] = 7
+    v[1] = 3
+    weights = torch.tensor([3.0, 1 / 3, 1.0, 2.0])
+    cu_seqlens = torch.tensor([0, 1, total], dtype=torch.int32)
+
+    out = _reference(q, k, v, cu_seqlens, weights.log(), HEAD_DIM**-0.5)
+
+    torch.testing.assert_close(out[0], torch.full_like(out[0], 7))
+    for row in range(lengths[1]):
+        left = max(0, row - WINDOW)
+        right = min(lengths[1], row + WINDOW + 1)
+        count = right - left
+        expected = (
+            (count - 1 + 3 * weights) / (count - 1 + weights)
+            if left == 0
+            else torch.ones_like(weights)
+        )
+        torch.testing.assert_close(out[1 + row], expected[:, None].expand_as(out[0]))
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="requires flash-attn")
 @pytest.mark.parametrize("num_kv_heads", [NUM_HEADS, NUM_HEADS // 2])
-def test_window_attention_applies_sinks(vision_attn_env, num_kv_heads):
+@pytest.mark.parametrize("tp_rank", [0, 1])
+def test_window_attention_applies_sinks(vision_attn_env, num_kv_heads, tp_rank):
     from vllm.model_executor.models.mimo_v2_omni import MiMoVisionAttention
 
     torch.manual_seed(0)
@@ -93,6 +129,14 @@ def test_window_attention_applies_sinks(vision_attn_env, num_kv_heads):
         visual_token_window_size=WINDOW,
     ).cuda()
     attn.sinks.data.normal_()
+    local_sinks = attn.sinks.detach().clone()
+    if tp_rank:
+        # Exercise rank-local slicing without starting another distributed rank.
+        other_sinks = torch.tensor(
+            [8, -8, 6, -6], device="cuda", dtype=local_sinks.dtype
+        )
+        attn.sinks = torch.nn.Parameter(torch.cat((other_sinks, local_sinks)))
+    attn.tp_rank = tp_rank
 
     total = sum(SEQ_LENS)
     opts = dict(device="cuda", dtype=torch.bfloat16)
@@ -106,9 +150,9 @@ def test_window_attention_applies_sinks(vision_attn_env, num_kv_heads):
     )
 
     out = attn._forward_window_attn(q, k, v, cu_seqlens, max(SEQ_LENS))
-    ref = _reference(q, k, v, cu_seqlens, attn.sinks, attn.scale)
+    ref = _reference(q, k, v, cu_seqlens, local_sinks, attn.scale)
 
-    # bf16 attention lands at ~2e-3 here; dropping the sinks lands at ~1e-1.
+    # Compare with FP32 attention on the same quantized inputs.
     error = ((out.float() - ref).norm() / ref.norm()).item()
     assert error < 1e-2, f"sink-corrected output is off by {error:.2e}"
 
