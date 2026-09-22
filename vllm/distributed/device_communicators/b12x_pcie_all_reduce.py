@@ -501,7 +501,10 @@ class B12xPcieAllReduce:
             ):
                 return "dma"
         elif invocation.operation == "all_reduce_fused_add_rms_norm":
-            if nbytes <= self.fused_max_bytes:
+            if (
+                nbytes <= self.fused_max_bytes
+                and getattr(self._runtime, "algorithm", "oneshot") == "oneshot"
+            ):
                 return "oneshot_fused"
         # The enclosing CUDA communicator retains its existing backend dispatch
         # for sizes this transport does not accept. They are not native obligations.
@@ -568,6 +571,7 @@ class B12xPcieAllReduce:
         from b12x.comm.pcie import (
             _dma_preparation,
             _oneshot_preparation,
+            _owner_preparation,
             _twoshot_preparation,
         )
         from b12x.preparation import CollectiveRequirement
@@ -605,10 +609,28 @@ class B12xPcieAllReduce:
                 continue
             routes[invocation.name] = route
             assert self._runtime is not None
-            target = self._runtime._prepared_channel_for_stream(
-                None, invocation.channel_id
+            hierarchical = (
+                getattr(self._runtime, "algorithm", "oneshot") == "hierarchical"
             )
-            if route.startswith("oneshot"):
+            if route == "oneshot" and hierarchical:
+                # The public manager chooses hierarchy versus island RS for
+                # this geometry. Its owner plan has no oneshot stream channel.
+                inp = self._request_input(invocation, registered=False)
+                out = torch.empty_like(inp)
+                candidate = self._runtime.plan(inp, out=out)
+                key = (id(self._runtime), candidate.query, None)
+                plan = declarations.setdefault(key, candidate)
+
+                def prepare(state, invocation=invocation):
+                    inp = self._request_input(invocation, registered=False)
+                    inp.fill_(1)
+                    return _owner_preparation.prepared_call(
+                        state, inp=inp, out=torch.empty_like(inp)
+                    )
+            elif route.startswith("oneshot"):
+                target = self._runtime._prepared_channel_for_stream(
+                    None, invocation.channel_id
+                )
                 surface = (
                     "OneshotAllReduce.all_reduce_fused_add_rms_norm"
                     if route == "oneshot_fused"
@@ -755,7 +777,12 @@ class B12xPcieAllReduce:
     @staticmethod
     def _plan_key(operation, shape, dtype, strides, weight=None, epsilon=None):
         norm = None if operation == "all_reduce" else (id(weight), epsilon)
-        return operation, tuple(shape), dtype, tuple(strides), norm
+        # Singleton strides do not affect addresses. Trimmed TP projections
+        # can retain a padded row stride when only one logical row is live.
+        address_strides = tuple(
+            0 if size == 1 else stride for size, stride in zip(shape, strides)
+        )
+        return operation, tuple(shape), dtype, address_strides, norm
 
     def _index_declared_plans(self) -> None:
         index: dict[tuple, object] = {}
@@ -861,6 +888,13 @@ class B12xPcieAllReduce:
         plan = self._plan_for(inp)
         if use_oneshot:
             assert self._runtime is not None
+            if getattr(self._runtime, "algorithm", "oneshot") == "hierarchical":
+                return self._runtime.all_reduce(
+                    inp,
+                    out=torch.empty_like(inp),
+                    stream=self._runtime_stream(),
+                    plan=plan,
+                )
             return self._runtime.all_reduce(
                 inp, stream=self._runtime_stream(), plan=plan
             )
@@ -876,6 +910,7 @@ class B12xPcieAllReduce:
             not self.disabled
             and self._runtime is not None
             and self.fused_max_bytes > 0
+            and getattr(self._runtime, "algorithm", "oneshot") == "oneshot"
             and hasattr(self._runtime, "all_reduce_fused_add_rms_norm")
         )
 

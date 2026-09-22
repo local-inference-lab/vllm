@@ -12,6 +12,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
+import torch
 import torch.distributed as dist
 
 from vllm.v1.executor.abstract import Executor, _aggregate_b12x_progress
@@ -120,6 +121,45 @@ class _Session:
 
 def _batches(autotune=True):
     return [((object(),), autotune)]
+
+
+def test_completed_preparation_reserves_each_request_model_lane(monkeypatch):
+    import vllm.v1.worker.workspace as workspace
+
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    manager = workspace.WorkspaceManager(
+        torch.device("cpu"), num_ubatches=2, num_lanes=2
+    )
+    requests = tuple(
+        SimpleNamespace(
+            name=name,
+            plan=SimpleNamespace(
+                scratch_specs=lambda size=size: (
+                    SimpleNamespace(shape=(size,), dtype=torch.uint8),
+                )
+            ),
+        )
+        for name, size in (("target", 1024), ("draft", 256))
+    )
+    events = []
+    job = _Job(events, [_progress(done=True)])
+    coordinator = B12xPreparationCoordinator(
+        _Session(job, events),
+        [(requests, False)],
+        global_rank=0,
+        world_group=None,
+        process_local_only=True,
+        workspace=manager,
+        request_workspace_lanes={"target": (0,), "draft": (1,)},
+    )
+    outcome = coordinator.advance()
+    assert outcome["done"] and outcome["error"] is None
+    assert [buffer.numel() for buffer in manager._current_workspaces] == [
+        1024,
+        256,
+        1024,
+        256,
+    ]
 
 
 def test_tuning_authorization_selects_once_across_disjoint_rank_shards() -> None:

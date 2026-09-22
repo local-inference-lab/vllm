@@ -305,6 +305,7 @@ class AttentionBackend(ABC):
         use_adaptive_verification: bool = False,
         use_dcp: bool = False,
         use_rswa: bool = False,
+        use_dcp_replicated: bool = False,
     ) -> list[str]:
         invalid_reasons = []
         if not cls.supports_head_size(head_size):
@@ -353,6 +354,8 @@ class AttentionBackend(ABC):
             invalid_reasons.append("PCP not supported")
         if use_dcp and not cls.supports_dcp():
             invalid_reasons.append("DCP not supported")
+        if use_dcp_replicated and not cls.supports_dcp_replicated:
+            invalid_reasons.append("replicated DCP KV not supported")
         if (
             use_adaptive_verification
             and not cls.supports_device_cpu_query_lens_mismatch()

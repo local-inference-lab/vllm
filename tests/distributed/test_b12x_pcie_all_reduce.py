@@ -44,6 +44,7 @@ def _make_communicator(
     *, allreduce_max_bytes: int = 64, fused_max_bytes: int = 64
 ) -> tuple[B12xPcieAllReduce, MagicMock]:
     runtime = MagicMock()
+    runtime.algorithm = "oneshot"
     runtime.for_stream.return_value.should_allreduce.return_value = True
 
     communicator = object.__new__(B12xPcieAllReduce)
@@ -74,6 +75,26 @@ def _attach_twoshot(
     communicator._twoshot = twoshot
     communicator.twoshot_max_bytes = max_bytes
     return twoshot
+
+
+def test_hierarchical_communicator_preserves_native_owner_plan():
+    communicator, runtime = _make_communicator()
+    runtime.algorithm = "hierarchical"
+    runtime.all_reduce.side_effect = lambda inp, *, out, **kwargs: out
+    inp = torch.zeros(16, dtype=torch.bfloat16)
+    actual = communicator.custom_all_reduce(inp)
+    assert actual is not inp and actual.shape == inp.shape
+    assert runtime.all_reduce.call_args.kwargs["out"] is actual
+    assert not communicator.supports_fused_add_rms_norm()
+    fused = b12x_pcie_all_reduce.B12xPcieInvocation(
+        name="norm",
+        operation="all_reduce_fused_add_rms_norm",
+        shape=(16,),
+        dtype=torch.bfloat16,
+        norm_weight=torch.ones(16, dtype=torch.bfloat16),
+        epsilon=1e-6,
+    )
+    assert communicator._route_invocation(fused) is None
 
 
 @pytest.mark.parametrize(
@@ -332,6 +353,37 @@ def test_dispatch_rejects_missing_exact_preparation() -> None:
         match="no declared plan for",
     ):
         B12xPcieAllReduce._plan_for(communicator, torch.randn(2, 4))
+
+
+@pytest.mark.parametrize("declared_strides", [None, (8, 1)])
+@pytest.mark.parametrize(
+    ("shape", "strides", "accepted"),
+    [
+        ((1, 8), (10, 1), True),
+        ((2, 8), (8, 1), True),
+        ((2, 8), (10, 1), False),
+        ((1, 8), (8, 2), False),
+    ],
+)
+def test_plan_matches_address_layout_not_singleton_stride(
+    declared_strides, shape, strides, accepted
+) -> None:
+    """A trimmed TP output with one row retains its padded row stride."""
+    communicator = _indexed_communicator(
+        [
+            b12x_pcie_all_reduce.B12xPcieInvocation(
+                name="prepared",
+                operation="all_reduce",
+                shape=shape,
+                dtype=torch.bfloat16,
+                strides=declared_strides,
+            )
+        ]
+    )
+    inp = torch.empty_strided(shape, strides, dtype=torch.bfloat16)
+    assert communicator._has_plan_for(inp) is accepted
+    if accepted:
+        assert communicator._plan_for(inp) is communicator._plans["prepared"]
 
 
 def _indexed_communicator(invocations):
@@ -780,6 +832,405 @@ def test_b12x_fused_allreduce_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
         _run_b12x_fused_allreduce_gpu,
         args=(get_open_port(),),
         nprocs=2,
+        join=True,
+    )
+
+
+def _run_b12x_hierarchical_allreduce_gpu(rank: int, port: int) -> None:
+    from b12x.preparation import PreparationSession
+
+    from vllm.model_executor.warmup.b12x_prepare import b12x_batches
+    from vllm.v1.worker.b12x_startup import B12xPreparationCoordinator
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    config = VllmConfig()
+    config.model_config = MagicMock()
+    config.model_config.dtype = torch.bfloat16
+    config.model_config.get_hidden_size.return_value = 7168
+    session = PreparationSession(device=device, autotune=False, compile_workers=1)
+    with ExitStack() as owned, set_current_vllm_config(config):
+        init_test_distributed_environment(16, 1, rank, str(port), local_rank=rank)
+        owned.callback(destroy_distributed_environment)
+        owned.callback(destroy_model_parallel)
+        owned.callback(session.close)
+        communicator = get_tp_group().device_communicator.b12x_ar_comm
+        assert isinstance(communicator, B12xPcieAllReduce)
+        assert communicator._runtime.algorithm == "hierarchical"
+        counts = (1, 2, 4, 16, 257)
+        communicator.register_describer(
+            communicator,
+            lambda workload: tuple(
+                b12x_pcie_all_reduce.B12xPcieInvocation(
+                    name=f"test.hierarchical.rows{rows}",
+                    operation="all_reduce",
+                    shape=(rows, 7168),
+                    dtype=torch.bfloat16,
+                )
+                for rows in counts
+            ),
+        )
+        workload = B12xWorkload(
+            stage="weights",
+            token_counts=counts,
+            fixed_token_counts=(),
+            output_dtype=torch.bfloat16,
+            max_tokens=257,
+            max_seqs=4,
+            max_model_len=32768,
+        )
+        units = communicator.get_b12x_preparation_units(communicator, workload)
+        coordinator = B12xPreparationCoordinator(
+            session,
+            b12x_batches(units),
+            global_rank=rank,
+            world_group=get_world_group(),
+        )
+        while True:
+            outcome = coordinator.advance()
+            if outcome["done"]:
+                assert outcome["error"] is None, outcome["error"]
+                break
+        for rows in counts:
+            inp = torch.full(
+                (rows, 7168), rank + 1, dtype=torch.bfloat16, device=device
+            )
+            eager = communicator.custom_all_reduce(inp)
+            assert eager is not None
+            torch.testing.assert_close(eager, torch.full_like(inp, 136), rtol=0, atol=0)
+            with session.capture(), graph_capture(device=device) as capture_context:
+                graph = torch.cuda.CUDAGraph()
+                owned.callback(graph.reset)
+                with torch.cuda.graph(graph, stream=capture_context.stream):
+                    out = communicator.custom_all_reduce(inp)
+            assert out is not None
+            for step in (1, 2, -1):
+                inp.fill_(rank + 1 + step)
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(
+                    out, torch.full_like(inp, 136 + 16 * step), rtol=0, atol=0
+                )
+
+
+@multi_gpu_test(num_gpus=16)
+def test_b12x_hierarchical_allreduce_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("b12x.comm.pcie")
+    monkeypatch.setenv("VLLM_ENABLE_PCIE_ALLREDUCE", "1")
+    monkeypatch.setenv("VLLM_PCIE_ALLREDUCE_BACKEND", "b12x")
+    monkeypatch.setenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "6MiB")
+    monkeypatch.setenv("B12X_PCIE_ALLREDUCE_ALGORITHM", "island_rs")
+    monkeypatch.setenv("B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION", "1")
+    monkeypatch.setenv("B12X_PCIE_HIERARCHICAL_BF16X2", "1")
+    monkeypatch.setenv("B12X_PCIE_HIERARCHICAL_BF16X2_MAX_ELEMENTS", "7168")
+    torch.multiprocessing.spawn(
+        _run_b12x_hierarchical_allreduce_gpu,
+        args=(get_open_port(),),
+        nprocs=16,
+        join=True,
+    )
+
+
+def _run_b12x_dcp_gpu(rank: int, port: int, world_size: int) -> None:
+    from b12x.preparation import PreparationSession
+
+    from vllm.distributed.device_communicators.b12x_dcp import (
+        get_b12x_dcp_transport,
+        get_b12x_kimi_projection_transport,
+    )
+    from vllm.model_executor.warmup.b12x_prepare import b12x_batches
+    from vllm.v1.worker.b12x_startup import B12xPreparationCoordinator
+
+    device = torch.device(f"cuda:{rank}")
+    heads_per_rank = (96 + world_size - 1) // world_size
+    total_heads = heads_per_rank * world_size
+    torch.cuda.set_device(device)
+    config = VllmConfig()
+    config.model_config = MagicMock()
+    config.model_config.dtype = torch.bfloat16
+    config.model_config.get_hidden_size.return_value = 7168
+    session = PreparationSession(device=device, autotune=False, compile_workers=1)
+    with ExitStack() as owned, set_current_vllm_config(config):
+        init_test_distributed_environment(
+            world_size, 1, rank, str(port), local_rank=rank
+        )
+        owned.callback(destroy_distributed_environment)
+        owned.callback(destroy_model_parallel)
+        owned.callback(session.close)
+        transports = [
+            get_b12x_dcp_transport(
+                get_tp_group(),
+                device,
+                8,
+                heads_per_rank,
+                576,
+                512,
+                dtype,
+                torch.bfloat16,
+            )
+            for dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        ]
+        assert all(transport is not None for transport in transports)
+        projection = get_b12x_kimi_projection_transport(get_tp_group(), device)
+        latent = get_b12x_kimi_projection_transport(
+            get_tp_group(), device, latent_width=136
+        )
+        if world_size in (9, 10, 12):
+            assert projection is not None and projection.returns_logits
+            assert latent is None
+        else:
+            assert projection is not None and latent is not None
+        workload = B12xWorkload(
+            stage="weights",
+            token_counts=(1, 2, 4, 8),
+            fixed_token_counts=(),
+            output_dtype=torch.bfloat16,
+            max_tokens=8,
+            max_seqs=8,
+            max_model_len=32768,
+        )
+        units = tuple(
+            unit
+            for transport in [*transports, projection, latent]
+            if transport is not None
+            for unit in transport.get_b12x_preparation_units(transport, workload)
+        )
+        coordinator = B12xPreparationCoordinator(
+            session,
+            b12x_batches(units),
+            global_rank=rank,
+            world_group=get_world_group(),
+        )
+        while True:
+            outcome = coordinator.advance()
+            if outcome["done"]:
+                assert outcome["error"] is None, outcome["error"]
+                break
+        session.freeze()
+        records = []
+        for transport in transports:
+            for rows in (1, 2, 4, 8):
+                base_e = rows % 3 != 2
+                query = torch.empty(
+                    rows,
+                    transport.num_heads,
+                    576,
+                    dtype=transport.query_dtype,
+                    device=device,
+                )
+                # MLA may supply head-major output with a fixed token capacity.
+                partial = torch.empty(
+                    total_heads,
+                    8,
+                    512,
+                    dtype=torch.bfloat16,
+                    device=device,
+                ).transpose(0, 1)[:rows]
+                lse = torch.empty(rows, total_heads, device=device)
+                with session.capture(), graph_capture(device=device) as capture_context:
+                    graph = torch.cuda.CUDAGraph()
+                    owned.callback(graph.reset)
+                    with torch.cuda.graph(graph, stream=capture_context.stream):
+                        gathered = transport.gather(query)
+                        combined = transport.combine(
+                            partial, lse, is_lse_base_on_e=base_e
+                        )
+                records.append(
+                    (
+                        transport,
+                        rows,
+                        base_e,
+                        query,
+                        partial,
+                        lse,
+                        graph,
+                        gathered,
+                        combined,
+                    )
+                )
+        for step in (1, 2, -1, 3):
+            # Alternate capture sizes and eager execution using changed inputs.
+            for (
+                transport,
+                rows,
+                base_e,
+                query,
+                partial,
+                lse,
+                graph,
+                gathered,
+                combined,
+            ) in reversed(records):
+                gen = torch.Generator().manual_seed(1931 + rows + step)
+                all_queries = torch.randn(
+                    rows,
+                    total_heads,
+                    576,
+                    generator=gen,
+                ).to(device=device, dtype=query.dtype)
+                all_outputs = torch.randn(
+                    world_size,
+                    rows,
+                    total_heads,
+                    512,
+                    generator=gen,
+                ).to(device=device, dtype=torch.bfloat16)
+                all_lses = torch.randn(world_size, rows, total_heads, generator=gen).to(
+                    device
+                )
+                all_lses[:, 0, 0] = -torch.inf
+                all_lses[0, :, 1] = -torch.inf
+                query.copy_(all_queries.chunk(world_size, dim=1)[rank])
+                partial.copy_(all_outputs[rank])
+                lse.copy_(all_lses[rank])
+                natural_lses = all_lses if base_e else all_lses * 0.6931471805599453
+                weights = torch.softmax(natural_lses, dim=0).nan_to_num()
+                expected = (all_outputs.float() * weights[..., None]).sum(0)
+                expected = expected.chunk(world_size, dim=1)[rank].to(torch.bfloat16)
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(
+                    gathered.float(), all_queries.float(), rtol=0, atol=0
+                )
+                torch.testing.assert_close(combined, expected, rtol=0.01, atol=0.01)
+                assert torch.isfinite(combined).all() and combined.abs().sum() > 0
+                eager_query = transport.gather(query)
+                eager_output = transport.combine(partial, lse, is_lse_base_on_e=base_e)
+                torch.testing.assert_close(
+                    eager_query.float(), all_queries.float(), rtol=0, atol=0
+                )
+                torch.testing.assert_close(eager_output, expected, rtol=0.01, atol=0.01)
+
+        if projection.returns_logits:
+            for rows in (1, 3, 8):
+                down = torch.zeros(
+                    rows, projection.down_width, device=device, dtype=torch.bfloat16
+                )
+                logits = torch.zeros(rows, projection.router_width, device=device)
+                with session.capture(), graph_capture(device=device) as capture_context:
+                    graph = torch.cuda.CUDAGraph()
+                    owned.callback(graph.reset)
+                    with torch.cuda.graph(graph, stream=capture_context.stream):
+                        output, payload = projection.gather_projections(
+                            down, logits, None
+                        )
+                for step in range(5):
+                    gen = torch.Generator().manual_seed(4811 + rows + step)
+                    all_down = torch.randn(
+                        rows, world_size * projection.down_width, generator=gen
+                    ).to(down)
+                    all_logits = torch.randn(
+                        rows, world_size * projection.router_width, generator=gen
+                    ).to(logits)
+                    down.copy_(all_down.chunk(world_size, dim=-1)[rank])
+                    logits.copy_(all_logits.chunk(world_size, dim=-1)[rank])
+                    output.fill_(torch.nan)
+                    payload.fill_(torch.nan)
+                    allocated = torch.cuda.memory_allocated()
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    assert torch.cuda.memory_allocated() == allocated
+                    eager = projection.gather_projections(down, logits, None)
+                    for actual_down, actual_logits in ((output, payload), eager):
+                        torch.testing.assert_close(
+                            actual_down, all_down[:, :3584], rtol=0, atol=0
+                        )
+                        torch.testing.assert_close(
+                            actual_logits, all_logits[:, :896], rtol=0, atol=0
+                        )
+                        assert actual_down.is_contiguous()
+                        assert actual_logits.is_contiguous()
+            return
+
+        projection_graphs = []
+        for rows in (1, 2, 8):
+            down = torch.empty(
+                rows, 3584 // world_size, device=device, dtype=torch.bfloat16
+            )
+            logits = torch.empty(rows, 896 // world_size, device=device)
+            bias = torch.zeros(896, device=device)
+            latent_input = torch.empty(
+                rows, 1, 136, device=device, dtype=torch.bfloat16
+            )
+            with session.capture(), graph_capture(device=device) as capture_context:
+                graph = torch.cuda.CUDAGraph()
+                owned.callback(graph.reset)
+                with torch.cuda.graph(graph, stream=capture_context.stream):
+                    output, payload = projection.gather_projections(down, logits, bias)
+                    gathered_latent = latent.gather(latent_input)
+            projection_graphs.append(
+                (
+                    rows,
+                    graph,
+                    down,
+                    logits,
+                    bias,
+                    latent_input,
+                    output,
+                    payload,
+                    gathered_latent,
+                )
+            )
+        for step in range(5):
+            for (
+                rows,
+                graph,
+                down,
+                logits,
+                bias,
+                latent_input,
+                output,
+                payload,
+                gathered_latent,
+            ) in reversed(projection_graphs):
+                gen = torch.Generator().manual_seed(4811 + rows + step)
+                all_down = torch.randn(rows, 3584, generator=gen).to(down)
+                all_logits = torch.randn(rows, 896, generator=gen).to(logits)
+                correction = torch.randn(896, generator=gen).to(bias) * 0.1
+                all_latents = torch.randn(rows, world_size, 136, generator=gen).to(down)
+                down.copy_(all_down.chunk(world_size, dim=-1)[rank])
+                logits.copy_(all_logits.chunk(world_size, dim=-1)[rank])
+                bias.copy_(correction)
+                latent_input.copy_(all_latents[:, rank : rank + 1])
+                scores = all_logits.sigmoid()
+                ids = (scores + correction).topk(16, dim=-1).indices
+                weights = scores.gather(-1, ids)
+                weights /= weights.sum(-1, keepdim=True)
+                graph.replay()
+                torch.cuda.synchronize()
+                eager_output, eager_payload = projection.gather_projections(
+                    down, logits, bias
+                )
+                for actual_down, actual_payload in (
+                    (output, payload),
+                    (eager_output, eager_payload),
+                ):
+                    torch.testing.assert_close(actual_down, all_down, rtol=0, atol=0)
+                    torch.testing.assert_close(
+                        actual_payload[rows:].view(torch.int32),
+                        ids.int(),
+                        rtol=0,
+                        atol=0,
+                    )
+                    torch.testing.assert_close(
+                        actual_payload[:rows], weights, rtol=2e-6, atol=1e-7
+                    )
+                    assert torch.isfinite(actual_payload[:rows]).all()
+                    assert (actual_payload[:rows] > 0).all()
+                torch.testing.assert_close(gathered_latent, all_latents, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("world_size", [2, 9, 10, 12, 16])
+def test_b12x_dcp_prepared_eager_graph_interleaving(monkeypatch, world_size):
+    """Fixed plans preserve rank heads and LSE weighting across live row counts."""
+    pytest.importorskip("b12x.comm.pcie")
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"requires {world_size} GPUs")
+    monkeypatch.setenv("VLLM_ENABLE_PCIE_ALLREDUCE", "0")
+    torch.multiprocessing.spawn(
+        _run_b12x_dcp_gpu,
+        args=(get_open_port(), world_size),
+        nprocs=world_size,
         join=True,
     )
 
