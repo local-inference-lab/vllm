@@ -37,6 +37,7 @@ class AttentionSelectorConfig(NamedTuple):
     use_adaptive_verification: bool = False
     use_dcp: bool = False
     use_rswa: bool = False
+    use_dcp_replicated: bool = False
 
     def __repr__(self):
         return (
@@ -57,7 +58,8 @@ class AttentionSelectorConfig(NamedTuple):
             f"use_adaptive_verification={self.use_adaptive_verification}, "
             f"use_pcp={self.use_pcp}, "
             f"use_dcp={self.use_dcp}, "
-            f"use_rswa={self.use_rswa})"
+            f"use_rswa={self.use_rswa}, "
+            f"use_dcp_replicated={self.use_dcp_replicated})"
         )
 
 
@@ -113,6 +115,7 @@ def get_attn_backend(
     attn_type: str | None = None,
     num_heads: int | None = None,
     has_sliding_window: bool = False,
+    dcp_replicated: bool = False,
 ) -> type[AttentionBackend]:
     """Selects which attention backend to use and lazily imports it."""
 
@@ -169,7 +172,14 @@ def get_attn_backend(
         use_kv_connector=use_kv_connector,
         use_pcp=vllm_config.parallel_config.prefill_context_parallel_size > 1,
         use_adaptive_verification=use_adaptive_verification,
-        use_dcp=vllm_config.parallel_config.decode_context_parallel_size > 1,
+        use_dcp=(
+            vllm_config.parallel_config.decode_context_parallel_size > 1
+            and not dcp_replicated
+        ),
+        use_dcp_replicated=(
+            vllm_config.parallel_config.decode_context_parallel_size > 1
+            and dcp_replicated
+        ),
         use_rswa=(
             vllm_config.model_config is not None
             and vllm_config.model_config.rswa_window is not None

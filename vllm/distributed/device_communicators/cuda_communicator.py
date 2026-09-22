@@ -456,6 +456,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
             torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
+    def all_reduce_in_place(self, input_: torch.Tensor) -> torch.Tensor:
+        """Use NCCL's aliasing contract for a caller-donated intermediate."""
+        pynccl_comm = self.pynccl_comm
+        if (
+            pynccl_comm is None
+            or pynccl_comm.disabled
+            or pynccl_comm.all_reduce(input_, out_tensor=input_) is None
+        ):
+            torch.distributed.all_reduce(input_, group=self.device_group)
+        return input_
+
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor | None:
         ca_comm = self.ca_comm
         if ca_comm is None:
@@ -718,6 +729,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise ValueError("No PyNCCL communicator found")
 
     def destroy(self):
+        for transport in getattr(self, "b12x_dcp_transports", {}).values():
+            transport.close()
+        self.b12x_dcp_transports = {}
         if self.b12x_ar_comm is not None:
             self.b12x_ar_comm.close()
             self.b12x_ar_comm = None

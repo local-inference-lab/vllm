@@ -137,3 +137,138 @@ def test_mla_cache_marker_is_promoted_to_group_capability():
         [unmarked, unmarked]
     ).non_causal_multi_token_decode
     assert MLAAttentionSpec.merge([unmarked, marked]).non_causal_multi_token_decode
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA metadata kernel")
+@pytest.mark.parametrize("dcp_size,rank", [(1, 0), (8, 7), (10, 3), (16, 0), (16, 15)])
+@pytest.mark.parametrize("causal", [True, False])
+def test_b12x_dense_decode_flattens_local_visibility_and_graph_padding(
+    dcp_size, rank, causal
+):
+    from vllm.v1.attention.backends.mla.b12x_mla import _flatten_decode_metadata
+
+    device = torch.device("cuda")
+    interleave = 16
+    starts = [0, 3, 5, 5]
+    global_lengths = [dcp_size * interleave + 1, interleave + 2, 0]
+
+    def local(length):
+        cycle = dcp_size * interleave
+        return length // cycle * interleave + min(
+            max(length % cycle - rank * interleave, 0), interleave
+        )
+
+    local_lengths = [local(length) for length in global_lengths]
+    cu = torch.tensor(starts, dtype=torch.int32, device=device)
+    global_seq = torch.tensor(global_lengths, dtype=torch.int32, device=device)
+    local_seq = torch.tensor(local_lengths, dtype=torch.int32, device=device)
+    table = torch.arange(3 * 11, dtype=torch.int32, device=device).reshape(3, 11)[:, :7]
+    lengths = torch.empty(8, dtype=torch.int32, device=device)
+    pages = torch.empty((8, 9), dtype=torch.int32, device=device)
+
+    def run():
+        _flatten_decode_metadata[(8, 1)](
+            cu,
+            local_seq,
+            global_seq,
+            table,
+            lengths,
+            pages,
+            3,
+            table.shape[1],
+            table.stride(0),
+            pages.shape[1],
+            dcp_size,
+            rank,
+            interleave,
+            causal,
+            128,
+        )
+
+    def check():
+        expected = []
+        for request, (start, end) in enumerate(zip(starts, starts[1:])):
+            for row in range(start, end):
+                expected.append(
+                    local(global_lengths[request] + row + 1 - end)
+                    if causal
+                    else local_lengths[request]
+                )
+        assert lengths.tolist() == expected + [0, 0, 0]
+        torch.testing.assert_close(pages[:3, :7], table[0].expand(3, -1))
+        torch.testing.assert_close(pages[3:5, :7], table[1].expand(2, -1))
+        assert torch.count_nonzero(pages[:, 7:]) == 0
+        assert torch.count_nonzero(pages[5:]) == 0
+
+    run()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    pages.fill_(-77)
+    lengths.fill_(-77)
+    graph.replay()
+    check()
+    graph.reset()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA metadata kernel")
+def test_bounded_draft_metadata_keeps_source_tables_and_replays_live_window():
+    """Windowing must not mutate shared target metadata or read evicted pages."""
+    from vllm.v1.attention.backends.mla.b12x_mla import _flatten_decode_metadata
+
+    device = torch.device("cuda")
+    window, page_size, rows = 4096, 64, 9
+    cu = torch.tensor([0, 4, 8, 8], dtype=torch.int32, device=device)
+    lengths = torch.tensor([window - 1, 524289, 0], dtype=torch.int32, device=device)
+    table = torch.arange(3 * 16385, dtype=torch.int32, device=device).view(3, -1)
+    source = table.clone()
+    flat_lengths = torch.empty(rows, dtype=torch.int32, device=device)
+    pages = torch.empty((rows, 65), dtype=torch.int32, device=device)
+
+    def run():
+        _flatten_decode_metadata[(rows, 1)](
+            cu,
+            lengths,
+            None,
+            table,
+            flat_lengths,
+            pages,
+            3,
+            table.shape[1],
+            table.stride(0),
+            pages.shape[1],
+            1,
+            0,
+            1,
+            False,
+            128,
+            WINDOW=window,
+            PAGE_SIZE=page_size,
+        )
+
+    def check():
+        expected_lengths = []
+        for request, length in enumerate(lengths.tolist()[:2]):
+            offset = max(length - window, 0) // page_size
+            expected_lengths.extend([length - offset * page_size] * 4)
+            torch.testing.assert_close(
+                pages[request * 4 : (request + 1) * 4],
+                source[request, offset : offset + 65].expand(4, -1),
+            )
+        assert flat_lengths.tolist() == expected_lengths + [0]
+        assert torch.count_nonzero(pages[-1]) == 0
+        torch.testing.assert_close(table, source)
+
+    run()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for live_lengths in ([window, window + 1, 0], [window + 63, 1048000, 0]):
+        lengths.copy_(torch.tensor(live_lengths, dtype=torch.int32, device=device))
+        pages.fill_(-77)
+        flat_lengths.fill_(-77)
+        graph.replay()
+        check()
+    graph.reset()

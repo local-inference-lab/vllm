@@ -36,6 +36,147 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheLayout
 
 
+@pytest.mark.parametrize(
+    "dtype,dcp_size", [(torch.bfloat16, 1), (torch.float8_e4m3fn, 16)]
+)
+@pytest.mark.parametrize("parallel_drafting", [False, True])
+@pytest.mark.parametrize("page_padding", [0, 192])
+@torch.inference_mode()
+def test_b12x_dense_mla_prepared_capacity_replay_and_high_pages(
+    dtype, dcp_size, parallel_drafting, page_padding, monkeypatch
+):
+    """Real prepared kernels consume high page IDs and mutable graph inputs."""
+    _require_b12x_paged_attention()
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.attention import dense_mla
+    from b12x.preparation import PreparationSession
+
+    from vllm.utils.b12x import B12xWorkload
+    from vllm.v1.attention.backends.mla.b12x_mla import B12xMLAImpl
+    from vllm.v1.worker import workspace
+
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    manager = workspace.WorkspaceManager(device)
+    monkeypatch.setattr(workspace, "_manager", manager)
+    page_size, head_dim, value_dim = 64, 576, 512
+    # Mixed target/draft cache groups insert padding between physical pages.
+    page_stride = page_size * head_dim + page_padding
+    high_page = 2**31 // page_stride + 1
+    cache = torch.empty_strided(
+        (high_page + 2, page_size, head_dim),
+        (page_stride, head_dim, 1),
+        device=device,
+        dtype=dtype,
+    )
+    torch.manual_seed(817)
+    cache[high_page:].copy_(
+        (torch.randn((2, page_size, head_dim), device=device) * 0.15).to(dtype)
+    )
+    layer = SimpleNamespace(
+        kv_cache=cache,
+        _q_scale=torch.ones(1, dtype=torch.float32, device=device),
+        _k_scale=torch.ones(1, dtype=torch.float32, device=device),
+    )
+    impl = object.__new__(B12xMLAImpl)
+    impl.num_heads = 6
+    impl.dcp_world_size = dcp_size
+    impl.head_size = head_dim
+    impl.kv_lora_rank = value_dim
+    impl.scale = 192**-0.5
+    impl.kv_cache_dtype = "fp8" if dtype == torch.float8_e4m3fn else "bfloat16"
+    impl._dense_mla = dense_mla
+    impl._config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=128 * dcp_size),
+        parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=16),
+        speculative_config=SimpleNamespace(parallel_drafting=parallel_drafting),
+    )
+    workload = B12xWorkload(
+        stage="state",
+        token_counts=(1, 4, 8),
+        fixed_token_counts=(1, 4),
+        output_dtype=torch.bfloat16,
+        max_tokens=16,
+        max_seqs=2,
+        max_model_len=128 * dcp_size,
+        speculative_tokens=3,
+    )
+    units = impl.get_b12x_preparation_units(layer, workload)
+    capacity = 14 if parallel_drafting else 8
+    assert max(impl._capacities) == capacity
+    heads = 6 * dcp_size
+    q_storage = (torch.randn((capacity, heads, head_dim), device=device) * 0.15).to(
+        dtype
+    )
+    length_storage = torch.tensor(
+        [1, 63, 64, 100, 2, 65, 96, 128, 60, 61, 62, 63, 64, 65],
+        dtype=torch.int32,
+        device=device,
+    )[:capacity]
+    q, lengths = q_storage[:4], length_storage[:4]
+    pages = torch.tensor(
+        [high_page, high_page + 1], dtype=torch.int32, device=device
+    ).repeat(capacity, 1)
+    cu = torch.arange(capacity + 1, dtype=torch.int32, device=device)
+    metadata = SimpleNamespace(
+        decode=SimpleNamespace(block_table=pages[:4], seq_lens=lengths),
+        flat_block_table=None,
+        query_start_loc=cu[:5],
+    )
+
+    def run():
+        return impl.forward_mqa(q, cache, metadata, layer)
+
+    def check(output, lse):
+        assert torch.isfinite(output).all()
+        assert torch.count_nonzero(output) > 0
+        for row, length in enumerate(lengths.tolist()):
+            if length == 0:
+                # The full-sequence oracle excludes empty DCP shards. Their
+                # exact neutral contribution is zero output and -inf LSE.
+                assert torch.count_nonzero(output[row]) == 0
+                assert torch.isneginf(lse[row]).all()
+                continue
+            expected, expected_lse = dense_mla.reference(
+                q[row : row + 1],
+                cache,
+                pages[row : row + 1],
+                lengths[row : row + 1],
+                cu[:2],
+                sm_scale=impl.scale,
+                kv_scale=layer._k_scale if dtype == torch.float8_e4m3fn else None,
+                q_scale=layer._q_scale if dtype == torch.float8_e4m3fn else None,
+            )
+            torch.testing.assert_close(
+                output[row : row + 1].float(), expected.float(), rtol=2e-2, atol=5e-4
+            )
+            torch.testing.assert_close(
+                lse[row : row + 1], expected_lse, rtol=2e-5, atol=2e-5
+            )
+
+    with PreparationSession(device=device, autotune=False) as session:
+        session.prepare(tuple(request for unit in units for request in unit.requests))
+        check(*run())
+        manager.lock()
+        session.freeze()
+        with kernel_resolution_guard("dense MLA prepared decode rows"):
+            for rows in (1, 3, 4, capacity):
+                q, lengths = q_storage[:rows], length_storage[:rows]
+                metadata.decode = SimpleNamespace(
+                    block_table=pages[:rows], seq_lens=lengths
+                )
+                metadata.query_start_loc = cu[: rows + 1]
+                graph = torch.cuda.CUDAGraph()
+                try:
+                    with session.capture(), torch.cuda.graph(graph):
+                        output, lse = run()
+                    q.copy_((-q.float()).to(dtype))
+                    lengths[0] = 0 if rows > 1 else 2
+                    graph.replay()
+                    check(output, lse)
+                finally:
+                    graph.reset()
+
+
 def _require_b12x_paged_attention() -> None:
     capability = current_platform.get_device_capability()
     if (
@@ -125,6 +266,7 @@ def _mla_query_layer() -> MLAAttention:
     )
     layer._b12x_query_prefix = "test.mla_query_plans"
     layer._b12x_query_plans = {}
+    layer.prefill_backend = None
     return layer
 
 

@@ -1460,6 +1460,8 @@ class MLADCPManager:
     """Select and own layer-level collective implementations for MLA DCP."""
 
     _kv_gather: Callable[[torch.Tensor, torch.Tensor], object]
+    combine: DCPCombine
+    query_gather: Callable[[torch.Tensor], torch.Tensor] | None
 
     def __init__(
         self,
@@ -1476,6 +1478,7 @@ class MLADCPManager:
         query_gather_fallback: Callable[[torch.Tensor], torch.Tensor] | None = None,
         output_reduce_scatter: Callable[[torch.Tensor], torch.Tensor | None]
         | None = None,
+        use_b12x: bool = False,
     ) -> None:
         parallel_config = vllm_config.parallel_config
         self.group = get_dcp_group()
@@ -1486,6 +1489,50 @@ class MLADCPManager:
         self.padded_num_heads = padded_num_heads
         self._query_gather_fallback = query_gather_fallback
         self._output_reduce_scatter = output_reduce_scatter
+
+        self.b12x_transport = None
+        if use_b12x:
+            logger.info_once(
+                "B12X DCP configuration: device=%s, ranks=%d, a2a=%s, "
+                "microbatches=%d, padded_heads=%s, PCP=%s, query=%s, output=%s.",
+                self.device,
+                self.group.world_size,
+                self.use_a2a,
+                self.num_ubatches,
+                padded_num_heads,
+                use_pcp,
+                query_dtype,
+                output_dtype,
+            )
+        if (
+            use_b12x
+            and self.use_a2a
+            and not use_pcp
+            and self.num_ubatches == 1
+            and padded_num_heads is None
+        ):
+            from vllm.distributed.device_communicators.b12x_dcp import (
+                get_b12x_dcp_transport,
+            )
+
+            self.b12x_transport = get_b12x_dcp_transport(
+                self.group,
+                self.device,
+                self.max_num_tokens,
+                num_heads,
+                query_head_dim,
+                output_head_dim,
+                query_dtype,
+                output_dtype,
+            )
+        if self.b12x_transport is not None:
+            logger.info_once("Using prepared B12X PCIe DCP query and LSE exchange.")
+            self.combine = functools.partial(
+                self._b12x_combine,
+                is_lse_base_on_e=is_lse_base_on_e,
+            )
+            self.query_gather = self._b12x_query_gather
+            return
 
         self.combine = self._init_combine(
             num_heads,
@@ -1510,6 +1557,41 @@ class MLADCPManager:
                 query_head_dim,
                 query_dtype,
             )
+        )
+
+    def _b12x_query_gather(self, query: torch.Tensor) -> torch.Tensor:
+        transport = self.b12x_transport
+        assert transport is not None
+        if query.shape[0] <= transport.max_tokens:
+            return transport.gather(query)
+        return self._gather_query(query)
+
+    def _b12x_combine(
+        self,
+        partial_output: torch.Tensor,
+        partial_lse: torch.Tensor,
+        is_lse_base_on_e: bool,
+        seq_lens: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        transport = self.b12x_transport
+        assert transport is not None
+        if partial_output.shape[0] <= transport.max_tokens:
+            # B12X_MLA supplies zero output and -inf LSE for every empty local
+            # shard, including padded queries. Other backends must not opt in
+            # without satisfying that contract before the collective.
+            return transport.combine(
+                partial_output,
+                partial_lse,
+                is_lse_base_on_e=is_lse_base_on_e,
+            )
+        return dcp_a2a_lse_reduce(
+            partial_output,
+            partial_lse,
+            cp_group=self.group,
+            is_lse_base_on_e=is_lse_base_on_e,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
         )
 
     def _init_combine(
