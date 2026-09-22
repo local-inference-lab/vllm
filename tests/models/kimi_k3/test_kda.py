@@ -68,6 +68,69 @@ PACKED_DECODE_IMPLS = {
 }
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA streams required")
+@pytest.mark.parametrize(
+    "rows,threshold,batch_invariant",
+    [(1, 0, False), (1, 6, False), (6, 6, False), (7, 6, False), (6, 6, True)],
+)
+@torch.inference_mode()
+def test_split_projection_stream_replay(rows, threshold, batch_invariant, monkeypatch):
+    """Graph replay preserves split projection values and eager fallback order."""
+    torch.manual_seed(234)
+    width, heads, hidden = 256, 2, 128
+    weights = [
+        torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        for n, k in (
+            (3 * width, hidden),
+            (width + 128 + heads + 14, hidden),
+            (width, 128),
+        )
+    ]
+    qkv, gfab, fb = weights
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    layer = SimpleNamespace(
+        local_projection_size=width,
+        head_dim=128,
+        local_num_heads=heads,
+        in_proj_padding=14,
+        _split_projection_overlap_max_tokens=threshold,
+        _projection_aux_stream=torch.cuda.Stream(),
+        _projection_events=(torch.cuda.Event(), torch.cuda.Event()),
+        in_proj_qkv=lambda value: (F.linear(value, qkv), None),
+        in_proj_gfab=lambda value: (F.linear(value, gfab), None),
+        f_b_proj=lambda value: (F.linear(value, fb), None),
+    )
+    parallel_calls = []
+    original_parallel = nvidia_kda.maybe_execute_in_parallel
+
+    def observe_parallel(*args, **kwargs):
+        parallel_calls.append(True)
+        return original_parallel(*args, **kwargs)
+
+    monkeypatch.setattr(nvidia_kda, "maybe_execute_in_parallel", observe_parallel)
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", str(int(batch_invariant)))
+    project = nvidia_kda.KimiK3DeltaAttention._project_split_input
+    for _ in range(3):
+        project(layer, x)
+    assert not parallel_calls
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = project(layer, x)
+    assert bool(parallel_calls) == (0 < rows <= threshold and not batch_invariant)
+    for _ in range(16):
+        x.normal_()
+        expected = project(layer, x)
+        for value in actual:
+            value.fill_(float("nan"))
+        for _ in range(8):
+            graph.replay()
+        torch.accelerator.synchronize()
+        for value, reference in zip(actual, expected):
+            assert torch.isfinite(value).all()
+            assert torch.equal(value, reference)
+    graph.reset()
+
+
 @pytest.mark.parametrize("padding", [0, 10])
 def test_kda_declares_checkpoint_omitted_projection_padding(padding):
     layer = torch.nn.Module()

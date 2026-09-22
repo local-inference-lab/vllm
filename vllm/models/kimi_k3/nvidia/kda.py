@@ -9,6 +9,7 @@ from einops import rearrange
 from torch import nn
 from torch.nn.parameter import Parameter
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
@@ -64,6 +65,7 @@ from vllm.utils.flashinfer import (
     has_flashinfer_fused_kda_decode,
     has_flashinfer_recurrent_kda,
 )
+from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -652,6 +654,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             (torch.cuda.Event(), torch.cuda.Event()) if aux_stream is not None else None
         )
         self._projection_overlap_max_tokens = 0
+        self._split_projection_overlap_max_tokens = max(
+            0, envs.VLLM_KIMI_KDA_PROJECTION_STREAM_TOKEN_THRESHOLD
+        )
 
         # Keep f_a before the narrow beta shard, then align each TP-local row.
         qkvg_output_sizes = [self.projection_size] * 4
@@ -893,6 +898,43 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             ),
         )
 
+    def _project_split_input(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Preserve projection kernels and layout while overlapping two branches."""
+
+        def project_gates():
+            split_sizes = [
+                self.local_projection_size,
+                self.head_dim,
+                self.local_num_heads,
+            ]
+            if self.in_proj_padding:
+                split_sizes.append(self.in_proj_padding)
+            projected = self.in_proj_gfab(hidden_states)[0].split(split_sizes, dim=-1)
+            g_proj_states, f_a, beta = projected[:3]
+            return g_proj_states, self.f_b_proj(f_a)[0], beta
+
+        if (
+            0 < hidden_states.shape[0] <= self._split_projection_overlap_max_tokens
+            and self._projection_aux_stream is not None
+            and self._projection_events is not None
+            and not envs.VLLM_BATCH_INVARIANT
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            # Q/K/V has no dependency on the gate/factor branch. The stream
+            # join must precede convolution and recurrent-state consumption.
+            gates, mixed_qkv = maybe_execute_in_parallel(
+                project_gates,
+                lambda: self.in_proj_qkv(hidden_states)[0],
+                *self._projection_events,
+                self._projection_aux_stream,
+            )
+        else:
+            mixed_qkv = self.in_proj_qkv(hidden_states)[0]
+            gates = project_gates()
+        return mixed_qkv, *gates
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -903,17 +945,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         projection_events = self._projection_events
         projection_aux_stream = self._projection_aux_stream
         if self.split_mixed_precision_input:
-            mixed_qkv = self.in_proj_qkv(hidden_states)[0]
-            split_sizes = [
-                self.local_projection_size,
-                self.head_dim,
-                self.local_num_heads,
-            ]
-            if self.in_proj_padding:
-                split_sizes.append(self.in_proj_padding)
-            projected = self.in_proj_gfab(hidden_states)[0].split(split_sizes, dim=-1)
-            g_proj_states, f_a, beta = projected[:3]
-            g1 = self.f_b_proj(f_a)[0]
+            mixed_qkv, g_proj_states, g1, beta = self._project_split_input(
+                hidden_states
+            )
         elif (
             0 < num_tokens <= self._projection_overlap_max_tokens
             and hidden_states.stride() == (self.hidden_size, 1)

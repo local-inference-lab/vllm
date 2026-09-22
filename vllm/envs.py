@@ -1692,6 +1692,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_KIMI_ALIGNED_DECODE_PROJECTIONS": lambda: bool(
         int(os.getenv("VLLM_KIMI_ALIGNED_DECODE_PROJECTIONS", "0"))
     ),
+    # Overlap split Kimi MXFP8 Q/K/V with BF16 gate/factor/beta projections
+    # during CUDA graph capture. Zero preserves sequential dispatch.
+    "VLLM_KIMI_KDA_PROJECTION_STREAM_TOKEN_THRESHOLD": lambda: int(
+        os.getenv("VLLM_KIMI_KDA_PROJECTION_STREAM_TOKEN_THRESHOLD", "0")
+    ),
     # Bound physical group width for Kimi's recurrent target and MLA draft pool.
     "VLLM_K3_KV_GROUP_SIZE": lambda: int(os.getenv("VLLM_K3_KV_GROUP_SIZE", "0")),
     # Keep a bounded draft-only MLA tail; target verification retains full KV.
