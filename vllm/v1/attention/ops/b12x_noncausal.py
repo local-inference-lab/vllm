@@ -15,10 +15,13 @@ def _gather_window(
     Pages,
     Lengths,
     QueryStarts,
+    KScale,
+    VScale,
     PackedK,
     PackedV,
     CuQ,
     CuK,
+    IS_FP8: tl.constexpr,
     K_STRIDES: tl.constexpr,
     V_STRIDES: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
@@ -71,8 +74,12 @@ def _gather_window(
         + dim[None, :] * V_STRIDES[3]
     )
     mask = (rows[:, None] < count) & (channels[None, :] < KV_HEADS * DIM)
-    k = tl.load(K + k_offset, mask, 0)
-    v = tl.load(V + v_offset, mask, 0)
+    k = tl.load(K + k_offset, mask, 0.0)
+    v = tl.load(V + v_offset, mask, 0.0)
+    if IS_FP8:
+        # Descale before the BF16 store, matching the packed attention inputs.
+        k = k.to(tl.float32) * tl.load(KScale)
+        v = v.to(tl.float32) * tl.load(VScale)
     destination = (offset + rows[:, None]).to(tl.int64) * KV_HEADS * DIM + channels[
         None, :
     ]
@@ -93,11 +100,12 @@ class B12xNoncausalAttention:
                 "B12X noncausal attention requires sliding-window speculation."
             )
         if (
-            impl.kv_torch_dtype != torch.bfloat16
+            impl.kv_torch_dtype not in (torch.bfloat16, torch.float8_e4m3fn)
             or impl.head_size != impl.output_head_size
         ):
             raise NotImplementedError(
-                "B12X noncausal attention requires BF16 KV and equal QK/V dimensions."
+                "B12X noncausal attention requires BF16 or FP8 E4M3 KV "
+                "and equal QK/V dimensions."
             )
         self.impl = impl
         self.max_q = impl._verify_q_per_req
@@ -155,6 +163,7 @@ class B12xNoncausalAttention:
                 pages[:batch],
                 lengths[:batch],
                 starts[: batch + 1],
+                layer=layer,
             )
 
         plan = self.plan
@@ -214,17 +223,41 @@ class B12xNoncausalAttention:
             ),
         )
 
-    def gather(self, key_cache, value_cache, pages, lengths, starts):
+    def _descales(self, layer, key_cache, value_cache):
+        if (
+            key_cache.dtype != self.impl.kv_torch_dtype
+            or value_cache.dtype != self.impl.kv_torch_dtype
+        ):
+            raise TypeError("Noncausal KV must use the backend's typed cache views.")
+        if self.impl.kv_torch_dtype == torch.bfloat16:
+            return None, None
+        # The cache writer uses tensor scales. Do not reinterpret a vector as
+        # per-head scales: _prepare_fp8_descales treats vectors as per-request.
+        for name in ("_k_scale", "_v_scale"):
+            scale = getattr(layer, name, None)
+            if not isinstance(scale, torch.Tensor):
+                raise TypeError(f"Noncausal FP8 {name} must be a tensor.")
+            if scale.ndim > 1 or scale.numel() != 1:
+                raise ValueError(
+                    f"Noncausal FP8 {name} must be scalar or shape (1,)."
+                )
+        return self.impl._prepare_fp8_descales(layer, 1, key_cache.device)
+
+    def gather(self, key_cache, value_cache, pages, lengths, starts, *, layer):
+        k_scale, v_scale = self._descales(layer, key_cache, value_cache)
         _gather_window[(self.batch, triton.cdiv(self.max_k, 16))](
             key_cache,
             value_cache,
             pages,
             lengths,
             starts,
+            k_scale,
+            v_scale,
             self.k,
             self.v,
             self.cu_q,
             self.cu_k,
+            self.impl.kv_torch_dtype == torch.float8_e4m3fn,
             key_cache.stride(),
             value_cache.stride(),
             pages.stride(0),
@@ -238,7 +271,7 @@ class B12xNoncausalAttention:
             triton.next_power_of_2(self.impl.num_kv_heads * self.impl.head_size),
         )
 
-    def forward(self, query, output, key_cache, value_cache, metadata):
+    def forward(self, query, output, key_cache, value_cache, metadata, *, layer):
         from b12x.attention import varlen
 
         if self.binding is None:
@@ -258,6 +291,7 @@ class B12xNoncausalAttention:
             metadata.block_table,
             metadata.seq_lens,
             metadata.query_start_loc,
+            layer=layer,
         )
         attended, _ = varlen.run(binding=self.binding)
         output.copy_(attended[: output.shape[0]])

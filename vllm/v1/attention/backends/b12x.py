@@ -1111,7 +1111,9 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         if not attn_metadata.causal:
             if self._noncausal is None:
                 raise ValueError("B12X noncausal attention was not configured.")
-            self._noncausal.forward(q, out, key_cache, value_cache, attn_metadata)
+            self._noncausal.forward(
+                q, out, key_cache, value_cache, attn_metadata, layer=layer
+            )
             return output
 
         page_table = _ensure_i32_contiguous(attn_metadata.block_table, "block_table")
