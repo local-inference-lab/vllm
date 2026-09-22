@@ -52,6 +52,11 @@ def copy_weight(destination: torch.Tensor, source: torch.Tensor) -> torch.Tensor
     return destination
 
 
+def is_weight_transfer_active() -> bool:
+    """Whether checkpoint copies use a scoped writer with deferred completion."""
+    return _writer.get() is not None
+
+
 def flush_weight_transfers() -> None:
     """Complete queued checkpoint reads before numerical weight preparation."""
     writer = _writer.get()
