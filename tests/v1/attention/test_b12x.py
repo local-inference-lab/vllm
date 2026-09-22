@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import weakref
 from functools import partial
 from types import SimpleNamespace
 
@@ -208,6 +209,7 @@ def test_mla_preallocates_absorbed_weights_before_dequantization(
     torch.nn.Module.__init__(layer)
     layer.impl = SimpleNamespace(
         process_weights_after_loading=lambda dtype: None,
+        is_sparse=False,
     )
     layer.is_amx_bmm_enabled = False
     layer.kv_lora_rank = 2
@@ -580,9 +582,341 @@ def test_b12x_attention_uses_two_plane_nhd_cache() -> None:
     assert not B12xPagedAttentionBackend.supports_block_size(32)
 
 
+@pytest.mark.parametrize("layout", [KVCacheLayout.LBHNC, KVCacheLayout.BLHNC])
+def test_b12x_diffkv_cache_views_preserve_compact_layer_storage(layout) -> None:
+    from tests.v1.attention.utils import dense_kv_cache_views
+
+    spec = B12xPagedAttentionBackend.customize_spec(
+        FullAttentionSpec(
+            block_size=128,
+            num_kv_heads=2,
+            head_size=192,
+            head_size_v=128,
+            dtype=torch.bfloat16,
+        )
+    )
+    assert spec.page_size_bytes == 128 * 2 * (192 + 128) * 2
+    raw = torch.zeros(3 * 2 * spec.page_size_bytes, dtype=torch.uint8)
+    cache, peer = dense_kv_cache_views(raw, spec, 3, 2, layout)
+    impl = object.__new__(B12xPagedAttentionImpl)
+    impl._noncausal = None
+    impl.num_kv_heads = 2
+    impl.head_size = 192
+    impl.output_head_size = 128
+    impl.kv_cache_dtype = "bfloat16"
+    impl.kv_torch_dtype = torch.bfloat16
+
+    key, value = impl._kv_cache_views(cache)
+    assert key.shape == (3, 128, 2, 192)
+    assert value.shape == (3, 128, 2, 128)
+    key.fill_(3)
+    value.fill_(7)
+    assert torch.all(cache[..., :192] == 3)
+    assert torch.all(cache[..., 192:] == 7)
+    assert torch.count_nonzero(peer) == 0
+
+
+@pytest.mark.parametrize("query_layout", ["contiguous", "packed_qkv"])
+@pytest.mark.parametrize("mode", ["prefill", "extend", "decode", "verify"])
+@pytest.mark.parametrize("sliding_window", [None, 128])
+@pytest.mark.parametrize("kv_cache_dtype", ["bfloat16", "fp8_e4m3"])
+def test_b12x_cache_update_and_graph_replay(
+    default_vllm_config, mode, sliding_window, kv_cache_dtype, query_layout, monkeypatch
+) -> None:
+    """Prepared contiguous and fused-QKV views preserve attention on replay."""
+    from b12x.attention.paged.reference import attention_reference
+    from b12x.preparation import PreparationSession
+
+    from tests.v1.attention.utils import dense_kv_cache_views
+    from vllm.utils.b12x import B12xWorkload
+    from vllm.v1.worker.workspace import (
+        init_workspace_manager,
+        reset_workspace_manager,
+    )
+
+    _require_b12x_paged_attention()
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    config = default_vllm_config
+    config.model_config = SimpleNamespace(
+        dtype=torch.bfloat16, max_model_len=512, is_hybrid=True
+    )
+    config.cache_config.block_size = 128
+    config.scheduler_config.max_num_seqs = 2
+    config.scheduler_config.max_num_batched_tokens = 64
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    head_size = 128 if query_layout == "packed_qkv" else 192
+    kv_heads = 2 if sliding_window is None else 4
+    storage_dtype = (
+        torch.bfloat16 if kv_cache_dtype == "bfloat16" else torch.float8_e4m3fn
+    )
+    sinks = (
+        torch.linspace(-1, 1, 32, device=device, dtype=torch.bfloat16)
+        if sliding_window is not None
+        else None
+    )
+    impl = B12xPagedAttentionImpl(
+        num_heads=32,
+        head_size=head_size,
+        head_size_v=128,
+        scale=head_size**-0.5,
+        num_kv_heads=kv_heads,
+        alibi_slopes=None,
+        sliding_window=sliding_window,
+        kv_cache_dtype=kv_cache_dtype,
+        sinks=sinks,
+    )
+    impl.process_weights_after_loading(torch.bfloat16)
+    spec = B12xPagedAttentionBackend.customize_spec(
+        FullAttentionSpec(
+            block_size=128,
+            num_kv_heads=kv_heads,
+            head_size=head_size,
+            head_size_v=128,
+            dtype=storage_dtype,
+        )
+    )
+    # Park live pages beyond 2**31 elements to exercise 64-bit cache offsets.
+    first_page = (
+        (1 << 31) // (2 * spec.page_size_bytes // storage_dtype.itemsize) + 1
+        if mode == "decode" and sliding_window is None
+        else 1
+    )
+    num_pages = first_page + 8
+    raw = torch.empty(
+        num_pages * 2 * spec.page_size_bytes, dtype=torch.uint8, device=device
+    )
+    cache, peer = dense_kv_cache_views(raw, spec, num_pages, 2, KVCacheLayout.BLHNC)
+    cache[0].zero_()
+    cache[first_page:].zero_()
+    peer[first_page:].fill_(11)
+    layer = SimpleNamespace(
+        kv_cache=cache,
+        _k_scale=torch.tensor(0.5, device=device),
+        _v_scale=torch.tensor(0.25, device=device),
+    )
+    q_lens = {"prefill": [17, 9], "extend": [5, 7], "decode": [1, 1], "verify": [4, 4]}[
+        mode
+    ]
+    context_lens = [0, 0] if mode == "prefill" else [131, 259]
+    seq_lens = [c + q for c, q in zip(context_lens, q_lens)]
+    pages = torch.tensor(
+        [
+            [first_page + 2, first_page, first_page + 4, 0, 0],
+            [first_page + 6, first_page + 1, first_page + 5, 0, 0],
+        ],
+        device=device,
+        dtype=torch.int32,
+    )
+    offsets = [0, q_lens[0], sum(q_lens)]
+    slots = torch.cat(
+        [
+            pages[i, torch.arange(length, device=device) // 128].long() * 128
+            + torch.arange(length, device=device) % 128
+            for i, length in enumerate(seq_lens)
+        ]
+    )
+    current_slots = torch.cat(
+        [
+            slots[sum(seq_lens[:i]) + context_lens[i] : sum(seq_lens[: i + 1])]
+            for i in range(2)
+        ]
+    )
+    metadata = b12x.B12xPagedMetadata(
+        num_actual_tokens=sum(q_lens),
+        max_query_len=max(q_lens),
+        query_start_loc=torch.tensor(offsets, dtype=torch.int32, device=device),
+        max_seq_len=max(seq_lens),
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+        block_table=pages,
+        slot_mapping=current_slots,
+    )
+    qkv = torch.randn(
+        sum(q_lens),
+        (32 + 2 * kv_heads) * head_size,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    query = qkv[:, : 32 * head_size].view(-1, 32, head_size)
+    if query_layout == "contiguous":
+        query = query.contiguous()
+    key = torch.randn(
+        sum(seq_lens), kv_heads, head_size, device=device, dtype=torch.bfloat16
+    )
+    value = torch.randn(
+        sum(seq_lens), kv_heads, 128, device=device, dtype=torch.bfloat16
+    )
+    output = torch.empty(sum(q_lens), 32, 128, device=device, dtype=torch.bfloat16)
+    workload = B12xWorkload(
+        stage="state",
+        token_counts=(1, 2, 64),
+        fixed_token_counts=(1, 2),
+        output_dtype=torch.bfloat16,
+        max_tokens=64,
+        max_seqs=2,
+        max_model_len=512,
+    )
+    impl.forward(layer, query, key, value, cache, None, output)
+    (unit,) = impl.get_b12x_preparation_units(layer, workload)
+    assert all(
+        request.plan.invocation["operands"]["q"]["strides"] == query.stride()
+        for request in unit.requests
+    )
+    init_workspace_manager(device)
+    try:
+        with PreparationSession(device=device, autotune=False) as session:
+            session.prepare(unit.requests).close()
+
+            def run():
+                impl.do_kv_cache_update(layer, key, value, cache, slots)
+                return impl.forward(layer, query, key, value, cache, metadata, output)
+
+            run()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+
+            def unexpected_plan(*args, **kwargs):
+                raise AssertionError("replay declared an unprepared attention plan")
+
+            monkeypatch.setattr(impl, "_declaration", unexpected_plan)
+            run()
+            for factor in (1.0, -0.75):
+                query.mul_(factor)
+                value.mul_(factor)
+                output.fill_(torch.nan)
+                graph.replay()
+                references = []
+                for i, (context, length) in enumerate(zip(context_lens, q_lens)):
+                    start, end = sum(seq_lens[:i]), sum(seq_lens[: i + 1])
+                    k, v = key[start:end].float(), value[start:end].float()
+                    if storage_dtype != torch.bfloat16:
+                        k = (k / layer._k_scale).to(
+                            storage_dtype
+                        ).float() * layer._k_scale
+                        v = (v / layer._v_scale).to(
+                            storage_dtype
+                        ).float() * layer._v_scale
+                    reference, _ = attention_reference(
+                        query[offsets[i] : offsets[i + 1]].float(),
+                        k,
+                        v,
+                        window_left=impl.window_left,
+                        attention_sink_bias=None if sinks is None else sinks.float(),
+                    )
+                    references.append(reference)
+                torch.testing.assert_close(
+                    output.float(), torch.cat(references), atol=2e-2, rtol=2e-2
+                )
+                assert torch.all(peer[first_page:] == 11)
+    finally:
+        reset_workspace_manager()
+
+
+def test_b12x_prepares_request_counts_for_verification_graphs(monkeypatch) -> None:
+    from vllm.utils.b12x import B12xWorkload
+
+    impl = object.__new__(B12xPagedAttentionImpl)
+    impl._noncausal = None
+    impl.dtype = torch.bfloat16
+    impl._max_num_seqs = 8
+    impl._verify_q_per_req = 4
+    impl._extend_q_capacities = (64,)
+    impl._query_stride = (4608, 128, 1)
+    impl._output_stride = (4096, 128, 1)
+    cache = torch.empty(1, 128, 2, 128)
+    layer = SimpleNamespace(kv_cache=cache)
+    monkeypatch.setattr(impl, "_kv_cache_views", lambda cache: (cache, cache))
+
+    def declaration(**kwargs):
+        return SimpleNamespace(request=lambda **request: SimpleNamespace(**request))
+
+    monkeypatch.setattr(impl, "_declaration", declaration)
+    workload = B12xWorkload(
+        stage="state",
+        token_counts=(1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 64),
+        fixed_token_counts=(1, 2, 4, 8, 12, 16, 20, 24, 28, 32),
+        output_dtype=torch.bfloat16,
+        max_tokens=64,
+        max_seqs=8,
+        max_model_len=512,
+        speculative_tokens=3,
+    )
+    impl.get_b12x_preparation_units(layer, workload)
+    # Graph token counts are four times their verification request counts.
+    for batch in range(1, 9):
+        metadata = SimpleNamespace(max_query_len=4)
+        plan, _ = impl._select_plan(
+            metadata,
+            4 * batch,
+            4 * batch,
+            batch,
+            128,
+            query_stride=(4608, 128, 1),
+            output_stride=(4096, 128, 1),
+        )
+        assert plan is not None
+
+
 def test_b12x_attention_hybrid_cache_capacity_includes_expansion() -> None:
     assert _max_page_table_width(4096, 128, 4096, False) == 32
     assert _max_page_table_width(4096, 128, 4096, True) == 64
+
+
+@pytest.mark.parametrize("page_size", (64, 128))
+def test_b12x_prepares_hybrid_attention_for_allocated_table_width(
+    page_size, monkeypatch
+) -> None:
+    from vllm.utils.b12x import B12xWorkload
+    from vllm.utils.math_utils import cdiv
+    from vllm.v1.worker.block_table import get_block_table_width
+
+    width = get_block_table_width(cdiv(262144, 8448), 8448, page_size)
+    estimate = _max_page_table_width(262144, page_size, 4096, True)
+    assert width > estimate
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=170),
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
+    impl = object.__new__(B12xPagedAttentionImpl)
+    impl._noncausal = None
+    impl.device = torch.device("cuda", 0)
+    impl.dtype = impl.kv_torch_dtype = torch.bfloat16
+    impl.num_heads, impl.num_kv_heads = 32, 2
+    impl.head_size = impl.output_head_size = 128
+    impl.kv_cache_dtype = "bfloat16"
+    impl.window_left, impl.sinks = -1, None
+    impl._max_num_seqs, impl._verify_q_per_req = 2, 4
+    impl._extend_q_capacities = (8,)
+    impl._query_stride = impl._output_stride = (4096, 128, 1)
+    impl._max_page_table_widths = {page_size: estimate}
+    impl._paged_attention = get_b12x_paged_attention()
+    layer = SimpleNamespace(
+        layer_name="target.attn",
+        kv_cache=torch.empty((1, 2, page_size, 256), dtype=torch.bfloat16),
+    )
+    workload = B12xWorkload(
+        stage="state",
+        token_counts=(1, 2, 4, 8),
+        fixed_token_counts=(1, 2, 4),
+        output_dtype=torch.bfloat16,
+        max_tokens=8,
+        max_seqs=2,
+        max_model_len=262144,
+        speculative_tokens=3,
+        block_table_widths=(("draft.attn", 32), ("target.attn", width)),
+    )
+    (unit,) = impl.get_b12x_preparation_units(layer, workload)
+    assert {request.plan.invocation["caps"]["mode"] for request in unit.requests} == {
+        "decode",
+        "verify",
+        "extend",
+    }
+    for request in unit.requests:
+        invocation = request.plan.invocation
+        assert invocation["caps"]["max_page_table_width"] == width
+        assert invocation["operands"]["page_table"]["shape"][1] == width
 
 
 def test_b12x_attention_runtime_page_size_comes_from_cache() -> None:
@@ -594,19 +928,74 @@ def test_b12x_attention_runtime_page_size_comes_from_cache() -> None:
         _kv_page_size(key_cache, torch.empty((3, 128, 4, 128), device="meta"))
 
 
+def test_b12x_attention_preparation_releases_temporary_buffers() -> None:
+    impl = object.__new__(B12xPagedAttentionImpl)
+    impl._noncausal = None
+    impl.device = torch.device("cpu")
+    impl.dtype = torch.bfloat16
+    impl.num_heads, impl.num_kv_heads = 32, 2
+    impl.head_size, impl.output_head_size = 192, 128
+    impl.kv_cache_dtype = "bfloat16"
+    impl.window_left, impl.sinks = -1, None
+    impl._max_page_table_widths = {128: 4}
+    references: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def bind(**kwargs):
+        references.extend(
+            weakref.ref(kwargs[name])
+            for name in ("q", "output", "page_table", "cache_seqlens", "cu_seqlens_q")
+        )
+        references.extend(weakref.ref(tensor) for tensor in kwargs["scratch"])
+        return kwargs
+
+    state = SimpleNamespace(
+        scratch_plan=SimpleNamespace(
+            scratch_specs=lambda: [SimpleNamespace(shape=(64,), dtype=torch.uint8)]
+        ),
+        bind=bind,
+        run=lambda binding: binding["output"].zero_(),
+    )
+    caches = (torch.empty(2, 128, 2, 192), torch.empty(2, 128, 2, 128))
+    call = impl._prepared_call(
+        object(),
+        state,
+        ("extend", 128, 2, 16, (6144, 192, 1), (4096, 128, 1)),
+        benchmark=False,
+        caches=caches,
+    )
+    call.produce()
+    call.invoke()
+    assert all(reference() is not None for reference in references)
+    # Publishing a prepared plan retains owners, but discards the priming call.
+    published = SimpleNamespace(state=state, owners=call.owners)
+    del call
+    assert all(reference() is None for reference in references)
+    assert published.state is state
+
+
 def test_b12x_attention_requires_prepared_decode_plan() -> None:
     impl = object.__new__(B12xPagedAttentionImpl)
+    impl._noncausal = None
     impl._plans = {}
     impl._verify_q_per_req = 0
     impl._extend_q_capacities = (16,)
     metadata = SimpleNamespace(max_query_len=1)
 
     with pytest.raises(PreparationResourceUnavailableError, match="not prepared"):
-        impl._select_plan(metadata, 7, 7, 7, 64)
+        impl._select_plan(
+            metadata,
+            7,
+            7,
+            7,
+            64,
+            query_stride=(4096, 128, 1),
+            output_stride=(4096, 128, 1),
+        )
 
 
 def test_b12x_attention_fp8_descales_follow_request_batch() -> None:
     impl = object.__new__(B12xPagedAttentionImpl)
+    impl._noncausal = None
     impl.kv_cache_dtype = "fp8_e4m3"
     layer = SimpleNamespace(
         _k_scale=torch.tensor(2.0),
@@ -625,6 +1014,7 @@ def test_b12x_attention_fp8_descales_follow_request_batch() -> None:
 
 def test_b12x_attention_sinks_refresh_in_place_after_reload() -> None:
     impl = object.__new__(B12xPagedAttentionImpl)
+    impl._noncausal = None
     source = torch.tensor([1.0, 2.0], dtype=torch.bfloat16)
     impl._sinks_source = source
     impl.sinks = None
@@ -795,7 +1185,7 @@ def test_b12x_dsa_indexer_live_rows_reuse_capacity_with_high_page_ids(
 
     if torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("requires SM12x")
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", torch.accelerator.current_device_index())
     torch.manual_seed(71)
     heads, topk, max_rows, width = 16, 512, 128, 16
     packed = pack_index_k_cache_reference(torch.randn(1024, 128, device=device))
@@ -925,7 +1315,7 @@ def test_b12x_dsa_indexer_live_rows_reuse_capacity_with_high_page_ids(
                     run(live_rows)
                 q.copy_((-q.float()).to(q.dtype))
                 graph.replay()
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 torch.testing.assert_close(
                     output[:live_rows].sort(dim=1).values,
                     expected(live_rows),
@@ -934,3 +1324,134 @@ def test_b12x_dsa_indexer_live_rows_reuse_capacity_with_high_page_ids(
                 )
             finally:
                 graph.reset()
+
+
+@pytest.mark.parametrize("page_size,batch", [(64, 1), (128, 4)])
+def test_b12x_noncausal_dflash_cache_and_graph(default_vllm_config, page_size, batch):
+    """DFlash windows retain future queries, sinks and live lengths on replay."""
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.preparation import PreparationSession
+
+    from tests.v1.attention.utils import dense_kv_cache_views
+    from vllm.utils.b12x import B12xWorkload
+
+    _require_b12x_paged_attention()
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    config = default_vllm_config
+    config.model_config = SimpleNamespace(
+        dtype=torch.bfloat16, max_model_len=4096, is_hybrid=True
+    )
+    config.cache_config.block_size = page_size
+    config.scheduler_config.max_num_seqs = 4
+    config.scheduler_config.max_num_batched_tokens = 64
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=7)
+    config.attention_config.use_non_causal = True
+    sinks = torch.linspace(-1, 1, 16, dtype=torch.bfloat16, device=device)
+    impl = B12xPagedAttentionImpl(
+        num_heads=16,
+        head_size=128,
+        scale=128**-0.5,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=1024,
+        kv_cache_dtype="bfloat16",
+        sinks=sinks,
+    )
+    impl.process_weights_after_loading(torch.bfloat16)
+    spec = B12xPagedAttentionBackend.customize_spec(
+        FullAttentionSpec(
+            block_size=page_size,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+        )
+    )
+    first = (1 << 31) // (2 * spec.page_size_bytes // 2) + 1
+    page_count = first + batch * (4096 // page_size)
+    raw = torch.empty(
+        page_count * 2 * spec.page_size_bytes, dtype=torch.uint8, device=device
+    )
+    cache, peer = dense_kv_cache_views(raw, spec, page_count, 2, KVCacheLayout.BLHNC)
+    cache[0].zero_()
+    cache[first:].normal_()
+    peer[first:].fill_(11)
+    pages = (
+        (torch.randperm(page_count - first, device=device) + first)
+        .to(torch.int32)
+        .reshape(batch, -1)
+    )
+    layer = SimpleNamespace(kv_cache=cache)
+    qkv = torch.randn(batch * 8, 18, 128, dtype=torch.bfloat16, device=device)
+    query = qkv[:, :16]
+    output = torch.empty_like(query)
+    metadata = b12x.B12xPagedMetadata(
+        num_actual_tokens=batch * 8,
+        max_query_len=8,
+        query_start_loc=torch.arange(batch + 1, dtype=torch.int32, device=device) * 8,
+        max_seq_len=4096,
+        seq_lens=torch.full((batch,), 8, dtype=torch.int32, device=device),
+        block_table=pages,
+        slot_mapping=torch.empty(0, dtype=torch.int64, device=device),
+        causal=False,
+    )
+    workload = B12xWorkload(
+        stage="state",
+        token_counts=(8, 16, 24, 32, 64),
+        fixed_token_counts=(8, 16, 24, 32),
+        output_dtype=torch.bfloat16,
+        max_tokens=64,
+        max_seqs=4,
+        max_model_len=4096,
+        speculative_tokens=7,
+    )
+    (unit,) = impl.get_b12x_preparation_units(layer, workload)
+
+    def run():
+        return impl.forward(layer, query, query, query, cache, metadata, output)
+
+    with PreparationSession(device=device, autotune=True) as session:
+        session.configure_compile_workers(2)
+        session.prepare(unit.requests).close()
+        run()
+        session.freeze()
+        graph = torch.cuda.CUDAGraph()
+        with (
+            kernel_resolution_guard("DFlash noncausal graph"),
+            session.capture(),
+            torch.cuda.graph(graph),
+        ):
+            run()
+        for lengths in ([8, 129, 1032, 0], [2049, 1024, 255, 8]):
+            lengths = lengths[:batch]
+            metadata.seq_lens.copy_(
+                torch.tensor(lengths, dtype=torch.int32, device=device)
+            )
+            query.neg_()
+            output.fill_(torch.nan)
+            graph.replay()
+            references = []
+            for request, length in enumerate(lengths):
+                if length == 0:
+                    references.append(torch.zeros(8, 16, 128, device=device))
+                    continue
+                positions = torch.arange(length, device=device)
+                physical = pages[request, positions // page_size].long()
+                k = cache[physical, 0, positions % page_size].float()
+                v = cache[physical, 1, positions % page_size].float()
+                q = query[request * 8 : (request + 1) * 8].float()
+                scores = torch.einsum("qhd,kd->qhk", q, k) * 128**-0.5
+                visible = positions[None, :] >= (
+                    length - 8 + torch.arange(8, device=device)[:, None] - 1023
+                )
+                scores.masked_fill_(~visible[:, None, :], -torch.inf)
+                scores = torch.cat(
+                    (scores, sinks.float()[None, :, None].expand(8, -1, -1)), dim=-1
+                )
+                references.append(
+                    torch.einsum("qhk,kd->qhd", scores.softmax(-1)[..., :-1], v)
+                )
+            torch.testing.assert_close(
+                output.float(), torch.cat(references), atol=2e-2, rtol=2e-2
+            )
+            assert torch.all(peer[first:] == 11)
+        graph.reset()

@@ -23,12 +23,13 @@ from vllm.model_executor.weight_transfer import get_file_tensor_source
 @pytest.mark.parametrize(
     "load_format", ["safetensors", "fastsafetensors", "instanttensor"]
 )
+@pytest.mark.parametrize("table_dtype", [torch.uint8, torch.bfloat16])
 def test_file_ranges_bypass_payload_loading_in_mixed_files(
-    tmp_path, monkeypatch, load_format
+    tmp_path, monkeypatch, load_format, table_dtype
 ):
     """Only ordinary weights may reach a payload reader, even in mixed files."""
     table_name = "keep.table.weight"
-    table = torch.arange(48, dtype=torch.uint8).reshape(6, 8)
+    table = torch.arange(48).reshape(6, 8).to(table_dtype)
     scale = torch.tensor([0.5], dtype=torch.bfloat16)
     mixed = tmp_path / "part-1.safetensors"
     ordinary = tmp_path / "part-0.safetensors"
@@ -83,9 +84,12 @@ def test_file_ranges_bypass_payload_loading_in_mixed_files(
     assert mapped.is_meta
     descriptor = get_file_tensor_source(mapped)
     assert descriptor is not None
+    assert mapped.dtype == table_dtype
     with open(descriptor.path, "rb", buffering=0) as file:
         file.seek(descriptor.offset)
-        assert file.read(table.numel()) == bytes(table.flatten().tolist())
+        assert file.read(table.nbytes) == bytes(
+            table.view(torch.uint8).flatten().tolist()
+        )
 
 
 def test_file_weight_selector_preserves_explicit_source_precedence(tmp_path):

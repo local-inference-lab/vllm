@@ -49,6 +49,11 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.utils import sequence_parallel_chunk
+from vllm.model_executor.weight_transfer import (
+    allocate_weights,
+    copy_weight,
+    materialize_weight,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionType
@@ -156,14 +161,17 @@ class MiMoV2MoE(nn.Module):
 
         dtype = getattr(config, "moe_router_dtype", "float32")
         self.gate_dtype = str_dtype_to_torch_dtype(dtype)
-        self.gate = nn.Linear(
+        self.gate = allocate_weights(
+            nn.Linear,
             config.hidden_size,
             config.n_routed_experts,
             bias=False,
             dtype=self.gate_dtype,
         )
         self.gate.e_score_correction_bias = nn.Parameter(
-            torch.empty(config.n_routed_experts, dtype=self.gate_dtype)
+            allocate_weights(
+                torch.empty, config.n_routed_experts, dtype=self.gate_dtype
+            )
         )
 
         self.experts = FusedMoEFactory(
@@ -287,20 +295,22 @@ class MiMoV2Attention(nn.Module):
         )
 
         self.attention_sink_bias = (
-            torch.nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
+            torch.nn.Parameter(
+                allocate_weights(torch.empty, self.num_heads), requires_grad=False
+            )
             if add_swa_attention_sink_bias
             else None
         )
 
         sliding_window = sliding_window_size if sliding_window_size > -1 else None
 
-        # Use DiffKV backend when V has a different head dim than K.
-        # Auto-pick FA-DiffKV when FA3/4 is usable on this device, else fall
-        # back to TRITON_ATTN_DIFFKV.  Users can force a choice via
-        # `--attention-backend <FLASH_ATTN_DIFFKV|TRITON_ATTN_DIFFKV>`.
+        # Honor B12X and DiffKV selections for unequal QK/V head dimensions.
         if self.v_head_dim != self.head_dim:
             requested = get_current_vllm_config().attention_config.backend
-            if requested is not None and requested.name.endswith("_DIFFKV"):
+            if requested is not None and (
+                requested == AttentionBackendEnum.B12X
+                or requested.name.endswith("_DIFFKV")
+            ):
                 backend_enum = requested
             else:
                 fa_backend = AttentionBackendEnum.FLASH_ATTN_DIFFKV.get_class()
@@ -314,8 +324,9 @@ class MiMoV2Attention(nn.Module):
                 else:
                     backend_enum = AttentionBackendEnum.TRITON_ATTN_DIFFKV
             attn_backend = backend_enum.get_class()
-            assert hasattr(attn_backend, "set_head_size_v")
-            attn_backend.set_head_size_v(self.v_head_dim)
+            if backend_enum != AttentionBackendEnum.B12X:
+                assert hasattr(attn_backend, "set_head_size_v")
+                attn_backend.set_head_size_v(self.v_head_dim)
             logger.info_once("Using %s for attention.", attn_backend.get_name())
         else:
             attn_backend = None
@@ -492,23 +503,23 @@ def _shard_fp8_qkv_proj(
     v_head_dim: int,
     tp_rank: int,
     tp_size: int,
-    ckpt_tp: int,
+    checkpoint_tp_size: int,
     block: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Shard the fp8 qkv_proj weights for ``tp_rank``.
 
-    The checkpoint stores the fused QKV pre-sharded for ``ckpt_tp`` ranks (the
-    model config's ``num_key_value_heads``), each chunk holding that slice's
+    The checkpoint stores fused QKV in ``checkpoint_tp_size`` shards (the
+    model config's ``num_key_value_heads``), each holding that slice's
     Q, K and V rows:
 
-        [Q_0 | K_0 | V_0 | Q_1 | K_1 | V_1 | ... | Q_n | K_n | V_n]   (n = ckpt_tp)
+        [Q_0 | K_0 | V_0 | Q_1 | K_1 | V_1 | ... | Q_n | K_n | V_n]
 
-    Per chunk, Q has ``(num_heads / ckpt_tp) * head_dim`` rows, K has
-    ``(num_kv_heads / ckpt_tp) * head_dim`` rows, and V has
-    ``(num_kv_heads / ckpt_tp) * v_head_dim`` rows, and the fp8 block scales
+    Per chunk, Q has ``(num_heads / checkpoint_tp_size) * head_dim`` rows, K has
+    ``(num_kv_heads / checkpoint_tp_size) * head_dim`` rows, and V has
+    ``(num_kv_heads / checkpoint_tp_size) * v_head_dim`` rows, and the fp8 block scales
     are tiled per chunk too (``ceil(rows_per_chunk / block)`` rows each).
 
-    ``ckpt_tp`` is not the layer's KV-head count: a MiMo-V2.5 SWA layer has 8
+    ``checkpoint_tp_size`` is not the layer's KV-head count: a MiMo-V2.5 SWA layer has 8
     KV heads over 4 chunks, so each chunk carries two KV heads (3712 rows = 29
     blocks) while a GA layer has 4 KV heads over 4 chunks (3392 rows each).
 
@@ -516,7 +527,7 @@ def _shard_fp8_qkv_proj(
 
         [Q_1 | Q_2 | ... | Q_g | K_1 | K_2 | ... | K_g | V_1 | V_2 | ... | V_g]
 
-    When ``tp_size == ckpt_tp`` the checkpoint chunk *is* that layout, so a
+    When ``tp_size == checkpoint_tp_size`` the checkpoint chunk *is* that layout, so a
     plain chunk of both weight and scale suffices. Otherwise each rank's Q, K
     and V rows are gathered from the chunks that hold them, dequantized with
     the chunk's own scales, reordered, and re-quantized to fp8.
@@ -524,9 +535,13 @@ def _shard_fp8_qkv_proj(
     assert num_heads % tp_size == 0, (
         f"num_heads={num_heads} must be divisible by tp_size={tp_size}."
     )
-    if ckpt_tp <= 0 or num_heads % ckpt_tp or num_kv_heads % ckpt_tp:
+    if (
+        checkpoint_tp_size <= 0
+        or num_heads % checkpoint_tp_size
+        or num_kv_heads % checkpoint_tp_size
+    ):
         raise ValueError(
-            f"fused qkv_proj is pre-sharded at {ckpt_tp} chunks, which do not "
+            f"fused qkv_proj has {checkpoint_tp_size} chunks, which do not "
             f"divide num_heads={num_heads} / num_kv_heads={num_kv_heads}."
         )
     # When there are fewer KV heads than ranks, vLLM replicates them
@@ -551,13 +566,14 @@ def _shard_fp8_qkv_proj(
         range(tp_rank * (num_heads // tp_size), (tp_rank + 1) * (num_heads // tp_size))
     )
 
-    rows_per_chunk = w_full.shape[0] // ckpt_tp
-    q_per_chunk = (num_heads // ckpt_tp) * head_dim
-    k_per_chunk = (num_kv_heads // ckpt_tp) * head_dim
-    v_per_chunk = (num_kv_heads // ckpt_tp) * v_head_dim
+    rows_per_chunk = w_full.shape[0] // checkpoint_tp_size
+    q_per_chunk = (num_heads // checkpoint_tp_size) * head_dim
+    k_per_chunk = (num_kv_heads // checkpoint_tp_size) * head_dim
+    v_per_chunk = (num_kv_heads // checkpoint_tp_size) * v_head_dim
     if q_per_chunk + k_per_chunk + v_per_chunk != rows_per_chunk:
         raise ValueError(
-            f"fused qkv_proj has {w_full.shape[0]} rows, not {ckpt_tp} chunks of "
+            f"fused qkv_proj has {w_full.shape[0]} rows, not "
+            f"{checkpoint_tp_size} chunks of "
             f"{q_per_chunk} Q + {k_per_chunk} K + {v_per_chunk} V rows."
         )
 
@@ -565,7 +581,7 @@ def _shard_fp8_qkv_proj(
     # a chunk is a whole number of blocks (the SWA chunks are: 3712 = 29 * 128).
     chunk_scale_rows = cdiv(rows_per_chunk, block)
     rows = torch.arange(w_full.shape[0])
-    per_chunk_scales = s_full.shape[0] == ckpt_tp * chunk_scale_rows
+    per_chunk_scales = s_full.shape[0] == checkpoint_tp_size * chunk_scale_rows
     if per_chunk_scales:
         scale_index = (rows // rows_per_chunk) * chunk_scale_rows + (
             rows % rows_per_chunk
@@ -575,22 +591,22 @@ def _shard_fp8_qkv_proj(
     else:
         raise ValueError(
             f"fused qkv_proj scale has {s_full.shape[0]} rows, expected either "
-            f"{ckpt_tp * chunk_scale_rows} ({ckpt_tp} chunks of "
+            f"{checkpoint_tp_size * chunk_scale_rows} ({checkpoint_tp_size} chunks of "
             f"{chunk_scale_rows} rows) or {cdiv(w_full.shape[0], block)} "
             f"(one continuous grid)"
         )
 
-    if tp_size == ckpt_tp and per_chunk_scales:
+    if tp_size == checkpoint_tp_size and per_chunk_scales:
         # One checkpoint chunk per rank: already [Q | K | V] for that rank, and
         # its scale rows line up with ceil(rows_per_chunk / block).
         return (
-            w_full.chunk(ckpt_tp, dim=0)[tp_rank],
-            s_full.chunk(ckpt_tp, dim=0)[tp_rank],
+            w_full.chunk(checkpoint_tp_size, dim=0)[tp_rank],
+            s_full.chunk(checkpoint_tp_size, dim=0)[tp_rank],
         )
 
     # Gather this rank's Q, K and V rows from the chunks that hold them.
-    q_heads_per_chunk = num_heads // ckpt_tp
-    kv_heads_per_chunk = num_kv_heads // ckpt_tp
+    q_heads_per_chunk = num_heads // checkpoint_tp_size
+    kv_heads_per_chunk = num_kv_heads // checkpoint_tp_size
     head_rows = torch.arange(head_dim)
     v_head_rows = torch.arange(v_head_dim)
     row_index: list[torch.Tensor] = []
@@ -617,9 +633,23 @@ def _shard_fp8_qkv_proj(
             + v_head_rows
         )
     index = torch.cat(row_index)
-    grouped = w_full[index].to(torch.float32) * s_full[
-        scale_index[index]
-    ].repeat_interleave(block, dim=1)
+    # Materialize checkpoint views before indexing so lazy sources retain their
+    # backing storage. Keep only one training shard live at a time.
+    grouped = None
+    for chunk in (index // rows_per_chunk).unique().tolist():
+        selected = index // rows_per_chunk == chunk
+        chunk_start = chunk * rows_per_chunk
+        weight = materialize_weight(w_full[chunk_start : chunk_start + rows_per_chunk])
+        scale_rows = scale_index[index[selected]]
+        scale_start, scale_end = int(scale_rows.min()), int(scale_rows.max()) + 1
+        scale = materialize_weight(s_full[scale_start:scale_end])
+        values = weight[index[selected] - chunk_start].to(torch.float32) * scale[
+            scale_rows - scale_start
+        ].repeat_interleave(block, dim=1)
+        if grouped is None:
+            grouped = values.new_empty((index.numel(), values.shape[1]))
+        grouped[selected] = values
+    assert grouped is not None
     return _requantize_fp8(grouped, index.numel(), block, w_full.dtype)
 
 
@@ -841,7 +871,7 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
                 head_start = tp_rank * heads_per_rank
                 narrow_weight = loaded_weight.narrow(0, head_start, heads_per_rank)
 
-                param.data.copy_(narrow_weight)
+                copy_weight(param.data, narrow_weight)
                 loaded_params.add(name)
             else:
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -903,8 +933,7 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             v_head_dim=attn.v_head_dim,
             tp_rank=tp_rank,
             tp_size=tp_size,
-            # The fused qkv_proj is pre-sharded for this many ranks.
-            ckpt_tp=self.config.num_key_value_heads,
+            checkpoint_tp_size=self.config.num_key_value_heads,
         )
         sharded = {"weight": w_rank, "weight_scale_inv": s_rank}
         for kind, tensor in sharded.items():

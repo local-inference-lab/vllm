@@ -142,7 +142,7 @@ def test_fused_qkv_proj_sharding(geometry, tp_size):
             v_head_dim=v_head_dim,
             tp_rank=tp_rank,
             tp_size=tp_size,
-            ckpt_tp=ckpt_tp,
+            checkpoint_tp_size=ckpt_tp,
         )
         assert w_rank.shape == (rows_rank, COLS)
         assert s_rank.shape == (cdiv(rows_rank, BLOCK), scale.shape[1])
@@ -178,7 +178,7 @@ def test_exact_chunk_matches_checkpoint(geometry, tp_rank):
         v_head_dim=v_head_dim,
         tp_rank=tp_rank,
         tp_size=ckpt_tp,
-        ckpt_tp=ckpt_tp,
+        checkpoint_tp_size=ckpt_tp,
     )
     # The checkpoint chunk is the rank's slice, without re-quantization.
     # torch.equal has no FP8 kernel, so compare the underlying bytes.
@@ -213,8 +213,8 @@ def test_wrong_chunk_count_is_detected():
         tp_rank=0,
         tp_size=1,
     )
-    correct = _shard_fp8_qkv_proj(weight, scale, ckpt_tp=ckpt_tp, **kw)
-    wrong = _shard_fp8_qkv_proj(weight, scale, ckpt_tp=num_kv_heads, **kw)
+    correct = _shard_fp8_qkv_proj(weight, scale, checkpoint_tp_size=ckpt_tp, **kw)
+    wrong = _shard_fp8_qkv_proj(weight, scale, checkpoint_tp_size=num_kv_heads, **kw)
     assert correct[0].shape == wrong[0].shape
 
     expected = _owned_rows(
@@ -236,7 +236,7 @@ def test_malformed_scale_grid_rejected(scale_rows):
             v_head_dim=128,
             tp_rank=0,
             tp_size=4,
-            ckpt_tp=4,
+            checkpoint_tp_size=4,
         )
 
 

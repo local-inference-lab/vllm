@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Qwen4Exp model configuration."""
 
+from pathlib import Path
 from typing import Any, ClassVar, cast
 
 from transformers import PretrainedConfig
@@ -9,7 +10,10 @@ from transformers.models.qwen3_vl.configuration_qwen3_vl import (
     Qwen3VLVisionConfig,
 )
 
+from vllm.logger import init_logger
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
+
+logger = init_logger(__name__)
 
 _QSA_CONFIG_FIELDS = (
     "indexer_n_heads",
@@ -18,6 +22,43 @@ _QSA_CONFIG_FIELDS = (
     "indexer_budget",
     "indexer_compress_ratio",
 )
+
+
+def resolve_ple_embedding_dtype(
+    config: PretrainedConfig,
+    config_dict: dict[str, Any],
+    model: str | Path,
+    revision: str | None,
+) -> None:
+    """Infer omitted PLE storage dtype from checkpoint headers before allocation."""
+    text_config = config.get_text_config()
+    text_config_dict = config_dict.get("text_config", config_dict)
+    if not text_config.ple_layer_ids or text_config_dict.get("ple_embedding_dtype"):
+        return
+
+    from vllm.transformers_utils.config import get_safetensors_params_metadata
+
+    metadata = get_safetensors_params_metadata(str(model), revision=revision)
+    dtypes = {
+        info["dtype"]
+        for name, info in metadata.items()
+        if ".ple.ple_embedding.ngram_embedding.shard_" in name
+        and name.endswith(".weight")
+    }
+    if not dtypes:
+        return
+    storage_dtypes = {
+        "BF16": "bfloat16",
+        "F8_E4M3": "float8_e4m3fn",
+        "U8": "nvfp4",
+    }
+    if len(dtypes) != 1 or not dtypes.issubset(storage_dtypes):
+        raise ValueError(f"Unsupported PLE checkpoint storage dtypes: {sorted(dtypes)}")
+    text_config.ple_embedding_dtype = storage_dtypes[dtypes.pop()]
+    logger.info(
+        "Resolved PLE embedding storage dtype from checkpoint: %s",
+        text_config.ple_embedding_dtype,
+    )
 
 
 class Qwen4ExpVisionConfig(Qwen3VLVisionConfig):
