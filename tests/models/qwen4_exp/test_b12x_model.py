@@ -99,6 +99,7 @@ def test_hyperconnection_consumes_projection_views_without_staging(monkeypatch):
         hyperconnection_module.GatedResidual
     )
     nn.Module.__init__(layer)
+    layer.tp_size = 1
     layer.use_combine = True
     object.__setattr__(layer, "_workspace", object())
     layer.lora_rank, layer.hc_count = 8, 4
@@ -132,6 +133,7 @@ def test_hyperconnection_benchmark_reproduces_activation_inputs() -> None:
         hyperconnection_module.GatedResidual
     )
     nn.Module.__init__(layer)
+    layer.tp_size = 1
     layer.config = SimpleNamespace(params_dtype=torch.bfloat16)
     layer.hc_count = 2
     layer.hidden_size = 4
@@ -155,6 +157,51 @@ def test_hyperconnection_benchmark_reproduces_activation_inputs() -> None:
     torch.testing.assert_close(activation, template)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_final_hyperconnection_compiles_with_shared_projection_capacity(monkeypatch):
+    """A smaller final projection must compile and reuse the ordinary HC workspace."""
+    layer = hyperconnection_module.GatedResidual.__new__(
+        hyperconnection_module.GatedResidual
+    )
+    nn.Module.__init__(layer)
+    layer.tp_size, layer.tp_rank = 2, 1
+    layer.use_combine = False
+    layer.lora_rank, layer.hc_count, layer.hidden_size = 16, 4, 16
+    factory = dict(device="cuda", dtype=torch.bfloat16)
+    layer.input_mix_weight_down = SimpleNamespace(weight=torch.randn(16, 64, **factory))
+    layer.input_mix_weight_up = SimpleNamespace(weight=torch.randn(32, 32, **factory))
+    workspace = SimpleNamespace(
+        local_down_fp32=torch.empty(8, 32, device="cuda", dtype=torch.float32),
+        local_down=torch.empty(8, 32, **factory),
+        local_gates=torch.empty(8, 32, **factory),
+        local_normalized=torch.empty(8, 32, **factory),
+    )
+    object.__setattr__(layer, "_workspace", workspace)
+    layer._binding = lambda _state, _operation: None
+
+    def gate_mean(normalized, logits, **kwargs):
+        return (normalized * logits.sigmoid()).view(-1, 4, 8).mean(dim=1)
+
+    api = SimpleNamespace(
+        run_scaled_silu=lambda projected, **kwargs: torch.nn.functional.silu(projected),
+        run_gate_mean=gate_mean,
+    )
+    monkeypatch.setattr(hyperconnection_module, "_hyperconnection_api", lambda: api)
+    monkeypatch.setattr(
+        hyperconnection_module,
+        "tensor_model_parallel_all_gather",
+        lambda tensor, dim: torch.cat((tensor, tensor), dim=dim),
+    )
+    compiled = torch.compile(layer._mix_normalized, backend="eager", fullgraph=True)
+    with torch.no_grad():
+        for rows in (4, 8, 4):
+            normalized = torch.randn(rows, 64, **factory)
+            expected, _ = layer._mix_normalized(normalized)
+            actual, injection = compiled(normalized)
+            torch.testing.assert_close(actual, expected)
+            assert injection is None
+
+
 def test_final_hyperconnection_declares_the_combine_norm_it_consumes(monkeypatch):
     from vllm.utils.b12x import B12xWorkload
 
@@ -166,6 +213,7 @@ def test_final_hyperconnection_declares_the_combine_norm_it_consumes(monkeypatch
         hyperconnection_module.GatedResidual
     )
     nn.Module.__init__(layer)
+    layer.tp_size = 1
     layer.use_combine = False
     layer._preparation_prefix = "model.hyper_connection_mixer"
     layer.hc_norm = SimpleNamespace(weight=torch.empty(1))
@@ -212,6 +260,7 @@ def test_hyperconnection_declares_one_capacity_per_operation(monkeypatch):
         hyperconnection_module.GatedResidual
     )
     nn.Module.__init__(layer)
+    layer.tp_size = 1
     layer.use_combine = True
     layer._preparation_prefix = "model.layers.0.hyperconnection"
     layer.hc_norm = SimpleNamespace(weight=torch.empty(1))
@@ -725,7 +774,12 @@ def test_disk_ple_preparation_refreshes_graph_output(tmp_path, monkeypatch) -> N
             memory,
         )
 
-    embedding = make_embedding("io_uring")
+    monkeypatch.delenv("VLLM_PLE_TABLE_MEMORY", raising=False)
+    monkeypatch.delenv("VLLM_PLE_CPU_OFFLOAD", raising=False)
+    embedding = make_embedding(
+        ple_embedding_module._resolve_ple_table_memory({}, config.ple_embedding_dtype)
+    )
+    assert embedding.requires_disk_preparation
     resident = make_embedding("device")
     rows = embedding._table_layout.padded_vocab_size
     table = torch.arange(rows * 32).reshape(rows, 32).remainder(251).to(torch.bfloat16)
@@ -892,16 +946,51 @@ def _allocate_aligned_mamba_cache(
     )[layer_name]
 
 
+@pytest.mark.parametrize("embedding_dtype", ["bfloat16", "float8_e4m3fn", "nvfp4"])
 @pytest.mark.parametrize(
-    ("enabled", "backend"), [(None, "device"), ("0", "device"), ("1", "mapped_host")]
+    ("enabled", "backend"), [(None, None), ("0", "device"), ("1", "mapped_host")]
 )
-def test_ple_cpu_offload_env_alias(monkeypatch, enabled, backend) -> None:
+def test_ple_cpu_offload_env_alias(
+    monkeypatch, embedding_dtype, enabled, backend
+) -> None:
     monkeypatch.delenv("VLLM_PLE_TABLE_MEMORY", raising=False)
     if enabled is None:
         monkeypatch.delenv("VLLM_PLE_CPU_OFFLOAD", raising=False)
     else:
         monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", enabled)
-    assert ple_embedding_module._resolve_ple_table_memory(None) == backend
+    if backend is None:
+        backend = "io_uring" if embedding_dtype == "bfloat16" else "device"
+    assert (
+        ple_embedding_module._resolve_ple_table_memory(None, embedding_dtype) == backend
+    )
+
+
+@pytest.mark.parametrize("embedding_dtype", ["bfloat16", "float8_e4m3fn", "nvfp4"])
+@pytest.mark.parametrize("policy", [None, "device", "ram", "disk"])
+def test_ple_checkpoint_file_filter_matches_storage_policy(
+    monkeypatch, embedding_dtype, policy
+) -> None:
+    monkeypatch.delenv("VLLM_PLE_TABLE_MEMORY", raising=False)
+    monkeypatch.delenv("VLLM_PLE_CPU_OFFLOAD", raising=False)
+    model = model_module.Qwen4ExpForCausalLM.__new__(model_module.Qwen4ExpForCausalLM)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        ple_layer_ids=[2], ple_embedding_dtype=embedding_dtype
+    )
+    model.vllm_config = SimpleNamespace(
+        additional_config={} if policy is None else {"ple_table_memory": policy},
+        kernel_config=SimpleNamespace(linear_backend="b12x", moe_backend="b12x"),
+    )
+    selector = model.checkpoint_file_weight_filter
+    if policy == "disk" or (policy is None and embedding_dtype == "bfloat16"):
+        assert selector is not None
+        assert selector(
+            "model.language_model.layers.1.ple.ple_embedding."
+            "ngram_embedding.shard_0.weight"
+        )
+        assert not selector("model.language_model.layers.1.ple.key_proj.weight")
+    else:
+        assert selector is None
 
 
 @pytest.mark.parametrize(

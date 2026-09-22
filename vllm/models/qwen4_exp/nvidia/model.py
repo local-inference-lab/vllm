@@ -891,7 +891,9 @@ class Qwen4ExpForCausalLM(
         if (
             uses_b12x(self.vllm_config)
             and self.config.ple_layer_ids
-            and _resolve_ple_table_memory(self.vllm_config.additional_config)
+            and _resolve_ple_table_memory(
+                self.vllm_config.additional_config, self.config.ple_embedding_dtype
+            )
             == "io_uring"
         ):
             return _is_file_backed_ple_weight

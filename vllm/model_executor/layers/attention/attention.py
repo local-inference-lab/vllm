@@ -52,6 +52,7 @@ from vllm.v1.kv_cache_interface import (
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
+    from vllm.v1.attention.backends.b12x import B12xPagedAttentionImpl
 
 logger = init_logger(__name__)
 
@@ -414,6 +415,8 @@ class Attention(nn.Module, AttentionLayerBase):
             if block_n is not None:
                 extra_impl_args.setdefault("block_n", block_n)
 
+        if self.attn_backend.get_name() == "B12X":
+            extra_impl_args["head_size_v"] = self.head_size_v
         impl_cls = self.attn_backend.get_impl_cls()
         self.impl = impl_cls(  # type: ignore[assignment]  # impl_cls always returns an AttentionImpl subclass
             num_heads,
@@ -497,12 +500,12 @@ class Attention(nn.Module, AttentionLayerBase):
             # Plans hold views of the bound cache. Drop them before the base
             # class publishes a replacement; the next preparation collection
             # declares plans against the new cache.
-            self.impl._plans = {}
+            cast("B12xPagedAttentionImpl", self.impl)._plans = {}
         super().bind_kv_cache(kv_cache)
 
     def unbind_kv_cache(self) -> None:
         if self._uses_b12x_paged_preparation():
-            self.impl._plans = {}
+            cast("B12xPagedAttentionImpl", self.impl)._plans = {}
         super().unbind_kv_cache()
 
     def forward(

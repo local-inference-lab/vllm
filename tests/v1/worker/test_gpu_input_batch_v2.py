@@ -178,8 +178,8 @@ def test_boundary_auxiliary_restore_survives_slot_reuse_and_virtual_attention_pa
     state.blocks.copy_(
         torch.tensor(
             [
-                [[4, 8], [5, 9], [12, 13]],
-                [[6, auxiliary_block], [7, 11], [14, 15]],
+                [[4, 8], [5, 9], [12, 13], [0, 0]],
+                [[6, auxiliary_block], [7, 11], [14, 15], [0, 0]],
             ],
             device=device,
         )
@@ -187,9 +187,9 @@ def test_boundary_auxiliary_restore_survives_slot_reuse_and_virtual_attention_pa
     idx = torch.tensor([1, 0], dtype=torch.int32, device=device)
     capture = torch.tensor(
         [
-            [[7, 0, 0], [0, 11, 0]],
-            [[0, 0, 0], [0, 0, 0]],
-            [[0, -1, 0], [-1, 1, 0]],
+            [[7, 0, 0, 0], [0, 11, 0, 0]],
+            [[0, 0, 0, 0], [0, 0, 0, 0]],
+            [[0, -1, 0, 0], [-1, 1, 0, 0]],
         ],
         dtype=torch.int32,
         device=device,
@@ -229,11 +229,13 @@ def test_boundary_auxiliary_restore_survives_slot_reuse_and_virtual_attention_pa
         lora_request=None,
         boundary_checkpoint=BoundaryCheckpoint(1, 7, ((6,),), (auxiliary_block,)),
         boundary_checkpoint_blocks=((12, 13), (14, 15)),
+        recurrent_prefill_tail_boundary=4,
     )
     state.add_request(restore_slot, request)
     torch.testing.assert_close(raw_state[restore_slot], expected_state)
     assert anchors[restore_slot].item() == 6
     assert accepted[restore_slot].item() == 1
+    assert state.seen[restore_slot, 3].item() == 1
     torch.testing.assert_close(state.get_hidden_states(auxiliary_block), hidden[:1])
     torch.testing.assert_close(
         state.get_hidden_states(auxiliary_block, draft=True), spec_hidden[:1]
@@ -251,15 +253,15 @@ def test_boundary_capture_uses_stop_trimmed_endpoint_and_leaves_middle_steps_pri
     state = SimpleNamespace(
         metadata=t(
             [
-                [1, 7, 0, 7, 8, 1],
-                [1, 7, 0, 7, 30, 1],
-                [0, 7, 0, 7, 30, 1],
-                [1, 7, 0, 12, 30, 1],
-                [1, 9, 4, 9, 30, 1],
+                [1, 7, 0, 7, 8, 1, 0],
+                [1, 7, 0, 7, 30, 1, 0],
+                [0, 7, 0, 7, 30, 1, 0],
+                [1, 7, 0, 12, 30, 1, 0],
+                [1, 9, 4, 9, 30, 1, 4],
             ]
         ),
         stop_tokens=torch.full((5, 128), 99, dtype=torch.int32, device="cuda"),
-        seen=t([[0, 0, 0], [1, 0, 0], [1, 0, 0], [1, 0, 0], [0, 0, 0]]),
+        seen=t([[0, 0, 0, 0], [1, 0, 0, 0], [1, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]]),
     )
     sampled = t(
         [
@@ -276,7 +278,7 @@ def test_boundary_capture_uses_stop_trimmed_endpoint_and_leaves_middle_steps_pri
     rejected = t([0, 0, 0, 0, 0])
     last_sampled = t([0, 0, 0, 0, 0])
     all_tokens = torch.zeros((5, 32), dtype=torch.int32, device="cuda")
-    capture = torch.empty((3, 5, 3), dtype=torch.int32, device="cuda")
+    capture = torch.empty((3, 5, 4), dtype=torch.int32, device="cuda")
     post_update(
         t([0, 1, 2, 3, 4]),
         computed,
@@ -292,27 +294,28 @@ def test_boundary_capture_uses_stop_trimmed_endpoint_and_leaves_middle_steps_pri
         capture,
     )
     assert capture[0].tolist() == [
-        [7, 7, 0],
-        [0, 10, 0],
-        [0, 0, 0],
-        [0, 11, 0],
-        [0, 0, 4],
+        [7, 7, 0, 0],
+        [0, 10, 0, 0],
+        [0, 0, 0, 0],
+        [0, 11, 0, 0],
+        [0, 0, 4, 4],
     ]
     assert capture[1].tolist() == [
-        [0, 0, 0],
-        [0, 1, 0],
-        [0, 3, 0],
-        [0, 2, 0],
-        [0, 0, 0],
+        [0, 0, 0, 0],
+        [0, 1, 0, 0],
+        [0, 3, 0, 0],
+        [0, 2, 0, 0],
+        [0, 0, 0, 0],
     ]
     assert num_sampled.tolist() == [1, 2, 4, 3, 0]
     assert computed.tolist() == [7, 10, 12, 11, 4]
     assert total.tolist() == [8, 11, 13, 12, 9]
     assert last_sampled.tolist() == [10, 99, 13, 99, 0]
-    assert capture[2][0].tolist() == [6, 6, -1]
+    assert capture[2][0].tolist() == [6, 6, -1, -1]
     assert capture[2][1, 1].item() == 8
     assert capture[2][3, 1].item() == 17
     assert capture[2][4, 2].item() == 22
+    assert capture[2][4, 3].item() == 22
 
 
 @pytest.mark.parametrize(

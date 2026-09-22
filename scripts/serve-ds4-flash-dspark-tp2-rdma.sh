@@ -11,9 +11,9 @@ CLUSTER_LAUNCHER="${CLUSTER_LAUNCHER:-${SPARK_ROOT}/launch-cluster.sh}"
 HEAD_IP="${HEAD_IP:-192.168.42.223}"
 WORKER_IP="${WORKER_IP:-192.168.42.110}"
 ETH_IF="${ETH_IF:-enP7s7}"
-IB_IF="${IB_IF:-rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1}"
-HEAD_IB_IF="${HEAD_IB_IF:-rocep1s0f1,roceP2p1s0f1}"
-WORKER_IB_IF="${WORKER_IB_IF:-rocep1s0f0,roceP2p1s0f0}"
+IB_IF="${IB_IF:-rocep1s0f0,roceP2p1s0f0}"
+HEAD_IB_IF="${HEAD_IB_IF:-${IB_IF}}"
+WORKER_IB_IF="${WORKER_IB_IF:-${IB_IF}}"
 NCCL_IB_MERGE_NICS="${NCCL_IB_MERGE_NICS:-1}"
 MASTER_PORT="${MASTER_PORT:-29655}"
 CONTAINER_NAME="${CONTAINER_NAME:-vllm_ds4_flash_dspark_tp2}"
@@ -52,8 +52,8 @@ Usage: $0 [launcher options] [-- vLLM options]
 
 Launch DeepSeek-V4-Flash with DSpark speculative decoding and TP=2 across
 tachyon and luxon through the Spark cluster launcher (one native vLLM rank per
-node, management LAN for bootstrap, both RoCE rails on the direct ConnectX-7
-link). ALLREDUCE=rocenante (default) routes the TP all-reduces and the logits
+node, management LAN for bootstrap, both RoCE interfaces through the ConnectX-7
+switch). ALLREDUCE=rocenante (default) routes the TP all-reduces and the logits
 all-gather to the b12x one-shot RoCE collectives; ALLREDUCE=nccl keeps NCCL.
 
 Launcher options:
@@ -300,8 +300,9 @@ cluster_args=(
   --env "VLLM_ENABLE_PCIE_ALLREDUCE=0"
   --env "NCCL_NET_PLUGIN=none"
   --env "NCCL_IB_GID_INDEX=3"
+  --env "NCCL_IB_TC=${NCCL_IB_TC:-106}"
+  --env "B12X_ROCE_TRAFFIC_CLASS=${B12X_ROCE_TRAFFIC_CLASS:-${NCCL_IB_TC:-106}}"
   --env "NCCL_IB_MERGE_NICS=${NCCL_IB_MERGE_NICS}"
-  --env "NCCL_IB_SUBNET_AWARE_ROUTING=1"
 )
 if [[ "${ALLREDUCE}" == rocenante ]]; then
   # b12x.comm.roce: B12X_ROCE_HCA falls back to the per-node NCCL_IB_HCA the

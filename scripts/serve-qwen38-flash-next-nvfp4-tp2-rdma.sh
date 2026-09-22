@@ -12,9 +12,9 @@ CLUSTER_LAUNCHER="${CLUSTER_LAUNCHER:-${SPARK_ROOT}/launch-cluster.sh}"
 HEAD_IP="${HEAD_IP:-192.168.42.223}"
 WORKER_IP="${WORKER_IP:-192.168.42.110}"
 ETH_IF="${ETH_IF:-enP7s7}"
-IB_IF="${IB_IF:-rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1}"
-HEAD_IB_IF="${HEAD_IB_IF:-rocep1s0f1,roceP2p1s0f1}"
-WORKER_IB_IF="${WORKER_IB_IF:-rocep1s0f0,roceP2p1s0f0}"
+IB_IF="${IB_IF:-rocep1s0f0,roceP2p1s0f0}"
+HEAD_IB_IF="${HEAD_IB_IF:-${IB_IF}}"
+WORKER_IB_IF="${WORKER_IB_IF:-${IB_IF}}"
 NCCL_IB_MERGE_NICS="${NCCL_IB_MERGE_NICS:-1}"
 MASTER_PORT="${MASTER_PORT:-29638}"
 TP_SIZE="${TP_SIZE:-2}"
@@ -57,7 +57,7 @@ Usage: $0 [launcher options] [-- vLLM options]
 
 Launch Qwen 3.8 Flash Next with TP_SIZE=1 on the local Spark or TP_SIZE=2
 (default) across tachyon and luxon. TP=2 uses the management LAN for bootstrap
-and both RoCE interfaces on the direct ConnectX-7 link. ALLREDUCE=rocenante
+and both RoCE interfaces through the ConnectX-7 switch. ALLREDUCE=rocenante
 (default) routes supported TP=2 collectives through b12x one-shot RoCE;
 ALLREDUCE=nccl keeps the existing NCCL path. TP=1 uses neither transport.
 
@@ -314,8 +314,9 @@ cluster_args=(
   --env "VLLM_ENABLE_PCIE_ALLREDUCE=0"
   --env "NCCL_NET_PLUGIN=none"
   --env "NCCL_IB_GID_INDEX=3"
+  --env "NCCL_IB_TC=${NCCL_IB_TC:-106}"
+  --env "B12X_ROCE_TRAFFIC_CLASS=${B12X_ROCE_TRAFFIC_CLASS:-${NCCL_IB_TC:-106}}"
   --env "NCCL_IB_MERGE_NICS=${NCCL_IB_MERGE_NICS}"
-  --env "NCCL_IB_SUBNET_AWARE_ROUTING=1"
 )
 if ((TP_SIZE == 1)); then
   cluster_args=(--solo "${cluster_args[@]}")

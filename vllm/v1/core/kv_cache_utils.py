@@ -1005,6 +1005,14 @@ def check_enough_kv_cache_memory(
             if groups
             else available_memory
         )
+        if vllm_config.use_request_boundary_checkpoints:
+            _check_enough_kv_cache_memory(
+                check_memory,
+                partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),
+                vllm_config.model_config.max_model_len,
+                partial(_estimate_max_model_len_from_groups, vllm_config, groups),
+            )
+            return
         _check_enough_kv_cache_memory(
             check_memory,
             lambda: max_memory_usage_bytes(vllm_config, kv_cache_spec.values()),
@@ -1068,6 +1076,39 @@ def is_kv_cache_spec_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
     return True
 
 
+def _request_boundary_reserve_blocks(vllm_config: VllmConfig, num_groups: int) -> int:
+    """Count private endpoints and the immutable checkpoint used by a restore."""
+    if not num_groups or not vllm_config.use_request_boundary_checkpoints:
+        return 0
+
+    from vllm.v1.core.boundary_checkpoint import (
+        NUM_BOUNDARY_CHECKPOINT_SLOTS,
+        get_prefill_tail_checkpoint_position,
+    )
+
+    # KVCacheManager.allocate_slots reserves one block per group and one
+    # auxiliary block per endpoint, separately from the live sequence state.
+    # Restoring a checkpoint pins its source until the reader finishes, while
+    # partial-tail CoW creates writable state. One additional bundle covers
+    # these source pages and auxiliary state alongside the private endpoints.
+    scheduler = vllm_config.scheduler_config
+    chunk_budget = (
+        scheduler.max_num_scheduled_tokens
+        if scheduler.max_num_scheduled_tokens is not None
+        else scheduler.max_num_batched_tokens
+    )
+    has_prefill_tail = (
+        get_prefill_tail_checkpoint_position(
+            vllm_config.model_config.max_model_len, chunk_budget, None
+        )
+        is not None
+    )
+    # Short-context capacity must not reserve a tail endpoint that no request
+    # can reach. The capacity search calls this for each candidate context.
+    slots = NUM_BOUNDARY_CHECKPOINT_SLOTS - int(not has_prefill_tail)
+    return (slots + 1) * (num_groups + 1)
+
+
 def get_max_concurrency_for_kv_cache_config(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> float:
@@ -1095,6 +1136,9 @@ def get_max_concurrency_for_kv_cache_config(
             host_blocks_per_request += required
         else:
             num_blocks_per_request += required
+    num_blocks_per_request += _request_boundary_reserve_blocks(
+        vllm_config, len(kv_cache_config.kv_cache_groups)
+    )
     limits = [kv_cache_config.num_blocks / num_blocks_per_request]
     if host_blocks_per_request:
         assert kv_cache_config.hisparse_host_num_blocks is not None
@@ -1747,6 +1791,9 @@ def _get_kv_cache_group_allocation_cost(
             group.kv_cache_spec.page_size_bytes,
         )
         for group in kv_cache_groups
+    )
+    num_blocks_per_request += _request_boundary_reserve_blocks(
+        vllm_config, len(kv_cache_groups)
     )
     return _get_kv_cache_bytes_per_block(kv_cache_groups) * num_blocks_per_request
 
@@ -2776,7 +2823,10 @@ def _max_memory_usage_bytes_from_groups(
         return 0
 
     if vllm_config.attention_config.hisparse_config is not None:
-        return get_hisparse_gpu_memory_usage(vllm_config, kv_cache_groups)
+        return get_hisparse_gpu_memory_usage(vllm_config, kv_cache_groups) + (
+            _request_boundary_reserve_blocks(vllm_config, len(kv_cache_groups))
+            * _pool_bytes_per_block(kv_cache_groups)
+        )
 
     if (glm5_layout := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
         (
@@ -2800,6 +2850,9 @@ def _max_memory_usage_bytes_from_groups(
         )
         if tail_names:
             total_blocks += 1
+        total_blocks += _request_boundary_reserve_blocks(
+            vllm_config, len(kv_cache_groups)
+        )
         return total_blocks * (len(mla_names) * mla_page + len(idx_names) * idx_page)
 
     bytes_per_block = _pool_bytes_per_block(kv_cache_groups)
@@ -2814,6 +2867,7 @@ def _max_memory_usage_bytes_from_groups(
                 spec.page_size_bytes,
             )
 
+    total_blocks += _request_boundary_reserve_blocks(vllm_config, len(kv_cache_groups))
     return bytes_per_block * total_blocks
 
 

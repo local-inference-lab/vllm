@@ -21,6 +21,11 @@ else()
       "-DSOURCE_DIR=<SOURCE_DIR>"
       "-DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/flashkda-packed-checkpoints.patch"
       -P "${CMAKE_CURRENT_LIST_DIR}/apply_flashkda_checkpoint_patch.cmake"
+    COMMAND
+      "${CMAKE_COMMAND}"
+      "-DSOURCE_DIR=<SOURCE_DIR>"
+      "-DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/flashkda-sm120-cta-copy.patch"
+      -P "${CMAKE_CURRENT_LIST_DIR}/apply_flashkda_checkpoint_patch.cmake"
   )
 endif()
 

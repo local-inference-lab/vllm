@@ -4,6 +4,7 @@
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
+from weakref import ref
 
 import pytest
 from torch import nn
@@ -165,6 +166,93 @@ def test_startup_plan_apply_gate(plan_env):
 
 # Memory accounting of the profiling run (Worker.determine_available_memory).
 
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_profile_release_collects_cycles_before_flushing_allocator(
+    monkeypatch, failure
+):
+    """The allocator flush must follow plan release and Python cycle collection."""
+
+    class _Batch:
+        def release(self):
+            self.resource = None
+            if failure:
+                raise RuntimeError("release failed")
+
+    class _Temporary:
+        def __init__(self):
+            self.cycle = self
+
+    batch = _Batch()
+    batch.resource = _Temporary()
+    resource_ref = ref(batch.resource)
+    worker = SimpleNamespace(_b12x_profile_batch=batch)
+    del batch
+    events = []
+
+    def empty_cache():
+        assert resource_ref() is None
+        assert worker._b12x_profile_batch is None
+        events.append("empty_cache")
+
+    monkeypatch.setattr(
+        gpu_worker.torch.accelerator, "synchronize", lambda: events.append("sync")
+    )
+    monkeypatch.setattr(gpu_worker.torch.accelerator, "empty_cache", empty_cache)
+    if failure:
+        with pytest.raises(RuntimeError, match="release failed"):
+            gpu_worker.Worker._release_b12x_profile_state(worker)
+    else:
+        gpu_worker.Worker._release_b12x_profile_state(worker)
+    assert events == ["sync", "empty_cache"]
+
+
+def test_serving_kv_allocation_collects_temporary_cycles(monkeypatch):
+    """No profiling garbage or freed allocator blocks survive into KV allocation."""
+
+    class _Temporary:
+        def __init__(self):
+            self.cycle = self
+
+    temporary = _Temporary()
+    temporary_ref = ref(temporary)
+    del temporary
+    events: list[str] = []
+
+    def allocate(*args, **kwargs):
+        assert temporary_ref() is None
+        assert events == ["sync", "empty_cache"]
+        events.append("allocate")
+
+    worker = SimpleNamespace(
+        cache_config=SimpleNamespace(),
+        vllm_config=object(),
+        model_config=SimpleNamespace(enable_return_routed_experts=False),
+        model_runner=SimpleNamespace(initialize_kv_cache=allocate),
+        _maybe_get_memory_pool_context=lambda **kw: nullcontext(),
+    )
+    monkeypatch.setattr(gpu_worker, "set_current_vllm_config", lambda _: nullcontext())
+    monkeypatch.setattr(
+        gpu_worker, "ensure_kv_transfer_initialized", lambda *args: None
+    )
+    monkeypatch.setattr(
+        gpu_worker.torch.accelerator, "synchronize", lambda: events.append("sync")
+    )
+    monkeypatch.setattr(
+        gpu_worker.torch.accelerator,
+        "empty_cache",
+        lambda: events.append("empty_cache"),
+    )
+
+    gpu_worker.Worker.initialize_from_config(
+        worker,
+        SimpleNamespace(
+            num_blocks=32, kv_cache_layout=None, needs_kv_cache_zeroing=False
+        ),
+    )
+    assert events[-1] == "allocate"
+
+
 # The fallback reads only the sign of the measured drop and this process's torch
 # reservation; free memory is only logged, so no amount here is a device size.
 ANY_FREE_MEMORY = 8 * GiB_bytes
@@ -311,12 +399,27 @@ def test_execute_model_waits_previous_pp_send_before_forward(
 )
 @pytest.mark.parametrize("graph_estimate", [0, 4])
 @pytest.mark.parametrize("estimate_graphs", [False, True])
+@pytest.mark.parametrize(
+    "native_profile,final_native,overlap",
+    [
+        (None, 0, 0),  # Runners without native capture measurements retain the budget.
+        ((100, 103, 4), 103, 3),  # Persistent capture initialization.
+        ((100, 103, 4), 101, 1),  # Prepared-plan release frees part of the growth.
+        ((100, 103, 4), 100, 0),  # All native capture storage was temporary.
+        ((103, 103, 4), 107, 0),  # Bootstrap and cleanup growth are not capture cost.
+        ((100, 103, 1), 107, 1),  # The measured capture delta bounds the overlap.
+        ((100, 103, 4), 107, 3),  # Cleanup-only growth cannot increase the discount.
+    ],
+)
 def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
     monkeypatch,
     final_free_memory,
     expected_available_memory,
     graph_estimate,
     estimate_graphs,
+    native_profile,
+    final_native,
+    overlap,
 ):
     """KV admission counts retained allocations, not released profiling blocks."""
     events: list[object] = []
@@ -326,10 +429,19 @@ def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
         events.append("profile_cudagraph_memory")
         return graph_estimate
 
+    def profile_run(prepare_profile_state):
+        prepare_profile_state()
+        events.append("profile_run")
+
+    def profile_glm_dcp_attention(prepare_profile_state):
+        prepare_profile_state()
+        events.append("profile_glm_dcp_attention")
+
     model_runner = SimpleNamespace(
+        cudagraph_native_memory_profile=native_profile,
         model_memory_usage=0,
-        profile_run=lambda prepare: (prepare(), events.append("profile_run")),
-        profile_glm_dcp_attention=lambda: events.append("profile_glm_dcp_attention"),
+        profile_run=profile_run,
+        profile_glm_dcp_attention=profile_glm_dcp_attention,
         profile_cudagraph_memory=profile_cudagraph_memory,
     )
     profile_result = SimpleNamespace(
@@ -373,7 +485,9 @@ def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
     def final_snapshot(**_kwargs):
         assert events[-3:] == ["collect", "synchronize", "empty_cache"]
         events.append("final_snapshot")
-        return SimpleNamespace(free_memory=final_free_memory)
+        return SimpleNamespace(
+            free_memory=final_free_memory, non_torch_memory=final_native
+        )
 
     monkeypatch.setattr(gpu_worker.gc, "collect", lambda: events.append("collect"))
     monkeypatch.setattr(
@@ -408,7 +522,9 @@ def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
         "prepare_b12x_profile_state",
         "profile_run",
         "release_b12x_profile_state",
+        "prepare_b12x_profile_state",
         "profile_glm_dcp_attention",
+        "release_b12x_profile_state",
         "prepare_b12x_profile_state",
         "profile_cudagraph_memory",
         "release_b12x_profile_state",
@@ -417,6 +533,7 @@ def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
         "empty_cache",
         "final_snapshot",
     ]
+    graph_estimate -= min(overlap, graph_estimate, 90 - final_free_memory)
     applied_graph_estimate = graph_estimate if estimate_graphs else 0
     assert available == expected_available_memory - applied_graph_estimate
     assert worker.peak_activation_memory == 5
@@ -478,8 +595,8 @@ def test_post_capture_recommendation_counts_measured_graph_memory_once(
         monkeypatch.setattr(gpu_worker, name, lambda *args: None)
     monkeypatch.setattr("vllm.utils.jit_monitor.activate", lambda **kwargs: None)
 
-    worker._compile_or_warm_up_model_after_preparation = (
-        lambda: gpu_worker.Worker._compile_or_warm_up_model_after_preparation(worker)
+    worker._compile_or_warm_up_model_after_preparation = lambda: (
+        gpu_worker.Worker._compile_or_warm_up_model_after_preparation(worker)
     )
     worker._b12x_session = None
     worker._get_cudagraph_capture_context = nullcontext

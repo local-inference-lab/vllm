@@ -188,16 +188,6 @@ Priority is **1 = highest** (tried first).
 ### b12x
 
 The optional [b12x](https://pypi.org/project/b12x/) backend supports causal
-decoder attention on NVIDIA SM120 and SM121 GPUs. Install and select it with:
-
-```bash
-uv pip install "vllm[b12x]"
-vllm serve <model> --attention-backend b12x
-```
-
-### b12x
-
-The optional [b12x](https://pypi.org/project/b12x/) backend supports causal
 decoder attention and compatible sparse MLA models on NVIDIA SM120 and SM121
 GPUs. The `B12X` selector chooses the implementation for the model's attention
 contract, including non-compressed DSA models and DeepSeek V4's compressed
@@ -207,6 +197,15 @@ sparse MLA path. Install and select it with:
 uv pip install "vllm[b12x]"
 vllm serve <model> --attention-backend b12x
 ```
+
+Noncausal sliding-window draft attention is implemented for BF16 KV caches
+with equal QK/V head dimensions. Select it independently through
+`speculative_config.attention_backend: B12X`. The adapter gathers each visible
+window from the paged cache into fixed storage and runs b12x's native varlen
+attention, including attention sinks. Query capacity comes from the configured
+speculative token count; sequence lengths remain GPU inputs. Preparation and
+CUDA graph replay use the same workspaces. Full-window noncausal attention and
+quantized noncausal KV caches are unsupported.
 
 ## MiniMax M3 Sparse Attention Backends
 

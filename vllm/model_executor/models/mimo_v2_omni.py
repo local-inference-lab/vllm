@@ -3,6 +3,7 @@
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 import einops
@@ -34,9 +35,15 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
+from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
+from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
+from vllm.multimodal.inputs import (
+    MultiModalFieldConfig,
+    MultiModalKwargsItem,
+    MultiModalKwargsItems,
+)
 from vllm.multimodal.parse import ImageSize, MultiModalDataItems
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
@@ -52,9 +59,11 @@ from vllm.transformers_utils.processors.mimo_v2_omni import (
     VideoAudioInput,
     _format_timestamp,
 )
+from vllm.transformers_utils.repo_utils import try_get_local_file
 
 from .interfaces import (
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsMultiModal,
     SupportsPP,
     SupportsQuant,
@@ -110,7 +119,7 @@ class MiMoVisionPatchMerger(nn.Module):
         self.hidden_size = context_dim * (spatial_merge_size**2)
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
-        self.ln_q = norm_layer(context_dim)
+        self.ln_q = allocate_weights(norm_layer, context_dim)
 
         self.mlp = nn.Sequential(
             ColumnParallelLinear(
@@ -215,7 +224,7 @@ class MiMoVisionAttention(nn.Module):
         self.use_sink = use_sink
         if use_sink:
             self.sinks = nn.Parameter(
-                torch.empty(num_heads),
+                allocate_weights(torch.empty, num_heads),
                 requires_grad=False,
             )
         else:
@@ -231,12 +240,7 @@ class MiMoVisionAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor,
     ) -> torch.Tensor:
-        """Window attention with the per-head sink applied to key 0.
-
-        The reference adds ``sinks[h]`` to the logit of each sequence's first
-        key, which the Triton prefill kernel supports directly, so the softmax
-        normalizes over the biased scores in one pass.
-        """
+        """Window attention with per-head null logits in the softmax denominator."""
         from vllm.v1.attention.ops.triton_prefill_attention import (
             context_attention_fwd,
         )
@@ -262,7 +266,6 @@ class MiMoVisionAttention(nn.Module):
             sliding_window_q=w,
             sliding_window_k=w,
             sinks=sinks,
-            sinks_bias_key0=True,
         )
         return output
 
@@ -1238,7 +1241,9 @@ class MiMoV2OmniDummyInputsBuilder(BaseDummyInputsBuilder[MiMoV2OmniProcessingIn
     info=MiMoV2OmniProcessingInfo,
     dummy_inputs=MiMoV2OmniDummyInputsBuilder,
 )
-class MiMoV2OmniForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsQuant):
+class MiMoV2OmniForCausalLM(
+    nn.Module, SupportsMultiModal, SupportsPP, SupportsQuant, SupportsEagle3
+):
     # To ensure correct weight loading and mapping.
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -1283,7 +1288,15 @@ class MiMoV2OmniForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsQ
                 prefix=maybe_prefix(prefix, "visual"),
             )
         audio_config = getattr(config, "audio_config", None)
-        model_path = vllm_config.model_config.model
+        model_config = vllm_config.model_config
+        config_path = try_get_local_file(
+            model_config.model, "config.json", revision=model_config.revision
+        )
+        model_path = (
+            str(config_path.parent)
+            if isinstance(config_path, Path)
+            else model_config.model
+        )
         self.audio_encoder: MimoAudioEncoder | None
         if audio_config is not None:
             with self._mark_tower_model(vllm_config, "audio"):
@@ -1301,6 +1314,24 @@ class MiMoV2OmniForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsQ
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
+
+    def get_mm_mapping(self) -> MultiModelKeys:
+        return MultiModelKeys.from_string_field(
+            language_model="language_model",
+            connector="visual.merger.",
+            tower_model="visual.",
+        )
+
+    def get_mm_lora_token_counts(
+        self,
+        *,
+        modality: str,
+        mm_kwargs: MultiModalKwargsItem | None,
+        num_mm_embeds: int,
+    ) -> tuple[int, int | None]:
+        if modality not in ("image", "video"):
+            raise NotImplementedError(f"No encoder token mapping for {modality}")
+        return num_mm_embeds * self.visual.spatial_merge_unit, num_mm_embeds
 
     def _parse_and_validate_image_input(
         self, **kwargs: object
