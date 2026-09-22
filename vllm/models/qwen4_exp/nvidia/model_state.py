@@ -392,6 +392,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
             model_specific_attn_metadata=model_metadata,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
+            uniform_decode_graph=input_batch.uniform_decode_graph,
         )
         if self.recoverssm is not None:
             self.recoverssm.record_step(

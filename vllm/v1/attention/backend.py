@@ -485,6 +485,9 @@ class CommonAttentionMetadata:
     _num_computed_tokens_cache: torch.Tensor | None = None
     _token_to_req_indices_cache: torch.Tensor | None = None
 
+    # True only when the selected graph excludes mixed/prefill kernels.
+    uniform_decode_graph: bool = False
+
     def batch_size(self) -> int:
         return self.seq_lens.shape[0]
 
