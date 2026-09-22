@@ -1185,6 +1185,13 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
             sections = tuple(map(int, sections))
         api = get_b12x_qsa()
         assert api is not None
+        dcp_geometry = {}
+        if self.dcp_size > 1:
+            dcp_geometry = dict(
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+            )
         return api.Caps(
             max_batch=self.max_seqs,
             max_raw_state_slots=self.max_seqs,
@@ -1206,9 +1213,7 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
             rms_norm_eps=float(self.indexer.q_layernorm.variance_epsilon),
             dtype=torch.bfloat16,
             kv_dtype=self.kv_cache_kernel_dtype,
-            dcp_size=self.dcp_size,
-            dcp_rank=self.dcp_rank,
-            cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+            **dcp_geometry,
             **geometry,
         )
 
@@ -1401,17 +1406,17 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
                 )
             local_rows = _dcp_local_length(
                 rows,
-                caps.dcp_size,
-                caps.dcp_rank,
-                caps.cp_kv_cache_interleave_size,
+                self.dcp_size,
+                self.dcp_rank,
+                self.cp_kv_cache_interleave_size,
             )
             local_groups = _dcp_local_length(
                 rows // caps.compress_ratio,
-                caps.dcp_size,
-                caps.dcp_rank,
+                self.dcp_size,
+                self.dcp_rank,
                 _compressed_dcp_interleave(
-                    caps.dcp_size,
-                    caps.cp_kv_cache_interleave_size,
+                    self.dcp_size,
+                    self.cp_kv_cache_interleave_size,
                     caps.compress_ratio,
                 ),
             )

@@ -39,9 +39,20 @@ def _nvfp4_compute_scale_factor(
     marlin_scales: torch.Tensor,
     a_dtype: torch.dtype | None = None,
 ) -> float:
-    """Compute the power-of-2 scale_factor needed so that all non-zero
-    values in marlin_scales * 2^7 are >= 2 after rescaling.
-    Returns a Python float (power of 2, >= 1.0)."""
+    """Compute the power-of-two rescaling factor for NVFP4 Marlin scales.
+
+    Args:
+        marlin_scales: Weight scales in the Marlin layout.
+        a_dtype: Activation dtype. FP16 disables rescaling.
+
+    Returns:
+        A Python power-of-two factor greater than or equal to one, derived
+        from the largest positive scale. Empty or non-positive inputs and
+        FP16 activations return one.
+
+    Raises:
+        ValueError: Scales contain NaN and rescaling is enabled.
+    """
 
     # Since half has a smaller dynamic range compared to bfloat16,
     # no rescaling is applied here if active dtype is half.

@@ -297,9 +297,12 @@ def test_qsa_dcp_falls_back_to_manager_above_decode_row_limit() -> None:
     expected = torch.empty(9, 6, 256)
     calls = []
     layer.max_decode_rows = 8
-    layer.dcp_manager = SimpleNamespace(
-        combine=lambda *args, **kwargs: calls.append((args, kwargs)) or expected
-    )
+
+    def combine(*args, **kwargs):
+        calls.append((args, kwargs))
+        return expected
+
+    layer.dcp_manager = SimpleNamespace(combine=combine)
     output = torch.empty(9, 24, 256)
     lse = torch.empty(9, 24)
     staged = SimpleNamespace(
@@ -506,6 +509,40 @@ def test_qsa_main_cache_views_reinterpret_fp8_storage() -> None:
     )
 
 
+def test_qsa_caps_without_dcp_accepts_the_base_b12x_contract() -> None:
+    """Ordinary TP must not require b12x's optional DCP capacity fields."""
+    pytest.importorskip("b12x.attention.qsa")
+    owner = SimpleNamespace(
+        max_seqs=2,
+        max_speculative_tokens=3,
+        dcp_size=1,
+        num_heads=6,
+        num_kv_heads=1,
+        head_dim=256,
+        index_heads=4,
+        index_head_dim=128,
+        compress_ratio=4,
+        budget=2048,
+        position_axes=1,
+        rotary_emb=SimpleNamespace(rotary_dim=64),
+        indexer=SimpleNamespace(q_layernorm=SimpleNamespace(variance_epsilon=1e-6)),
+        kv_cache_kernel_dtype=torch.float8_e4m3fn,
+    )
+    caps = Qwen4ExpQSAAttention._qsa_caps(
+        owner,
+        device="cuda:0",
+        max_q_rows=8,
+        max_seq_len=128,
+        num_main_cache_pages=8,
+        num_compressed_cache_pages=8,
+        main_page_size=16,
+        compressed_page_size=4,
+    )
+
+    assert caps.q_heads == 6
+    assert caps.main_table_width == 8
+
+
 @pytest.mark.parametrize("draft", [False, True])
 @pytest.mark.parametrize("large_pool", [False, True])
 def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
@@ -542,6 +579,7 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
     impl.num_kv_heads, impl.head_size, impl.kv_cache_dtype = 1, 256, "fp8"
     owner.impl = impl
     owner.max_tokens, owner.max_seqs, owner.max_seq_len = 32, 2, maximum
+    owner.dcp_size, owner.dcp_rank, owner.cp_kv_cache_interleave_size = 1, 0, 1
     owner._qsa_model_config = SimpleNamespace(max_model_len=maximum)
     owner._qsa_cache_config = SimpleNamespace(
         block_size=page_size, num_gpu_blocks_override=None
@@ -831,17 +869,6 @@ def test_qsa_prefill_context_capacities_cover_the_configured_limit() -> None:
     )
 
 
-def test_qsa_compressed_dcp_interleave_keeps_dcp1_local() -> None:
-    assert qsa_module._compressed_dcp_interleave(1, 1, 4) == 1
-    assert qsa_module._compressed_dcp_interleave(4, 4, 4) == 1
-
-
-def test_qsa_dcp_group_kv_geometry_tracks_replica_subgroups() -> None:
-    assert qsa_module._qsa_dcp_group_kv_geometry(2, 2, 2) == (2, 1)
-    assert qsa_module._qsa_dcp_group_kv_geometry(4, 2, 2) == (1, 2)
-    assert qsa_module._qsa_dcp_group_kv_geometry(4, 4, 2) == (2, 2)
-
-
 def test_qsa_prefill_binding_accepts_pass_one_at_one_million_tokens() -> None:
     """Pass one uses a prefill plan at the target context ceiling."""
     owner = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
@@ -861,6 +888,17 @@ def test_qsa_prefill_binding_accepts_pass_one_at_one_million_tokens() -> None:
         owner._qsa_binding_for_workload(rows=17, max_seq_len=1048576).plan
         is prefill_plan
     )
+
+
+def test_qsa_compressed_dcp_interleave_keeps_dcp1_local() -> None:
+    assert qsa_module._compressed_dcp_interleave(1, 1, 4) == 1
+    assert qsa_module._compressed_dcp_interleave(4, 4, 4) == 1
+
+
+def test_qsa_dcp_group_kv_geometry_tracks_replica_subgroups() -> None:
+    assert qsa_module._qsa_dcp_group_kv_geometry(2, 2, 2) == (2, 1)
+    assert qsa_module._qsa_dcp_group_kv_geometry(4, 2, 2) == (1, 2)
+    assert qsa_module._qsa_dcp_group_kv_geometry(4, 4, 2) == (2, 2)
 
 
 def test_qsa_run_consumes_projection_views_and_writes_live_output(monkeypatch) -> None:
