@@ -83,13 +83,15 @@ class _Job:
         self.events_session = None
         self.keys = []
         self.tunings = []
+        self.caches = []
 
     def cancel(self):
         self.events.append("cancel")
 
-    def advance(self, *, collective_key=None, tuning=None):
+    def advance(self, *, collective_key=None, tuning=None, cache=None):
         self.keys.append(collective_key)
         self.tunings.append(tuning)
+        self.caches.append(cache)
         self.events.append("advance")
         return next(self.progress)
 
@@ -458,6 +460,47 @@ def test_all_local_winners_consolidate_once_with_empty_world_rank():
         assert all(winner.assignment["width"] == 2 for winner in winners)
     decision = pickle.loads(store.get("stage-0/round-0/decision"))
     assert len(decision["tuning"]) == 2
+
+
+@pytest.mark.parametrize("cancel", (False, True))
+def test_tuning_caches_exchange_before_races_with_empty_world_rank(cancel):
+    from b12x.preparation import PreparationProgress, TuningCacheRequirement
+
+    caches = tuple(
+        TuningCacheRequirement((0, 1), {"model": "test"}, {str(rank): {}})
+        for rank in range(2)
+    )
+    coordinators, jobs, store = _coordinators(
+        [
+            [
+                PreparationProgress(False, False, (), False, ready_cache=cache),
+                _progress(done=True),
+            ]
+            for cache in caches
+        ]
+        + [[]]
+    )
+    if cancel:
+        store.set("stage-0/stop", b"1")
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        outcomes = list(pool.map(_finish, coordinators))
+    assert all(item["done"] and not item["error"] for item in outcomes)
+    for job in jobs[:2]:
+        assert job.caches[1] == (() if cancel else caches)
+
+
+def test_missing_cache_participant_fails_all_ranks_without_hanging():
+    from b12x.preparation import PreparationProgress, TuningCacheRequirement
+
+    cache = TuningCacheRequirement((0, 1), {}, {})
+    coordinators, _, _ = _coordinators(
+        [[PreparationProgress(False, False, (), False, ready_cache=cache)], []]
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(_finish, coordinators))
+    assert all(
+        "tuning cache boundaries" in item["error"]["message"] for item in outcomes
+    )
 
 
 def test_fixed_collective_authorization_waits_for_every_participant():

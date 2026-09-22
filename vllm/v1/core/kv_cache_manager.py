@@ -11,11 +11,13 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.boundary_checkpoint import (
     INSTRUCTION_CHECKPOINT_SLOT,
+    PREFILL_TAIL_CHECKPOINT_SLOT,
     PROMPT_CHECKPOINT_SLOT,
     RESPONSE_CHECKPOINT_SLOT,
     BoundaryCheckpoint,
     BoundaryCheckpointCache,
     BoundaryCheckpointKind,
+    boundary_checkpoint_slots,
 )
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
@@ -595,9 +597,7 @@ class KVCacheManager:
         boundary_replay_managers = []
         if request.use_boundary_checkpoints:
             if request.request_id not in self._boundary_allocations:
-                checkpoint_slots = 2 + int(
-                    request.recurrent_instruction_boundary is not None
-                )
+                checkpoint_slots = len(boundary_checkpoint_slots(request))
                 boundary_blocks = checkpoint_slots * (self.num_kv_cache_groups + 1)
             if request.boundary_checkpoint is not None:
                 boundary_blocks += sum(
@@ -798,14 +798,18 @@ class KVCacheManager:
             request.request_id not in self._boundary_allocations
         ):
             width = self.num_kv_cache_groups + 1
-            checkpoint_slots = 2 + int(
-                request.recurrent_instruction_boundary is not None
-            )
-            allocation = self.block_pool.get_new_blocks(checkpoint_slots * width)
+            slots = boundary_checkpoint_slots(request)
+            allocation = self.block_pool.get_new_blocks(len(slots) * width)
             self._boundary_allocations[request.request_id] = allocation
+            by_slot = {
+                slot: tuple(
+                    block.block_id
+                    for block in allocation[index * width : (index + 1) * width]
+                )
+                for index, slot in enumerate(slots)
+            }
             request.boundary_checkpoint_blocks = tuple(
-                tuple(block.block_id for block in allocation[start : start + width])
-                for start in range(0, checkpoint_slots * width, width)
+                by_slot.get(slot, (0,) * width) for slot in range(max(slots) + 1)
             )
 
         # P/D: delay caching blocks if we have to recv from
@@ -871,10 +875,16 @@ class KVCacheManager:
             if num_tokens != request.num_prompt_tokens:
                 return None
             slot = PROMPT_CHECKPOINT_SLOT
-        else:
+        elif kind == "instruction":
             if num_tokens != request.recurrent_instruction_boundary:
                 return None
             slot = INSTRUCTION_CHECKPOINT_SLOT
+        elif kind == "prefill_tail":
+            if num_tokens != request.recurrent_prefill_tail_boundary:
+                return None
+            slot = PREFILL_TAIL_CHECKPOINT_SLOT
+        else:
+            return None
         if slot >= len(allocation):
             return None
         grouped_blocks = []
@@ -976,7 +986,10 @@ class KVCacheManager:
             raise ValueError("Imported boundary must cover an existing request prefix")
         if not 0 <= draft_prefix_len <= num_tokens:
             raise ValueError("Imported draft prefix exceeds the target prefix")
-        if kind not in ("instruction", "prompt", "response") or num_ranks < 1:
+        if (
+            kind not in ("instruction", "prompt", "response", "prefill_tail")
+            or num_ranks < 1
+        ):
             raise ValueError("Invalid external checkpoint kind or rank count")
         if page_positions != self.boundary_checkpoint_page_positions(num_tokens):
             raise ValueError("External checkpoint does not cover every live cache page")

@@ -3,15 +3,26 @@
 """The GLM-5.3 KDA gate side stream: same result as the sequential forward,
 gate projections off the main stream, graph-capturable."""
 
+import weakref
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+from vllm.forward_context import override_forward_context
 from vllm.models.glm5next.nvidia import kda as kda_module
 from vllm.models.glm5next.nvidia.kda import Glm5NextLinearAttention
+from vllm.v1.worker import workspace
 
 HIDDEN, HEADS, HEAD_DIM, GATE_RANK = 64, 2, 16, 8
 PROJ = HEADS * HEAD_DIM
+
+
+@pytest.fixture(autouse=True)
+def forward_context():
+    with override_forward_context(SimpleNamespace(attn_metadata=None)):
+        yield
 
 
 class _Linear:
@@ -150,3 +161,105 @@ def test_gate_side_stream_is_graph_capturable(monkeypatch):
         graph.replay()
         torch.accelerator.synchronize(device)
         assert torch.equal(captured, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_gate_overlap_keeps_projection_scratch_disjoint(monkeypatch):
+    """Concurrent gate/main linears must not overwrite each other's scratch."""
+    from vllm.compilation import monitor
+
+    device = torch.device("cuda", 0)
+    manager = workspace.WorkspaceManager(device)
+    monkeypatch.setattr(workspace, "_manager", manager)
+    monkeypatch.setattr(monitor, "is_cudagraph_capturing_enabled", lambda: False)
+    generator = torch.Generator().manual_seed(19)
+    layer = _make_layer(device, [], generator)
+    allocations = {}
+
+    class ScratchLinear(_Linear):
+        @property
+        def quant_method(self):
+            return self
+
+        def get_workspace_size(self, layer, rows):
+            return rows * self.weight.shape[1] * self.weight.element_size()
+
+        def __call__(self, x):
+            size = self.get_workspace_size(self, x.shape[0])
+            scratch = workspace.current_preallocated_workspace()
+            if scratch is None:
+                (scratch,) = manager.get_simultaneous(((size,), torch.uint8))
+            allocations[self.name] = (scratch.data_ptr(), size)
+            result, _ = super().__call__(x)
+            temporary = scratch[:size].view(result.dtype).view_as(result)
+            temporary.copy_(result)
+            return temporary.clone(), None
+
+    for name in ("g_a_proj", "g_b_proj", "in_proj_qkvgfab", "f_b_proj"):
+        linear = getattr(layer, name)
+        setattr(layer, name, ScratchLinear(linear.name, linear.weight, linear.log))
+    x = torch.randn(4, HIDDEN, device=device, dtype=torch.bfloat16)
+    monkeypatch.setattr(kda_module, "_GATE_SIDE_STREAM", False)
+    expected = _run(layer, x)
+    monkeypatch.setattr(kda_module, "_GATE_SIDE_STREAM", True)
+    # Warmup is serialized but must reserve enough for the captured fork.
+    monkeypatch.setattr(monitor, "is_cudagraph_capturing_enabled", lambda: True)
+    _run(layer, x)
+    manager.lock()
+    monkeypatch.setattr(monitor, "is_cudagraph_capturing_enabled", lambda: False)
+    actual = _run(layer, x)
+    for gate in ("g_a", "g_b"):
+        gate_ptr, gate_bytes = allocations[gate]
+        for main in ("in_proj", "f_b"):
+            main_ptr, main_bytes = allocations[main]
+            assert (
+                gate_ptr + gate_bytes <= main_ptr or main_ptr + main_bytes <= gate_ptr
+            ), f"{gate} scratch overlaps {main} scratch"
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = layer(x, positions=None)
+    for _ in range(3):
+        x.copy_(torch.randn_like(x))
+        monkeypatch.setattr(kda_module, "_GATE_SIDE_STREAM", False)
+        expected = _run(layer, x)
+        graph.replay()
+        torch.accelerator.synchronize(device)
+        torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("overlap", [False, True])
+def test_projection_owners_release_before_glm_output_gemm(monkeypatch, overlap):
+    """GLM returns the output projection directly after releasing inputs."""
+    from vllm.compilation import monitor
+
+    device = torch.device("cuda", 0)
+    layer = _make_layer(device, [], torch.Generator().manual_seed(27))
+    owners = []
+
+    class TrackedLinear(_Linear):
+        def __call__(self, x):
+            result, bias = super().__call__(x)
+            owners.append(weakref.ref(result))
+            return result, bias
+
+    for name in ("g_a_proj", "g_b_proj", "in_proj_qkvgfab", "f_b_proj"):
+        linear = getattr(layer, name)
+        setattr(layer, name, TrackedLinear(linear.name, linear.weight, linear.log))
+    original = layer.o_proj
+    outputs = []
+
+    def output_projection(x):
+        assert all(owner() is None for owner in owners)
+        result = original(x)
+        outputs.append(result[0])
+        return result
+
+    layer.o_proj = output_projection
+    monkeypatch.setattr(kda_module, "_GATE_SIDE_STREAM", overlap)
+    monkeypatch.setattr(monitor, "is_cudagraph_capturing_enabled", lambda: False)
+    x = torch.randn(64, HIDDEN, device=device, dtype=torch.bfloat16)
+    actual = _run(layer, x)
+    assert actual is outputs[0]

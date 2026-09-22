@@ -282,6 +282,48 @@ def test_mtp_speculator_rolls_back_qsa_anchor_around_lookahead() -> None:
     assert lifecycle.calls == ["snapshot", "restore"]
 
 
+@pytest.mark.parametrize("num_reqs", [1, 2, 4])
+def test_mtp_prefill_compacts_only_the_graph_request_capacity(num_reqs) -> None:
+    """A small captured graph must not run the MTP MLP for every request slot."""
+    speculator = object.__new__(MTPSpeculator)
+    speculator.max_num_reqs = 4
+    speculator.share_mtp_topk_indices = False
+    speculator.prefill_outputs_are_compact = True
+    speculator.pcp_manager = None
+    speculator.mrope_positions = None
+    speculator.last_token_indices = torch.tensor([2, 0, 3, 1])
+    speculator.idx_mapping = torch.arange(4)
+    speculator.input_buffers = SimpleNamespace(positions=torch.arange(4))
+    speculator.sample_src_positions = torch.zeros(4, dtype=torch.int64)
+    speculator.hidden_states = torch.zeros(4, 1)
+    speculator.draft_tokens = torch.zeros(4, 1, dtype=torch.int64)
+    speculator.temperature = speculator.seeds = None
+    speculator.current_draft_step = speculator.draft_logits = None
+    source = torch.arange(4, dtype=torch.float32).unsqueeze(1)
+    compacted = []
+
+    def select(indices):
+        speculator.model.model.output_indices = indices
+
+    def run_model(*args, **kwargs):
+        hidden = source[speculator.model.model.output_indices]
+        compacted.append(hidden.clone())
+        return hidden, hidden
+
+    speculator.model = SimpleNamespace(
+        model=SimpleNamespace(set_prefill_output_indices=select)
+    )
+    speculator._run_model = run_model
+    speculator.sample_draft = lambda hidden, *args: hidden[:, 0].long()
+    speculator.on_prefill_begin(speculator.max_num_reqs)
+
+    speculator._prefill(num_reqs, 4, None, None, None)
+
+    expected = source[speculator.last_token_indices[:num_reqs]]
+    torch.testing.assert_close(compacted[0], expected)
+    torch.testing.assert_close(speculator.hidden_states[:num_reqs], expected)
+
+
 def test_propose_restores_mtp_state_when_draft_decode_raises(monkeypatch) -> None:
     lifecycle = _QSAIntervalLifecycle()
     speculator = object.__new__(MTPSpeculator)

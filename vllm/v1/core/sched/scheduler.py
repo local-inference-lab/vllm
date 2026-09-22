@@ -32,6 +32,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.v1.core.boundary_checkpoint import get_prefill_tail_checkpoint_position
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -513,14 +514,21 @@ class Scheduler(SchedulerInterface):
             + num_external_computed_tokens
         )
         if request.use_boundary_checkpoints:
-            # Running-state migration still happens in the worker, but these
-            # requests publish only semantic endpoints. Stop exactly at the
-            # leading instruction boundary so the worker can snapshot the
-            # recurrent state associated with that token prefix.
-            instruction_boundary = request.recurrent_instruction_boundary
-            if instruction_boundary is not None and start < instruction_boundary:
-                return min(num_new_tokens, instruction_boundary - start)
-            return num_new_tokens
+            # The worker can snapshot recurrent state only at a computed
+            # endpoint, never retroactively inside an already executed chunk.
+            end = start + num_new_tokens
+            boundary_stops = (
+                request.recurrent_instruction_boundary,
+                request.recurrent_prefill_tail_boundary,
+            )
+            return min(
+                (
+                    stop - start
+                    for stop in boundary_stops
+                    if stop is not None and start < stop < end
+                ),
+                default=num_new_tokens,
+            )
         # Split only during prefill: `request.num_tokens - 1` extends this to
         # resumed requests replaying their output tokens.
         prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
@@ -2930,9 +2938,18 @@ class Scheduler(SchedulerInterface):
             finish_reason = None
             captures = model_runner_output.boundary_checkpoint_tokens
             if captures is not None and not output_is_stale:
-                prompt_boundary, response_boundary, instruction_boundary = captures[
-                    req_index
-                ]
+                (
+                    prompt_boundary,
+                    response_boundary,
+                    instruction_boundary,
+                    prefill_tail_boundary,
+                ) = captures[req_index]
+                if prefill_tail_boundary:
+                    checkpoint = self.kv_cache_manager.publish_boundary_checkpoint(
+                        request, prefill_tail_boundary, kind="prefill_tail"
+                    )
+                    if checkpoint is not None and self.connector is not None:
+                        self.connector.store_boundary_checkpoint(request, checkpoint)
                 if instruction_boundary:
                     checkpoint = self.kv_cache_manager.publish_boundary_checkpoint(
                         request, instruction_boundary, kind="instruction"
@@ -3342,6 +3359,14 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
+            if self.kv_cache_manager.boundary_checkpoints is not None:
+                request.recurrent_prefill_tail_boundary = (
+                    get_prefill_tail_checkpoint_position(
+                        request.num_prompt_tokens,
+                        self.max_num_scheduled_tokens,
+                        request.recurrent_instruction_boundary,
+                    )
+                )
             if request.resumable:
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)

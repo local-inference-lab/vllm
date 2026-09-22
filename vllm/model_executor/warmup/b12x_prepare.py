@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 from collections import Counter
 from collections.abc import Iterable
+from contextlib import ExitStack
 from dataclasses import replace
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -547,8 +548,9 @@ class B12xPreparedBatch:
 
     def release(self) -> None:
         plans, self.plans = self.plans, ()
-        for plan in reversed(plans):
-            self.session.release(plan)
+        with ExitStack() as stack:
+            for plan in plans:
+                stack.callback(self.session.release, plan)
 
 
 def initialize_b12x_tuning_cache(worker: Worker, kv_cache_config) -> bool:
@@ -595,10 +597,15 @@ def release_b12x_tuning_cache(worker: Worker) -> None:
 
     batch = getattr(worker, "_b12x_tuning_batch", None)
     worker._b12x_tuning_batch = None
-    if batch is not None:
-        batch.release()
-    _teardown_profiling_state(cast("GPUModelRunner", worker.model_runner))
-    worker._b12x_tuning_cache = False
+    try:
+        if batch is not None:
+            batch.release()
+    finally:
+        del batch
+        try:
+            _teardown_profiling_state(cast("GPUModelRunner", worker.model_runner))
+        finally:
+            worker._b12x_tuning_cache = False
 
 
 def prepare_b12x_profile(worker: Worker, *, stage: str) -> B12xPreparedBatch:

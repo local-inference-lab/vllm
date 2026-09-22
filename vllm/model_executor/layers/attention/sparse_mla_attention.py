@@ -204,8 +204,16 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
         self.dcp_local_block_size = self.cp_kv_cache_interleave_size
         self.dcp_virtual_block_size = self.dcp_local_block_size * self.dcp_world_size
 
+        attention_layer = vllm_config.compilation_config.static_forward_context[
+            layer_names[0]
+        ]
+        layer_prefill_backend = attention_layer.prefill_backend
+        # Backends with native sparse prefill use their own caller-owned scratch
+        # and never build generic chunked-context metadata.
         self.chunked_prefill_workspace_size = (
             self.determine_chunked_prefill_workspace_size(vllm_config)
+            if layer_prefill_backend is not None
+            else 0
         )
         workspace_head_size = (
             self.mla_dims.kv_lora_rank + self.mla_dims.qk_rope_head_dim
@@ -235,10 +243,6 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
                 dtype=torch.int32,
                 device=device,
             )
-        attention_layer = vllm_config.compilation_config.static_forward_context[
-            layer_names[0]
-        ]
-        layer_prefill_backend = attention_layer.prefill_backend
         self.dcp_manager: MLADCPManager | None = None
         if self.dcp_world_size > 1:
             self.dcp_manager = getattr(attention_layer, "dcp_manager", None)
@@ -627,7 +631,7 @@ class SharedTopkIndicesBuffer:
         topk_indices_buffer: torch.Tensor | None,
     ) -> None:
         self._indexer = indexer
-        self._topk_indices_buffer = topk_indices_buffer
+        self._topk_indices_buffer = topk_indices_buffer if indexer is None else None
 
     @property
     def topk_indices_buffer(self) -> torch.Tensor | None:
@@ -646,6 +650,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
     """Sparse MLA base with dense and masked-MHA prefill paths."""
 
     is_sparse = True
+    uses_index_group = True
 
     def __init__(
         self,
@@ -688,9 +693,13 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
         self.init_topk_indices_buffer(indexer, topk_indices_buffer)
         self.index_group: SparseMLAIndexGroup | None = None
         self.index_group_index = 0
-        if index_group_builder is None and self.topk_indices_buffer is not None:
+        if (
+            self.uses_index_group
+            and index_group_builder is None
+            and self.topk_indices_buffer is not None
+        ):
             index_group_builder = SparseMLAIndexGroupBuilder(self.topk_indices_buffer)
-        if index_group_builder is not None:
+        if self.uses_index_group and index_group_builder is not None:
             vllm_config = get_current_vllm_config()
             self.index_group, self.index_group_index = (
                 index_group_builder.register_layer(

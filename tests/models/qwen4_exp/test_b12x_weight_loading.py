@@ -10,11 +10,19 @@ import torch
 from safetensors.torch import save_file
 from torch import nn
 
+import vllm.distributed.parallel_state as parallel_state
 from vllm.config.load import LoadConfig
 from vllm.model_executor.model_loader import weight_utils
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.models.registry import ModelRegistry
+from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.models.qwen4_exp.nvidia.hyperconnection import (
+    HyperConnectionConfig,
+    _ShardedDownProjection,
+    _ShardedUpProjection,
+)
 from vllm.models.qwen4_exp.nvidia.model import (
+    _EXTRA_WEIGHTS_MAPPER,
     _remap_qsa_cache_scale_name,
 )
 from vllm.models.qwen4_exp.nvidia.mtp import (
@@ -27,6 +35,66 @@ from vllm.models.qwen4_exp.nvidia.ple_layer import (
     B12xNGramEmbedding,
     Qwen4ExpPLELayer,
 )
+
+
+@pytest.mark.parametrize("tp_size", [2, 4])
+@pytest.mark.parametrize("use_combine", [False, True])
+def test_hc_tp_loading_preserves_stream_order_and_replicates_injection(
+    monkeypatch, tp_size, use_combine
+):
+    """Checkpoint rows reconstruct exactly across ranks, including merged aliases."""
+    config = HyperConnectionConfig(hidden_size=8, hc_lowrank=8)
+    width = config.hc_count * config.hidden_size
+    down = torch.arange(config.hc_lowrank * width, dtype=torch.bfloat16).view(-1, width)
+    injection = torch.arange(config.hc_count * width, dtype=torch.bfloat16).view(
+        -1, width
+    )
+    up = torch.arange(width * config.hc_lowrank, dtype=torch.bfloat16).view(width, -1)
+    downs, ups = [], []
+    for rank in range(tp_size):
+        monkeypatch.setattr(
+            parallel_state,
+            "_TP",
+            SimpleNamespace(rank_in_group=rank, world_size=tp_size),
+        )
+        root = nn.Module()
+        hc = nn.Module()
+        root.attn_hyper_connection = hc
+        name = (
+            "input_mix_weight_down_block_inject"
+            if use_combine
+            else "input_mix_weight_down"
+        )
+        projection = _ShardedDownProjection(config, rank, tp_size, use_combine, name)
+        setattr(hc, name, projection)
+        hc.input_mix_weight_up = _ShardedUpProjection(config, rank, tp_size, "up")
+        weights = [
+            ("attn_hyper_connection.input_mix_weight_down.weight", down),
+            ("attn_hyper_connection.input_mix_weight_up.weight", up),
+        ]
+        if use_combine:
+            weights.insert(
+                0, ("attn_hyper_connection.block_inject_weight.weight", injection)
+            )
+        AutoWeightsLoader(root).load_weights(
+            iter(weights), mapper=_EXTRA_WEIGHTS_MAPPER if use_combine else None
+        )
+        local_rank = config.hc_lowrank // tp_size
+        downs.append(projection.weight[:local_rank])
+        ups.append(
+            hc.input_mix_weight_up.weight.view(config.hc_count, -1, config.hc_lowrank)
+        )
+        if use_combine:
+            torch.testing.assert_close(
+                projection.weight[local_rank : local_rank + config.hc_count],
+                injection,
+                rtol=0,
+                atol=0,
+            )
+        if projection.padding:
+            assert torch.count_nonzero(projection.weight[-projection.padding :]) == 0
+    torch.testing.assert_close(torch.cat(downs), down, rtol=0, atol=0)
+    torch.testing.assert_close(torch.cat(ups, dim=1).flatten(0, 1), up, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

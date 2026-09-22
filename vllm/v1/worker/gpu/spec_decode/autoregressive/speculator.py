@@ -202,7 +202,6 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         if self.prefill_cudagraph_manager.use_breakable_cg:
             self.prefill_cudagraph_manager.init_breakable_cg_runner(self.model)
 
-        self.on_prefill_begin(self.max_num_reqs)
         self.prefill_cudagraph_manager.capture(
             self._prefill,
             self.model_state,
@@ -547,6 +546,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
     ) -> None:
+        # Bind compact outputs to this graph's request capacity during capture.
+        self.on_prefill_begin(num_reqs)
         last_token_indices = self.last_token_indices[:num_reqs]
         positions = self.input_buffers.positions[last_token_indices]
         # The output hidden state at position P (= positions) and the token id

@@ -1,0 +1,21 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-816",
+  "category": "feature",
+  "summary": "Support Qwen QSA decode context parallelism",
+  "models": [
+    "Qwen3.8-Flash-Next"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "DCP ranks own interleaved KV and selector state, merge candidates globally, and combine decode attention with FP32 weighting.",
+    "QSA external KV-cache transfer remains unsupported."
+  ],
+  "pull_requests": [
+    816
+  ],
+  "requires": [
+    "b12x-401",
+    "b12x-402"
+  ]
+}
