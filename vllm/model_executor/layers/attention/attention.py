@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
 import torch.nn as nn
@@ -235,6 +235,10 @@ class Attention(nn.Module, AttentionLayerBase):
     3. Return the output tensor.
     """
 
+    # Subclasses with complete local KV must declare the same cache contract
+    # during backend selection and in get_kv_cache_spec().
+    dcp_replicated: ClassVar[bool] = False
+
     def __init__(
         self,
         num_heads: int,
@@ -355,6 +359,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 use_per_head_quant_scales=use_per_head_quant_scales,
                 attn_type=attn_type,
                 has_sliding_window=sliding_window is not None,
+                dcp_replicated=self.dcp_replicated,
             )
         else:
             self.attn_backend = attn_backend
