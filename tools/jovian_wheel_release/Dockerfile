@@ -7,7 +7,7 @@ ARG BUILDER_IMAGE
 FROM ${UV_IMAGE} AS uv
 FROM ${RUST_IMAGE} AS rust
 
-FROM ${BUILDER_IMAGE} AS wheels
+FROM ${BUILDER_IMAGE} AS wheel-source
 
 # DeepGEMM's DeepJIT exception formatter includes the elfutils DWARF API.
 RUN --mount=type=cache,id=lil-wheel-apt-packages,target=/var/cache/apt,sharing=locked \
@@ -59,6 +59,7 @@ assert torch._C._GLIBCXX_USE_CXX11_ABI
 assert importlib.metadata.version("nvidia-cutlass-dsl") == os.environ["CUTLASS_DSL_VERSION"]
 PY
 
+FROM wheel-source AS wheels
 RUN --mount=type=cache,id=lil-vllm-native-cu134-torch214-sm120-${DEPENDENCY_RECIPE},target=/src/vllm/build,sharing=locked \
     --mount=type=cache,id=lil-vllm-fetchcontent-cu134-${DEPENDENCY_RECIPE},target=/tmp/vllm-fetchcontent,sharing=locked \
     --mount=type=cache,id=lil-vllm-generated-cu134-torch214-sm120-${DEPENDENCY_RECIPE},target=/tmp/vllm-generated,sharing=locked \
@@ -73,3 +74,19 @@ RUN --mount=type=cache,id=lil-vllm-native-cu134-torch214-sm120-${DEPENDENCY_RECI
 
 FROM scratch AS export
 COPY --from=wheels /wheelhouse/ /wheels/
+
+FROM wheel-source AS precompiled-wheels
+RUN --mount=type=bind,from=native-bundle,source=/,target=/native-bundle,ro \
+    --mount=type=cache,id=lil-wheel-uv,target=/root/.cache/uv,sharing=locked \
+    test "$(find /native-bundle/wheels -name 'vllm-*.whl' | wc -l)" -eq 1 && \
+    SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" \
+    BUILD_JOBS="${BUILD_JOBS}" \
+    VLLM_USE_PRECOMPILED=1 \
+    VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX=1 \
+    VLLM_PRECOMPILED_WHEEL_LOCATION="$(find /native-bundle/wheels -name 'vllm-*.whl')" \
+    tools/jovian_wheel_release/build_vllm_wheel.sh && \
+    /build-venv/bin/python tools/jovian_wheel_release/verify_native_payload.py \
+      /native-bundle/wheels/vllm-*.whl /wheelhouse/vllm-*.whl
+
+FROM scratch AS export-precompiled
+COPY --from=precompiled-wheels /wheelhouse/ /wheels/
