@@ -387,21 +387,21 @@ def _select_diffkv_tiling(
     """Select host launch geometry without changing dispatch or split count.
 
     The multi-query 3D policy depends on the separate split-KV dispatch change.
-    Keep minimal-width block tables on the existing tile until their coverage
-    is a multiple of 64; a partial final tile needs separate load-mask support.
-    With 16 query heads per KV head, M32 processes two query rows together,
-    reusing each global KV tile. M32/T64 improves the measured kernel cases;
-    full serving performance must be validated separately.
+    With 16 query heads per KV head, M32 reuses each global KV tile across two
+    query rows. Keep the original T16 KV tile and 16 segments to limit numerical
+    changes, and retain aligned table coverage as the measured scope. Only
+    batches with at least 128 query tokens qualify; 2D geometry stays unchanged.
+    Full serving accuracy and performance require separate validation.
     """
     queries_per_kv = q.shape[1] // k.shape[2]
     block_m = 16 if queries_per_kv <= 16 else triton.next_power_of_2(queries_per_kv)
     tile_size = 32 if not use_3d else (16 if q.element_size() >= 2 else 32)
     if (
         not is_batch_invariant
-        and (
-            (use_3d and max_seqlen_q > 1 and q.shape[0] >= 8 and num_segments == 16)
-            or (not use_3d and max_seqlen_q >= 512 and q.shape[0] >= 512)
-        )
+        and use_3d
+        and max_seqlen_q > 1
+        and q.shape[0] >= 128
+        and num_segments == 16
         and sliding_window == 0
         and q.dtype == torch.bfloat16
         and k.dtype == v.dtype
@@ -413,7 +413,7 @@ def _select_diffkv_tiling(
         and current_platform.is_cuda()
         and current_platform.is_device_capability(120, q.device.index or 0)
     ):
-        block_m, tile_size = 32, 64
+        block_m = 32
     return block_m, tile_size
 
 
