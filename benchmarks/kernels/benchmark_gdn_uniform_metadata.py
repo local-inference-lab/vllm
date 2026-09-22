@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Proxy timing for uniform GDN metadata writes, not end-to-end serving."""
+"""Isolated uniform and cross-group GDN metadata timing, not serving latency."""
 
 import argparse
 import json
@@ -10,6 +10,7 @@ from pathlib import Path
 
 import torch
 
+from vllm.v1.attention.backends.b12x_gdn_metadata import B12xGdnMixedMetadata
 from vllm.v1.attention.backends.gdn_attn import _fill_uniform_spec_metadata
 
 
@@ -83,9 +84,108 @@ def benchmark_case(rows: int) -> dict:
     }
 
 
+def benchmark_group_refresh(non_spec: int, spec: int, groups: int) -> dict:
+    from flashinfer.testing import bench_gpu_time_with_cupti
+
+    device = torch.device("cuda")
+
+    def allocate():
+        return B12xGdnMixedMetadata(
+            max_tokens=1024, max_seqs=2, state_columns=4, device=device
+        )
+
+    source = allocate()
+    source._num_non_spec = non_spec
+    source._num_spec = spec
+    source.request_rows.copy_(torch.arange(2, device=device))
+    source.spec_request_rows.copy_(torch.arange(2, device=device))
+    source.checkpoint_columns.fill_(1)
+    for index, values in enumerate(source._worklists):
+        if any(
+            values is rows
+            for rows in (
+                source.request_rows,
+                source.spec_request_rows,
+                source.checkpoint_columns,
+            )
+        ):
+            continue
+        values.fill_(index + 1)
+    states = [
+        torch.arange(16, dtype=torch.int32, device=device).view(2, 8) + group * 100
+        for group in range(groups)
+    ]
+    tables = [
+        torch.arange(12, dtype=torch.int32, device=device).view(2, 6) + group * 1000
+        for group in range(groups)
+    ]
+    reference = [allocate() for _ in range(groups)]
+    candidate = [allocate() for _ in range(groups)]
+
+    def copies():
+        for dest, state, table in zip(reference, states, tables):
+            dest.copy_worklists_from(source)
+            dest.refresh_state_indices(state, table)
+
+    def fused():
+        for dest, state, table in zip(candidate, states, tables):
+            dest.copy_and_refresh_from(source, state, table)
+
+    def tensors(metadata):
+        return (
+            *metadata._worklists,
+            metadata.state_indices,
+            metadata.spec_state_indices,
+            metadata.checkpoint.state_indices,
+        )
+
+    copies()
+    fused()
+    for actual, expected in zip(candidate, reference):
+        for a, b in zip(tensors(actual), tensors(expected)):
+            torch.testing.assert_close(a, b, atol=0, rtol=0)
+
+    samples = {"gpu_us": {}, "wall_us": {}}
+    for label, launch in (
+        ("copies", copies),
+        ("fused", fused),
+        ("fused", fused),
+        ("copies", copies),
+    ):
+        gpu_ms = bench_gpu_time_with_cupti(
+            launch,
+            use_cuda_graph=True,
+            cold_l2_cache=True,
+            dry_run_iters=5,
+            repeat_iters=30,
+        )
+        samples["gpu_us"].setdefault(label, []).extend(v * 1000 for v in gpu_ms)
+        for _ in range(3):
+            torch.accelerator.synchronize()
+            started = time.perf_counter()
+            for _ in range(100):
+                launch()
+            torch.accelerator.synchronize()
+            elapsed_us = (time.perf_counter() - started) * 1e6 / 100
+            samples["wall_us"].setdefault(label, []).append(elapsed_us)
+    return {
+        "non_spec": non_spec,
+        "spec": spec,
+        "groups": groups,
+        "correctness": "bit-exact",
+        **samples,
+        "median_us": {
+            scope: {label: statistics.median(v) for label, v in values.items()}
+            for scope, values in samples.items()
+        },
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--group-refresh", action="store_true")
+    parser.add_argument("--groups", type=int, default=35)
     args = parser.parse_args()
     report = {
         "status": "research-only",
@@ -94,7 +194,16 @@ def main():
         "torch": torch.__version__,
         "cases": [],
     }
-    report["cases"] = [benchmark_case(rows) for rows in (1, 4, 16)]
+    if args.group_refresh:
+        if args.groups <= 0:
+            parser.error("--groups must be positive")
+        report["scope"] = "cross-group metadata refresh; graph cold-L2 and host timing"
+        report["cases"] = [
+            benchmark_group_refresh(non_spec, spec, args.groups)
+            for non_spec, spec in ((0, 1), (1, 0), (1, 1))
+        ]
+    else:
+        report["cases"] = [benchmark_case(rows) for rows in (1, 4, 16)]
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
 

@@ -39,7 +39,7 @@ def test_state_tuning_releases_temporary_pools_before_serving_allocation(
     monkeypatch.setattr("vllm.utils.b12x.has_b12x", lambda: True)
     monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(current_platform, "is_device_capability_family", lambda _: True)
-    events = []
+    events: list[object] = []
 
     def rpc(method, **kwargs):
         events.append(method)
@@ -126,11 +126,11 @@ def test_tuning_authorization_selects_once_across_disjoint_rank_shards() -> None
     gathered = [
         {
             "global_rank": 0,
-            "tuning": (("query", (0, 1), {"width": 4}, 3.0, 0),),
+            "tuning": (("query", (0, 1), {"width": 4}, 3.0, 0, 0),),
         },
         {
             "global_rank": 1,
-            "tuning": (("query", (0, 1), {"width": 2}, 1.0, 1),),
+            "tuning": (("query", (0, 1), {"width": 2}, 1.0, 1, 0),),
         },
     ]
 
@@ -141,6 +141,7 @@ def test_tuning_authorization_selects_once_across_disjoint_rank_shards() -> None
             {"width": 2},
             1.0,
             1,
+            0,
         ),
     )
 
@@ -229,7 +230,7 @@ def test_progress_does_not_sum_replicated_fixed_candidate_count() -> None:
 
 
 def test_local_only_cancel_still_completes_and_primes() -> None:
-    events = []
+    events: list[object] = []
     job = _Job(events, [_progress(done=True)])
     coordinator = B12xPreparationCoordinator(
         _Session(job, events),
@@ -253,7 +254,7 @@ def test_local_only_cancel_still_completes_and_primes() -> None:
 
 
 def test_default_only_batch_disables_tuning_for_job() -> None:
-    events = []
+    events: list[object] = []
     coordinator = B12xPreparationCoordinator(
         _Session(_Job(events, [_progress(done=True)]), events),
         _batches(autotune=False),
@@ -266,15 +267,18 @@ def test_default_only_batch_disables_tuning_for_job() -> None:
     coordinator.abort()
 
 
-def test_batches_run_in_order_and_finish_after_the_last() -> None:
-    events = []
+def test_batches_run_in_order_and_finish_after_the_last(monkeypatch) -> None:
+    events: list[object] = []
     first = _Job(events, [_progress(done=True)])
     second = _Job(events, [_progress(done=True)])
     session = _Session(first, events)
     jobs = iter([first, second])
-    session.begin = lambda requests, *, autotune=None: (
-        events.append(("begin", autotune)) or next(jobs)
-    )
+
+    def begin(requests, *, autotune=None):
+        events.append(("begin", autotune))
+        return next(jobs)
+
+    monkeypatch.setattr(session, "begin", begin)
     coordinator = B12xPreparationCoordinator(
         session,
         [((object(),), True), ((object(),), False)],
@@ -298,7 +302,7 @@ def test_batches_run_in_order_and_finish_after_the_last() -> None:
 
 
 def test_pending_compilation_wait_is_bounded() -> None:
-    events = []
+    events: list[object] = []
     job = _Job(events, [_progress(pending=True)])
 
     class _Pool:
@@ -319,7 +323,7 @@ def test_pending_compilation_wait_is_bounded() -> None:
 
 
 def test_abort_closes_active_job_once() -> None:
-    events = []
+    events: list[object] = []
     job = _Job(events, [_progress(pending=True)])
     coordinator = B12xPreparationCoordinator(
         _Session(job, events),
@@ -373,13 +377,13 @@ def test_attention_tuning_rendezvous_ignores_rank_local_device_ordinal(variant):
             {
                 "global_rank": rank,
                 "tuning": (
-                    (key, ranks, {"tile_m": 128, "tile_n": 64}, 10.0 + rank, rank),
+                    (key, ranks, {"tile_m": 128, "tile_n": 64}, 10.0 + rank, rank, 0),
                 ),
             }
         )
     authorized = _authorize_tuning(gathered, ranks)
     assert authorized is not None
-    assert authorized[0][1:] == (ranks, {"tile_m": 128, "tile_n": 64}, 10.0, 0)
+    assert authorized[0][1:] == (ranks, {"tile_m": 128, "tile_n": 64}, 10.0, 0, 0)
 
 
 def _coordinators(progress_by_rank):
@@ -388,7 +392,7 @@ def _coordinators(progress_by_rank):
     ranks = tuple(range(len(progress_by_rank)))
     coordinators, jobs = [], []
     for rank, progress in enumerate(progress_by_rank):
-        events = []
+        events: list[object] = []
         job = _Job(events, progress)
         jobs.append(job)
         group = SimpleNamespace(store=store)
@@ -460,6 +464,43 @@ def test_all_local_winners_consolidate_once_with_empty_world_rank():
         assert all(winner.assignment["width"] == 2 for winner in winners)
     decision = pickle.loads(store.get("stage-0/round-0/decision"))
     assert len(decision["tuning"]) == 2
+
+
+@pytest.mark.parametrize("all_rejected", (False, True))
+def test_rejected_shards_finish_with_a_peer_winner_or_an_explicit_error(all_rejected):
+    from b12x.preparation import TuningRequirement
+
+    progress = [_tuning_progress(rank, keys=("query",)) for rank in (0, 1)]
+    progress[0].ready_tuning = (
+        TuningRequirement("query", (0, 1), None, None, None, rejected_count=2),
+    )
+    progress[1].ready_tuning = (
+        TuningRequirement(
+            "query",
+            (0, 1),
+            None if all_rejected else {"width": 2},
+            None if all_rejected else 1.0,
+            None if all_rejected else 1,
+            rejected_count=1,
+        ),
+    )
+    coordinators, jobs, _ = _coordinators(
+        [[item, _progress(done=True)] for item in progress]
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(_finish, coordinators))
+    assert all(outcome["done"] for outcome in outcomes)
+    if all_rejected:
+        assert all(
+            "no launchable candidates" in outcome["error"]["message"]
+            for outcome in outcomes
+        )
+    else:
+        assert all(not outcome["error"] for outcome in outcomes)
+        for job in jobs:
+            (winner,) = job.tunings[1]
+            assert winner.assignment["width"] == 2
+            assert winner.rejected_count == 3
 
 
 @pytest.mark.parametrize("cancel", (False, True))

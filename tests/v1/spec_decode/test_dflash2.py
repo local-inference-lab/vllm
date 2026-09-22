@@ -25,6 +25,7 @@ def test_dflash_loader_honors_draft_load_config(monkeypatch):
     vllm_config = SimpleNamespace(
         attention_config=SimpleNamespace(),
         cache_config=SimpleNamespace(),
+        load_config=SimpleNamespace(load_format="b12x"),
         speculative_config=speculative_config,
     )
     loaded = SimpleNamespace(model=SimpleNamespace())
@@ -41,18 +42,14 @@ def test_dflash_loader_honors_draft_load_config(monkeypatch):
 
     monkeypatch.setattr(dflash_utils, "replace", fake_replace)
     monkeypatch.setattr(dflash_utils, "get_model", fake_get_model)
+    monkeypatch.setattr(dflash_utils, "maybe_share_target_embed", lambda *_args: None)
     monkeypatch.setattr(
-        dflash_utils,
-        "get_pp_group",
+        "vllm.v1.worker.gpu.spec_decode.utils.get_pp_group",
         lambda: SimpleNamespace(world_size=2),
     )
     monkeypatch.setattr(
         "vllm.compilation.backends.set_model_tag",
         lambda _tag: nullcontext(),
-    )
-    monkeypatch.setattr(
-        "vllm.model_executor.models.qwen3_dflash.dflash_target_rope_is_neox_style",
-        lambda _model: None,
     )
     monkeypatch.setattr(
         "vllm.model_executor.models.qwen3_dflash.dflash_has_any_non_causal",
@@ -158,15 +155,17 @@ def test_dflash_context_projection_rejects_mixed_quantization(mxfp8_layer: int):
     from torch import nn
 
     from vllm.model_executor.layers.quantization.modelopt import (
-        ModelOptMxFp8LinearMethod,
+        ModelOptLinearMethod,
     )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Static
     from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
 
     class UnreadableWeight:
         def __getitem__(self, _key):
             raise AssertionError("weights must not be read before validation")
 
-    mxfp8_method = object.__new__(ModelOptMxFp8LinearMethod)
+    mxfp8_method = object.__new__(ModelOptLinearMethod)
+    mxfp8_method.spec = SimpleNamespace(weight=kMxfp8Static)
     methods = [None, None]
     methods[mxfp8_layer] = mxfp8_method
     layers_attn = [

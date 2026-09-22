@@ -337,7 +337,8 @@ def resolve_kv_cache_layout(
     Runs once in the engine core. Every worker reports the layouts its backends
     support, most preferred first (``get_supported_kv_cache_layouts``); all
     ranks run the same backends, so their lists must agree. Specs mixing HNC
-    shapes narrow the candidates to block-compact layouts. An explicit
+    shapes narrow the candidates to block-compact layouts; differing page sizes
+    also require the block dimension outside the layer dimension. An explicit
     ``VLLM_KV_CACHE_LAYOUT`` must be one of the candidates or resolution fails,
     with the legacy ``NHD``/``HND`` names as aliases for ``LBNHC``/``LBHNC``; the
     connector's preference is used when compatible and dropped with a warning
@@ -371,6 +372,14 @@ def resolve_kv_cache_layout(
         if not candidates:
             raise ValueError(
                 "Specs with mixed HNC shapes need a block-compact layout, but "
+                f"none is in every supported set: {supported_layouts}."
+            )
+
+    if len({shape[2] for shape in hnc_shapes}) > 1:
+        candidates = [m for m in candidates if m.is_block_outermost]
+        if not candidates:
+            raise ValueError(
+                "Mixed KV page sizes need a block-outermost layout, but "
                 f"none is in every supported set: {supported_layouts}."
             )
 

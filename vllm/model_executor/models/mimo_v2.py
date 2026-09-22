@@ -50,6 +50,11 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.utils import sequence_parallel_chunk
+from vllm.model_executor.weight_transfer import (
+    allocate_weights,
+    copy_weight,
+    materialize_weight,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -165,7 +170,9 @@ class MiMoV2MoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
         self.gate.e_score_correction_bias = nn.Parameter(
-            torch.empty(config.n_routed_experts, dtype=self.gate.out_dtype)
+            allocate_weights(
+                torch.empty, config.n_routed_experts, dtype=self.gate.out_dtype
+            )
         )
 
         self.experts = FusedMoEFactory(
@@ -289,20 +296,22 @@ class MiMoV2Attention(nn.Module):
         )
 
         self.attention_sink_bias = (
-            torch.nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
+            torch.nn.Parameter(
+                allocate_weights(torch.empty, self.num_heads), requires_grad=False
+            )
             if add_swa_attention_sink_bias
             else None
         )
 
         sliding_window = sliding_window_size if sliding_window_size > -1 else None
 
-        # Use DiffKV backend when V has a different head dim than K.
-        # Auto-pick FA-DiffKV when FA3/4 is usable on this device, else fall
-        # back to TRITON_ATTN_DIFFKV.  Users can force a choice via
-        # `--attention-backend <FLASH_ATTN_DIFFKV|TRITON_ATTN_DIFFKV>`.
+        # Honor B12X and DiffKV selections for unequal QK/V head dimensions.
         if self.v_head_dim != self.head_dim:
             requested = get_current_vllm_config().attention_config.backend
-            if requested is not None and requested.name.endswith("_DIFFKV"):
+            if requested is not None and (
+                requested == AttentionBackendEnum.B12X
+                or requested.name.endswith("_DIFFKV")
+            ):
                 backend_enum = requested
             else:
                 fa_backend = AttentionBackendEnum.FLASH_ATTN_DIFFKV.get_class()
@@ -316,8 +325,9 @@ class MiMoV2Attention(nn.Module):
                 else:
                     backend_enum = AttentionBackendEnum.TRITON_ATTN_DIFFKV
             attn_backend = backend_enum.get_class()
-            assert hasattr(attn_backend, "set_head_size_v")
-            attn_backend.set_head_size_v(self.v_head_dim)
+            if backend_enum != AttentionBackendEnum.B12X:
+                assert hasattr(attn_backend, "set_head_size_v")
+                attn_backend.set_head_size_v(self.v_head_dim)
             logger.info_once("Using %s for attention.", attn_backend.get_name())
         else:
             attn_backend = None
@@ -472,19 +482,18 @@ def _shard_fp8_qkv_proj(
     v_head_dim: int,
     tp_rank: int,
     tp_size: int,
+    checkpoint_tp_size: int,
     block: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Shard the fp8 qkv_proj weights for ``tp_rank``.
 
-    The checkpoint stores the fused QKV as ``num_kv_heads`` contiguous groups
-    (one per KV head; ``n`` below), each ordered ``[Q | K | V]``:
+    The checkpoint stores ``checkpoint_tp_size`` contiguous training shards,
+    each ordered ``[Q | K | V]``. Sliding-window shards can contain multiple
+    KV heads. The training TP size is the model's global-attention KV count:
 
         [Q_1 | K_1 | V_1 | Q_2 | K_2 | V_2 | ... | Q_n | K_n | V_n]
 
-    Per group, Q has ``(num_heads / num_kv_heads) * head_dim`` rows, K has
-    ``head_dim`` rows, and V has ``v_head_dim`` rows.
-
-    Each TP rank owns ``g = num_kv_heads / tp_size`` of these groups, and the
+    Each TP rank owns ``g = checkpoint_tp_size / tp_size`` shards, and the
     forward expects them de-interleaved into a single Q, K, and V block:
 
         [Q_1 | Q_2 | ... | Q_g | K_1 | K_2 | ... | K_g | V_1 | V_2 | ... | V_g]
@@ -498,32 +507,37 @@ def _shard_fp8_qkv_proj(
     layout above (Q, K, and V then each span a whole number of blocks), and
     re-quantize to fp8.
     """
-    assert tp_size <= num_kv_heads and num_kv_heads % tp_size == 0, (
-        "TP size must evenly split the number of KV heads."
+    assert checkpoint_tp_size % tp_size == 0, (
+        "TP size must evenly split the checkpoint TP size."
     )
+    assert num_kv_heads % checkpoint_tp_size == 0
 
-    kv_heads_per_rank = num_kv_heads // tp_size
-    if kv_heads_per_rank == 1:
-        # One KV head per rank. The weights and scale can be trivially sharded
+    groups_per_rank = checkpoint_tp_size // tp_size
+    if groups_per_rank == 1:
+        # One checkpoint shard per rank. Weights and scales can be sharded
         # without re-quantization.
         w = w_full.chunk(tp_size, dim=0)[tp_rank]
         s = s_full.chunk(tp_size, dim=0)[tp_rank]
         return w, s
 
-    q_rows_per_group = (num_heads // num_kv_heads) * head_dim
-    k_rows_per_group = head_dim
-    v_rows_per_group = v_head_dim
+    q_rows_per_group = (num_heads // checkpoint_tp_size) * head_dim
+    k_rows_per_group = (num_kv_heads // checkpoint_tp_size) * head_dim
+    v_rows_per_group = (num_kv_heads // checkpoint_tp_size) * v_head_dim
     rows_per_group = q_rows_per_group + k_rows_per_group + v_rows_per_group
-    scale_rows_per_group = s_full.shape[0] // num_kv_heads
+    scale_rows_per_group = (rows_per_group + block - 1) // block
+    assert w_full.shape[0] == rows_per_group * checkpoint_tp_size
+    assert s_full.shape[0] == scale_rows_per_group * checkpoint_tp_size
     qs, ks, vs = [], [], []
-    for g_idx in range(tp_rank * kv_heads_per_rank, (tp_rank + 1) * kv_heads_per_rank):
+    for g_idx in range(tp_rank * groups_per_rank, (tp_rank + 1) * groups_per_rank):
         row_start = g_idx * rows_per_group
         scale_row_start = g_idx * scale_rows_per_group
         # Dequantize this group's weights.
-        w_g = w_full[row_start : row_start + rows_per_group].to(torch.float32)
-        s_g = s_full[scale_row_start : scale_row_start + scale_rows_per_group].to(
+        w_g = materialize_weight(w_full[row_start : row_start + rows_per_group]).to(
             torch.float32
         )
+        s_g = materialize_weight(
+            s_full[scale_row_start : scale_row_start + scale_rows_per_group]
+        ).to(torch.float32)
         s_g_expanded = s_g.repeat_interleave(block, dim=0).repeat_interleave(
             block, dim=1
         )[:rows_per_group]
@@ -760,7 +774,7 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
                 head_start = tp_rank * heads_per_rank
                 narrow_weight = loaded_weight.narrow(0, head_start, heads_per_rank)
 
-                param.data.copy_(narrow_weight)
+                copy_weight(param.data, narrow_weight)
                 loaded_params.add(name)
             else:
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -822,6 +836,7 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             v_head_dim=attn.v_head_dim,
             tp_rank=tp_rank,
             tp_size=tp_size,
+            checkpoint_tp_size=self.config.num_key_value_heads,
         )
         sharded = {"weight": w_rank, "weight_scale_inv": s_rank}
         for kind, tensor in sharded.items():
