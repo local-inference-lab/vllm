@@ -446,6 +446,7 @@ def build_attn_metadata(
     ubatch_idx: int = 0,
     fast_prefill: FastPrefillBatchMetadata | None = None,
     req_idx: np.ndarray | None = None,
+    uniform_decode_graph: bool = False,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -535,6 +536,7 @@ def build_attn_metadata(
                         rswa_prefix_lens=rswa_prefix_lens,
                         req_idx=req_idx,
                         _token_to_req_indices_cache=token_to_req_indices,
+                        uniform_decode_graph=uniform_decode_graph,
                         **common_attn_metadata_extra_kwargs,
                     )
 

@@ -438,6 +438,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
+        if m.uniform_decode_graph and self._can_reuse_spec_inputs(
+            m, num_accepted_tokens, num_decode_draft_tokens_cpu
+        ):
+            assert num_accepted_tokens is not None
+            # Uniform graphs read the packed decode metadata, not the mixed
+            # prefill worklists. Mixed graphs keep their complete staging even
+            # when the request rows happen to be uniform on this invocation.
+            return self._build_uniform_spec_decode(m, num_accepted_tokens)
         mixed = getattr(self, "_b12x_mixed", None)
         if mixed is not None:
             mixed.stage(
@@ -900,6 +908,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         del slot_mapping
         assert metadata.num_reqs > 0
         assert metadata.seq_lens is not None
+        if (
+            metadata.is_uniform_spec_decode
+            and metadata.b12x_mixed is None
+            and self._reuse_spec_decode_inputs
+            and self.mamba_aligned_state_indices is not None
+        ):
+            assert metadata.num_accepted_tokens is not None
+            return self._build_uniform_spec_decode(
+                metadata, metadata.num_accepted_tokens
+            )
         mixed = None
         if metadata.b12x_mixed is not None:
             mixed = self._b12x_mixed

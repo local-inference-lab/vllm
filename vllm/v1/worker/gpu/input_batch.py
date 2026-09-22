@@ -123,6 +123,10 @@ class InputBatch:
     # [num_reqs] set only under PCP+DCP (see CommonAttentionMetadata).
     dcp_local_seq_lens_cpu_upper_bound: torch.Tensor | None = None
 
+    # The selected full graph specializes uniform decode. This is not inferred
+    # from dummy query lengths: a mixed graph may be captured with uniform rows.
+    uniform_decode_graph: bool = False
+
     @classmethod
     def make_dummy(
         cls,

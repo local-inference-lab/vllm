@@ -1001,6 +1001,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 attn_groups,
                 kv_cache_config,
                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
+                uniform_decode_graph=desc.uniform_token_count is not None,
                 max_query_len=desc.max_query_len,
                 pcp_manager=pcp_manager,
             )
@@ -1077,12 +1078,15 @@ def prepare_inputs_to_capture(
     full_cudagraph: bool,
     max_query_len: int | None = None,
     pcp_manager: "PCPManager | None" = None,
+    uniform_decode_graph: bool = False,
 ) -> AttentionState:
     input_batch = InputBatch.make_dummy(
         num_reqs, num_tokens, input_buffers, max_query_len=max_query_len
     )
     if pcp_manager is not None:
         input_batch = pcp_manager.prepare_inputs_to_capture(input_batch)
+
+    input_batch.uniform_decode_graph = full_cudagraph and uniform_decode_graph
 
     block_table_provider = pcp_manager or block_tables
     input_block_tables = block_table_provider.get_dummy_block_tables(num_reqs)

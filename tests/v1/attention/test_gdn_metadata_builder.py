@@ -427,6 +427,61 @@ def test_uniform_spec_decode_falls_back_for_nonuniform_requests(
     assert not metadata.is_uniform_spec_decode
 
 
+@pytest.mark.parametrize("uniform_graph", [False, True])
+def test_uniform_graph_skips_only_unused_b12x_mixed_worklists(
+    monkeypatch, uniform_graph: bool
+):
+    """A graph's kernel contract, not uniform-looking rows, permits elision."""
+    monkeypatch.setenv("VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH", "1")
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn."
+        "_resolve_gdn_prefill_backend",
+        lambda _: ("b12x", "b12x"),
+    )
+    builders = [_create_gdn_builder(3, full_cuda_graph=True) for _ in range(2)]
+    for index, builder in enumerate(builders):
+        builder.vllm_config.cache_config.mamba_cache_mode = "align"
+        builder.mamba_aligned_state_indices = (
+            torch.arange(8, dtype=torch.int32).reshape(2, 4) + 100 * index
+        )
+        if uniform_graph:
+
+            def unexpected_staging(*args, **kwargs):
+                raise AssertionError("Uniform decode must not stage mixed worklists")
+
+            monkeypatch.setattr(builder._b12x_mixed, "stage", unexpected_staging)
+            monkeypatch.setattr(
+                builder._b12x_mixed, "copy_worklists_from", unexpected_staging
+            )
+
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[64, 64], query_lens=[4, 4]), BLOCK_SIZE, DEVICE
+    ).replace(
+        is_prefilling=torch.zeros(2, dtype=torch.bool),
+        uniform_decode_graph=uniform_graph,
+    )
+    captured = [builder.build_for_cudagraph_capture(common) for builder in builders]
+    drafts = torch.full((2,), 3, dtype=torch.int32)
+    for values in ([1, 4], [3, 2]):
+        accepted = torch.tensor(values, dtype=torch.int32)
+        for builder in builders:
+            builder.mamba_aligned_state_indices.add_(8)
+        source = builders[0].build(0, common, accepted, drafts)
+        rebound = builders[1].update_block_table(
+            source, common.block_table_tensor, None
+        )
+        for builder, metadata, graph_metadata in zip(
+            builders, [source, rebound], captured
+        ):
+            assert metadata.is_uniform_spec_decode
+            assert (metadata.b12x_mixed is None) is uniform_graph
+            torch.testing.assert_close(
+                graph_metadata.spec_state_indices_tensor,
+                builder.mamba_aligned_state_indices,
+            )
+            torch.testing.assert_close(graph_metadata.num_accepted_tokens, accepted)
+
+
 @pytest.mark.parametrize(
     "test_case", GDN_BUILD_TEST_CASES.values(), ids=GDN_BUILD_TEST_CASES.keys()
 )
