@@ -178,6 +178,23 @@ class WorkspaceManager:
         """Check if workspace is locked."""
         return self._locked
 
+    def available_bytes(self) -> int:
+        """Capacity of the active execution slot, without allocating storage.
+
+        A borrower must ensure that no nested or concurrent operation consumes
+        this slot while its views are live.
+        """
+        ubatch_id = dbo_current_ubatch_id()
+        lane = _workspace_lane.get()
+        if lane >= self._num_lanes:
+            raise RuntimeError(
+                f"Workspace lane {lane} is not configured; manager has "
+                f"{self._num_lanes} lane(s)."
+            )
+        return self._workspace_size_bytes(
+            self._current_workspaces[ubatch_id * self._num_lanes + lane]
+        )
+
     def get_simultaneous(
         self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
     ) -> list[torch.Tensor]:
@@ -229,15 +246,40 @@ class WorkspaceManager:
             required_bytes,
             max(map(self._workspace_size_bytes, self._current_workspaces), default=0),
         )
+        self._reserve_slots(
+            [required_bytes] * len(self._current_workspaces), operation="reserve_all"
+        )
+
+    def reserve_by_lane(self) -> None:
+        """Cover every microbatch without copying capacity between model lanes.
+
+        A target and its drafter have separate scratch contracts. A microbatch
+        can execute either model, but each model always uses its assigned lane.
+        """
+        lane_bytes = [
+            max(
+                map(
+                    self._workspace_size_bytes,
+                    self._current_workspaces[lane :: self._num_lanes],
+                ),
+                default=0,
+            )
+            for lane in range(self._num_lanes)
+        ]
+        self._reserve_slots(
+            lane_bytes * self._num_ubatches, operation="reserve_by_lane"
+        )
+
+    def _reserve_slots(self, sizes: list[int], *, operation: str) -> None:
         undersized = [
             workspace_id
             for workspace_id, workspace in enumerate(self._current_workspaces)
-            if self._workspace_size_bytes(workspace) < required_bytes
+            if self._workspace_size_bytes(workspace) < sizes[workspace_id]
         ]
         if self._locked and undersized:
             raise AssertionError(
-                "Workspace is locked but reserve_all requires "
-                f"{required_bytes / _MB:.2f} MB in slot(s) {undersized}."
+                f"Workspace is locked but {operation} requires "
+                f"larger capacity in slot(s) {undersized}."
             )
 
         for workspace_id in undersized:
@@ -246,14 +288,13 @@ class WorkspaceManager:
             del current_workspace
             torch.accelerator.empty_cache()
             self._current_workspaces[workspace_id] = torch.empty(
-                (required_bytes,), dtype=torch.uint8, device=self._device
+                (sizes[workspace_id],), dtype=torch.uint8, device=self._device
             )
 
         if envs.VLLM_DEBUG_WORKSPACE and undersized:
             logger.info(
-                "[WORKSPACE DEBUG] Reserved %.2f MB in execution slots %s",
-                required_bytes / _MB,
-                undersized,
+                "[WORKSPACE DEBUG] Reserved execution slots (slot, MB): %s",
+                [(slot, sizes[slot] / _MB) for slot in undersized],
             )
 
     def _ensure_workspace_size(self, required_bytes: int) -> torch.Tensor:
@@ -327,7 +368,7 @@ class WorkspaceManager:
             # stream-ordered, so wait for the device first. Growth happens only
             # before the workspace is locked, never in steady-state serving.
             if self._device.type == "cuda" and current_workspace is not None:
-                torch.cuda.synchronize(self._device)
+                torch.accelerator.synchronize(self._device)
             self._current_workspaces[workspace_id] = None
             del current_workspace
             # Release the freed segment back to CUDA so the caching

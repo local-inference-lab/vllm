@@ -186,7 +186,7 @@ class _ContextKVProjection:
             packed_weight=self.weight,
             output=out.view(rows, self.weight.out_features, 1),
         )
-        retain_cuda_graph_capture_resource(binding)
+        retain_cuda_graph_capture_resource(scratch)
         block_fp8_linear.run(binding=binding)
         return out
 

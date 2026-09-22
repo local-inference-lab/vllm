@@ -7,6 +7,7 @@ import importlib
 import sys
 import types
 from dataclasses import dataclass
+from typing import Any
 
 import pytest
 import torch
@@ -492,7 +493,8 @@ def test_b12x_mxfp8_process_weights_packs_modelopt_layout(monkeypatch) -> None:
     assert len(calls) == 1
     weight, weight_scale = calls[0]
     assert weight.shape == (48, 128)
-    assert weight_scale.shape == (48, 4)
+    # Preserve the checkpoint's padded row layout for native packed scales.
+    assert weight_scale.shape == (64, 4)
     assert weight.dtype == torch.float8_e4m3fn
     assert weight_scale.dtype == torch.uint8
     assert layer.weight.numel() == 0
@@ -932,7 +934,14 @@ def test_b12x_fp4_processes_scale_and_preserves_loader(
     if kernel_cls is B12xNvFp4LinearKernel:
         layer.weight = torch.empty((48, 64), dtype=torch.uint8)
         layer.weight_global_scale = torch.tensor(0.5)
-        packed = object()
+        layer.input_global_scale_inv = torch.tensor(1.0)
+
+        @dataclass(frozen=True)
+        class PackedWeight:
+            in_features: int
+            values: torch.Tensor
+
+        packed = PackedWeight(0, layer.weight)
 
         def pack_weight(weight, scale, *, recipe, global_scale):
             assert weight.data_ptr() == layer.weight.data_ptr()
@@ -947,13 +956,16 @@ def test_b12x_fp4_processes_scale_and_preserves_loader(
             lambda: types.SimpleNamespace(pack_weight=pack_weight),
         )
     kernel = object.__new__(kernel_cls)
+    if kernel_cls is B12xNvFp4LinearKernel:
+        kernel.config = NvFp4LinearLayerConfig(use_a16=False)
 
     kernel.process_weights_after_loading(layer)
 
     assert layer.weight_scale.data_ptr() == swizzled_scale.data_ptr()
     assert layer.weight_scale.weight_loader is weight_loader
     if kernel_cls is B12xNvFp4LinearKernel:
-        assert layer.b12x_nvfp4_packed_weight is packed
+        assert layer.b12x_nvfp4_packed_weight.in_features == 128
+        assert layer.b12x_nvfp4_packed_weight.values is packed.values
 
 
 def test_b12x_mxfp4_apply_calls_native_blockscaled_gemm(monkeypatch) -> None:
@@ -1054,7 +1066,7 @@ def test_b12x_w4a16_modelopt_vision_width_preserves_bf16_activations(monkeypatch
     from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.quantization.modelopt import (
         ModelOptNvFp4Config,
-        ModelOptNvFp4W4A16LinearMethod,
+        build_linear_method,
     )
     from vllm.v1.worker.workspace import (
         current_workspace_manager,
@@ -1076,11 +1088,13 @@ def test_b12x_w4a16_modelopt_vision_width_preserves_bf16_activations(monkeypatch
     n, k = 1152, 4304
     config = VllmConfig(kernel_config=KernelConfig(linear_backend="b12x"))
     with set_current_vllm_config(config), torch.no_grad():
-        method = ModelOptNvFp4W4A16LinearMethod(
+        method = build_linear_method(
             ModelOptNvFp4Config(
                 quant_method="W4A16_NVFP4",
                 is_checkpoint_nvfp4_serialized=True,
-            )
+            ),
+            "W4A16_NVFP4",
+            "vision_tower.mlp",
         )
         layer = torch.nn.Module()
         with torch.device(device):
@@ -1874,6 +1888,122 @@ def test_b12x_mhc_declares_the_operations_each_layer_runs(
             mhc._plan_for("pre", 8)
 
 
+@torch.inference_mode()
+@pytest.mark.parametrize("operation", ["pre", "post_pre", "post_pre_bf16", "post"])
+@pytest.mark.parametrize("tokens", [3, 4096])
+def test_b12x_mhc_preparation_reuses_outputs_with_exact_graph_replay(
+    monkeypatch, operation, tokens
+):
+    """Tuning fixtures retain one output set per candidate, not per sample."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("native b12x mHC requires SM12x")
+    from b12x.norm.mhc import _impl
+    from b12x.preparation import PreparationSession
+
+    from vllm.models.deepseek_v4.nvidia import b12x as dsv4_b12x
+
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    hidden, mult = 4096, 4
+    fn = torch.randn(24, mult * hidden, device=device) * 0.001
+    norm = types.SimpleNamespace(
+        weight=torch.ones(hidden, dtype=torch.bfloat16, device=device),
+        variance_epsilon=1e-6,
+    )
+    layer = types.SimpleNamespace(
+        hc_attn_fn=fn,
+        hc_ffn_fn=fn,
+        hc_attn_scale=torch.ones(3, device=device),
+        hc_ffn_scale=torch.ones(3, device=device),
+        hc_attn_base=torch.zeros(24, device=device),
+        hc_ffn_base=torch.zeros(24, device=device),
+        hc_attn_fn_broadcast=fn.view(24, mult, hidden).sum(1),
+        attn_norm=norm,
+        ffn_norm=norm,
+        hc_ffn_fn_bf16=fn.to(torch.bfloat16),
+    )
+    mhc = dsv4_b12x.B12xMHCResidual(
+        hidden_size=hidden,
+        hc_mult=mult,
+        rms_eps=1e-6,
+        hc_eps=1e-6,
+        sinkhorn_iters=20,
+    )
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(tokens,),
+        fixed_token_counts=(),
+        output_dtype=torch.bfloat16,
+        max_tokens=tokens,
+        max_seqs=1,
+        max_model_len=tokens,
+    )
+    (unit,) = mhc.get_b12x_preparation_units(layer, workload)
+    request = next(
+        item for item in unit.requests if item.name.endswith(f".{operation}.m{tokens}")
+    )
+    native_operation = "post_pre" if operation == "post_pre_bf16" else operation
+    name = f"_b12x_mhc_{native_operation}_impl"
+    native = getattr(_impl, name)
+    captured_call: list[tuple[tuple[torch.Tensor, ...], dict[str, Any]]] = []
+    captured_outputs = []
+
+    def observe(*args, **kwargs):
+        captured_call[:] = [(args, kwargs)]
+        result = native(*args, **kwargs)
+        captured_outputs[:] = outputs(result)
+        return result
+
+    def outputs(value):
+        return value if isinstance(value, tuple) else (value,)
+
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
+        session.prepare((request,))
+        call = request.prepare_call(request.plan.prepared.state)
+        with monkeypatch.context() as hooks:
+            hooks.setattr(_impl, name, observe)
+            call.produce()
+            assert call.invoke() is None
+            first = tuple(captured_outputs)
+            assert call.invoke() is None
+            second = tuple(captured_outputs)
+        args, kwargs = captured_call.pop()
+        reference_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in {"residual_out", "y_out", "post_out", "comb_out", "out"}
+        }
+        pointers = [tensor.data_ptr() for tensor in first]
+        assert [tensor.data_ptr() for tensor in second] == pointers
+        for actual, expected in zip(
+            second, outputs(native(*args, **reference_kwargs)), strict=True
+        ):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with session.capture(), torch.cuda.graph(graph):
+                call.invoke()
+                call.invoke()
+            for _ in range(2):
+                call.produce()
+                for tensor in first:
+                    tensor.fill_(float("nan"))
+                allocated = torch.accelerator.memory_allocated(device)
+                graph.replay()
+                torch.accelerator.synchronize()
+                assert torch.accelerator.memory_allocated(device) == allocated
+                # Preparation must not pin full-prefill results in the session.
+                assert call.output is None
+                assert [tensor.data_ptr() for tensor in first] == pointers
+                expected = outputs(native(*args, **reference_kwargs))
+                for actual, wanted in zip(first, expected, strict=True):
+                    assert torch.isfinite(actual).all()
+                    torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
+        finally:
+            graph.reset()
+
+
 def test_b12x_mhc_keeps_plans_across_workloads(monkeypatch) -> None:
     from vllm.models.deepseek_v4.nvidia import b12x as dsv4_b12x
 
@@ -2610,7 +2740,7 @@ def test_b12x_fp8_eager_unplanned_rows_use_default_and_replay(recipe):
         assert set(plans) == {4, capacity}
         actual = run(11)
         assert plans[11].prepared is not None
-        assert plans[11].selection.source == "fixed"
+        assert plans[11].selection.source == "default"
         torch.testing.assert_close(actual, expected(11), rtol=0.02, atol=0.125)
         session.freeze()
         with kernel_resolution_guard("FP8 prepared exact-M execution"):
@@ -2634,11 +2764,17 @@ def test_b12x_fp8_eager_unplanned_rows_use_default_and_replay(recipe):
 
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
 @torch.no_grad()
-def test_v41_unquantized_prepares_dtypes_and_exact_rows_before_replay(output_dtype):
+def test_v41_unquantized_prepares_dtypes_and_exact_rows_before_replay(
+    output_dtype, request
+):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("native b12x projection requires SM12x")
     from vllm.models.deepseek_v4_1.b12x_layers import B12xLinearMethod
 
+    # A TF32 reference rounds FP32 inputs, unlike the native SIMT projection.
+    precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    request.addfinalizer(lambda: torch.set_float32_matmul_precision(precision))
     device = torch.device("cuda", torch.accelerator.current_device_index())
     layer = torch.nn.Module()
     layer.weight = torch.nn.Parameter(

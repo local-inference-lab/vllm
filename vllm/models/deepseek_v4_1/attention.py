@@ -1454,16 +1454,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                         candidate_lengths=source._candidate_lens[offset:end],
                     )
                 index_plan = self._index_plan(index_mode, count)
+                scratch = current_workspace_manager().get_simultaneous(
+                    *(
+                        (spec.shape, spec.dtype)
+                        for spec in dsa_indexer.scratch_specs(
+                            index_plan, device=iq_data.device
+                        )
+                    )
+                )
                 binding = dsa_indexer.bind(
                     index_plan,
-                    scratch=current_workspace_manager().get_simultaneous(
-                        *(
-                            (spec.shape, spec.dtype)
-                            for spec in dsa_indexer.scratch_specs(
-                                index_plan, device=iq_data.device
-                            )
-                        )
-                    ),
+                    scratch=scratch,
                     q_mxfp4=iq_data[offset:end],
                     q_scales=iq_scale[offset:end],
                     query_weights=iw[offset:end],
@@ -1475,7 +1476,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     output_indices=self.topk_indices_buffer[offset:end],
                     **candidate_args,
                 )
-                retain_cuda_graph_capture_resource(binding)
+                retain_cuda_graph_capture_resource(scratch)
                 dsa_indexer.score(binding)
                 dsa_indexer.select(binding)
 
@@ -1534,7 +1535,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             swa_lengths=swa_lengths[:rows],
             **kwargs,
         )
-        retain_cuda_graph_capture_resource(binding)
+        # Keep scratch and metadata, not aliases of the transient query storage.
+        retain_cuda_graph_capture_resource(buffers)
         mla.run(
             binding=binding,
             swa_k_cache=self.swa_cache_layer.kv_cache,
@@ -1706,9 +1708,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             )
         require_prepared(plan, "gemm.wo_projection", o.device)
         weights = self._wo_projection_weights
+        scratch = _scratch(plan)
         binding = wo_projection.bind_inv_rope(
             plan,
-            scratch=_scratch(plan),
+            scratch=scratch,
             o=o,
             positions=positions,
             cos_sin_cache=self.rotary_emb.cos_sin_cache,
@@ -1725,7 +1728,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             device=o.device,
         )
         binding = replace(binding, output=output)
-        retain_cuda_graph_capture_resource(binding)
+        # The model owns the plan and weights; graph pools manage activation
+        # lifetimes. Keep only the borrowed workspace, not layer activations.
+        retain_cuda_graph_capture_resource(scratch)
         local = wo_projection.run_inv_rope(
             binding=binding,
             plan=plan,

@@ -4,6 +4,7 @@
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
 import time
+from collections.abc import Iterable
 from typing import Annotated, Any, ClassVar, Literal
 
 from openai.types.chat.chat_completion_audio import (
@@ -51,6 +52,7 @@ from vllm.sampling_params import (
     ThinkingTokenBudget,
 )
 from vllm.utils import random_uuid
+from vllm.utils.tool_names import normalize_tool_namespace
 
 logger = init_logger(__name__)
 
@@ -186,6 +188,11 @@ class ChatCompletionToolsParam(OpenAIBaseModel):
     function: FunctionDefinition
     defer_loading: bool | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_namespace(cls, data: Any) -> Any:
+        return normalize_tool_namespace(data)
+
     @model_validator(mode="after")
     def _propagate_defer_loading(self) -> "ChatCompletionToolsParam":
         if self.defer_loading is not None and self.function.defer_loading is None:
@@ -208,6 +215,11 @@ class ChatCompletionNamedFunction(OpenAIBaseModel):
 class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
     function: ChatCompletionNamedFunction
     type: Literal["function"] = "function"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_namespace(cls, data: Any) -> Any:
+        return normalize_tool_namespace(data)
 
 
 class ChatCompletionRequest(OpenAIBaseModel):
@@ -534,23 +546,40 @@ class ChatCompletionRequest(OpenAIBaseModel):
     def _normalize_messages_before(cls, data: Any) -> Any:
         """Pre-process message dicts before Pydantic field validation.
 
-        Performs two normalizations in a single pass:
+        Normalizes tool identities and message fields in a single pass:
         - Converts tool_calls generators/iterators to lists so one-shot
           generators are not consumed during union type matching.
         - Renames the deprecated ``reasoning_content`` field to
           ``reasoning`` so downstream code only needs to check one field.
+        - Qualifies tool-call namespaces before union validation can drop them.
+
+        Args:
+            data: Unvalidated request payload, including Python message sequences.
+
+        Returns:
+            A copied payload with normalized list/tuple message histories, or
+            the unchanged input when it is not a supported payload shape.
         """
         if not isinstance(data, dict):
             return data
         messages = data.get("messages")
-        if not isinstance(messages, list):
+        if not isinstance(messages, (list, tuple)):
             return data
+        data = dict(data)
+        messages = [dict(msg) if isinstance(msg, dict) else msg for msg in messages]
+        data["messages"] = messages
         for msg in messages:
             if not isinstance(msg, dict):
                 continue
             tool_calls = msg.get("tool_calls")
-            if tool_calls is not None and not isinstance(tool_calls, list):
-                msg["tool_calls"] = list(tool_calls)
+            if isinstance(tool_calls, Iterable) and not isinstance(
+                tool_calls, (str, bytes, dict)
+            ):
+                msg["tool_calls"] = [
+                    normalize_tool_namespace(call) for call in tool_calls
+                ]
+            if isinstance(msg.get("tools"), list):
+                msg["tools"] = [normalize_tool_namespace(tool) for tool in msg["tools"]]
             reasoning_content = msg.pop("reasoning_content", None)
             if reasoning_content is not None and msg.get("reasoning") is None:
                 msg["reasoning"] = reasoning_content
@@ -915,6 +944,17 @@ class ChatCompletionRequest(OpenAIBaseModel):
             raise data
         if not isinstance(data, dict):
             return data
+
+        # Named choices must be compared with qualified identities before
+        # Pydantic serializes function definitions and discards extra fields.
+        data = dict(data)
+        tools = data.get("tools")
+        if isinstance(tools, Iterable) and not isinstance(
+            tools, (str, bytes, bytearray, dict)
+        ):
+            data["tools"] = [normalize_tool_namespace(tool) for tool in tools]
+        if isinstance(data.get("tool_choice"), dict):
+            data["tool_choice"] = normalize_tool_namespace(data["tool_choice"])
 
         # Reject empty tools array, matching OpenAI API behavior
         if data.get("tools") == []:

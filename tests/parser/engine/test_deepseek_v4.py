@@ -21,6 +21,7 @@ from tests.parser.engine.streaming_helpers import (
     simulate_reasoning_streaming,
     simulate_tool_streaming,
 )
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.parser.abstract_parser import DelegatingParser
 from vllm.parser.deepseek_v4 import (
     DSML_INVOKE_END,
@@ -36,16 +37,108 @@ from vllm.parser.deepseek_v4 import (
     _unwrap_wrapper_args,
     deepseek_v4_config,
 )
+from vllm.parser.deepseek_v41 import DeepSeekV41Parser
+from vllm.parser.engine.adapters import make_adapters
 from vllm.parser.engine.registered_adapters import (
     DeepSeekV4ParserReasoningAdapter,
     DeepSeekV4ParserToolAdapter,
 )
+from vllm.tokenizers.deepseek_v41_encoding import encode_messages
 
 _THINK_START_ID = 50
 _THINK_END_ID = 51
 
 _PARAM_OPEN = '｜DSML｜parameter name="{name}" string="{is_str}">'
 _PARAM_CLOSE = "</｜DSML｜parameter>"
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 7, 17, 1000])
+def test_v41_namespaced_tools_keep_identity_in_full_stream_and_history(chunk_size):
+    names = ["inventory::lookup", "billing::lookup"]
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "Look up A1."}],
+        tools=[
+            {
+                "type": "function",
+                "namespace": namespace,
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"sku": {"type": "string"}},
+                    },
+                },
+            }
+            for namespace in ("inventory", "billing")
+        ],
+    )
+    tokenizer = make_mock_tokenizer({"<think>": 50, "</think>": 51})
+    _, adapter = make_adapters(DeepSeekV41Parser)
+
+    def parser():
+        return adapter(
+            tokenizer, request.tools, chat_template_kwargs={"thinking": False}
+        )
+
+    text = (
+        "<｜DSML｜ calls>\n"
+        + "\n".join(
+            f'<｜DSML｜ invoke name="{name}">\n'
+            '<｜DSML｜ parameter name="sku" string="true">A1</｜DSML｜ parameter>\n'
+            "</｜DSML｜ invoke>"
+            for name in names
+        )
+        + "\n</｜DSML｜ calls>"
+    )
+    calls = parser().extract_tool_calls(text, request).tool_calls
+    assert [call.function.name for call in calls] == names
+    assert [json.loads(call.function.arguments) for call in calls] == [
+        {"sku": "A1"}
+    ] * 2
+    stream = parser()
+    collected: dict[int, dict[str, str]] = {}
+
+    def collect(delta):
+        if delta is None:
+            return
+        for call in delta.tool_calls:
+            value = collected.setdefault(call.index, {"name": "", "arguments": ""})
+            if call.function:
+                value["name"] += call.function.name or ""
+                value["arguments"] += call.function.arguments or ""
+
+    previous = ""
+    for offset in range(0, len(text), chunk_size):
+        chunk = text[offset : offset + chunk_size]
+        collect(
+            stream.extract_tool_calls_streaming(
+                previous,
+                previous + chunk,
+                chunk,
+                (),
+                (),
+                (),
+                request,
+            )
+        )
+        previous += chunk
+    collect(stream.finish_streaming())
+    assert [collected[i]["name"] for i in sorted(collected)] == names
+    assert [json.loads(collected[i]["arguments"]) for i in sorted(collected)] == (
+        [{"sku": "A1"}] * 2
+    )
+    prompt = encode_messages(
+        [
+            {"role": "user", "content": "Look up A1."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [call.model_dump(exclude_none=True) for call in calls],
+            },
+        ],
+        thinking_mode="chat",
+    )
+    assert all(f'name="{name}"' in prompt for name in names)
 
 
 def _param(name: str, is_str: str, value: str) -> str:
@@ -212,8 +305,10 @@ class TestImplicitParameterClose:
         chunks = [
             DSML_TOOL_START,
             f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n",
-            f"<{_PARAM_OPEN.format(name='location', is_str='true')}"
-            "Paris a<b><｜DSML｜parameter",
+            (
+                f"<{_PARAM_OPEN.format(name='location', is_str='true')}"
+                "Paris a<b><｜DSML｜parameter"
+            ),
             ' name="date" string="true">tomorrow',
             _PARAM_CLOSE,
             DSML_INVOKE_END,
@@ -283,8 +378,10 @@ class TestMissingInvokeEnd:
         parser = DeepSeekV4Parser(mock_tokenizer)
         chunks = [
             DSML_TOOL_START,
-            f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
-            f"{_param('location', 'true', 'NYC')}\n",
+            (
+                f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
+                f"{_param('location', 'true', 'NYC')}\n"
+            ),
             DSML_TOOL_END,
             "Done.",
         ]

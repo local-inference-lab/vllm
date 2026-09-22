@@ -4,10 +4,12 @@
 
 import gc
 import weakref
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 
 from vllm.config import CUDAGraphMode
 
@@ -336,9 +338,11 @@ def test_index_preparation_reuses_reserved_workspace(native_workspace):
         torch.testing.assert_close(cache, torch.zeros_like(cache), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("projection_kind", ["linear", "dspark_context"])
 def test_block_linear_capture_retains_scratch_not_caller_activations(
     native_workspace,
     monkeypatch,
+    projection_kind,
 ):
     from vllm.models.deepseek_v4_1 import b12x_layers
 
@@ -353,10 +357,22 @@ def test_block_linear_capture_retains_scratch_not_caller_activations(
     layer.weight = torch.randn(256, 256, device=device).to(torch.float8_e4m3fn)
     layer.weight_scale_inv = torch.ones(8, 8, device=device).to(torch.float8_e8m0fnu)
     monkeypatch.setattr(b12x_layers, "_execution_capacities", lambda: (16,))
-    method = b12x_layers.B12xFP8LinearMethod(
-        SimpleNamespace(weight_block_size=[32, 32])
-    )
-    method.process_weights_after_loading(layer)
+    if projection_kind == "linear":
+        method = b12x_layers.B12xFP8LinearMethod(
+            SimpleNamespace(weight_block_size=[32, 32])
+        )
+        method.process_weights_after_loading(layer)
+        project = partial(method.apply, layer)
+        plans = layer.b12x_plans
+    else:
+        from vllm.models.deepseek_v4_1.nvidia import dspark
+
+        monkeypatch.setattr(dspark, "_execution_capacities", lambda: (16,))
+        method = dspark._ContextKVProjection(
+            SimpleNamespace(fused_wqa_wkv=layer, q_lora_rank=0), 16
+        )
+        project = method
+        plans = method.plans
     workload = B12xWorkload(
         stage="weights",
         token_counts=(8, 16),
@@ -376,7 +392,7 @@ def test_block_linear_capture_retains_scratch_not_caller_activations(
     )
     session.freeze()
     manager.reserve_all(
-        *((spec.shape, spec.dtype) for spec in layer.b12x_plans[0].scratch_specs())
+        *((spec.shape, spec.dtype) for spec in plans[0].scratch_specs())
     )
     manager.lock()
     inputs = torch.randn(16, 256, dtype=torch.bfloat16, device=device)
@@ -385,7 +401,7 @@ def test_block_linear_capture_retains_scratch_not_caller_activations(
 
     def run(rows):
         source = inputs[:rows] + 1
-        output = method.apply(layer, source)
+        output = project(source)
         references.extend((weakref.ref(source), weakref.ref(output)))
         outputs[:rows].copy_(output)
 
@@ -416,6 +432,159 @@ def test_block_linear_capture_retains_scratch_not_caller_activations(
             outputs.fill_(float("nan"))
             graphs[rows].replay()
             torch.testing.assert_close(outputs[:rows], expected, rtol=0, atol=0)
+    finally:
+        for graph in graphs.values():
+            graph.reset()
+        session.close()
+
+
+@pytest.mark.parametrize("operation", ["pre", "post_pre"])
+@pytest.mark.parametrize("capture_kind", ["full", "breakable"])
+def test_mhc_capture_retains_scratch_not_caller_activations(
+    native_workspace, monkeypatch, operation, capture_kind
+):
+    """Intermediate MHC outputs must be reusable across shared-pool graphs."""
+    from b12x.preparation import PreparationSession
+
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+    from vllm.models.deepseek_v4_1 import b12x_layers
+    from vllm.utils.b12x import B12xWorkload, register_b12x_layer
+
+    _, manager, workspace = native_workspace
+    monkeypatch.setattr(b12x_layers, "_execution_capacities", lambda: (8, 16))
+    device = torch.device("cuda")
+    hidden = 5120
+    torch.manual_seed(146)
+    layer = torch.nn.Module()
+    for kind in ("attn", "ffn"):
+        setattr(layer, f"hc_{kind}_fn", torch.randn(24, hidden * 4, device=device) / 64)
+        setattr(layer, f"hc_{kind}_scale", torch.ones(3, device=device))
+        setattr(layer, f"hc_{kind}_base", torch.zeros(24, device=device))
+        setattr(
+            layer,
+            f"{kind}_norm",
+            SimpleNamespace(
+                weight=torch.ones(hidden, dtype=torch.bfloat16, device=device)
+            ),
+        )
+    layer.hc_attn_fn_broadcast = None
+    module = layer._b12x_mhc = b12x_layers.B12xMHC(
+        SimpleNamespace(
+            hidden_size=hidden,
+            rms_norm_eps=1e-20,
+            hc_eps=1e-6,
+            hc_sinkhorn_iters=20,
+            hc_mult=4,
+        )
+    )
+    name = f"test.mhc.capture.{operation}"
+    module.bind_layer_name(name)
+    register_b12x_layer(name, layer)
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(8, 16),
+        fixed_token_counts=(8,),
+        output_dtype=torch.bfloat16,
+        max_tokens=16,
+        max_seqs=1,
+        max_model_len=16,
+    )
+    session = PreparationSession(device=device, autotune=False, compile_workers=2)
+    session.prepare(
+        tuple(
+            request
+            for unit in module.get_b12x_preparation_units(layer, workload)
+            for request in unit.requests
+        )
+    )
+    session.freeze()
+    manager.reserve_all(
+        *(
+            (spec.shape, spec.dtype)
+            for plan in module._plans.values()
+            for spec in plan.scratch_specs()
+        )
+    )
+    manager.lock()
+    residual = torch.randn(16, 4, hidden, dtype=torch.bfloat16, device=device)
+    previous = torch.randn(16, hidden, dtype=torch.bfloat16, device=device)
+    pre = torch.full((16, 4), 0.25, device=device)
+    previous_post = pre.clone()
+    comb = torch.eye(4, device=device).expand(16, -1, -1).contiguous()
+    destinations = [
+        torch.empty_like(residual),
+        torch.empty_like(pre),
+        torch.empty_like(comb),
+        torch.empty_like(previous),
+        torch.empty_like(pre),
+    ]
+    references: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def run(rows):
+        kwargs = (
+            {}
+            if operation == "pre"
+            else dict(
+                previous_output=previous[:rows],
+                previous_post=previous_post[:rows],
+                previous_comb=comb[:rows],
+            )
+        )
+        values = module.pre(
+            residual[:rows],
+            layer.hc_attn_fn,
+            layer.hc_attn_scale,
+            layer.hc_attn_base,
+            layer.attn_norm.weight,
+            pre[:rows],
+            **kwargs,
+        )
+        capture = BreakableCUDAGraphCapture.current()
+        if capture is not None:
+            # The lagged outputs cross a segment boundary before consumption.
+            capture.add_eager(lambda: None)
+        for destination, value in zip(destinations, values, strict=True):
+            references.append(weakref.ref(value))
+            destination[:rows].copy_(value)
+
+    pool = torch.cuda.graph_pool_handle()
+    graphs, owners = {}, []
+    try:
+        for rows in (16, 8):
+            run(rows)
+            torch.accelerator.synchronize()
+            graph = (
+                torch.cuda.CUDAGraph()
+                if capture_kind == "full"
+                else BreakableCUDAGraphCapture(pool=pool)
+            )
+            graphs[rows] = graph
+            context = (
+                torch.cuda.graph(graph, pool=pool) if capture_kind == "full" else graph
+            )
+            with (
+                session.capture(),
+                workspace.collect_cuda_graph_capture_resources() as resources,
+                torch.cuda.stream(torch.cuda.Stream()),
+                context,
+            ):
+                run(rows)
+            torch.accelerator.synchronize()
+            owners.append(resources)
+            gc.collect()
+            assert all(reference() is None for reference in references)
+            assert resources
+
+        for rows in (8, 16, 8, 16):
+            residual.normal_()
+            previous.normal_()
+            run(rows)
+            expected = [output[:rows].clone() for output in destinations]
+            for output in destinations:
+                output.fill_(float("nan"))
+            graphs[rows].replay()
+            for output, reference in zip(destinations, expected, strict=True):
+                torch.testing.assert_close(output[:rows], reference, rtol=0, atol=0)
     finally:
         for graph in graphs.values():
             graph.reset()
@@ -532,6 +701,73 @@ def test_mhc_fixed_capacity_buckets_preserve_decode_policy(
             assert bool(torch.isfinite(y).all())
 
 
+def _v41_fp8_operands(cache, kind):
+    """Decode native cache rows into E4M3 operands and per-64 scales.
+
+    This independent operand reference follows B12X's
+    tests/_reference/v41_fp8.py. SWA pairs its E8M0 scales; indexed NVFP4
+    uses a power-of-two scale that bounds four adjacent scale groups.
+    """
+    if kind == "swa":
+        rows = cache.reshape(-1, 528)
+        codes = rows[:, :512].contiguous().view(torch.float8_e4m3fn).double()
+        original = rows[:, 512:528].double()
+        exponent = original.reshape(-1, 8, 2).amax(-1).clamp_min(1) - 127
+        values = codes * torch.exp2(original - 127).repeat_interleave(32, dim=1)
+    else:
+        rows = cache.reshape(-1, 288)
+        packed = rows[:, :256].long()
+        codes = torch.stack((packed & 15, packed >> 4), -1).flatten(1)
+        lut = torch.tensor(
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+            dtype=torch.float64,
+            device=cache.device,
+        )
+        original = rows[:, 256:288].contiguous().view(torch.float8_e4m3fn).double()
+        values = lut[codes] * original.repeat_interleave(16, dim=1)
+        bound = original.reshape(-1, 8, 4).amax(-1) * (6 / 448)
+        exponent = torch.ceil(torch.log2(bound.clamp_min(2.0**-126)))
+    scales = torch.exp2(exponent)
+    codes = (values / scales.repeat_interleave(64, dim=1)).float()
+    return codes.to(torch.float8_e4m3fn).float(), scales.float()
+
+
+def _v41_fp8_prefill_reference(q, values, scales, valid, sink):
+    """Model BF16 Q/K and per-64-key FP8 probability/value products.
+
+    Prefill computes Q/K with BF16 operands. Each output group independently
+    quantizes scaled probabilities to E4M3 before its product with FP8 V;
+    partial numerators remain FP32 until the final LSE merge.
+    """
+    keys = (values * scales.repeat_interleave(64, dim=-1)).bfloat16().float()
+    logits = torch.einsum("rhd,rkd->rhk", q.float(), keys) * 512**-0.5
+    logits.masked_fill_(~valid[:, None], -torch.inf)
+    partials, lses = [], []
+    for first in range(0, values.shape[1], 64):
+        local = logits[:, :, first : first + 64]
+        maximum = local.amax(-1)
+        p = torch.exp(local - maximum[:, :, None])
+        p = torch.where(valid[:, None, first : first + 64], p, 0)
+        denominator = p.sum(-1)
+        groups = []
+        for group in range(8):
+            weighted = p * scales[:, None, first : first + 64, group]
+            pscale = weighted.abs().amax(-1, keepdim=True).clamp_min(1e-10) / 448
+            pq = (weighted / pscale).to(torch.float8_e4m3fn).float()
+            vq = values[:, first : first + 64, group * 64 : (group + 1) * 64]
+            groups.append(torch.einsum("rhk,rkd->rhd", pq, vq) * pscale)
+        partials.append(torch.cat(groups, -1) / denominator.clamp_min(1e-30)[..., None])
+        lses.append(
+            torch.where(denominator > 0, maximum + denominator.log(), -torch.inf)
+        )
+    lse = torch.stack(lses, -1)
+    maximum = torch.maximum(lse.amax(-1), sink.float()[None])
+    weights = torch.where(torch.isfinite(lse), torch.exp(lse - maximum[..., None]), 0)
+    denominator = weights.sum(-1) + torch.exp(sink.float()[None] - maximum)
+    output = (torch.stack(partials, -2) * weights[..., None]).sum(-2)
+    return (output / denominator.clamp_min(1e-30)[..., None]).bfloat16().float()
+
+
 @pytest.mark.parametrize("main_page,swa_page", [(64, 32), (128, 64), (256, 128)])
 @pytest.mark.parametrize(
     "is_decode,rows,live_rows",
@@ -557,6 +793,7 @@ def test_attention_shared_scratch_graph_replay(
     device = torch.device("cuda", torch.accelerator.current_device_index())
     torch.manual_seed(142)
     layer = _layer(attention, swa_page=swa_page)
+    layer.rotary_emb = SimpleNamespace(cos_sin_cache=torch.empty(0, device=device))
     layer.config.cache_config.block_size = main_page
     layer.max_model_len = 4096
     if rows == 36:
@@ -673,17 +910,29 @@ def test_attention_shared_scratch_graph_replay(
     units = layer.get_b12x_preparation_units(layer, workload)
     requests = tuple(request for unit in units for request in unit.requests)
     session.prepare(requests, autotune=False)
+    activation_refs: list[tuple[str, StorageWeakRef]] = []
 
     def run():
-        attention.dsa_indexer.quantize_q_mxfp4(
-            layer._index_plan("decode", min(rows, layer.DECODE_CHUNK)),
-            iq,
-            q_mxfp4=packed,
-            q_scales=scales,
+        query = q.clone()
+        index_query = packed.clone(), scales.clone(), weights.clone()
+        activation_refs.extend(
+            (name, StorageWeakRef(tensor.untyped_storage()))
+            for name, tensor in zip(
+                ("query", "index_query", "index_scales", "index_weights"),
+                (query, *index_query),
+            )
         )
-        layer.forward_mqa(
-            q, None, positions, out, index_query=(packed, scales, weights)
-        )
+        mode = "decode" if is_decode else "prefill"
+        chunk = layer.DECODE_CHUNK if is_decode else layer.INDEX_CHUNK
+        for offset in range(0, rows, chunk):
+            end = min(offset + chunk, rows)
+            attention.dsa_indexer.quantize_q_mxfp4(
+                layer._index_plan(mode, end - offset),
+                iq[offset:end],
+                q_mxfp4=index_query[0][offset:end],
+                q_scales=index_query[1][offset:end],
+            )
+        layer.forward_mqa(query, None, positions, out, index_query=index_query)
 
     run()
     batched_output = out.clone()
@@ -707,6 +956,10 @@ def test_attention_shared_scratch_graph_replay(
         torch.cuda.graph(graph, stream=stream),
     ):
         run()
+    # Graph resources own scratch, not the per-layer query activations.
+    gc.collect()
+    retained = [name for name, reference in activation_refs if not reference.expired()]
+    assert not retained, f"Capture resources retained caller activations: {retained}"
     # Changed queries exercise both selection and attention on replay, after
     # all plan storage has been reused by another operation.
     for step, seed in enumerate((143, 144)):
@@ -822,6 +1075,110 @@ def test_output_projection_prepares_uncaptured_decode_sizes(native_workspace):
             graph.reset()
             manager.unlock()
     del resources
+
+
+@pytest.mark.parametrize("is_prefill", [False, True])
+def test_output_projection_capture_releases_caller_activations(
+    native_workspace, is_prefill
+):
+    """WO bindings may borrow inputs and results without pinning them per graph."""
+    from b12x.preparation import PreparationSession
+
+    from vllm.utils.b12x import B12xWorkload
+
+    attention, manager, workspace = native_workspace
+    device = torch.device("cuda")
+    torch.manual_seed(147)
+    layer = _layer(attention)
+    layer.capacity = 16
+    layer.n_local_groups = 2
+    layer.n_local_heads = 16
+    layer.head_dim = 512
+    layer.rope_head_dim = 64
+    layer.o_lora_rank = 1024
+    layer.hidden_size = 5120
+    layer._wo_plans = {}
+    angles = torch.randn(32, 32, device=device)
+    layer.rotary_emb = SimpleNamespace(
+        cos_sin_cache=torch.cat((angles.cos(), angles.sin()), dim=-1)
+    )
+    for name, shape in (("wo_a", (2048, 4096)), ("wo_b", (5120, 2048))):
+        setattr(
+            layer,
+            name,
+            SimpleNamespace(
+                weight=(torch.randn(shape, device=device) / 32).to(torch.float8_e4m3fn),
+                weight_scale_inv=torch.ones(
+                    shape[0] // 32, shape[1] // 32, device=device
+                ).to(torch.float8_e8m0fnu),
+            ),
+        )
+    layer.setup_wo_projection()
+    layer._declare_attention(device)
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(8, 16),
+        fixed_token_counts=(8,),
+        output_dtype=torch.bfloat16,
+        max_tokens=16,
+        max_seqs=1,
+        max_model_len=32,
+    )
+    session = PreparationSession(device=device, autotune=False, compile_workers=2)
+    session.prepare(layer._wo_preparation_unit(workload).requests)
+    session.freeze()
+    manager.reserve_all(
+        *(
+            (spec.shape, spec.dtype)
+            for plan in layer._wo_plans.values()
+            for spec in plan.scratch_specs()
+        )
+    )
+    manager.lock()
+    inputs = torch.randn(16, 16, 512, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(16, device=device)
+    output = torch.empty(16, 5120, dtype=torch.bfloat16, device=device)
+    references: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def run(rows):
+        source = inputs[:rows] + 1
+        result = layer._o_proj(source, positions[:rows], is_prefill=is_prefill)
+        references.extend((weakref.ref(source), weakref.ref(result)))
+        if result._base is not None:
+            references.append(weakref.ref(result._base))
+        output[:rows].copy_(result)
+
+    pool = torch.cuda.graph_pool_handle()
+    graphs, owners = {}, []
+    try:
+        for rows in (16, 8):
+            run(rows)
+            torch.accelerator.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            graphs[rows] = graph
+            with (
+                session.capture(),
+                workspace.collect_cuda_graph_capture_resources() as resources,
+                torch.cuda.graph(graph, pool=pool),
+            ):
+                run(rows)
+            owners.append(resources)
+            gc.collect()
+            assert all(reference() is None for reference in references)
+            assert resources
+
+        for rows in (8, 16, 8, 16):
+            inputs.normal_()
+            positions.copy_(torch.randperm(16, device=device))
+            run(rows)
+            expected = output[:rows].clone()
+            output.fill_(float("nan"))
+            graphs[rows].replay()
+            torch.testing.assert_close(output[:rows], expected, rtol=0, atol=0)
+    finally:
+        for graph in graphs.values():
+            graph.reset()
+        session.close()
 
 
 def test_output_projection_uses_fused_block32_path(native_workspace, monkeypatch):
@@ -1271,14 +1628,14 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
 ):
     from contextlib import ExitStack
 
-    from b12x.attention._shared.mla.compressed_reference import (
-        unpack_deepseek_v41_cache_reference,
-    )
     from b12x.preparation import PreparationSession
 
     from vllm.utils.b12x import B12xWorkload
 
     attention, manager, workspace = native_workspace
+    precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    request.addfinalizer(lambda: torch.set_float32_matmul_precision(precision))
     torch.manual_seed(713)
     device = torch.device("cuda", torch.accelerator.current_device_index())
     layer = _layer(attention, 20, swa_page=swa_page)
@@ -1343,17 +1700,19 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
         )
         if kind == "swa":
             layer.swa_cache_layer.kv_cache = cache
-            swa_values = unpack_deepseek_v41_cache_reference(
-                cache, page_size=page, cache_kind=kind
-            )[page : page + length].clone()
+            swa_values, swa_scales = (
+                part[page : page + length].clone()
+                for part in _v41_fp8_operands(cache, kind)
+            )
             # NaN FP8 payloads in every old SWA row: reading below the
             # replay boundary cannot accidentally look like a valid zero page.
             cache[1 : 1 + boundary // page].fill_(0x7F)
         else:
             layer.kv_cache = cache
-            main_values = unpack_deepseek_v41_cache_reference(
-                cache, page_size=page, cache_kind=kind
-            )[page : page + length].clone()
+            main_values, main_scales = (
+                part[page : page + length].clone()
+                for part in _v41_fp8_operands(cache, kind)
+            )
     layer.indexer.k_cache.kv_cache = torch.zeros(
         (
             length // main_page + 1,
@@ -1393,21 +1752,35 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
         )
 
     def oracle(live):
-        values = torch.cat((swa_values[boundary:], main_values))
-        logical = torch.cat(
+        selected = layer.topk_indices_buffer[:live].long()
+        # Candidate order affects per-tile FP8 rounding. Verify its complete
+        # causal set independently before using that order in the numeric oracle.
+        columns = torch.arange(selected.shape[1], device=device)[None]
+        expected_ids = columns.expand_as(selected).clone()
+        expected_ids.masked_fill_(columns > positions[:live, None], length)
+        actual_ids = selected.masked_fill(selected < 0, length).sort(dim=1).values
+        torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
+        swa_logical = torch.arange(boundary, length, device=device)[None]
+        swa_valid = swa_logical <= positions[:live, None]
+        main_valid = (selected >= 0) & (selected <= positions[:live, None])
+        valid = torch.cat((swa_valid, main_valid), dim=1)
+        values = torch.cat(
             (
-                torch.arange(boundary, length, device=device),
-                torch.arange(length, device=device),
-            )
+                swa_values[None, boundary:].expand(live, -1, -1),
+                main_values[selected.clamp_min(0)],
+            ),
+            dim=1,
+        ).masked_fill(~valid[..., None], 0)
+        scales = torch.cat(
+            (
+                swa_scales[None, boundary:].expand(live, -1, -1),
+                main_scales[selected.clamp_min(0)],
+            ),
+            dim=1,
+        ).masked_fill(~valid[..., None], 0)
+        return _v41_fp8_prefill_reference(
+            q[:live], values, scales, valid, layer.attn_sink
         )
-        logits = torch.einsum("rhd,kd->rhk", q[:live].float(), values) * 512**-0.5
-        logits.masked_fill_(
-            logical[None, None] > positions[:live, None, None], -torch.inf
-        )
-        logits = torch.cat(
-            (logits, layer.attn_sink[None, :, None].expand(live, -1, -1)), -1
-        )
-        return torch.einsum("rhk,kd->rhd", logits.softmax(-1)[..., :-1], values)
 
     workload = B12xWorkload(
         stage="state",
@@ -1454,9 +1827,9 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
                 visible.copy_((positions + 1).clamp_min(0).int())
                 starts[1] = live
                 q.normal_()
-                expected = oracle(live)
                 # Eager execution also catches live-count specialization leaks.
                 run()
+                expected = oracle(live)
                 torch.testing.assert_close(
                     out[:live].float(), expected, rtol=0.04, atol=0.025
                 )
