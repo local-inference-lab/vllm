@@ -253,12 +253,26 @@ def test_reinterpret_u64_as_i64_preserves_pointer_bits():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_aligned_state_indices_graph_replay_masks_padding_and_refreshes_blocks():
+@pytest.mark.parametrize("num_groups", [2, 69])
+@pytest.mark.parametrize("num_state_slots", [1, 8])
+@pytest.mark.parametrize("num_reqs", [1, 4, 33])
+def test_aligned_state_indices_graph_replay_masks_padding_and_refreshes_blocks(
+    num_groups, num_state_slots, num_reqs
+):
+    max_reqs, table_width, sentinel = num_reqs + 2, 16, -77
     tables = [
-        torch.arange(16, dtype=torch.int32, device="cuda").view(4, 4) + group * 100
-        for group in range(2)
+        torch.arange(max_reqs * table_width, dtype=torch.int32, device="cuda")
+        .view(max_reqs, table_width)
+        .add(group * 10000)
+        for group in range(num_groups)
     ]
-    indices = torch.empty((2, 4, 1), dtype=torch.int32, device="cuda")
+    storage = torch.full(
+        (num_groups, max_reqs, num_state_slots * 2),
+        sentinel,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    indices = storage[:, :, ::2]
     ctx = SimpleNamespace(
         is_initialized=True,
         aligned_state_indices=indices,
@@ -267,25 +281,55 @@ def test_aligned_state_indices_graph_replay_masks_padding_and_refreshes_blocks()
             dtype=torch.int64,
             device="cuda",
         ),
-        block_table_stride_req=4,
+        block_table_stride_req=table_width,
         block_size=16,
-        num_groups=2,
+        num_groups=num_groups,
     )
-    seq_lens = torch.tensor([16, 17, 0, 0], dtype=torch.int32, device="cuda")
+    seq_lens = torch.zeros(max_reqs * 2, dtype=torch.int32, device="cuda")[::2]
+
+    def set_lengths(values):
+        lengths = torch.tensor(
+            [values[row % len(values)] for row in range(max_reqs)], dtype=torch.int32
+        )
+        seq_lens.copy_(lengths)
+        return lengths
+
+    lengths = set_lengths([16, 17, 0])
 
     def compute():
-        MambaSpecDecodeGPUContext.compute_aligned_state_indices(ctx, seq_lens, 4)
+        MambaSpecDecodeGPUContext.compute_aligned_state_indices(ctx, seq_lens, num_reqs)
+
+    def check(lengths, table_delta=0):
+        expected = torch.full((num_groups, max_reqs, num_state_slots), sentinel)
+        for group in range(num_groups):
+            for row in range(num_reqs):
+                first_slot = max((int(lengths[row]) - 1) // 16, 0)
+                expected[group, row] = (
+                    group * 10000
+                    + row * table_width
+                    + first_slot
+                    + torch.arange(num_state_slots)
+                    + table_delta
+                    if lengths[row] > 0
+                    else -1
+                )
+        torch.testing.assert_close(
+            indices.cpu(), expected.to(torch.int32), rtol=0, atol=0
+        )
+        assert torch.all(storage[:, :, 1::2] == sentinel)
 
     compute()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         compute()
     graph.replay()
-    assert indices[:, :, 0].tolist() == [[0, 5, -1, -1], [100, 105, -1, -1]]
+    check(lengths)
 
-    seq_lens.copy_(torch.tensor([17, 0, 33, 0], dtype=torch.int32, device="cuda"))
+    lengths = set_lengths([33, 0, 17])
+    for table in tables:
+        table.add_(3)
     graph.replay()
-    assert indices[:, :, 0].tolist() == [[1, -1, 10, -1], [101, -1, 110, -1]]
+    check(lengths, table_delta=3)
 
 
 def test_gpu_context_reinterprets_high_data_ptrs_for_int64_metadata():

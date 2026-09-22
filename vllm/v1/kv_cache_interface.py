@@ -961,6 +961,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     """Sliding window attention with MLA cache format."""
 
     cache_dtype_str: str | None = None
+    non_causal_multi_token_decode: bool = False
     # DeepseekV4-only: see MLAAttentionSpec.model_version.
     alignment: int | None = None  # Default to None for no padding.
     model_version: str | None = None
@@ -999,6 +1000,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         sliding_window_set = set(spec.sliding_window for spec in specs)
         extra_retained_set = set(spec.extra_retained_tokens for spec in specs)
         dcp_replicated_set = {spec.dcp_replicated for spec in specs}
+        non_causal_set = {spec.non_causal_multi_token_decode for spec in specs}
         prefix_policy_set = {
             (spec.prefix_cache_enabled, spec.prefill_replay_window) for spec in specs
         }
@@ -1009,12 +1011,13 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             and len(sliding_window_set) == 1
             and len(extra_retained_set) == 1
             and len(dcp_replicated_set) == 1
+            and len(non_causal_set) == 1
             and len(prefix_policy_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "quantization method, tokens per state, model version, sliding "
             "window size, retained token count, DCP replication mode, "
-            "and prefix policy."
+            "non-causal mode, and prefix policy."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -1030,6 +1033,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
             dcp_replicated=dcp_replicated_set.pop(),
+            non_causal_multi_token_decode=non_causal_set.pop(),
             prefix_cache_enabled=specs[0].prefix_cache_enabled,
             prefill_replay_window=specs[0].prefill_replay_window,
         )
@@ -1041,6 +1045,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             isinstance(spec, SlidingWindowMLASpec)
             and spec.sliding_window == self.sliding_window
             and spec.dcp_replicated == self.dcp_replicated
+            and spec.non_causal_multi_token_decode == self.non_causal_multi_token_decode
             and spec.prefix_cacheable == self.prefix_cacheable
             and spec.prefill_replay_tokens == self.prefill_replay_tokens
             for spec in kv_cache_specs.values()

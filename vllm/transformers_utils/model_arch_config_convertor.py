@@ -309,6 +309,8 @@ class ModelArchConfigConvertorBase:
         return quant_cfg
 
     def is_deepseek_mla(self) -> bool:
+        if "DFlash2KimiK3Model" in self.get_architectures():
+            return getattr(self.hf_text_config, "kv_lora_rank", None) is not None
         if not hasattr(self.hf_text_config, "model_type"):
             return False
         elif self.hf_text_config.model_type in (
@@ -809,6 +811,19 @@ class MossAudioModelArchConfigConvertor(ModelArchConfigConvertorBase):
         return max_position_embeddings, "language_config.max_position_embeddings"
 
 
+class Qwen3ModelArchConfigConvertor(ModelArchConfigConvertorBase):
+    def __init__(self, hf_config, hf_text_config, revision=None):
+        # MLA and GQA DFlash2 checkpoints share the serialized Qwen3 type.
+        # Resolve the implementation before registry inspection and KV sizing.
+        if (
+            getattr(hf_config, "architectures", None) == ["DFlash2DraftModel"]
+            and (getattr(hf_config, "dflash_config", None) or {}).get("attention_mode")
+            == "mla"
+        ):
+            hf_config.architectures = ["DFlash2KimiK3Model"]
+        super().__init__(hf_config, hf_text_config, revision)
+
+
 # hf_config.model_type -> convertor class
 MODEL_ARCH_CONFIG_CONVERTORS = {
     "bailing_hybrid_mtp": BailingHybridMTPModelArchConfigConvertor,
@@ -840,6 +855,7 @@ MODEL_ARCH_CONFIG_CONVERTORS = {
     "nemotron-nas": NemotronNasModelArchConfigConvertor,
     "bailing_hybrid_v3_mtp": BailingHybridV3MTPModelArchConfigConvertor,
     "pangu_ultra_moe_mtp": PanguUltraMoeMTPModelArchConfigConvertor,
+    "qwen3": Qwen3ModelArchConfigConvertor,
     "qwen3_5_mtp": Qwen3_5MTPModelArchConfigConvertor,
     "qwen3_next_mtp": Qwen3NextMTPModelArchConfigConvertor,
     "qwen4_exp_mtp": Qwen4ExpMTPModelArchConfigConvertor,

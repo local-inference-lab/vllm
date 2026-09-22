@@ -483,6 +483,71 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
             ):
                 quant_config["quant_method"] = "mxfp4"
 
+    @staticmethod
+    def update_model_config_for_parallelism(
+        model_config: "ModelConfig", parallel_config: "ParallelConfig"
+    ) -> None:
+        if model_config.quantization != "qsrt_k2":
+            return
+        text = model_config.hf_text_config
+        tp = parallel_config.tensor_parallel_size
+        if not 2 <= tp <= 24 or parallel_config.enable_expert_parallel:
+            raise ValueError("QSRT-K2 requires tensor parallel size 2..24 without EP")
+        original = getattr(
+            text, "original_num_attention_heads", text.num_attention_heads
+        )
+        text.original_num_attention_heads = original
+        text.num_attention_heads = round_up(original, tp)
+        if text.linear_attn_config is not None:
+            kda = dict(text.linear_attn_config)
+            original = kda.get("original_num_heads", kda["num_heads"])
+            kda["original_num_heads"] = original
+            kda["num_heads"] = round_up(original, tp)
+            text.linear_attn_config = kda
+        model_config.model_arch_config = model_config.get_model_arch_config()
+
+
+class Qwen3DSparkConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def update_model_config_for_parallelism(
+        model_config: "ModelConfig", parallel_config: "ParallelConfig"
+    ) -> None:
+        text = model_config.hf_text_config
+        heads = getattr(text, "original_num_attention_heads", text.num_attention_heads)
+        kv_heads = getattr(
+            text, "original_num_key_value_heads", text.num_key_value_heads
+        )
+        if heads % kv_heads:
+            raise ValueError("DSpark query heads must form complete KV groups")
+        tp = parallel_config.tensor_parallel_size
+        # Preserve the checkpoint's GQA grouping, including supported KV replication.
+        compatible = heads % tp == 0 and (kv_heads % tp == 0 or tp % kv_heads == 0)
+        text.original_num_attention_heads = heads
+        text.original_num_key_value_heads = kv_heads
+        if getattr(text, "head_dim", None) is None:
+            text.head_dim = text.hidden_size // heads
+        text.num_key_value_heads = kv_heads if compatible else round_up(kv_heads, tp)
+        text.num_attention_heads = (
+            heads if compatible else (text.num_key_value_heads * (heads // kv_heads))
+        )
+        model_config.model_arch_config = model_config.get_model_arch_config()
+
+
+class KimiK3MLADraftConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def update_model_config_for_parallelism(
+        model_config: "ModelConfig", parallel_config: "ParallelConfig"
+    ) -> None:
+        text = model_config.hf_text_config
+        original = getattr(
+            text, "original_num_attention_heads", text.num_attention_heads
+        )
+        text.original_num_attention_heads = original
+        text.num_attention_heads = round_up(
+            original, parallel_config.tensor_parallel_size
+        )
+        model_config.model_arch_config = model_config.get_model_arch_config()
+
 
 class GptOssForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
@@ -1131,6 +1196,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "DeepseekV4ForConditionalGeneration": DeepseekV4ForCausalLMConfig,
     "DeepseekV41ForCausalLM": DeepseekV41ForCausalLMConfig,
     "DSparkV41DraftModel": DeepseekV41ForCausalLMConfig,
+    "DFlash2KimiK3Model": KimiK3MLADraftConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
     "DiffusionGemmaForBlockDiffusion": DiffusionGemmaModelForBlockDiffusionConfig,  # noqa: E501
     "Ernie4_5_VLMoeForConditionalGeneration": Ernie4_5_VLMoeForConditionalGenerationConfig,  # noqa: E501
@@ -1151,6 +1217,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "JinaVLForRanking": JinaVLForSequenceClassificationConfig,
     "KimiK3ForConditionalGeneration": KimiK3ForConditionalGenerationConfig,
     "KimiK3MTPModel": KimiK3ForConditionalGenerationConfig,
+    "K3DSparkModel": KimiK3MLADraftConfig,
     "LlamaBidirectionalForSequenceClassification": LlamaBidirectionalConfig,
     "LlamaBidirectionalModel": LlamaBidirectionalConfig,
     "LlamaNemotronVLForSequenceClassification": LlamaNemotronVLConfig,
@@ -1163,6 +1230,8 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "NomicBertModel": NomicBertModelConfig,
     "Qwen2ForProcessRewardModel": Qwen2ForProcessRewardModelConfig,
     "Qwen2ForRewardModel": Qwen2ForRewardModelConfig,
+    "Qwen3DSparkModel": Qwen3DSparkConfig,
+    "Qwen3OmniDSparkModel": Qwen3DSparkConfig,
     "Qwen3ForSequenceClassification": Qwen3ForSequenceClassificationConfig,
     "Qwen3VLForSequenceClassification": Qwen3VLForSequenceClassificationConfig,
     "Qwen3_5ForCausalLM": Qwen3_5ForCausalLMConfig,

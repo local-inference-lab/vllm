@@ -1278,6 +1278,7 @@ class ModelConfig:
                 "awq_marlin",
                 "inc",
                 "moe_wna16",
+                "qsrt_k2",
                 "modelopt",
                 "modelopt_fp4",
                 "modelopt_mxfp8",
@@ -1957,8 +1958,12 @@ class ModelConfig:
 
         # Bidirectional DeepSeek variants (is_causal=False, used by some
         # embedding models) must use the non-MLA attention path, since the
-        # MLA kernels only support causal attention.
-        if not getattr(self.hf_text_config, "is_causal", True):
+        # ordinary MLA path only supports causal attention. Kimi-K3 DFlash2
+        # supplies a separate non-causal block-query implementation.
+        if (
+            not getattr(self.hf_text_config, "is_causal", True)
+            and "DFlash2KimiK3Model" not in self.architectures
+        ):
             return False
         return self.is_deepseek_mla
 

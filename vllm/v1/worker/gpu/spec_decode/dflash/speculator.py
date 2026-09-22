@@ -183,7 +183,11 @@ class DFlashSpeculator(DraftModelSpeculator):
         target_model: nn.Module,
         target_attn_layer_names: set[str],
     ) -> nn.Module:
-        return load_dflash_model(target_model, self.vllm_config)
+        model = load_dflash_model(target_model, self.vllm_config)
+        bind_auxiliary_stream = getattr(model, "bind_target_auxiliary_stream", None)
+        if callable(bind_auxiliary_stream):
+            bind_auxiliary_stream(target_model, self.hidden_states)
+        return model
 
     def set_attn(
         self,
@@ -428,11 +432,21 @@ class DFlashSpeculator(DraftModelSpeculator):
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
+        is_streamed_context = getattr(self.model, "is_streamed_context_states", None)
+        context_states_are_streamed = bool(
+            aux_hidden_states
+            and not context_kv_is_restored
+            and ced_indices is None
+            and callable(is_streamed_context)
+            and is_streamed_context(aux_hidden_states)
+        )
+        context_states = self.hidden_states[:num_context_tokens]
         use_context_graph = (
             not dummy_run
             and ced_indices is None
             and not is_profile
             and not context_kv_is_restored
+            and not context_states_are_streamed
             and bool(aux_hidden_states)
             and self._context_preparer is not None
             and self._context_preparer.can_run(num_target_tokens)
@@ -447,22 +461,23 @@ class DFlashSpeculator(DraftModelSpeculator):
                     ]
                 else:
                     last_hidden_states = gather_rows(last_hidden_states, ced_indices)
-            if aux_hidden_states:
+            if context_states_are_streamed:
+                context_states = aux_hidden_states[0]
+            elif aux_hidden_states:
                 hidden_states = self.model.combine_hidden_states(
                     torch.cat(aux_hidden_states, dim=-1)
                 )
             else:
                 hidden_states = last_hidden_states
-            self.hidden_states[:num_context_tokens].copy_(
-                hidden_states[:num_context_tokens]
-            )
+            if not context_states_are_streamed:
+                context_states.copy_(hidden_states[:num_context_tokens])
 
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
             # Since DFlash needs to build its own attention metadata, we must skip the
             # preparation in this path and run a minimal forward pass.
             self.model.precompute_and_store_context_kv(
-                self.hidden_states[:num_context_tokens],
+                context_states,
                 self.context_positions[:num_context_tokens],
             )
             # DFlash processes all speculative tokens in one forward pass,
@@ -555,7 +570,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self._context_preparer.run(aux_hidden_states, num_target_tokens)
         elif not context_kv_is_restored:
             self.model.precompute_and_store_context_kv(
-                self.hidden_states[:num_context_tokens],
+                context_states,
                 context_positions,
                 context_slots,
             )
