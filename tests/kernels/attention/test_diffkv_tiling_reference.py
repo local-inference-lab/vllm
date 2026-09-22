@@ -62,10 +62,12 @@ def reference(q, k, v, table, query_lens, kv_lens, block):
     "query_lens",
     [[8], [8] * 8, [8] * 16, [1, 3, 8, 17], [64], [128], [256], [512], [2048]],
 )
-@pytest.mark.parametrize("context", [0, 2111])
+@pytest.mark.parametrize("context", [0, 2111, 2887])
 @pytest.mark.parametrize("block", [16, 64])
 @torch.inference_mode()
-def test_bf16_prefill_and_multiquery_geometry(monkeypatch, query_lens, context, block):
+def test_bf16_prefill_and_multiquery_geometry(
+    monkeypatch, record_property, query_lens, context, block
+):
     if not current_platform.is_cuda():
         pytest.skip("CUDA numerical test")
     torch.manual_seed(71)
@@ -90,8 +92,10 @@ def test_bf16_prefill_and_multiquery_geometry(monkeypatch, query_lens, context, 
         0, dtype=torch.int32
     )
     recorder = ForwardRecorder(ops.kernel_unified_attention_diffkv)
+    reducer = ForwardRecorder(ops.kernel_reduce_segments_diffkv)
     monkeypatch.setattr(ops, "kernel_unified_attention_diffkv", recorder)
-    ops.unified_attention_diffkv(
+    monkeypatch.setattr(ops, "kernel_reduce_segments_diffkv", reducer)
+    kwargs = dict(
         q=q,
         k=k,
         v=v,
@@ -110,6 +114,7 @@ def test_bf16_prefill_and_multiquery_geometry(monkeypatch, query_lens, context, 
         softmax_segm_max=maximum,
         softmax_segm_expsum=expsum,
     )
+    ops.unified_attention_diffkv(**kwargs)
     expected = reference(q, k, v, table, query_lens, kv_lens, block)
     torch.testing.assert_close(output[:tokens].float(), expected, atol=0.02, rtol=0.02)
     relative = (output[:tokens].float() - expected).norm(dim=-1) / expected.norm(
@@ -119,24 +124,77 @@ def test_bf16_prefill_and_multiquery_geometry(monkeypatch, query_lens, context, 
     assert (output[tokens:] == -17).all()
     assert len(recorder.calls) == 1
     _, launch = recorder.calls[0]
+    eligible = (
+        launch["IS_3D"]
+        and tokens >= 128
+        and max(query_lens) > 1
+        and not ops.is_batch_invariant
+        and current_platform.is_device_capability(120, q.device.index or 0)
+    )
+    record_property("diffkv_dispatch", "3d" if launch["IS_3D"] else "2d")
+    record_property("integrated_query_reuse_exercised", bool(eligible))
     if launch["IS_3D"]:
-        # Integration-only on multi-query input. This never forces old dispatch.
         assert launch["NUM_SEGMENTS_PER_SEQ"] == 16
         assert torch.isfinite(expsum[:, :, 0]).all()
-        if current_platform.is_device_capability(120, q.device.index or 0):
-            assert (launch["BLOCK_M"], launch["TILE_SIZE"]) == (32, 64)
+        assert (launch["BLOCK_M"], launch["TILE_SIZE"]) == (32 if eligible else 16, 16)
+        assert len(reducer.calls) == 1
     else:
-        expected_tile = (
-            (32, 64)
-            if (
-                tokens >= 512
-                and max(query_lens) >= 512
-                and not ops.is_batch_invariant
-                and current_platform.is_device_capability(120, q.device.index or 0)
-            )
-            else (16, 32)
-        )
-        assert (launch["BLOCK_M"], launch["TILE_SIZE"]) == expected_tile
+        assert (launch["BLOCK_M"], launch["TILE_SIZE"]) == (16, 32)
         assert torch.isnan(partial).all()
         assert torch.isnan(maximum).all()
         assert torch.isnan(expsum).all()
+        assert not reducer.calls
+
+    # Reuse the exact input tensors and actual dispatch. Only select the old
+    # M16 geometry for the second real GPU launch; scratch/output are distinct.
+    # Standalone multi-query dispatch stays 2D and still executes this equality
+    # check. Eligible M32-vs-M16 coverage is recorded only on integrated 3D.
+    baseline_output = torch.full_like(output, -17)
+    baseline_kwargs = dict(
+        kwargs,
+        out=baseline_output[:tokens],
+        softmax_segm_output=torch.full_like(partial, float("nan")),
+        softmax_segm_max=torch.full_like(maximum, float("nan")),
+        softmax_segm_expsum=torch.full_like(expsum, float("nan")),
+    )
+
+    def original_tiling(*args, **controls):
+        return 16, 16 if controls["use_3d"] else 32
+
+    with monkeypatch.context() as baseline_patch:
+        baseline_patch.setattr(ops, "_select_diffkv_tiling", original_tiling)
+        ops.unified_attention_diffkv(**baseline_kwargs)
+    assert len(recorder.calls) == 2
+    baseline_launch = recorder.calls[1][1]
+    assert baseline_launch["IS_3D"] == launch["IS_3D"]
+    assert baseline_launch["BLOCK_M"] == 16
+    assert baseline_launch["TILE_SIZE"] == launch["TILE_SIZE"]
+    assert baseline_launch["NUM_SEGMENTS_PER_SEQ"] == launch["NUM_SEGMENTS_PER_SEQ"]
+    for pointer in (
+        "query_ptr",
+        "key_cache_ptr",
+        "value_cache_ptr",
+        "block_tables_ptr",
+        "seq_lens_ptr",
+        "query_start_len_ptr",
+    ):
+        assert baseline_launch[pointer] is launch[pointer]
+    if launch["IS_3D"]:
+        assert len(reducer.calls) == 2
+        assert reducer.calls[1][0] == reducer.calls[0][0] == (tokens, 16)
+        assert reducer.calls[1][1]["BLOCK_Q"] == 1
+        assert reducer.calls[1][1]["TILE_SIZE"] == 16
+        assert reducer.calls[1][1]["NUM_SEGMENTS_PER_SEQ"] == 16
+        assert torch.isfinite(baseline_kwargs["softmax_segm_expsum"][:, :, 0]).all()
+        for actual, name in (
+            (partial, "softmax_segm_output"),
+            (maximum, "softmax_segm_max"),
+            (expsum, "softmax_segm_expsum"),
+        ):
+            torch.testing.assert_close(
+                actual, baseline_kwargs[name], rtol=0, atol=0, equal_nan=True
+            )
+    else:
+        assert not reducer.calls
+    assert torch.equal(output[:tokens], baseline_output[:tokens])
+    assert (baseline_output[tokens:] == -17).all()

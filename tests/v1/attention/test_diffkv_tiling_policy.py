@@ -39,7 +39,7 @@ def platform(monkeypatch):
 
 
 def tensors(
-    tokens=64,
+    tokens=128,
     heads=16,
     kv_heads=1,
     qk=192,
@@ -63,17 +63,17 @@ def select(args, **changes):
     return ops._select_diffkv_tiling(*args, **controls)
 
 
-@pytest.mark.parametrize("tokens", [8, 64, 128, 256])
+@pytest.mark.parametrize("tokens", [128, 256])
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_selected_multiquery_geometry(platform, tokens, cache_dtype):
-    assert select(tensors(tokens=tokens, cache_dtype=cache_dtype)) == (32, 64)
+    assert select(tensors(tokens=tokens, cache_dtype=cache_dtype)) == (32, 16)
     platform.is_device_capability.assert_called_once_with(120, 0)
 
 
 @pytest.mark.parametrize(
     "change",
     [
-        dict(tokens=7),
+        dict(tokens=127),
         dict(heads=8),
         dict(kv_heads=2),
         dict(qk=128),
@@ -100,10 +100,10 @@ def test_dispatch_window_and_split_count_are_not_expanded(platform, change, expe
 
 
 @pytest.mark.parametrize("tokens,max_query", [(512, 512), (2048, 2048)])
-def test_measured_2d_prefill_geometry(platform, tokens, max_query):
+def test_2d_prefill_geometry_remains_unchanged(platform, tokens, max_query):
     assert select(
         tensors(tokens=tokens), use_3d=False, max_seqlen_q=max_query, num_segments=None
-    ) == (32, 64)
+    ) == (16, 32)
 
 
 @pytest.mark.parametrize(
@@ -142,7 +142,7 @@ def test_hardware_gate_and_query_device(platform):
         element_size=q.element_size,
         device=SimpleNamespace(index=3),
     )
-    assert select(args) == (32, 64)
+    assert select(args) == (32, 16)
     platform.is_device_capability.assert_called_with(120, 3)
     platform.is_device_capability.return_value = False
     assert select(args) == (16, 16)
@@ -152,21 +152,22 @@ def test_hardware_gate_and_query_device(platform):
     platform.is_device_capability.assert_not_called()
 
 
-def call_wrapper(monkeypatch, qlen, *, force_tile_for_grid_test=False):
-    q, k, v, table = tensors(tokens=8 * qlen, columns=max(8, (qlen + 15) // 16))
+def call_wrapper(monkeypatch, qlen, *, batch=8, force_tile_for_grid_test=False):
+    q, k, v, table = tensors(tokens=batch * qlen, columns=max(8, (qlen + 15) // 16))
+    table = torch.empty(batch, table.shape[1], dtype=torch.int32)
     main, reduce = Recorder(), Recorder()
     monkeypatch.setattr(ops, "kernel_unified_attention_diffkv", main)
     monkeypatch.setattr(ops, "kernel_reduce_segments_diffkv", reduce)
     if force_tile_for_grid_test:
         # Test grid plumbing in the real wrapper, not multi-query eligibility.
-        monkeypatch.setattr(ops, "_select_diffkv_tiling", lambda *a, **kw: (32, 64))
+        monkeypatch.setattr(ops, "_select_diffkv_tiling", lambda *a, **kw: (32, 16))
     ops.unified_attention_diffkv(
         q=q,
         k=k,
         v=v,
-        out=torch.empty(8 * qlen, 16, 128),
-        cu_seqlens_q=torch.arange(9, dtype=torch.int32) * qlen,
-        seqused_k=torch.full((8,), max(128, qlen), dtype=torch.int32),
+        out=torch.empty(batch * qlen, 16, 128),
+        cu_seqlens_q=torch.arange(batch + 1, dtype=torch.int32) * qlen,
+        seqused_k=torch.full((batch,), max(128, qlen), dtype=torch.int32),
         softmax_scale=192**-0.5,
         causal=True,
         window_size=(-1, -1),
@@ -182,25 +183,27 @@ def call_wrapper(monkeypatch, qlen, *, force_tile_for_grid_test=False):
     return main.calls, reduce.calls
 
 
+@pytest.mark.parametrize("batch", [1, 8, 16])
 def test_multiquery_geometry_matches_selected_dispatch(
-    platform, monkeypatch, record_property
+    platform, monkeypatch, record_property, batch
 ):
-    main, reduce = call_wrapper(monkeypatch, 8)
+    main, reduce = call_wrapper(monkeypatch, 8, batch=batch)
     assert len(main) == 1
     grid, kw = main[0]
     record_property("diffkv_dispatch", "3d" if kw["IS_3D"] else "2d")
     if kw["IS_3D"]:
-        assert (kw["BLOCK_M"], kw["BLOCK_Q"], kw["TILE_SIZE"]) == (32, 2, 64)
-        assert grid == (40, 1, 16)
+        block_m, block_q = (32, 2) if batch == 16 else (16, 1)
+        assert (kw["BLOCK_M"], kw["BLOCK_Q"], kw["TILE_SIZE"]) == (block_m, block_q, 16)
+        assert grid == (batch * 8 // block_q + batch, 1, 16)
         assert kw["NUM_SEGMENTS_PER_SEQ"] == 16
         assert len(reduce) == 1
-        assert reduce[0][0] == (64, 16)
-        assert reduce[0][1]["BLOCK_Q"] == 2
-        assert reduce[0][1]["TILE_SIZE"] == 64
+        assert reduce[0][0] == (batch * 8, 16)
+        assert reduce[0][1]["BLOCK_Q"] == block_q
+        assert reduce[0][1]["TILE_SIZE"] == 16
         assert reduce[0][1]["NUM_SEGMENTS_PER_SEQ"] == 16
     else:
         assert (kw["BLOCK_M"], kw["BLOCK_Q"], kw["TILE_SIZE"]) == (16, 1, 32)
-        assert grid == (72, 1)
+        assert grid == (batch * 9, 1)
         assert not reduce
 
 
@@ -220,26 +223,26 @@ def test_selected_tile_precedes_main_and_reduction_grid_derivation(
     main, reduce = call_wrapper(monkeypatch, 1, force_tile_for_grid_test=True)
     grid, kw = main[0]
     assert grid == (12, 1, 16)
-    assert (kw["BLOCK_M"], kw["BLOCK_Q"], kw["TILE_SIZE"]) == (32, 2, 64)
+    assert (kw["BLOCK_M"], kw["BLOCK_Q"], kw["TILE_SIZE"]) == (32, 2, 16)
     assert reduce[0][0] == (8, 16)
     assert reduce[0][1]["BLOCK_Q"] == 2
-    assert reduce[0][1]["TILE_SIZE"] == 64
+    assert reduce[0][1]["TILE_SIZE"] == 16
     assert reduce[0][1]["NUM_SEGMENTS_PER_SEQ"] == 16
 
 
-def test_real_wrapper_2d_prefill_uses_selected_grid(platform, monkeypatch):
+def test_real_wrapper_2d_prefill_keeps_original_grid(platform, monkeypatch):
     # 8 * 512 query tokens cannot fit this wrapper fixture's 128-token workspace.
     main, reduce = call_wrapper(monkeypatch, 512)
     grid, kw = main[0]
     assert not kw["IS_3D"]
-    assert (kw["BLOCK_M"], kw["BLOCK_Q"], kw["TILE_SIZE"]) == (32, 2, 64)
-    assert grid == (2056, 1)
+    assert (kw["BLOCK_M"], kw["BLOCK_Q"], kw["TILE_SIZE"]) == (16, 1, 32)
+    assert grid == (4104, 1)
     assert not reduce
 
 
 @pytest.mark.parametrize("block,columns", [(16, 4), (64, 1)])
 def test_exact_aligned_table_coverage_is_eligible(platform, block, columns):
-    assert select(tensors(block=block, columns=columns)) == (32, 64)
+    assert select(tensors(block=block, columns=columns)) == (32, 16)
 
 
 @pytest.mark.parametrize("use_3d", [False, True])
@@ -260,4 +263,10 @@ def test_unmeasured_or_mixed_cache_types_keep_original_tiles(
     args = list(tensors(tokens=512, cache_dtype=key_dtype))
     args[2] = torch.empty(args[2].shape, dtype=value_dtype)
     assert select(args, use_3d=use_3d, max_seqlen_q=512) == (16, 16 if use_3d else 32)
+    platform.is_device_capability.assert_not_called()
+
+
+@pytest.mark.parametrize("tokens", [8, 64, 127])
+def test_c1_c8_and_subthreshold_query_batches_keep_original_tiles(platform, tokens):
+    assert select(tensors(tokens=tokens)) == (16, 16)
     platform.is_device_capability.assert_not_called()
