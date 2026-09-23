@@ -207,6 +207,7 @@ if TYPE_CHECKING:
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
+    VLLM_B12X_PAGED_DECODE: Literal["auto", "0", "1"] = "auto"
     VLLM_PLE_TABLE_MEMORY: Literal["ram", "disk"] | None = None
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
@@ -1709,6 +1710,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS", "524288")
+    ),
+    # B12X attention decode/verify through b12x.attention.paged_decode:
+    # "auto" for layers with unequal Q/K and V head dims and for non-causal
+    # FP8-KV layers, "1" for every supported layer, "0" never.
+    "VLLM_B12X_PAGED_DECODE": env_with_choices(
+        "VLLM_B12X_PAGED_DECODE", "auto", ["auto", "0", "1"]
     ),
     # Qwen3.8-Flash-Next PLE offload policy, resolved by vLLM for b12x.
     "VLLM_PLE_TABLE_MEMORY": env_with_choices(

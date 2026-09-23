@@ -757,9 +757,11 @@ def test_b12x_cache_update_and_graph_replay(
     )
     impl.forward(layer, query, key, value, cache, None, output)
     (unit,) = impl.get_b12x_preparation_units(layer, workload)
+    # Paged plans bake in the q strides; paged_decode reads them at launch.
     assert all(
         request.plan.invocation["operands"]["q"]["strides"] == query.stride()
         for request in unit.requests
+        if request.plan.component_id == "attention.paged"
     )
     init_workspace_manager(device)
     try:
@@ -770,7 +772,25 @@ def test_b12x_cache_update_and_graph_replay(
                 impl.do_kv_cache_update(layer, key, value, cache, slots)
                 return impl.forward(layer, query, key, value, cache, metadata, output)
 
+            pristine = cache.clone()
             run()
+            if impl._paged_decode is not None:
+                # b12x paged_decode.write_kv replaces the Triton DiffKV writer:
+                # identical cache bytes.
+                from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+                    triton_reshape_and_cache_flash_diffkv,
+                )
+
+                triton_reshape_and_cache_flash_diffkv(
+                    key,
+                    value,
+                    pristine.transpose(1, 2),
+                    slots,
+                    impl.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
+                assert torch.equal(cache.view(torch.uint8), pristine.view(torch.uint8))
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 run()
@@ -812,11 +832,148 @@ def test_b12x_cache_update_and_graph_replay(
         reset_workspace_manager()
 
 
+@pytest.mark.parametrize("q_lens", [[8, 3], [1, 1]])
+def test_b12x_noncausal_fp8_drafter_uses_paged_decode(
+    default_vllm_config, q_lens, monkeypatch
+) -> None:
+    """Non-causal windowed FP8-KV layers (speculative drafters) run decode and
+    ragged query blocks through b12x paged_decode, including graph replay."""
+    from b12x.attention.paged.reference import attention_reference
+    from b12x.preparation import PreparationSession
+
+    from tests.v1.attention.utils import dense_kv_cache_views
+    from vllm.utils.b12x import B12xWorkload, get_b12x_paged_decode
+    from vllm.v1.worker.workspace import (
+        init_workspace_manager,
+        reset_workspace_manager,
+    )
+
+    _require_b12x_paged_attention()
+    if get_b12x_paged_decode() is None:
+        pytest.skip("b12x.attention.paged_decode is not available")
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    config = default_vllm_config
+    config.model_config = SimpleNamespace(
+        dtype=torch.bfloat16, max_model_len=2048, is_hybrid=False
+    )
+    config.cache_config.block_size = 64
+    config.scheduler_config.max_num_seqs = 2
+    config.scheduler_config.max_num_batched_tokens = 64
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=7)
+    config.attention_config.use_non_causal = True
+    sinks = torch.linspace(-1, 1, 16, device=device, dtype=torch.float32)
+    impl = B12xPagedAttentionImpl(
+        num_heads=16,
+        head_size=128,
+        scale=128**-0.5,
+        num_kv_heads=2,
+        alibi_slopes=None,
+        sliding_window=1024,
+        kv_cache_dtype="fp8_e4m3",
+        sinks=sinks,
+    )
+    impl.process_weights_after_loading(torch.bfloat16)
+    assert impl._paged_decode is not None
+    spec = B12xPagedAttentionBackend.customize_spec(
+        FullAttentionSpec(
+            block_size=64, num_kv_heads=2, head_size=128, dtype=torch.float8_e4m3fn
+        )
+    )
+    num_pages = 40
+    raw = torch.zeros(
+        num_pages * 2 * spec.page_size_bytes, dtype=torch.uint8, device=device
+    )
+    cache, peer = dense_kv_cache_views(raw, spec, num_pages, 2, KVCacheLayout.BLHNC)
+    peer.fill_(7)
+    layer = SimpleNamespace(
+        kv_cache=cache,
+        _k_scale=torch.tensor(0.5, device=device),
+        _v_scale=torch.tensor(0.25, device=device),
+    )
+    context_lens = [1200, 131]
+    seq_lens = [c + q for c, q in zip(context_lens, q_lens)]
+    gen = torch.Generator(device=device).manual_seed(0)
+    pages = torch.randperm(num_pages - 1, generator=gen, device=device)[: 40 - 2]
+    table = torch.zeros((2, 20), dtype=torch.int32, device=device)
+    table[0, :20] = (pages[:20] + 1).to(torch.int32)
+    table[1, :3] = (pages[20:23] + 1).to(torch.int32)
+    slots = torch.cat(
+        [
+            table[i, torch.arange(length, device=device) // 64].long() * 64
+            + torch.arange(length, device=device) % 64
+            for i, length in enumerate(seq_lens)
+        ]
+    )
+    offsets = [0, q_lens[0], sum(q_lens)]
+    metadata = b12x.B12xPagedMetadata(
+        num_actual_tokens=sum(q_lens),
+        max_query_len=max(q_lens),
+        query_start_loc=torch.tensor(offsets, dtype=torch.int32, device=device),
+        max_seq_len=max(seq_lens),
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+        block_table=table,
+        slot_mapping=slots,
+        causal=False,
+    )
+    key = torch.randn(sum(seq_lens), 2, 128, device=device, dtype=torch.bfloat16)
+    value = torch.randn(sum(seq_lens), 2, 128, device=device, dtype=torch.bfloat16)
+    query = torch.randn(sum(q_lens), 16, 128, device=device, dtype=torch.bfloat16)
+    output = torch.empty(sum(q_lens), 16, 128, device=device, dtype=torch.bfloat16)
+    workload = B12xWorkload(
+        stage="state",
+        token_counts=(1, 2, 16),
+        fixed_token_counts=(1, 2),
+        output_dtype=torch.bfloat16,
+        max_tokens=64,
+        max_seqs=2,
+        max_model_len=2048,
+    )
+    impl.forward(layer, query, key, value, cache, None, output)
+    (unit,) = impl.get_b12x_preparation_units(layer, workload)
+    assert {r.plan.component_id for r in unit.requests} == {"attention.paged_decode"}
+    init_workspace_manager(device)
+    try:
+        with PreparationSession(device=device, autotune=False) as session:
+            session.prepare(unit.requests).close()
+            impl.do_kv_cache_update(layer, key, value, cache, slots)
+            # Only the new rows are written per step; the whole history here.
+            impl.forward(layer, query, key, value, cache, metadata, output)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                impl.forward(layer, query, key, value, cache, metadata, output)
+            for factor in (1.0, -0.5):
+                query.mul_(factor)
+                output.fill_(torch.nan)
+                graph.replay()
+                references = []
+                for i, length in enumerate(q_lens):
+                    start, end = sum(seq_lens[:i]), sum(seq_lens[: i + 1])
+                    fp8 = torch.float8_e4m3fn
+                    k = (key[start:end].float() / 0.5).to(fp8).float() * 0.5
+                    v = (value[start:end].float() / 0.25).to(fp8).float() * 0.25
+                    reference, _ = attention_reference(
+                        query[offsets[i] : offsets[i + 1]].float(),
+                        k,
+                        v,
+                        causal=False,
+                        window_left=1023,
+                        attention_sink_bias=sinks,
+                    )
+                    references.append(reference)
+                torch.testing.assert_close(
+                    output.float(), torch.cat(references), atol=2e-2, rtol=2e-2
+                )
+                assert torch.all(peer == 7)
+    finally:
+        reset_workspace_manager()
+
+
 def test_b12x_prepares_request_counts_for_verification_graphs(monkeypatch) -> None:
     from vllm.utils.b12x import B12xWorkload
 
     impl = object.__new__(B12xPagedAttentionImpl)
-    impl._noncausal = None
+    impl._noncausal = impl._paged_decode = None
+    impl._causal = True
     impl.dtype = torch.bfloat16
     impl._max_num_seqs = 8
     impl._verify_q_per_req = 4
@@ -880,7 +1037,8 @@ def test_b12x_prepares_hybrid_attention_for_allocated_table_width(
     )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
     impl = object.__new__(B12xPagedAttentionImpl)
-    impl._noncausal = None
+    impl._noncausal = impl._paged_decode = None
+    impl._causal = True
     impl.device = torch.device("cuda", 0)
     impl.dtype = impl.kv_torch_dtype = torch.bfloat16
     impl.num_heads, impl.num_kv_heads = 32, 2
