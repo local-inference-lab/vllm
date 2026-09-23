@@ -964,6 +964,7 @@ class MoERunner(MoERunnerInterface):
                 router_logits,
             )
 
+            num_tokens = hidden_states.shape[0]
             shared_output, hidden_states = self._apply_quant_method(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -972,10 +973,17 @@ class MoERunner(MoERunnerInterface):
                 shared_experts_overlapping=shared_experts_overlapping,
             )
 
-            return self._maybe_combine(
+            output = self._maybe_combine(
                 shared_output,
                 hidden_states,
             )
+        # Optional model-installed callback fired inside the opaque MoE op,
+        # after the experts and before the final all-reduce (L2 weight
+        # prefetch for torch.compiled models).
+        prefetch = getattr(self, "_l2_prefetch_post_experts_hook", None)
+        if prefetch is not None:
+            prefetch(num_tokens)
+        return output
 
     #########################################################
     #

@@ -799,6 +799,11 @@ def unified_attention_with_output(
     del kv_cache_dummy_dep
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
+    # Optional model-installed callback (L2 weight prefetch windows); inside
+    # this opaque op so torch.compile never traces it.
+    prefetch = getattr(self, "_l2_prefetch_hook", None)
+    if prefetch is not None:
+        prefetch(query.shape[0])
 
     self.impl.forward(
         self,

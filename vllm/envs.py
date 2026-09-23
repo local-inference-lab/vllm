@@ -204,6 +204,7 @@ if TYPE_CHECKING:
     VLLM_MTP_NVFP4_LM_HEAD: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_HC_TP: bool = True
+    VLLM_MIMO_L2_PREFETCH: bool = False
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
@@ -1698,6 +1699,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_QWEN3_8_FLASH_NEXT_HC_TP": lambda: bool(
         int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_HC_TP", "1"))
     ),
+    # MiMo-V2: prefetch upcoming decode weights into L2 on a side stream
+    # during FULL CUDA-graph decode (cache hints only; numerics unchanged).
+    "VLLM_MIMO_L2_PREFETCH": lambda: os.getenv("VLLM_MIMO_L2_PREFETCH", "0") == "1",
     # Gather DCP-sharded C4 records before B12X sparse-MLA prefill. This avoids
     # query replication plus the per-rank LSE combine and is opt-in while the
     # path is being qualified on GLM5Next.
