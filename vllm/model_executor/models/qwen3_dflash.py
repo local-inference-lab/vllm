@@ -1193,6 +1193,19 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         logits_new[:, targets] = logits
         return logits_new
 
+    def compute_local_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This rank's vocab-shard logits, not gathered, for vocab-parallel
+        drafting (the speculator validates the shard layout: no vocab padding,
+        no added vocab, no draft-to-target id map)."""
+        lp = self.logits_processor
+        logits = lp._apply_head(self.lm_head, hidden_states, None)
+        logits = logits[..., : self.lm_head.shard_indices.num_org_elements]
+        if lp.soft_cap is not None:
+            logits = torch.tanh(logits / lp.soft_cap) * lp.soft_cap
+        if lp.scale != 1.0:
+            logits = logits * lp.scale
+        return logits
+
     def precompute_and_store_context_kv(
         self,
         context_states: torch.Tensor,
