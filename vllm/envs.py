@@ -191,6 +191,7 @@ if TYPE_CHECKING:
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
+    VLLM_B12X_BF16_GEMV: bool = False
     VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE: Literal["0", "1", "all", "w13", "w2"] = "0"
     VLLM_DEFAULT_MOE_BACKEND: str = "auto"
     VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
@@ -1656,6 +1657,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_B12X_MOE_FP4_FORCE_A16": lambda: bool(
         int(os.getenv("VLLM_B12X_MOE_FP4_FORCE_A16", "0"))
     ),
+    # Opt-in: under --linear-backend b12x, serve decode-sized (<= 8 row) BF16
+    # linears through b12x gemm.bf16_gemv plans autotuned against cuBLAS.
+    "VLLM_B12X_BF16_GEMV": lambda: os.getenv("VLLM_B12X_BF16_GEMV", "0") == "1",
     # Select layer-wide activation scales for b12x NVFP4 MoE projections.
     "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE": env_with_choices(
         "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE",

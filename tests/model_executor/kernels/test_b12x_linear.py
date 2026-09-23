@@ -2982,3 +2982,76 @@ def test_v41_unquantized_prepares_dtypes_and_exact_rows_before_replay(
     finally:
         graph.reset()
         session.close()
+
+
+def test_b12x_unquantized_decode_linear_is_opt_in(
+    default_vllm_config, monkeypatch
+) -> None:
+    """Without VLLM_B12X_BF16_GEMV=1, BF16 linears keep the stock F.linear path."""
+    from vllm.model_executor.kernels.linear.b12x_unquantized import (
+        maybe_attach_b12x_bf16_gemv,
+    )
+
+    monkeypatch.delenv("VLLM_B12X_BF16_GEMV", raising=False)
+    weight = torch.zeros(256, 512, dtype=torch.bfloat16)
+    layer = _WeakNamespace(prefix="test.bf16_gemv.off", weight=weight, bias=None)
+    assert not maybe_attach_b12x_bf16_gemv(layer)
+    assert not hasattr(layer, "b12x_bf16_gemv_plans")
+
+
+@pytest.mark.parametrize("n,k", [(4096, 2048), (2560, 4096)])
+@torch.inference_mode()
+def test_b12x_unquantized_decode_linear_uses_prepared_plans(
+    default_vllm_config, monkeypatch, tmp_path, n, k
+) -> None:
+    """Decode-sized BF16 linears run prepared b12x plans; larger batches F.linear."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("requires SM12x")
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    monkeypatch.setenv("VLLM_B12X_BF16_GEMV", "1")
+
+    from vllm.model_executor.kernels.linear.b12x_unquantized import (
+        b12x_unquantized_gemm,
+        maybe_attach_b12x_bf16_gemv,
+    )
+
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    torch.manual_seed(7)
+    weight = torch.randn(n, k, device=device, dtype=torch.bfloat16) * 0.05
+    layer = _WeakNamespace(prefix=f"test.bf16_gemv.{n}x{k}", weight=weight, bias=None)
+    assert maybe_attach_b12x_bf16_gemv(layer)
+    session, _ = _prepare(
+        layer, device=device, counts=(1, 2, 4, 8, 16), cache_dir=tmp_path
+    )
+    session.freeze()
+    assert sorted(layer.b12x_bf16_gemv_plans) == [1, 2, 4, 8]
+
+    def check(source, actual):
+        expected = source.double() @ weight.double().T
+        torch.testing.assert_close(actual.double(), expected, rtol=1e-2, atol=1e-2)
+
+    compiled = torch.compile(
+        lambda source: b12x_unquantized_gemm(layer, source, weight),
+        fullgraph=True,
+        dynamic=False,
+    )
+    with session, kernel_resolution_guard("prepared b12x BF16 decode linear"):
+        for rows in (1, 3, 8, 16):
+            source = torch.randn(rows, k, device=device, dtype=torch.bfloat16)
+            check(source, b12x_unquantized_gemm(layer, source, weight))
+        # Model forwards are traced: the routing check must not need the
+        # opaque layer name's value.
+        source = torch.randn(4, k, device=device, dtype=torch.bfloat16)
+        check(source, compiled(source))
+        source = torch.randn(4, k, device=device, dtype=torch.bfloat16)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with session.capture(), torch.cuda.graph(graph):
+                actual = b12x_unquantized_gemm(layer, source, weight)
+            source.neg_()
+            graph.replay()
+            torch.accelerator.synchronize()
+            check(source, actual)
+        finally:
+            graph.reset()
