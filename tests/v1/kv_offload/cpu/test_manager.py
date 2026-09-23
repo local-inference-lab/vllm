@@ -1156,3 +1156,28 @@ def test_touch_forwards_req_context_to_policy(monkeypatch):
     assert len(received) == 1
     assert received[0][0] == keys
     assert received[0][1] is ctx
+
+
+def test_second_store_of_in_flight_key_is_deduped():
+    """A key registered by prepare_store but not yet completed must dedup a
+    second store of the same key: the in-flight chunk is already claimed, so
+    a concurrent producer (two requests sharing a boundary prefix) must not
+    allocate a second chunk or overwrite the pending one. This is the
+    first-writer-wins guarantee the boundary-store path relies on for
+    same-key producers."""
+    manager = make_cpu_manager(num_chunks=4)
+
+    out1 = manager.prepare_store(to_keys([7]), _EMPTY_REQ_CTX)
+    assert out1 is not None and out1.keys_to_store == to_keys([7])
+
+    # Same key offered again while the first store is still in flight.
+    out2 = manager.prepare_store(to_keys([7]), _EMPTY_REQ_CTX)
+    assert out2 is not None
+    assert out2.keys_to_store == [], "in-flight key must dedup, not overwrite"
+    assert manager.lookup(to_key(7), _EMPTY_REQ_CTX) is LookupResult.HIT_PENDING
+
+    # The first store completing does not disturb the dedup decision.
+    manager.complete_store(to_keys([7]), _EMPTY_REQ_CTX)
+    assert manager.lookup(to_key(7), _EMPTY_REQ_CTX) is LookupResult.HIT
+    out3 = manager.prepare_store(to_keys([7]), _EMPTY_REQ_CTX)
+    assert out3 is not None and out3.keys_to_store == []

@@ -175,6 +175,17 @@ class ModelState(ABC):
         """Return per-request selector acceptance for boundary MTP replay."""
         raise NotImplementedError
 
+    def get_recurrent_checkpoint_fresh(self) -> torch.Tensor:
+        """Return the per-request selector fresh flag for boundary restores.
+
+        Any restore path must clear it: the pools the restore writes are
+        'restored, not recycled', and the next forward's fresh-reset would
+        otherwise re-zero them.  Models without a selector fresh flag raise;
+        the boundary path only calls this when a checkpoint (and therefore a
+        restorable pool set) exists.
+        """
+        raise NotImplementedError
+
     def postprocess_state(
         self,
         idx_mapping: torch.Tensor,

@@ -674,6 +674,11 @@ class BoundaryCheckpointState:
             # Prefill consumes a canonical committed prefix, not the previous
             # verification interval's acceptance count.
             self.model_state.get_recurrent_checkpoint_acceptance()[slot] = 1
+            # The pools this restore wrote are 'restored, not recycled'.
+            # The selector fresh flag gates the next forward's pool
+            # zeroing, so a restore that leaves it set would re-zero what
+            # it just copied -- clear it for the restored slot.
+            self.model_state.get_recurrent_checkpoint_fresh()[slot] = False
             for module in self.target_modules:
                 if hasattr(module, "set_recurrent_checkpoint_anchor"):
                     module.set_recurrent_checkpoint_anchor(

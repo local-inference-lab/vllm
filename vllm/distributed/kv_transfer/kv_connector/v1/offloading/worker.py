@@ -21,6 +21,7 @@ from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
+    KVCacheSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
     group_kernel_blocks,
@@ -82,6 +83,8 @@ class OffloadingConnectorWorker:
         unpadded_page_size_bytes: dict[str, int] = {}
         # layer_name -> size of page in bytes
         page_size_bytes: dict[str, int] = {}
+        # layer_name -> KV cache spec of the layer
+        layer_specs: dict[str, KVCacheSpec] = {}
         for kv_cache_group in selected_groups:
             assert not kv_cache_group.host_resident
             num_blocks = kv_cache_config.num_blocks
@@ -95,6 +98,7 @@ class OffloadingConnectorWorker:
                 layer_kv_cache_spec = per_layer_specs.get(
                     layer_name, group_kv_cache_spec
                 )
+                layer_specs[layer_name] = layer_kv_cache_spec
                 ref = group_kernel_blocks(kv_caches[layer_name], num_blocks)
                 page = layer_kv_cache_spec.page_size_bytes
                 elem_size = ref.element_size()
@@ -194,7 +198,15 @@ class OffloadingConnectorWorker:
                     block_data_refs[layer_name].append(
                         CanonicalKVCacheRef(
                             tensor_idx=curr_tensor_idx,
-                            page_size_bytes=(unpadded_page_size_bytes[layer_name]),
+                            # Attention refs transport the FULL padded page:
+                            # the compressed-K tail lives in
+                            # [unpadded, padded) and the consumer reads it.
+                            # Mamba refs keep the unpadded width.
+                            page_size_bytes=(
+                                page_size_bytes[layer_name]
+                                if isinstance(layer_specs[layer_name], AttentionSpec)
+                                else unpadded_page_size_bytes[layer_name]
+                            ),
                             mapping=mapping,
                         )
                     )
