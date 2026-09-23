@@ -45,6 +45,8 @@ if TYPE_CHECKING:
     VLLM_LOGGING_COLOR: str = "auto"
     NO_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
+    VLLM_REQUEST_STALL_WARNING_S: float = 60.0
+    VLLM_LOG_REQUEST_TIMELINE: bool = False
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_GLM53_MTP_DRAFT_HEAD: Literal["bf16", "nvfp4"] = "bf16"
@@ -875,6 +877,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         val
         if (val := float(os.getenv("VLLM_LOG_STATS_INTERVAL", "10."))) > 0.0
         else 10.0
+    ),
+    # Warn when a request takes longer than this many seconds to get from
+    # rendering to the engine core, waits that long in the engine-core input
+    # queue, or leaves its final output unread by the client that long; also
+    # warn, with the loop's stack, when one engine-core loop iteration runs
+    # that long. 0 disables these warnings.
+    "VLLM_REQUEST_STALL_WARNING_S": lambda: max(
+        0.0, float(os.getenv("VLLM_REQUEST_STALL_WARNING_S", "60"))
+    ),
+    # If set, the API server logs one line per request with the time each
+    # stage took: rendering, input processing, engine submission, first and
+    # final output, and the client reading the final output.
+    "VLLM_LOG_REQUEST_TIMELINE": lambda: (
+        os.getenv("VLLM_LOG_REQUEST_TIMELINE", "0").lower() in ("1", "true")
     ),
     # Trace function calls
     # If set to 1, vllm will trace function calls
@@ -2441,6 +2457,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOGGING_CONFIG_PATH",
         "VLLM_LOGGING_COLOR",
         "VLLM_LOG_STATS_INTERVAL",
+        "VLLM_REQUEST_STALL_WARNING_S",
+        "VLLM_LOG_REQUEST_TIMELINE",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
