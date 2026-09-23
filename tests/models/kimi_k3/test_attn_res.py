@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -277,3 +278,187 @@ def test_fused_mtp_input(num_tokens: int):
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
     assert actual.shape == (num_tokens, 2 * HIDDEN_SIZE)
     assert actual.is_contiguous()
+
+
+def test_attn_res_reuses_delta_for_output():
+    prefix = torch.randn(17, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    delta = torch.randn_like(prefix)
+    blocks = torch.randn(
+        17, MAX_BLOCKS, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16
+    )
+    norm_weight = torch.ones(HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    qk_weight = (
+        torch.randn(HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16) / HIDDEN_SIZE**0.5
+    )
+    output_norm_weight = torch.ones_like(norm_weight)
+    expected, expected_prefix = _reference(
+        prefix.clone(),
+        delta.clone(),
+        blocks,
+        norm_weight,
+        qk_weight,
+        output_norm_weight,
+        MAX_BLOCKS,
+    )
+    output_pointer = delta.data_ptr()
+
+    actual = attn_res(
+        prefix,
+        delta,
+        blocks,
+        norm_weight,
+        qk_weight,
+        output_norm_weight,
+        MAX_BLOCKS,
+        -1,
+        EPS,
+        EPS,
+        output=delta,
+    )
+
+    assert actual.data_ptr() == output_pointer
+    torch.testing.assert_close(actual, expected, atol=8e-2, rtol=3e-2)
+    torch.testing.assert_close(prefix, expected_prefix, atol=0, rtol=0)
+
+
+def test_attn_res_uses_an_inactive_workspace_block_for_output():
+    num_tokens = 17
+    prefix = torch.randn(num_tokens, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    block_storage = torch.randn(
+        MAX_BLOCKS,
+        num_tokens,
+        HIDDEN_SIZE,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    blocks = block_storage.permute(1, 0, 2)
+    output = blocks[:, -1]
+    norm_weight = torch.ones(HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    qk_weight = (
+        torch.randn(HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16) / HIDDEN_SIZE**0.5
+    )
+    output_norm_weight = torch.ones_like(norm_weight)
+    expected, expected_prefix = _reference(
+        prefix.clone(),
+        None,
+        blocks,
+        norm_weight,
+        qk_weight,
+        output_norm_weight,
+        0,
+    )
+    output_pointer = output.data_ptr()
+
+    actual = attn_res(
+        prefix,
+        None,
+        blocks,
+        norm_weight,
+        qk_weight,
+        output_norm_weight,
+        0,
+        0,
+        EPS,
+        EPS,
+        output=output,
+    )
+
+    assert actual.data_ptr() == output_pointer
+    torch.testing.assert_close(actual, expected, atol=8e-2, rtol=3e-2)
+    torch.testing.assert_close(prefix, expected_prefix, atol=0, rtol=0)
+    torch.testing.assert_close(blocks[:, 0], expected_prefix, atol=0, rtol=0)
+
+
+def test_attn_res_reused_output_supports_cuda_graph_replay():
+    prefix = torch.randn(17, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    delta = torch.randn_like(prefix)
+    blocks = torch.randn(
+        17, MAX_BLOCKS, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16
+    )
+    norm_weight = torch.ones(HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    qk_weight = (
+        torch.randn(HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16) / HIDDEN_SIZE**0.5
+    )
+    output_norm_weight = torch.ones_like(norm_weight)
+    original_prefix = prefix.clone()
+    original_delta = delta.clone()
+    graph = torch.cuda.CUDAGraph()
+    torch.accelerator.synchronize()
+    with torch.cuda.graph(graph):
+        actual = attn_res(
+            prefix,
+            delta,
+            blocks,
+            norm_weight,
+            qk_weight,
+            output_norm_weight,
+            MAX_BLOCKS,
+            -1,
+            EPS,
+            EPS,
+            output=delta,
+        )
+
+    prefix.copy_(original_prefix)
+    delta.copy_(original_delta)
+    graph.replay()
+    first = actual.clone()
+    prefix.copy_(original_prefix)
+    delta.copy_(original_delta)
+    graph.replay()
+    torch.testing.assert_close(actual, first, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("rows", [1, 257, 4096])
+@torch.inference_mode()
+def test_decoder_residual_reuse_preserves_all_93_layer_boundaries(rows):
+    """Compare allocation and reuse through the final committed block."""
+    from vllm.models.kimi_k3.nvidia.model import KimiDecoderLayer
+
+    torch.manual_seed(327)
+    initial = torch.randn(rows, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    norm = SimpleNamespace(
+        weight=torch.ones(HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16),
+        variance_epsilon=EPS,
+    )
+    projection = SimpleNamespace(
+        weight=torch.randn(1, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+        / HIDDEN_SIZE**0.5
+    )
+
+    def state():
+        blocks = torch.zeros(
+            MAX_BLOCKS, rows, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16
+        ).permute(1, 0, 2)
+        return [None, initial.clone(), blocks]
+
+    reference, reused = state(), state()
+    # A serialized vision encoder may overwrite the residual bank between
+    # target calls. Every active block must be initialized before it is read.
+    reused[2].fill_(float("nan"))
+    for index in range(93):
+        for reuse, stream in ((False, reference), (True, reused)):
+            layer = object.__new__(KimiDecoderLayer)
+            torch.nn.Module.__init__(layer)
+            layer.use_attn_res = True
+            layer.reuse_attn_res_output = reuse
+            layer.is_block_write_layer = index % 12 == 0
+            layer.is_final_block_write_layer = index == 84
+            layer.block_write_idx = index // 12
+            layer.prev_valid_blocks = (index + 11) // 12
+            layer.self_attention_res_norm = layer.mlp_res_norm = norm
+            layer.self_attention_res_proj = layer.mlp_res_proj = projection
+            layer.input_layernorm = layer.post_attention_layernorm = norm
+            delta, prefix, blocks = stream
+            hidden, prefix, _ = layer._pre_attn_norm(
+                delta, blocks, prefix, blocks[:, -1] if reuse else None
+            )
+            hidden = hidden * (0.25 + index / 256)
+            hidden, prefix, _ = layer._post_attn_norm(hidden, blocks, prefix)
+            stream[:] = [hidden * 0.125, prefix, blocks]
+        torch.testing.assert_close(reused[0], reference[0], rtol=0, atol=0)
+        torch.testing.assert_close(reused[1], reference[1], rtol=0, atol=0)
+        active = index // 12 + 1
+        torch.testing.assert_close(
+            reused[2][:, :active], reference[2][:, :active], rtol=0, atol=0
+        )
