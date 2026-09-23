@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-880",
+  "category": "performance",
+  "summary": "Optionally let prefill-only scheduling steps use the full batched-token budget",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS=1 lets steps with no runnable decode prefill up to max_num_batched_tokens. Default off."
+  ],
+  "pull_requests": [
+    880
+  ]
+}

@@ -1205,3 +1205,17 @@ def test_prefill_fairness_hot_switch_is_atomic(opt_model_path):
     unchanged = scheduler.get_prefill_fairness()
     assert unchanged["prefill_compute_share"] == "auto"
     assert unchanged["prefill_compute_half_life"] == "responsive"
+
+
+@pytest.mark.parametrize("uncap", [False, True])
+def test_prefill_only_step_may_use_the_batched_token_budget(
+    opt_model_path, monkeypatch, uncap
+):
+    """With no runnable decode, max_num_scheduled_tokens only shrinks the chunk."""
+    monkeypatch.setenv("VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS", "1" if uncap else "0")
+    scheduler = _create_fair_scheduler(opt_model_path, max_num_batched_tokens=64)
+    scheduler.max_num_scheduled_tokens = 16
+    (request,) = create_requests(num_requests=1, num_tokens=100)
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[request.request_id] == (64 if uncap else 16)
