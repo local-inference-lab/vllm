@@ -687,7 +687,15 @@ class VllmConfig:
             and parallel.data_parallel_size == 1
             and (
                 parallel.decode_context_parallel_size == 1
-                or model.hf_text_config.model_type in ("glm5_next_text", "glm5_next")
+                or model.hf_text_config.model_type
+                in (
+                    "qwen3_8_flash_next_text",
+                    "qwen3_8_flash_next",
+                    "qwen4_exp_text",
+                    "qwen4_exp",
+                    "glm5_next_text",
+                    "glm5_next",
+                )
             )
             and parallel.prefill_context_parallel_size == 1
             and (
@@ -1232,6 +1240,28 @@ class VllmConfig:
             or self.kv_transfer_config.kv_connector is None
         ):
             return
+
+        model_type = getattr(
+            getattr(self.model_config, "hf_text_config", None), "model_type", None
+        )
+        if model_type in (
+            "qwen3_8_flash_next_text",
+            "qwen3_8_flash_next",
+            "qwen4_exp_text",
+            "qwen4_exp",
+        ):
+            from vllm.distributed.kv_transfer.kv_connector.factory import (
+                KVConnectorFactory,
+            )
+
+            connector = KVConnectorFactory.get_connector_class(
+                self.kv_transfer_config
+            )
+            if not connector.supports_request_boundary_checkpoints(self):
+                raise ValueError(
+                    "Qwen QSA KV transfer requires an atomic request-boundary "
+                    "checkpoint connector"
+                )
 
         # PyTorch's expandable_segments allocator uses CUDA VMM, which can
         # remap a virtual address range to different physical pages over the

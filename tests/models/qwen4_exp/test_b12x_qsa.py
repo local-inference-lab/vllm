@@ -183,6 +183,10 @@ def test_qsa_backend_selects_the_manager_block_without_dense_page_limits(
         assert Qwen4ExpQSABackend.get_preferred_block_size(70) == 72
 
 
+def test_qsa_backend_supports_atomic_kv_connectors() -> None:
+    assert Qwen4ExpQSABackend.supports_kv_connector()
+
+
 def test_qsa_dcp_packs_qkv_into_one_collective() -> None:
     layer = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
     torch.nn.Module.__init__(layer)
