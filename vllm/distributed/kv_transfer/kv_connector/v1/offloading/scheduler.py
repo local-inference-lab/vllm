@@ -1115,6 +1115,7 @@ class OffloadingConnectorScheduler:
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):
+        self._record_allocated_blocks(blocks)
         if num_external_tokens == 0:
             return
 
@@ -1136,10 +1137,6 @@ class OffloadingConnectorScheduler:
             req_status.group_states,
         ):
             group_blocks = blocks.blocks[group_config.group_idx]
-            self._current_batch_allocated_block_ids.update(
-                block.block_id for block in group_blocks if block.block_id != 0
-            )
-
             tokens_per_block = group_config.tokens_per_block
             tokens_per_chunk = group_config.tokens_per_chunk
             offload_keys = group_state.offload_keys
@@ -1227,6 +1224,14 @@ class OffloadingConnectorScheduler:
         if self._chunks_being_loaded is not None:
             self._chunks_being_loaded.update(keys_to_load)
         req_status.partial_tail_boundary = None
+
+    def _record_allocated_blocks(self, blocks: KVCacheBlocks) -> None:
+        self._current_batch_allocated_block_ids.update(
+            block.block_id
+            for group_blocks in blocks.blocks
+            for block in group_blocks
+            if block.block_id != 0
+        )
 
     def _update_req_states(self, scheduler_output: SchedulerOutput) -> None:
         """
@@ -1568,6 +1573,16 @@ class OffloadingConnectorScheduler:
                 )
 
                 if group_config.requires_cow_source:
+                    # CoW (mamba align-mode) groups are persisted through the
+                    # boundary / partial-tail store path, not the chunk path.
+                    # Append a (0, 0) placeholder rather than a bare continue so
+                    # group_store_ranges stays positionally aligned with
+                    # kv_group_configs. The consumer zip below pairs each range
+                    # with its own group; a shorter list truncates group_sizes
+                    # AND misaligns every surviving group's chunk range, which
+                    # trips the worker assert
+                    # len(group_sizes) == len(layer_refs_per_group).
+                    group_store_ranges.append((0, 0))
                     continue
 
                 start_chunk_idx = group_state.next_stored_chunk_idx
@@ -1607,9 +1622,6 @@ class OffloadingConnectorScheduler:
                     )
                     start_chunk_idx = min(start_chunk_idx, partial_segment_start_chunk)
                 group_store_ranges.append((start_chunk_idx, num_chunks))
-
-                if group_config.requires_cow_source:
-                    continue
 
                 if num_chunks <= start_chunk_idx:
                     continue
@@ -1676,6 +1688,13 @@ class OffloadingConnectorScheduler:
                     ):
                         continue
                     new_offload_keys.append(offload_key)
+
+            assert len(group_store_ranges) == len(self.config.kv_group_configs), (
+                "every KV group must contribute exactly one store range; a "
+                "pre-append continue would silently truncate the consumer "
+                "zip and misalign group_sizes for the worker, whose own "
+                "assert is far from the cause"
+            )
 
             if not new_offload_keys:
                 req_status.advance_stored_idx(num_offloadable_tokens)
