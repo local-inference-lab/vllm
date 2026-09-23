@@ -23,7 +23,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.model_executor.weight_transfer import allocate_weights, copy_weight
+from vllm.model_executor.weight_transfer import copy_weight
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -480,9 +480,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.f_b_proj",
         )
         self.dt_bias = nn.Parameter(
-            allocate_weights(
-                torch.empty, self.local_projection_size, dtype=torch.float32
-            )
+            torch.empty(self.local_projection_size, dtype=torch.float32)
         )
 
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
@@ -510,7 +508,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
         self.A_log = nn.Parameter(
-            allocate_weights(torch.empty, self.local_num_heads, dtype=torch.float32)
+            torch.empty(self.local_num_heads, dtype=torch.float32)
         )
         set_weight_attrs(self.A_log, {"weight_loader": a_log_weight_loader(0)})
 
@@ -574,9 +572,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 quant_config=self.quant_config,
                 prefix=f"{prefix}.g_b_proj",
             )
-        self.o_norm = allocate_weights(
-            FusedRMSNormGated, self.head_dim, activation="sigmoid"
-        )
+        self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
         self._b12x_kda_api: Any | None = None
         self._b12x_prefill_api: Any | None = None
         self._b12x_kda_plan = None

@@ -12,7 +12,6 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
-from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     compress_norm_rope_store_triton,
     compress_norm_rope_store_two_stage_triton,
@@ -260,8 +259,7 @@ class DeepseekCompressor(nn.Module):
 
         state_dtype = torch.float32
         self.ape = nn.Parameter(
-            allocate_weights(
-                torch.empty,
+            torch.empty(
                 (compress_ratio, self.coff * self.head_dim),
                 dtype=state_dtype,
                 device=self.device,

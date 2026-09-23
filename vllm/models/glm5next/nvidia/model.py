@@ -77,7 +77,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
     sequence_parallel_chunk,
 )
-from vllm.model_executor.weight_transfer import allocate_weights, materialize_weight
+from vllm.model_executor.weight_transfer import materialize_weight
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_reduce_scatter,
@@ -235,9 +235,7 @@ class Glm5NextMoE(nn.Module):
         )
         if getattr(config, "topk_method", None) == "noaux_tc":
             self.gate.e_score_correction_bias = nn.Parameter(
-                allocate_weights(
-                    torch.empty, config.n_routed_experts, dtype=torch.float32
-                )
+                torch.empty(config.n_routed_experts, dtype=torch.float32)
             )
         else:
             self.gate.e_score_correction_bias = None
@@ -458,26 +456,18 @@ class Glm5NextDecoderLayer(nn.Module):
 
             # attn hc
             self.hc_attn_fn = nn.Parameter(
-                allocate_weights(torch.empty, mix_hc, d_model, dtype=torch.float32)
+                torch.empty(mix_hc, d_model, dtype=torch.float32)
             )
             self.hc_attn_fn_broadcast: torch.Tensor | None = None
-            self.hc_attn_base = nn.Parameter(
-                allocate_weights(torch.empty, mix_hc, dtype=torch.float32)
-            )
-            self.hc_attn_scale = nn.Parameter(
-                allocate_weights(torch.empty, 3, dtype=torch.float32)
-            )
+            self.hc_attn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
+            self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
             # ffn hc
             self.hc_ffn_fn = nn.Parameter(
-                allocate_weights(torch.empty, mix_hc, d_model, dtype=torch.float32)
+                torch.empty(mix_hc, d_model, dtype=torch.float32)
             )
-            self.hc_ffn_base = nn.Parameter(
-                allocate_weights(torch.empty, mix_hc, dtype=torch.float32)
-            )
-            self.hc_ffn_scale = nn.Parameter(
-                allocate_weights(torch.empty, 3, dtype=torch.float32)
-            )
+            self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
+            self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
             self.mhc_pre_op = MHCPreOp()
             self.mhc_post_op = MHCPostOp()

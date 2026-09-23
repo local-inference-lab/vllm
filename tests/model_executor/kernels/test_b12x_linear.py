@@ -2213,8 +2213,10 @@ def test_b12x_fp8_preparation_units_key_on_their_planned_rows(
         monkeypatch.setattr(
             b12x_mod,
             "_block_fp8_plan",
-            lambda layer, rows, dtype: layer.b12x_block_fp8_plans.setdefault(
-                rows, FakePlan()
+            lambda layer, rows, dtype, dynamic_rows=False: (
+                layer.b12x_block_fp8_plans.setdefault(
+                    None if dynamic_rows else rows, FakePlan()
+                )
             ),
         )
         kernel = object.__new__(B12xFp8BlockScaledMMKernel)
@@ -2237,10 +2239,13 @@ def test_b12x_fp8_preparation_units_key_on_their_planned_rows(
     (unit,) = kernel.get_b12x_preparation_units(layer, workload)
 
     assert unit.name == f"{kind.upper()}_FP8"
-    assert unit.key == (name, (1, 8, 64))
-    assert tuple(request.name for request in unit.requests) == tuple(
-        f"linear.{kind}_fp8.{name}.m{rows}" for rows in (1, 8, 64)
-    )
+    key: tuple[object, ...] = (name, (1, 8, 64))
+    names = tuple(f"linear.{kind}_fp8.{name}.m{rows}" for rows in (1, 8, 64))
+    if kind == "block":
+        key += (64,)
+        names += (f"linear.block_fp8.{name}.capacity",)
+    assert unit.key == key
+    assert tuple(request.name for request in unit.requests) == names
 
 
 def _check_v41_vocab_embedding_and_tied_head(device):
@@ -2780,14 +2785,22 @@ def test_b12x_fp8_preparation_unit_tracks_requested_rows(recipe):
             max_model_len=4,
         )
         (unit,) = kernel.get_b12x_preparation_units(layer, workload)
-        assert unit.key == ("fp8-preparation", counts)
-        assert tuple(request.plan.query.max_rows for request in unit.requests) == counts
+        key: tuple[object, ...] = ("fp8-preparation", counts)
+        planned_rows: tuple[int, ...] = counts
+        if recipe == "block":
+            key += (4,)
+            planned_rows += (4,)
+            assert unit.requests[-1].plan.query.expected_m is None
+        assert unit.key == key
+        assert tuple(request.plan.query.max_rows for request in unit.requests) == (
+            planned_rows
+        )
         assert all(request.plan.prepared is None for request in unit.requests)
 
 
 @pytest.mark.parametrize("recipe", ["block", "tensor"])
 @torch.inference_mode()
-def test_b12x_fp8_eager_unplanned_rows_use_default_and_replay(recipe):
+def test_b12x_fp8_unplanned_rows_reuse_capacity_or_default_and_replay(recipe):
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.preparation import PreparationSession
 
@@ -2799,7 +2812,7 @@ def test_b12x_fp8_eager_unplanned_rows_use_default_and_replay(recipe):
     device = torch.device("cuda", torch.accelerator.current_device_index())
     n, k, capacity = 512, 256, 128
     values = torch.randn(n, k, device=device).to(torch.float8_e4m3fn)
-    source = torch.randn(capacity, k, device=device).to(torch.float8_e4m3fn)
+    source = torch.randn(capacity + 1, k, device=device).to(torch.float8_e4m3fn)
     layer = torch.nn.Module()
     name = f"fp8-eager-{recipe}-{id(layer):x}"
     layer.b12x_layer_name = _encode_layer_name(name)
@@ -2809,11 +2822,12 @@ def test_b12x_fp8_eager_unplanned_rows_use_default_and_replay(recipe):
         kernel.config = types.SimpleNamespace(out_dtype=torch.bfloat16)
         layer.weight = torch.nn.Parameter(values, requires_grad=False)
         layer.weight_scale = torch.nn.Parameter(
-            torch.full((n // 128, k // 128), 0.5, device=device), requires_grad=False
+            torch.rand((n // 128, k // 128), device=device).mul_(0.5).add_(0.25),
+            requires_grad=False,
         )
         layer.b12x_block_fp8_plans = {}
         plans = layer.b12x_block_fp8_plans
-        scales = torch.full((capacity, k // 128), 0.25, device=device)
+        scales = torch.rand((capacity + 1, k // 128), device=device).mul_(0.5)
 
         def run(rows):
             return module.run_b12x_block_fp8_linear(
@@ -2851,33 +2865,55 @@ def test_b12x_fp8_eager_unplanned_rows_use_default_and_replay(recipe):
     units = kernel.get_b12x_preparation_units(layer, workload)
 
     def expected(rows):
+        if recipe == "block":
+            lhs = source[:rows].float() * scales[:rows].repeat_interleave(128, 1)
+            rhs = values.float() * layer.weight_scale.repeat_interleave(
+                128, 0
+            ).repeat_interleave(128, 1)
+            return (lhs @ rhs.T).bfloat16()
         return (source[:rows].float() @ values.float().T * 0.125).bfloat16()
 
     with PreparationSession(device=device, autotune=False) as session:
         session.prepare(tuple(request for unit in units for request in unit.requests))
-        assert set(plans) == {4, capacity}
-        actual = run(11)
-        assert plans[11].prepared is not None
-        assert plans[11].selection.source == "default"
-        torch.testing.assert_close(actual, expected(11), rtol=0.02, atol=0.125)
+        counts: tuple[int, ...]
+        if recipe == "block":
+            assert set(plans) == {4, capacity, None}
+            counts, graph_rows = (4, 11, 20, 63, capacity), 20
+        else:
+            assert set(plans) == {4, capacity}
+            actual = run(11)
+            assert plans[11].prepared is not None
+            assert plans[11].selection.source == "default"
+            torch.testing.assert_close(actual, expected(11), rtol=0.02, atol=0.125)
+            counts, graph_rows = (4, 11, capacity), 4
+        declared = dict(plans)
         session.freeze()
-        with kernel_resolution_guard("FP8 prepared exact-M execution"):
-            for rows in (4, 11, capacity):
+        with kernel_resolution_guard("FP8 prepared execution"):
+            for rows in counts:
                 torch.testing.assert_close(
                     run(rows), expected(rows), rtol=0.02, atol=0.125
                 )
             graph = torch.cuda.CUDAGraph()
             try:
                 with session.capture(), torch.cuda.graph(graph):
-                    captured = run(4)
+                    captured = run(graph_rows)
                 pointer = captured.data_ptr()
                 source.copy_((-source.float()).to(source.dtype))
+                if recipe == "block":
+                    scales.mul_(0.5)
                 graph.replay()
                 torch.accelerator.synchronize()
                 assert captured.data_ptr() == pointer
-                torch.testing.assert_close(captured, expected(4), rtol=0.02, atol=0.125)
+                torch.testing.assert_close(
+                    captured, expected(graph_rows), rtol=0.02, atol=0.125
+                )
             finally:
                 graph.reset()
+
+        assert plans == declared
+        if recipe == "block":
+            with pytest.raises(ValueError, match="planned M capacity"):
+                run(capacity + 1)
 
 
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])

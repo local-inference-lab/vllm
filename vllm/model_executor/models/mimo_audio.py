@@ -26,8 +26,6 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
 
-from vllm.model_executor.weight_transfer import allocate_weights
-
 logger = logging.getLogger(__name__)
 
 
@@ -1162,9 +1160,9 @@ class AudioProjection(nn.Module):
     ) -> None:
         super().__init__()
         self.mlp = nn.Sequential(
-            allocate_weights(nn.Linear, input_size, hidden_size, bias=False),
+            nn.Linear(input_size, hidden_size, bias=False),
             nn.GELU(),
-            allocate_weights(nn.Linear, hidden_size, output_size, bias=False),
+            nn.Linear(hidden_size, output_size, bias=False),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1218,14 +1216,9 @@ class MimoAudioEncoder(nn.Module):
         if not config.add_post_norm:
             self.input_local_transformer.norm = nn.Identity()
 
-        # Keep the HF transformer's rotary buffers outside the weight pool.
-        for parameter in self.input_local_transformer.parameters():
-            parameter.data = allocate_weights(torch.clone, parameter.data)
-
         self.speech_embeddings = nn.ModuleList(
             [
-                allocate_weights(
-                    nn.Embedding,
+                nn.Embedding(
                     speech_vocab_sizes[i],
                     config.input_local_dim,
                     padding_idx=speech_empty_ids[i],
@@ -1235,8 +1228,7 @@ class MimoAudioEncoder(nn.Module):
         )
 
         if config.projection_layers == 1:
-            self.projection = allocate_weights(
-                nn.Linear,
+            self.projection = nn.Linear(
                 config.input_local_dim * config.group_size,
                 config.out_hidden_size,
                 bias=False,

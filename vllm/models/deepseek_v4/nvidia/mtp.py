@@ -45,11 +45,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import get_spec_layer_idx_from_weight_name
 from vllm.model_executor.models.utils import maybe_prefix
-from vllm.model_executor.weight_transfer import (
-    allocate_weights,
-    copy_weight,
-    flush_weight_transfers,
-)
+from vllm.model_executor.weight_transfer import copy_weight, flush_weight_transfers
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -123,17 +119,15 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_dim = self.hc_mult * config.hidden_size
         self.hc_head_fn = nn.Parameter(
-            allocate_weights(
-                torch.empty, self.hc_mult, self.hc_dim, dtype=torch.float32
-            ),
+            torch.empty(self.hc_mult, self.hc_dim, dtype=torch.float32),
             requires_grad=False,
         )
         self.hc_head_base = nn.Parameter(
-            allocate_weights(torch.empty, self.hc_mult, dtype=torch.float32),
+            torch.empty(self.hc_mult, dtype=torch.float32),
             requires_grad=False,
         )
         self.hc_head_scale = nn.Parameter(
-            allocate_weights(torch.empty, 1, dtype=torch.float32),
+            torch.empty(1, dtype=torch.float32),
             requires_grad=False,
         )
 

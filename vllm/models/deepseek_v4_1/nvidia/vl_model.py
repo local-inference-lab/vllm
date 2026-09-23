@@ -13,7 +13,6 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     maybe_prefix,
 )
-from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.models.deepseek_v41.common.mm_preprocess import (
     DeepseekV4VLDummyInputsBuilder,
     DeepseekV4VLMultiModalProcessor,
@@ -73,13 +72,13 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
             self.vision = DeepseekV4ViT(config)
             self.aligner = DeepseekV4Aligner(config)
             self.image_start = nn.Parameter(
-                allocate_weights(torch.empty, config.hidden_size, dtype=torch.float32)
+                torch.empty(config.hidden_size, dtype=torch.float32)
             )
             self.image_end = nn.Parameter(
-                allocate_weights(torch.empty, config.hidden_size, dtype=torch.float32)
+                torch.empty(config.hidden_size, dtype=torch.float32)
             )
             self.image_newline = nn.Parameter(
-                allocate_weights(torch.empty, config.hidden_size, dtype=torch.float32)
+                torch.empty(config.hidden_size, dtype=torch.float32)
             )
 
         with self._mark_language_model(vllm_config):

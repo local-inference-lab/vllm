@@ -12,7 +12,6 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models.utils import maybe_prefix
-from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.models.deepseek_v4.nvidia.dspark import (
     DSparkDeepseekV4ForCausalLM,
     DSparkDeepseekV4Model,
@@ -106,7 +105,7 @@ class Glm53DSparkModel(DSparkDeepseekV4Model):
             maybe_prefix(prefix, "output_afterburner"),
         )
         self.noise_embedding = nn.Parameter(
-            allocate_weights(torch.empty, config.hidden_size), requires_grad=False
+            torch.empty(config.hidden_size), requires_grad=False
         )
         max_queries = max(
             vllm_config.scheduler_config.max_num_batched_tokens,

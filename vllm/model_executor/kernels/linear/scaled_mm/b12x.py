@@ -14,6 +14,7 @@ from vllm.platforms import current_platform
 from vllm.utils.b12x import (
     B12xPreparationUnit,
     B12xWorkload,
+    PreparationResourceUnavailableError,
     b12x_layer,
     b12x_layer_prefix,
     register_b12x_layer,
@@ -40,9 +41,16 @@ from .BlockScaledMMLinearKernel import (
 from .ScaledMMLinearKernel import FP8ScaledMMLinearKernel
 
 
-def _block_fp8_plan(layer: torch.nn.Module, rows: int, out_dtype: torch.dtype):
+def _block_fp8_plan(
+    layer: torch.nn.Module,
+    rows: int,
+    out_dtype: torch.dtype,
+    *,
+    dynamic_rows: bool = False,
+):
     plans = layer.b12x_block_fp8_plans
-    plan = plans.get(rows)
+    key = None if dynamic_rows else rows
+    plan = plans.get(key)
     if plan is None:
         api = _import_b12x_blockscaled()
         assert api is not None
@@ -56,10 +64,12 @@ def _block_fp8_plan(layer: torch.nn.Module, rows: int, out_dtype: torch.dtype):
             out_features=n,
             input_dtype="float8_e4m3fn",
             output_dtype=str(out_dtype).removeprefix("torch."),
-            expected_m=rows,
+            expected_m=None if dynamic_rows else rows,
         )
         plan = api.plan(query)
-        plans[rows] = plan
+        plans[key] = plan
+    elif plan.query.max_rows != rows:
+        raise ValueError("B12x block-FP8 preparation capacity changed")
     return plan
 
 
@@ -72,7 +82,12 @@ def _b12x_block_fp8_linear(
     layer_name: LayerNameType,
 ) -> torch.Tensor:
     layer = b12x_layer(_resolve_layer_name(layer_name))
-    plan = _block_fp8_plan(layer, int(a.shape[0]), out_dtype)
+    plans = layer.b12x_block_fp8_plans
+    plan = plans.get(int(a.shape[0]), plans.get(None))
+    if plan is None:
+        raise PreparationResourceUnavailableError(
+            "B12x block-FP8 linear has no prepared capacity plan"
+        )
     blockscaled = _import_b12x_blockscaled()
     assert blockscaled is not None
     return blockscaled.mm_block_fp8(
@@ -217,10 +232,13 @@ class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         k = int(weight.shape[1])
         prefix = _resolve_layer_name(layer.b12x_layer_name)
         requests = []
-        for rows in workload.token_counts:
-            plan = _block_fp8_plan(layer, rows, workload.output_dtype)
+        for rows in (*workload.token_counts, None):
+            capacity = workload.max_tokens if rows is None else rows
+            plan = _block_fp8_plan(
+                layer, capacity, workload.output_dtype, dynamic_rows=rows is None
+            )
 
-            def call(state, *, m=rows):
+            def call(state, *, m=capacity):
                 from b12x.preparation import PreparedCall
 
                 values = torch.empty(
@@ -272,7 +290,8 @@ class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
 
             requests.append(
                 plan.request(
-                    name=f"linear.block_fp8.{prefix}.m{rows}",
+                    name=f"linear.block_fp8.{prefix}."
+                    f"{'capacity' if rows is None else f'm{rows}'}",
                     prepare_call=call,
                     benchmark_call=call,
                 )
@@ -282,7 +301,7 @@ class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         return (
             B12xPreparationUnit(
                 name="BLOCK_FP8",
-                key=(prefix, workload.token_counts),
+                key=(prefix, workload.token_counts, workload.max_tokens),
                 requests=tuple(requests),
                 stage="weights",
             ),

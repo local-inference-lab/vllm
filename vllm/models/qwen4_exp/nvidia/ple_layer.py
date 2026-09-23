@@ -25,7 +25,6 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
-from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
@@ -71,9 +70,7 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
             )
         self.eps = eps
         self.group_size = group_size
-        self.weight = nn.Parameter(
-            allocate_weights(torch.zeros, hidden_size, dtype=dtype)
-        )
+        self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=dtype))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
@@ -179,8 +176,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         self.norm_key = Qwen4ExpPLEGroupedNorm(*norm_args)
         self.norm_query = Qwen4ExpPLEGroupedNorm(*norm_args)
         self.norm_conv = Qwen4ExpPLEGroupedNorm(*norm_args)
-        self.conv1d = allocate_weights(
-            nn.Conv1d,
+        self.conv1d = nn.Conv1d(
             self.hc_hidden_size,
             self.hc_hidden_size,
             self.conv_kernel_size,

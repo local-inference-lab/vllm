@@ -50,7 +50,7 @@ VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE="${VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE:-512}"
 VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE="${VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE:-512}"
 case "${SPECULATOR}" in
   dflash2) default_num_speculative_tokens=7 ;;
-  *) default_num_speculative_tokens=5 ;;
+  *) default_num_speculative_tokens=3 ;;
 esac
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-${default_num_speculative_tokens}}"
 MTP_MOE_BACKEND="${MTP_MOE_BACKEND:-b12x}"
@@ -127,6 +127,7 @@ Launcher options:
                 Write uncompressed trace files.
   -h, --help    Show this help.
 
+MTP defaults to three draft tokens; NUM_SPECULATIVE_TOKENS overrides the depth.
 Set SPECULATOR=dflash2 to use the external DFlash2 draft with seven draft
 tokens. DFLASH2_MODEL_PATH selects its local checkpoint.
 

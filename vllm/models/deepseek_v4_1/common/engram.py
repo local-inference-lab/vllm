@@ -20,11 +20,7 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.model_executor.weight_transfer import (
-    allocate_weights,
-    copy_weight,
-    get_file_tensor_source,
-)
+from vllm.model_executor.weight_transfer import copy_weight, get_file_tensor_source
 from vllm.triton_utils import tl, triton
 from vllm.utils.b12x import (
     B12xPreparationUnit,
@@ -477,8 +473,7 @@ class ParallelEngramEmbedding(nn.Module):
             )
         elif table_memory != "disk":
             self.weight = nn.Parameter(
-                allocate_weights(
-                    torch.empty,
+                torch.empty(
                     self.weight_shape,
                     dtype=torch.float8_e4m3fn,
                     device=caps.device,
@@ -486,9 +481,7 @@ class ParallelEngramEmbedding(nn.Module):
                 requires_grad=False,
             )
             self.weight_scale_inv = nn.Parameter(
-                allocate_weights(
-                    torch.empty, self.scale_shape, dtype=torch.uint8, device=caps.device
-                ),
+                torch.empty(self.scale_shape, dtype=torch.uint8, device=caps.device),
                 requires_grad=False,
             )
         else:
@@ -660,11 +653,11 @@ class Engram(nn.Module):
             **({"gather_output": True} if projection_tp else {}),
         )
         self.q_weight = nn.Parameter(
-            allocate_weights(torch.empty, self.hc_mult, self.dim, dtype=torch.bfloat16),
+            torch.empty(self.hc_mult, self.dim, dtype=torch.bfloat16),
             requires_grad=False,
         )
         self.k_weight = nn.Parameter(
-            allocate_weights(torch.empty_like, self.q_weight), requires_grad=False
+            torch.empty_like(self.q_weight), requires_grad=False
         )
         self.register_buffer(
             "norm_weights",

@@ -49,11 +49,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.utils import sequence_parallel_chunk
-from vllm.model_executor.weight_transfer import (
-    allocate_weights,
-    copy_weight,
-    materialize_weight,
-)
+from vllm.model_executor.weight_transfer import copy_weight, materialize_weight
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -160,17 +156,14 @@ class MiMoV2MoE(nn.Module):
 
         dtype = getattr(config, "moe_router_dtype", "float32")
         self.gate_dtype = str_dtype_to_torch_dtype(dtype)
-        self.gate = allocate_weights(
-            nn.Linear,
+        self.gate = nn.Linear(
             config.hidden_size,
             config.n_routed_experts,
             bias=False,
             dtype=self.gate_dtype,
         )
         self.gate.e_score_correction_bias = nn.Parameter(
-            allocate_weights(
-                torch.empty, config.n_routed_experts, dtype=self.gate_dtype
-            )
+            torch.empty(config.n_routed_experts, dtype=self.gate_dtype)
         )
 
         self.experts = FusedMoEFactory(
@@ -294,9 +287,7 @@ class MiMoV2Attention(nn.Module):
         )
 
         self.attention_sink_bias = (
-            torch.nn.Parameter(
-                allocate_weights(torch.empty, self.num_heads), requires_grad=False
-            )
+            torch.nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
             if add_swa_attention_sink_bias
             else None
         )

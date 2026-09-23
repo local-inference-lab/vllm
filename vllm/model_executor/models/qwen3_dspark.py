@@ -32,7 +32,6 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import 
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
 )
-from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.platforms import current_platform
 
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
@@ -69,7 +68,7 @@ class DSparkMarkovHead(nn.Module):
         retain_weight_for_gather: bool = False,
     ) -> None:
         super().__init__()
-        self.markov_w1 = allocate_weights(nn.Embedding, vocab_size, markov_rank)
+        self.markov_w1 = nn.Embedding(vocab_size, markov_rank)
         self.markov_w2 = ParallelLMHead(
             draft_vocab_size,
             markov_rank,

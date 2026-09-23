@@ -33,7 +33,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.model_executor.weight_transfer import allocate_weights, copy_weight
+from vllm.model_executor.weight_transfer import copy_weight
 from vllm.platforms import current_platform
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
@@ -478,8 +478,7 @@ class VocabParallelEmbedding(PluggableLayer):
             and isinstance(quant_method, UnquantizedEmbeddingMethod)
         )
 
-        allocate_weights(
-            self.quant_method.create_weights,
+        self.quant_method.create_weights(
             self,
             self.embedding_dim,
             [self.num_embeddings_per_partition],
@@ -756,9 +755,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.register_parameter("bias", None)
 
     def _register_bias(self):
-        data = allocate_weights(
-            torch.empty, self.num_embeddings_per_partition, dtype=self.params_dtype
-        )
+        data = torch.empty(self.num_embeddings_per_partition, dtype=self.params_dtype)
         self.bias = Parameter(data, requires_grad=False)
         weight_attrs = dict(output_dim=0, weight_loader=self.weight_loader)
         set_weight_attrs(weight=self.bias, weight_attrs=weight_attrs)

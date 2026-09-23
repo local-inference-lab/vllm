@@ -3,19 +3,14 @@
 """Scoped transport for checkpoint copies into model parameter views."""
 
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, TypeVar
 
 import torch
 
 WeightWriter = Callable[[torch.Tensor, torch.Tensor], bool]
 _writer: ContextVar[WeightWriter | None] = ContextVar("weight_writer", default=None)
-_allocator: ContextVar[Callable[[], AbstractContextManager] | None] = ContextVar(
-    "weight_allocator", default=None
-)
-_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
@@ -36,8 +31,6 @@ def get_file_tensor_source(tensor: torch.Tensor) -> FileTensorSource | None:
 @contextmanager
 def weight_transfer(
     writer: WeightWriter,
-    *,
-    allocator: Callable[[], AbstractContextManager] | None = None,
 ) -> Iterator[None]:
     """Install a synchronous writer during exclusive model weight loading.
 
@@ -46,23 +39,10 @@ def weight_transfer(
     Return False to use Torch's usual copy semantics.
     """
     token = _writer.set(writer)
-    allocation_token = _allocator.set(allocator)
     try:
         yield
     finally:
-        _allocator.reset(allocation_token)
         _writer.reset(token)
-
-
-def allocate_weights(factory: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
-    """Create checkpoint destinations using the active loader's allocation policy.
-
-    The factory must only allocate weights. Runtime state, outputs and scratch
-    use ordinary allocation, including during model construction and preparation.
-    """
-    allocator = _allocator.get()
-    with allocator() if allocator is not None else nullcontext():
-        return factory(*args, **kwargs)
 
 
 def copy_weight(destination: torch.Tensor, source: torch.Tensor) -> torch.Tensor:

@@ -3,7 +3,7 @@
 """Adaptive verification for DSpark speculative decoding."""
 
 from collections import defaultdict
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -17,7 +17,7 @@ from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker.gpu.async_utils import StepTimingSample, stream
+from vllm.v1.worker.gpu.async_utils import StepTimingCollector, StepTimingSample, stream
 from vllm.v1.worker.gpu.attn_utils import (
     get_attn_cg_support,
     get_query_lens_mismatch_unsupported_backend,
@@ -203,6 +203,8 @@ class AdaptiveVerificationManager:
         self,
         capture_sizes: list[int],
         full_batch_shapes: list[tuple[int, int]] | None = None,
+        *,
+        replays: int = _PROFILE_REPLAYS,
     ) -> Iterator[dict[str, int]]:
         """Dummy-run kwargs whose step timings seed the cost tables.
 
@@ -226,8 +228,9 @@ class AdaptiveVerificationManager:
             (num_tokens, None)
             for num_tokens in preparation_tail_sizes(capture_sizes, max_num_tokens)
         )
-        for num_tokens, num_reqs in profile_shapes:
-            for _ in range(_PROFILE_REPLAYS):
+        for replay in range(replays):
+            shapes = profile_shapes if replay % 2 == 0 else reversed(profile_shapes)
+            for num_tokens, num_reqs in shapes:
                 batch = {
                     "num_tokens": num_tokens,
                     "context_len": envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN,
@@ -235,6 +238,23 @@ class AdaptiveVerificationManager:
                 if num_reqs is not None:
                     batch["profile_num_reqs"] = num_reqs
                 yield batch
+
+    def profile_costs(
+        self,
+        run_dummy: Callable[..., object],
+        step_timing: StepTimingCollector,
+        capture_sizes: list[int],
+        full_batch_shapes: list[tuple[int, int]],
+    ) -> None:
+        """Warm every shape, then sample rounds to limit startup/order bias."""
+        for batch in self.batches_to_profile(
+            capture_sizes, full_batch_shapes, replays=1
+        ):
+            run_dummy(**batch)
+        with step_timing.collect() as timings:
+            for batch in self.batches_to_profile(capture_sizes, full_batch_shapes):
+                run_dummy(**batch)
+        self.set_initial_cost_curves(timings)
 
     def set_initial_cost_curves(self, samples: list[StepTimingSample]) -> None:
         def median_curve(

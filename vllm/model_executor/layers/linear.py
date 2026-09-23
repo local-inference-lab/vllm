@@ -43,7 +43,7 @@ from vllm.model_executor.parameter import (
     copy_tensor_parallel_shard,
 )
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.model_executor.weight_transfer import allocate_weights, copy_weight
+from vllm.model_executor.weight_transfer import copy_weight
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -414,8 +414,7 @@ class ReplicatedLinear(LinearBase):
             disable_tp=disable_tp,
         )
 
-        allocate_weights(
-            self.quant_method.create_weights,
+        self.quant_method.create_weights(
             self,
             self.input_size,
             self.output_partition_sizes,
@@ -427,9 +426,7 @@ class ReplicatedLinear(LinearBase):
 
         if bias:
             self.bias = Parameter(
-                allocate_weights(
-                    torch.empty, self.output_size, dtype=self.params_dtype
-                ),
+                torch.empty(self.output_size, dtype=self.params_dtype),
                 requires_grad=False,
             )
             set_weight_attrs(
@@ -559,8 +556,7 @@ class ColumnParallelLinear(LinearBase):
         self._maybe_allow_fp8_block_shape_mismatch()
         self.gather_output = gather_output
 
-        allocate_weights(
-            self.quant_method.create_weights,
+        self.quant_method.create_weights(
             layer=self,
             input_size_per_partition=self.input_size_per_partition,
             output_partition_sizes=self.output_partition_sizes,
@@ -576,9 +572,7 @@ class ColumnParallelLinear(LinearBase):
 
         if bias:
             self.bias = Parameter(
-                allocate_weights(
-                    torch.empty, self.output_size_per_partition, dtype=params_dtype
-                ),
+                torch.empty(self.output_size_per_partition, dtype=params_dtype),
                 requires_grad=False,
             )
             set_weight_attrs(
@@ -1775,8 +1769,7 @@ class RowParallelLinear(LinearBase):
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
 
-        allocate_weights(
-            self.quant_method.create_weights,
+        self.quant_method.create_weights(
             layer=self,
             input_size_per_partition=self.input_size_per_partition,
             output_partition_sizes=self.output_partition_sizes,
@@ -1797,7 +1790,7 @@ class RowParallelLinear(LinearBase):
 
         if bias:
             self.bias = Parameter(
-                allocate_weights(torch.empty, self.output_size, dtype=params_dtype),
+                torch.empty(self.output_size, dtype=params_dtype),
                 requires_grad=False,
             )
             set_weight_attrs(

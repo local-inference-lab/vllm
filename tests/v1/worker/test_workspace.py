@@ -94,10 +94,19 @@ def test_workspace_lanes_compose_with_ubatches(monkeypatch) -> None:
         active_ubatch[0] = ubatch_id
         for lane in range(2):
             with workspace.use_workspace_lane(lane):
-                (buffer,) = manager.get_simultaneous(((16,), torch.uint8))
+                assert manager.available_bytes() == 0
+                assert manager._current_workspaces[ubatch_id * 2 + lane] is None
+                size = 256 * (1 + ubatch_id * 2 + lane)
+                (buffer,) = manager.get_simultaneous(((size,), torch.uint8))
                 pointers.add(buffer.data_ptr())
 
     assert len(pointers) == 4
+    manager.lock()
+    for ubatch_id in range(2):
+        active_ubatch[0] = ubatch_id
+        for lane in range(2):
+            with workspace.use_workspace_lane(lane):
+                assert manager.available_bytes() == 256 * (1 + ubatch_id * 2 + lane)
 
 
 def test_workspace_lock_blocks_growth_and_unlock_restores(monkeypatch) -> None:
@@ -167,6 +176,12 @@ def test_workspace_lane_validation(monkeypatch) -> None:
         pytest.raises(RuntimeError, match="is not configured"),
     ):
         manager.get_simultaneous(((1,), torch.uint8))
+
+    with (
+        workspace.use_workspace_lane(1),
+        pytest.raises(RuntimeError, match="is not configured"),
+    ):
+        manager.available_bytes()
 
     with pytest.raises(ValueError, match="at least one"):
         workspace.WorkspaceManager(torch.device("cpu"), num_lanes=0)

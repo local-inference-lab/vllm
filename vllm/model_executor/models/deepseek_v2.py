@@ -99,7 +99,7 @@ from vllm.model_executor.models.utils import (
     extract_layer_index,
     sequence_parallel_chunk,
 )
-from vllm.model_executor.weight_transfer import allocate_weights, materialize_weight
+from vllm.model_executor.weight_transfer import materialize_weight
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -327,9 +327,7 @@ class DeepseekV2MoE(nn.Module):
         )
         if getattr(config, "topk_method", None) == "noaux_tc":
             self.gate.e_score_correction_bias = nn.Parameter(
-                allocate_weights(
-                    torch.empty, config.n_routed_experts, dtype=torch.float32
-                )
+                torch.empty(config.n_routed_experts, dtype=torch.float32)
             )
         else:
             self.gate.e_score_correction_bias = None

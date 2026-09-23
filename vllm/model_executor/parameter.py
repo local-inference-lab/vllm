@@ -14,7 +14,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.weight_transfer import allocate_weights, copy_weight
+from vllm.model_executor.weight_transfer import copy_weight
 
 
 def copy_tensor_parallel_shard(
@@ -496,7 +496,7 @@ class SharedWeightParameter(BasevLLMParameter):
         """
         # load (shared) tensor using `data_key`
         if data_key not in self.tensors_registry:
-            data = allocate_weights(torch.empty, *args, **kwargs)
+            data = torch.empty(*args, **kwargs)
             self.tensors_registry[data_key] = data
         else:
             data = self.tensors_registry[data_key]

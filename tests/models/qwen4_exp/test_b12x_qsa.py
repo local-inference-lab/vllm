@@ -9,6 +9,7 @@ import pytest
 import torch
 
 import vllm.models.qwen4_exp.nvidia.b12x_qsa as qsa_module
+from vllm.config.vllm import set_current_vllm_config
 from vllm.models.qwen4_exp.common import b12x_qsa_cache as qsa_cache_module
 from vllm.models.qwen4_exp.common.b12x_qsa_cache import (
     qsa_compressed_cache_view,
@@ -95,20 +96,24 @@ def test_qsa_backend_platform_probe_uses_b12x_selector_geometry(
     (
         "dcp_size",
         "initial_block_size",
+        "speculative_tokens",
         "expected_block_size",
         "expected_page_size",
     ),
     [
-        (1, 64, 1472, 847_872),
-        (2, 64, 1472, 847_872),
-        (4, 64, 768, 835_584),
-        (4, 16, 752, 818_176),
+        (1, 64, 0, 1472, 847_872),
+        (2, 64, 3, 1472, 847_872),
+        (4, 64, 3, 768, 835_584),
+        (4, 16, 3, 752, 818_176),
+        (1, 64, 5, 1536, 884_736),
+        (4, 16, 5, 768, 835_584),
     ],
 )
 def test_qsa_hybrid_alignment_uses_materialized_dcp_heads(
     monkeypatch,
     dcp_size: int,
     initial_block_size: int,
+    speculative_tokens: int,
     expected_block_size: int,
     expected_page_size: int,
 ) -> None:
@@ -146,6 +151,7 @@ def test_qsa_hybrid_alignment_uses_materialized_dcp_heads(
         mamba_page_size_padded=None,
     )
     config = SimpleNamespace(
+        num_speculative_tokens=speculative_tokens,
         model_config=model_config,
         cache_config=cache_config,
         parallel_config=SimpleNamespace(
@@ -161,13 +167,20 @@ def test_qsa_hybrid_alignment_uses_materialized_dcp_heads(
     assert cache_config.mamba_page_size_padded == expected_page_size
 
 
-def test_qsa_backend_selects_the_manager_block_without_dense_page_limits() -> None:
-    assert select_common_block_size(384, [Qwen4ExpQSABackend]) == 384
-    assert select_common_block_size(512, [Qwen4ExpQSABackend]) == 512
-    assert Qwen4ExpQSABackend.supports_block_size(384)
-    assert Qwen4ExpQSABackend.supports_block_size(512)
-    assert not Qwen4ExpQSABackend.supports_block_size(12)
-    assert Qwen4ExpQSABackend.get_preferred_block_size(70) == 72
+@pytest.mark.parametrize("speculative_tokens", [0, 3, 5, 8])
+def test_qsa_backend_selects_the_manager_block_without_dense_page_limits(
+    speculative_tokens: int,
+) -> None:
+    config = SimpleNamespace(num_speculative_tokens=speculative_tokens)
+    expected = 512 if speculative_tokens <= 4 else 528
+    with set_current_vllm_config(config):
+        assert select_common_block_size(384, [Qwen4ExpQSABackend]) == 384
+        assert select_common_block_size(expected, [Qwen4ExpQSABackend]) == expected
+        assert Qwen4ExpQSABackend.get_preferred_block_size(512) == expected
+        assert Qwen4ExpQSABackend.supports_block_size(384)
+        assert Qwen4ExpQSABackend.supports_block_size(expected)
+        assert not Qwen4ExpQSABackend.supports_block_size(12)
+        assert Qwen4ExpQSABackend.get_preferred_block_size(70) == 72
 
 
 def test_qsa_dcp_packs_qkv_into_one_collective() -> None:

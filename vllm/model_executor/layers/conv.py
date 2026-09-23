@@ -10,7 +10,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.utils.torch_utils import is_torch_equal_or_newer
 
 
@@ -83,8 +82,7 @@ class ConvLayerBase(CustomOp):
         self.input_size = in_channels * math.prod(self.kernel_size)
 
         self.weight = nn.Parameter(
-            allocate_weights(
-                torch.empty,
+            torch.empty(
                 out_channels,
                 in_channels // groups,
                 *kernel_size,
@@ -93,9 +91,7 @@ class ConvLayerBase(CustomOp):
         )
 
         if bias:
-            self.bias = nn.Parameter(
-                allocate_weights(torch.empty, self.out_channels, dtype=params_dtype)
-            )
+            self.bias = nn.Parameter(torch.empty(self.out_channels, dtype=params_dtype))
         else:
             self.register_parameter("bias", None)
 

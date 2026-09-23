@@ -10,7 +10,6 @@ from b12x.preparation import PreparedCall
 
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
-from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.models.deepseek_v4_1.b12x_layers import B12xLinearMethod, B12xRMSNorm
 from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xBackend
 from vllm.triton_utils import tl, triton
@@ -154,7 +153,7 @@ class DeepseekCompressor(nn.Module):
         )
         self.norm = B12xRMSNorm(512, vllm_config.model_config.hf_config.rms_norm_eps)
         self.norm.weight = nn.Parameter(
-            allocate_weights(torch.ones, 512, dtype=torch.float32), requires_grad=False
+            torch.ones(512, dtype=torch.float32), requires_grad=False
         )
         self.state_cache = (
             CompressorStateCache(vllm_config, f"{prefix}.state_cache")

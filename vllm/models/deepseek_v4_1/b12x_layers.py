@@ -24,7 +24,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
 from vllm.model_executor.parameter import BlockQuantScaleParameter
-from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.utils.b12x import (
     B12xPreparationUnit,
     B12xWorkload,
@@ -468,7 +467,7 @@ class B12xRMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(
-            allocate_weights(torch.ones, hidden_size, dtype=torch.bfloat16),
+            torch.ones(hidden_size, dtype=torch.bfloat16),
             requires_grad=False,
         )
         self.variance_epsilon = eps

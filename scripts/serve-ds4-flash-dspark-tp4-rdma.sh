@@ -41,6 +41,8 @@ MODEL_ID="${MODEL_ID:-deepseek-ai/DeepSeek-V4-Flash-0731}"
 MODEL_REVISION="${MODEL_REVISION:-9e165c30e2704aec5d9d593cce3eebd58bbef1cb}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-DeepSeek-V4-Flash}"
 TOKENIZER_MODE="${TOKENIZER_MODE:-deepseek_v4}"
+TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-deepseek_v4}"
+REASONING_PARSER="${REASONING_PARSER:-deepseek_v4}"
 ENGRAM_CONFIG="${ENGRAM_CONFIG:-}"
 LIMIT_MM_PER_PROMPT="${LIMIT_MM_PER_PROMPT:-}"
 SECCOMP_PROFILE="${SECCOMP_PROFILE:-}"
@@ -360,7 +362,7 @@ cluster_args=(
   --env "VLLM_USE_B12X_MOE=1"
   --env "VLLM_USE_B12X_SPARSE_INDEXER=1"
   --env "B12X_MLA_SM120_UNIFIED=1"
-  --env "B12X_DENSE_SPLITK_TURBO=1"
+  --env "B12X_DENSE_SPLITK_TURBO=${B12X_DENSE_SPLITK_TURBO:-1}"
   --env "B12X_W4A16_TC_DECODE=1"
   --env "B12X_MOE_FORCE_A8=1"
   --env "VLLM_ENABLE_PCIE_ALLREDUCE=0"
@@ -492,11 +494,11 @@ vllm_command=(
   --enable-flashinfer-autotune
   --compilation-config "${compilation_config}"
   --tokenizer-mode "${TOKENIZER_MODE}"
-  --tool-call-parser deepseek_v4
+  --tool-call-parser "${TOOL_CALL_PARSER}"
   --enable-auto-tool-choice
-  --reasoning-parser deepseek_v4
+  --reasoning-parser "${REASONING_PARSER}"
   --reasoning-config
-  '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}'
+  "{\"reasoning_parser\":\"${REASONING_PARSER}\",\"reasoning_start_str\":\"\",\"reasoning_end_str\":\"\"}"
   --default-chat-template-kwargs.thinking=true
   --default-chat-template-kwargs.reasoning_effort=high
 )

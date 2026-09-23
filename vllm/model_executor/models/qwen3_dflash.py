@@ -34,7 +34,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.weight_transfer import allocate_weights, flush_weight_transfers
+from vllm.model_executor.weight_transfer import flush_weight_transfers
 from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
@@ -258,9 +258,7 @@ class DFlashQwen3Attention(nn.Module):
         )
 
         self.attention_sink_bias = (
-            torch.nn.Parameter(
-                allocate_weights(torch.empty, self.num_heads), requires_grad=False
-            )
+            torch.nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
             if add_swa_attention_sink_bias
             else None
         )
@@ -456,8 +454,7 @@ class DFlashQwen3Model(nn.Module):
             "mask_token_id", getattr(self.config, "mask_token_id", None)
         )
         self.mask_embedding = nn.Parameter(
-            allocate_weights(
-                torch.zeros,
+            torch.zeros(
                 self.config.hidden_size,
                 dtype=vllm_config.model_config.dtype,
             ),
@@ -842,9 +839,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         target_vocab_size = vllm_config.model_config.get_vocab_size()
         if self.config.draft_vocab_size != target_vocab_size:
             self.draft_id_to_target_id = nn.Parameter(
-                allocate_weights(
-                    torch.zeros, self.config.draft_vocab_size, dtype=torch.long
-                ),
+                torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
                 requires_grad=False,
             )
         else:

@@ -2410,7 +2410,7 @@ def _deepseek_v4_wo_layer(device, groups=2, heads_per_group=8, rank=128, hidden=
 
 @pytest.mark.parametrize("eager_only", [False, True])
 @pytest.mark.parametrize("tiled", [False, True])
-def test_deepseek_v4_wo_declares_exact_rows_before_profiling(
+def test_deepseek_v4_wo_declares_exact_rows_and_capacity_before_profiling(
     monkeypatch, eager_only, tiled
 ):
     from dataclasses import replace
@@ -2450,11 +2450,13 @@ def test_deepseek_v4_wo_declares_exact_rows_before_profiling(
         4,
         8,
         17,
+        17,
     )
     assert all(request.plan.prepared is None for request in unit.requests)
     for request in unit.requests:
         query = request.plan.query
-        assert query.operation == "inv_rope" and not query.dynamic_tokens
+        assert query.operation == "inv_rope"
+        assert query.dynamic_tokens is request.name.endswith(".capacity")
         assert (query.heads_per_group, query.nope_dim, query.rope_dim) == (8, 448, 64)
         assert query.positions_dtype == "int64" and query.cos_sin_dtype == "bfloat16"
         assert query.sfb_k_replicated
@@ -2513,7 +2515,8 @@ def test_deepseek_v4_wo_preparation_runs_and_replays_native_projection(
     angles = torch.randn(32, 32, device=device)
     table.copy_(torch.cat((angles.cos(), angles.sin()), dim=-1))
     layer.setup_b12x_wo_projection()
-    counts = (1, 4, 8, 17)
+    counts = (1, 4, 8, 33)
+    capacity = counts[-1]
     workload = B12xWorkload(
         stage="weights",
         token_counts=counts,
@@ -2526,12 +2529,18 @@ def test_deepseek_v4_wo_preparation_runs_and_replays_native_projection(
     allocated = torch.accelerator.memory_allocated(device)
     units = tuple(_units_from_modules(layer, workload))
     assert torch.accelerator.memory_allocated(device) == allocated
-    assert len(units) == 1 and len(units[0].requests) == len(counts)
+    assert len(units) == 1 and len(units[0].requests) == len(counts) + 1
     source = torch.randn(
-        17, max(32, layer.n_local_heads), 512, device=device, dtype=torch.bfloat16
+        capacity + 1,
+        max(32, layer.n_local_heads),
+        512,
+        device=device,
+        dtype=torch.bfloat16,
     )
     source = source[:, : layer.n_local_heads]
-    positions = torch.arange(17, dtype=torch.int64, device=device)
+    positions = torch.arange(capacity + 1, dtype=torch.int64, device=device).remainder_(
+        table.shape[0]
+    )
     init_workspace_manager(device)
     try:
         with PreparationSession(
@@ -2542,8 +2551,10 @@ def test_deepseek_v4_wo_preparation_runs_and_replays_native_projection(
                 get_b12x_scratch_buffers(plan)
             session.freeze()
             current_workspace_manager().lock()
-            for rows in counts:
-                plan = layer._b12x_wo_plans[rows]
+            declared = dict(layer._b12x_wo_plans)
+            for rows in (*counts, 3, 20, 32):
+                plan = declared.get(rows, declared[None])
+                assert plan is not None
                 assert plan.prepared is not None
                 scratch = tuple(
                     torch.empty(spec.shape, dtype=spec.dtype, device=device)
@@ -2590,8 +2601,9 @@ def test_deepseek_v4_wo_preparation_runs_and_replays_native_projection(
                     )
                 finally:
                     graph.reset()
-            with pytest.raises(RuntimeError, match="frozen"):
-                layer._o_proj(source[:3], positions[:3])
+            assert layer._b12x_wo_plans == declared
+            with pytest.raises(ValueError, match="planned token capacity"):
+                layer._o_proj(source, positions)
     finally:
         reset_workspace_manager()
 

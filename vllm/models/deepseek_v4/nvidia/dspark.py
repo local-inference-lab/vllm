@@ -42,11 +42,7 @@ from vllm.model_executor.models.qwen3_dspark import (
     DSparkMarkovHead,
 )
 from vllm.model_executor.models.utils import maybe_prefix
-from vllm.model_executor.weight_transfer import (
-    allocate_weights,
-    copy_weight,
-    flush_weight_transfers,
-)
+from vllm.model_executor.weight_transfer import copy_weight, flush_weight_transfers
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -123,15 +119,15 @@ class DSparkDeepseekV4Model(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         hc_dim = self.hc_mult * config.hidden_size
         self.hc_head_fn = nn.Parameter(
-            allocate_weights(torch.empty, self.hc_mult, hc_dim, dtype=torch.float32),
+            torch.empty(self.hc_mult, hc_dim, dtype=torch.float32),
             requires_grad=False,
         )
         self.hc_head_base = nn.Parameter(
-            allocate_weights(torch.empty, self.hc_mult, dtype=torch.float32),
+            torch.empty(self.hc_mult, dtype=torch.float32),
             requires_grad=False,
         )
         self.hc_head_scale = nn.Parameter(
-            allocate_weights(torch.empty, 1, dtype=torch.float32), requires_grad=False
+            torch.empty(1, dtype=torch.float32), requires_grad=False
         )
         draft_vocab_size = (
             getattr(config, "draft_vocab_size", None) or config.vocab_size

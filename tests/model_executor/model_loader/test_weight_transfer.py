@@ -3,14 +3,12 @@
 """Weight transport preserves routing and ordinary Torch copy semantics."""
 
 import inspect
-from contextlib import contextmanager
 
 import pytest
 import torch
 
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.weight_transfer import (
-    allocate_weights,
     copy_weight,
     weight_transfer,
 )
@@ -46,29 +44,6 @@ def test_declined_transfer_preserves_torch_cast_and_broadcast():
     torch.testing.assert_close(
         destination, torch.tensor([[1, 2, 3], [1, 2, 3]], dtype=torch.float64)
     )
-
-
-def test_weight_factory_restores_loader_policy_after_failure():
-    active = []
-
-    @contextmanager
-    def allocator():
-        active.append(True)
-        try:
-            yield
-        finally:
-            active.pop()
-
-    def factory():
-        assert active
-        raise RuntimeError("allocation failed")
-
-    with weight_transfer(lambda *_: False, allocator=allocator):
-        assert not active
-        with pytest.raises(RuntimeError, match="allocation failed"):
-            allocate_weights(factory)
-        assert not active
-    assert allocate_weights(lambda: len(active)) == 0
 
 
 def test_layerwise_meta_probe_counts_elements_without_io():

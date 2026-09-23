@@ -861,6 +861,7 @@ class Platform:
             split_mamba_block_size = os.getenv(
                 "VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE", "auto"
             )
+            mamba_block_size: int | None
             mamba_block_size = (
                 target_block_size
                 if split_mamba_block_size.lower() == "auto"
@@ -1009,7 +1010,7 @@ class Platform:
 
         # Get kernel block alignment from the backend's supported sizes
         with set_current_vllm_config(vllm_config):
-            kernel_block_alignment_size = max(
+            kernel_block_alignment_size = lcm(
                 min(
                     s.base if isinstance(s, MultipleOf) else s
                     for s in backend_cls.get_supported_kernel_block_sizes()

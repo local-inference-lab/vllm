@@ -36,7 +36,7 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_layers,
 )
-from vllm.model_executor.weight_transfer import allocate_weights, copy_weight
+from vllm.model_executor.weight_transfer import copy_weight
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -168,8 +168,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         mix_hc = (2 + self.hc_mult) * self.hc_mult
         hc_dim = self.hc_mult * self.hidden_size
         self.hc_attn_fn = nn.Parameter(
-            allocate_weights(
-                torch.empty,
+            torch.empty(
                 (mix_hc, hc_dim),
                 dtype=torch.float32,
             ),
@@ -177,40 +176,35 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         self.hc_attn_fn_broadcast: torch.Tensor | None = None
         self.hc_ffn_fn = nn.Parameter(
-            allocate_weights(
-                torch.empty,
+            torch.empty(
                 (mix_hc, hc_dim),
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_attn_base = nn.Parameter(
-            allocate_weights(
-                torch.empty,
+            torch.empty(
                 mix_hc,
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_ffn_base = nn.Parameter(
-            allocate_weights(
-                torch.empty,
+            torch.empty(
                 mix_hc,
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_attn_scale = nn.Parameter(
-            allocate_weights(
-                torch.empty,
+            torch.empty(
                 3,
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_ffn_scale = nn.Parameter(
-            allocate_weights(
-                torch.empty,
+            torch.empty(
                 3,
                 dtype=torch.float32,
             ),

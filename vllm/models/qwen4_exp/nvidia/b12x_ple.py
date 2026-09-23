@@ -21,7 +21,6 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.model_executor.weight_transfer import (
-    allocate_weights,
     copy_weight,
     flush_weight_transfers,
     get_file_tensor_source,
@@ -140,8 +139,7 @@ class _NGramEmbeddingStorage(nn.Module):
             for name in ("weight_scale", "weight_scale_2"):
                 shape = getattr(layout, f"{name}_shape")
                 tensors[name] = (
-                    allocate_weights(
-                        torch.empty,
+                    torch.empty(
                         shape,
                         dtype=getattr(layout, f"{name}_dtype"),
                         device=layout.caps.device,
@@ -150,7 +148,7 @@ class _NGramEmbeddingStorage(nn.Module):
                     else None
                 )
         else:
-            self._table_storage = allocate_weights(layout.allocate_storage)
+            self._table_storage = layout.allocate_storage()
             tensors = {
                 name: getattr(self._table_storage, name)
                 for name in ("weight", "weight_scale", "weight_scale_2")

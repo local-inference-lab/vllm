@@ -70,11 +70,7 @@ from vllm.model_executor.models.utils import (
     spec_decode_needs_target_embed,
 )
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.model_executor.weight_transfer import (
-    allocate_weights,
-    copy_weight,
-    flush_weight_transfers,
-)
+from vllm.model_executor.weight_transfer import copy_weight, flush_weight_transfers
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -226,8 +222,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
         weight_attrs = {"weight_loader": self.weight_loader}
         self.w13_weight = nn.Parameter(
-            allocate_weights(
-                torch.zeros,
+            torch.zeros(
                 num_local_experts,
                 2 * intermediate_size,
                 hidden_size // 2,
@@ -238,8 +233,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         set_weight_attrs(self.w13_weight, weight_attrs)
 
         self.w13_weight_scale = nn.Parameter(
-            allocate_weights(
-                torch.zeros,
+            torch.zeros(
                 num_local_experts,
                 2 * intermediate_size,
                 hidden_size // 32,
@@ -251,8 +245,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.w13_weight_scale.quant_method = "block"
 
         self.w2_weight = nn.Parameter(
-            allocate_weights(
-                torch.zeros,
+            torch.zeros(
                 num_local_experts,
                 hidden_size,
                 intermediate_size // 2,
@@ -263,8 +256,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         set_weight_attrs(self.w2_weight, weight_attrs)
 
         self.w2_weight_scale = nn.Parameter(
-            allocate_weights(
-                torch.zeros,
+            torch.zeros(
                 num_local_experts,
                 hidden_size,
                 intermediate_size // 32,
@@ -883,8 +875,7 @@ class DeepseekV4MoE(nn.Module):
             # Use randint instead of empty to avoid garbage values causing
             # invalid memory access in dummy mode (--load-format="dummy")
             self.gate.tid2eid = nn.Parameter(
-                allocate_weights(
-                    torch.randint,
+                torch.randint(
                     0,
                     self.n_routed_experts,
                     (config.vocab_size, self.n_activated_experts),
@@ -898,9 +889,7 @@ class DeepseekV4MoE(nn.Module):
             # Vision checkpoints ship a gate bias on hash layers too (it is
             # unused for routing there; image tokens use bias_vl instead).
             self.gate.e_score_correction_bias = nn.Parameter(
-                allocate_weights(
-                    torch.empty, self.n_routed_experts, dtype=torch.float32
-                ),
+                torch.empty(self.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
             )
 
@@ -909,9 +898,7 @@ class DeepseekV4MoE(nn.Module):
             # instead of e_score_correction_bias / the hash table. Created on
             # every MoE layer, hash layers included.
             self.gate.bias_vl = nn.Parameter(
-                allocate_weights(
-                    torch.empty, self.n_routed_experts, dtype=torch.float32
-                ),
+                torch.empty(self.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
             )
 
@@ -1207,8 +1194,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         mix_hc = (2 + self.hc_mult) * self.hc_mult
         hc_dim = self.hc_mult * self.hidden_size
         self.hc_attn_fn = nn.Parameter(
-            allocate_weights(
-                torch.empty,
+            torch.empty(
                 (mix_hc, hc_dim),
                 dtype=torch.float32,
             ),
@@ -1216,40 +1202,35 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         self.hc_attn_fn_broadcast: torch.Tensor | None = None
         self.hc_ffn_fn = nn.Parameter(
-            allocate_weights(
-                torch.empty,
+            torch.empty(
                 (mix_hc, hc_dim),
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_attn_base = nn.Parameter(
-            allocate_weights(
-                torch.empty,
+            torch.empty(
                 mix_hc,
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_ffn_base = nn.Parameter(
-            allocate_weights(
-                torch.empty,
+            torch.empty(
                 mix_hc,
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_attn_scale = nn.Parameter(
-            allocate_weights(
-                torch.empty,
+            torch.empty(
                 3,
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_ffn_scale = nn.Parameter(
-            allocate_weights(
-                torch.empty,
+            torch.empty(
                 3,
                 dtype=torch.float32,
             ),
@@ -1559,8 +1540,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.norm = PPMissingLayer()
 
         self.hc_head_fn = nn.Parameter(
-            allocate_weights(
-                torch.empty,
+            torch.empty(
                 self.hc_mult,
                 self.hc_dim,
                 dtype=torch.float32,
@@ -1568,15 +1548,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             requires_grad=False,
         )
         self.hc_head_base = nn.Parameter(
-            allocate_weights(
-                torch.empty,
+            torch.empty(
                 self.hc_mult,
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_head_scale = nn.Parameter(
-            allocate_weights(torch.empty, 1, dtype=torch.float32),
+            torch.empty(1, dtype=torch.float32),
             requires_grad=False,
         )
         spec_config = vllm_config.speculative_config

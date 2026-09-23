@@ -4,8 +4,6 @@
 
 import pytest
 import torch
-from torch.utils._python_dispatch import TorchDispatchMode
-from torch.utils._pytree import tree_leaves
 
 from tests.utils import ensure_current_vllm_config
 from vllm.distributed.parallel_state import (
@@ -111,47 +109,6 @@ def test_window_attention_applies_sinks(vision_attn_env, num_kv_heads):
     # bf16 attention lands at ~2e-3 here; dropping the sinks lands at ~1e-1.
     error = ((out.float() - ref).norm() / ref.norm()).item()
     assert error < 1e-2, f"sink-corrected output is off by {error:.2e}"
-
-
-@pytest.mark.parametrize("projection_layers", [1, 2])
-def test_audio_weights_use_loader_pool_without_rotary_buffers(projection_layers):
-    from vllm.model_executor.models.mimo_audio import (
-        MimoAudioEncoder,
-        MimoAudioEncoderConfig,
-    )
-    from vllm.model_executor.weight_transfer import weight_transfer
-
-    weight_storage = set()
-
-    class WeightPool(TorchDispatchMode):
-        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-            result = func(*args, **(kwargs or {}))
-            for tensor in tree_leaves(result):
-                if isinstance(tensor, torch.Tensor):
-                    weight_storage.add(tensor.untyped_storage()._cdata)
-            return result
-
-    config = MimoAudioEncoderConfig(
-        input_local_dim=16,
-        input_local_layers=1,
-        input_local_attn_heads=2,
-        input_local_intermediate_size=32,
-        out_hidden_size=32,
-        audio_channels=2,
-        speech_vocab_size="16",
-        speech_zeroemb_idx="0",
-        projection_layers=projection_layers,
-        add_post_norm=True,
-    )
-    with weight_transfer(lambda *_: False, allocator=WeightPool):
-        encoder = MimoAudioEncoder(config)
-
-    for name, parameter in encoder.named_parameters():
-        assert parameter.untyped_storage()._cdata in weight_storage, name
-    buffers = dict(encoder.input_local_transformer.named_buffers())
-    assert buffers
-    for name, buffer in buffers.items():
-        assert buffer.untyped_storage()._cdata not in weight_storage, name
 
 
 @pytest.mark.parametrize("num_kv_heads", [4, 8])

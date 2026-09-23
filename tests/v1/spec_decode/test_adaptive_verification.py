@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from contextlib import nullcontext
+from collections import Counter
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import numpy as np
@@ -320,6 +321,58 @@ def test_budget_uses_request_specific_full_graph_costs():
     assert manager.get_num_tokens({"low": 3}, {"low": [1, 2]}) == 3
     assert manager._batch_budget is not None
     assert manager._batch_budget[2] == 2
+
+
+def test_profile_costs_excludes_each_shapes_cold_run():
+    """One-time preparation must not inflate the adaptive verifier's costs."""
+    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
+    manager.req_states = SimpleNamespace(max_num_batched_tokens=16)
+    curves: dict[str, object] = {}
+    manager.set_cost_curves = lambda draft, verify, **kwargs: curves.update(
+        draft=draft, verify=verify, **kwargs
+    )
+    seen: Counter[tuple[int, int]] = Counter()
+    measured_shapes = []
+
+    class TimingCollector:
+        def __init__(self):
+            self.samples = None
+
+        @contextmanager
+        def collect(self):
+            self.samples = []
+            try:
+                yield self.samples
+            finally:
+                self.samples = None
+
+    timing = TimingCollector()
+
+    def run_dummy(num_tokens, context_len, profile_num_reqs=2):
+        shape = (num_tokens, profile_num_reqs)
+        cost = 1000.0 if not seen[shape] else float(num_tokens + profile_num_reqs)
+        seen[shape] += 1
+        if timing.samples is not None:
+            measured_shapes.append(shape)
+            timing.samples.append(
+                StepTimingSample(
+                    cost, cost, num_tokens, profile_num_reqs, num_tokens <= 8
+                )
+            )
+
+    manager.profile_costs(
+        run_dummy, timing, [1, 2, 8], [(1, 1), (2, 1), (8, 1), (8, 2)]
+    )
+
+    assert curves["verify_curves_by_num_reqs"] == {
+        1: [(1, 2.0), (2, 3.0), (8, 9.0)],
+        2: [(8, 10.0)],
+    }
+    assert curves["verify"] == [(1, 2.0), (2, 3.0), (8, 9.5), (12, 14.0), (16, 18.0)]
+    assert curves["draft"] == [(1, 3.0), (2, 10.0)]
+    # Every shape is sampled in each round instead of consecutive shape blocks.
+    for start in range(0, len(measured_shapes), len(seen)):
+        assert set(measured_shapes[start : start + len(seen)]) == set(seen)
 
 
 def test_sparse_full_graph_costs_follow_request_padding(monkeypatch):

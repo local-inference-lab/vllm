@@ -27,11 +27,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     resolve_quant_method,
 )
-from vllm.model_executor.weight_transfer import (
-    allocate_weights,
-    copy_weight,
-    flush_weight_transfers,
-)
+from vllm.model_executor.weight_transfer import copy_weight, flush_weight_transfers
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
@@ -173,9 +169,7 @@ class RoutedExperts(PluggableLayer):
             "global_num_experts": moe_config.num_experts,
         }
 
-        allocate_weights(
-            self.quant_method.create_weights, layer=self, **moe_quant_params
-        )
+        self.quant_method.create_weights(layer=self, **moe_quant_params)
 
         self.lora_base_layer_prefix = ""
 

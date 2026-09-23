@@ -37,7 +37,6 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
-from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
@@ -119,7 +118,7 @@ class MiMoVisionPatchMerger(nn.Module):
         self.hidden_size = context_dim * (spatial_merge_size**2)
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
-        self.ln_q = allocate_weights(norm_layer, context_dim)
+        self.ln_q = norm_layer(context_dim)
 
         self.mlp = nn.Sequential(
             ColumnParallelLinear(
@@ -224,7 +223,7 @@ class MiMoVisionAttention(nn.Module):
         self.use_sink = use_sink
         if use_sink:
             self.sinks = nn.Parameter(
-                allocate_weights(torch.empty, num_heads),
+                torch.empty(num_heads),
                 requires_grad=False,
             )
         else:

@@ -15,6 +15,7 @@ from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.vllm import get_current_vllm_config_or_none
 from vllm.distributed import get_dcp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention.attention import set_default_quant_scales
@@ -86,13 +87,18 @@ from .b12x_indexer_qsa import QSAIndexer
 
 _QSA_COMPRESS_RATIO = 4
 _QSA_INDEX_HEAD_DIM = 128
-# The supported speculative envelope is zero to four draft tokens. Its raw
-# ring is either 4 or 8 rows, so eight is the static manager-page alignment
-# that is valid for every supported runtime configuration.
+# Preserve the existing page alignment while accommodating larger raw rings.
 _QSA_MANAGER_BLOCK_ALIGNMENT = 8
-_QSA_MAX_SPECULATIVE_TOKENS = 4
 _QSA_SPLITTING_OP = "vllm::qwen4_exp_b12x_qsa_with_output"
 _QSA_PROJECTED_READ_OP = "vllm::qwen4_exp_b12x_qsa_run_projected"
+
+
+def _qsa_manager_block_alignment() -> int:
+    config = get_current_vllm_config_or_none()
+    speculative_tokens = 0 if config is None else config.num_speculative_tokens
+    ratio = _QSA_COMPRESS_RATIO
+    raw_ring_capacity = ratio * ((ratio + speculative_tokens + ratio - 1) // ratio)
+    return math.lcm(_QSA_MANAGER_BLOCK_ALIGNMENT, raw_ring_capacity)
 
 
 def _qsa_prefill_context_capacities(
@@ -373,19 +379,18 @@ class Qwen4ExpQSABackend(B12xPagedAttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [MultipleOf(_QSA_MANAGER_BLOCK_ALIGNMENT)]
+        return [MultipleOf(_qsa_manager_block_alignment())]
 
     @classmethod
     def supports_block_size(cls, block_size: int | None) -> bool:
-        return block_size is None or int(block_size) % _QSA_MANAGER_BLOCK_ALIGNMENT == 0
+        return (
+            block_size is None or int(block_size) % _qsa_manager_block_alignment() == 0
+        )
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
-        return (
-            (int(default_block_size) + _QSA_MANAGER_BLOCK_ALIGNMENT - 1)
-            // _QSA_MANAGER_BLOCK_ALIGNMENT
-            * _QSA_MANAGER_BLOCK_ALIGNMENT
-        )
+        alignment = _qsa_manager_block_alignment()
+        return (int(default_block_size) + alignment - 1) // alignment * alignment
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -433,7 +438,7 @@ class Qwen4ExpQSABackend(B12xPagedAttentionBackend):
         if not cls.supports_block_size(block_size):
             return (
                 "QSA manager block size must be a multiple of "
-                f"{_QSA_MANAGER_BLOCK_ALIGNMENT}"
+                f"{_qsa_manager_block_alignment()}"
             )
         qsa = get_b12x_qsa()
         if qsa is None:
@@ -996,10 +1001,6 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
         self._qsa_model_config = model_config
         self._qsa_cache_config = vllm_config.cache_config
         self.max_speculative_tokens = int(vllm_config.num_speculative_tokens)
-        if self.max_speculative_tokens > _QSA_MAX_SPECULATIVE_TOKENS:
-            raise NotImplementedError(
-                "QSA currently supports at most four speculative tokens"
-            )
         self.compress_ratio = int(config.indexer_compress_ratio)
         self.budget = int(config.indexer_budget)
         self.index_heads = int(config.indexer_n_heads)

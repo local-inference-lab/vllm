@@ -35,8 +35,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from vllm.model_executor.weight_transfer import allocate_weights
-
 
 # ---------------------------------------------------------------------------
 # Config
@@ -70,9 +68,7 @@ class GroupedGemmaRMSNorm(nn.Module):
             )
         self.variance_epsilon = eps
         self.group_size = group_size
-        self.weight = nn.Parameter(
-            allocate_weights(torch.zeros, hidden_size, dtype=dtype)
-        )
+        self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=dtype))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype

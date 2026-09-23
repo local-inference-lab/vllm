@@ -36,7 +36,6 @@ from vllm.model_executor.models.utils import (
     init_vllm_registered_model,
     maybe_prefix,
 )
-from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalKwargsItem
 
@@ -147,13 +146,11 @@ class DeepseekV4ForConditionalGeneration(
                         self,
                         name,
                         nn.Parameter(
-                            allocate_weights(
-                                torch.empty, config.hidden_size, dtype=torch.float32
-                            )
+                            torch.empty(config.hidden_size, dtype=torch.float32)
                         ),
                     )
-                allocate_weights(self.vision.to, dtype=model_config.dtype)
-                allocate_weights(self.aligner.to, dtype=model_config.dtype)
+                self.vision.to(dtype=model_config.dtype)
+                self.aligner.to(dtype=model_config.dtype)
 
         with self._mark_language_model(vllm_config):
             # The arch convertor routes any config with a vision tower to
