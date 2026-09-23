@@ -1401,10 +1401,14 @@ def test_b12x_moe_tuning_times_native_candidate_without_capture(
             state = require_prepared(plan, plan.component_id)
             call = request.benchmark_call(state)
             assert not call.capture_safe
-            call.restore()
-            call.invoke()
-            expected = call.output.clone()
-            assert torch.isfinite(expected).all() and torch.count_nonzero(expected)
+            # Timed replay visits every routing workload and leaves the final
+            # producer's result in output, not the default restore workload.
+            for producer in call.benchmark_producers or (call.produce,):
+                call.reset()
+                producer()
+                call.invoke()
+                expected = call.output.clone()
+                assert torch.isfinite(expected).all() and torch.count_nonzero(expected)
             address = call.output.data_ptr()
             session.freeze()
 
