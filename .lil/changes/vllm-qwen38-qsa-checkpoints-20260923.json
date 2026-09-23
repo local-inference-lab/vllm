@@ -1,0 +1,12 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-qwen38-qsa-checkpoints-20260923",
+  "category": "feature",
+  "summary": "Allow Qwen QSA checkpoints to use compatible external KV storage",
+  "models": ["Qwen3.8-Flash-Next"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Qwen KV transfer requires a connector that saves and restores an atomic request-boundary checkpoint."
+  ],
+  "authors": ["yatesdr"]
+}
