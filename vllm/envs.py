@@ -202,6 +202,9 @@ if TYPE_CHECKING:
     VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = True
     VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
     VLLM_MTP_NVFP4_LM_HEAD: bool = True
+    VLLM_DS41_MARKOV_NVFP4: bool = True
+    VLLM_DS41_DRAFT_NVFP4_HEAD: bool = False
+    VLLM_DS41_ENGRAM_OVERLAP: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_HC_TP: bool = True
     VLLM_B12X_MLA_CKV_GATHER: bool = False
@@ -1689,6 +1692,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_MTP_NVFP4_LM_HEAD": lambda: bool(
         int(os.getenv("VLLM_MTP_NVFP4_LM_HEAD", "1"))
+    ),
+    # Quantize the DeepSeek V4.1 DSpark Markov transition head to NVFP4 (fits
+    # the GB10 L2; draft graph 3.57 -> 3.0 ms, acceptance unchanged).
+    "VLLM_DS41_MARKOV_NVFP4": lambda: bool(
+        int(os.getenv("VLLM_DS41_MARKOV_NVFP4", "1"))
+    ),
+    # Give the DeepSeek V4.1 DSpark drafter its own NVFP4 vocabulary head.
+    "VLLM_DS41_DRAFT_NVFP4_HEAD": lambda: bool(
+        int(os.getenv("VLLM_DS41_DRAFT_NVFP4_HEAD", "0"))
+    ),
+    # Read DeepSeek V4.1 disk Engram rows while the target graph starts.
+    "VLLM_DS41_ENGRAM_OVERLAP": lambda: bool(
+        int(os.getenv("VLLM_DS41_ENGRAM_OVERLAP", "1"))
     ),
     # Overlap independent small-batch projections in Qwen3.8-Flash-Next graphs.
     "VLLM_QWEN3_8_FLASH_NEXT_OVERLAP": lambda: bool(

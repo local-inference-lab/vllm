@@ -561,6 +561,12 @@ class ParallelEngramEmbedding(nn.Module):
         self.disk_table = table
 
     def prepare_disk(self, indices, out, num_tokens):
+        binding = self.stage_disk(indices, out, num_tokens)
+        native.run_lookup(binding, token_count=indices.shape[0], clear_tail=False)
+        self._disk_prepared_rows = indices.shape[0]
+
+    def stage_disk(self, indices, out, num_tokens):
+        """Bind a disk lookup of ``indices``; the caller runs it."""
         if self.table_memory != "disk":
             raise RuntimeError("Engram table is not disk-backed")
         self._ensure_disk_table()
@@ -584,10 +590,7 @@ class ParallelEngramEmbedding(nn.Module):
             self._disk_prepared_rows = 0
         if indices.shape[0] < self._disk_prepared_rows:
             out[indices.shape[0] : self._disk_prepared_rows].zero_()
-        native.run_lookup(
-            self._disk_binding, token_count=indices.shape[0], clear_tail=False
-        )
-        self._disk_prepared_rows = indices.shape[0]
+        return self._disk_binding
 
     def lookup_native(self, indices, out):
         if self.plan.prepared is None:
@@ -611,6 +614,26 @@ class ParallelEngramEmbedding(nn.Module):
 
     def lookup(self, indices, out):
         self.lookup_native(indices, out)
+
+
+@triton.jit
+def _wait_engram_rows(ready, expected, failed, timeout_ms):
+    """Spin until the side-stream lookup publishes this step's epoch."""
+    target = tl.load(expected)
+    timeout_ns = timeout_ms.to(tl.int64) * 1_000_000
+    start = tl.inline_asm_elementwise(
+        "mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1
+    )
+    waiting = (tl.load(ready, volatile=True) < target).to(tl.int32)
+    while waiting != 0:
+        now = tl.inline_asm_elementwise(
+            "mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1
+        )
+        if now - start > timeout_ns:
+            tl.store(failed, 1)
+            waiting = 0
+        else:
+            waiting = (tl.load(ready, volatile=True) < target).to(tl.int32)
 
 
 class Engram(nn.Module):
@@ -641,6 +664,8 @@ class Engram(nn.Module):
         )
         self._disk_prepared = False
         self._disk_prepared_tokens = 0
+        # (ready, expected, failed) epochs when disk rows arrive asynchronously.
+        self.overlap_epochs: tuple[torch.Tensor, ...] | None = None
         projection_tp = getattr(layout, "projection_tp", False)
         projection_cls = ColumnParallelLinear if projection_tp else ReplicatedLinear
         self.wkv = projection_cls(
@@ -845,7 +870,16 @@ class Engram(nn.Module):
         except BaseException:
             self.invalidate_disk_output(clear=True)
             raise
-        self._disk_prepared_tokens = hash_ids.shape[0]
+        self.finish_disk(hash_ids.shape[0])
+
+    def stage_disk(self, hash_ids, num_tokens):
+        """Bind this layer's disk lookup; ``prepare_disks`` runs a batch."""
+        self.invalidate_disk_output()
+        return self.embed_tokens.stage_disk(hash_ids, self.staged_rows, num_tokens)
+
+    def finish_disk(self, num_tokens):
+        self.embed_tokens._disk_prepared_rows = num_tokens
+        self._disk_prepared_tokens = num_tokens
         self._disk_prepared = True
 
     def prepare_dummy_output(self, num_tokens):
@@ -863,6 +897,8 @@ class Engram(nn.Module):
             )
         ):
             raise RuntimeError("Disk Engram output is not prepared")
+        if self.overlap_epochs is not None:
+            _wait_engram_rows[(1,)](*self.overlap_epochs, 5000)
         rows = tensor_model_parallel_all_reduce(self.staged_rows[: hash_ids.shape[0]])
         kv = self.wkv(rows)
         state = hidden_states.flatten(1)

@@ -28,6 +28,7 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.models.deepseek_v4_1 import l2_prefetch
 from vllm.models.deepseek_v4_1.b12x_layers import (
     B12xFP8LinearMethod,
     B12xLinearMethod,
@@ -546,6 +547,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     set_weight_attrs(param, {"allow_tp_padding": True})
         self._wo_projection_weights = None
         self._wo_plans = {}
+        self._l2pf_wo = None
+        self._l2pf_ffn = None
         for linear in (self.fused_wqa_wkv, self.wq_b):
             _native_linear(linear)
         self.rotary_emb = build_deepseek_v4_rope(
@@ -1314,6 +1317,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
         qr, kv = self.q_norm(qr), self.kv_norm(kv)
         q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
+        l2_prefetch.issue(self._l2pf_wo, rows)
         q = _rotated(
             q,
             positions,
@@ -1479,50 +1483,44 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
 
         # Reuse the shared arena only after indexing completes. Keep full-batch
         # metadata beside, not overlapping, the native attention scratch.
+        metadata_specs = self._attention_workspace_specs[mode]
         buffers = current_workspace_manager().get_simultaneous(
-            *self._attention_workspace_specs[mode],
+            *metadata_specs,
             *((spec.shape, spec.dtype) for spec in state.scratch_plan.scratch_specs()),
         )
-        swa_indices, swa_lengths, top_lengths = buffers[:3]
-        visible = main.cache_lengths if main is not None else swa.cache_lengths
-        _chunk[(rows,)](
-            swa.positions,
-            swa.req_id_per_token,
-            swa.block_table,
-            swa_indices,
-            swa_lengths,
-            top_lengths,
-            visible,
-            swa.query_start_loc,
-            swa.request_positions,
-            0,
-            swa.block_table.stride(0),
-            self.swa_cache_layer.block_size,
-            self.window_size,
-            self.swa_width,
-            self.is_draft,
-            triton.next_power_of_2(self.swa_width),
-            swa_replay_start=swa.swa_replay_start if self.is_ced_decoder else None,
-        )
-        kwargs = {}
-        metadata_count = 3
-        if main is not None:
-            main_pages = buffers[3]
-            metadata_count += 1
-            _pages[(rows, triton.cdiv(self._main_width, 128))](
-                main.req_id_per_token,
-                main.block_table,
-                main_pages,
-                0,
-                main.block_table.stride(0),
-                main.block_table.shape[1],
-                self._main_width,
-                128,
+        metadata_count = len(metadata_specs)
+        # Decode layers sharing cache groups map identical pages, so the first
+        # layer of each group keeps its metadata for the rest of the forward.
+        if mode == "decode":
+            key = (
+                id(swa),
+                id(main),
+                self.is_draft,
+                self.is_ced_decoder,
+                rows,
+                metadata_specs,
             )
+            context = get_forward_context()
+            shared = context.__dict__.setdefault("_ds41_decode_metadata", {})
+            entry = shared.get(key)
+            if entry is None or entry[0] is not swa or entry[1] is not main:
+                metadata_buffers = tuple(
+                    torch.empty(shape, dtype=dtype, device=q.device)
+                    for shape, dtype in metadata_specs
+                )
+                retain_cuda_graph_capture_resource(metadata_buffers)
+                self._write_decode_metadata(metadata_buffers, swa, main, rows)
+                entry = shared[key] = (swa, main, metadata_buffers)
+            buffers = [*entry[2], *buffers[metadata_count:]]
+        else:
+            self._write_decode_metadata(buffers, swa, main, rows)
+        swa_indices, swa_lengths, top_lengths = buffers[:3]
+        kwargs = {}
+        if main is not None:
             kwargs = dict(
                 indexed_indices=owner.topk_indices_buffer[:rows],
                 indexed_lengths=top_lengths[:rows],
-                indexed_page_table=main_pages[:rows],
+                indexed_page_table=buffers[3][:rows],
             )
         binding = mla.bind(
             plan,
@@ -1545,6 +1543,40 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             out=output,
             cache_format="deepseek_v41",
         )
+
+    def _write_decode_metadata(self, buffers, swa, main, rows):
+        swa_indices, swa_lengths, top_lengths = buffers[:3]
+        visible = main.cache_lengths if main is not None else swa.cache_lengths
+        _chunk[(rows,)](
+            swa.positions,
+            swa.req_id_per_token,
+            swa.block_table,
+            swa_indices,
+            swa_lengths,
+            top_lengths,
+            visible,
+            swa.query_start_loc,
+            swa.request_positions,
+            0,
+            swa.block_table.stride(0),
+            self.swa_cache_layer.block_size,
+            self.window_size,
+            self.swa_width,
+            self.is_draft,
+            triton.next_power_of_2(self.swa_width),
+            swa_replay_start=swa.swa_replay_start if self.is_ced_decoder else None,
+        )
+        if main is not None:
+            _pages[(rows, triton.cdiv(self._main_width, 128))](
+                main.req_id_per_token,
+                main.block_table,
+                buffers[3],
+                0,
+                main.block_table.stride(0),
+                main.block_table.shape[1],
+                self._main_width,
+                128,
+            )
 
     def setup_wo_projection(self):
         groups = self.n_local_groups
@@ -1735,6 +1767,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         )
         if local.dtype != torch.bfloat16:
             raise TypeError("V4.1 WO projection must return BF16")
+        l2_prefetch.issue(self._l2pf_ffn, rows)
         if get_tensor_model_parallel_world_size() > 1:
             local = get_tp_group().all_reduce(local)
         return local

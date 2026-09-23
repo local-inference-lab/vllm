@@ -3,11 +3,13 @@
 import copy
 import typing
 from collections.abc import Callable, Iterable
+from concurrent.futures import Future, ThreadPoolExecutor
 from itertools import islice
 
 import regex as re
 import torch
 import torch.nn as nn
+from b12x.sequence import engram as engram_native
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
@@ -62,6 +64,7 @@ from vllm.utils.b12x import (
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
+from .. import l2_prefetch
 from ..b12x_layers import B12xLinearMethod, B12xMHC
 from ..b12x_layers import B12xRMSNorm as RMSNorm
 from ..ced import ced_decoder_start, gather_rows, scatter_rows
@@ -211,6 +214,53 @@ class DeepseekV4DecoderLayer(nn.Module):
             requires_grad=False,
         )
 
+    def build_l2_prefetch(self, nxt: "DeepseekV4DecoderLayer | None") -> str:
+        """Install this layer's L2 prefetch windows; see ``l2_prefetch``."""
+        attn, device = self.attn, self.hc_attn_fn.device
+        wo = l2_prefetch.object_segments("wo", attn._wo_projection_weights)
+        attn._l2pf_wo = l2_prefetch.make_plan(wo, l2_prefetch.BUDGET_WO, device)
+        ffn = l2_prefetch.param_segments(
+            "mhc", self, ("hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base")
+        )
+        ffn += l2_prefetch.param_segments("ffn_norm", self.ffn_norm, ("weight",))
+        ffn += l2_prefetch.linear_segments("gate", self.ffn.gate)
+        shared = getattr(self.ffn, "shared_experts", None)
+        for name in ("gate_up_proj", "down_proj"):
+            ffn += l2_prefetch.linear_segments(name, getattr(shared, name, None))
+        attn._l2pf_ffn = l2_prefetch.make_plan(ffn, l2_prefetch.BUDGET_FFN, device)
+        plan_next = None
+        if nxt is not None:
+            segments = l2_prefetch.param_segments(
+                "mhc",
+                nxt,
+                ("hc_attn_fn_broadcast", "hc_attn_fn", "hc_attn_scale", "hc_attn_base"),
+            )
+            segments += l2_prefetch.param_segments(
+                "attn_norm", nxt.attn_norm, ("weight",)
+            )
+            segments += l2_prefetch.linear_segments("wqa_wkv", nxt.attn.fused_wqa_wkv)
+            segments += l2_prefetch.linear_segments("wq_b", nxt.attn.wq_b)
+            indexer = getattr(nxt.attn, "indexer", None)
+            for name in ("wq_b", "weights_proj"):
+                segments += l2_prefetch.linear_segments(
+                    f"indexer.{name}", getattr(indexer, name, None)
+                )
+            plan_next = l2_prefetch.make_plan(segments, l2_prefetch.BUDGET_NEXT, device)
+        if plan_next is not None:
+            object.__setattr__(
+                self.ffn.experts,
+                "_l2_prefetch_pre_reduce_hook",
+                lambda n, p=plan_next: l2_prefetch.issue(p, n),
+            )
+        return " | ".join(
+            f"{label} {plan.describe() if plan else '-'}"
+            for label, plan in (
+                ("WO", attn._l2pf_wo),
+                ("FFN", attn._l2pf_ffn),
+                ("NEXT", plan_next),
+            )
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -281,6 +331,27 @@ class DeepseekV4DecoderLayer(nn.Module):
         return x, residual, post_mix, res_mix, ffn_pre
 
 
+def build_l2_prefetch_plans(layers: list, first_layer: int = 0) -> bool:
+    """Install L2 prefetch windows on consecutive decoder layers.
+
+    Plans own device tables, so they are built on an eager pass before any
+    graph capture, once the WO weights have been packed. Returns whether the
+    layers need no further attempt.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    if any(layer.attn._wo_projection_weights is None for layer in layers):
+        return False
+    if not l2_prefetch.warmup():
+        return True
+    for index, layer in enumerate(layers):
+        nxt = layers[index + 1] if index + 1 < len(layers) else None
+        summary = layer.build_l2_prefetch(nxt)
+        if index in (0, len(layers) - 1):
+            logger.info("[l2_prefetch] layer %d %s", first_layer + index, summary)
+    return True
+
+
 class DeepseekV4Model(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -343,6 +414,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         self.engram_layout = EngramLayout.from_config(config)
 
+        self._l2pf_ready = False
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV4DecoderLayer(
@@ -391,6 +463,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 ),
                 persistent=False,
             )
+            # Disk rows may arrive while the target graph runs its first layer:
+            # a side stream publishes an epoch that Engram layers wait for.
+            self._engram_overlap = envs.VLLM_DS41_ENGRAM_OVERLAP
+            self._engram_epoch = 0
+            self._engram_job: Future | None = None
+            if self._engram_overlap:
+                self._engram_epochs = torch.zeros(
+                    3, dtype=torch.int64, device=caps.device
+                )
+                epochs = tuple(self._engram_epochs[i : i + 1] for i in range(3))
+                for layer in islice(self.layers, self.start_layer, self.end_layer):
+                    if getattr(layer, "engram", None) is not None:
+                        layer.engram.overlap_epochs = epochs
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
@@ -410,11 +495,46 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self._mtp_hidden_buffer = None
 
+    def _engram_stream(self) -> torch.cuda.Stream:
+        stream = getattr(self, "_engram_side_stream", None)
+        if stream is None:
+            stream = self._engram_side_stream = torch.cuda.Stream()
+        return stream
+
+    def _finish_engram_job(self) -> None:
+        job, self._engram_job = getattr(self, "_engram_job", None), None
+        if job is not None:
+            job.result()
+
+    def _start_engram_job(self, bindings, counts) -> None:
+        self._engram_epoch += 1
+        epoch = self._engram_epoch
+        self._engram_epochs[1:2].fill_(epoch)
+        ready = torch.cuda.Event()
+        ready.record()
+        stream = self._engram_stream()
+        device = torch.accelerator.current_device_index()
+
+        def lookup():
+            torch.accelerator.set_device_index(device)
+            with torch.inference_mode(), torch.cuda.stream(stream):
+                stream.wait_event(ready)
+                engram_native.run_lookups(bindings, counts, clear_tail=False)
+                self._engram_epochs[0:1].fill_(epoch)
+
+        pool = getattr(self, "_engram_pool", None)
+        if pool is None:
+            pool = self._engram_pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="ds41-engram"
+            )
+        self._engram_job = pool.submit(lookup)
+
     def prepare_disk_engram(self, input_ids, query_start_loc, lookback_token_ids):
         if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "Disk Engram preparation must run outside compile/capture"
             )
+        self._finish_engram_job()
         engrams = tuple(
             layer.engram
             for layer in islice(self.layers, self.start_layer, self.end_layer)
@@ -433,10 +553,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 lookback_token_ids,
                 hashes,
             )
-            for engram in engrams:
-                engram.prepare_disk(
+            # One batch lets the per-layer disk reads overlap on the host.
+            bindings = [
+                engram.stage_disk(
                     hashes[:, engram.layer_hash_index], self.engram_hash.num_tokens
                 )
+                for engram in engrams
+            ]
+            counts = [hashes.shape[0]] * len(bindings)
+            if self._engram_overlap:
+                self._start_engram_job(bindings, counts)
+            else:
+                engram_native.run_lookups(bindings, counts, clear_tail=False)
+            for engram in engrams:
+                engram.finish_disk(hashes.shape[0])
         except BaseException:
             for engram in engrams:
                 try:
@@ -450,6 +580,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             raise RuntimeError(
                 "Disk Engram preparation must run outside compile/capture"
             )
+        self._finish_engram_job()
+        if self._engram_overlap:
+            # Dummy rows are ready at once; order after the last side-stream
+            # publication so an older epoch cannot overwrite this one.
+            torch.cuda.current_stream().wait_stream(self._engram_stream())
+            self._engram_epoch += 1
+            self._engram_epochs[:2].fill_(self._engram_epoch)
         self.prepared_engram_hashes.fill_(-1)
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             if getattr(layer, "engram", None) is not None:
@@ -484,6 +621,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 ),
             }
         )
+
+    def _build_l2_prefetch(self) -> None:
+        layers = list(islice(self.layers, self.start_layer, self.end_layer))
+        self._l2pf_ready = build_l2_prefetch_plans(layers, self.start_layer)
 
     def forward(
         self,
@@ -579,6 +720,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             decoder_compacted = True
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
+        if l2_prefetch.ENABLED and not self._l2pf_ready:
+            self._build_l2_prefetch()
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -615,6 +758,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     )
                 aux_hidden_states.append(aux_hidden_state)
                 final_aux_recon = aux_recon
+        l2_prefetch.join()
         if layer is not None:
             # Reuse if the last layer was captured as an aux hidden state
             if self.end_layer in self.aux_hidden_state_layers:
