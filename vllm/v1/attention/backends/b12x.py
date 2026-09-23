@@ -12,7 +12,12 @@ from typing import Any, ClassVar
 
 import torch
 
-from vllm.config import VllmConfig, get_current_vllm_config
+import vllm.envs as envs
+from vllm.config import (
+    VllmConfig,
+    get_current_vllm_config,
+    get_layers_from_vllm_config,
+)
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -22,6 +27,7 @@ from vllm.utils.b12x import (
     B12xWorkload,
     PreparationResourceUnavailableError,
     get_b12x_paged_attention,
+    get_b12x_paged_decode,
     get_b12x_scratch_buffers,
 )
 from vllm.utils.math_utils import cdiv
@@ -266,6 +272,16 @@ class B12xPagedMetadata(AttentionMetadata):
     causal: bool = True
 
 
+def _group_uses_paged_decode(vllm_config: VllmConfig, layer_names: list[str]) -> bool:
+    from vllm.model_executor.layers.attention import Attention
+
+    layers = get_layers_from_vllm_config(vllm_config, Attention, layer_names)
+    return bool(layers) and all(
+        getattr(layer.impl, "_paged_decode", None) is not None
+        for layer in layers.values()
+    )
+
+
 class B12xPagedMetadataBuilder(AttentionMetadataBuilder[B12xPagedMetadata]):
     """Metadata builder for b12x.
 
@@ -294,6 +310,12 @@ class B12xPagedMetadataBuilder(AttentionMetadataBuilder[B12xPagedMetadata]):
         device: torch.device,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        # Ragged decode/verify batches (adaptive verification trims drafts on
+        # device) are graph-safe when every layer of the group runs them
+        # through paged_decode, which derives its schedule on device.
+        self.supports_varlen_decode_cudagraph = _group_uses_paged_decode(
+            vllm_config, layer_names
+        )
 
     def build(
         self,
@@ -477,8 +499,16 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         )
         self._plans: dict[_PagedPlanKey, object] = {}
         self.supports_quant_query_input = False
+        # Decode/verify (ragged, up to one verifier row block per request)
+        # through b12x.attention.paged_decode; prefill keeps the paged extend.
+        self._causal = not vllm_config.attention_config.use_non_causal
+        self._paged_decode_max_q = max(1, self._verify_q_per_req)
+        self._paged_decode_plans: dict[tuple[int, int], object] = {}
+        self._paged_decode = self._select_paged_decode(default_block_size)
+        # Noncausal (drafter) query blocks never exceed one verifier row block,
+        # so paged_decode serves them all; otherwise use the gather path.
         self._noncausal = None
-        if vllm_config.attention_config.use_non_causal:
+        if not self._causal and self._paged_decode is None:
             from vllm.v1.attention.ops.b12x_noncausal import B12xNoncausalAttention
 
             self._noncausal = B12xNoncausalAttention(self)
@@ -494,6 +524,188 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
             self.window_left,
             self._verify_q_per_req,
             self._extend_q_capacities,
+        )
+
+    def _select_paged_decode(self, page_size: int):
+        mode = envs.VLLM_B12X_PAGED_DECODE
+        decode = get_b12x_paged_decode()
+        if mode == "0" or decode is None or not decode.is_supported(self.device):
+            return None
+        fp8 = _is_b12x_fp8_kv_cache(self.kv_cache_dtype)
+        if not decode.supports(
+            num_q_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim_qk=self.head_size,
+            head_dim_vo=self.output_head_size,
+            page_size=page_size,
+            kv_dtype=self.kv_torch_dtype,
+            max_q_per_req=self._paged_decode_max_q,
+            window_left=self.window_left,
+            causal=self._causal,
+            has_sinks=self._sinks_source is not None,
+        ):
+            return None
+        # "auto": layers the paged kernels serve only through extend for
+        # ragged verify (unequal Q/K and V head dims) or not at all
+        # (non-causal FP8 KV); other layers keep their existing path.
+        if mode == "auto" and not (
+            self.head_size != self.output_head_size or (not self._causal and fp8)
+        ):
+            return None
+        logger.info_once(
+            "b12x paged_decode serves decode/verify for q_heads=%d kv_heads=%d "
+            "head_dim_qk=%d head_dim_vo=%d window_left=%d causal=%s.",
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_size,
+            self.output_head_size,
+            self.window_left,
+            self._causal,
+        )
+        return decode
+
+    def _paged_decode_plan(self, batch: int, page_size: int):
+        decode = self._paged_decode
+        return decode.plan(
+            decode.Caps(
+                device=self.device,
+                num_q_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim_qk=self.head_size,
+                head_dim_vo=self.output_head_size,
+                page_size=page_size,
+                max_batch=batch,
+                max_q_per_req=self._paged_decode_max_q,
+                kv_dtype=self.kv_torch_dtype,
+                window_left=self.window_left,
+                causal=self._causal,
+                has_sinks=self._sinks_source is not None,
+            )
+        )
+
+    def _paged_decode_prepared_call(
+        self, owner: torch.nn.Module, state: Any, plan, batch: int, page_size: int
+    ):
+        from b12x.preparation import PreparedCall
+
+        key_cache, value_cache = self._kv_cache_views(owner.kv_cache)
+        total_q = batch * self._paged_decode_max_q
+        scratch = tuple(
+            torch.empty(spec.shape, dtype=spec.dtype, device=self.device)
+            for spec in plan.scratch_specs()
+        )
+        q = torch.empty_strided(
+            (total_q, self.num_heads, self.head_size),
+            self._query_stride,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        output = torch.empty(
+            (total_q, self.num_heads, self.output_head_size),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        page_table = torch.zeros(
+            (batch, self._max_page_table_widths[page_size]),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        cache_seqlens = torch.full(
+            (batch,), page_size, dtype=torch.int32, device=self.device
+        )
+        cu_seqlens_q = torch.arange(
+            0,
+            total_q + 1,
+            self._paged_decode_max_q,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        k_descale, v_descale = self._paged_decode_descales(owner)
+        binding = state.bind(
+            plan=plan,
+            scratch=scratch,
+            q=q,
+            k_cache=key_cache,
+            v_cache=value_cache,
+            output=output,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            attention_sink_bias=self.sinks,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+        return PreparedCall(run=lambda: state.run(binding), produce=lambda: q.zero_())
+
+    def _paged_decode_units(self, layer, page_size: int, batches):
+        plans = {}
+        requests = []
+        for batch in batches:
+            plan = self._paged_decode_plan(batch, page_size)
+            plans[(page_size, batch)] = plan
+            call = (
+                lambda state, plan=plan, batch=batch: self._paged_decode_prepared_call(
+                    layer, state, plan, batch, page_size
+                )
+            )
+            requests.append(
+                plan.request(
+                    name=f"attention.paged_decode.{id(layer):x}.p{page_size}.b{batch}",
+                    prepare_call=call,
+                    benchmark_call=call,
+                )
+            )
+        self._paged_decode_plans = plans
+        return requests
+
+    def _paged_decode_descales(self, layer):
+        if not _is_b12x_fp8_kv_cache(self.kv_cache_dtype):
+            return None, None
+        # Per-layer dequant scales, read by the kernel as one value.
+        return layer._k_scale, layer._v_scale
+
+    def _forward_paged_decode(
+        self, layer, q, out, key_cache, value_cache, attn_metadata, page_size
+    ) -> None:
+        page_table = _ensure_i32_contiguous(attn_metadata.block_table, "block_table")
+        cache_seqlens = _ensure_i32_contiguous(attn_metadata.seq_lens, "seq_lens")
+        cu_seqlens_q = _ensure_i32_contiguous(
+            attn_metadata.query_start_loc, "query_start_loc"
+        )
+        num_reqs = int(cache_seqlens.shape[0])
+        bucket = min(
+            (
+                b
+                for (p, b) in self._paged_decode_plans
+                if p == page_size and b >= num_reqs
+            ),
+            default=None,
+        )
+        if bucket is None:
+            # Undeclared by preparation (e.g. a profiling shape): declare it
+            # with its default configuration, materialized on first use.
+            bucket = num_reqs
+            self._paged_decode_plans[(page_size, bucket)] = self._paged_decode_plan(
+                bucket, page_size
+            )
+        plan = self._paged_decode_plans[(page_size, bucket)]
+        k_descale, v_descale = self._paged_decode_descales(layer)
+        decode = self._paged_decode
+        decode.run(
+            decode.bind(
+                plan,
+                scratch=tuple(get_b12x_scratch_buffers(plan)),
+                q=q,
+                k_cache=key_cache,
+                v_cache=value_cache,
+                output=out,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                cu_seqlens_q=cu_seqlens_q,
+                attention_sink_bias=self.sinks,
+                k_descale=k_descale,
+                v_descale=v_descale,
+            )
         )
 
     def _request_name(self, owner: object, key: _PagedPlanKey) -> str:
@@ -725,7 +937,9 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
                 | {self._max_num_seqs}
             )
         )
-        for batch in batches:
+        if self._paged_decode is not None:
+            requests.extend(self._paged_decode_units(layer, page_size, batches))
+        for batch in batches if self._paged_decode is None else ():
             key = (
                 "decode",
                 page_size,
@@ -796,7 +1010,8 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
                         ),
                     )
                 )
-        for batch in range(1, self._max_num_seqs + 1):
+        extend_batches = range(1, self._max_num_seqs + 1) if self._causal else ()
+        for batch in extend_batches:
             for total_q in self._extend_q_capacities:
                 if batch >= total_q:
                     continue
@@ -1108,6 +1323,14 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
 
         key_cache, value_cache = self._kv_cache_views(kv_cache)
         page_size = _kv_page_size(key_cache, value_cache)
+        if (
+            self._paged_decode is not None
+            and int(attn_metadata.max_query_len) <= self._paged_decode_max_q
+        ):
+            self._forward_paged_decode(
+                layer, q, out, key_cache, value_cache, attn_metadata, page_size
+            )
+            return output
         if not attn_metadata.causal:
             if self._noncausal is None:
                 raise ValueError("B12X noncausal attention was not configured.")
@@ -1172,6 +1395,23 @@ class B12xPagedAttentionImpl(AttentionImpl[B12xPagedMetadata]):
         slot_mapping: torch.Tensor,
     ) -> None:
         if kv_cache.numel() == 0:
+            return
+        if self._paged_decode is not None:
+            # Layers paged_decode serves append through its prepared plan.
+            if not self._paged_decode_plans:
+                raise RuntimeError("b12x paged_decode KV write before preparation")
+            key_cache, value_cache = self._kv_cache_views(kv_cache)
+            k_scale, v_scale = self._paged_decode_descales(layer)
+            self._paged_decode.write_kv(
+                next(iter(self._paged_decode_plans.values())),
+                key=key,
+                value=value,
+                k_cache=key_cache,
+                v_cache=value_cache,
+                slot_mapping=slot_mapping,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
             return
         if self.head_size != self.output_head_size:
             from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
