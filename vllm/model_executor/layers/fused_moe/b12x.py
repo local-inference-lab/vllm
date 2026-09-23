@@ -46,6 +46,7 @@ _B12X_MOE_MODES: dict[
 ] = {
     ("mxfp4", "mxfp8"): ("w4a8_mx", "fp4_e8m0_k32", "w31"),
     ("mxfp4", None): ("w4a16", "fp4_e8m0_k32", "w31"),
+    ("exl3", None): ("w4a16", "exl3", "w31"),
     ("nvfp4", "nvfp4"): ("nvfp4", "modelopt_nvfp4", "w31"),
     ("nvfp4", "mxfp8"): ("w4a8_nvfp4", "modelopt_nvfp4", "w31"),
     ("nvfp4", None): ("w4a16", "modelopt_nvfp4", "w31"),
@@ -234,7 +235,7 @@ def _normalize_expert_scale(scale: torch.Tensor) -> torch.Tensor:
 
 
 class B12xExperts(mk.FusedMoEExpertsModular):
-    """FP4 MoE experts backed by the b12x SM12x planned API."""
+    """FP4 and EXL3 MoE experts backed by the b12x SM12x planned API."""
 
     def __init__(
         self,
@@ -242,9 +243,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         quant_config: FusedMoEQuantConfig,
     ):
         super().__init__(moe_config, quant_config)
-        if quant_config.weight_quant_dtype not in ("mxfp4", "nvfp4"):
+        if quant_config.weight_quant_dtype not in ("mxfp4", "nvfp4", "exl3"):
             raise ValueError(
-                "b12x MoE requires MXFP4 or NVFP4 weights, got "
+                "b12x MoE requires MXFP4, NVFP4 or EXL3 weights, got "
                 f"{quant_config.weight_quant_dtype}"
             )
         scheme = (
@@ -436,6 +437,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         return prepared
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self._source_format == "exl3":
+            raise RuntimeError("EXL3 weights require install_prepared_experts")
         self._apply_router_weight_on_input = layer.apply_router_weight_on_input
         if self._apply_router_weight_on_input and self._quant_mode != "w4a16":
             raise ValueError(
@@ -457,6 +460,33 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         _register_b12x_moe_output_collective(
             layer, hidden_size=int(prepared.hidden_size)
         )
+
+    def install_prepared_experts(self, layer: torch.nn.Module, prepared: Any) -> None:
+        """Use a prepared EXL3 package without repacking it as ordinary FP4."""
+        fused_moe = _require_b12x_fused_moe()
+        if (
+            self._source_format != "exl3"
+            or not isinstance(prepared, fused_moe.PreparedExperts)
+            or not isinstance(prepared.plan.source, fused_moe.Exl3Source)
+        ):
+            raise TypeError("EXL3 installation requires a B12X prepared EXL3 package")
+        if (
+            prepared.num_experts != self.moe_config.num_experts
+            or prepared.hidden_size != self.moe_config.hidden_dim
+            or prepared.intermediate_size
+            > self.moe_config.intermediate_size_per_partition
+            or prepared.plan.activation.io_dtype != self.moe_config.in_dtype
+            or prepared.plan.activation.nonlinearity
+            != _b12x_activation_name(layer.activation)
+            or layer.apply_router_weight_on_input
+        ):
+            raise ValueError(
+                "Prepared EXL3 geometry, activation or routing does not match the layer"
+            )
+        self._apply_router_weight_on_input = False
+        self._reuse_prepared_storage(layer, prepared)
+        set_b12x_preparation_provider(layer, self)
+        _register_b12x_moe_output_collective(layer, hidden_size=prepared.hidden_size)
 
     @staticmethod
     def is_supported_config(
