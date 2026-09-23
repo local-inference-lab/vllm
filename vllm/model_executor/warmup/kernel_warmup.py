@@ -17,7 +17,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
+    read_flashinfer_autotune_cache,
     resolve_flashinfer_autotune_file,
+    save_flashinfer_autotune_cache,
     write_flashinfer_autotune_cache,
 )
 from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
@@ -405,9 +407,8 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     # during synchronized autotuning.
     # Read cached autotune results and broadcast to all ranks.
     cached_results: bytes | None = None
-    if is_leader and cache_path.exists():
-        with open(cache_path, "rb") as f:
-            cached_results = f.read()
+    if is_leader:
+        cached_results = read_flashinfer_autotune_cache(cache_path)
     cached_results = world.broadcast_object(cached_results, src=0)
     if cached_results is not None:
         write_flashinfer_autotune_cache(cache_path, cached_results)
@@ -437,4 +438,4 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     if world.world_size > 1:
         world.barrier()
     if is_leader:
-        tuner.save_configs(str(cache_path))
+        save_flashinfer_autotune_cache(cache_path, tuner)
