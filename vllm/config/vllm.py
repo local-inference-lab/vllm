@@ -1244,11 +1244,23 @@ class VllmConfig:
         model_type = getattr(
             getattr(self.model_config, "hf_text_config", None), "model_type", None
         )
-        if model_type in (
-            "qwen3_8_flash_next_text",
-            "qwen3_8_flash_next",
-            "qwen4_exp_text",
-            "qwen4_exp",
+        # Request-boundary checkpointing cannot engage under an explicit
+        # aligned-retention policy (use_request_boundary_checkpoints requires
+        # "auto" or "request_boundaries"), so the atomic-adapter requirement
+        # applies only when the rail is not explicitly disabled. Absent
+        # cache_config (synthetic configs) keeps the requirement enforced.
+        policy = getattr(
+            getattr(self, "cache_config", None), "recurrent_checkpoint_policy", None
+        )
+        if (
+            model_type
+            in (
+                "qwen3_8_flash_next_text",
+                "qwen3_8_flash_next",
+                "qwen4_exp_text",
+                "qwen4_exp",
+            )
+            and policy != "aligned"
         ):
             from vllm.distributed.kv_transfer.kv_connector.factory import (
                 KVConnectorFactory,

@@ -105,6 +105,7 @@ def _build_config(
     enable_sleep_mode: bool = False,
     enable_cumem_allocator: bool = False,
     model_type: str | None = None,
+    recurrent_checkpoint_policy: str | None = None,
 ) -> VllmConfig:
     """Build a model-free config for KV-transfer compatibility checks.
 
@@ -114,6 +115,8 @@ def _build_config(
         enable_sleep_mode: Whether sleep mode is enabled.
         enable_cumem_allocator: Whether the cuMem allocator is enabled.
         model_type: Optional Hugging Face model type.
+        recurrent_checkpoint_policy: Optional explicit retention policy;
+            "aligned" disables request-boundary checkpointing entirely.
 
     Returns:
         A VllmConfig suitable for exercising KV-transfer compatibility checks.
@@ -138,6 +141,9 @@ def _build_config(
         enable_sleep_mode=enable_sleep_mode,
         enable_cumem_allocator=(enable_cumem_allocator or enable_sleep_mode),
         hf_text_config=SimpleNamespace(model_type=model_type),
+    )
+    cfg.cache_config = SimpleNamespace(
+        recurrent_checkpoint_policy=recurrent_checkpoint_policy
     )
     cfg._verify_kv_transfer_compat()
     return cfg
@@ -164,6 +170,47 @@ def test_qwen_qsa_requires_atomic_checkpoint_connector(
     else:
         with pytest.raises(ValueError, match="atomic request-boundary"):
             _build_config(kv_connector="stub", model_type="qwen3_8_flash_next_text")
+
+
+@pytest.mark.parametrize(
+    "policy,raises",
+    [
+        # Explicit aligned retention cannot enable request-boundary
+        # checkpointing, so no atomic adapter is required.
+        ("aligned", False),
+        ("request_boundaries", True),
+        ("auto", True),
+        # Unset (synthetic configs without a cache_config default) stays
+        # enforced.
+        (None, True),
+    ],
+)
+def test_qwen_qsa_atomic_requirement_follows_policy(monkeypatch, policy, raises):
+    class _StubConnector:
+        @classmethod
+        def supports_request_boundary_checkpoints(cls, config):
+            del config
+            return False
+
+    monkeypatch.setattr(
+        KVConnectorFactory,
+        "get_connector_class",
+        lambda config: _StubConnector,
+    )
+
+    if raises:
+        with pytest.raises(ValueError, match="atomic request-boundary"):
+            _build_config(
+                kv_connector="stub",
+                model_type="qwen3_8_flash_next_text",
+                recurrent_checkpoint_policy=policy,
+            )
+    else:
+        _build_config(
+            kv_connector="stub",
+            model_type="qwen3_8_flash_next_text",
+            recurrent_checkpoint_policy=policy,
+        )
 
 
 @pytest.mark.parametrize(
