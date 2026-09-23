@@ -1240,9 +1240,8 @@ class VllmConfig:
         # registrations pointing at stale physical pages after any remap,
         # producing RDMA failures like IBV_WC_REM_ACCESS_ERR /
         # NIXL_ERR_REMOTE_DISCONNECT at the first inter-node KV transfer.
-        # We can't enumerate every in-tree and out-of-tree connector that
-        # pins memory, so we conservatively reject the combination whenever
-        # any KV connector is configured.
+        # Unknown transports remain rejected unless the connector explicitly
+        # declares a configuration that does not retain GPU page registrations.
         #
         # CuMem allocator is exempt: CuMemAllocator.use_memory_pool toggles
         # expandable_segments off around its pool (see #40812), so the KV
@@ -1253,6 +1252,8 @@ class VllmConfig:
         ):
             return
         if self.model_config is not None and (self.model_config.enable_cumem_allocator):
+            return
+        if self._connector_supports_vmm_safe_transfers():
             return
 
         # Engine-driven LMCache MP transport does not pin or register KV
@@ -1277,8 +1278,25 @@ class VllmConfig:
             "unset expandable_segments:True or enable the cumem allocator "
             "(sleep mode does this automatically and also "
             "routes KV allocations through CuMemAllocator's pool, where "
-            "expandable_segments is automatically disabled)."
+            "expandable_segments is automatically disabled), or use a connector "
+            "that declares SupportsVmmSafeTransfers."
         )
+
+    def _connector_supports_vmm_safe_transfers(self) -> bool:
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory,
+        )
+        from vllm.distributed.kv_transfer.kv_connector.v1 import (
+            supports_vmm_safe_transfers,
+        )
+
+        try:
+            connector_cls = KVConnectorFactory.get_connector_class(
+                self.kv_transfer_config
+            )
+        except (AttributeError, ImportError, TypeError, ValueError):
+            return False
+        return supports_vmm_safe_transfers(connector_cls, self.kv_transfer_config)
 
     def _verify_sampling_replay_config(self) -> None:
         model_config = self.model_config

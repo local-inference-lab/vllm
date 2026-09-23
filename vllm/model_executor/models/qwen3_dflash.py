@@ -4,6 +4,7 @@
 import dataclasses
 import io
 from collections.abc import Iterable
+from typing import Any, ClassVar
 
 import torch
 import torch.nn.functional as F
@@ -11,33 +12,40 @@ from torch import nn
 from transformers import Qwen3Config
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.quantization.modelopt import ModelOptLinearMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Static
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.rotary_embedding.compact import CompactRotaryEmbedding
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.parameter import copy_tensor_parallel_shard
 from vllm.model_executor.weight_transfer import flush_weight_transfers
 from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
+from vllm.utils.math_utils import round_up
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -63,6 +71,30 @@ logger = init_logger(__name__)
 
 
 _SLIDING_ATTENTION = "sliding_attention"
+_STREAMED_AUX_MIN_TOKENS = 1024
+
+
+def _enable_dflash_tp_padding(layer: nn.Module) -> None:
+    """Zero checkpoint-absent tails before optional online MXFP8 conversion."""
+    from vllm.model_executor.layers.quantization.online.mxfp8 import (
+        Mxfp8OnlineLinearMethod,
+    )
+
+    if not isinstance(
+        layer.quant_method, (UnquantizedLinearMethod, Mxfp8OnlineLinearMethod)
+    ):
+        raise ValueError(
+            "DFlash/DSpark TP padding supports BF16/FP16 checkpoints with "
+            "unquantized or online MXFP8 linear weights"
+        )
+    for parameter in layer.parameters(recurse=False):
+        parameter.allow_tp_padding = True
+
+
+def _dflash_padded_width(width: int, tp: int) -> int:
+    # Whole 128-channel tiles preserve MXFP8 block boundaries and avoid extra
+    # activation-padding copies in the W8A16 projection kernels.
+    return width if width % tp == 0 else round_up(width, tp * 128)
 
 
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
@@ -162,6 +194,8 @@ def _resolve_layer_attention(
 class DFlashAttention(Attention):
     """Attention whose small draft KV is replicated across DCP ranks."""
 
+    dcp_replicated: ClassVar[bool] = True
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         dcp_replicated = vllm_config.parallel_config.decode_context_parallel_size > 1
         if self.sliding_window is not None:
@@ -214,6 +248,7 @@ class DFlashQwen3Attention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
+        pad_heads: bool = False,
     ) -> None:
         super().__init__()
         self.layer_name = prefix
@@ -249,13 +284,33 @@ class DFlashQwen3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        if pad_heads:
+            _enable_dflash_tp_padding(self.qkv_proj)
+            _enable_dflash_tp_padding(self.o_proj)
 
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            max_position=max_position,
-            is_neox_style=is_neox_style,
-            rope_parameters=rope_parameters,
-        )
+        if envs.VLLM_DFLASH_COMPACT_ROPE:
+            params = rope_parameters or {}
+            if params.get("rope_type", "default") != "default" or set(params) - {
+                "rope_type",
+                "rope_theta",
+            }:
+                raise ValueError("DFlash compact RoPE requires unscaled full-head RoPE")
+            self.rotary_emb = CompactRotaryEmbedding(
+                self.head_dim,
+                self.head_dim,
+                max_position,
+                params.get("rope_theta", 10000),
+                is_neox_style,
+                torch.get_default_dtype(),
+                capacity=get_current_vllm_config().scheduler_config.max_num_batched_tokens,
+            )
+        else:
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                max_position=max_position,
+                is_neox_style=is_neox_style,
+                rope_parameters=rope_parameters,
+            )
 
         self.attention_sink_bias = (
             torch.nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
@@ -360,14 +415,24 @@ class DFlashQwen3DecoderLayer(nn.Module):
             rope_parameters=config.rope_parameters,
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
+            pad_heads=config.num_attention_heads
+            != getattr(
+                config, "original_num_attention_heads", config.num_attention_heads
+            ),
+        )
+        intermediate_size = _dflash_padded_width(
+            config.intermediate_size, get_tensor_model_parallel_world_size()
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
-            intermediate_size=config.intermediate_size,
+            intermediate_size=intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
         )
+        if intermediate_size != config.intermediate_size:
+            _enable_dflash_tp_padding(self.mlp.gate_up_proj)
+            _enable_dflash_tp_padding(self.mlp.down_proj)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -476,17 +541,87 @@ class DFlashQwen3Model(nn.Module):
             ]
         )
         if self.use_aux_hidden_state:
-            self.fc = ReplicatedLinear(
+            if (
+                envs.VLLM_DFLASH_AUX_MXFP8_STREAMING
+                and envs.VLLM_DFLASH_AUX_BF16_STAGING
+            ):
+                raise ValueError("Select either MXFP8 or BF16 auxiliary input staging")
+            fc_cls = ReplicatedLinear
+            fc_kwargs = {}
+            fc_output_size = self.config.hidden_size
+            if envs.VLLM_DFLASH_SHARD_AUX_PROJECTION:
+                fc_cls = ColumnParallelLinear
+                fc_kwargs["gather_output"] = True
+                fc_output_size = _dflash_padded_width(
+                    fc_output_size, get_tensor_model_parallel_world_size()
+                )
+            self.fc = fc_cls(
                 input_size=_get_dflash_fc_input_size(
                     vllm_config,
                 ),
-                output_size=self.config.hidden_size,
+                output_size=fc_output_size,
                 bias=False,
                 params_dtype=vllm_config.model_config.dtype,
                 quant_config=self.quant_config,
                 prefix=maybe_prefix(prefix, "fc"),
                 return_bias=False,
+                **fc_kwargs,
             )
+            if fc_output_size != self.config.hidden_size:
+                _enable_dflash_tp_padding(self.fc)
+            if envs.VLLM_DFLASH_AUX_MXFP8_STREAMING:
+                from vllm.model_executor.kernels.linear.mxfp8.b12x import (
+                    B12xMxfp8LinearKernel,
+                    Mxfp8LinearLayerConfig,
+                )
+                from vllm.model_executor.layers.quantization.online.mxfp8 import (
+                    Mxfp8OnlineLinearMethod,
+                )
+
+                method = self.fc.quant_method
+                if not isinstance(method, Mxfp8OnlineLinearMethod):
+                    raise ValueError(
+                        "DFlash MXFP8 staging requires online MXFP8 FC weights"
+                    )
+                method.kernel = B12xMxfp8LinearKernel(Mxfp8LinearLayerConfig())
+                method.use_a16 = False
+                # The wrapper prepares small FC calls separately from staged
+                # prefill, so their activation scratch is not reserved twice.
+                self.fc.b12x_preparation_suppressed = True
+            elif envs.VLLM_DFLASH_AUX_BF16_STAGING:
+                from vllm.model_executor.kernels.linear.mxfp8.marlin import (
+                    MarlinMxfp8LinearKernel,
+                    Mxfp8LinearLayerConfig,
+                )
+                from vllm.model_executor.layers.quantization.online.mxfp8 import (
+                    Mxfp8OnlineLinearMethod,
+                )
+
+                method = self.fc.quant_method
+                if not isinstance(method, Mxfp8OnlineLinearMethod):
+                    raise ValueError(
+                        "DFlash BF16 staging requires online MXFP8 FC weights"
+                    )
+                # Preserve BF16 activations through the same W8A16 linear path
+                # used without staging; weight sharding does not quantize inputs.
+                method.kernel = MarlinMxfp8LinearKernel(Mxfp8LinearLayerConfig())
+        self._aux_projection_tp_size = (
+            get_tensor_model_parallel_world_size()
+            if envs.VLLM_DFLASH_SHARD_AUX_PROJECTION
+            else 1
+        )
+        self._streamed_aux_layer_ids = tuple(
+            get_eagle3_aux_layers_from_config(vllm_config.speculative_config) or ()
+        )
+        self._target_hidden_size = int(
+            getattr(self.config, "target_hidden_size", None) or self.config.hidden_size
+        )
+        self._streamed_aux_accumulator = None
+        self._streamed_aux_scratch = None
+        self._streamed_aux_tokens = self._streamed_aux_index = 0
+        self._streamed_aux_generation = self._completed_stream_generation = 0
+        self._consumed_stream_generation = 0
+        self._completed_stream_result = None
         self.hidden_norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
@@ -511,6 +646,140 @@ class DFlashQwen3Model(nn.Module):
             is_mask = (input_ids == self.mask_token_id).unsqueeze(-1)
             embeds = torch.where(is_mask, self.mask_embedding.to(embeds.dtype), embeds)
         return embeds
+
+    def bind_auxiliary_stream(
+        self,
+        accumulator: Any,
+        scratch: torch.Tensor,
+    ) -> None:
+        """Bind retained storage for large target auxiliary-state projections."""
+        if scratch.ndim != 2 or int(scratch.shape[1]) != int(self.config.hidden_size):
+            raise ValueError(
+                "DFlash auxiliary output scratch must have shape "
+                f"[max_tokens,{self.config.hidden_size}], got {tuple(scratch.shape)}"
+            )
+        if int(scratch.shape[1]) < self._target_hidden_size:
+            raise ValueError(
+                "DFlash auxiliary output scratch also stages target residual "
+                f"sums and must be at least {self._target_hidden_size} wide, "
+                f"got {scratch.shape[1]}"
+            )
+        self._streamed_aux_accumulator = accumulator
+        self._streamed_aux_scratch = scratch
+
+    def can_stream_auxiliary_states(
+        self,
+        layer_ids: tuple[int, ...],
+        hidden_states: torch.Tensor,
+    ) -> bool:
+        """Return whether a target forward can release auxiliary states early."""
+        accumulator = self._streamed_aux_accumulator
+        scratch = self._streamed_aux_scratch
+        if accumulator is None or scratch is None or not self.use_aux_hidden_state:
+            return False
+        if hidden_states.ndim != 2 or hidden_states.shape[0] < _STREAMED_AUX_MIN_TOKENS:
+            return False
+        if tuple(layer_ids) != self._streamed_aux_layer_ids:
+            return False
+        if hidden_states.shape[1] * len(layer_ids) != accumulator.input_width:
+            return False
+        if hidden_states.shape[0] > accumulator.max_tokens:
+            return False
+        if (
+            hidden_states.dtype != scratch.dtype
+            or hidden_states.device != scratch.device
+        ):
+            return False
+        return not (hidden_states.is_cuda and torch.cuda.is_current_stream_capturing())
+
+    def begin_auxiliary_stream(self, hidden_states: torch.Tensor) -> None:
+        """Start one ordered sequence of target auxiliary-state slices."""
+        if not self.can_stream_auxiliary_states(
+            self._streamed_aux_layer_ids, hidden_states
+        ):
+            raise RuntimeError(
+                "DFlash auxiliary streaming was started for an unsupported geometry"
+            )
+        self._streamed_aux_tokens = int(hidden_states.shape[0])
+        self._streamed_aux_index = 0
+        self._streamed_aux_generation += 1
+        self._completed_stream_result = None
+        self._streamed_aux_accumulator.begin(self._streamed_aux_tokens)
+        logger.info_once(
+            "DFlash staged auxiliary projection is active: "
+            "tokens=%d target_width=%d slices=%d.",
+            self._streamed_aux_tokens,
+            self._target_hidden_size,
+            len(self._streamed_aux_layer_ids),
+        )
+
+    def accumulate_auxiliary_state(
+        self,
+        primary: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> None:
+        """Store one complete target state in the retained linear input."""
+        if self._streamed_aux_index >= len(self._streamed_aux_layer_ids):
+            raise RuntimeError("DFlash received too many auxiliary states")
+        expected_shape = (self._streamed_aux_tokens, self._target_hidden_size)
+        if tuple(primary.shape) != expected_shape:
+            raise ValueError(
+                "DFlash auxiliary state shape changed during streaming: "
+                f"got={tuple(primary.shape)}, expected={expected_shape}"
+            )
+        source = primary
+        if residual is not None:
+            if tuple(residual.shape) != expected_shape:
+                raise ValueError(
+                    "DFlash auxiliary residual shape changed during streaming: "
+                    f"got={tuple(residual.shape)}, expected={expected_shape}"
+                )
+            assert self._streamed_aux_scratch is not None
+            source = self._streamed_aux_scratch[
+                : self._streamed_aux_tokens, : self._target_hidden_size
+            ]
+            torch.add(primary, residual, out=source)
+        self._streamed_aux_accumulator.append(source)
+        self._streamed_aux_index += 1
+
+    def finish_auxiliary_stream(self) -> torch.Tensor:
+        """Project the assembled input with the draft's FC weights."""
+        expected = len(self._streamed_aux_layer_ids)
+        if self._streamed_aux_index != expected:
+            raise RuntimeError(
+                "DFlash auxiliary stream ended before every configured state "
+                f"was received: received={self._streamed_aux_index}, "
+                f"expected={expected}"
+            )
+        output = self._gather_auxiliary_projection(
+            self._streamed_aux_accumulator.finish()
+        )
+        self._completed_stream_generation = self._streamed_aux_generation
+        self._completed_stream_result = output
+        return output
+
+    def _gather_auxiliary_projection(self, output: torch.Tensor) -> torch.Tensor:
+        if getattr(self, "_aux_projection_tp_size", 1) > 1:
+            output = tensor_model_parallel_all_gather(output, dim=-1)
+        return output[..., : self.config.hidden_size]
+
+    def is_streamed_context_states(self, states: list[torch.Tensor]) -> bool:
+        """Claim one completed streamed projection exactly once."""
+        if len(states) != 1 or self._completed_stream_result is None:
+            return False
+        candidate = states[0]
+        expected = self._completed_stream_result
+        matches = (
+            self._completed_stream_generation > self._consumed_stream_generation
+            and candidate is expected
+            and candidate.shape == expected.shape
+            and candidate.dtype == expected.dtype
+            and candidate.device == expected.device
+            and candidate.data_ptr() == expected.data_ptr()
+        )
+        if matches:
+            self._consumed_stream_generation = self._completed_stream_generation
+        return matches
 
     def _build_context_kv_buffers(
         self,
@@ -733,8 +1002,12 @@ class DFlashQwen3Model(nn.Module):
         # View as [L * num_ctx, kv] so RoPE sees one big batch (no copy).
         # In-place RoPE: pass K as the "query" arg with key=None.
         all_k_flat = all_k_normed.view(L * num_ctx, kv)
-        positions_repeated = context_positions.repeat(L)
-        cos_sin_cache = self._rope_cos_sin_cache
+        rotary = self.layers[0].self_attn.rotary_emb
+        if isinstance(rotary, CompactRotaryEmbedding):
+            rope_positions, cos_sin_cache = rotary.materialize(context_positions)
+        else:
+            rope_positions, cos_sin_cache = context_positions, self._rope_cos_sin_cache
+        positions_repeated = rope_positions.repeat(L)
         if cos_sin_cache.dtype != all_k_flat.dtype:
             cos_sin_cache = cos_sin_cache.to(dtype=all_k_flat.dtype)
         ops.rotary_embedding(
@@ -751,7 +1024,7 @@ class DFlashQwen3Model(nn.Module):
 
         # --- Per-layer cache insert ---
         all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
-        per_layer = isinstance(context_slot_mapping, (list, tuple))
+        per_layer = isinstance(context_slot_mapping, list | tuple)
         for i in range(L):
             slot_mapping = (
                 context_slot_mapping[i] if per_layer else context_slot_mapping
@@ -798,10 +1071,17 @@ class DFlashQwen3Model(nn.Module):
             if "attention_sink_bias" in name:
                 # Sink bias is per-head; shard it across TP ranks like the
                 # attention heads themselves.
-                heads_per_rank = loaded_weight.shape[0] // tp_size
-                loaded_weight = loaded_weight.narrow(
-                    0, tp_rank * heads_per_rank, heads_per_rank
+                heads_per_rank = self.config.num_attention_heads // tp_size
+                shard = loaded_weight.new_empty(heads_per_rank)
+                copy_tensor_parallel_shard(
+                    shard,
+                    loaded_weight,
+                    0,
+                    tp_rank * heads_per_rank,
+                    heads_per_rank,
+                    allow_padding=True,
                 )
+                loaded_weight = shard
             yield name, loaded_weight
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -918,10 +1198,100 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                 "means the draft model's target_layer_ids reference layers that "
                 "do not exist in the target model (incompatible draft/target pair)."
             )
-        result = self.model.fc(hidden_states)
+        accumulator = self.model._streamed_aux_accumulator
+        if (
+            accumulator is not None
+            and hidden_states.shape[0] >= _STREAMED_AUX_MIN_TOKENS
+        ):
+            # Large non-streamed calls, including graph capture, use the same
+            # staged buffers. Only smaller calls need a separate linear plan.
+            accumulator.begin(hidden_states.shape[0])
+            for source in hidden_states.split(accumulator.slice_width, dim=-1):
+                accumulator.append(source)
+            result = self.model._gather_auxiliary_projection(accumulator.finish())
+        else:
+            result = self.model.fc(hidden_states)
+            result = result[..., : self.model.config.hidden_size]
         if needs_squeeze:
             result = result.squeeze(0)
         return result
+
+    def bind_target_auxiliary_stream(self, target_model, scratch) -> None:
+        """Stage large Kimi auxiliary states with the selected input precision."""
+        bf16_staging = envs.VLLM_DFLASH_AUX_BF16_STAGING
+        if not envs.VLLM_DFLASH_AUX_MXFP8_STREAMING and not bf16_staging:
+            return
+        from vllm.model_executor.kernels.linear.mxfp8.staged import (
+            B12xMxfp8InputAccumulator,
+        )
+        from vllm.utils.b12x import set_b12x_preparation_provider
+
+        language_model = (
+            target_model.get_language_model()
+            if hasattr(target_model, "get_language_model")
+            else target_model
+        )
+        target = getattr(language_model, "model", language_model)
+        setter = getattr(target, "set_aux_hidden_state_projector", None)
+        if not callable(setter) or not self.model.use_aux_hidden_state:
+            raise ValueError(
+                "DFlash auxiliary staging requires a target auxiliary-state hook"
+            )
+        fc = self.model.fc
+        if bf16_staging:
+            from vllm.model_executor.kernels.linear.bf16_staging import (
+                Bf16InputAccumulator,
+            )
+
+            accumulator = Bf16InputAccumulator(
+                fc, scratch, self.model._target_hidden_size
+            )
+            self.model.bind_auxiliary_stream(accumulator, scratch)
+            setter(self.model)
+            logger.info_once("DFlash auxiliary projection retains BF16 input slices.")
+            return
+        local_width = fc.b12x_mxfp8_packed_weight.out_features
+        output = scratch
+        if local_width != scratch.shape[1]:
+            output = torch.empty(
+                (scratch.shape[0], local_width),
+                dtype=scratch.dtype,
+                device=scratch.device,
+            )
+        accumulator = B12xMxfp8InputAccumulator(
+            fc, output, self.model._target_hidden_size
+        )
+        self.model.bind_auxiliary_stream(accumulator, scratch)
+        setter(self.model)
+        set_b12x_preparation_provider(self, self)
+        logger.info_once("DFlash auxiliary projection uses prepared MXFP8 staging.")
+
+    def get_b12x_preparation_units(self, layer, workload):
+        accumulator = self.model._streamed_aux_accumulator
+        if workload.stage != "weights" or accumulator is None:
+            return ()
+        if not callable(getattr(accumulator, "preparation_unit", None)):
+            # BF16 input storage uses the ordinary Marlin FC without B12X plans.
+            return ()
+        capacity = min(workload.max_tokens, _STREAMED_AUX_MIN_TOKENS - 1)
+        small_workload = dataclasses.replace(
+            workload,
+            max_tokens=capacity,
+            token_counts=tuple(
+                sorted({capacity, *(n for n in workload.token_counts if n < capacity)})
+            ),
+            fixed_token_counts=tuple(
+                n for n in workload.fixed_token_counts if n < capacity
+            ),
+        )
+        linear = self.model.fc.b12x_linear
+        return (
+            linear.unit(small_workload, name=f"linear.mxfp8.{linear.layer_name}"),
+            accumulator.preparation_unit("dflash.auxiliary"),
+        )
+
+    def is_streamed_context_states(self, states: list[torch.Tensor]) -> bool:
+        return self.model.is_streamed_context_states(states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         model_weights = {}
