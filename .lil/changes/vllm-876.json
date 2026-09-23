@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-876",
+  "category": "fix",
+  "summary": "MiMo-V2 audio input works without torchaudio, with identical features",
+  "models": [
+    "XiaomiMiMo/MiMo-V2.6-Flash-RL",
+    "XiaomiMiMo/MiMo-V2.6-Pro-RL"
+  ],
+  "compatibility": "No user action required. Deployments with torchaudio installed are unchanged.",
+  "details": [
+    "Images without a matching torchaudio wheel rejected every MiMo audio request: the media parser's default resampler and the MiMo processor's mel spectrogram both required torchaudio.",
+    "Plain-PyTorch ports of torchaudio's default Resample and MelSpectrogram now serve when torchaudio is missing; they are bitwise identical to torchaudio (tests compare with torch.equal when torchaudio is present and pin reference values when it is not)."
+  ],
+  "pull_requests": [
+    876
+  ]
+}
