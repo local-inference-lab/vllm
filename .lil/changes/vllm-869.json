@@ -1,0 +1,19 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-869",
+  "category": "fix",
+  "summary": "Track allocated KV blocks and keep CoW group store ranges aligned in the offloading connector",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "Two OffloadingConnector fixes from #867: newly allocated blocks are tracked before an early return (port of vllm-project/vllm#46960), and skipped align-mode CoW groups keep their store-range slots, which stops an EngineCore assert on the first store of a long prompt."
+  ],
+  "pull_requests": [
+    869
+  ],
+  "authors": [
+    "@llitz"
+  ]
+}
