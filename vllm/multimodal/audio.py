@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Literal
 
 import numpy as np
@@ -30,8 +31,11 @@ except ImportError:
 
 try:
     import torchaudio
+
+    _HAS_TORCHAUDIO = True
 except ImportError:
     torchaudio = PlaceholderModule("torchaudio")  # type: ignore[assignment]
+    _HAS_TORCHAUDIO = False
 
 
 # ============================================================
@@ -281,13 +285,141 @@ def resample_audio_soxr(
     return soxr.resample(audio, orig_sr_int, target_sr_int)
 
 
+# ============================================================
+# torchaudio-compatible transforms in plain PyTorch
+# ============================================================
+# Some deployments cannot install torchaudio (for example images built on a
+# vendor PyTorch with no matching wheel). These ports reproduce the default
+# torchaudio.transforms.Resample and torchaudio.transforms.MelSpectrogram with
+# the same arithmetic, so features are identical whether or not torchaudio is
+# installed. They are used only when torchaudio is missing.
+
+
+@lru_cache(maxsize=32)
+def _sinc_resample_kernel(
+    orig_freq: int,
+    new_freq: int,
+    lowpass_filter_width: int = 6,
+    rolloff: float = 0.99,
+) -> tuple[torch.Tensor, int]:
+    """The Hann-windowed sinc kernel of ``torchaudio.transforms.Resample``.
+
+    Built in float64 and stored as float32, as torchaudio does when no dtype
+    is given.
+    """
+    gcd = math.gcd(orig_freq, new_freq)
+    orig_freq //= gcd
+    new_freq //= gcd
+    base_freq = min(orig_freq, new_freq) * rolloff
+    width = math.ceil(lowpass_filter_width * orig_freq / base_freq)
+    idx = (
+        torch.arange(-width, width + orig_freq, dtype=torch.float64)[None, None]
+        / orig_freq
+    )
+    t = torch.arange(0, -new_freq, -1).to(torch.float32)[:, None, None] / new_freq
+    t = (t + idx) * base_freq
+    t = t.clamp_(-lowpass_filter_width, lowpass_filter_width)
+    window = torch.cos(t * math.pi / lowpass_filter_width / 2) ** 2
+    t *= math.pi
+    scale = base_freq / orig_freq
+    kernels = torch.where(t == 0, torch.tensor(1.0).to(t), t.sin() / t)
+    kernels *= window * scale
+    return kernels.to(torch.float32), width
+
+
+def resample_sinc(
+    waveform: torch.Tensor, orig_freq: int, new_freq: int
+) -> torch.Tensor:
+    """``torchaudio.transforms.Resample(orig_freq, new_freq)(waveform)``.
+
+    Bandlimited sinc interpolation over the trailing axis of a float tensor.
+    """
+    if orig_freq == new_freq:
+        return waveform
+    kernel, width = _sinc_resample_kernel(orig_freq, new_freq)
+    gcd = math.gcd(orig_freq, new_freq)
+    orig_freq //= gcd
+    new_freq //= gcd
+    shape = waveform.size()
+    waveform = waveform.view(-1, shape[-1])
+    num_wavs, length = waveform.shape
+    waveform = torch.nn.functional.pad(waveform, (width, width + orig_freq))
+    resampled = torch.nn.functional.conv1d(
+        waveform[:, None], kernel.to(waveform.device), stride=orig_freq
+    )
+    resampled = resampled.transpose(1, 2).reshape(num_wavs, -1)
+    target_length = torch.ceil(torch.as_tensor(new_freq * length / orig_freq)).long()
+    resampled = resampled[..., :target_length]
+    return resampled.view(shape[:-1] + resampled.shape[-1:])
+
+
+class MelSpectrogram:
+    """``torchaudio.transforms.MelSpectrogram`` (HTK mel scale, no filterbank
+    normalization, periodic Hann window) in plain PyTorch."""
+
+    def __init__(
+        self,
+        *,
+        sample_rate: int,
+        n_fft: int,
+        win_length: int | None = None,
+        hop_length: int | None = None,
+        f_min: float = 0.0,
+        f_max: float | None = None,
+        n_mels: int = 128,
+        power: float = 2.0,
+        center: bool = True,
+        pad_mode: str = "reflect",
+    ) -> None:
+        self.n_fft = n_fft
+        self.win_length = win_length if win_length is not None else n_fft
+        self.hop_length = hop_length if hop_length is not None else self.win_length // 2
+        self.power = power
+        self.center = center
+        self.pad_mode = pad_mode
+        self.window = torch.hann_window(self.win_length)
+        f_max = f_max if f_max is not None else float(sample_rate // 2)
+        # torchaudio.functional.melscale_fbanks(norm=None, mel_scale="htk")
+        all_freqs = torch.linspace(0, sample_rate // 2, n_fft // 2 + 1)
+        m_min = 2595.0 * math.log10(1.0 + (f_min / 700.0))
+        m_max = 2595.0 * math.log10(1.0 + (f_max / 700.0))
+        m_pts = torch.linspace(m_min, m_max, n_mels + 2)
+        f_pts = 700.0 * (10.0 ** (m_pts / 2595.0) - 1.0)
+        f_diff = f_pts[1:] - f_pts[:-1]
+        slopes = f_pts.unsqueeze(0) - all_freqs.unsqueeze(1)
+        down_slopes = (-1.0 * slopes[:, :-2]) / f_diff[:-1]
+        up_slopes = slopes[:, 2:] / f_diff[1:]
+        self.fb = torch.max(torch.zeros(1), torch.min(down_slopes, up_slopes))
+
+    def __call__(self, waveform: torch.Tensor) -> torch.Tensor:
+        shape = waveform.size()
+        spec = torch.stft(
+            waveform.reshape(-1, shape[-1]),
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=self.window.to(waveform.device),
+            center=self.center,
+            pad_mode=self.pad_mode,
+            normalized=False,
+            onesided=True,
+            return_complex=True,
+        )
+        spec = spec.reshape(shape[:-1] + spec.shape[-2:])
+        spec = spec.abs() if self.power == 1.0 else spec.abs().pow(self.power)
+        fb = self.fb.to(spec.device)
+        return torch.matmul(spec.transpose(-1, -2), fb).transpose(-1, -2)
+
+
 @lru_cache(maxsize=32)
 def _get_torchaudio_resampler(
     orig_sr: int, target_sr: int
-) -> "torchaudio.transforms.Resample":
+) -> Callable[[torch.Tensor], torch.Tensor]:
     # `torchaudio.transforms.Resample` precomputes its kernel for a fixed
     # (orig_sr, target_sr) pair; cache instances so repeated requests at a
     # common input rate skip the kernel rebuild.
+    if not _HAS_TORCHAUDIO:
+        return partial(resample_sinc, orig_freq=orig_sr, new_freq=target_sr)
     return torchaudio.transforms.Resample(orig_sr, target_sr)
 
 
@@ -298,6 +430,9 @@ def resample_audio_torchaudio(
     target_sr: float,
 ) -> npt.NDArray[np.floating]:
     """Resample audio using torchaudio's bandlimited sinc interpolation.
+
+    Without torchaudio installed, the same kernel runs in plain PyTorch
+    (:func:`resample_sinc`), with identical results.
 
     Unlike the PyAV resampler, this handles any input length without padding
     and applies the kernel over the trailing axis, so 2D ``(channels,
