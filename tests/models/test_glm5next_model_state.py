@@ -293,7 +293,14 @@ def test_glm5next_recycled_and_rebound_state_is_fresh(monkeypatch) -> None:
         lambda self: None,
     )
 
-    state.add_request(5, SimpleNamespace(num_computed_tokens=0))
+    state.add_request(
+        5,
+        SimpleNamespace(
+            num_computed_tokens=0,
+            boundary_checkpoint=None,
+            boundary_checkpoint_blocks=None,
+        ),
+    )
 
     assert state.selector_state_is_fresh_gpu[5]
     assert state.selector_committed_num_accepted_tokens_gpu[5] == 1
@@ -330,7 +337,9 @@ def test_glm5next_rejects_unaligned_fresh_prefix(
         state.add_request(
             3,
             SimpleNamespace(
-                num_computed_tokens=prefix_length, boundary_checkpoint=None
+                num_computed_tokens=prefix_length,
+                boundary_checkpoint=None,
+                boundary_checkpoint_blocks=None,
             ),
         )
 
@@ -347,7 +356,12 @@ def test_glm5next_accepts_pool_aligned_fresh_prefix(monkeypatch) -> None:
     )
 
     state.add_request(
-        3, SimpleNamespace(num_computed_tokens=4, boundary_checkpoint=None)
+        3,
+        SimpleNamespace(
+            num_computed_tokens=4,
+            boundary_checkpoint=None,
+            boundary_checkpoint_blocks=None,
+        ),
     )
 
     assert calls == [3]

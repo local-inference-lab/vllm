@@ -1084,6 +1084,13 @@ class MambaSpec(KVCacheSpec):
     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
     # rank holds the full state (e.g. the replicated PLE conv state).
     tp_replicated: bool = False
+    # Frozen boundary capture: at every retention-grid crossing the step
+    # commits, the manager copies the live state column into a dedicated
+    # single-writer pool block before the column advances, so a connector
+    # boundary store never sources a column the next forward can clobber.
+    # Independent of `num_prefill_checkpoint_blocks` (the in-forward kernel
+    # export), which this model's backend cannot address safely.
+    boundary_capture: bool = False
 
     def prefill_checkpoint_indices(
         self, num_computed_tokens: int, num_tokens: int
