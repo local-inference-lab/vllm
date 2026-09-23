@@ -1,0 +1,12 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-qwen38-qsa-stable-dcp-topk-20260923",
+  "category": "fix",
+  "summary": "Keep Qwen QSA DCP top-k selection in a stable order",
+  "models": ["Qwen3.8-Flash-Next"],
+  "compatibility": "No user action required.",
+  "details": [
+    "DCP candidate compaction preserves the selected order instead of depending on atomic arrival order."
+  ],
+  "authors": ["yatesdr"]
+}
