@@ -34,6 +34,10 @@ class _MLAPrefillBackendEnumMeta(EnumMeta):
 class MLAPrefillBackendEnum(Enum, metaclass=_MLAPrefillBackendEnumMeta):
     """Enumeration of all supported MLA prefill backends."""
 
+    B12X = "vllm.v1.attention.backends.mla.prefill.b12x.B12xPrefillBackend"
+    B12X_CONTEXT = (
+        "vllm.v1.attention.backends.mla.prefill.b12x.B12xContextPrefillBackend"
+    )
     FLASH_ATTN = (
         "vllm.v1.attention.backends.mla.prefill.flash_attn.FlashAttnPrefillBackend"
     )

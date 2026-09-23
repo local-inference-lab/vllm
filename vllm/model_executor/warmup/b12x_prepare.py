@@ -537,7 +537,7 @@ def begin_b12x_preparation(worker: Worker, *, stage: str):
     from vllm.v1.worker.workspace import current_workspace_manager
 
     batches = []
-    units = []
+    units: list[B12xPreparationUnit] = []
     if b12x_native_supported(worker):
         workload = b12x_workload(worker, stage="state" if stage == "bind" else stage)
         units = collect_b12x_units(worker, workload)
@@ -662,7 +662,7 @@ def prepare_b12x_profile(worker: Worker, *, stage: str) -> B12xPreparedBatch:
     from vllm.v1.worker.workspace import current_workspace_manager
 
     requests: tuple[PreparationRequest, ...] = ()
-    units = []
+    units: list[B12xPreparationUnit] = []
     if b12x_native_supported(worker):
         workload = b12x_workload(worker, stage=stage)
         units = collect_b12x_units(worker, workload)

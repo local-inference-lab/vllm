@@ -397,8 +397,8 @@ def test_mla_dcp_manager_selects_direct_backends(monkeypatch):
 
     group = MagicMock(world_size=2)
     monkeypatch.setattr(dcp_manager, "get_dcp_group", lambda: group)
-    direct_a2a = MagicMock()
-    direct_query = MagicMock()
+    direct_a2a = MagicMock(max_num_tokens=4)
+    direct_query = MagicMock(max_num_tokens=4)
     direct_kv = MagicMock()
     monkeypatch.setattr(
         dcp_manager, "get_direct_dcp_a2a_workspace", MagicMock(return_value=direct_a2a)
@@ -428,7 +428,9 @@ def test_mla_dcp_manager_selects_direct_backends(monkeypatch):
     )
     workspace = torch.empty(96, 8)
 
-    assert manager.query_gather == direct_query.gather
+    query = torch.empty(1, 2, 8)
+    assert manager.query_gather(query) is direct_query.gather.return_value
+    direct_query.gather.assert_called_once_with(query)
     manager.init_kv_gather(workspace, 64)
     gathered_kv, local_kv = torch.empty(4, 8), torch.empty(2, 8)
     manager.kv_gather(gathered_kv, local_kv)
@@ -445,9 +447,9 @@ def test_mla_dcp_manager_selects_direct_backends(monkeypatch):
     direct_a2a.lse_reduce.assert_called_once_with(
         output,
         lse,
-        seq_lens=seq_lens,
-        query_start_loc=query_start_loc,
-        is_lse_base_on_e=False,
+        False,
+        seq_lens,
+        query_start_loc,
     )
 
 
@@ -561,6 +563,59 @@ def test_mla_query_scratch_fallback_preserves_direct_transport_priority(
     group.all_gather.assert_not_called()
 
 
+@pytest.mark.parametrize("ubatches", [1, 2])
+def test_mla_dcp_b12x_is_serial_and_capacity_bounded(monkeypatch, ubatches):
+    from vllm.distributed.device_communicators import b12x_dcp
+
+    config = _manager_config()
+    config.parallel_config.num_ubatches = ubatches
+    group = MagicMock(world_size=2)
+    monkeypatch.setattr(dcp, "get_dcp_group", lambda: group)
+    for name in ("get_direct_dcp_a2a_workspace", "get_direct_dcp_q_gather_workspace"):
+        monkeypatch.setattr(dcp, name, MagicMock(return_value=None))
+    transport = MagicMock(max_tokens=4)
+    factory = MagicMock(return_value=transport)
+    monkeypatch.setattr(b12x_dcp, "get_b12x_dcp_transport", factory)
+    fallback = MagicMock()
+    monkeypatch.setattr(dcp, "dcp_a2a_lse_reduce", fallback)
+    manager = dcp.MLADCPManager(
+        vllm_config=config,
+        device=torch.device("cpu"),
+        num_heads=2,
+        query_head_dim=576,
+        output_head_dim=512,
+        query_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        padded_num_heads=None,
+        is_lse_base_on_e=True,
+        use_pcp=False,
+        use_b12x=True,
+    )
+    if ubatches != 1:
+        factory.assert_not_called()
+        assert manager.b12x_transport is None
+        return
+    query = torch.zeros(4, 2, 576)
+    partial, lse = torch.zeros(4, 4, 512), torch.zeros(4, 4)
+    assert manager.query_gather(query) is transport.gather.return_value
+    assert manager.combine(partial, lse) is transport.combine.return_value
+    transport.gather.assert_called_once_with(query)
+    transport.combine.assert_called_once_with(partial, lse, is_lse_base_on_e=True)
+    query = torch.zeros(5, 2, 576)
+    partial, lse = torch.zeros(5, 4, 512), torch.zeros(5, 4)
+    assert manager.query_gather(query) is group.all_gather.return_value
+    assert manager.combine(partial, lse) is fallback.return_value
+    group.all_gather.assert_called_once_with(query, dim=1)
+    fallback.assert_called_once_with(
+        partial,
+        lse,
+        cp_group=group,
+        is_lse_base_on_e=True,
+        seq_lens=None,
+        query_start_loc=None,
+    )
+
+
 def test_mla_dcp_manager_selects_pcp_combine(monkeypatch):
     import vllm.v1.attention.ops.dcp as dcp_manager
 
@@ -630,6 +685,7 @@ def test_dcp_chunk_workspace_alignment_covers_interleave():
 def test_sparse_mla_builder_initializes_dcp_manager(monkeypatch):
     import vllm.model_executor.layers.attention.sparse_mla_attention as sparse_mla
 
+    monkeypatch.setattr(sparse_mla, "PIN_MEMORY", False)
     monkeypatch.setattr(
         sparse_mla.AttentionMetadataBuilder,
         "__init__",
@@ -652,7 +708,7 @@ def test_sparse_mla_builder_initializes_dcp_manager(monkeypatch):
     config = MagicMock()
     config.model_config.dtype = torch.bfloat16
     config.model_config.max_model_len = 64
-    config.model_config.hf_config.index_topk = 8
+    config.model_config.hf_text_config.index_topk = 8
     config.scheduler_config.max_num_batched_tokens = 64
     config.scheduler_config.max_num_seqs = 2
     config.cache_config.block_size = 4
@@ -682,7 +738,7 @@ def test_sparse_mla_workspace_preserves_non_dcp_size():
 
     config = MagicMock()
     config.model_config.max_model_len = 1
-    config.model_config.hf_config.index_topk = 7
+    config.model_config.hf_text_config.index_topk = 7
     config.scheduler_config.max_num_seqs = 3
     config.cache_config.block_size = 4
     config.parallel_config.decode_context_parallel_size = 1

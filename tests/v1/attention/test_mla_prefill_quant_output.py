@@ -22,12 +22,167 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
 )
 from vllm.platforms.interface import DeviceCapability
+from vllm.v1.attention.backends.mla.prefill.b12x import (
+    B12xContextPrefillBackend,
+    B12xPrefillBackend,
+)
 from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
 from vllm.v1.attention.backends.mla.prefill.flash_attn import (
     FlashAttnPrefillBackend,
 )
 
 _FA_MODULE = "vllm.v1.attention.backends.mla.prefill.flash_attn"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "heads,capacity", [(6, 257), (11, 257), (12, 257), (11, 76032)]
+)
+@pytest.mark.parametrize("dcp_head_axis", [False, True])
+@torch.inference_mode()
+def test_b12x_context_projection_reuses_scratch_and_preserves_attention(
+    heads, capacity, dcp_head_axis, monkeypatch
+):
+    """Ragged live chunks and graph replay retain exact BF16 K/V and attention."""
+    from b12x.preparation import PreparationSession
+
+    from vllm.model_executor.layers.attention.mla_attention import (
+        MLACommonMetadataBuilder,
+    )
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.v1.worker import workspace
+
+    if torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("requires SM12x")
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    manager = workspace.WorkspaceManager(device)
+    monkeypatch.setattr(workspace, "_manager", manager)
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    query_rows = 16
+    monkeypatch.setattr(
+        MLACommonMetadataBuilder,
+        "determine_chunked_prefill_workspace_size",
+        staticmethod(lambda _: capacity),
+    )
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=query_rows, max_num_seqs=1
+        ),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+    )
+    backend = B12xPrefillBackend(heads, 192**-0.5, 512, 128, 64, 128, config)
+    projection = torch.nn.Linear(
+        512, heads * 256, bias=False, device=device, dtype=torch.bfloat16
+    )
+    projection.quant_method = UnquantizedLinearMethod()
+    owner = SimpleNamespace(kv_b_proj=projection, layer_name="test.context_projection")
+    units = backend.get_b12x_preparation_units(owner, SimpleNamespace(stage="weights"))
+    latent_storage = (
+        torch.randn(capacity, 576, device=device, dtype=torch.bfloat16) * 0.1
+    )
+    q = torch.randn(query_rows, heads, 192, device=device, dtype=torch.bfloat16) * 0.1
+    cu_q = torch.tensor([0, query_rows], device=device, dtype=torch.int32)
+    cu_k = torch.tensor([0, capacity], device=device, dtype=torch.int32)
+
+    with PreparationSession(device=device, autotune=False) as session:
+        session.prepare(tuple(request for unit in units for request in unit.requests))
+        manager.lock()
+        address = manager._current_workspaces[0].data_ptr()
+        for rows in (1, 65, capacity, 7):
+            latent = latent_storage[:rows, :512]
+            if dcp_head_axis:
+                latent = latent.unsqueeze(1)
+            rope = latent_storage[:rows, 512:].unsqueeze(1)
+            cu_k[1] = rows
+
+            def reference(latent=latent, rows=rows, rope=rope):
+                kv = projection(latent).view(rows, heads, 256)
+                k = torch.cat((kv[..., :128], rope.expand(-1, heads, -1)), dim=-1)
+                return backend._run(
+                    q, k, kv[..., 128:], cu_q, cu_k, query_rows, rows, False, None
+                )
+
+            def bounded(latent=latent, rows=rows, rope=rope):
+                k, v = backend.project_context_kv(projection, latent, rope)
+                return backend._run(q, k, v, cu_q, cu_k, query_rows, rows, False, None)
+
+            kv = projection(latent).view(rows, heads, 256)
+            k, v = backend.project_context_kv(projection, latent, rope)
+            torch.testing.assert_close(k[..., :128], kv[..., :128], atol=0, rtol=0)
+            torch.testing.assert_close(
+                k[..., 128:], rope.expand(-1, heads, -1), atol=0, rtol=0
+            )
+            torch.testing.assert_close(v, kv[..., 128:], atol=0, rtol=0)
+            pointers = (k.data_ptr(), v.data_ptr())
+            reference()
+            bounded()
+            graph = torch.cuda.CUDAGraph()
+            try:
+                with session.capture(), torch.cuda.graph(graph):
+                    actual = bounded()
+                for _ in range(3):
+                    latent_storage.normal_(std=0.1)
+                    expected = reference()
+                    graph.replay()
+                    torch.accelerator.synchronize()
+                    for got, want in zip(actual, expected):
+                        assert torch.isfinite(got).all() and torch.count_nonzero(got)
+                        torch.testing.assert_close(got, want, atol=0, rtol=0)
+                    k, v = backend.project_context_kv(projection, latent, rope)
+                    assert (k.data_ptr(), v.data_ptr()) == pointers
+                    assert manager._current_workspaces[0].data_ptr() == address
+            finally:
+                graph.reset()
+        with pytest.raises(ValueError, match="prepared capacity"):
+            backend.project_context_kv(
+                projection,
+                torch.empty(capacity + 1, 512, device=device, dtype=torch.bfloat16),
+                torch.empty(capacity + 1, 1, 64, device=device, dtype=torch.bfloat16),
+            )
+
+
+def test_b12x_context_projection_respects_linear_dispatch(monkeypatch):
+    """Caller scratch must not bypass quantization, hooks or alternate GEMMs."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    layer = torch.nn.Linear(8, 8, bias=False, dtype=torch.bfloat16)
+    layer.quant_method = UnquantizedLinearMethod()
+    assert B12xPrefillBackend._can_project_context(layer)
+    handle = layer.register_forward_hook(lambda *_: None)
+    assert not B12xPrefillBackend._can_project_context(layer)
+    handle.remove()
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    assert not B12xPrefillBackend._can_project_context(layer)
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    layer.quant_method._gemm_impl = lambda *_: None
+    assert not B12xPrefillBackend._can_project_context(layer)
+
+
+@pytest.mark.parametrize("provide_out", [False, True])
+def test_b12x_context_preserves_causal_values_and_compact_output(provide_out):
+    """FA2's padded result must preserve values and honor caller-owned output."""
+    backend = object.__new__(B12xContextPrefillBackend)
+    backend.scale = 0.125
+    backend.v_head_dim = 128
+    padded = torch.arange(2 * 3 * 192, dtype=torch.float32).view(2, 3, 192)
+    lse = torch.ones(3, 2)
+
+    def causal(**kwargs):
+        assert kwargs["causal"] and kwargs["return_softmax_lse"]
+        assert "out" not in kwargs
+        assert kwargs["softmax_scale"] == backend.scale
+        return padded, lse
+
+    backend._causal_backend = SimpleNamespace(_flash_attn_varlen_diff_headdims=causal)
+    out = torch.full((2, 3, 128), float("nan")) if provide_out else None
+    value, actual_lse = backend._run(None, None, None, None, None, 2, 2, True, out)
+    torch.testing.assert_close(value, padded[..., :128], rtol=0, atol=0)
+    assert value.is_contiguous() and actual_lse is lse
+    if provide_out:
+        assert value is out
+    with patch.object(B12xPrefillBackend, "_run", return_value=(value, lse)) as context:
+        assert backend._run(None, None, None, None, None, 2, 2, False, out)[0] is value
+        context.assert_called_once()
 
 
 class _DummyPrefillBackend(MLAPrefillBackend):

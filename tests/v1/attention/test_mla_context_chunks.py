@@ -15,6 +15,7 @@ import torch
 
 import vllm.utils.gpu_sync_debug as gsd
 from vllm.model_executor.layers.attention.mla_attention import (
+    MLACommonMetadataBuilder,
     build_mla_chunked_context_metadata,
     init_mla_context_partial,
     reorg_kvcache,
@@ -24,6 +25,31 @@ from vllm.model_executor.layers.attention.sparse_mla_attention import (
 )
 
 BLOCK_SIZE = 16
+
+
+@pytest.mark.parametrize("dcp_size", [1, 16])
+@pytest.mark.parametrize("block_size", [64, 768])
+@pytest.mark.parametrize("configured_rows", [0, 4096, -1])
+def test_dense_mla_context_workspace_respects_configured_bound(
+    monkeypatch, dcp_size, block_size, configured_rows
+):
+    monkeypatch.setenv("VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE", str(configured_rows))
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=950000),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+        cache_config=SimpleNamespace(block_size=block_size),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=dcp_size, cp_kv_cache_interleave_size=1
+        ),
+    )
+    determine = MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size
+    if configured_rows < 0:
+        with pytest.raises(ValueError, match="must be non-negative"):
+            determine(config)
+        return
+    rows = configured_rows or 65536
+    expected = (rows + block_size - 1) // block_size * block_size
+    assert determine(config) == expected
 
 
 def build_chunked_context(

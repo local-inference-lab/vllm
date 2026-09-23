@@ -474,6 +474,7 @@ def test_draft_model_units_run_their_callbacks_in_the_draft_lane() -> None:
     worker = _worker(torch.nn.Module(), draft=draft, draft_lane=1)
 
     (unit,) = b12x_prepare.collect_b12x_units(worker, _workload())
+    assert unit.workspace_lanes == (1,)
     call = unit.requests[0].prepare_call(object())
     call.run()
     assert observed == [("collect", 1, 1), ("prepare", 1), ("run", 1)]
@@ -484,6 +485,7 @@ def test_scope_unit_calls_wraps_mapping_factories() -> None:
     request = _Request("composite")
     request.prepare_call = {2: lambda state: _Call(run=lambda: _workspace_lane.get())}
     scoped = scope_b12x_unit_calls(_unit("u", request), 1)
+    assert scoped.workspace_lanes == (1,)
     assert scoped.requests[0].prepare_call[2](object()).run() == 1
     assert scoped.workspace_lanes == (1,)
 

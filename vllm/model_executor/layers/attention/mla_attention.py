@@ -306,6 +306,7 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.attention.ops.dcp import MLADCPManager
+from vllm.v1.attention.ops.dcp_prefetch import DCPContextPrefetch
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.ops.pcp import (
     finalize_mla_pcp_decode,
@@ -805,6 +806,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     v_head_dim=self.v_head_dim,
                     vllm_config=vllm_config,
                 )
+                if callable(
+                    getattr(self.prefill_backend, "get_b12x_preparation_units", None)
+                ):
+                    set_b12x_preparation_provider(self, self)
 
         self.kv_cache = torch.tensor([])
 
@@ -864,6 +869,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 query_gather_fallback=getattr(self.impl, "gather_dcp_query", None),
                 output_reduce_scatter=getattr(
                     self.impl, "reduce_scatter_dcp_output", None
+                ),
+                use_b12x=(
+                    self.attn_backend.get_name() == "B12X_MLA"
+                    and envs.VLLM_USE_B12X_DCP_A2A
                 ),
             )
 
@@ -1706,6 +1715,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         provider = getattr(impl, "b12x_preparation_provider", None)
         hook = getattr(provider, "get_b12x_preparation_units", None)
         backend_units = tuple(hook(impl, workload)) if callable(hook) else ()
+        prefill_hook = getattr(self.prefill_backend, "get_b12x_preparation_units", None)
+        if callable(prefill_hook):
+            backend_units += tuple(prefill_hook(self, workload))
         weight = getattr(self, "W_UK_T", None)
         if (
             not isinstance(weight, torch.Tensor)
@@ -2049,6 +2061,7 @@ class MLACommonPrefillMetadata:
         context_lens_list: list[int]
         empty_token_slices: list[slice]
         dcp_manager: MLADCPManager | None = None
+        dcp_prefetch: DCPContextPrefetch | None = None
 
     block_table: torch.Tensor
     query_start_loc: torch.Tensor
@@ -2671,6 +2684,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             speculative_config is None
             or getattr(speculative_config, "method", None) != "dspark"
             or parallel_config.decode_context_parallel_size <= 1
+            or getattr(self.kv_cache_spec, "dcp_replicated", False)
         ):
             return
 
@@ -2694,6 +2708,17 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         scheduler_config = vllm_config.scheduler_config
         cache_config = vllm_config.cache_config
         model_config = vllm_config.model_config
+
+        configured_workspace_size = envs.VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE
+        if configured_workspace_size < 0:
+            raise ValueError(
+                "VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE must be non-negative, "
+                f"got {configured_workspace_size}."
+            )
+        if configured_workspace_size:
+            return align_mla_chunked_context_workspace_size(
+                vllm_config, configured_workspace_size
+            )
 
         chunked_prefill_workspace_size = min(
             # Try for 8 full length request or at least 4 pages per-request
@@ -2799,7 +2824,6 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         )
         self.aot_schedule = current_platform.is_cuda()
 
-        self.kv_cache_spec = kv_cache_spec
         self.q_data_type = self.determine_prefill_query_data_type(
             vllm_config, self.model_config.dtype
         )
@@ -2809,6 +2833,8 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             self.dcp_world_size = get_dcp_group().world_size
         except AssertionError:
             # DCP might not be initialized in testing
+            self.dcp_world_size = 1
+        if getattr(kv_cache_spec, "dcp_replicated", False):
             self.dcp_world_size = 1
         self.dcp_local_block_size = parallel_config.cp_kv_cache_interleave_size
         self.dcp_virtual_block_size = self.dcp_local_block_size * self.dcp_world_size
@@ -2824,6 +2850,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             self.kv_cache_spec
         )
         self.dcp_manager: MLADCPManager | None = None
+        self.dcp_prefetch: DCPContextPrefetch | None = None
         if self.dcp_world_size > 1:
             # Note(hc): The local kvcache is incomplete when DCP is triggered,
             # an additional kvcache allgather across the DCP group is therefore
@@ -2849,6 +2876,24 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 self.chunked_prefill_workspace,
                 self.chunked_prefill_workspace_size,
             )
+            fp8_transport = envs.VLLM_MLA_PREFILL_DCP_FP8_TRANSPORT
+            if fp8_transport and (
+                not envs.VLLM_MLA_PREFILL_DCP_OVERLAP
+                or self.model_config.dtype != torch.bfloat16
+                or attention_layer.kv_cache_dtype not in ("fp8", "fp8_e4m3")
+                or current_platform.fp8_dtype() != torch.float8_e4m3fn
+                or use_packed_sparse_mla_cache
+            ):
+                raise ValueError(
+                    "FP8 DCP context transport requires overlapped prefill, "
+                    "standard E4M3 KV cache and BF16 attention inputs"
+                )
+            if envs.VLLM_MLA_PREFILL_DCP_OVERLAP:
+                self.dcp_prefetch = DCPContextPrefetch(
+                    self.dcp_manager,
+                    self.chunked_prefill_workspace,
+                    fp8_transport=fp8_transport,
+                )
         else:
             self.chunked_prefill_workspace = torch.empty(
                 (
@@ -3012,6 +3057,8 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 dcp_virtual_block_size=self.dcp_virtual_block_size,
                 dcp_manager=self.dcp_manager,
             )
+            if chunked_context_metadata is not None:
+                chunked_context_metadata.dcp_prefetch = self.dcp_prefetch
 
             prefill_metadata = MLACommonPrefillMetadata(
                 block_table=block_table_tensor[reqs_start:, ...],
@@ -3438,7 +3485,7 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
         output_lse = None
         workspace = chunked_context.workspace
 
-        for chunk in chunked_context.chunks:
+        def extract_local(chunk, local_workspace):
             assert chunk.padded_local_seq_lens is not None
             assert chunk.local_context_lens_allranks is not None
             assert chunk.padded_local_cu_seq_lens is not None
@@ -3448,10 +3495,23 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             toks = chunk.num_local_context_tokens
             padded_local_cu_seq_lens = chunk.padded_local_cu_seq_lens
             block_table = prefill_metadata.block_table[chunk.request_slice]
-            if self.kv_cache_dtype == "fp8_ds_mla":
+            if local_workspace.dtype == torch.uint8:
+                # The packet retains the original cache bytes. The gather
+                # carries each rank's scale, then upconverts on the consumer.
+                if self.kv_cache_dtype not in ("fp8", "fp8_e4m3"):
+                    raise ValueError("Raw DCP transport requires standard E4M3 KV")
+                ops.cp_gather_cache(
+                    src_cache=kv_c_and_k_pe_cache.view(torch.uint8),
+                    dst=local_workspace,
+                    block_table=block_table,
+                    cu_seq_lens=padded_local_cu_seq_lens,
+                    batch_size=chunk.num_requests,
+                    seq_starts=chunk.starts,
+                )
+            elif self.kv_cache_dtype == "fp8_ds_mla":
                 ops.cp_gather_and_upconvert_fp8_kv_cache(
                     src_cache=kv_c_and_k_pe_cache,
-                    dst=workspace[:toks],
+                    dst=local_workspace[:toks],
                     block_table=block_table,
                     workspace_starts=padded_local_cu_seq_lens,
                     batch_size=chunk.num_requests,
@@ -3461,7 +3521,7 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                 assert k_scale is not None
                 ops.gather_and_maybe_dequant_cache(
                     src_cache=kv_c_and_k_pe_cache,
-                    dst=workspace,
+                    dst=local_workspace,
                     block_table=block_table,
                     cu_seq_lens=padded_local_cu_seq_lens,
                     token_to_seq=chunk.padded_local_token_to_seq,
@@ -3473,26 +3533,37 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             else:
                 ops.cp_gather_cache(
                     src_cache=kv_c_and_k_pe_cache,
-                    dst=workspace[:toks],
+                    dst=local_workspace[:toks],
                     block_table=block_table,
                     cu_seq_lens=padded_local_cu_seq_lens,
                     batch_size=chunk.num_requests,
                     seq_starts=chunk.starts,
                 )
-            # workspace
-            # |------- N tokens --------|--------- N*dcp_size tokens ----------|
-            # |<- use for local_gather ->|<--------- use for allgather -------->|
+
+        def gather_serial():
             allgather_offset = workspace.shape[0] // (dcp_world_size + 1)
             assert allgather_offset * (dcp_world_size + 1) == workspace.shape[0]
-            assert toks <= allgather_offset
-            local_gathered_kvcache = workspace[:toks]
-            cur_allgather_workspace = workspace[
-                allgather_offset : allgather_offset * (1 + dcp_world_size)
-            ]
-            assert toks * dcp_world_size <= cur_allgather_workspace.shape[0]
-            cur_allgather_kvcache = cur_allgather_workspace[: toks * dcp_world_size]
             dcp_manager = cast(MLADCPManager, chunked_context.dcp_manager)
-            dcp_manager.kv_gather(cur_allgather_kvcache, local_gathered_kvcache)
+            for chunk in chunked_context.chunks:
+                toks = chunk.num_local_context_tokens
+                assert toks <= allgather_offset
+                local = workspace[:toks]
+                extract_local(chunk, local)
+                gathered = workspace[
+                    allgather_offset : allgather_offset + toks * dcp_world_size
+                ]
+                dcp_manager.kv_gather(gathered, local)
+                yield chunk, gathered
+
+        gathered_chunks = (
+            chunked_context.dcp_prefetch.gather_chunks(
+                chunked_context.chunks, extract_local, k_scale
+            )
+            if chunked_context.dcp_prefetch is not None
+            else gather_serial()
+        )
+        for chunk, cur_allgather_kvcache in gathered_chunks:
+            toks = chunk.num_local_context_tokens
             assert (
                 cur_allgather_kvcache.shape[-1]
                 == self.kv_lora_rank + self.qk_rope_head_dim
@@ -3514,14 +3585,27 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             if kv_b_proj_input_dtype is not None:
                 kv_c_normed = kv_c_normed.to(kv_b_proj_input_dtype)
 
-            kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
-                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+            project_context = getattr(
+                prefill_metadata.prefill_backend, "project_context_kv", None
             )
-            if use_fp8_prefill:
-                kv_nope = kv_nope.to(prefill_metadata.q_data_type)
-                k_pe = k_pe.to(prefill_metadata.q_data_type)
-            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k = self._concat_k_nope_k_pe(k_nope, k_pe)
+            projected = (
+                project_context(self.kv_b_proj, kv_c_normed, k_pe)
+                if project_context is not None and not use_fp8_prefill
+                else None
+            )
+            if projected is None:
+                kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+                    -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+                )
+                if use_fp8_prefill:
+                    kv_nope = kv_nope.to(prefill_metadata.q_data_type)
+                    k_pe = k_pe.to(prefill_metadata.q_data_type)
+                k_nope, v = kv_nope.split(
+                    [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+                )
+                k = self._concat_k_nope_k_pe(k_nope, k_pe)
+            else:
+                k, v = projected
 
             attn_output, attn_softmax_lse = (
                 prefill_metadata.prefill_backend.run_prefill_context_chunk(
