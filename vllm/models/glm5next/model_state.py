@@ -139,7 +139,20 @@ class Glm5NextModelState(MambaHybridModelState):
         if self.uses_pooled_selector:
             # The scheduler may recycle this request-state slot while selector
             # raw-ring tags and its interval anchor still belong to the prior owner.
-            self.selector_state_is_fresh_gpu[req_index].fill_(True)
+            # Only a boundary-checkpoint restore carries the producer's committed
+            # selector pools into this slot; the OffloadingConnector restores KV
+            # pages, never these per-slot buffers.  A restored prefix without a
+            # checkpoint still owns a recycled slot, so it keeps the fresh reset.
+            # The condition mirrors BoundaryCheckpointState.add_request, whose
+            # restore branch -- the only writer of these pools -- needs both
+            # fields before it clears the flag.
+            restored_selector_state = (
+                new_req_data.boundary_checkpoint is not None
+                and new_req_data.boundary_checkpoint_blocks is not None
+            )
+            self.selector_state_is_fresh_gpu[req_index].fill_(
+                not restored_selector_state
+            )
             self.selector_committed_num_accepted_tokens_gpu[req_index].fill_(1)
 
     def reset_kv_cache_state(self) -> None:
@@ -156,6 +169,9 @@ class Glm5NextModelState(MambaHybridModelState):
 
     def get_recurrent_checkpoint_acceptance(self) -> torch.Tensor:
         return self.selector_committed_num_accepted_tokens_gpu
+
+    def get_recurrent_checkpoint_fresh(self) -> torch.Tensor:
+        return self.selector_state_is_fresh_gpu
 
     def _prepare_selector_state(
         self,

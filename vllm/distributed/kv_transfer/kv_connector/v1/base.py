@@ -477,6 +477,16 @@ class KVConnectorBase_V1(ABC):
         self._kv_cache_manager = kv_cache_manager
         self.bind_gpu_block_pool(kv_cache_manager.block_pool)
 
+    def bind_boundary_capture_releaser(self, releaser: Callable[[int], None]) -> None:
+        """Bind the cache manager's capture-pin releaser.
+
+        A connector whose boundary stores source frozen capture blocks must
+        release the manager pin when a store job completes or the offer is
+        dropped. Connectors that never source capture blocks ignore it (the
+        manager's pin dict stays empty, so a missed release cannot leak).
+        """
+        return None
+
     @classmethod
     def supports_request_boundary_checkpoints(cls, config: "VllmConfig") -> bool:
         """Whether configuration selects a complete external checkpoint adapter."""

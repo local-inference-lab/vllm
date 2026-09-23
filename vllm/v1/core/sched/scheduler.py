@@ -368,6 +368,12 @@ class Scheduler(SchedulerInterface):
         if self.connector is not None:
             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
+            # Frozen boundary capture: the connector releases the manager pin
+            # on a capture block when its store DMA acks or the offer is
+            # dropped (I4). No-op for block ids the manager never pinned.
+            self.connector.bind_boundary_capture_releaser(
+                self.kv_cache_manager.release_boundary_capture
+            )
             if self.kv_cache_manager.boundary_checkpoints is not None:
                 self.connector.bind_boundary_checkpoint_cache(self.kv_cache_manager)
 

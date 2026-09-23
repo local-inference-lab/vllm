@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from itertools import chain, islice
 from typing import Any, NamedTuple
@@ -97,7 +97,11 @@ class GroupOffloadConfig(NamedTuple):
     # Cached manager class for this group's KV cache spec, resolved at init time
     manager_cls: type[SingleTypeKVCacheManager]
     # Partial-tail data for this group comes from the scheduler's CoW hand-off
-    # rather than the request block table.
+    # rather than the request block table. Invariant (asserted in from_spec and
+    # at capture record time): a frozen capture boundary is a state-block
+    # multiple, and partial-tail configs force chunk == block, so the aligned
+    # builder alone owns capture offers and its release-before-DMA branch never
+    # abandons a pinned source to a partial-tail claim.
     requires_cow_source: bool = False
     # True for EAGLE/MTP draft-model attention groups. The trailing chunk
     # of these groups is volatile and lacks a stable hash, so it must
@@ -313,6 +317,18 @@ class SchedulerOffloadConfig(NamedTuple):
             )
             and not any(config.is_eagle_group for config in kv_group_configs)
             and vllm_config.parallel_config.decode_context_parallel_size == 1
+        )
+        # Drift guard for the capture-ownership invariant (see
+        # GroupOffloadConfig.requires_cow_source): capture boundaries are state
+        # -block multiples and the partial-tail builder only claims non-block
+        # multiples, so the aligned builder's release-before-DMA branch can
+        # never strand a pinned capture source to a partial-tail claim.
+        assert not supports_partial_tail or all(
+            config.tokens_per_chunk == config.tokens_per_block
+            for config in kv_group_configs
+        ), (
+            "partial tails require one physical block per offload chunk so "
+            "frozen capture boundaries stay out of the partial-tail builder"
         )
 
         if retention_interval is not None:
@@ -601,6 +617,19 @@ class OffloadingConnectorScheduler:
             for config in self.config.kv_group_configs
             if config.requires_cow_source
         )
+        # Align-mode Mamba boundary stores source FROZEN capture blocks
+        # (single_type_kv_cache_manager boundary capture): a dedicated pool
+        # block written exactly once by a post-forward copy at the step whose
+        # forward ended at the retention boundary B, then fenced like any
+        # other store source. With capture enabled on every recurrent group,
+        # the external hit extends to the largest B where all groups key --
+        # which is exactly what the per-group convergence in
+        # `_lookup_complete_chunks` computes (mamba groups participate with a
+        # one-chunk window over their boundary state key). No half-restore.
+        # Without frozen capture the boundary store still sources the request's
+        # live running column, which the deferred DMA reads after the next
+        # forward clobbers it: align-Mamba deployments must enable
+        # boundary_capture on every recurrent group.
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
@@ -618,6 +647,9 @@ class OffloadingConnectorScheduler:
         # Threshold value for stale jobs. All job ids >= _stale_job_threshold are
         # active jobs.
         self._stale_job_threshold: int = 0
+        # job_id -> capture-pinned source blocks of store jobs orphaned by a
+        # cache reset; released when the worker's stale ack drains them (I4).
+        self._stale_capture_blocks: dict[int, list[int]] = {}
         self._jobs: dict[int, TransferJobStatus] = {}
 
         # block_id -> pending store job_ids. Used to track jobs that needs
@@ -626,8 +658,19 @@ class OffloadingConnectorScheduler:
         # protected by their ref_cnt) and for sliding window blocks (which can
         # be freed before a request finishes).
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
+        # Set by the scheduler after the KV cache manager exists: releases the
+        # manager pin on a frozen capture block once its store completed or the
+        # offer was dropped (I4). No-op for block ids the manager never pinned.
+        self._release_boundary_capture: Callable[[int], None] | None = None
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+
+    def bind_boundary_capture_releaser(self, releaser: Callable[[int], None]) -> None:
+        self._release_boundary_capture = releaser
+
+    def _release_capture(self, block_id: int) -> None:
+        if self._release_boundary_capture is not None:
+            self._release_boundary_capture(block_id)
 
     def _maybe_observe_lookup_async_delay(
         self, req_status: RequestOffloadState
@@ -1300,12 +1343,17 @@ class OffloadingConnectorScheduler:
         for req_id, entries in handoffs.items():
             req_status = self._req_status.get(req_id)
             if req_status is None:
+                # Offered after the request's last job drained: nothing will
+                # store these blocks, so drop their capture pins now.
+                for _, block_id, _ in entries:
+                    self._release_capture(block_id)
                 continue
             req = req_status.req
             max_boundary = self._calc_num_offloadable_tokens(req_status, req.num_tokens)
             for group_idx, block_id, boundary in entries:
                 config_idx = config_idx_by_group.get(group_idx)
                 if config_idx is None:
+                    self._release_capture(block_id)
                     continue
                 group_config = self.config.kv_group_configs[config_idx]
                 if (
@@ -1313,6 +1361,7 @@ class OffloadingConnectorScheduler:
                     or boundary > max_boundary
                     or boundary % group_config.tokens_per_chunk != 0
                 ):
+                    self._release_capture(block_id)
                     continue
 
                 key = self._make_boundary_key(req, group_idx, boundary)
@@ -1321,8 +1370,12 @@ class OffloadingConnectorScheduler:
                     self._connector_stats.increase_counter(
                         _ConnectorMetricName.ALLOCATION_FAILURE
                     )
+                    self._release_capture(block_id)
                     continue
                 if not store_output.keys_to_store:
+                    # Deduped: the CPU tier already holds this key (an
+                    # earlier producer stored it). No DMA is submitted.
+                    self._release_capture(block_id)
                     continue
 
                 job_id = self._generate_job_id()
@@ -1408,6 +1461,10 @@ class OffloadingConnectorScheduler:
                 and block_idx >= len(group_states[group.group_idx].block_ids)
                 for group in self.config.kv_group_configs
             ):
+                # Abandoned hand-off: drop capture pins among the CoW sources
+                # (no-op for table blocks), mirroring the aligned builder.
+                for block_id in cow_blocks.values():
+                    self._release_capture(block_id)
                 continue
             keys = [
                 self._make_boundary_key(req, group.group_idx, boundary)
@@ -1426,8 +1483,14 @@ class OffloadingConnectorScheduler:
                 self._connector_stats.increase_counter(
                     _ConnectorMetricName.ALLOCATION_FAILURE
                 )
+                for block_id in cow_blocks.values():
+                    self._release_capture(block_id)
                 continue
             if not store_output.keys_to_store:
+                # Deduped: the CPU tier already holds these keys; no DMA is
+                # submitted, so any capture-sourced CoW pin drops here.
+                for block_id in cow_blocks.values():
+                    self._release_capture(block_id)
                 continue
 
             for group_config, key in zip(self.config.kv_group_configs, keys):
@@ -1930,6 +1993,18 @@ class OffloadingConnectorScheduler:
                     job_id,
                     self._stale_job_threshold,
                 )
+                # The release loop below never runs for this orphan: drain its
+                # recorded capture pins, skipping blocks a live (post-reset)
+                # job now fences — block ids are reused across resets.
+                stale_blocks = self._stale_capture_blocks.pop(job_id, ())
+                if stale_blocks:
+                    live_fenced: set[int] = set()
+                    for job in self._jobs.values():
+                        live_fenced.update(job.fenced_block_ids or ())
+                        live_fenced.update(job.deferred_fence_block_ids or ())
+                    for block_id in stale_blocks:
+                        if block_id not in live_fenced:
+                            self._release_capture(block_id)
                 continue
             job_status = self._jobs[job_id]
             job_status.pending_count -= count
@@ -1940,6 +2015,11 @@ class OffloadingConnectorScheduler:
             req_status = self._req_status[job_status.req_id]
             if job_status.is_store:
                 self.manager.complete_store(job_status.keys, req_status.req_context)
+                # Every worker's D2H read of the source blocks is done (I4):
+                # release the manager pin on any frozen capture sources.
+                # No-op for block ids the manager never pinned.
+                for block_id in job_status.fenced_block_ids or ():
+                    self._release_capture(block_id)
             else:
                 self.manager.complete_load(job_status.keys, req_status.req_context)
                 if self._chunks_being_loaded:
@@ -2058,6 +2138,15 @@ class OffloadingConnectorScheduler:
 
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter
+        # Stale acks skip the release loop; record orphaned store fences so a
+        # reset that bypassed the manager's release-all can't leak pins (I4).
+        self._stale_capture_blocks.update(
+            {
+                job_id: list(job.fenced_block_ids)
+                for job_id, job in self._jobs.items()
+                if job.is_store and job.fenced_block_ids
+            }
+        )
         self._jobs.clear()
         self._block_id_to_pending_jobs.clear()
 
