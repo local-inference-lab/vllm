@@ -127,6 +127,11 @@ class InputBatch:
     # from dummy query lengths: a mixed graph may be captured with uniform rows.
     uniform_decode_graph: bool = False
 
+    # Dummy batch for any CUDA graph capture, FULL or PIECEWISE. Operations
+    # recorded inside a PIECEWISE graph must size their metadata for every
+    # replay, not for the dummy sequence lengths.
+    cudagraph_capture: bool = False
+
     @classmethod
     def make_dummy(
         cls,

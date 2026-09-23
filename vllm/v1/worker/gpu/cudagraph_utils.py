@@ -1087,6 +1087,7 @@ def prepare_inputs_to_capture(
         input_batch = pcp_manager.prepare_inputs_to_capture(input_batch)
 
     input_batch.uniform_decode_graph = full_cudagraph and uniform_decode_graph
+    input_batch.cudagraph_capture = True
 
     block_table_provider = pcp_manager or block_tables
     input_block_tables = block_table_provider.get_dummy_block_tables(num_reqs)
