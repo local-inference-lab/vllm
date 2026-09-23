@@ -17,6 +17,9 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.parallel_state import (
+    declare_b12x_fused_allreduce_rms_norm_sites,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -494,6 +497,21 @@ class DFlashQwen3Model(nn.Module):
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
+        )
+        # Residual RMSNorms fed by a TP all-reduce: post-attention norms, input
+        # norms of layers 1.., and the final norm.
+        fused_norms = []
+        for i, layer in enumerate(self.layers):
+            fused_norms.append(
+                (f"layers.{i}.post_attention_layernorm", layer.post_attention_layernorm)
+            )
+            if i > 0:
+                fused_norms.append(
+                    (f"layers.{i}.input_layernorm", layer.input_layernorm)
+                )
+        fused_norms.append(("norm", self.norm))
+        declare_b12x_fused_allreduce_rms_norm_sites(
+            self, fused_norms, self.config.hidden_size, "dflash"
         )
         # The context projection concatenates K/V weights from every draft
         # layer. It is not a LinearBase module because its output layout is a
