@@ -4777,3 +4777,118 @@ class TestMambaHybridOffloadServing:
             False,
         ]
         assert self._roundtrip_served_tokens(scheduler) == 16
+
+
+def _make_capture_hybrid_scheduler():
+    """OffloadingConnector scheduler over an align-Mamba hybrid whose mamba
+    group declares frozen boundary capture (the serve gate opens)."""
+    from dataclasses import replace
+
+    vllm_config = _make_vllm_config()
+    vllm_config.speculative_config = None
+    kv_cache_config = _make_mamba_hybrid_kv_cache_config()
+    kv_cache_config = replace(
+        kv_cache_config,
+        kv_cache_groups=[
+            kv_cache_config.kv_cache_groups[0],
+            KVCacheGroupSpec(
+                ["mamba_layer"],
+                replace(
+                    kv_cache_config.kv_cache_groups[1].kv_cache_spec,
+                    boundary_capture=True,
+                ),
+            ),
+        ],
+    )
+    spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+    return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+
+
+def test_external_hit_served_when_capture_enabled():
+    """An align-Mamba deployment whose groups declare frozen boundary capture
+    extends external hits to the deepest boundary every group keys, instead of
+    zeroing them."""
+    scheduler = _make_capture_hybrid_scheduler()
+
+    request = _make_partial_tail_request(scheduler)
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+    tokens, load_async = scheduler.get_num_new_matched_tokens(request, 0)
+    assert tokens > 0 and load_async
+
+
+def test_hit_gate_extends_to_keyed_boundary():
+    """With capture enabled the hit ends at the deepest boundary every group
+    keys. The mamba group participates with a one-chunk window over its
+    boundary key: with only its first chunk stored, the hit stops at one
+    chunk -- it is neither zeroed nor extended past the stored key.
+    """
+    scheduler = _make_capture_hybrid_scheduler()
+    request = _make_partial_tail_request(scheduler)
+    req_status = scheduler._req_status["req"]
+    req_status.num_locally_computed_tokens = 0
+    req_status.update_offload_keys()
+
+    # Store only chunk 0 of every group (attention keys h0, mamba state key
+    # at the first chunk end).
+    stored = {state.offload_keys[0] for state in req_status.group_states}
+
+    def _lookup(key, req_context):
+        return LookupResult.HIT if key in stored else LookupResult.MISS
+
+    scheduler.manager.lookup.side_effect = _lookup
+    tokens, load_async = scheduler.get_num_new_matched_tokens(request, 0)
+    assert tokens == 16 and load_async  # one chunk of 16 tokens, not 0
+
+
+def test_capture_pin_released_on_store_ack_and_on_drop():
+    """The connector releases the manager pin on the capture block when the
+    store job completes, and on every offer-skip path (unknown request,
+    save-window filter, dedup)."""
+    scheduler = _make_capture_hybrid_scheduler()
+    released: list[int] = []
+    scheduler.bind_boundary_capture_releaser(released.append)
+    _make_partial_tail_request(scheduler)
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    # Boundary beyond the save window is filtered -> pin dropped immediately.
+    jobs = scheduler._build_aligned_boundary_store_jobs({"req": [(1, 77, 10 ** 6)]})
+    assert jobs == {}
+    assert released == [77]
+
+    # Accepted offer -> job created; the ack releases the pin.
+    jobs = scheduler._build_aligned_boundary_store_jobs({"req": [(1, 88, 16)]})
+    [job_id] = jobs
+    assert released == [77]  # not before the workers report completion
+    output = KVConnectorOutput(
+        kv_connector_worker_meta=OffloadingWorkerMetadata(
+            completed_jobs={job_id: scheduler.config.num_workers}
+        )
+    )
+    req_status = scheduler._req_status["req"]
+    req_status.finished_signaled = True  # keep _req_status alive for the ack
+    scheduler.update_connector_output(output)
+    assert released == [77, 88]
+
+    # Unknown request drains its offers too.
+    jobs = scheduler._build_aligned_boundary_store_jobs({"ghost": [(1, 99, 16)]})
+    assert jobs == {}
+    assert released == [77, 88, 99]
+
+
+def test_capture_offer_skips_stores_release_pins():
+    """prepare_store allocation failure and dedup (key already stored) both
+    drop the pin: no job will ever read the capture block."""
+    scheduler = _make_capture_hybrid_scheduler()
+    released: list[int] = []
+    scheduler.bind_boundary_capture_releaser(released.append)
+    _make_partial_tail_request(scheduler)
+
+    scheduler.manager.prepare_store.return_value = None
+    assert scheduler._build_aligned_boundary_store_jobs({"req": [(1, 42, 16)]}) == {}
+    assert released == [42]
+
+    scheduler.manager.prepare_store.return_value = generate_store_output([])
+    assert scheduler._build_aligned_boundary_store_jobs({"req": [(1, 43, 16)]}) == {}
+    assert released == [42, 43]

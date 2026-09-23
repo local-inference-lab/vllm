@@ -1095,6 +1095,10 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
+        # Capture pins are not request-owned; the pool reset releases them
+        # even while stores are still pending.
+        for mgr in self.coordinator.single_type_managers:
+            mgr.release_all_boundary_captures()
         if not self.coordinator.reset_prefix_cache():
             return False
         if self.log_stats:
@@ -1348,6 +1352,16 @@ class KVCacheManager:
                     (group_id, block.block_id, boundary_tokens)
                 )
         return offloads
+
+    def release_boundary_capture(self, block_id: int) -> None:
+        """Release a frozen capture block's manager pin (store ack / drop).
+
+        Only the Mamba manager that pinned ``block_id`` acts; the call is a
+        no-op for every other manager and for block ids never pinned, so a
+        connector may pass it fenced ids from any store kind.
+        """
+        for mgr in self.coordinator.single_type_managers:
+            mgr.release_boundary_capture(block_id)
 
     def finalize_partial_tail_offloads(
         self, request: Request
