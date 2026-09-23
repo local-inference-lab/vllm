@@ -66,6 +66,22 @@ def test_mark_b12x_eager_shapes_covers_encoder_and_connector_profile_shapes(
         assert all(module.b12x_eager_only for module in connector.modules())
 
 
+def test_mark_b12x_eager_shapes_skips_missing_vision_stage() -> None:
+    from vllm.model_executor.models.utils import StageMissingLayer
+    from vllm.model_executor.warmup.b12x_prepare import mark_b12x_eager_shapes
+
+    model = nn.Module()
+    model.visual = StageMissingLayer("vision_tower")
+    model.get_mm_lora_token_counts = lambda **kwargs: (1, 1)
+    model.get_mm_mapping = lambda: SimpleNamespace(connector=("visual.merger",))
+    worker = SimpleNamespace(
+        get_model=lambda: model,
+        model_runner=SimpleNamespace(mm_registry=object()),
+    )
+
+    mark_b12x_eager_shapes(worker)
+
+
 def test_b12x_workload_covers_target_and_draft_profile_shapes() -> None:
     from vllm.model_executor.warmup.b12x_prepare import b12x_workload
 
