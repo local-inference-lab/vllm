@@ -1,0 +1,21 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-871",
+  "category": "feature",
+  "summary": "Serve MiMo V2 decode and speculative verify through b12x paged_decode",
+  "models": [
+    "XiaomiMiMo/MiMo-V2.6-Flash-RL",
+    "XiaomiMiMo/MiMo-V2.6-Pro-RL"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "The B12X backend serves DiffKV layers and non-causal FP8-KV drafter layers through b12x paged_decode, including ragged adaptive-verification batches, and appends their KV through the same plan.",
+    "Other layer geometries keep their existing B12X paths (VLLM_B12X_PAGED_DECODE=auto)."
+  ],
+  "pull_requests": [
+    871
+  ],
+  "requires": [
+    "b12x-420"
+  ]
+}
