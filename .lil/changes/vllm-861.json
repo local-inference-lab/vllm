@@ -2,11 +2,12 @@
   "schema": "local-inference-release-change/v1",
   "id": "vllm-861",
   "category": "fix",
-  "summary": "Keep Qwen QSA DCP top-k selection in a stable order",
-  "models": ["Qwen3.8-Flash-Next"],
-  "compatibility": "No user action required.",
+  "summary": "Keep DCP top-k attention selection in a stable order",
+  "models": ["Qwen3.8-Flash-Next", "GLM-5.3-Flash", "DeepSeek-V4-Flash", "DeepSeek-V4.1-Flash"],
+  "compatibility": "No user action required. Only decode context parallelism (DCP > 1) is affected.",
   "details": [
-    "DCP candidate compaction preserves the selected order instead of depending on atomic arrival order."
+    "DCP candidate compaction preserves the selected order instead of depending on atomic arrival order.",
+    "The merge kernel is shared by the Qwen QSA, GLM and DeepSeek sparse indexers."
   ],
   "pull_requests": [861]
 }
