@@ -1,0 +1,17 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-877",
+  "category": "performance",
+  "summary": "Shard the DFlash context projection and optionally draft per vocab shard at TP > 1",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "The DFlash context projection is column-parallel at TP > 1 (bit-identical output, 1/tp of the weight per rank).",
+    "VLLM_DFLASH_VOCAB_PARALLEL_DRAFT=1 samples probabilistic drafts per vocab shard with identical draws and verification, without the draft-logits all-gather. Default off."
+  ],
+  "pull_requests": [
+    877
+  ]
+}
