@@ -207,6 +207,7 @@ class DFlashQwen3Attention(nn.Module):
         rms_norm_eps: float = 1e-06,
         attention_bias: bool = False,
         add_swa_attention_sink_bias: bool = False,
+        v_scale: float | None = None,
         sliding_window: int | None = None,
         causal: bool = False,
         is_neox_style: bool = True,
@@ -232,6 +233,7 @@ class DFlashQwen3Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
+        self.v_scale = v_scale
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -305,6 +307,8 @@ class DFlashQwen3Attention(nn.Module):
 
         q, k = self.rotary_emb(positions, q, k)
 
+        if self.v_scale is not None:
+            v = v * self.v_scale
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
@@ -353,6 +357,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             attention_bias=getattr(config, "attention_bias", False),
             add_swa_attention_sink_bias=add_swa_attention_sink_bias,
+            v_scale=dflash_config.get("attention_value_scale"),
             sliding_window=sliding_window,
             causal=causal,
             is_neox_style=is_neox_style,
@@ -751,6 +756,10 @@ class DFlashQwen3Model(nn.Module):
 
         if context_slot_mapping is None:
             return
+
+        v_scale = getattr(self.layers[0].self_attn, "v_scale", None)
+        if v_scale is not None:
+            all_v.mul_(v_scale)
 
         # --- Per-layer cache insert ---
         all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
