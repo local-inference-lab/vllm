@@ -172,6 +172,7 @@ if TYPE_CHECKING:
     VLLM_RUST_FRONTEND_PATH: str | None = "auto"
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
+    VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS: bool = False
     VLLM_MLA_DISABLE: bool = False
     VLLM_K3_DENSE_MLA_PARTIAL_DTYPE: Literal["bf16", "fp32"] = "bf16"
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
@@ -1506,6 +1507,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TTFT and overall throughput.
     "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE": lambda: int(
         os.getenv("VLLM_V1_OUTPUT_PROC_CHUNK_SIZE", "128")
+    ),
+    # Let a scheduling step with no runnable decode use the full
+    # max_num_batched_tokens for prefill instead of max_num_scheduled_tokens,
+    # which only exists to keep decode streams moving.
+    "VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS": lambda: (
+        os.getenv("VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS", "0") == "1"
     ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
