@@ -1,6 +1,6 @@
 {
   "schema": "local-inference-release-change/v1",
-  "id": "vllm-contended-prefill-quantum-20260923",
+  "id": "vllm-862",
   "category": "performance",
   "summary": "Optionally bound prefill work per compute-share step under decode load",
   "models": ["all"],
@@ -8,5 +8,5 @@
   "details": [
     "A new step-token limit applies only when prefill and decode contend; the default leaves scheduling unchanged."
   ],
-  "authors": ["yatesdr"]
+  "pull_requests": [862]
 }
