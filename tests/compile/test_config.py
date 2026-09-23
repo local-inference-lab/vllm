@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
 from contextlib import nullcontext
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -507,13 +507,17 @@ def _mock_config_for_cudagraph_sizes(
     max_num_batched_tokens: int,
     compilation_config: CompilationConfig,
     num_speculative_tokens_per_batch_size: list[tuple[int, int, int]] | None = None,
+    adaptive_speculative_tokens_window: int | None = None,
 ) -> MagicMock:
     """Mock VllmConfig wired up enough to run `_set_cudagraph_sizes`.
 
     `num_speculative_tokens` and `uniform_decode_query_len` are filled in by
     calling the real property functions, so the tests below cover the
     derivation from `speculative_config` and not just the arithmetic
-    downstream of it.
+    downstream of it. The dynamic-SD predicates are the real
+    `SpeculativeConfig` methods bound to the namespace for the same reason:
+    a stand-in that answered from the schedule alone hid the acceptance-only
+    startup assertion.
     """
     config = MagicMock(spec=VllmConfig)
     config.compilation_config = compilation_config
@@ -526,16 +530,27 @@ def _mock_config_for_cudagraph_sizes(
     config.model_config.enforce_eager = False
     config.performance_mode = None
     config.diffusion_config = None
-    schedule = num_speculative_tokens_per_batch_size
-    config.speculative_config = (
-        SimpleNamespace(
+    if num_speculative_tokens:
+        speculative_config = SimpleNamespace(
             num_speculative_tokens=num_speculative_tokens,
-            num_speculative_tokens_per_batch_size=schedule,
-            uses_dynamic_speculative_decoding=lambda: schedule is not None,
+            num_speculative_tokens_per_batch_size=(
+                num_speculative_tokens_per_batch_size
+            ),
+            adaptive_speculative_tokens_window=adaptive_speculative_tokens_window,
         )
-        if num_speculative_tokens
-        else None
-    )
+        for name in (
+            "uses_batch_size_dynamic_speculative_decoding",
+            "uses_acceptance_length_adaptation",
+            "uses_dynamic_speculative_decoding",
+        ):
+            setattr(
+                speculative_config,
+                name,
+                MethodType(getattr(SpeculativeConfig, name), speculative_config),
+            )
+        config.speculative_config = speculative_config
+    else:
+        config.speculative_config = None
     config.num_speculative_tokens = VllmConfig.num_speculative_tokens.fget(config)
     config.uniform_decode_query_len = VllmConfig.uniform_decode_query_len.fget(config)
     return config
@@ -866,6 +881,70 @@ def test_default_cudagraph_capture_sizes_cover_every_dynamic_decode_width():
     # The wide tier only ever runs to a batch of 16, the narrow one to 128.
     assert _widest_covered_request_count(sizes, 17, 128) >= 16
     assert _widest_covered_request_count(sizes, 3, 128) == 128
+
+
+@pytest.mark.parametrize("max_num_seqs", [16, 64])
+def test_acceptance_only_adaptation_sizes_like_fixed_depth(max_num_seqs):
+    """Acceptance-length adaptation alone must not assert at startup.
+
+    With `adaptive_speculative_tokens_window` set and no batch-size schedule,
+    `uses_dynamic_speculative_decoding()` is true but there is no schedule to
+    read tiers from. The controller narrows the whole batch to a depth of
+    1..num_speculative_tokens. Keep the fixed-depth grid; the manager derives
+    narrower-width graphs from these sizes, with fallback if none fits.
+    """
+    num_speculative_tokens = 7
+    sizes_by_window = {}
+    for window in (None, 32):
+        compilation_config = CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE
+        )
+        config = _mock_config_for_cudagraph_sizes(
+            max_num_seqs=max_num_seqs,
+            num_speculative_tokens=num_speculative_tokens,
+            max_num_batched_tokens=8192,
+            compilation_config=compilation_config,
+            adaptive_speculative_tokens_window=window,
+        )
+        assert config.speculative_config.uses_dynamic_speculative_decoding() is (
+            window is not None
+        )
+
+        VllmConfig._set_cudagraph_sizes(config)
+
+        sizes_by_window[window] = compilation_config.cudagraph_capture_sizes
+
+    assert sizes_by_window[32] == sizes_by_window[None]
+    for query_len in range(2, num_speculative_tokens + 2):
+        assert (
+            _widest_covered_request_count(sizes_by_window[32], query_len, max_num_seqs)
+            == max_num_seqs
+        )
+
+
+def test_schedule_with_acceptance_adaptation_keeps_schedule_tiers():
+    """A batch-size schedule still defines the tiers when adaptation is on."""
+    sizes = []
+    for window in (None, 32):
+        compilation_config = CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE
+        )
+        config = _mock_config_for_cudagraph_sizes(
+            max_num_seqs=128,
+            num_speculative_tokens=16,
+            max_num_batched_tokens=32768,
+            compilation_config=compilation_config,
+            num_speculative_tokens_per_batch_size=[(1, 16, 16), (17, 128, 2)],
+            adaptive_speculative_tokens_window=window,
+        )
+
+        VllmConfig._set_cudagraph_sizes(config)
+
+        sizes.append(compilation_config.cudagraph_capture_sizes)
+
+    assert sizes[0] == sizes[1]
+    assert _widest_covered_request_count(sizes[1], 17, 128) >= 16
+    assert _widest_covered_request_count(sizes[1], 3, 128) == 128
 
 
 def test_dynamic_decode_capture_clamps_configured_width():
