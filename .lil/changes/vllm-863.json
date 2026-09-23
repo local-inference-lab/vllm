@@ -1,6 +1,6 @@
 {
   "schema": "local-inference-release-change/v1",
-  "id": "vllm-qwen38-missing-vision-warmup-20260923",
+  "id": "vllm-863",
   "category": "fix",
   "summary": "Start Qwen without a loaded vision stage during B12X warmup",
   "models": ["Qwen3.8-Flash-Next"],
@@ -8,5 +8,5 @@
   "details": [
     "Warmup skips a missing multimodal stage rather than treating its placeholder as a vision module."
   ],
-  "authors": ["yatesdr"]
+  "pull_requests": [863]
 }
