@@ -99,6 +99,31 @@ def test_prefill_compute_share_cli_accepts_auto():
     assert engine_args.prefill_compute_share == "auto"
 
 
+def test_prefill_compute_token_cap_cli_contract():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    namespace = parser.parse_args(
+        [
+            "--prefill-compute-share",
+            "auto",
+            "--max-num-prefill-tokens-per-step",
+            "3008",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(namespace)
+
+    assert engine_args.max_num_prefill_tokens_per_step == 3008
+
+
+def test_prefill_compute_token_cap_requires_compute_share():
+    with pytest.raises(ValueError, match="requires prefill_compute_share"):
+        SchedulerConfig(
+            max_model_len=128,
+            is_encoder_decoder=False,
+            max_num_prefill_tokens_per_step=4,
+        )
+
+
 def test_prefill_interleave_cli_contract():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
 
@@ -445,6 +470,47 @@ def test_prefill_fcfs_and_capacity_bound_does_not_bypass_share(opt_model_path):
     assert second in scheduler.waiting
 
 
+def test_fairness_prefill_token_cap_applies_only_under_contention(
+    opt_model_path,
+):
+    scheduler = _create_fair_scheduler(
+        opt_model_path,
+        max_num_batched_tokens=16,
+        max_model_len=128,
+        max_num_prefill_tokens_per_step=4,
+    )
+    _establish_decode(scheduler)
+    (prefill,) = create_requests(
+        num_requests=1,
+        num_tokens=32,
+        req_ids=["prefill"],
+    )
+    scheduler.add_request(prefill)
+
+    decode_output = scheduler.schedule()
+    scheduler.record_compute_time("decode", 0.01, contended=True)
+    _update(scheduler, decode_output)
+    prefill_output = scheduler.schedule()
+
+    assert prefill_output.compute_service_class == "prefill"
+    assert prefill_output.num_scheduled_tokens == {prefill.request_id: 4}
+
+    uncontended = _create_fair_scheduler(
+        opt_model_path,
+        max_num_batched_tokens=16,
+        max_model_len=128,
+    )
+    (only_prefill,) = create_requests(
+        num_requests=1,
+        num_tokens=32,
+        req_ids=["only-prefill"],
+    )
+    uncontended.add_request(only_prefill)
+
+    output = uncontended.schedule()
+    assert output.num_scheduled_tokens == {only_prefill.request_id: 16}
+
+
 def test_running_prefills_retain_fcfs_order(opt_model_path):
     scheduler = _create_fair_scheduler(
         opt_model_path,
@@ -509,11 +575,14 @@ def test_prefill_turn_falls_back_when_prefill_is_alignment_blocked(
     assert output.num_scheduled_tokens == {"decode": 1}
 
 
-def test_decode_turn_falls_back_when_decode_is_no_longer_runnable(opt_model_path):
+def test_decode_turn_falls_back_when_decode_is_no_longer_runnable(
+    opt_model_path,
+):
     scheduler = _create_fair_scheduler(
         opt_model_path,
         max_num_batched_tokens=16,
         max_model_len=128,
+        max_num_prefill_tokens_per_step=4,
     )
     decode = _establish_decode(scheduler)
     # Model the async guard that can make a coarsely eligible decode unable to
@@ -531,7 +600,7 @@ def test_decode_turn_falls_back_when_decode_is_no_longer_runnable(opt_model_path
     output = scheduler.schedule()
 
     assert output.compute_service_class == "prefill"
-    assert output.num_scheduled_tokens == {prefill.request_id: 16}
+    assert output.num_scheduled_tokens == {prefill.request_id: 4}
 
 
 def test_decode_turn_falls_back_to_running_prefill(opt_model_path):
@@ -540,6 +609,7 @@ def test_decode_turn_falls_back_to_running_prefill(opt_model_path):
         max_num_batched_tokens=16,
         max_model_len=128,
         long_prefill_token_threshold=8,
+        max_num_prefill_tokens_per_step=4,
     )
     decode = _establish_decode(scheduler)
     (prefill,) = create_requests(
@@ -562,7 +632,7 @@ def test_decode_turn_falls_back_to_running_prefill(opt_model_path):
     fallback_output = scheduler.schedule()
 
     assert fallback_output.compute_service_class == "prefill"
-    assert fallback_output.num_scheduled_tokens == {prefill.request_id: 8}
+    assert fallback_output.num_scheduled_tokens == {prefill.request_id: 4}
 
 
 def test_full_apc_hit_is_decode_not_prefill(opt_model_path):
