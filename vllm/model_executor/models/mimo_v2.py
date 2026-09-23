@@ -51,6 +51,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.model_executor.weight_transfer import copy_weight, materialize_weight
 from vllm.sequence import IntermediateTensors
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -230,6 +231,7 @@ class MiMoV2Attention(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         partial_rotary_factor: float = 1.0,
+        fused_qkv_chunks: int = 0,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -256,16 +258,38 @@ class MiMoV2Attention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=attention_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
-            v_head_size=self.v_head_dim,
+        # A fused-QKV checkpoint stores ``fused_qkv_chunks`` [Q | K | V]
+        # chunks; see _fused_qkv_kv_chunk_rows for the rank layout.
+        self.kv_chunk_rows = _fused_qkv_kv_chunk_rows(
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            self.v_head_dim,
+            tp_size,
+            fused_qkv_chunks,
         )
+        if self.kv_chunk_rows:
+            self.qkv_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [
+                    self.total_num_heads * self.head_dim,
+                    fused_qkv_chunks * self.kv_chunk_rows,
+                ],
+                bias=attention_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=attention_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+                v_head_size=self.v_head_dim,
+            )
 
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.v_head_dim,
@@ -342,7 +366,9 @@ class MiMoV2Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        q, k, v = _split_qkv(
+            qkv, self.q_size, self.k_size, self.v_size, self.kv_chunk_rows
+        )
         q, k = self.rotary_emb(positions, q, k)
 
         # Apply v_scale before attention
@@ -370,6 +396,12 @@ class MiMoV2FlashDecoderLayer(nn.Module):
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
 
         v_scale = getattr(config, "attention_value_scale", None)
+        fused_qkv_chunks = (
+            config.num_key_value_heads
+            if getattr(config, "attention_projection_layout", None) == "fused_qkv"
+            and getattr(quant_config, "weight_block_size", None)
+            else 0
+        )
 
         if self.is_compressed_softmax_layer():
             self.self_attn = MiMoV2Attention(
@@ -389,6 +421,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
                 max_position_embeddings=max_position_embeddings,
                 quant_config=quant_config,
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
+                fused_qkv_chunks=fused_qkv_chunks,
                 prefix=f"{prefix}.self_attn",
             )
         else:
@@ -406,6 +439,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
                 max_position_embeddings=max_position_embeddings,
                 quant_config=quant_config,
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
+                fused_qkv_chunks=fused_qkv_chunks,
                 prefix=f"{prefix}.self_attn",
             )
 
@@ -462,6 +496,54 @@ class MiMoV2FlashDecoderLayer(nn.Module):
         return self.config.hybrid_layer_pattern[self.layer_id] == 1
 
 
+def _fused_qkv_kv_chunk_rows(
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    v_head_dim: int,
+    tp_size: int,
+    checkpoint_tp_size: int,
+    block: int = 128,
+) -> int:
+    """Rows per checkpoint chunk of a rank's ``K | V`` fused-QKV section.
+
+    Returns 0 when the de-interleaved ``[Q | K | V]`` rank layout is exact:
+    a rank owns at most one checkpoint chunk, or every chunk's Q, K and V
+    rows span whole FP8 scale blocks, so the layout is a block permutation.
+
+    Otherwise, when a rank owns several chunks whose K and V rows share a
+    scale block (MiMo global layers: 192 K + 128 V rows), the rank keeps each
+    chunk's K and V rows together, zero-padded to whole blocks, so every row
+    keeps its checkpoint scale:
+
+        [Q_1 | ... | Q_g | K_1 V_1 pad | ... | K_g V_g pad]
+
+    and this returns the padded ``K | V`` rows per chunk.
+    """
+    if checkpoint_tp_size <= tp_size or checkpoint_tp_size % tp_size:
+        return 0
+    q_rows = num_heads // checkpoint_tp_size * head_dim
+    k_rows = num_kv_heads // checkpoint_tp_size * head_dim
+    v_rows = num_kv_heads // checkpoint_tp_size * v_head_dim
+    if q_rows % block or (k_rows % block == 0 and v_rows % block == 0):
+        return 0
+    return cdiv(k_rows + v_rows, block) * block
+
+
+def _split_qkv(
+    qkv: torch.Tensor, q_size: int, k_size: int, v_size: int, kv_chunk_rows: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split a rank's fused QKV output (see _fused_qkv_kv_chunk_rows)."""
+    if not kv_chunk_rows:
+        return qkv.split([q_size, k_size, v_size], dim=-1)
+    q, kv = qkv.split([q_size, qkv.shape[-1] - q_size], dim=-1)
+    kv = kv.unflatten(-1, (-1, kv_chunk_rows))
+    k_rows, v_rows = k_size // kv.shape[-2], v_size // kv.shape[-2]
+    k = kv[..., :k_rows].flatten(-2)
+    v = kv[..., k_rows : k_rows + v_rows].flatten(-2)
+    return q, k, v
+
+
 def _shard_fp8_qkv_proj(
     w_full: torch.Tensor,
     s_full: torch.Tensor,
@@ -473,6 +555,7 @@ def _shard_fp8_qkv_proj(
     tp_size: int,
     checkpoint_tp_size: int,
     block: int = 128,
+    kv_chunk_rows: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Shard the fp8 qkv_proj weights for ``tp_rank``.
 
@@ -488,13 +571,13 @@ def _shard_fp8_qkv_proj(
         [Q_1 | Q_2 | ... | Q_g | K_1 | K_2 | ... | K_g | V_1 | V_2 | ... | V_g]
 
     When ``g == 1`` the rank's slice is already ``[Q | K | V]``, so a plain
-    chunk suffices. When ``g > 1`` we cannot reach the de-interleaved layout by
-    re-permuting the fp8 block scales: each scale covers a 128-row block, and
-    since K is 192 rows (1.5 blocks) a block straddles the K/V boundary, so no
-    whole-block permutation produces it. Instead we dequantize this rank's
-    groups to float (dropping the block constraint), reorder the rows into the
-    layout above (Q, K, and V then each span a whole number of blocks), and
-    re-quantize to fp8.
+    chunk suffices. When Q, K and V each span whole 128-row scale blocks, the
+    layout above is a block permutation of the checkpoint and is exact. When
+    a block straddles the K/V boundary (a 192-row K is 1.5 blocks), the rank
+    uses the padded ``[Q_1 | ... | Q_g | K_1 V_1 pad | ... | K_g V_g pad]``
+    layout of ``_fused_qkv_kv_chunk_rows`` instead (``kv_chunk_rows``), again
+    exact. Only when neither applies do we dequantize this rank's groups to
+    float, reorder the rows into the layout above, and re-quantize to fp8.
     """
     assert checkpoint_tp_size % tp_size == 0, (
         "TP size must evenly split the checkpoint TP size."
@@ -516,8 +599,42 @@ def _shard_fp8_qkv_proj(
     scale_rows_per_group = (rows_per_group + block - 1) // block
     assert w_full.shape[0] == rows_per_group * checkpoint_tp_size
     assert s_full.shape[0] == scale_rows_per_group * checkpoint_tp_size
+    groups = range(tp_rank * groups_per_rank, (tp_rank + 1) * groups_per_rank)
+    q_end = q_rows_per_group
+    k_end = q_end + k_rows_per_group
+    if kv_chunk_rows or all(
+        n % block == 0 for n in (q_rows_per_group, k_rows_per_group, v_rows_per_group)
+    ):
+        # Exact: every row keeps its checkpoint FP8 value and block scale.
+        def rows(g: int, start: int, stop: int) -> torch.Tensor:
+            base = g * rows_per_group
+            return materialize_weight(w_full[base + start : base + stop])
+
+        def scales(g: int, start: int, stop: int) -> torch.Tensor:
+            base = g * scale_rows_per_group
+            return materialize_weight(
+                s_full[base + start // block : base + cdiv(stop, block)]
+            )
+
+        if kv_chunk_rows:
+            pad = kv_chunk_rows - (rows_per_group - q_end)
+            weights = [rows(g, 0, q_end) for g in groups]
+            for g in groups:
+                kv = rows(g, q_end, rows_per_group).view(torch.uint8)
+                zeros = kv.new_zeros((pad, kv.shape[1]))  # FP8 +0.0
+                weights.append(torch.cat([kv, zeros]).view(w_full.dtype))
+            scale_rows = [scales(g, 0, q_end) for g in groups]
+            scale_rows += [scales(g, q_end, rows_per_group) for g in groups]
+        else:
+            segments = ((0, q_end), (q_end, k_end), (k_end, rows_per_group))
+            weights = [rows(g, *seg) for seg in segments for g in groups]
+            scale_rows = [scales(g, *seg) for seg in segments for g in groups]
+        return (
+            torch.cat([w.view(torch.uint8) for w in weights]).view(w_full.dtype),
+            torch.cat(scale_rows),
+        )
     qs, ks, vs = [], [], []
-    for g_idx in range(tp_rank * groups_per_rank, (tp_rank + 1) * groups_per_rank):
+    for g_idx in groups:
         row_start = g_idx * rows_per_group
         scale_row_start = g_idx * scale_rows_per_group
         # Dequantize this group's weights.
@@ -826,6 +943,7 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             tp_rank=tp_rank,
             tp_size=tp_size,
             checkpoint_tp_size=self.config.num_key_value_heads,
+            kv_chunk_rows=getattr(attn, "kv_chunk_rows", 0),
         )
         sharded = {"weight": w_rank, "weight_scale_inv": s_rank}
         for kind, tensor in sharded.items():
