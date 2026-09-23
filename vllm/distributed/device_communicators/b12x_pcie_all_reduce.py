@@ -777,9 +777,13 @@ class B12xPcieAllReduce:
 
     @staticmethod
     def _plan_key(operation, shape, dtype, strides, weight=None, epsilon=None):
-        norm = None if operation == "all_reduce" else (id(weight), epsilon)
-        # Singleton strides do not affect addresses. Trimmed TP projections
-        # can retain a padded row stride when only one logical row is live.
+        # Parameter aliases retain the same storage identity.
+        norm = (
+            None
+            if operation == "all_reduce"
+            else (weight.data_ptr() if weight is not None else None, epsilon)
+        )
+        # Singleton strides do not affect padded TP projection addresses.
         address_strides = tuple(
             0 if size == 1 else stride for size, stride in zip(shape, strides)
         )
