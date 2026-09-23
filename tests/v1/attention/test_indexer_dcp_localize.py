@@ -634,14 +634,9 @@ def test_sparse_decode_dcp_persistent_topk_matches_non_dcp():
     merged_global_topks = _merge_local_topks_global_with_fake_dcp(
         local_logits, local_topks, topk, world, interleave
     )
-    # The radix top-K kernel selects a deterministic SET but writes it in
-    # nondeterministic (atomicAdd) order; the production path is permutation-
-    # invariant (compaction + softmax), so all ranks must agree on the set, not
-    # the array order. (The fp64 fallback happens to return sorted order.)
     ref_topk = merged_global_topks[0]
     for rank_topk in merged_global_topks[1:]:
-        for row in range(rank_topk.shape[0]):
-            assert set(rank_topk[row].tolist()) == set(ref_topk[row].tolist())
+        torch.testing.assert_close(rank_topk, ref_topk, rtol=0, atol=0)
 
     local_outs = []
     local_lses = []
@@ -737,8 +732,49 @@ def test_cutedsl_dcp_candidate_pack_and_select_matches_reference(
         topk,
     )
 
+    repeated = torch.empty_like(actual)
+    stable_topk_from_gathered_candidates_cutedsl(gathered, topk, out=repeated)
+    torch.testing.assert_close(repeated, actual, rtol=0, atol=0)
     for row in range(rows):
         assert set(actual[row].cpu().tolist()) == set(expected[row].cpu().tolist())
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not has_cutedsl(),
+    reason="This test requires CUDA and CuteDSL",
+)
+def test_cutedsl_dcp_select_packs_valid_ids_before_deterministic_padding():
+    from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (
+        stable_topk_from_gathered_candidates_cutedsl,
+    )
+
+    rows = 8
+    topk = 512
+    candidates = topk * 4
+    valid = 37
+    gathered = torch.full(
+        (rows, candidates, 2),
+        -1,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    gathered[..., 0].fill_(float("-inf"))
+    scores = torch.arange(valid, dtype=torch.float32, device="cuda")
+    token_ids = torch.arange(valid, dtype=torch.float32, device="cuda")
+    gathered[:, :valid, 0] = scores
+    gathered[:, :valid, 1] = token_ids
+
+    expected_valid = torch.arange(
+        valid, dtype=torch.int32, device="cuda"
+    ).expand(rows, -1)
+    expected_padding = torch.full(
+        (rows, topk - valid), -1, dtype=torch.int32, device="cuda"
+    )
+    expected = torch.cat((expected_valid, expected_padding), dim=1)
+
+    for _ in range(20):
+        actual = stable_topk_from_gathered_candidates_cutedsl(gathered, topk)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")

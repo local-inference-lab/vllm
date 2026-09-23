@@ -290,6 +290,7 @@ class StableTopKFromGatheredCandidatesKernel(
         @cute.struct
         class SharedStorage:
             hist: cute.struct.MemRange[Int32, hist_bins]
+            selected: cute.struct.MemRange[Int32, compile_key.num_candidates]
             committed_count: cute.struct.MemRange[Int32, 1]
             running_count: cute.struct.MemRange[Int32, 1]
             threshold_bin: cute.struct.MemRange[Int32, 1]
@@ -363,7 +364,6 @@ class StableTopKFromGatheredCandidatesKernel(
         @cute.jit
         def radix_pass(
             keys: cute.Tensor,
-            output: cute.Tensor,
             storage,
             tid: Int32,
             step: Int32,
@@ -371,6 +371,9 @@ class StableTopKFromGatheredCandidatesKernel(
             is_final_pass: bool,
         ):
             hist_smem = storage.hist.get_tensor(cute.make_layout((hist_bins,)))
+            selected_smem = storage.selected.get_tensor(
+                cute.make_layout((compile_key.num_candidates,))
+            )
             committed_count_smem = storage.committed_count.data_ptr()
             running_count_smem = storage.running_count.data_ptr()
             threshold_bin_smem = storage.threshold_bin.data_ptr()
@@ -460,7 +463,8 @@ class StableTopKFromGatheredCandidatesKernel(
                             scope="cta",
                         )
                         if dst < Int32(topk):
-                            output[dst] = recast_val(~Uint32(key), Int32)
+                            candidate = tid + Int32(key_idx * tb_size)
+                            selected_smem[candidate] = Int32(1)
             cute.arch.sync_threads()
 
             pass_finished = include_threshold_bin_smem.load()
@@ -479,13 +483,21 @@ class StableTopKFromGatheredCandidatesKernel(
 
             smem = cutlass.utils.SmemAllocator()
             storage = smem.allocate(shared_storage, 8)
+            selected_smem = storage.selected.get_tensor(
+                cute.make_layout((compile_key.num_candidates,))
+            )
             committed_count_smem = storage.committed_count.data_ptr()
+            running_count_smem = storage.running_count.data_ptr()
             prefix_smem = storage.prefix_s.data_ptr()
+            warp_totals_smem = storage.warp_totals.get_tensor(
+                cute.make_layout((1, warps_per_block))
+            )
             for i in range(tid, topk, tb_size):
                 output_row[i] = Int32(-1)
 
             for key_idx in cutlass.range_constexpr(keys_per_thread):
                 col = tid + Int32(key_idx * tb_size)
+                selected_smem[col] = Int32(0)
                 score = Float32(input_row[col, 0])
                 token_id = Int32(input_row[col, 1])
                 keys[key_idx] = stable_key(score, token_id)
@@ -500,7 +512,6 @@ class StableTopKFromGatheredCandidatesKernel(
             while finished == Int32(0) and step < Int32(radix_passes - 1):
                 finished = radix_pass(
                     keys,
-                    output_row,
                     storage,
                     tid,
                     step,
@@ -512,13 +523,38 @@ class StableTopKFromGatheredCandidatesKernel(
             if finished == Int32(0):
                 radix_pass(
                     keys,
-                    output_row,
                     storage,
                     tid,
                     Int32(radix_passes - 1),
                     final_radix_bits,
                     True,
                 )
+
+            # Keep selected candidates in input order for stable attention sums.
+            if tid == Int32(0):
+                running_count_smem.store(Int32(0))
+            cute.arch.sync_threads()
+            for key_idx in cutlass.range_constexpr(keys_per_thread):
+                col = tid + Int32(key_idx * tb_size)
+                is_selected = selected_smem[col] * (
+                    keys[key_idx] != Uint64(0)
+                ).to(Int32)
+                prefix = block_scan_inclusive_i32(
+                    is_selected,
+                    cute.arch.lane_idx(),
+                    cute.arch.warp_idx(),
+                    warp_totals_smem,
+                    warps_per_block,
+                )
+                base = running_count_smem.load()
+                if is_selected != Int32(0):
+                    output_row[base + prefix - Int32(1)] = recast_val(
+                        ~Uint32(keys[key_idx]), Int32
+                    )
+                cute.arch.sync_threads()
+                if tid == Int32(tb_size - 1):
+                    running_count_smem.store(base + prefix)
+                cute.arch.sync_threads()
 
         @cute.jit
         def host_entrypoint(
