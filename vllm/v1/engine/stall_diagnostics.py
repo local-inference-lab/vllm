@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import traceback
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
@@ -23,6 +24,22 @@ logger = init_logger(__name__)
 
 # Innermost loop-thread frames included in a stall report.
 _STACK_FRAMES = 40
+
+
+class RequestReceipt:
+    """When the API server received an HTTP request and finished reading it."""
+
+    __slots__ = ("received", "body_read")
+
+    def __init__(self, received: float):
+        self.received = received
+        self.body_read: float | None = None
+
+
+# Set by the HTTP receipt middleware for the task that serves the request.
+REQUEST_RECEIPT: ContextVar[RequestReceipt | None] = ContextVar(
+    "vllm_request_receipt", default=None
+)
 
 
 def _clock(timestamp: float) -> str:
@@ -53,6 +70,8 @@ class RequestTimeline:
 
     __slots__ = (
         "request_id",
+        "received",
+        "body_read",
         "arrival",
         "started",
         "processed",
@@ -65,6 +84,10 @@ class RequestTimeline:
 
     def __init__(self, request_id: str, arrival: float | None, started: float):
         self.request_id = request_id
+        receipt = REQUEST_RECEIPT.get()
+        # HTTP receipt and complete request body, when served over HTTP.
+        self.received = receipt.received if receipt is not None else None
+        self.body_read = receipt.body_read if receipt is not None else None
         self.arrival = arrival
         self.started = started
         # Input processing finished and the output collector was created.
@@ -90,25 +113,39 @@ class RequestTimeline:
     def outside_engine(self) -> float:
         """Longest stretch spent outside engine work, in seconds.
 
-        That is rendering until the generator started, input processing plus
-        submission, or the handler taking the final output to the client.
+        That is HTTP receipt (or rendering) until the generator started, input
+        processing plus submission, or the handler taking the final output to
+        the client.
         """
         waits = [0.0]
-        if self.arrival is not None:
-            waits.append(self.started - self.arrival)
+        first = self._origin()
+        waits.append(self.started - first)
         if self.submitted is not None:
             waits.append(self.submitted - self.started)
         if self.final_output is not None and self.closed is not None:
             waits.append(self.closed - self.final_output)
         return max(waits)
 
+    def _origin(self) -> float:
+        for stamp in (self.received, self.arrival):
+            if stamp is not None:
+                return stamp
+        return self.started
+
     def describe(self, outcome: str) -> str:
         """Return a one-line account of every stage the request reached."""
         assert self.closed is not None
-        origin = self.arrival if self.arrival is not None else self.started
+        origin = self._origin()
         parts = [
             f"Request {self.request_id} {outcome} after "
             f"{self.closed - origin:.2f} s (arrived {_clock(origin)})",
+        ]
+        if self.received is not None:
+            parts += [
+                f"HTTP receipt to body read {_span(self.received, self.body_read)}",
+                f"body read to rendering {_span(self.body_read, self.arrival)}",
+            ]
+        parts += [
             f"arrival to generator start {_span(self.arrival, self.started)}",
             f"input processing {_span(self.started, self.processed)}",
             f"engine submission {_span(self.processed, self.submitted)}",
@@ -153,7 +190,7 @@ class RequestTimeline:
             return
         if threshold <= 0:
             return
-        origin = self.arrival if self.arrival is not None else self.started
+        origin = self._origin()
         if self.outside_engine() > threshold or (
             self.first_output is None and self.closed - origin > threshold
         ):
