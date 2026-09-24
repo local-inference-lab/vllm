@@ -74,6 +74,11 @@ class DFlashCudaGraphManager(CudaGraphManager):
     """DFlash CudaGraphManager for the parallel-drafting query forward,
     building its own attention metadata from scratch."""
 
+    def _get_decode_query_lens(self) -> list[int]:
+        # DFlash and DSpark draft a fixed query block even when the target
+        # verifies fewer tokens. Capture must match that fixed forward shape.
+        return [self.decode_query_len]
+
     def capture(
         self,
         forward_fn: Callable,
