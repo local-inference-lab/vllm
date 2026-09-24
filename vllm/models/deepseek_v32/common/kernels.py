@@ -184,8 +184,9 @@ def _fused_norm_rope_kernel(
     if slot_mapping_ptr is None:
         if kv_out_ptr is None and kpe_out_ptr is None and index_k_out_ptr is None:
             return
-    elif tl.load(slot_mapping_ptr + tok_idx) < 0:
-        # Padding
+    elif pid != 2 and tl.load(slot_mapping_ptr + tok_idx) < 0:
+        # A negative DCP slot suppresses rank-local cache writes. Q remains
+        # replicated and must still be computed on every rank.
         return
 
     if pid == 2:
