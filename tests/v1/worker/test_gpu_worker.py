@@ -180,6 +180,23 @@ def test_startup_plan_apply_gate(plan_env):
     assert explicit.cache_config.kv_cache_memory_bytes == 7 * GiB_bytes
 
 
+def test_startup_plan_survives_profiling_config_rewrites(plan_env):
+    """A boot saves under the key computed before profiling, so the next
+    boot finds the plan although profiling rewrote the config (DS4 falls
+    back from FULL_AND_PIECEWISE to FULL_DECODE_ONLY graphs)."""
+    config_hash = ["before-profiling"]
+    first = _plan_worker()
+    first.vllm_config = SimpleNamespace(compute_hash=lambda: config_hash[0])
+    maybe_apply_startup_plan(first)
+    assert first.cache_config.kv_cache_memory_bytes is None
+    config_hash[0] = "after-capture"
+    maybe_save_startup_plan(first, 50 * GiB_bytes)
+
+    second = _plan_worker(config_hash="before-profiling")
+    maybe_apply_startup_plan(second)
+    assert second.cache_config.kv_cache_memory_bytes == 50 * GiB_bytes
+
+
 # Memory accounting of the profiling run (Worker.determine_available_memory).
 
 
