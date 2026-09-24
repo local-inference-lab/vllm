@@ -17,10 +17,11 @@ from vllm.logger import init_logger
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
-    read_flashinfer_autotune_cache,
+    load_autotune_cache_on_all_ranks,
+    rank_union_cache_path,
     resolve_flashinfer_autotune_file,
     save_flashinfer_autotune_cache,
-    write_flashinfer_autotune_cache,
+    save_rank_union_autotune_cache,
 )
 from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     autotune_hisparse_flashinfer_attention,
@@ -397,6 +398,11 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         autotune_kwargs["skip_ops"] = skip_ops
 
     cache_path = resolve_flashinfer_autotune_file(runner)
+    multi_rank = world.world_size > 1
+    if multi_rank:
+        # Keys can be rank-specific (FlashInfer MoE keys include the EP rank),
+        # so multi-rank caches hold every rank's entries under their own name.
+        cache_path = rank_union_cache_path(cache_path)
     if is_leader:
         logger.info_once("Using FlashInfer autotune cache file: %s", cache_path)
 
@@ -405,15 +411,9 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     # which lead to some EP ranks receiving no tokens and skipping their
     # MoE kernel entirely, and cause hang due to all-reduce collective
     # during synchronized autotuning.
-    # Read cached autotune results and broadcast to all ranks.
-    cached_results: bytes | None = None
-    if is_leader:
-        cached_results = read_flashinfer_autotune_cache(cache_path)
-    cached_results = world.broadcast_object(cached_results, src=0)
-    if cached_results is not None:
-        write_flashinfer_autotune_cache(cache_path, cached_results)
-        world.barrier()
-        tuner.load_configs(str(cache_path))
+    # Load the leader's cache on every rank, or on none: a cache hit skips a
+    # profile's all-reduce, so all ranks must make the same hit/miss decisions.
+    load_autotune_cache_on_all_ranks(cache_path, tuner, world)
 
     group = world.cpu_group if world.world_size > 1 else None
     set_autotune_process_group(group)
@@ -435,7 +435,8 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     finally:
         set_autotune_process_group(None)
 
-    if world.world_size > 1:
+    if multi_rank:
         world.barrier()
-    if is_leader:
+        save_rank_union_autotune_cache(cache_path, tuner, world)
+    else:
         save_flashinfer_autotune_cache(cache_path, tuner)
