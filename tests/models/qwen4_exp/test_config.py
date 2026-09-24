@@ -13,6 +13,7 @@ from vllm.model_executor.models.config import (
     Qwen3_5ForConditionalGenerationConfig,
     Qwen4ExpForConditionalGenerationConfig,
 )
+from vllm.models.qwen3_8_flash_next.config import Qwen3_8FlashNextTextConfig
 from vllm.models.qwen4_exp.config import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
@@ -285,3 +286,11 @@ def test_qwen4_exp_model_state_prepares_stable_dummy_ngram_inputs() -> None:
     )
     assert second["query_start_loc"].data_ptr() == query_start_loc_ptr
     assert second["ngram_context"].data_ptr() == ngram_context_ptr
+
+
+@pytest.mark.parametrize("config_cls", [Qwen4ExpTextConfig, Qwen3_8FlashNextTextConfig])
+def test_qwen_text_configs_allow_full_tp_dcp_with_kv_gather(config_cls) -> None:
+    """Qwen3.8 checkpoints declare either qwen4_exp_text or
+    qwen3_8_flash_next_text and load the same model. Both must opt in, or
+    TP4/DCP4 with two KV heads is refused for one spelling only."""
+    assert config_cls.supports_full_tp_dcp_with_kv_gather
