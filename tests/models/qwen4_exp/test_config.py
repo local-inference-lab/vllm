@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from importlib import import_module
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -8,12 +9,12 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from vllm.config import ModelConfig, ParallelConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.models.config import (
     Qwen3_5ForConditionalGenerationConfig,
     Qwen4ExpForConditionalGenerationConfig,
 )
-from vllm.models.qwen3_8_flash_next.config import Qwen3_8FlashNextTextConfig
 from vllm.models.qwen4_exp.config import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
@@ -288,9 +289,30 @@ def test_qwen4_exp_model_state_prepares_stable_dummy_ngram_inputs() -> None:
     assert second["ngram_context"].data_ptr() == ngram_context_ptr
 
 
-@pytest.mark.parametrize("config_cls", [Qwen4ExpTextConfig, Qwen3_8FlashNextTextConfig])
-def test_qwen_text_configs_allow_full_tp_dcp_with_kv_gather(config_cls) -> None:
-    """Qwen3.8 checkpoints declare either qwen4_exp_text or
-    qwen3_8_flash_next_text and load the same model. Both must opt in, or
-    TP4/DCP4 with two KV heads is refused for one spelling only."""
-    assert config_cls.supports_full_tp_dcp_with_kv_gather
+@pytest.mark.parametrize(
+    ("model_type", "architecture"),
+    [
+        ("qwen4_exp", "Qwen4ExpForConditionalGeneration"),
+        ("qwen3_8_flash_next", "Qwen3_8FlashNextForConditionalGeneration"),
+    ],
+)
+def test_qwen_tp4_allows_dcp4_with_two_kv_heads(
+    tmp_path, model_type: str, architecture: str
+) -> None:
+    """Qwen3.8 checkpoints declare either qwen4_exp or qwen3_8_flash_next and
+    load the same model. Both must pass the TP4/DCP4 gate with two KV heads."""
+    text_config = _text_config(num_attention_heads=16, num_key_value_heads=2).to_dict()
+    text_config["model_type"] = f"{model_type}_text"
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": model_type,
+                "architectures": [architecture],
+                "text_config": text_config,
+            }
+        )
+    )
+    model_config = ModelConfig(model=str(tmp_path), skip_tokenizer_init=True)
+    model_config.verify_with_parallel_config(
+        ParallelConfig(tensor_parallel_size=4, decode_context_parallel_size=4)
+    )
