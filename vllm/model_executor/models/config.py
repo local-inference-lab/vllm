@@ -492,6 +492,25 @@ class Glm5NextForCausalLMConfig(VerifyAndUpdateConfig):
         def logical(name: str) -> int:
             return getattr(text_config, f"original_{name}", getattr(text_config, name))
 
+        # The vision tower is built even with --language-model-only; when TP
+        # cannot shard its heads, run it data-parallel (replicated) instead.
+        vision_config = getattr(model_config.hf_config, "vision_config", None)
+        multimodal_config = getattr(model_config, "multimodal_config", None)
+        if (
+            vision_config is not None
+            and multimodal_config is not None
+            and multimodal_config.mm_encoder_tp_mode != "data"
+            and vision_config.num_heads % tp_size
+        ):
+            logger.warning(
+                "The GLM-5.3 vision tower (%d heads) cannot be sharded across "
+                "TP%d; switching mm_encoder_tp_mode from %r to 'data'.",
+                vision_config.num_heads,
+                tp_size,
+                multimodal_config.mm_encoder_tp_mode,
+            )
+            multimodal_config.mm_encoder_tp_mode = "data"
+
         heads = logical("num_attention_heads")
         kv_heads = logical("num_key_value_heads")
         kda_heads = logical("linear_num_heads")
@@ -545,24 +564,6 @@ class Glm5NextForCausalLMConfig(VerifyAndUpdateConfig):
                 f"GLM-5.3 dense MLP width ({text_config.intermediate_size}) is "
                 f"not divisible by tensor_parallel_size={tp_size}."
             )
-        vision_config = getattr(model_config.hf_config, "vision_config", None)
-        multimodal_config = getattr(model_config, "multimodal_config", None)
-        if (
-            vision_config is not None
-            and multimodal_config is not None
-            and multimodal_config.mm_encoder_tp_mode != "data"
-            and any(
-                multimodal_config.get_limit_per_prompt(modality) > 0
-                for modality in ("image", "video")
-            )
-            and vision_config.num_heads % tp_size
-        ):
-            raise ValueError(
-                f"The GLM-5.3 vision tower ({vision_config.num_heads} heads) "
-                f"cannot be sharded across tensor_parallel_size={tp_size}. Use "
-                "--mm-encoder-tp-mode data or --language-model-only."
-            )
-
         text_config.original_num_attention_heads = heads
         text_config.num_attention_heads = padded_heads
         text_config.original_num_key_value_heads = kv_heads

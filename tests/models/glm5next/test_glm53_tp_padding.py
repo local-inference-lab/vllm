@@ -169,25 +169,28 @@ def test_tp3_without_expert_parallel_raises(cuda_platform) -> None:
         )
 
 
-def test_tp3_vision_weights_mode_raises(cuda_platform) -> None:
-    def multimodal_config(mode: str, limit: int):
-        return SimpleNamespace(
-            mm_encoder_tp_mode=mode, get_limit_per_prompt=lambda _: limit
-        )
+@pytest.mark.parametrize("language_model_only", [False, True])
+def test_tp3_switches_unsplittable_vision_tower_to_data_parallel(
+    cuda_platform, language_model_only
+) -> None:
+    # The tower is built even with --language-model-only, so switch regardless.
+    multimodal_config = SimpleNamespace(
+        mm_encoder_tp_mode="weights", language_model_only=language_model_only
+    )
+    model_config = _glm53_model_config(multimodal_config=multimodal_config)
+    ModelConfig._update_model_config_for_parallelism(model_config, _parallel_config(TP))
+    assert multimodal_config.mm_encoder_tp_mode == "data"
+    assert model_config.hf_text_config.num_attention_heads == 72
 
-    with pytest.raises(ValueError, match="mm-encoder-tp-mode data"):
-        ModelConfig._update_model_config_for_parallelism(
-            _glm53_model_config(multimodal_config=multimodal_config("weights", 1)),
-            _parallel_config(TP),
-        )
-    for mode, limit in (("data", 1), ("weights", 0)):
-        model_config = _glm53_model_config(
-            multimodal_config=multimodal_config(mode, limit)
-        )
-        ModelConfig._update_model_config_for_parallelism(
-            model_config, _parallel_config(TP)
-        )
-        assert model_config.hf_text_config.num_attention_heads == 72
+
+@pytest.mark.parametrize("tp_size", [2, 4])
+def test_splittable_vision_tower_keeps_weights_mode(cuda_platform, tp_size) -> None:
+    multimodal_config = SimpleNamespace(mm_encoder_tp_mode="weights")
+    ModelConfig._update_model_config_for_parallelism(
+        _glm53_model_config(multimodal_config=multimodal_config),
+        _parallel_config(tp_size),
+    )
+    assert multimodal_config.mm_encoder_tp_mode == "weights"
 
 
 def test_non_cuda_platforms_are_untouched(monkeypatch) -> None:
