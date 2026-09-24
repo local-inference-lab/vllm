@@ -143,6 +143,10 @@ def maybe_apply_startup_plan(worker: "Worker") -> None:
     fingerprint = compute_plan_fingerprint(
         worker.vllm_config, worker.rank, worker.parallel_config.world_size
     )
+    # Profiling and capture can still rewrite the config, for example a
+    # CUDA-graph mode the loaded model cannot capture. Save under the key
+    # that the next boot computes here, before those rewrites.
+    worker.startup_plan_fingerprint = fingerprint
     plan = _load_plan(fingerprint)
     if plan is None:
         return
@@ -170,9 +174,11 @@ def maybe_save_startup_plan(worker: "Worker", kv_cache_memory_bytes: int) -> Non
     never raised."""
     if not envs.VLLM_ENABLE_STARTUP_PLAN:
         return
-    fingerprint = compute_plan_fingerprint(
-        worker.vllm_config, worker.rank, worker.parallel_config.world_size
-    )
+    fingerprint = getattr(worker, "startup_plan_fingerprint", None)
+    if fingerprint is None:
+        fingerprint = compute_plan_fingerprint(
+            worker.vllm_config, worker.rank, worker.parallel_config.world_size
+        )
     path = _plan_path(fingerprint)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
