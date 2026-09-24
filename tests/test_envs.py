@@ -43,6 +43,15 @@ def test_api_key_is_not_compile_factor(monkeypatch: pytest.MonkeyPatch):
     assert "VLLM_API_KEY" not in envs.compile_factors()
 
 
+@pytest.mark.skip_global_cleanup
+def test_shm_broadcast_spin_tunables_are_not_compile_factors(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_EXPERIMENTAL_SHM_BROADCAST_ADAPTIVE_SPIN", "1")
+
+    assert "VLLM_EXPERIMENTAL_SHM_BROADCAST_ADAPTIVE_SPIN" not in envs.compile_factors()
+
+
 def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_HOST", raising=False)
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_PORT", raising=False)
