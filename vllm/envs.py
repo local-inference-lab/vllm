@@ -202,7 +202,7 @@ if TYPE_CHECKING:
     VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = True
     VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
     VLLM_MTP_NVFP4_LM_HEAD: bool = True
-    VLLM_DS41_MARKOV_NVFP4: bool = True
+    VLLM_DS41_MARKOV_NVFP4: bool = False
     VLLM_DS41_DRAFT_NVFP4_HEAD: bool = False
     VLLM_DS41_ENGRAM_OVERLAP: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
@@ -1694,9 +1694,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_MTP_NVFP4_LM_HEAD", "1"))
     ),
     # Quantize the DeepSeek V4.1 DSpark Markov transition head to NVFP4 (fits
-    # the GB10 L2; draft graph 3.57 -> 3.0 ms, acceptance unchanged).
+    # the GB10 L2; draft graph 3.57 -> 3.0 ms). Off until its effect on
+    # acceptance is measured.
     "VLLM_DS41_MARKOV_NVFP4": lambda: bool(
-        int(os.getenv("VLLM_DS41_MARKOV_NVFP4", "1"))
+        int(os.getenv("VLLM_DS41_MARKOV_NVFP4", "0"))
     ),
     # Give the DeepSeek V4.1 DSpark drafter its own NVFP4 vocabulary head.
     "VLLM_DS41_DRAFT_NVFP4_HEAD": lambda: bool(
