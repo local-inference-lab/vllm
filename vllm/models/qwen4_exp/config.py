@@ -70,6 +70,9 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
     model_type = "qwen4_exp_text"
     base_config_key = "text_config"
     keys_to_ignore_at_inference = ["past_key_values"]
+    # B12X QSA gathers KV across DCP ranks, so DCP may equal TP even with fewer
+    # KV heads than ranks. Other QSA backends refuse DCP > 1 on their own.
+    supports_full_tp_dcp_with_kv_gather = True
 
     def __init__(
         self,
