@@ -20,10 +20,15 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-1024}"
 BLOCK_SIZE="${BLOCK_SIZE:-256}"
 MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-64}"
-# The KV cache is reserved before experts are placed in HBM.
-KV_CACHE_GB="${KV_CACHE_GB:-24}"
+# The KV cache is reserved before experts are placed in HBM. V4.1's compressed
+# cache is small: 8 GiB holds several million tokens at block size 256.
+KV_CACHE_GB="${KV_CACHE_GB:-8}"
 # HBM left free for activations, CUDA graphs and other prepared operators.
-HBM_RESERVE_GB="${HBM_RESERVE_GB:-16}"
+HBM_RESERVE_GB="${HBM_RESERVE_GB:-12}"
+# GB300 HBM appears as a CPU-less NUMA node. Bind host allocations and the page
+# cache to the Grace node so reading the checkpoint cannot occupy HBM that the
+# expert placement counts on. Set HOST_NUMA_NODE= (empty) to disable.
+HOST_NUMA_NODE="${HOST_NUMA_NODE-0}"
 # Optional b12x placement profile; without one, placement is budget-balanced.
 RESIDENCY_PROFILE="${RESIDENCY_PROFILE:-}"
 ENGRAM_TABLE_MEMORY="${ENGRAM_TABLE_MEMORY:-disk}"
@@ -58,7 +63,13 @@ if ((NUM_SPECULATIVE_TOKENS > 0)); then
     "${NUM_SPECULATIVE_TOKENS}")")
 fi
 
+numa_prefix=()
+if [[ -n "${HOST_NUMA_NODE}" ]] && command -v numactl >/dev/null; then
+  numa_prefix=(numactl --membind="${HOST_NUMA_NODE}")
+fi
+
 command=(
+  "${numa_prefix[@]}"
   "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL_PATH}"
   --served-model-name "${SERVED_MODEL_NAME}"
   --host "${HOST}" --port "${PORT}"
