@@ -16,6 +16,7 @@ DSparkMarkovHead and DSparkConfidenceHead are shared with the DSV4-style DSpark 
 """
 
 from collections.abc import Iterable
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -66,6 +67,7 @@ class DSparkMarkovHead(nn.Module):
         prefix: str,
         quant_config: QuantizationConfig | None = None,
         retain_weight_for_gather: bool = False,
+        lm_head_quantization: Literal["mxfp8", "nvfp4"] | None = None,
     ) -> None:
         super().__init__()
         self.markov_w1 = nn.Embedding(vocab_size, markov_rank)
@@ -76,6 +78,7 @@ class DSparkMarkovHead(nn.Module):
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "markov_w2"),
             disable_tp=True,
+            lm_head_quantization=lm_head_quantization,
         )
         self.markov_w2._retain_weight_for_gather = retain_weight_for_gather
         self.markov_w2.is_w4a16_nvfp4 = False

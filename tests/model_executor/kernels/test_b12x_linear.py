@@ -2725,6 +2725,26 @@ def test_b12x_holder_draws_from_the_manager_without_a_reserved_scratch(
     assert calls[0]["workspace"] is drawn
 
 
+@pytest.mark.parametrize("offset", [0, 32, 256])
+def test_b12x_holder_preserves_arena_backed_projection_input(monkeypatch, offset):
+    import vllm.v1.worker.workspace as workspace
+
+    holder, calls = _holder_with_prepared_state(monkeypatch, required_workspace=64)
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    manager = workspace.WorkspaceManager(torch.device("cpu"))
+    monkeypatch.setattr(workspace, "current_workspace_manager", lambda: manager)
+    (arena,) = manager.get_simultaneous(((1024,), torch.uint8))
+    manager.lock()
+    source = arena[offset : offset + 128].view(torch.bfloat16).view(4, 16)
+    expected = torch.arange(64, dtype=torch.bfloat16).view(4, 16)
+    for rows in (1, 3, 4):
+        source.copy_(expected)
+        holder.run(source[:rows], None)
+        calls[-1]["workspace"].fill_(255)
+        torch.testing.assert_close(source[:rows], expected[:rows], rtol=0, atol=0)
+        assert manager.available_bytes() == 1024
+
+
 def test_b12x_linear_methods_report_their_kernel_scratch_requirement() -> None:
     from vllm.model_executor.layers.linear import LinearMethodBase
 

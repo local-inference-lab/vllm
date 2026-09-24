@@ -6,6 +6,7 @@ Run `pytest tests/quantization/test_modelopt.py`.
 """
 
 import os
+from types import SimpleNamespace
 from typing import Any, NoReturn
 from unittest.mock import MagicMock, Mock, patch
 
@@ -271,6 +272,251 @@ def test_modelopt_mixed_precision_dispatches_block_fp8_moe(algo):
     assert called_layer is layer
     assert fp8_config.weight_block_size == [128, 128]
     assert fp8_config.activation_scheme == "dynamic"
+
+
+def _iq2_xs_moe_config(tp_size=1, tp_rank=0):
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+    return SimpleNamespace(
+        moe_backend="b12x",
+        in_dtype=torch.bfloat16,
+        activation=MoEActivation.SILU,
+        has_bias=False,
+        swiglu_limit=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        hidden_dim=256,
+        intermediate_size_per_partition=512 // tp_size,
+        tp_rank=tp_rank,
+        moe_parallel_config=SimpleNamespace(
+            use_ep=False,
+            ep_size=1,
+            use_all2all_kernels=False,
+            enable_eplb=False,
+            tp_size=tp_size,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "codec,block_size,block_bytes",
+    [("iq2_xs", 256, 74), ("iq2_xxs", 256, 66), ("q8_0", 32, 34)],
+)
+def test_modelopt_mixed_precision_dispatches_iq2_xs_experts(
+    monkeypatch, codec, block_size, block_bytes
+):
+    from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
+    from vllm.model_executor.layers.quantization.modelopt_iq2_xs import (
+        ModelOptIQ2XSMoEMethod,
+    )
+
+    monkeypatch.setattr(B12xExperts, "_supports_current_device", lambda: True)
+    config = _mixed_precision_config(
+        {
+            "model.language_model.layers.0.mlp.experts": {
+                "quant_algo": codec.upper(),
+                "group_size": block_size,
+                "block_payload_bytes": block_bytes,
+                "packing": "ggml",
+            },
+        }
+    )
+    layer = MagicMock(spec=RoutedExperts)
+    layer.moe_config = _iq2_xs_moe_config()
+    method = config.get_quant_method(
+        layer,
+        "language_model.model.layers.0.mlp.experts",
+    )
+    assert isinstance(method, ModelOptIQ2XSMoEMethod)
+    quant = method.get_fused_moe_quant_config(layer)
+    assert quant.weight_quant_dtype == codec
+    assert quant.quant_dtype is None
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("group_size", 0),
+        ("block_payload_bytes", 75),
+        ("packing", "unknown"),
+    ],
+)
+@pytest.mark.parametrize(
+    "codec,block_size,block_bytes",
+    [("iq2_xs", 256, 74), ("iq2_xxs", 256, 66), ("q8_0", 32, 34)],
+)
+def test_modelopt_iq2_xs_rejects_incompatible_block_metadata(
+    field, value, codec, block_size, block_bytes
+):
+    recipe = {
+        "quant_algo": codec.upper(),
+        "group_size": block_size,
+        "block_payload_bytes": block_bytes,
+        "packing": "ggml",
+        field: value,
+    }
+    with pytest.raises(ValueError, match=f"unsupported {codec.upper()} block contract"):
+        _mixed_precision_config({"model.layers.0.mlp.experts": recipe})
+
+
+@pytest.mark.parametrize("parallel", ["row", "column"])
+@pytest.mark.parametrize("tp_rank", [0, 1])
+@pytest.mark.parametrize(
+    "codec,block_size,block_bytes",
+    [("iq2_xs", 256, 74), ("iq2_xxs", 256, 66), ("q8_0", 32, 34)],
+)
+def test_modelopt_iq2_xs_dense_loading_preserves_whole_blocks(
+    monkeypatch, parallel, tp_rank, codec, block_size, block_bytes
+):
+    import vllm.model_executor.parameter as parameter_module
+    import vllm.utils.b12x as b12x_utils
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm.model_executor.layers.quantization.modelopt_iq2_xs import (
+        ModelOptIQ2XSLinearMethod,
+    )
+
+    monkeypatch.setattr(
+        b12x_utils,
+        "get_b12x_blockscaled",
+        lambda: SimpleNamespace(
+            IQ2XSLinearWeight=object,
+            is_supported=lambda: True,
+        ),
+    )
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_rank", lambda: tp_rank
+    )
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    prefix = "model.layers.1.mixer.shared_experts.up_proj"
+    config = _mixed_precision_config(
+        {
+            prefix: {
+                "quant_algo": codec.upper(),
+                "group_size": block_size,
+                "block_payload_bytes": block_bytes,
+                "packing": "ggml",
+            }
+        }
+    )
+    method = config.get_quant_method(MagicMock(spec=LinearBase), prefix)
+    assert isinstance(method, ModelOptIQ2XSLinearMethod)
+    layer = torch.nn.Module()
+    n, k = (128, 256) if parallel == "row" else (64, 512)
+    method.create_weights(
+        layer, k, [n], 512, 128, torch.bfloat16, weight_loader=lambda *args: None
+    )
+    source = torch.randint(
+        0, 256, (128, 512 // block_size, block_bytes), dtype=torch.uint8
+    )
+    if parallel == "row":
+        layer.weight.load_row_parallel_weight(source)
+        expected = source[
+            :, tp_rank * (256 // block_size) : (tp_rank + 1) * (256 // block_size)
+        ]
+    else:
+        layer.weight.load_column_parallel_weight(source)
+        expected = source[tp_rank * n : (tp_rank + 1) * n]
+    torch.testing.assert_close(layer.weight, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("tp_size,tp_rank", [(1, 0), (2, 0), (2, 1)])
+@pytest.mark.parametrize("gated", [True, False])
+@pytest.mark.parametrize(
+    "codec,block_size,block_bytes",
+    [("iq2_xs", 256, 74), ("iq2_xxs", 256, 66), ("q8_0", 32, 34)],
+)
+def test_modelopt_iq2_xs_loads_expert_blocks_with_aligned_tp_slices(
+    monkeypatch,
+    tp_size,
+    tp_rank,
+    gated,
+    codec,
+    block_size,
+    block_bytes,
+):
+    import vllm.model_executor.parameter as parameter_module
+    from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
+    from vllm.model_executor.layers.quantization.modelopt_iq2_xs import (
+        ModelOptIQ2XSMoEMethod,
+    )
+
+    monkeypatch.setattr(B12xExperts, "_supports_current_device", lambda: True)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_rank", lambda: tp_rank
+    )
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+    config = _iq2_xs_moe_config(tp_size, tp_rank)
+    if not gated:
+        from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+        config.activation = MoEActivation.RELU2_NO_MUL
+    method = ModelOptIQ2XSMoEMethod(config, codec=codec)
+    layer = torch.nn.Module()
+    layer.layer_name = "model.layers.0.mlp.experts"
+    layer.is_fused_checkpoint_transposed = False
+    layer._orient_fused_weight = RoutedExperts._orient_fused_weight
+    layer.get_expert_mapping = lambda **kwargs: (
+        RoutedExperts.build_expert_params_mapping(
+            "gate_proj",
+            "down_proj",
+            "up_proj",
+            num_experts=2,
+            routed_experts_prefix="",
+            **kwargs,
+        )
+    )
+    local_i = 512 // tp_size
+    method.create_weights(layer, 2, 256, local_i, torch.bfloat16)
+    assert layer.w13_weight.shape[1] == local_i * (2 if gated else 1)
+    layer.w13_weight.data.zero_()
+    layer.w2_weight.data.zero_()
+    for shard, name in (
+        ("w1", "w13_weight"),
+        ("w3", "w13_weight"),
+        ("w2", "w2_weight"),
+    ):
+        if shard == "w3" and not gated:
+            continue
+        shape = (
+            (256, 512 // block_size, block_bytes)
+            if shard == "w2"
+            else (512, 256 // block_size, block_bytes)
+        )
+        source = torch.randint(1, 256, shape, dtype=torch.uint8)
+        param = getattr(layer, name)
+        projection = {"w1": "gate", "w3": "up", "w2": "down"}[shard]
+        loaded = list(
+            RoutedExperts.load_weights(
+                layer,
+                [(f"1.{projection}_proj.weight", source)],
+            )
+        )
+        assert loaded == [name]
+        if shard == "w2":
+            expected = source[
+                :,
+                tp_rank * (local_i // block_size) : (tp_rank + 1)
+                * (local_i // block_size),
+            ]
+            actual = param[1]
+        else:
+            expected = source[tp_rank * local_i : (tp_rank + 1) * local_i]
+            offset = 0 if shard == "w1" else local_i
+            actual = param[1, offset : offset + local_i]
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert param[0].count_nonzero() == 0
+    with pytest.raises(ValueError, match="invalid IQ2_XS tensor"):
+        layer.w2_weight.weight_loader(
+            layer.w2_weight,
+            torch.zeros(256, 512),
+            "w2_weight",
+            "w2",
+            0,
+        )
 
 
 def test_modelopt_nvfp4_leaves_excluded_parallel_lm_head_unquantized():
@@ -950,3 +1196,79 @@ def test_modelopt_fp8_pb_wo_rejects_non_128_input():
         scheme.create_weights(
             torch.nn.Module(), mo.WEIGHT, mo.CkptCtx(), shapes, Mock()
         )
+
+
+@pytest.mark.parametrize("head", [False, True])
+def test_modelopt_q8_vocab_weights_keep_native_blocks(monkeypatch, head):
+    import vllm.model_executor.parameter as parameter_module
+    import vllm.utils.b12x as b12x_utils
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        VocabParallelEmbedding,
+    )
+
+    monkeypatch.setattr(
+        b12x_utils,
+        "get_b12x_blockscaled",
+        lambda: SimpleNamespace(IQ2XSLinearWeight=object, is_supported=lambda: True),
+    )
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    cls = ParallelLMHead if head else VocabParallelEmbedding
+    layer = cls.__new__(cls)
+    torch.nn.Module.__init__(layer)
+    prefix = "language_model.lm_head" if head else "language_model.model.embeddings"
+    config = _mixed_precision_config(
+        {
+            prefix: {
+                "quant_algo": "Q8_0",
+                "group_size": 32,
+                "block_payload_bytes": 34,
+                "packing": "ggml",
+            }
+        }
+    )
+    method = config.get_quant_method(layer, prefix)
+    method.create_weights(
+        layer, 64, [16], 64, 16, torch.bfloat16, weight_loader=lambda *args: None
+    )
+    assert method.codec == "q8_0"
+    assert method.is_embedding is (not head)
+    assert layer.weight.dtype == torch.uint8
+    assert layer.weight.shape == (16, 2, 34)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_modelopt_q8_vocab_lookup_chunks_encoder_rows_and_replays():
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.preparation import PreparationSession
+
+    from vllm.model_executor.layers.quantization.modelopt_iq2_xs import (
+        ModelOptIQ2XSLinearMethod,
+    )
+
+    method = ModelOptIQ2XSLinearMethod.__new__(ModelOptIQ2XSLinearMethod)
+    method.is_embedding = True
+    layer = torch.nn.Module()
+    raw = torch.zeros((16, 2, 34), device="cuda", dtype=torch.uint8)
+    raw[..., :2] = torch.tensor([0, 60], device="cuda", dtype=torch.uint8)
+    raw[..., 2:] = torch.arange(16, device="cuda", dtype=torch.uint8)[:, None, None]
+    layer.register_parameter("weight", torch.nn.Parameter(raw, requires_grad=False))
+    layer.b12x_embedding_plans = {}
+    workload = SimpleNamespace(stage="weights", max_tokens=3, max_model_len=5)
+    units = method.get_b12x_preparation_units(layer, workload)
+    ids = torch.tensor([[0, 15, 1, 14], [2, 13, 3, 12]], device="cuda")
+    with PreparationSession(device=raw.device, autotune=False) as session:
+        session.prepare(tuple(request for unit in units for request in unit.requests))
+        session.freeze()
+        with kernel_resolution_guard("Q8 encoder embedding chunks"):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = method.embedding(layer, ids)
+            ids.copy_(15 - ids)
+            graph.replay()
+            torch.accelerator.synchronize()
+            expected = ids.to(torch.bfloat16)[..., None].expand(2, 4, 64)
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)

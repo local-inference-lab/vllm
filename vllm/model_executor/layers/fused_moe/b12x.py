@@ -49,6 +49,9 @@ _B12X_MOE_MODES: dict[
     ("nvfp4", "nvfp4"): ("nvfp4", "modelopt_nvfp4", "w31"),
     ("nvfp4", "mxfp8"): ("w4a8_nvfp4", "modelopt_nvfp4", "w31"),
     ("nvfp4", None): ("w4a16", "modelopt_nvfp4", "w31"),
+    ("iq2_xs", None): ("w4a16", "iq2_xs", "w31"),
+    ("iq2_xxs", None): ("w4a16", "iq2_xxs", "w31"),
+    ("q8_0", None): ("w4a16", "q8_0", "w31"),
 }
 
 
@@ -234,7 +237,7 @@ def _normalize_expert_scale(scale: torch.Tensor) -> torch.Tensor:
 
 
 class B12xExperts(mk.FusedMoEExpertsModular):
-    """FP4 MoE experts backed by the b12x SM12x planned API."""
+    """Packed MoE experts backed by the b12x SM12x planned API."""
 
     def __init__(
         self,
@@ -242,9 +245,15 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         quant_config: FusedMoEQuantConfig,
     ):
         super().__init__(moe_config, quant_config)
-        if quant_config.weight_quant_dtype not in ("mxfp4", "nvfp4"):
+        if quant_config.weight_quant_dtype not in (
+            "mxfp4",
+            "nvfp4",
+            "iq2_xs",
+            "iq2_xxs",
+            "q8_0",
+        ):
             raise ValueError(
-                "b12x MoE requires MXFP4 or NVFP4 weights, got "
+                "b12x MoE requires MXFP4, NVFP4 or IQ2_XS weights, got "
                 f"{quant_config.weight_quant_dtype}"
             )
         scheme = (
@@ -332,6 +341,30 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             raise RuntimeError(
                 "b12x MoE weights must be prepared before CUDA graph capture"
             )
+        if self._source_format in ("iq2_xs", "iq2_xxs", "q8_0"):
+            fused_moe = _require_b12x_fused_moe()
+            weight_plan = fused_moe.plan_weights(
+                source=fused_moe.PackedSource(
+                    format=self._source_format, w13_layout="w31"
+                ),
+                activation=fused_moe.ActivationSpec(
+                    mode="a16",
+                    nonlinearity=_b12x_activation_name(activation),
+                    io_dtype=params_dtype,
+                ),
+                geometry=fused_moe.MoEGeometry(
+                    num_experts=int(w1.shape[0]),
+                    hidden_size=int(w2.shape[1]),
+                    intermediate_size=int(w2.shape[2])
+                    * (32 if self._source_format == "q8_0" else 256),
+                ),
+            )
+            return fused_moe.prepare_weights(
+                plan=weight_plan,
+                weights=fused_moe.BlockQuantWeights(
+                    w13=w1, w2=w2, codec=self._source_format
+                ),
+            )
         if self.w1_scale is None or self.w2_scale is None:
             raise ValueError("b12x MoE requires w1 and w2 block scales")
 
@@ -401,6 +434,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         )
 
     def _refresh_quant_config(self, layer: torch.nn.Module) -> None:
+        if self._source_format in ("iq2_xs", "iq2_xxs", "q8_0"):
+            return
         self.quant_config._w1.scale = layer.w13_weight_scale
         self.quant_config._w2.scale = layer.w2_weight_scale
         if self._source_format != "modelopt_nvfp4":
