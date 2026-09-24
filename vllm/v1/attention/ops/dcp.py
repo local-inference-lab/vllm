@@ -132,6 +132,7 @@ class CorrectAttnCPOutKernel(VllmTritonJitKernel["CorrectAttnCPOutKernel.Compile
         lse_idx,
         HEAD_DIM: tl.constexpr,
         N_ROUNDED: tl.constexpr,
+        BLOCK_N: tl.constexpr,
         IS_BASE_E: tl.constexpr,
     ):
         """
@@ -152,7 +153,9 @@ class CorrectAttnCPOutKernel(VllmTritonJitKernel["CorrectAttnCPOutKernel.Compile
         batch_idx = tl.program_id(axis=0).to(tl.int64)
         head_idx = tl.program_id(axis=1).to(tl.int64)
         d_offsets = tl.arange(0, HEAD_DIM)
-        num_n_offsets = tl.arange(0, N_ROUNDED)
+        # N_ROUNDED is the actual LSE rank extent in this launcher.
+        # Triton requires a power-of-two vector; masked lanes contribute -inf.
+        num_n_offsets = tl.arange(0, BLOCK_N)
 
         # shape = [N]
         lse_offsets = (
@@ -162,7 +165,11 @@ class CorrectAttnCPOutKernel(VllmTritonJitKernel["CorrectAttnCPOutKernel.Compile
         )
 
         # calc final lse
-        lse = tl.load(lses_ptr + lse_offsets).to(tl.float32)
+        lse = tl.load(
+            lses_ptr + lse_offsets,
+            mask=num_n_offsets < N_ROUNDED,
+            other=-float("inf"),
+        ).to(tl.float32)
         lse = tl.where((lse != lse) | (lse == float("inf")), -float("inf"), lse)
         lse_max = tl.max(lse, axis=0)
         lse_max = tl.where(lse_max == -float("inf"), 0, lse_max)
@@ -340,6 +347,7 @@ class CorrectAttnCPOutKernel(VllmTritonJitKernel["CorrectAttnCPOutKernel.Compile
             lses_stride_H=lses_stride_h,
             HEAD_DIM=head_dim,
             N_ROUNDED=n_rounded,
+            BLOCK_N=triton.next_power_of_2(n_rounded),
             IS_BASE_E=is_base_e,
             _runtime_launcher=None if self._warming else ctx.call_kernel,
             # CPTritonContext caches the non-constexpr positional prefix; derive
