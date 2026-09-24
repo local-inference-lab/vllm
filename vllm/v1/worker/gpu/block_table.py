@@ -342,7 +342,12 @@ def _compute_slot_mappings_kernel(
     group_cp_size = tl.load(group_cp_sizes + group_id)
 
     req_state_idx = tl.load(idx_mapping + batch_idx)
-    num_blocks = tl.load(group_num_blocks_ptr + req_state_idx)
+    # idx_mapping == -1 marks a dummy (or CUDA-graph padding) request that owns
+    # no blocks: never read its block-table row and emit PAD for its tokens.
+    is_real_req = req_state_idx >= 0
+    num_blocks = tl.load(
+        group_num_blocks_ptr + req_state_idx, mask=is_real_req, other=0
+    )
     start_idx = tl.load(query_start_loc + batch_idx)
     end_idx = tl.load(query_start_loc + batch_idx + 1)
     for i in range(start_idx, end_idx, TRITON_BLOCK_SIZE):
@@ -372,7 +377,7 @@ def _compute_slot_mappings_kernel(
         valid_block = token_mask & (block_indices < num_blocks)
         block_numbers = tl.load(
             block_table_ptr + req_state_idx * block_table_stride + block_indices,
-            mask=is_local & valid_block,
+            mask=is_local & valid_block & is_real_req,
             other=0,
         )
         slot_ids = block_numbers * kernel_block_size + block_offsets
@@ -380,5 +385,5 @@ def _compute_slot_mappings_kernel(
             slot_ids = tl.where(is_local, slot_ids, PAD_ID)
         slot_ids = tl.where(valid_block, slot_ids, PAD_ID)
 
-        slot_ids = tl.where(mapping_enabled, slot_ids, PAD_ID)
+        slot_ids = tl.where(mapping_enabled & is_real_req, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
