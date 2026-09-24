@@ -421,6 +421,84 @@ def test_vision_preparation_uses_encoder_and_connector_token_counts(
         assert module.b12x_eager_only
 
 
+def _vision_worker(monkeypatch, model, *, encoder_budget: int = 8192):
+    from vllm.multimodal import encoder_budget as budget_module
+
+    model.visual = torch.nn.Module()
+    model.visual.blocks = torch.nn.Sequential(torch.nn.Identity())
+    model.visual.merger = torch.nn.Identity()
+    worker = _worker(model)
+    worker.vllm_config = object()
+    worker.model_runner.mm_registry = object()
+    monkeypatch.setattr(
+        budget_module,
+        "MultiModalBudget",
+        lambda *args, **kwargs: SimpleNamespace(
+            get_encoder_budget=lambda: encoder_budget
+        ),
+    )
+    return worker
+
+
+def test_vision_preparation_skips_undeclared_encoder_rows(monkeypatch) -> None:
+    """A tower whose model declares no profiling rows keeps the serving shapes.
+
+    ``SupportsMultiModal.get_mm_lora_token_counts`` delegates to hooks that
+    return nothing when a model leaves them unimplemented, which is not zero.
+    """
+    from vllm.model_executor.models.interfaces import SupportsMultiModal
+
+    class _Undeclared(torch.nn.Module, SupportsMultiModal):
+        pass
+
+    model = _Undeclared()
+    worker = _vision_worker(monkeypatch, model)
+    assert model.get_mm_lora_token_counts(
+        modality="image", mm_kwargs=None, num_mm_embeds=8192
+    ) == (None, None)
+
+    b12x_prepare.mark_b12x_eager_shapes(worker)
+
+    for module in model.visual.modules():
+        assert not hasattr(module, "b12x_eager_token_counts")
+        assert not hasattr(module, "b12x_eager_only")
+
+
+def test_vision_preparation_keeps_connector_rows_without_encoder_rows(
+    monkeypatch,
+) -> None:
+    class _ConnectorOnly(torch.nn.Module):
+        def get_mm_lora_token_counts(self, *, modality, mm_kwargs, num_mm_embeds):
+            return None, num_mm_embeds
+
+        def get_mm_mapping(self):
+            return SimpleNamespace(connector=["visual.merger."])
+
+    model = _ConnectorOnly()
+    worker = _vision_worker(monkeypatch, model)
+
+    b12x_prepare.mark_b12x_eager_shapes(worker)
+
+    for module in model.visual.blocks.modules():
+        assert not hasattr(module, "b12x_eager_token_counts")
+    assert model.visual.merger.b12x_eager_token_counts == (8192,)
+    assert model.visual.merger.b12x_eager_only
+
+
+@pytest.mark.parametrize("rows", ((0, 0), (0, None), (-1, 8192)))
+def test_vision_preparation_rejects_non_positive_encoder_rows(
+    monkeypatch, rows
+) -> None:
+    class _Declared(torch.nn.Module):
+        def get_mm_lora_token_counts(self, *, modality, mm_kwargs, num_mm_embeds):
+            return rows
+
+    worker = _vision_worker(monkeypatch, _Declared())
+
+    with pytest.raises(ValueError, match="encoder profiling rows"):
+        b12x_prepare.mark_b12x_eager_shapes(worker)
+
+
 def test_collect_units_asks_unit_providers_and_rejects_duplicate_names() -> None:
     class _Comm:
         def get_b12x_preparation_units(self, owner, workload):

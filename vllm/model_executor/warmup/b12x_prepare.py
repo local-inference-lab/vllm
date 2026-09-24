@@ -300,11 +300,22 @@ def mark_b12x_eager_shapes(worker: Worker) -> None:
     encoder_rows, connector_rows = get_token_counts(
         modality="image", mm_kwargs=None, num_mm_embeds=encoder_budget
     )
-    if encoder_rows <= 0:
+    if encoder_rows is None:
+        # The interface default delegates to per-model hooks that a model may
+        # leave unimplemented, so the count is unknown rather than zero. The
+        # tower keeps the serving workload; a declared connector count is
+        # still honored below.
+        logger.warning_once(
+            "%s declares no multimodal encoder profiling rows; its encoder "
+            "is not tuned for eager shapes",
+            type(model).__name__,
+        )
+    elif encoder_rows <= 0:
         raise ValueError("multimodal encoder profiling rows must be positive")
-    for module in visual.modules():
-        module.b12x_eager_token_counts = (encoder_rows,)
-        module.b12x_eager_only = True
+    else:
+        for module in visual.modules():
+            module.b12x_eager_token_counts = (encoder_rows,)
+            module.b12x_eager_only = True
     get_mapping = getattr(model, "get_mm_mapping", None)
     if connector_rows is None or not callable(get_mapping):
         return
