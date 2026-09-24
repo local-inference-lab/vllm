@@ -157,15 +157,10 @@ class Executor(ABC):
 
     def initialize_from_config(self, kv_cache_configs: list[KVCacheConfig]) -> None:
         """Initialize the KV caches on the underlying workers."""
-        from vllm.platforms import current_platform
-        from vllm.utils.b12x import has_b12x
+        from vllm.utils.b12x import b12x_native_device, has_b12x
 
         self._b12x_state_tuned_before_allocation = False
-        if (
-            has_b12x()
-            and current_platform.is_cuda()
-            and current_platform.is_device_capability_family(120)
-        ):
+        if has_b12x() and b12x_native_device():
             try:
                 initialized: list[bool] = self.collective_rpc(
                     "initialize_b12x_tuning_cache", args=(kv_cache_configs,)
@@ -198,14 +193,9 @@ class Executor(ABC):
     @contextmanager
     def b12x_warmup_control(self):
         """Keep startup cancellation active across both native preparation stages."""
-        from vllm.platforms import current_platform
-        from vllm.utils.b12x import has_b12x
+        from vllm.utils.b12x import b12x_native_device, has_b12x
 
-        if not (
-            has_b12x()
-            and current_platform.is_cuda()
-            and current_platform.is_device_capability_family(120)
-        ):
+        if not (has_b12x() and b12x_native_device()):
             yield
             return
         if (

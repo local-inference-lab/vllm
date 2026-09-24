@@ -3,6 +3,7 @@
 """DeepSeek V4.1 hardware-isolated model entry point."""
 
 from vllm.platforms import current_platform
+from vllm.utils.b12x import b12x_native_device
 
 from .quant_config import DeepseekV4FP8Config
 
@@ -13,9 +14,7 @@ def __getattr__(name):
     if current_platform.is_rocm():
         from .amd.dspark import DSparkDeepseekV4ForCausalLM
         from .amd.vl_model import DeepseekV41ForCausalLM
-    elif current_platform.is_cuda() and current_platform.is_device_capability_family(
-        120
-    ):
+    elif b12x_native_device():
         from vllm.models.deepseek_v4_1 import (
             DeepseekV41ForCausalLM,
             DSparkDeepseekV4ForCausalLM,

@@ -194,6 +194,7 @@ if TYPE_CHECKING:
     VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE: Literal["0", "1", "all", "w13", "w2"] = "0"
     VLLM_DEFAULT_MOE_BACKEND: str = "auto"
     VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
+    VLLM_B12X_SM103: bool = False
     VLLM_B12X_NVFP4_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
     VLLM_B12X_MXFP8_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
     VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES: int = 2_000_000_000
@@ -1664,6 +1665,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE",
         "0",
         ["0", "1", "all", "w13", "w2"],
+    ),
+    # Serve supported b12x models natively on SM103 (B300/GB300). Off by
+    # default so SM103 keeps the upstream kernels unless b12x is requested.
+    "VLLM_B12X_SM103": lambda: (
+        os.getenv("VLLM_B12X_SM103", "0").lower() in ("1", "true", "yes", "on")
     ),
     # Dense activation precision; recipe overrides take precedence.
     "VLLM_B12X_DENSE_ACTIVATION_MODE": env_with_choices(

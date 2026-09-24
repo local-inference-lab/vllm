@@ -291,6 +291,21 @@ def has_b12x() -> bool:
     return _HAS_B12X
 
 
+def b12x_native_device() -> bool:
+    """Whether b12x replaces the default kernels on the current device.
+
+    SM120/SM121 always use b12x. SM103 does so only when ``VLLM_B12X_SM103``
+    opts in, so existing SM103 deployments keep the upstream kernels.
+    """
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return False
+    if current_platform.is_device_capability_family(120):
+        return True
+    return envs.VLLM_B12X_SM103 and current_platform.is_device_capability((10, 3))
+
+
 def _get_submodule(module_name: str) -> ModuleType | None:
     return _B12X_SUBMODULES.get(module_name)
 

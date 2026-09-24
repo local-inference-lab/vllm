@@ -28,11 +28,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Static,
 )
 from vllm.model_executor.utils import replace_parameter
-from vllm.platforms import current_platform
 from vllm.utils.b12x import (
     B12xPreparationUnit,
     B12xWorkload,
     PreparationResourceUnavailableError,
+    b12x_native_device,
     get_b12x_fused_moe,
     reuse_packed_weight_storage,
     set_b12x_preparation_provider,
@@ -518,10 +518,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        if not (
-            current_platform.is_cuda()
-            and current_platform.is_device_capability_family(120)
-        ):
+        if not b12x_native_device():
             return False
         fused_moe = get_b12x_fused_moe()
         if fused_moe is None:

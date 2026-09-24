@@ -23,10 +23,10 @@ from typing import TYPE_CHECKING, Literal, cast
 import torch
 
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
 from vllm.utils.b12x import (
     B12xPreparationUnit,
     B12xWorkload,
+    b12x_native_device,
     b12x_preparation_token_counts,
     b12x_unit_providers,
     has_b12x,
@@ -64,11 +64,7 @@ if os.environ.get("B12X_HANG_DUMP"):
 
 
 def b12x_native_supported(worker: Worker) -> bool:
-    return (
-        has_b12x()
-        and current_platform.is_cuda()
-        and current_platform.is_device_capability_family(120)
-    )
+    return has_b12x() and b12x_native_device()
 
 
 def _draft_lane(worker: Worker) -> int:

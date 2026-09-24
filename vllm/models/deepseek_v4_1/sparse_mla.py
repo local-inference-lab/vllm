@@ -302,4 +302,8 @@ class DeepseekV41B12xBackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability):
-        return capability.major == 12
+        import vllm.envs as envs
+
+        return capability.major == 12 or (
+            envs.VLLM_B12X_SM103 and (capability.major, capability.minor) == (10, 3)
+        )

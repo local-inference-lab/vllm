@@ -358,12 +358,9 @@ class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
 class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
-        from vllm.platforms import current_platform
+        from vllm.utils.b12x import b12x_native_device
 
-        if not (
-            current_platform.is_cuda()
-            and current_platform.is_device_capability_family(120)
-        ):
+        if not b12x_native_device():
             DeepseekV4ForCausalLMConfig.verify_and_update_model_config(model_config)
             return
         for cfg in (
@@ -382,12 +379,9 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
     def update_model_config_for_parallelism(
         model_config: "ModelConfig", parallel_config: "ParallelConfig"
     ) -> None:
-        from vllm.platforms import current_platform
+        from vllm.utils.b12x import b12x_native_device
 
-        if not (
-            current_platform.is_cuda()
-            and current_platform.is_device_capability_family(120)
-        ):
+        if not b12x_native_device():
             return
         text_config = model_config.hf_text_config
         tp_size = parallel_config.tensor_parallel_size
@@ -438,17 +432,22 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         from vllm.platforms import current_platform
+        from vllm.utils.b12x import b12x_native_device
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-        if not (
-            current_platform.is_cuda()
-            and current_platform.is_device_capability_family(120)
-        ):
+        if not b12x_native_device():
             return
         backend = AttentionBackendEnum.B12X
         if vllm_config.attention_config.backend not in (None, backend):
             raise ValueError("DeepSeek V4.1 requires B12X.")
         vllm_config.attention_config.backend = backend
+        if current_platform.is_device_capability((10, 3)):
+            multimodal = vllm_config.model_config.multimodal_config
+            if multimodal is not None and not multimodal.language_model_only:
+                raise ValueError(
+                    "DeepSeek V4.1 on SM103 serves text only; the b12x vision "
+                    "attention has no SM103 kernel. Pass --language-model-only."
+                )
 
 
 class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
