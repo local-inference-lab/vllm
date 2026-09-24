@@ -1254,13 +1254,25 @@ class VllmConfig:
                 KVConnectorFactory,
             )
 
-            connector = KVConnectorFactory.get_connector_class(
-                self.kv_transfer_config
+            connector = KVConnectorFactory.get_connector_class(self.kv_transfer_config)
+            # Explicit aligned retention bypasses request-boundary checkpoints;
+            # it is correct only with connectors that move hybrid state at
+            # aligned boundaries, and only validated without DCP.
+            cache_config = getattr(self, "cache_config", None)
+            parallel_config = getattr(self, "parallel_config", None)
+            aligned = (
+                getattr(cache_config, "recurrent_checkpoint_policy", None) == "aligned"
+                and getattr(parallel_config, "decode_context_parallel_size", None) == 1
+                and connector.supports_aligned_hybrid_transfer(self)
             )
-            if not connector.supports_request_boundary_checkpoints(self):
+            if not aligned and not connector.supports_request_boundary_checkpoints(
+                self
+            ):
                 raise ValueError(
                     "Qwen QSA KV transfer requires an atomic request-boundary "
-                    "checkpoint connector"
+                    "checkpoint connector, or --recurrent-checkpoint-policy "
+                    "aligned without DCP and a connector that transfers aligned "
+                    "hybrid state (SimpleCPUOffloadConnector, OffloadingConnector)"
                 )
 
         # PyTorch's expandable_segments allocator uses CUDA VMM, which can
