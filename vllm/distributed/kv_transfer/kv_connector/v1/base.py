@@ -492,6 +492,16 @@ class KVConnectorBase_V1(ABC):
         """Whether configuration selects a complete external checkpoint adapter."""
         return False
 
+    @classmethod
+    def supports_aligned_hybrid_transfer(cls, config: "VllmConfig") -> bool:
+        """Whether aligned retention transfers hybrid recurrent state correctly.
+
+        Qwen QSA models may use such a connector with
+        ``--recurrent-checkpoint-policy aligned`` instead of an atomic
+        request-boundary checkpoint adapter.
+        """
+        return False
+
     def bind_boundary_checkpoint_cache(self, manager: "KVCacheManager") -> None:
         """Bind the scheduler allocator for atomic external checkpoint imports.
 
