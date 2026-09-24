@@ -1,0 +1,13 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-895",
+  "category": "fix",
+  "summary": "Persisted startup plans are found again after profiling rewrites the configuration",
+  "models": ["DeepSeek-V4-Flash"],
+  "compatibility": "Takes effect only with VLLM_ENABLE_STARTUP_PLAN=1.",
+  "details": [
+    "The startup plan was saved under a fingerprint computed after profiling. DeepSeek-V4-Flash rewrites its CUDA-graph mode from FULL_AND_PIECEWISE to FULL_DECODE_ONLY during profiling, so the next boot looked for a different fingerprint and never applied the plan.",
+    "The plan is now saved under the fingerprint computed before profiling. A matching plan skips the CUDA-graph memory estimation pass, which re-prepares every b12x attention plan."
+  ],
+  "pull_requests": [895]
+}

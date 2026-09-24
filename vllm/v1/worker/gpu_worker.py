@@ -258,6 +258,8 @@ class Worker(WorkerBase):
         self._b12x_profile_batch: B12xPreparedBatch | None = None
         self._b12x_tuning_batch: B12xPreparedBatch | None = None
         self._b12x_tuning_cache = False
+        # Startup-plan key computed before profiling can rewrite the config.
+        self.startup_plan_fingerprint: str | None = None
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
 
