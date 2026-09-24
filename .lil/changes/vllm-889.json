@@ -12,5 +12,5 @@
     "Based on BoxTops4Coochie's GLM-5.3-Flash TP3 port."
   ],
   "pull_requests": [889],
-  "requires": [887]
+  "requires": ["vllm-887"]
 }
