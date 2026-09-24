@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-887",
+  "category": "fix",
+  "summary": "DCP with 3 or 6 ranks compiles; padded recurrent state rows use the null block",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "The DCP attention-output correction required a power-of-two rank count, so DCP 3 or 6 failed to compile.",
+    "CUDA-graph padding rows of aligned recurrent state indices pointed at -1 instead of the reserved null block; consumers that skip the null block could address memory before the state pool.",
+    "Both were found by BoxTops4Coochie's GLM-5.3-Flash TP3 port."
+  ],
+  "pull_requests": [887],
+  "requires": []
+}
