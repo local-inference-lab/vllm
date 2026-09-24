@@ -459,12 +459,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             if self.layer_id < len(hf.compress_ratios)
             else 0
         )
-        self._main_page = vllm_config.cache_config.block_size // max(
-            self.compress_ratio, 1
-        )
+        # The engine lowers cache_config.block_size to the smallest KV group
+        # block (the 128-token SWA pages) after allocation; this layer's
+        # caches keep the storage block size they were declared with.
+        self._storage_block_size = vllm_config.cache_config.block_size
+        self._main_page = self._storage_block_size // max(self.compress_ratio, 1)
         self._main_width = (
-            self.max_model_len + vllm_config.cache_config.block_size - 1
-        ) // vllm_config.cache_config.block_size
+            self.max_model_len + self._storage_block_size - 1
+        ) // self._storage_block_size
         self._index_page, self._index_width = self._main_page, self._main_width
         self.is_kv_source = self.layer_id in hf.kv_source_layer_ids
         self.is_index_source = self.layer_id in hf.index_source_layer_ids
@@ -653,12 +655,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 "dtype": str(tensor.dtype).removeprefix("torch."),
             }
 
-        self._main_page = self.config.cache_config.block_size // max(
-            self.compress_ratio, 1
-        )
+        self._main_page = self._storage_block_size // max(self.compress_ratio, 1)
         self._main_width = (
-            self.max_model_len + self.config.cache_config.block_size - 1
-        ) // self.config.cache_config.block_size
+            self.max_model_len + self._storage_block_size - 1
+        ) // self._storage_block_size
         self._index_page = self._main_page
         self._index_width = self._main_width
         spec = self.config.speculative_config

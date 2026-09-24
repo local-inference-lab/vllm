@@ -102,9 +102,6 @@ def _warmup_bf16x3_router_gemm(
     model: torch.nn.Module,
     max_num_tokens: int,
 ) -> None:
-    from vllm.model_executor.layers.fused_moe.router.bf16x3_router_gemm_cutedsl import (  # noqa: E501
-        warmup_bf16x3_router_gemm,
-    )
     from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 
     gate = next(
@@ -120,6 +117,12 @@ def _warmup_bf16x3_router_gemm(
             "Skipping BF16x3 router GEMM warmup: no eligible GateLinear found."
         )
         return
+
+    # Import only when a gate uses the kernel: its CuTe DSL dependency (quack)
+    # may not match the installed CUTLASS DSL.
+    from vllm.model_executor.layers.fused_moe.router.bf16x3_router_gemm_cutedsl import (  # noqa: E501
+        warmup_bf16x3_router_gemm,
+    )
 
     min_num_tokens = gate.FP32_MAX_TOKENS + 1 if gate.allow_fp32_router_gemm else 1
     logger.info_once(
