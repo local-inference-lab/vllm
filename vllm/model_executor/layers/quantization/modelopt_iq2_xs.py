@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""ModelOpt safetensors IQ2_XS dense and routed weights with BF16 activations."""
+"""ModelOpt safetensors block codecs with BF16 activations."""
 
 import torch
 
@@ -22,15 +22,23 @@ from vllm.model_executor.layers.linear import (
     LinearMethodBase,
     register_weight_loader_v2_supported_method,
 )
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.weight_transfer import copy_weight
 
+BLOCK_CODECS = {"IQ2_XS": (256, 74), "IQ2_XXS": (256, 66), "Q8_0": (32, 34)}
+
 
 class ModelOptIQ2XSMoEMethod(FusedMoEMethodBase):
-    """Load 74-byte blocks and retain compact b12x prepared expert storage."""
+    """Load native blocks and retain compact b12x prepared expert storage."""
 
-    def __init__(self, moe_config: FusedMoEConfig):
+    def __init__(self, moe_config: FusedMoEConfig, codec: str = "iq2_xs"):
         super().__init__(moe_config)
+        self.codec = codec
+        self.block_size, self.block_bytes = BLOCK_CODECS[codec.upper()]
         if moe_config.moe_backend not in ("auto", "b12x"):
             raise ValueError("IQ2_XS routed experts require the b12x MoE backend")
         if not B12xExperts._supports_current_device():
@@ -63,9 +71,11 @@ class ModelOptIQ2XSMoEMethod(FusedMoEMethodBase):
         act_dtype,
         moe_parallel_config,
     ):
-        if hidden_size % 256 or intermediate_size_per_partition % 256:
+        alignment = max(128, self.block_size)
+        if hidden_size % alignment or intermediate_size_per_partition % alignment:
             raise ValueError(
-                "IQ2_XS hidden and per-rank intermediate sizes must align to 256"
+                f"{self.codec.upper()} hidden and per-rank intermediate sizes "
+                f"must align to {alignment}"
             )
         return hidden_size, intermediate_size_per_partition
 
@@ -90,13 +100,18 @@ class ModelOptIQ2XSMoEMethod(FusedMoEMethodBase):
                 (
                     num_experts,
                     (2 if self.gated else 1) * intermediate_size_per_partition,
-                    hidden_size // 256,
-                    74,
+                    hidden_size // self.block_size,
+                    self.block_bytes,
                 ),
             ),
             (
                 "w2_weight",
-                (num_experts, hidden_size, intermediate_size_per_partition // 256, 74),
+                (
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // self.block_size,
+                    self.block_bytes,
+                ),
             ),
         ):
             layer.register_parameter(
@@ -126,9 +141,9 @@ class ModelOptIQ2XSMoEMethod(FusedMoEMethodBase):
         global_i = local_i * self.moe.moe_parallel_config.tp_size
         hidden = self.moe.hidden_dim
         expected = (
-            (hidden, global_i // 256, 74)
+            (hidden, global_i // self.block_size, self.block_bytes)
             if shard_id == "w2"
-            else (global_i, hidden // 256, 74)
+            else (global_i, hidden // self.block_size, self.block_bytes)
         )
         if loaded_weight.dtype != torch.uint8 or tuple(loaded_weight.shape) != expected:
             raise ValueError(
@@ -140,7 +155,9 @@ class ModelOptIQ2XSMoEMethod(FusedMoEMethodBase):
         destination = param.data[expert_id]
         if shard_id == "w2":
             source = loaded_weight.narrow(
-                1, self.moe.tp_rank * (local_i // 256), local_i // 256
+                1,
+                self.moe.tp_rank * (local_i // self.block_size),
+                local_i // self.block_size,
             )
         else:
             source = loaded_weight.narrow(0, self.moe.tp_rank * local_i, local_i)
@@ -154,8 +171,8 @@ class ModelOptIQ2XSMoEMethod(FusedMoEMethodBase):
         return FusedMoEQuantConfig(
             _a1=FusedMoEQuantDesc(),
             _a2=FusedMoEQuantDesc(),
-            _w1=FusedMoEQuantDesc(dtype="iq2_xs"),
-            _w2=FusedMoEQuantDesc(dtype="iq2_xs"),
+            _w1=FusedMoEQuantDesc(dtype=self.codec),
+            _w2=FusedMoEQuantDesc(dtype=self.codec),
         )
 
     def process_weights_after_loading(self, layer):
@@ -205,11 +222,14 @@ ModelOptIQ2XSMoEMethod.weight_loader.supports_moe_loading = True  # type: ignore
 class ModelOptIQ2XSLinearMethod(LinearMethodBase):
     """Load native block payloads and execute the prepared b12x dense API."""
 
-    def __init__(self):
+    def __init__(self, codec: str = "iq2_xs"):
+        self.codec = codec
+        self.block_size, self.block_bytes = BLOCK_CODECS[codec.upper()]
+        self.is_embedding = False
         from vllm.model_executor.kernels.linear import _get_linear_backend
         from vllm.utils.b12x import get_b12x_blockscaled
 
-        if _get_linear_backend(quantization="iq2_xs") not in ("auto", "b12x"):
+        if _get_linear_backend(quantization=codec) not in ("auto", "b12x"):
             raise ValueError("IQ2_XS dense weights require the b12x linear backend")
         api = get_b12x_blockscaled()
         if (
@@ -230,13 +250,26 @@ class ModelOptIQ2XSLinearMethod(LinearMethodBase):
         **extra_weight_attrs,
     ):
         n = sum(output_partition_sizes)
-        if params_dtype != torch.bfloat16 or input_size_per_partition % 256 or n % 8:
-            raise ValueError("IQ2_XS dense weights require BF16, K256 and N8")
+        self.is_embedding = isinstance(
+            layer, VocabParallelEmbedding
+        ) and not isinstance(layer, ParallelLMHead)
+        if self.is_embedding and self.codec != "q8_0":
+            raise ValueError("packed embedding currently requires Q8_0")
+        if (
+            params_dtype != torch.bfloat16
+            or input_size_per_partition % self.block_size
+            or n % 8
+        ):
+            raise ValueError(
+                f"{self.codec.upper()} dense weights require BF16, "
+                f"K{self.block_size} and N8"
+            )
         layer.register_parameter(
             "weight",
             ModelWeightParameter(
                 data=torch.empty(
-                    (n, input_size_per_partition // 256, 74), dtype=torch.uint8
+                    (n, input_size_per_partition // self.block_size, self.block_bytes),
+                    dtype=torch.uint8,
                 ),
                 input_dim=1,
                 output_dim=0,
@@ -259,11 +292,18 @@ class ModelOptIQ2XSLinearMethod(LinearMethodBase):
 
         api = get_b12x_blockscaled()
         assert api is not None
-        packed = api.pack_weight(layer.weight.data, recipe="iq2_xs")
+        if self.is_embedding:
+            bases = layer.weight.data[..., :2].contiguous().view(torch.float16)
+            if not torch.isfinite(bases).all().item():
+                raise ValueError("Q8_0 embedding scales must be finite")
+            layer.b12x_embedding_plans = {}
+            set_b12x_preparation_provider(layer, self)
+            return
+        packed = api.pack_weight(layer.weight.data, recipe=self.codec)
         name = b12x_layer_prefix(layer)
         layer.b12x_linear = B12xBlockscaledLinear(
             packed,
-            recipe="iq2_xs",
+            recipe=self.codec,
             activation_mode="a16",
             layer_name=name,
         )
@@ -281,8 +321,10 @@ class ModelOptIQ2XSLinearMethod(LinearMethodBase):
         )
 
     def get_b12x_preparation_units(self, layer, workload):
+        if self.is_embedding:
+            return self._embedding_units(layer, workload)
         linear = layer.b12x_linear
-        return (linear.unit(workload, name=f"linear.iq2_xs.{linear.layer_name}"),)
+        return (linear.unit(workload, name=f"linear.{self.codec}.{linear.layer_name}"),)
 
     def get_workspace_size(self, layer, rows):
         return layer.b12x_linear.get_workspace_size(rows)
@@ -300,3 +342,81 @@ class ModelOptIQ2XSLinearMethod(LinearMethodBase):
             layer.b12x_layer_name,
         )
         return output.view(*x.shape[:-1], n)
+
+    def _embedding_units(self, layer, workload):
+        from b12x.preparation import PreparedCall
+        from b12x.sequence import embedding
+
+        from vllm.utils.b12x import B12xPreparationUnit
+
+        if workload.stage != "weights" or layer.weight.is_meta:
+            return ()
+        weight = layer.weight
+        width = weight.shape[1] * 32
+        # Video separator lookups can span a full prompt before chunked prefill.
+        max_rows = max(workload.max_tokens, workload.max_model_len)
+
+        def make_call(state):
+            ids = torch.zeros(
+                state.query.max_rows,
+                device=weight.device,
+                dtype=getattr(torch, state.query.id_dtype),
+            )
+            out = torch.empty(
+                (ids.numel(), width), device=weight.device, dtype=torch.bfloat16
+            )
+            return PreparedCall(
+                run=lambda: state.run(weight, ids, out=out), owners=(weight, ids, out)
+            )
+
+        requests = []
+        for dtype in (torch.int32, torch.int64):
+            plan = layer.b12x_embedding_plans.get(dtype)
+            if plan is None:
+                plan = embedding.plan(
+                    embedding.EmbeddingQuery(
+                        max_rows=max_rows,
+                        table_rows=weight.shape[0],
+                        width=width,
+                        row_stride=weight.stride(0),
+                        weight_dtype="uint8",
+                        id_dtype=str(dtype).removeprefix("torch."),
+                    ),
+                    device=weight.device,
+                )
+                layer.b12x_embedding_plans[dtype] = plan
+            requests.append(
+                plan.request(
+                    name=f"q8_0.embedding.{id(layer):x}.{dtype}", prepare_call=make_call
+                )
+            )
+        return (
+            B12xPreparationUnit(
+                name="Q8Embedding",
+                key=(id(layer), max_rows),
+                requests=tuple(requests),
+                stage="weights",
+            ),
+        )
+
+    def embedding(self, layer, input_):
+        from b12x.sequence import embedding
+
+        plan = layer.b12x_embedding_plans[input_.dtype]
+        width = layer.weight.shape[1] * 32
+        out = torch.empty(
+            (*input_.shape, width),
+            device=layer.weight.device,
+            dtype=torch.bfloat16,
+        )
+        # Encoder profiling may add video separators beyond the token budget.
+        ids, rows = input_.reshape(-1), out.view(-1, width)
+        capacity = plan.query.max_rows
+        for start in range(0, ids.numel(), capacity):
+            embedding.run(
+                layer.weight,
+                ids[start : start + capacity],
+                out=rows[start : start + capacity],
+                plan=plan,
+            )
+        return out
