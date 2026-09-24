@@ -37,6 +37,9 @@ class Qwen4ExpAttnMetadata(MambaHybridAttnMetadata):
     qsa_state_is_fresh: torch.Tensor | None = None
     qsa_num_accepted_tokens: torch.Tensor | None = None
     qsa_is_prefilling: torch.Tensor | None = None
+    # Set during CUDA graph capture: B12X QSA selects and stages its context
+    # inside PIECEWISE graphs, so the captured context must cover max_model_len.
+    qsa_max_seq_len: int | None = None
 
     def get_extra_attn_kwargs(
         self,
@@ -55,6 +58,7 @@ class Qwen4ExpAttnMetadata(MambaHybridAttnMetadata):
             qsa_state_is_fresh=self.qsa_state_is_fresh[:num_reqs],
             qsa_num_accepted_tokens=self.qsa_num_accepted_tokens[:num_reqs],
             qsa_is_prefilling=self.qsa_is_prefilling[:num_reqs],
+            qsa_max_seq_len=self.qsa_max_seq_len,
         )
         return kwargs
 
@@ -374,6 +378,11 @@ class Qwen4ExpModelState(MambaHybridModelState):
             qsa_state_is_fresh=qsa_state_is_fresh,
             qsa_num_accepted_tokens=qsa_num_accepted_tokens,
             qsa_is_prefilling=qsa_is_prefilling,
+            qsa_max_seq_len=(
+                self.max_model_len
+                if for_capture or input_batch.cudagraph_capture
+                else None
+            ),
         )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
