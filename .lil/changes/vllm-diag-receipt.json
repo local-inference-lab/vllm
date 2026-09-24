@@ -1,0 +1,13 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-diag-receipt",
+  "category": "feature",
+  "summary": "Time requests from HTTP receipt, not only from rendering",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "The request timeline adds HTTP receipt to body read and body read to rendering, so a request held before rendering, for example by a slowly delivered body, shows its wait.",
+    "A request that ends without any response after VLLM_REQUEST_STALL_WARNING_S logs a warning with the method, path and when its body was read."
+  ],
+  "authors": ["@voipmonitor"]
+}
