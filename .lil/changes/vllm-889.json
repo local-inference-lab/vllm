@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-889",
+  "category": "feature",
+  "summary": "GLM-5.3-Flash on three GPUs (TP3)",
+  "models": ["GLM-5.3-Flash"],
+  "compatibility": "Opt-in: TP=3 with expert parallelism; other TP sizes are unchanged. The vision tower runs data-parallel at TP3.",
+  "details": [
+    "At TP3, MLA heads are padded 64->72, KDA heads 64->66 and the shared expert 2048->2112 with zero weights, so outputs match the unpadded model; routed experts use expert parallelism.",
+    "Optional FP8 weight-only decode for the large BF16 projections (VLLM_GLM53_FP8_DENSE=1) and a low-latency GEMM plan for TP3 decode shapes.",
+    "FlashInfer autotune caches now hold every rank's entries and all ranks load them consistently; with expert parallelism a warm start could hang.",
+    "Based on BoxTops4Coochie's GLM-5.3-Flash TP3 port."
+  ],
+  "pull_requests": [889],
+  "requires": [887]
+}

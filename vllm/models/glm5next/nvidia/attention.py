@@ -19,6 +19,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepSeekV2FusedQkvAProjLinear,
     yarn_get_mscale,
 )
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -196,6 +197,18 @@ class Glm5NextMLAAttention(nn.Module):
             is_sparse=self.is_sparse,
             topk_indices_buffer=topk_indices_buffer,
         )
+        # TP padding (see Glm5NextForCausalLMConfig) appends zero heads after
+        # the checkpoint heads: zero Q and KV-up rows and zero o_proj input
+        # columns, so padded heads contribute nothing to the output.
+        if getattr(config, "original_num_attention_heads", num_heads) != num_heads:
+            for linear in (
+                self.q_b_proj if q_lora_rank is not None else self.q_proj,
+                self.kv_b_proj,
+                self.o_proj,
+            ):
+                for param in linear.parameters():
+                    set_weight_attrs(param, {"allow_tp_padding": True})
+
         self.mla_attn = MultiHeadLatentAttentionWrapper(
             hidden_size,
             self.num_local_heads,
