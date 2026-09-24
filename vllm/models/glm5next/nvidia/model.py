@@ -97,6 +97,8 @@ from vllm.utils.b12x import get_b12x_mhc, set_b12x_preparation_provider
 
 from . import l2_prefetch as _l2pf
 from .attention import Glm5NextMLAAttention
+from .glm53_fp8_dense import enable_glm53_fp8_dense, enable_glm53_fp8_lm_head
+from .glm53_low_latency_gemm import enable_glm53_low_latency_gemm
 from .kda import Glm5NextLinearAttention
 from .pooled_indexer import Glm5NextIndexerScratch, Glm5NextPooledIndexer
 
@@ -1341,6 +1343,9 @@ class Glm5NextForCausalLM(
         self.model = Glm5NextModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        # TP3-only decode GEMM selection; both are no-ops at other TP sizes.
+        enable_glm53_low_latency_gemm(self.model, self.model_config.dtype)
+        enable_glm53_fp8_dense(self.model)
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 self.config.vocab_size,
@@ -1348,6 +1353,7 @@ class Glm5NextForCausalLM(
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
+            enable_glm53_fp8_lm_head(self.lm_head)
         else:
             self.lm_head = PPMissingLayer()
         logit_scale = getattr(self.config, "logit_scale", 1.0)
