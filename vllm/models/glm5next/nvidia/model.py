@@ -77,6 +77,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
     sequence_parallel_chunk,
 )
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.weight_transfer import materialize_weight
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
@@ -259,10 +260,15 @@ class Glm5NextMoE(nn.Module):
             self.shared_experts = None
         else:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+            # TP padding (see Glm5NextForCausalLMConfig) widens the shared
+            # expert with zero gate/up rows and zero down_proj input columns.
+            padded_size = getattr(
+                config, "shared_expert_intermediate_size", intermediate_size
+            )
 
             self.shared_experts = Glm5NextMLP(
                 hidden_size=config.hidden_size,
-                intermediate_size=intermediate_size,
+                intermediate_size=padded_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 is_sequence_parallel=self.is_sequence_parallel,
@@ -270,6 +276,9 @@ class Glm5NextMoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
                 swiglu_limit=swiglu_limit,
             )
+            if padded_size != intermediate_size:
+                for param in self.shared_experts.parameters():
+                    set_weight_attrs(param, {"allow_tp_padding": True})
 
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
