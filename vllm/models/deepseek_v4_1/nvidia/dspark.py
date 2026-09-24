@@ -33,6 +33,7 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_dspark import (
     DSparkConfidenceHead,
@@ -60,6 +61,7 @@ from vllm.v1.worker.workspace import (
     retain_cuda_graph_capture_resource,
 )
 
+from .. import l2_prefetch
 from ..b12x_layers import B12xRMSNorm as RMSNorm
 from ..b12x_layers import (
     _execution_capacities,
@@ -68,6 +70,7 @@ from .model import (
     DeepseekV4DecoderLayer,
     _linear_scale_param_name,
     _use_sequence_parallel,
+    build_l2_prefetch_plans,
 )
 
 logger = init_logger(__name__)
@@ -354,6 +357,7 @@ class DSparkDeepseekV4Model(nn.Module):
         )
 
         current_vllm_config = get_current_vllm_config()
+        self._l2pf_ready = False
         self.layers = nn.ModuleList(
             [
                 DeepseekV4DecoderLayer(
@@ -379,6 +383,9 @@ class DSparkDeepseekV4Model(nn.Module):
             draft_vocab_size,
             config.dspark_markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
+            # An NVFP4 transition head fits the GB10 L2, so the sequential
+            # draft positions after the first reread it from L2.
+            lm_head_quantization="nvfp4" if envs.VLLM_DS41_MARKOV_NVFP4 else None,
         )
         self.confidence_head: DSparkConfidenceHead | None = None
         if getattr(config, "enable_confidence_head", True):
@@ -451,6 +458,10 @@ class DSparkDeepseekV4Model(nn.Module):
         hidden_states = inputs_embeds
 
         residual = post_mix = res_mix = pre_mix = None
+        if l2_prefetch.ENABLED and not self._l2pf_ready:
+            self._l2pf_ready = build_l2_prefetch_plans(
+                list(self.layers), self.config.num_hidden_layers
+            )
         for layer in self.layers:
             hidden_states, residual, post_mix, res_mix, pre_mix = layer(
                 hidden_states,
@@ -461,6 +472,7 @@ class DSparkDeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
+        l2_prefetch.join()
         hidden_states = layer._b12x_mhc.post(hidden_states, residual, post_mix, res_mix)
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
@@ -490,7 +502,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     has_own_lm_head = False
     # Full-vocab draft: draft ids are target ids, no remapping needed.
     draft_id_to_target_id = None
-    checkpoint_weight_name_prefixes = ("mtp.",)
+    checkpoint_weight_name_prefixes: tuple[str, ...] = ("mtp.",)
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -508,6 +520,19 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         # head otherwise remains on meta and cannot be natively precompiled.
         self.lm_head: nn.Module | None = None
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        if envs.VLLM_DS41_DRAFT_NVFP4_HEAD:
+            # A drafter-owned NVFP4 vocabulary head reads half the bytes of
+            # the shared MXFP8 target head; only draft acceptance depends on it.
+            head = ParallelLMHead(
+                self.config.vocab_size,
+                self.config.hidden_size,
+                prefix=maybe_prefix(prefix, "lm_head"),
+                lm_head_quantization="nvfp4",
+            )
+            if head.runtime_lm_head_quantization == "nvfp4":
+                self.lm_head = head
+                self.has_own_lm_head = True
+                self.checkpoint_weight_name_prefixes = ("mtp.", "head.")
 
     # --- Hooks used by the speculator -------------------------------------
 
@@ -704,6 +729,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
+        if self.has_own_lm_head and "lm_head.weight" not in loaded_params:
+            raise RuntimeError("The DSpark NVFP4 draft head was not loaded")
         if self.model.confidence_head is not None and not loaded_confidence_head:
             self.model.confidence_head = None
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
@@ -742,6 +769,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
         Returns None for non-mtp weights (owned by the target model).
         """
+        if name == "head.weight":
+            return "lm_head.weight" if self.has_own_lm_head else None
         m = re.match(r"mtp\.(\d+)\.(.*)", name)
         if m is None:
             return None

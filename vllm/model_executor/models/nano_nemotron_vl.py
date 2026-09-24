@@ -1540,13 +1540,17 @@ class NemotronH_Nano_VL_V2(
             return name.startswith("language_model")
 
         def is_adapter_weights(weight: tuple[str, torch.Tensor]):
-            return weight[0].startswith("mlp1")
+            return weight[0].startswith(("mlp1.", "vision_projector.mlp1."))
 
         def is_vision_weights(name: str) -> bool:
-            return name.startswith("vision_model.radio_model.")
+            return name.startswith("vision_model.")
 
         def is_sound_weights(name: str) -> bool:
             return name.startswith("sound")
+
+        def retain_weight(weight: torch.Tensor) -> torch.Tensor:
+            # Meta tensors carry direct-loader file provenance in their storage.
+            return weight.detach() if weight.is_meta else weight.detach().clone()
 
         # LLM weights (the bulk of the model) are streamed lazily through a
         # generator so each tensor is copied into its parameter before the
@@ -1566,19 +1570,26 @@ class NemotronH_Nano_VL_V2(
                 elif is_adapter_weights((name, w)):
                     if not load_multimodal_weights:
                         continue
-                    trimmed_name = ".".join(name.split(".")[1:])
-                    adapter_weights.append((trimmed_name, w.detach().clone()))
+                    if name.startswith("vision_projector.mlp1."):
+                        part, suffix = name.removeprefix(
+                            "vision_projector.mlp1."
+                        ).split(".", 1)
+                        index = {"norm": "0", "linear1": "1", "linear2": "3"}[part]
+                        trimmed_name = f"{index}.{suffix}"
+                    else:
+                        trimmed_name = ".".join(name.split(".")[1:])
+                    adapter_weights.append((trimmed_name, retain_weight(w)))
                 elif is_vision_weights(name):
                     if not load_multimodal_weights:
                         continue
                     # Convert: vision_model.radio_model.* → radio_model.*
                     hf_key = name[len("vision_model.") :]
-                    vision_weights.append((hf_key, w.detach().clone()))
+                    vision_weights.append((hf_key, retain_weight(w)))
                 elif is_sound_weights(name):
                     if not load_multimodal_weights:
                         continue
                     assert self.sound_encoder is not None
-                    sound_weights.append((name, w.detach().clone()))
+                    sound_weights.append((name, retain_weight(w)))
 
         # Fully drain the generator so every mm tensor is buffered, even if
         # the LLM loader stops iterating early.

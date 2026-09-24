@@ -58,7 +58,6 @@ logger = init_logger(__name__)
 
 _MIN_BYTES = 64 * 1024
 _CHUNK_BYTES = 4096
-_GRID = 16
 _BLOCK = 128
 # Caches and lookup tables are either written immediately before use or read
 # sparsely. Streaming them into L2 would evict projection weights without
@@ -94,6 +93,15 @@ def _mb(name: str, default: str) -> int:
         return int(float(default) * 1e6)
 
 
+# Fewer issuing CTAs throttle the fill rate, leaving device-memory headroom
+# for latency-bound kernels running beside the prefetch. GB10 (SM121) decode
+# measured best with 4.
+_GRID = _int_env(
+    "VLLM_L2_PREFETCH_GRID",
+    4
+    if torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 1)
+    else 16,
+)
 _MAX_TOKENS = _int_env("VLLM_GLM53_L2_PREFETCH_MAX_TOKENS", 256)
 
 

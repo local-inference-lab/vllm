@@ -94,7 +94,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     requantize_with_max_scale,
 )
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.parameter import (
     BlockQuantScaleParameter,
     ChannelQuantScaleParameter,
@@ -1527,6 +1530,21 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         super().__init__(exclude_modules)
         self.kv_cache_quant_method = kv_cache_quant_method
         self.quantized_layers = quantized_layers
+        from .modelopt_iq2_xs import BLOCK_CODECS
+
+        for prefix, recipe in quantized_layers.items():
+            codec = recipe.get("quant_algo", "").upper()
+            if codec in BLOCK_CODECS and any(
+                recipe.get(key) != value
+                for key, value in {
+                    "group_size": BLOCK_CODECS[codec][0],
+                    "block_payload_bytes": BLOCK_CODECS[codec][1],
+                    "packing": "ggml",
+                }.items()
+            ):
+                raise ValueError(
+                    f"unsupported {codec} block contract for {prefix}: {recipe}"
+                )
         self.fp8_config = fp8_config
         self.nvfp4_config = nvfp4_config
         self.w4a16_nvfp4_config = w4a16_nvfp4_config
@@ -1775,6 +1793,20 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             return None
 
         quant_algo = self._resolve_quant_algo(prefix)
+
+        if quant_algo in ("IQ2_XS", "IQ2_XXS", "Q8_0"):
+            from vllm.model_executor.layers.quantization.modelopt_iq2_xs import (
+                ModelOptIQ2XSLinearMethod,
+                ModelOptIQ2XSMoEMethod,
+            )
+
+            if isinstance(layer, RoutedExperts):
+                return ModelOptIQ2XSMoEMethod(
+                    layer.moe_config, codec=quant_algo.lower()
+                )
+            if isinstance(layer, (LinearBase, VocabParallelEmbedding)):
+                return ModelOptIQ2XSLinearMethod(codec=quant_algo.lower())
+            raise ValueError("IQ2_XS requires a dense linear or routed experts")
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             # Per-prefix algo -> its sub-config, then the generic linear method.

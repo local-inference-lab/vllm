@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-karmic-canonical-sync-20260924",
+  "category": "compatibility",
+  "summary": "Carry the current canonical Karmic runtime into beta: DeepSeek V4.1 decode prefetch and compact IQ2/Q8_0 checkpoints",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "DeepSeek V4.1 decode prefetches the next weights into L2 and reads disk Engram rows for both Engram layers concurrently; the NVFP4 Markov head stays opt-in (VLLM_DS41_MARKOV_NVFP4=1).",
+    "ModelOpt IQ2_XS, IQ2_XXS and Q8_0 checkpoints load through compact B12X dense, expert, embedding and LM-head paths."
+  ],
+  "authors": ["lukealonso"],
+  "requires": ["b12x-master-sync-20260924"]
+}
