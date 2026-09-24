@@ -1,0 +1,13 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-886",
+  "category": "fix",
+  "summary": "Allow decode context parallelism equal to tensor parallelism for official Qwen3.8-Flash-Next checkpoints",
+  "models": ["Qwen3.8-Flash-Next"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Checkpoints that declare model_type qwen4_exp, including the official FP8 and NVFP4 releases, now start at TP4/DCP4 instead of failing with \"decode-context-parallel-size (4) exceeds the maximum supported value (2)\".",
+    "Decode context parallelism still requires the B12X QSA backend."
+  ],
+  "pull_requests": [886]
+}
