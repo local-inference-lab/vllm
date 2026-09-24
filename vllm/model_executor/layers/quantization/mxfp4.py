@@ -498,6 +498,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     def supports_eplb(self) -> bool:
         return True
 
+    def _stages_experts_on_host(self) -> bool:
+        from vllm.model_executor.layers.fused_moe.b12x_residency import (
+            expert_residency_enabled,
+        )
+
+        return (
+            self.mxfp4_backend == Mxfp4MoeBackend.B12X_MXFP4_MXFP8
+            and expert_residency_enabled()
+        )
+
     @property
     def skip_forward_padding(self) -> bool:
         # SM100_FI_MXFP4_MXFP8_TRTLLM supports padding with mxfp8 quant
@@ -584,6 +594,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.hidden_size = hidden_size
         weight_loader = extra_weight_attrs.pop("weight_loader")
         scale_weight_loader = Mxfp4MoEMethod.get_scale_weight_loader(weight_loader)
+        # Expert residency stages routed experts in host memory; b12x places
+        # them in HBM or Grace during preparation, so they never move to HBM here.
+        staged = self._stages_experts_on_host()
+        expert_device = torch.device("cpu") if staged else None
+        if staged:
+            self.requires_device_loading = False
 
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
@@ -592,6 +608,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self.moe.w13_num_shards * intermediate_size_per_partition,
                 hidden_size // 2,
                 dtype=weight_dtype,
+                device=expert_device,
             ),
             requires_grad=False,
         )
@@ -607,6 +624,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     hidden_size // mxfp4_block,
                 ),
                 dtype=scale_dtype,
+                device=expert_device,
             ),
             requires_grad=False,
         )
@@ -622,6 +640,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 intermediate_size_per_partition // 2,
                 dtype=weight_dtype,
+                device=expert_device,
             ),
             requires_grad=False,
         )
@@ -637,6 +656,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     intermediate_size_per_partition // mxfp4_block,
                 ),
                 dtype=scale_dtype,
+                device=expert_device,
             ),
             requires_grad=False,
         )

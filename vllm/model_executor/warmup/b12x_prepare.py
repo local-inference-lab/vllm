@@ -355,6 +355,25 @@ def collect_b12x_units(
     module_lanes = {key: tuple(sorted(lanes)) for key, lanes in lanes_by_module.items()}
     if draft is not None:
         workload = _draft_workload(worker, workload, lane=0)
+    vllm_config = getattr(worker, "vllm_config", None)
+    if (
+        workload.stage == "weights"
+        and vllm_config is not None
+        and vllm_config.expert_residency_config is not None
+    ):
+        from vllm.model_executor.layers.fused_moe.b12x_residency import (
+            declare_expert_residency,
+        )
+
+        # Placement spans every MoE layer, so it precedes per-layer units.
+        declare_expert_residency(
+            vllm_config,
+            model=model,
+            draft=draft,
+            workload=workload,
+            draft_workload=replace(workload, lane=lane) if draft is not None else None,
+            device=worker.device,
+        )
     # Target and draft can share the same embedding and output-head modules.
     seen: set[int] = set()
     units.extend(

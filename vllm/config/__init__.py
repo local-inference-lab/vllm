@@ -14,6 +14,7 @@ from vllm.config.diffusion import DiffusionConfig
 from vllm.config.ec_manager_config import EncoderCacheManagerConfig
 from vllm.config.ec_transfer import ECTransferConfig
 from vllm.config.engram import EngramConfig
+from vllm.config.expert_residency import ExpertResidencyConfig
 from vllm.config.fault_tolerance import FaultToleranceConfig
 from vllm.config.kernel import KernelConfig
 from vllm.config.kv_events import KVEventsConfig
@@ -86,6 +87,8 @@ __all__ = [
     "ECTransferConfig",
     # From vllm.config.engram
     "EngramConfig",
+    # From vllm.config.expert_residency
+    "ExpertResidencyConfig",
     # From vllm.config.kernel
     "KernelConfig",
     # From vllm.config.kv_events

@@ -35,6 +35,7 @@ from .diffusion import DiffusionConfig
 from .ec_manager_config import EncoderCacheManagerConfig
 from .ec_transfer import ECTransferConfig
 from .engram import EngramConfig, model_has_engram_layers
+from .expert_residency import ExpertResidencyConfig
 from .kernel import KernelConfig
 from .kv_events import KVEventsConfig
 from .kv_transfer import KVTransferConfig
@@ -435,6 +436,8 @@ class VllmConfig:
     """Attention configuration."""
     engram_config: EngramConfig | None = None
     """N-gram embedding storage and sharding settings."""
+    expert_residency_config: ExpertResidencyConfig | None = None
+    """HBM and Grace placement of routed MoE experts (b12x, SM103)."""
     mamba_config: MambaConfig = Field(default_factory=MambaConfig)
     """Mamba configuration."""
     kernel_config: KernelConfig = Field(default_factory=KernelConfig)
@@ -576,6 +579,11 @@ class VllmConfig:
         vllm_factors.append(
             self.engram_config.compute_hash()
             if self.engram_config is not None
+            else "None"
+        )
+        vllm_factors.append(
+            self.expert_residency_config.compute_hash()
+            if self.expert_residency_config is not None
             else "None"
         )
         if self.lora_config:
@@ -1438,6 +1446,14 @@ class VllmConfig:
 
         self.try_verify_and_update_config()
         self._resolve_and_verify_engram_config()
+        if self.expert_residency_config is not None:
+            self.expert_residency_config.verify(
+                model_config=self.model_config,
+                parallel_config=self.parallel_config,
+                cache_config=self.cache_config,
+                load_config=self.load_config,
+                moe_backend=self.kernel_config.moe_backend,
+            )
 
         self._check_watermarking_unsupported()
         # Models may have supplied their own DCP defaults above; anything still

@@ -45,6 +45,7 @@ from vllm.config import (
     EncoderCacheManagerConfig,
     EngramConfig,
     EPLBConfig,
+    ExpertResidencyConfig,
     FaultToleranceConfig,
     KernelConfig,
     KVEventsConfig,
@@ -775,6 +776,9 @@ class EngineArgs:
     compilation_config: CompilationConfig = get_field(VllmConfig, "compilation_config")
     attention_config: AttentionConfig = get_field(VllmConfig, "attention_config")
     engram_config: EngramConfig | None = get_field(VllmConfig, "engram_config")
+    expert_residency_config: ExpertResidencyConfig | None = get_field(
+        VllmConfig, "expert_residency_config"
+    )
     mamba_config: MambaConfig = get_field(VllmConfig, "mamba_config")
     kernel_config: KernelConfig = get_field(VllmConfig, "kernel_config")
     enable_bf16x3_router_gemm: bool | None = None
@@ -880,6 +884,10 @@ class EngineArgs:
             self.attention_config = AttentionConfig(**self.attention_config)
         if isinstance(self.engram_config, dict):
             self.engram_config = EngramConfig(**self.engram_config)
+        if isinstance(self.expert_residency_config, dict):
+            self.expert_residency_config = ExpertResidencyConfig(
+                **self.expert_residency_config
+            )
         if isinstance(self.mamba_config, dict):
             self.mamba_config = MambaConfig(**self.mamba_config)
         if isinstance(self.kernel_config, dict):
@@ -1848,6 +1856,9 @@ class EngineArgs:
             "--attention-config", "-ac", **vllm_kwargs["attention_config"]
         )
         vllm_group.add_argument("--engram-config", **vllm_kwargs["engram_config"])
+        vllm_group.add_argument(
+            "--expert-residency-config", **vllm_kwargs["expert_residency_config"]
+        )
         vllm_group.add_argument("--reasoning-config", **vllm_kwargs["reasoning_config"])
         vllm_group.add_argument("--kernel-config", **vllm_kwargs["kernel_config"])
         vllm_group.add_argument(
@@ -2800,6 +2811,7 @@ class EngineArgs:
             offload_config=offload_config,
             attention_config=attention_config,
             engram_config=copy.deepcopy(self.engram_config),
+            expert_residency_config=copy.deepcopy(self.expert_residency_config),
             mamba_config=mamba_config,
             kernel_config=kernel_config,
             lora_config=lora_config,

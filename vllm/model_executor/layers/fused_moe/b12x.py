@@ -13,6 +13,11 @@ import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.b12x_residency import (
+    ResidencyDeclaration,
+    expert_residency_enabled,
+    residency_prepare_call_factory,
+)
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
@@ -267,6 +272,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self._plan_key: tuple | None = None
         self._plan_activation: MoEActivation | None = None
         self._plan_route_on_input: bool | None = None
+        # Host-staged MXFP4 experts served by b12x expert residency (SM103).
+        self._residency = expert_residency_enabled() and self._quant_mode == "w4a8_mx"
+        self.residency_declaration: ResidencyDeclaration | None = None
 
     def _unit_scale(self, device: torch.device, num_experts: int) -> torch.Tensor:
         scale = self._unit_scales.get(device)
@@ -443,6 +451,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             )
         self._source_parameters_released = False
         self._refresh_quant_config(layer)
+        if self._residency:
+            self._declare_residency(layer)
+            return
         prepared = self._prepare_experts(
             w1=layer.w13_weight,
             w2=layer.w2_weight,
@@ -457,6 +468,117 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         _register_b12x_moe_output_collective(
             layer, hidden_size=int(prepared.hidden_size)
         )
+
+    def _declare_residency(self, layer: torch.nn.Module) -> None:
+        """Keep the host-staged experts; the model-wide residency step plans them."""
+        if self._apply_router_weight_on_input:
+            raise ValueError(
+                "expert residency applies router weights after the experts"
+            )
+        if self.w1_scale is None or self.w2_scale is None:
+            raise ValueError("b12x MoE requires w1 and w2 block scales")
+        fused_moe = _require_b12x_fused_moe()
+        w1, w2 = layer.w13_weight, layer.w2_weight
+        if w1.device.type != "cpu":
+            raise ValueError(
+                "expert residency requires routed experts staged in host memory"
+            )
+        limit, alpha, beta = self._swiglu_params(layer.activation)
+        weight_plan = fused_moe.plan_weights(
+            source=fused_moe.PackedSource(
+                format=fused_moe.PackedSourceFormat(self._source_format),
+                w13_layout=fused_moe.W13Layout(self._w13_layout),
+            ),
+            activation=fused_moe.ActivationSpec(
+                mode=fused_moe.ActivationMode.A8,
+                nonlinearity=_b12x_activation_name(layer.activation),
+                io_dtype=self.moe_config.in_dtype,
+                swiglu_limit=limit,
+                swiglu_alpha=alpha,
+                swiglu_beta=beta,
+            ),
+            geometry=fused_moe.MoEGeometry(
+                num_experts=int(w1.shape[0]),
+                hidden_size=int(w2.shape[1]),
+                intermediate_size=int(w2.shape[2]) * 2,
+            ),
+            constraints=fused_moe.WeightPlanConstraints(
+                required_packing="source_native"
+            ),
+        )
+        self.residency_declaration = ResidencyDeclaration(
+            layer_name=layer.layer_name,
+            weight_plan=weight_plan,
+            w13=w1,
+            w2=w2,
+            w13_block_scales=self.w1_scale,
+            w2_block_scales=self.w2_scale,
+            top_k=int(self.moe_config.experts_per_token),
+        )
+        if not getattr(layer, "b12x_preparation_suppressed", False):
+            set_b12x_preparation_provider(layer, self)
+        _register_b12x_moe_output_collective(layer, hidden_size=int(w2.shape[1]))
+
+    def _residency_units(
+        self, layer: torch.nn.Module, workload: B12xWorkload
+    ) -> Sequence[B12xPreparationUnit]:
+        declaration = self.residency_declaration
+        assert declaration is not None
+        if workload.stage != "weights":
+            return ()
+        if workload.output_dtype != self.moe_config.in_dtype:
+            raise ValueError("b12x MoE output dtype differs from its loaded contract")
+        if declaration.plan is None:
+            raise RuntimeError(
+                "expert residency must place every layer before weights preparation"
+            )
+        geometry = declaration.weight_plan.geometry
+        request = declaration.plan.request(
+            name=f"fused_moe:{id(layer)}",
+            prepare_call=residency_prepare_call_factory(
+                tokens=declaration.max_tokens,
+                topk=declaration.top_k,
+                hidden_size=int(geometry.hidden_size),
+                num_experts=int(geometry.num_experts),
+                device=torch.device("cuda", torch.cuda.current_device()),
+            ),
+        )
+        key = ("expert_residency", declaration.layer_name, declaration.max_tokens)
+        return (
+            B12xPreparationUnit(
+                name="EXPERT_RESIDENCY", key=key, requests=(request,), stage="weights"
+            ),
+        )
+
+    def _apply_residency(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> None:
+        declaration = self.residency_declaration
+        assert declaration is not None
+        if declaration.plan is None:
+            raise PreparationResourceUnavailableError(
+                "expert residency has no prepared plan for this layer"
+            )
+        if int(hidden_states.shape[0]) == 0:
+            return
+        if int(hidden_states.shape[0]) > declaration.max_tokens:
+            raise ValueError(
+                f"live MoE token count {int(hidden_states.shape[0])} exceeds the "
+                f"residency capacity {declaration.max_tokens}"
+            )
+        fused_moe = _require_b12x_fused_moe()
+        binding = fused_moe.bind(
+            declaration.plan,
+            a=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=_normalize_topk_weights(topk_weights),
+            output=output,
+        )
+        fused_moe.run(binding=binding)
 
     @staticmethod
     def is_supported_config(
@@ -624,6 +746,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         from b12x.moe.fused_moe.workloads import TUNING_WORKLOAD_VERSION
         from b12x.preparation import FrozenMapping
 
+        if self.residency_declaration is not None:
+            return self._residency_units(layer, workload)
         if workload.stage != "weights":
             return ()
         if workload.output_dtype != self.moe_config.in_dtype:
@@ -755,6 +879,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         del N, global_num_experts, local_num_experts, expert_tokens_meta
+        if self.residency_declaration is not None:
+            # The residency plan owns its workspace and output staging.
+            return (0,), (1,), (M, K)
         plan = self._plan_for_tokens(
             int(M),
             activation=activation,
@@ -790,7 +917,6 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             raise ValueError(
                 "apply_router_weight_on_input does not match the prepared b12x MoE plan"
             )
-        prepared = self._prepared()
         # Native routes are specialized for both int32 and int64 identifiers
         # during materialization.  Preserve the caller's representation: a
         # conversion here would allocate during capture and would silently
@@ -800,6 +926,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             or not topk_ids.is_contiguous()
         ):
             raise TypeError("b12x MoE topk_ids must be contiguous int32 or int64")
+        if self.residency_declaration is not None:
+            self._apply_residency(output, hidden_states, topk_weights, topk_ids)
+            return
+        prepared = self._prepared()
         topk_weights = _normalize_topk_weights(topk_weights)
         plan = self._plan_for_tokens(
             int(hidden_states.shape[0]),
