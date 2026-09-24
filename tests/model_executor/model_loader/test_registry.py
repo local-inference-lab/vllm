@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+
 import pytest
+import torch
 from torch import nn
 
 from vllm.config import ModelConfig
@@ -131,3 +134,80 @@ def test_default_loader_restricts_safetensors_shards_by_weight_prefix(
 
     assert use_safetensors
     assert files == [str(mtp_shard)]
+
+
+@pytest.mark.parametrize("prefixes", ["vision.", [], [""], [1]])
+def test_default_loader_rejects_invalid_priority_prefixes(prefixes):
+    with pytest.raises(ValueError, match="non-empty list of non-empty strings"):
+        DefaultModelLoader(
+            LoadConfig(
+                load_format="instanttensor",
+                model_loader_extra_config={
+                    "instanttensor_priority_weight_name_prefixes": prefixes,
+                },
+            )
+        )
+
+
+@pytest.mark.parametrize("threshold", [0, -1, True, "4096"])
+def test_default_loader_rejects_invalid_small_checkpoint_threshold(threshold):
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        DefaultModelLoader(
+            LoadConfig(
+                load_format="instanttensor",
+                model_loader_extra_config={
+                    "instanttensor_small_checkpoint_max_bytes": threshold,
+                },
+            )
+        )
+
+
+def test_instanttensor_loader_retains_index_and_priority_for_selected_shard(
+    tmp_path, monkeypatch
+):
+    """Shard selection must not discard tensor identity or priority ordering."""
+    shard = tmp_path / "model.safetensors"
+    shard.touch()
+    weight_name = "vision.proj.weight"
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {weight_name: shard.name}})
+    )
+    weight = torch.ones(2, 2)
+    observed = {}
+
+    def iterator(files, use_tqdm, **kwargs):
+        observed.update(files=files, **kwargs)
+        yield weight_name, weight
+
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.default_loader.instanttensor_weights_iterator",
+        iterator,
+    )
+    loader = DefaultModelLoader(
+        LoadConfig(
+            load_format="instanttensor",
+            model_loader_extra_config={
+                "instanttensor_priority_weight_name_prefixes": ["vision."],
+                "instanttensor_small_checkpoint_max_bytes": 4096,
+            },
+        )
+    )
+    result = list(
+        loader._get_weights_iterator(
+            DefaultModelLoader.Source(
+                str(tmp_path),
+                None,
+                prefix="target.",
+                weight_name_prefixes=("vision.",),
+            )
+        )
+    )
+
+    assert result == [("target." + weight_name, weight)]
+    assert observed == {
+        "files": [str(shard)],
+        "weight_name_prefixes": ("vision.",),
+        "indexed_tensor_files": {weight_name: str(shard)},
+        "priority_weight_name_prefixes": ["vision."],
+        "small_checkpoint_max_bytes": 4096,
+    }
