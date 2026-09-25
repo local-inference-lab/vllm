@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     VLLM_DFLASH_VOCAB_PARALLEL_DRAFT: bool = False
     VLLM_GLM53_VISION_MXFP8: bool = False
     VLLM_GLM53_EMBED_HOST: bool = False
+    VLLM_SHARE_PYNCCL_COMMS: bool = False
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -944,6 +945,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the rows of the current tokens through a UVA view.
     "VLLM_GLM53_EMBED_HOST": lambda: bool(
         int(os.getenv("VLLM_GLM53_EMBED_HOST", "0"))
+    ),
+    # Groups over the same ranks share one PyNCCL communicator.
+    "VLLM_SHARE_PYNCCL_COMMS": lambda: bool(
+        int(os.getenv("VLLM_SHARE_PYNCCL_COMMS", "0"))
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
