@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_GLM53_MTP_DRAFT_HEAD: Literal["bf16", "nvfp4"] = "bf16"
     VLLM_DFLASH_VOCAB_PARALLEL_DRAFT: bool = False
+    VLLM_GLM53_VISION_MXFP8: bool = False
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -932,6 +933,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # verification outcomes) instead of all-gathering the draft logits.
     "VLLM_DFLASH_VOCAB_PARALLEL_DRAFT": lambda: (
         os.getenv("VLLM_DFLASH_VOCAB_PARALLEL_DRAFT", "0") == "1"
+    ),
+    # Quantize the GLM-5.3 vision tower's linear layers to MXFP8 while loading
+    # its BF16 weights. Convolutions and norms stay BF16.
+    "VLLM_GLM53_VISION_MXFP8": lambda: bool(
+        int(os.getenv("VLLM_GLM53_VISION_MXFP8", "0"))
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
