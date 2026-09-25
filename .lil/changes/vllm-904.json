@@ -1,0 +1,13 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-904",
+  "category": "feature",
+  "summary": "Image and video conversations get boundary checkpoints, so an external cache can restore them",
+  "models": ["GLM-5.3-Flash"],
+  "compatibility": "No user action required. Text requests are unchanged.",
+  "details": [
+    "Requests with images or video were excluded from boundary checkpoints, so after eviction from GPU memory or a restart they were computed from scratch, including all text after the image.",
+    "Placeholder positions are now named by the image's content hash, so a checkpoint of one image is never restored for another. In GPU memory the next turn also reuses the exact request boundary instead of the last block boundary (15,331 instead of 12,288 of 15,410 tokens in our test)."
+  ],
+  "pull_requests": [904]
+}
