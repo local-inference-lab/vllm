@@ -3,6 +3,7 @@
 
 """Exact request-boundary lookup and ownership for recurrent prefix caches."""
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -13,6 +14,53 @@ if TYPE_CHECKING:
     from vllm.v1.core.block_pool import BlockPool
 
 MAX_BOUNDARY_STOP_TOKENS = 128
+
+# Modalities whose placeholder spans are fully identified by their content hash.
+CHECKPOINT_MODALITIES = frozenset({"image", "video"})
+# Placeholder positions map into [2**30, 2**31): above every vocabulary and
+# inside LMCache's token wire domain.
+_CONTENT_TOKEN_BASE = 1 << 30
+_CONTENT_TOKEN_STEP = 0x9E3779B1
+
+
+def content_token_ids(
+    request: Request, start: int, end: int, salt: bytes = b""
+) -> tuple[int, ...]:
+    """Token IDs of ``[start, end)`` with each multimodal span named by content.
+
+    Placeholder tokens are identical for every image, so a checkpoint keyed by
+    token IDs alone could restore one image's state for another. Positions in
+    a multimodal span are replaced by pseudo-IDs derived from the item's
+    content hash and the position inside the span. Text requests are unchanged.
+
+    Args:
+        request: Request whose ``all_token_ids`` and ``mm_features`` are read.
+        start: First position, inclusive.
+        end: Last position, exclusive.
+        salt: Extra identity (for example encoder precision) mixed into the IDs.
+    """
+    tokens = request.all_token_ids[start:end]
+    features = request.mm_features
+    if not features:
+        return tuple(tokens)
+    tokens = list(tokens)
+    for feature in features:
+        offset = feature.mm_position.offset
+        length = feature.mm_position.length
+        lo, hi = max(offset, start), min(offset + length, end)
+        if lo >= hi:
+            continue
+        digest = hashlib.sha256(
+            b"vllm-mm-content-tokens-v1\0" + salt + b"\0" + feature.identifier.encode()
+        ).digest()
+        base = int.from_bytes(digest[:8], "little")
+        for position in range(lo, hi):
+            value = (
+                base + (position - offset) * _CONTENT_TOKEN_STEP
+            ) % _CONTENT_TOKEN_BASE
+            tokens[position - start] = _CONTENT_TOKEN_BASE + value
+    return tuple(tokens)
+
 
 # Optional checkpoints have fixed slots; absent slots contain no KV blocks.
 PROMPT_CHECKPOINT_SLOT = 0
@@ -187,7 +235,10 @@ class BoundaryCheckpointCache:
         return (
             request.prompt_token_ids is not None
             and request.prompt_embeds is None
-            and not request.mm_features
+            and all(
+                feature.modality in CHECKPOINT_MODALITIES and feature.identifier
+                for feature in request.mm_features or ()
+            )
             and not request.resumable
             and request.sampling_params is not None
             and len(request.sampling_params.stop_token_ids or ())
@@ -222,7 +273,7 @@ class BoundaryCheckpointCache:
         pending = _PendingCheckpoint(
             checkpoint,
             self._root_key(request, start),
-            tuple(request.all_token_ids[start : checkpoint.num_tokens]),
+            content_token_ids(request, start, checkpoint.num_tokens),
             num_ranks,
         )
         self.block_pool.touch(blocks)
@@ -289,10 +340,8 @@ class BoundaryCheckpointCache:
             root = self._roots.get(self._root_key(request, offset))
             if root is None:
                 continue
-            tokens = tuple(
-                request.all_token_ids[
-                    offset : min(offset + self.hash_block_size, max_length)
-                ]
+            tokens = content_token_ids(
+                request, offset, min(offset + self.hash_block_size, max_length)
             )
             checkpoint_id = root.find(tokens)
             if checkpoint_id is not None:
