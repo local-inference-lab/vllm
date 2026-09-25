@@ -26,6 +26,52 @@ from .base_device_communicator import DeviceCommunicatorBase
 logger = init_logger(__name__)
 
 
+# PyNCCL communicators shared by groups over the same ranks and device
+# (VLLM_SHARE_PYNCCL_COMMS): key -> [communicator, owners].
+_SHARED_PYNCCL: dict[tuple, list] = {}
+
+
+def _acquire_pynccl(group, device: torch.device):
+    """Return (communicator, share key, created).
+
+    With VLLM_SHARE_PYNCCL_COMMS, groups over the same ranks (for example TP,
+    DCP and EP at TP2+DCP2) reuse one NCCL communicator instead of each
+    allocating channel and P2P buffers. Every rank creates its groups in the
+    same order, so each rank makes the same reuse decision. The groups' device
+    collectives are issued from the current stream, so their order on the
+    shared communicator matches on every rank.
+    """
+    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+
+    if not envs.VLLM_SHARE_PYNCCL_COMMS or isinstance(group, StatelessProcessGroup):
+        return PyNcclCommunicator(group=group, device=device), None, True
+    import torch.distributed as dist
+
+    key = (tuple(dist.get_process_group_ranks(group)), str(device))
+    entry = _SHARED_PYNCCL.get(key)
+    if entry is not None:
+        entry[1] += 1
+        logger.info("Reusing the PyNCCL communicator of ranks %s", key[0])
+        return entry[0], key, False
+    comm = PyNcclCommunicator(group=group, device=device)
+    _SHARED_PYNCCL[key] = [comm, 1]
+    return comm, key, True
+
+
+def _release_pynccl(comm, key: tuple | None) -> None:
+    if key is None:
+        comm.destroy()
+        return
+    entry = _SHARED_PYNCCL.get(key)
+    if entry is None or entry[0] is not comm:
+        comm.destroy()
+        return
+    entry[1] -= 1
+    if entry[1] == 0:
+        del _SHARED_PYNCCL[key]
+        comm.destroy()
+
+
 class CudaCommunicator(DeviceCommunicatorBase):
     def __init__(
         self,
@@ -109,12 +155,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
 
         self.pynccl_comm: PyNcclCommunicator | None = None
+        self._pynccl_share_key: tuple | None = None
         if self.world_size > 1:
-            self.pynccl_comm = PyNcclCommunicator(
-                group=self.cpu_group if tcp_store_group is None else tcp_store_group,
-                device=self.device,
+            group = self.cpu_group if tcp_store_group is None else tcp_store_group
+            self.pynccl_comm, self._pynccl_share_key, created = _acquire_pynccl(
+                group, self.device
             )
-            if is_symmetric_memory_enabled():
+            if created and is_symmetric_memory_enabled():
                 register_nccl_symmetric_ops(self.pynccl_comm)
 
         self.ca_comm: CustomAllreduce | None = None
@@ -722,7 +769,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.b12x_ar_comm.close()
             self.b12x_ar_comm = None
         if self.pynccl_comm is not None:
-            self.pynccl_comm.destroy()
+            _release_pynccl(self.pynccl_comm, self._pynccl_share_key)
             self.pynccl_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
