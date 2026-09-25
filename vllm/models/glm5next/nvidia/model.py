@@ -1699,9 +1699,7 @@ def host_embedding_if_requested(embed: VocabParallelEmbedding) -> None:
     if not is_uva_available():
         raise RuntimeError("VLLM_GLM53_EMBED_HOST requires UVA and pinned memory")
     weight = embed.weight
-    host = torch.empty(
-        weight.shape, dtype=weight.dtype, device="cpu", pin_memory=True
-    )
+    host = torch.empty(weight.shape, dtype=weight.dtype, device="cpu", pin_memory=True)
     weight.data = get_accelerator_view_from_cpu_tensor(host)
     weight._vllm_is_uva_offloaded = True
 

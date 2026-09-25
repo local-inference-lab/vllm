@@ -925,9 +925,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Keep the GLM-5.3 input embedding table in pinned host RAM; the GPU reads
     # the rows of the current tokens through a UVA view.
-    "VLLM_GLM53_EMBED_HOST": lambda: bool(
-        int(os.getenv("VLLM_GLM53_EMBED_HOST", "0"))
-    ),
+    "VLLM_GLM53_EMBED_HOST": lambda: bool(int(os.getenv("VLLM_GLM53_EMBED_HOST", "0"))),
     # Groups over the same ranks share one PyNCCL communicator.
     "VLLM_SHARE_PYNCCL_COMMS": lambda: bool(
         int(os.getenv("VLLM_SHARE_PYNCCL_COMMS", "0"))
