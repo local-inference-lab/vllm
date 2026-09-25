@@ -3,6 +3,8 @@
 
 """GPU capture of request endpoints into budgeted KV-pool blocks."""
 
+import os
+import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, cast
 
@@ -19,6 +21,12 @@ from vllm.v1.core.boundary_checkpoint import (
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec, iter_layer_specs
 from vllm.v1.worker.mamba_utils import _reinterpret_u64_as_i64
+
+# The capture_attention completion wait must be bounded. These are small
+# tail copies (microseconds-to-ms healthy path); a wedged kernel
+# otherwise holds the engine-core loop forever. On expiry we raise —
+# the loud-failure family: an incomplete capture must not be read.
+_COPY_WAIT_TIMEOUT = float(os.getenv("VLLM_BOUNDARY_COPY_TIMEOUT", "120.0"))
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import NewRequestData
@@ -903,7 +911,15 @@ class BoundaryCheckpointState:
         self._completion.record()
 
     def wait_for_copies(self) -> None:
-        self._completion.synchronize()
+        deadline = time.monotonic() + _COPY_WAIT_TIMEOUT
+        while not self._completion.query():
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "boundary checkpoint copies did not complete within "
+                    f"{_COPY_WAIT_TIMEOUT}s; refusing to read a possibly "
+                    "incomplete capture"
+                )
+            time.sleep(0.005)
 
     def get_hidden_states(self, block_id: int, *, draft: bool = False) -> torch.Tensor:
         shape = self.spec_hidden_shape if draft else self.hidden_shape
