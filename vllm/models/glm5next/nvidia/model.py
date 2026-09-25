@@ -7,6 +7,7 @@ from typing import ClassVar, Literal
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import (
     get_ep_group,
@@ -1541,8 +1542,9 @@ class Glm5NextForConditionalGeneration(
                 # the latter onto text_config (1e-5), silently ignoring the
                 # vision tower's own (1e-6) rms_norm_eps.
                 norm_eps=config.vision_config.rms_norm_eps,
-                # The vision tower ships BF16 weights and is not quantized.
-                quant_config=None,
+                # The vision tower ships BF16 weights; it is quantized only
+                # on request (VLLM_GLM53_VISION_MXFP8).
+                quant_config=_vision_quant_config(),
                 prefix=maybe_prefix(prefix, "visual"),
             )
 
@@ -1679,6 +1681,18 @@ def _try_load_fp8_attn_proj(
         param.weight_loader(param, weight_bf16, shard_id)
     loaded_params.add(target_w)
     return True
+
+
+def _vision_quant_config() -> QuantizationConfig | None:
+    """Online MXFP8 for the vision tower's linear layers, when requested."""
+    if not envs.VLLM_GLM53_VISION_MXFP8:
+        return None
+    from vllm.config.quantization import QuantizationConfigArgs
+    from vllm.model_executor.layers.quantization.online.base import (
+        OnlineQuantizationConfig,
+    )
+
+    return OnlineQuantizationConfig(QuantizationConfigArgs(linear="mxfp8"))
 
 
 def _try_load_mxfp8_bf16_attn_proj(

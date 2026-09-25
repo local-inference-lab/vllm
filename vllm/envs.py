@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_GLM53_MTP_DRAFT_HEAD: Literal["bf16", "nvfp4"] = "bf16"
+    VLLM_GLM53_VISION_MXFP8: bool = False
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -914,6 +915,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "bf16",
         ["bf16", "nvfp4"],
         case_sensitive=False,
+    ),
+    # Quantize the GLM-5.3 vision tower's linear layers to MXFP8 while loading
+    # its BF16 weights. Convolutions and norms stay BF16.
+    "VLLM_GLM53_VISION_MXFP8": lambda: bool(
+        int(os.getenv("VLLM_GLM53_VISION_MXFP8", "0"))
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
