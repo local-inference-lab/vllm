@@ -706,7 +706,12 @@ class EngineCore:
         self, model_output: ModelRunnerOutput
     ) -> None:
         if model_output.boundary_checkpoint_tokens is not None:
-            self.model_executor.collective_rpc("wait_for_boundary_checkpoint_copies")
+            # Bounded like execute_model: a wedged copy stream ends the engine
+            # instead of stalling the step loop forever.
+            self.model_executor.collective_rpc(
+                "wait_for_boundary_checkpoint_copies",
+                timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+            )
 
     def step_with_batch_queue(
         self,
