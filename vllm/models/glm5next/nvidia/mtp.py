@@ -35,6 +35,7 @@ from .model import (
     _try_load_fp8_attn_proj,
     _try_load_mxfp8_bf16_attn_proj,
     get_spec_layer_idx_from_weight_name,
+    host_embedding_if_requested,
 )
 from .mtp_draft_head import QuantizedDraftHead, make_quantized_draft_head
 from .pooled_indexer import Glm5NextPooledIndexer
@@ -137,6 +138,7 @@ class Glm5NextMultiTokenPredictor(nn.Module):
             config.hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
+        host_embedding_if_requested(self.embed_tokens)
         # Plain list for the per-propose lookup: ModuleDict[str(...)] builds a
         # string and hashes it on every draft step.
         self._mtp_layers = list(self.layers.values())

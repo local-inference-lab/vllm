@@ -982,6 +982,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 config.hidden_size,
                 prefix=f"{prefix}.embed_tokens",
             )
+            host_embedding_if_requested(self.embed_tokens)
         else:
             self.embed_tokens = PPMissingLayer()
 
@@ -1681,6 +1682,28 @@ def _try_load_fp8_attn_proj(
         param.weight_loader(param, weight_bf16, shard_id)
     loaded_params.add(target_w)
     return True
+
+
+def host_embedding_if_requested(embed: VocabParallelEmbedding) -> None:
+    """Move the vocabulary table to pinned host RAM (VLLM_GLM53_EMBED_HOST).
+
+    A lookup reads one row per token, so the GPU reads the rows it needs
+    through a UVA view instead of keeping the table in device memory.
+    Checkpoint loading writes through the same view.
+    """
+    if not envs.VLLM_GLM53_EMBED_HOST:
+        return
+    from vllm.utils.platform_utils import is_uva_available
+    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+    if not is_uva_available():
+        raise RuntimeError("VLLM_GLM53_EMBED_HOST requires UVA and pinned memory")
+    weight = embed.weight
+    host = torch.empty(
+        weight.shape, dtype=weight.dtype, device="cpu", pin_memory=True
+    )
+    weight.data = get_accelerator_view_from_cpu_tensor(host)
+    weight._vllm_is_uva_offloaded = True
 
 
 def _vision_quant_config() -> QuantizationConfig | None:
