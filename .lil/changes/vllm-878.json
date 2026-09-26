@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-878",
+  "category": "fix",
+  "summary": "Support block-FP8 DFlash drafters in the fused context projection",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "Online fp8_per_block drafters failed in the fused context K/V projection (BF16 x FP8 matmul); their K/V rows are now dequantized with their block scales for that projection."
+  ],
+  "pull_requests": [
+    878
+  ]
+}

@@ -100,6 +100,9 @@ def _refit_kernel(
     NUM_SPECULATIVE_STEPS: tl.constexpr,
     L2: tl.constexpr,
     DAMPING: tl.constexpr,
+    MAX_STEP: tl.constexpr,
+    MAX_SLOPE: tl.constexpr,
+    MAX_ABS_INTERCEPT: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     k = tl.arange(0, BLOCK)
@@ -136,8 +139,11 @@ def _refit_kernel(
     step_w *= total_n / (total_n + DAMPING)
     # Mask out NaNs and steps that would drive the slope negative.
     step_w = tl.where((step_w == step_w) & (w + step_w >= 0.0), step_w, 0.0)
+    # Trust region: near-certain predictions carry almost no IRLS weight, so a
+    # data-poor round's Newton step can be enormous.
+    step_w = tl.minimum(tl.maximum(step_w, -MAX_STEP), MAX_STEP)
     # Update the shared slope.
-    new_w = w + step_w
+    new_w = tl.minimum(w + step_w, MAX_SLOPE)
 
     # Solve for the per-position intercept deltas, Δβₖ, in the same system.
     step_bias = (g1_k - b_k * step_w) / c_k
@@ -145,8 +151,12 @@ def _refit_kernel(
     step_bias *= n / (n + DAMPING)
     # Mask out NaNs.
     step_bias = tl.where(step_bias == step_bias, step_bias, 0.0)
-    # Update the per-position intercepts.
-    new_bias = bias + step_bias
+    step_bias = tl.minimum(tl.maximum(step_bias, -MAX_STEP), MAX_STEP)
+    # Update the per-position intercepts, kept off saturation: a logistic pinned
+    # at ~0 admits no drafts, so no graded drafts arrive to move it back.
+    new_bias = tl.minimum(
+        tl.maximum(bias + step_bias, -MAX_ABS_INTERCEPT), MAX_ABS_INTERCEPT
+    )
 
     tl.store(slope_ptr, new_w)
     tl.store(intercepts_ptr + k, new_bias, mask=mask)
@@ -336,6 +346,12 @@ class OnlineAcceptanceEstimator:
     DAMPING_OBSERVATIONS = 50.0
     # Ridge on the Newton solve.
     L2 = 1e-3
+    # Largest change of any coefficient in one refit, and coefficient bounds.
+    # A single confidently wrong draft otherwise moved an intercept by ~-20,
+    # predicting ~1e-8 acceptance for everything after it.
+    MAX_STEP = 1.0
+    MAX_SLOPE = 4.0
+    MAX_ABS_INTERCEPT = 8.0
 
     def __init__(
         self,
@@ -443,6 +459,9 @@ class OnlineAcceptanceEstimator:
             NUM_SPECULATIVE_STEPS=self.num_speculative_steps,
             L2=self.L2,
             DAMPING=self.DAMPING_OBSERVATIONS,
+            MAX_STEP=self.MAX_STEP,
+            MAX_SLOPE=self.MAX_SLOPE,
+            MAX_ABS_INTERCEPT=self.MAX_ABS_INTERCEPT,
             BLOCK=triton.next_power_of_2(self.num_speculative_steps),
         )
         self._refits += 1

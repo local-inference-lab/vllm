@@ -218,6 +218,45 @@ def register_b12x_collective_describer(owner, describe, *, group=None) -> bool:
     return True
 
 
+def declare_b12x_fused_allreduce_rms_norm_sites(
+    owner, norms, hidden_size: int, name_prefix: str, *, group=None
+) -> int:
+    """Declare a model's TP all-reduce -> residual-add RMSNorm pairs.
+
+    The ``allreduce_rms`` fusion pass rewrites these pairs into
+    ``b12x_fused_allreduce_add_rms_norm``, whose fused kernel only runs for
+    declared (shape, norm weight, epsilon) plans; an undeclared call falls back
+    to all-reduce, a copy, and a separate RMSNorm.  ``norms`` is an iterable of
+    ``(name, RMSNorm)`` for norms whose input is a TP all-reduce output.
+    Returns the number of declared sites (0 without the native transport).
+    """
+    norms = list(norms)
+    if not norms:
+        return 0
+
+    def describe(requirements):
+        from vllm.distributed.device_communicators.b12x_pcie_all_reduce import (
+            B12xPcieInvocation,
+        )
+
+        return tuple(
+            B12xPcieInvocation(
+                name=f"{name_prefix}.{name}.fused_ar_norm.m{rows}",
+                operation="all_reduce_fused_add_rms_norm",
+                shape=(rows, hidden_size),
+                dtype=requirements.output_dtype,
+                norm_weight=norm.weight,
+                epsilon=float(norm.variance_epsilon),
+            )
+            for name, norm in norms
+            for rows in requirements.token_counts
+        )
+
+    if not register_b12x_collective_describer(owner, describe, group=group):
+        return 0
+    return len(norms)
+
+
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
