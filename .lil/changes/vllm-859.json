@@ -1,0 +1,20 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-859",
+  "category": "feature",
+  "summary": "Serve source-aligned EXL3 routed experts without padded weight payloads",
+  "models": [
+    "Kimi-K3"
+  ],
+  "compatibility": "Requires an EXL3 manifest checkpoint and the B12X prepared EXL3 expert API.",
+  "details": [
+    "Preserves serialized dense weight formats and BF16 expert activations.",
+    "Retains IQ2_XS, IQ2_XXS and Q8_0 backend support."
+  ],
+  "pull_requests": [
+    859
+  ],
+  "requires": [
+    "b12x-415"
+  ]
+}
