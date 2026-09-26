@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -869,6 +870,18 @@ class Scheduler(SchedulerInterface):
             else 0
         )
         has_eligible_decode = num_runnable_decodes > 0
+        # max_num_scheduled_tokens keeps decode streams moving while a long
+        # prompt prefills. With no runnable decode it only shrinks the prefill
+        # chunk, so such a step may use the full batched-token budget.
+        step_token_cap = self.max_num_scheduled_tokens
+        if (
+            envs.VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS
+            and needs_decode_count
+            and not has_eligible_decode
+            and token_budget > 0
+            and step_token_cap < input_budget
+        ):
+            step_token_cap = token_budget = input_budget
         prefill_interleave_step = (
             self.prefill_interleave_controller.begin_step(
                 running=self.running,
@@ -1926,7 +1939,7 @@ class Scheduler(SchedulerInterface):
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-        assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        assert total_num_scheduled_tokens <= step_token_cap
         assert token_budget >= 0
         assert input_budget >= 0
         assert draft_input_budget >= 0
