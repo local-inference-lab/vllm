@@ -18,9 +18,12 @@ MAX_BOUNDARY_STOP_TOKENS = 128
 # Modalities whose placeholder spans are fully identified by their content hash.
 CHECKPOINT_MODALITIES = frozenset({"image", "video"})
 # Placeholder positions map into [2**30, 2**31): above every vocabulary and
-# inside LMCache's token wire domain.
+# inside LMCache's token wire domain. Each position carries 30 independent
+# bits of the item's full content hash.
 _CONTENT_TOKEN_BASE = 1 << 30
-_CONTENT_TOKEN_STEP = 0x9E3779B1
+# A checkpoint may not end within an item's first positions: with fewer of
+# them its key would hold under 150 bits of that item's identity.
+MIN_CHECKPOINT_ITEM_TOKENS = 5
 
 
 def content_token_ids(
@@ -50,16 +53,35 @@ def content_token_ids(
         lo, hi = max(offset, start), min(offset + length, end)
         if lo >= hi:
             continue
-        digest = hashlib.sha256(
-            b"vllm-mm-content-tokens-v1\0" + salt + b"\0" + feature.identifier.encode()
+        key = hashlib.sha256(
+            b"vllm-mm-content-tokens-v2\0" + salt + b"\0" + feature.identifier.encode()
         ).digest()
-        base = int.from_bytes(digest[:8], "little")
-        for position in range(lo, hi):
-            value = (
-                base + (position - offset) * _CONTENT_TOKEN_STEP
-            ) % _CONTENT_TOKEN_BASE
-            tokens[position - start] = _CONTENT_TOKEN_BASE + value
+        # Counter-mode BLAKE2b keyed by the full digest: 16 values per call,
+        # independent across positions, so a span is not one 30-bit seed.
+        first, last = lo - offset, hi - offset
+        for block in range(first // 16, (last - 1) // 16 + 1):
+            words = hashlib.blake2b(
+                block.to_bytes(8, "little"), key=key, digest_size=64
+            ).digest()
+            for index in range(max(first, block * 16), min(last, block * 16 + 16)):
+                word = words[(index % 16) * 4 : (index % 16) * 4 + 4]
+                value = int.from_bytes(word, "little") & (_CONTENT_TOKEN_BASE - 1)
+                tokens[offset + index - start] = _CONTENT_TOKEN_BASE + value
     return tuple(tokens)
+
+
+def checkpoint_end_allowed(request: Request, num_tokens: int) -> bool:
+    """Whether a checkpoint may end after ``num_tokens`` of this request.
+
+    It must not end within the first MIN_CHECKPOINT_ITEM_TOKENS positions of
+    a multimodal item: its key would identify that item by too few bits.
+    """
+    for feature in request.mm_features or ():
+        offset = feature.mm_position.offset
+        depth = min(MIN_CHECKPOINT_ITEM_TOKENS, feature.mm_position.length)
+        if offset < num_tokens < offset + depth:
+            return False
+    return True
 
 
 # Optional checkpoints have fixed slots; absent slots contain no KV blocks.
@@ -257,6 +279,8 @@ class BoundaryCheckpointCache:
             raise ValueError("Boundary checkpoints require a text generation request")
         if not 0 < checkpoint.num_tokens <= request.num_tokens:
             raise ValueError("Checkpoint must cover an existing, nonempty prefix")
+        if not checkpoint_end_allowed(request, checkpoint.num_tokens):
+            raise ValueError("Checkpoint cannot end at the start of a multimodal item")
         if not 0 <= checkpoint.draft_prefix_len <= checkpoint.num_tokens:
             raise ValueError("Draft prefix cannot extend beyond the target prefix")
         if num_ranks < 1:
