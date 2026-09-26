@@ -50,6 +50,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.engine.stall_diagnostics import RequestTimeline, arrival_time
 from vllm.v1.executor import Executor
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
 from vllm.v1.metrics.loggers import (
@@ -127,6 +128,8 @@ class AsyncLLM(EngineClient):
             init_tracer("vllm.llm_engine", tracing_endpoint)
 
         self.log_requests = log_requests
+        self._request_stall_warning_s = envs.VLLM_REQUEST_STALL_WARNING_S
+        self._log_request_timeline = envs.VLLM_LOG_REQUEST_TIMELINE
 
         custom_stat_loggers = list(stat_loggers or [])
         custom_stat_loggers.extend(load_stat_logger_plugin_factories())
@@ -681,6 +684,14 @@ class AsyncLLM(EngineClient):
         """
 
         q: RequestOutputCollector | None = None
+        # The body runs only once the serving handler asks for output, so a
+        # hold before engine submission shows up as a late generator start.
+        timeline = (
+            RequestTimeline(request_id, arrival_time(prompt), time.time())
+            if self._request_stall_warning_s > 0 or self._log_request_timeline
+            else None
+        )
+        outcome = "failed"
         try:
             q = await self.add_request(
                 request_id,
@@ -696,6 +707,9 @@ class AsyncLLM(EngineClient):
                 reasoning_ended=reasoning_ended,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
             )
+            if timeline is not None:
+                timeline.processed = q.created
+                timeline.submitted = time.time()
 
             # The output_handler task pushes items into the queue.
             # This task pulls from the queue and yields to caller.
@@ -709,13 +723,17 @@ class AsyncLLM(EngineClient):
                 # own request cleanup based on finished.
                 assert isinstance(out, RequestOutput)
                 finished = out.finished
+                if timeline is not None:
+                    timeline.output(out)
                 if out is not STREAM_FINISHED:
                     yield out
+            outcome = "finished"
 
         # If the request is disconnected by the client, generate()
         # is cancelled or the generator is garbage collected. So,
         # we abort the request if we end up here.
         except (asyncio.CancelledError, GeneratorExit):
+            outcome = "aborted"
             if q is not None:
                 await self.abort(q.request_id, internal=True)
             if self.log_requests:
@@ -760,6 +778,12 @@ class AsyncLLM(EngineClient):
         finally:
             if q is not None:
                 q.close()
+            if timeline is not None:
+                timeline.close(
+                    outcome,
+                    self._request_stall_warning_s,
+                    self._log_request_timeline,
+                )
 
     def _run_output_handler(self):
         """Background loop: pulls from EngineCore and pushes to AsyncStreams."""

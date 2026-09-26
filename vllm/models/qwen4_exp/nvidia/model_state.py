@@ -37,6 +37,9 @@ class Qwen4ExpAttnMetadata(MambaHybridAttnMetadata):
     qsa_state_is_fresh: torch.Tensor | None = None
     qsa_num_accepted_tokens: torch.Tensor | None = None
     qsa_is_prefilling: torch.Tensor | None = None
+    # Set during CUDA graph capture: B12X QSA selects and stages its context
+    # inside PIECEWISE graphs, so the captured context must cover max_model_len.
+    qsa_max_seq_len: int | None = None
 
     def get_extra_attn_kwargs(
         self,
@@ -55,6 +58,7 @@ class Qwen4ExpAttnMetadata(MambaHybridAttnMetadata):
             qsa_state_is_fresh=self.qsa_state_is_fresh[:num_reqs],
             qsa_num_accepted_tokens=self.qsa_num_accepted_tokens[:num_reqs],
             qsa_is_prefilling=self.qsa_is_prefilling[:num_reqs],
+            qsa_max_seq_len=self.qsa_max_seq_len,
         )
         return kwargs
 
@@ -173,8 +177,52 @@ class Qwen4ExpModelState(MambaHybridModelState):
             # RoPE, and anchor pools still contain the prior owner's data.  The
             # flag remains set through the complete next model forward so every
             # QSA layer independently resets its slot.
-            self.qsa_state_is_fresh_gpu[req_index].fill_(True)
+            #
+            # Only the boundary-checkpoint restore carries the producer's
+            # committed selector pools into this slot: the complex
+            # OffloadingConnector restores KV pages (main/compressed cache,
+            # align-Mamba columns), never these per-slot module buffers.  A
+            # resumed prefix without a checkpoint -- local hit or connector
+            # external-resume -- still owns a recycled slot, so it keeps the
+            # fresh reset.  The condition mirrors the rail's restore branch
+            # (BoundaryCheckpointState.add_request), the only pool writer.
+            checkpoint = new_req_data.boundary_checkpoint
+            restored_selector_state = (
+                checkpoint is not None
+                and new_req_data.boundary_checkpoint_blocks is not None
+            )
+            self.qsa_state_is_fresh_gpu[req_index].fill_(not restored_selector_state)
             self.qsa_committed_num_accepted_tokens_gpu[req_index].fill_(1)
+            if restored_selector_state:
+                # The fresh-reset's anchor formula (first_position -
+                # accepted, in the QSA reset kernel) is skipped with the
+                # flag down, so seed the value it would have produced:
+                # prefix_len - 1.  The commit kernel overwrites it during
+                # the first forward (the anchor self-heals), so this keeps
+                # the pre-forward selector state consistent, not just the
+                # post-forward one.
+                anchor = checkpoint.num_tokens - 1
+                for module in self._qsa_state_modules():
+                    module.set_recurrent_checkpoint_anchor(req_index, anchor)
+
+    def _qsa_state_modules(self) -> tuple[Any, ...]:
+        """QSA layer modules exposing the per-request selector pools.
+
+        Mirrors ``BoundaryCheckpointState.target_modules``: the raw ring /
+        logical-tag / RoPE / anchor pools are per-layer module buffers
+        indexed by request slot, so seeding or reading one request's
+        selector state goes through every module that publishes the
+        recurrent-checkpoint accessors.
+        """
+        modules = self.__dict__.get("_qsa_state_module_cache")
+        if modules is None:
+            modules = tuple(
+                module
+                for module in self.model.modules()
+                if hasattr(module, "set_recurrent_checkpoint_anchor")
+            )
+            self._qsa_state_module_cache = modules
+        return modules
 
     def get_recurrent_checkpoint_tensors(self) -> tuple[torch.Tensor, ...]:
         return (
@@ -184,6 +232,9 @@ class Qwen4ExpModelState(MambaHybridModelState):
 
     def get_recurrent_checkpoint_acceptance(self) -> torch.Tensor:
         return self.qsa_committed_num_accepted_tokens_gpu
+
+    def get_recurrent_checkpoint_fresh(self) -> torch.Tensor:
+        return self.qsa_state_is_fresh_gpu
 
     def _prepare_qsa_state(
         self,
@@ -374,6 +425,11 @@ class Qwen4ExpModelState(MambaHybridModelState):
             qsa_state_is_fresh=qsa_state_is_fresh,
             qsa_num_accepted_tokens=qsa_num_accepted_tokens,
             qsa_is_prefilling=qsa_is_prefilling,
+            qsa_max_seq_len=(
+                self.max_model_len
+                if for_capture or input_batch.cudagraph_capture
+                else None
+            ),
         )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,

@@ -73,3 +73,8 @@ def init_entrypoints_middleware(
             raise ValueError(
                 f"Invalid middleware {middleware}. Must be a function or a class."
             )
+
+    # Outermost, so the receipt stamp precedes every other middleware.
+    from .request_receipt import RequestReceiptMiddleware
+
+    app.add_middleware(RequestReceiptMiddleware)

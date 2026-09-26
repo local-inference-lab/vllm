@@ -21,7 +21,10 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
-from vllm.model_executor.parameter import BasevLLMParameter
+from vllm.model_executor.parameter import (
+    BasevLLMParameter,
+    copy_tensor_parallel_shard,
+)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.weight_transfer import copy_weight
 from vllm.platforms import current_platform
@@ -247,8 +250,12 @@ def resolve_kda_prefill_backend(
 
 def a_log_weight_loader(
     shard_axis: int,
+    allow_tp_padding: bool = False,
 ) -> Callable[[torch.Tensor, torch.Tensor], None]:
-    """Load KDA A_log stored as either old 4D or current 1D weights."""
+    """Load KDA A_log stored as either old 4D or current 1D weights.
+
+    With ``allow_tp_padding``, heads past the checkpoint are zero-filled.
+    """
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         tp_rank = get_tensor_model_parallel_rank()
@@ -264,8 +271,37 @@ def a_log_weight_loader(
             )
             loaded_weight = loaded_weight.view(loaded_weight.shape[2])
 
+        if allow_tp_padding:
+            copy_tensor_parallel_shard(
+                param.data,
+                loaded_weight,
+                shard_axis,
+                start_idx,
+                shard_size,
+                allow_padding=True,
+            )
+            return None
         loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
         return default_weight_loader(param, loaded_weight)
+
+    return loader
+
+
+def _tp_padded_weight_loader(
+    shard_axis: int,
+) -> Callable[[torch.Tensor, torch.Tensor], None]:
+    """Load a TP shard, zero-filling rows past the end of the checkpoint."""
+
+    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        shard_size = param.data.shape[shard_axis]
+        copy_tensor_parallel_shard(
+            param.data,
+            loaded_weight,
+            shard_axis,
+            get_tensor_model_parallel_rank() * shard_size,
+            shard_size,
+            allow_padding=True,
+        )
 
     return loader
 
@@ -274,6 +310,7 @@ def _make_fused_conv1d_weight_loader(
     dims: list[int],
     tp_size: int,
     tp_rank: int,
+    allow_tp_padding: bool = False,
 ) -> Callable[..., None]:
     sharded_dims = [dim // tp_size for dim in dims]
 
@@ -287,8 +324,19 @@ def _make_fused_conv1d_weight_loader(
         shard_size = sharded_dims[loaded_shard_id]
         source_start = tp_rank * shard_size
         target_start = sum(sharded_dims[:loaded_shard_id])
+        destination = param.data[target_start : target_start + shard_size]
+        if allow_tp_padding:
+            copy_tensor_parallel_shard(
+                destination,
+                loaded_weight,
+                0,
+                source_start,
+                shard_size,
+                allow_padding=True,
+            )
+            return
         loaded_shard = loaded_weight[source_start : source_start + shard_size]
-        copy_weight(param.data[target_start : target_start + shard_size], loaded_shard)
+        copy_weight(destination, loaded_shard)
 
     return weight_loader
 
@@ -432,6 +480,12 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.head_dim = kda_config["head_dim"]
         self.num_heads = kda_config["num_heads"]
         assert self.num_heads % self.tp_size == 0
+        # TP padding (e.g. GLM-5.3 at TP3) appends zero heads after the
+        # checkpoint heads. Their projections, conv, decay and output columns
+        # load as zeros, so they keep a zero state and contribute nothing.
+        self.tp_padded = (
+            kda_config.get("original_num_heads", self.num_heads) != self.num_heads
+        )
         self.local_num_heads = divide(self.num_heads, self.tp_size)
 
         self.projection_size = self.head_dim * self.num_heads
@@ -483,7 +537,14 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             torch.empty(self.local_projection_size, dtype=torch.float32)
         )
 
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.dt_bias,
+            {
+                "weight_loader": _tp_padded_weight_loader(0)
+                if self.tp_padded
+                else sharded_weight_loader(0)
+            },
+        )
 
         # One packed parameter and cache let decode run a single conv update.
         # Prefill slices them back into Q/K/V to obtain dense outputs cheaply.
@@ -503,6 +564,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     [self.projection_size] * 3,
                     self.tp_size,
                     self.tp_rank,
+                    allow_tp_padding=self.tp_padded,
                 )
             },
         )
@@ -510,7 +572,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.A_log = nn.Parameter(
             torch.empty(self.local_num_heads, dtype=torch.float32)
         )
-        set_weight_attrs(self.A_log, {"weight_loader": a_log_weight_loader(0)})
+        set_weight_attrs(
+            self.A_log,
+            {"weight_loader": a_log_weight_loader(0, self.tp_padded)},
+        )
 
         self.gate_lower_bound: float | None = kda_config.get("gate_lower_bound", None)
         if self.gate_lower_bound is not None:
@@ -586,6 +651,13 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             quant_config=self.quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        if self.tp_padded:
+            linears = [self.in_proj_qkvgfab, self.f_b_proj, self.o_proj]
+            if not self.use_full_rank_gate:
+                linears.append(self.g_b_proj)
+            for linear in linears:
+                for param in linear.parameters():
+                    set_weight_attrs(param, {"allow_tp_padding": True})
         self._b12x_preparation_prefix = prefix
         if (
             self._b12x_kda_api is not None or self._b12x_prefill_api is not None

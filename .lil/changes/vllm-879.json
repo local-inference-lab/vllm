@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-879",
+  "category": "fix",
+  "summary": "Keep adaptive verification's acceptance estimator from collapsing",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "One confidently wrong draft could drive the estimator's predicted acceptance to ~1e-8, after which adaptive verification admitted no drafts for the rest of the run (DFlash or DSpark drafting stopping mid-generation). Refits are now bounded and an idle-step probe keeps evidence flowing."
+  ],
+  "pull_requests": [
+    879
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-873",
+  "category": "performance",
+  "summary": "Optionally serve decode-sized BF16 linears through b12x bf16_gemv",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "VLLM_B12X_BF16_GEMV=1 routes BF16 linears with up to eight rows to autotuned b12x GEMV plans under --linear-backend b12x. Default off."
+  ],
+  "pull_requests": [
+    873
+  ]
+}

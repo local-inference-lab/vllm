@@ -1,0 +1,28 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-881",
+  "category": "feature",
+  "summary": "serve-mimo26-flash.sh starts MiMo-V2.6-Flash with DFlash and the b12x serving flags",
+  "models": [
+    "XiaomiMiMo/MiMo-V2.6-Flash-RL",
+    "XiaomiMiMo/MiMo-V2.6-Pro-RL"
+  ],
+  "compatibility": "serve-mimo26-flash.sh now defaults to DFlash and an FP8 KV cache and pins revision 5711b268; KV_CACHE_DTYPE=bfloat16 and NUM_SPECULATIVE_TOKENS=0 restore the previous cache and no speculation.",
+  "details": [
+    "DFlash drafting (7 tokens) with TP drafting and adaptive verification, FP8 KV cache by default, vision and audio via MiMoV2OmniForCausalLM, and the MiMo b12x switches.",
+    "MODEL_REVISION moves to 5711b268, the first revision with a valid dflash/config.json."
+  ],
+  "pull_requests": [
+    881
+  ],
+  "requires": [
+    "b12x-420",
+    "b12x-423",
+    "vllm-871",
+    "vllm-872",
+    "vllm-873",
+    "vllm-875",
+    "vllm-877",
+    "vllm-880"
+  ]
+}

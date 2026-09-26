@@ -55,6 +55,11 @@ _DISK_ONLY_KEYS = (
 class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     """CPU KV cache offloading with custom kernel transfers and BlockPool LRU."""
 
+    @classmethod
+    def supports_aligned_hybrid_transfer(cls, config: "VllmConfig") -> bool:
+        # Aligned Qwen QSA restores are validated with this connector.
+        return True
+
     @property
     def requires_kv_delivery(self) -> bool:
         # Runs as kv_both, but is a best-effort cache: a dropped save is just a

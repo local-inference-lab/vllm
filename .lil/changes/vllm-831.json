@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-831",
+  "category": "fix",
+  "summary": "The SM120 BF16-to-FP32 router matmul compiles under fullgraph compilation",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "The CUDA-graph capture guard, its BF16 allocation and the FP32-output matmul run inside one SM120 custom op, so torch.compile no longer traces a Python bool from the capture query. Other platforms and router paths are unchanged."
+  ],
+  "pull_requests": [
+    831
+  ]
+}

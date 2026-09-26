@@ -88,7 +88,10 @@ def get_aligned_state_indices_multi_group_kernel(
             & (seq_lens[None, :, None] > 0)
             & valid_state_slot[None, None, :]
         ),
-        other=-1,
+        # Padding must use the recurrent/conv NULL_BLOCK_ID (reserved block 0).
+        # MTP0 reuses this buffer directly during full CUDA graph replay;
+        # -1 would be interpreted as a real state address before the pool.
+        other=0,
     )
     tl.store(
         state_indices_ptr

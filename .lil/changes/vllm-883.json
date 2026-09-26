@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-883",
+  "category": "fix",
+  "summary": "Start Qwen with the native CPU prefix cache again",
+  "models": ["Qwen3.8-Flash-Next"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Since #864, Qwen with CACHE_MODE=native stopped at startup with \"Qwen QSA KV transfer requires an atomic request-boundary checkpoint connector\".",
+    "Aligned retention is accepted again with connectors that transfer aligned hybrid state (SimpleCPU, OffloadingConnector) and DCP 1; other connectors keep the atomic checkpoint requirement."
+  ],
+  "pull_requests": [883],
+  "authors": ["@llitz"]
+}

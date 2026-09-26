@@ -471,3 +471,39 @@ def test_dflash2_model_decoder_layer_cls(monkeypatch):
     # 4. Assert that the layers are DFlash2Qwen3DecoderLayer (the subclass)
     assert len(model.layers) == 2
     assert isinstance(model.layers[0], DFlash2Qwen3DecoderLayer)
+
+
+def test_fused_context_projection_dequantizes_block_fp8_rows():
+    """Online ``fp8_per_block`` drafters quantize while loading, so the fused
+    context projection receives FP8 rows; it must run on their dequantized
+    values (with their block scales), not on raw FP8 bytes."""
+    from torch import nn
+
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
+
+    torch.manual_seed(0)
+    layers, expected = [], []
+    for _ in range(2):
+        projection = nn.Module()
+        projection.quant_method = None
+        scale = torch.rand(2, 2) + 0.5
+        full_scale = scale.repeat_interleave(128, 0).repeat_interleave(128, 1)
+        dense = torch.randn(256, 256)
+        weight = (dense / full_scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+        projection.weight = nn.Parameter(weight, requires_grad=False)
+        projection.weight_scale_inv = nn.Parameter(scale, requires_grad=False)
+        projection.weight_block_size = [128, 128]
+        layers.append(
+            SimpleNamespace(
+                qkv_proj=projection,
+                q_size=128,
+                k_norm=SimpleNamespace(weight=torch.ones(32)),
+            )
+        )
+        expected.append((weight.float() * full_scale)[128:].to(torch.bfloat16))
+    model = object.__new__(DFlashQwen3Model)
+    nn.Module.__init__(model)
+    model.hidden_norm = SimpleNamespace(weight=torch.ones(256, dtype=torch.bfloat16))
+    model._build_context_kv_buffers(layers, has_bias=False)
+    assert model._fused_kv_weight.dtype == torch.bfloat16
+    assert torch.equal(model._fused_kv_weight, torch.cat(expected))

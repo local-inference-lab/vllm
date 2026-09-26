@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -368,6 +369,12 @@ class Scheduler(SchedulerInterface):
         if self.connector is not None:
             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
+            # Frozen boundary capture: the connector releases the manager pin
+            # on a capture block when its store DMA acks or the offer is
+            # dropped (I4). No-op for block ids the manager never pinned.
+            self.connector.bind_boundary_capture_releaser(
+                self.kv_cache_manager.release_boundary_capture
+            )
             if self.kv_cache_manager.boundary_checkpoints is not None:
                 self.connector.bind_boundary_checkpoint_cache(self.kv_cache_manager)
 
@@ -388,6 +395,9 @@ class Scheduler(SchedulerInterface):
             )
             if prefill_compute_share is not None
             else None
+        )
+        self.prefill_fairness_max_tokens = (
+            self.scheduler_config.max_num_prefill_tokens_per_step or None
         )
         self._decode_compute_seconds = 0.0
         self._prefill_compute_seconds = 0.0
@@ -860,6 +870,18 @@ class Scheduler(SchedulerInterface):
             else 0
         )
         has_eligible_decode = num_runnable_decodes > 0
+        # max_num_scheduled_tokens keeps decode streams moving while a long
+        # prompt prefills. With no runnable decode it only shrinks the prefill
+        # chunk, so such a step may use the full batched-token budget.
+        step_token_cap = self.max_num_scheduled_tokens
+        if (
+            envs.VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS
+            and needs_decode_count
+            and not has_eligible_decode
+            and token_budget > 0
+            and step_token_cap < input_budget
+        ):
+            step_token_cap = token_budget = input_budget
         prefill_interleave_step = (
             self.prefill_interleave_controller.begin_step(
                 running=self.running,
@@ -904,6 +926,17 @@ class Scheduler(SchedulerInterface):
             )
             compute_contention = has_eligible_decode and has_prefill_candidate
             compute_contention_started = compute_contention and not prior_contention
+
+        if (
+            selected_compute_class == "prefill"
+            and compute_contention
+            and self.prefill_fairness_max_tokens is not None
+        ):
+            token_budget = min(token_budget, self.prefill_fairness_max_tokens)
+            input_budget = min(
+                input_budget,
+                self.prefill_fairness_max_tokens + draft_slots,
+            )
 
         legacy_defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
@@ -1510,6 +1543,14 @@ class Scheduler(SchedulerInterface):
                             # its resource checks. Fall back immediately.
                             adaptive_defer_prefills = False
                             defer_prefills = legacy_defer_prefills
+                            if self.prefill_fairness_max_tokens is not None:
+                                token_budget = min(
+                                    token_budget, self.prefill_fairness_max_tokens
+                                )
+                                input_budget = min(
+                                    input_budget,
+                                    self.prefill_fairness_max_tokens + draft_slots,
+                                )
                         else:
                             # DP prefill balancing: defer this step's local
                             # prefill compute to a cadence-aligned step.
@@ -1872,6 +1913,12 @@ class Scheduler(SchedulerInterface):
         ):
             adaptive_defer_prefills = False
             defer_prefills = False
+            if self.prefill_fairness_max_tokens is not None:
+                token_budget = min(token_budget, self.prefill_fairness_max_tokens)
+                input_budget = min(
+                    input_budget,
+                    self.prefill_fairness_max_tokens + draft_slots,
+                )
             schedule_running_requests("prefill")
 
         # A prefill turn gives prefills first use of the model-step capacity.
@@ -1892,7 +1939,7 @@ class Scheduler(SchedulerInterface):
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-        assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        assert total_num_scheduled_tokens <= step_token_cap
         assert token_budget >= 0
         assert input_budget >= 0
         assert draft_input_budget >= 0
@@ -2149,6 +2196,9 @@ class Scheduler(SchedulerInterface):
             "prefill_compute_share": self.scheduler_config.prefill_compute_share,
             "prefill_compute_half_life": (
                 self.scheduler_config.prefill_compute_half_life
+            ),
+            "max_num_prefill_tokens_per_step": (
+                self.scheduler_config.max_num_prefill_tokens_per_step
             ),
             "effective_prefill_compute_half_life_seconds": (
                 controller.effective_prefill_compute_half_life

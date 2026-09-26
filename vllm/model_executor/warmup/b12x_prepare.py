@@ -286,7 +286,11 @@ def mark_b12x_eager_shapes(worker: Worker) -> None:
     mm_registry = getattr(worker.model_runner, "mm_registry", None)
     visual = getattr(model, "visual", None)
     get_token_counts = getattr(model, "get_mm_lora_token_counts", None)
+    from vllm.model_executor.models.utils import StageMissingLayer
+
     if mm_registry is None or visual is None or not callable(get_token_counts):
+        return
+    if isinstance(visual, StageMissingLayer):
         return
     from vllm.multimodal.encoder_budget import MultiModalBudget
 
