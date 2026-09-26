@@ -26,7 +26,7 @@ class Exl3Extent:
 @functools.cache
 def load_exl3_manifest(root: str) -> Any:
     """Read and validate a checkpoint's EXL3 manifest once per process."""
-    from b12x.moe._shared.kernels.w4a16.exl3 import read_exl3_manifest
+    from b12x.moe.checkpoints.exl3 import read_exl3_manifest
 
     path = Path(root)
     if not (path / EXL3_MANIFEST_FILENAME).is_file():
