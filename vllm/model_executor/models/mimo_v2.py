@@ -21,6 +21,9 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from vllm.distributed.parallel_state import (
+    declare_b12x_fused_allreduce_rms_norm_sites,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
@@ -602,6 +605,29 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             self.norm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
         else:
             self.norm = PPMissingLayer()
+        self._declare_fused_allreduce_rms_norm_sites()
+
+    def _declare_fused_allreduce_rms_norm_sites(self) -> None:
+        # Each post-attention norm follows the o_proj all-reduce, and each later
+        # layer's input norm follows the previous layer's MLP/MoE all-reduce.
+        norms = []
+        layers = islice(self.layers, self.start_layer, self.end_layer)
+        for i, layer in enumerate(layers):
+            norms.append(
+                (
+                    f"layers.{layer.layer_id}.post_attention_layernorm",
+                    layer.post_attention_layernorm,
+                )
+            )
+            if i > 0:
+                norms.append(
+                    (f"layers.{layer.layer_id}.input_layernorm", layer.input_layernorm)
+                )
+        if isinstance(self.norm, RMSNorm):
+            norms.append(("norm", self.norm))
+        declare_b12x_fused_allreduce_rms_norm_sites(
+            self, norms, self.config.hidden_size, "mimo_v2"
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
