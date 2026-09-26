@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-908",
+  "category": "fix",
+  "summary": "Image checkpoints are keyed by the full image identity, not a 30-bit seed",
+  "models": ["all"],
+  "compatibility": "No user action required. Image checkpoints saved by earlier builds are not reused and recompute once; text checkpoints are unaffected.",
+  "details": [
+    "Two different images could get the same boundary-checkpoint key (about 1 in a billion per pair, and constructible on purpose), so one image's cached state could be restored for another.",
+    "Every image position now carries independent bits of the image's content hash, and no checkpoint ends within an image's first five tokens."
+  ],
+  "pull_requests": [908],
+  "requires": []
+}
