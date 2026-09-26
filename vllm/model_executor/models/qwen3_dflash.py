@@ -404,6 +404,38 @@ class DFlashQwen3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+def _context_kv_rows(
+    attn: nn.Module, dtype: torch.dtype, *, packed_mxfp8: bool
+) -> torch.Tensor:
+    """One layer's K/V projection rows for the fused context projection.
+
+    Serialized MXFP8 rows stay packed for the fused projection's own linear
+    method. Block-FP8 rows (serialized, or online ``fp8_per_block``, which
+    quantizes while loading) are dequantized with their block scales, so the
+    fused projection runs in ``dtype`` while each layer keeps its FP8 GEMM.
+    """
+    projection = attn.qkv_proj
+    rows = projection.weight[attn.q_size :]
+    scale = getattr(projection, "weight_scale_inv", None)
+    if (
+        packed_mxfp8
+        or scale is None
+        or rows.dtype
+        not in (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        )
+    ):
+        return rows
+    block_n, block_k = getattr(projection, "weight_block_size", None) or (128, 128)
+    if attn.q_size % block_n:
+        raise ValueError("DFlash block-FP8 K/V rows must start on a scale block.")
+    scales = scale[attn.q_size // block_n :].float()
+    scales = scales.repeat_interleave(block_n, 0)[: rows.shape[0]]
+    scales = scales.repeat_interleave(block_k, 1)[:, : rows.shape[1]]
+    return (rows.float() * scales).to(dtype)
+
+
 @support_torch_compile
 class DFlashQwen3Model(nn.Module):
     decoder_layer_cls = DFlashQwen3DecoderLayer
@@ -563,7 +595,12 @@ class DFlashQwen3Model(nn.Module):
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+        kv_weights = [
+            _context_kv_rows(
+                a, self.hidden_norm.weight.dtype, packed_mxfp8=all(uses_mxfp8)
+            )
+            for a in layers_attn
+        ]
         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
 
         if all(uses_mxfp8):
