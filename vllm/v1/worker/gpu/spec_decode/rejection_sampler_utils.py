@@ -534,10 +534,15 @@ def _rejection_kernel(
     local_residual_mass_ptr,
     local_residual_mass_stride,
     vocab_num_blocks,
+    # Vocab-parallel drafts: [max_num_reqs + 1, num_speculative_steps]
+    vp_token_logit_ptr,
+    vp_lse_ptr,
+    vp_stride,
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
     SYNTHETIC_MODE: tl.constexpr,
     USE_BLOCK_VERIFICATION: tl.constexpr,
+    VP_DRAFT: tl.constexpr = False,
 ):
     req_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_idx).to(tl.int64)
@@ -628,32 +633,69 @@ def _rejection_kernel(
                 tl.store(sampled_ptr + req_idx * sampled_stride + i, draft_sampled)
             else:
                 # Speculative decoding (Leviathan et al., 2023): https://arxiv.org/abs/2211.17192
-                target_logprob, draft_logprob, target_lse, draft_lse = (
-                    _compute_global_logprobs_and_logsumexp(
-                        draft_sampled,
-                        True,  # mask
-                        logit_idx,
-                        req_state_idx,
-                        i,
-                        temp,
-                        target_logits_ptr,
-                        target_logits_stride,
-                        target_local_max_ptr,
-                        target_local_max_stride,
-                        target_local_sumexp_ptr,
-                        target_local_sumexp_stride,
-                        draft_logits_ptr,
-                        draft_logits_stride_0,
-                        draft_logits_stride_1,
-                        draft_local_max_ptr,
-                        draft_local_max_stride,
-                        draft_local_sumexp_ptr,
-                        draft_local_sumexp_stride,
-                        vocab_num_blocks,
-                        PADDED_VOCAB_NUM_BLOCKS,
-                        HAS_DRAFT_LOGITS,
+                if VP_DRAFT:
+                    # Vocab-parallel drafts: q(d) from the drawn token's
+                    # pre-temperature logit and the global logsumexp, both
+                    # recorded when the draft was sampled.
+                    target_logprob, _, target_lse, _ = (
+                        _compute_global_logprobs_and_logsumexp(
+                            draft_sampled,
+                            True,  # mask
+                            logit_idx,
+                            req_state_idx,
+                            i,
+                            temp,
+                            target_logits_ptr,
+                            target_logits_stride,
+                            target_local_max_ptr,
+                            target_local_max_stride,
+                            target_local_sumexp_ptr,
+                            target_local_sumexp_stride,
+                            draft_logits_ptr,
+                            draft_logits_stride_0,
+                            draft_logits_stride_1,
+                            draft_local_max_ptr,
+                            draft_local_max_stride,
+                            draft_local_sumexp_ptr,
+                            draft_local_sumexp_stride,
+                            vocab_num_blocks,
+                            PADDED_VOCAB_NUM_BLOCKS,
+                            False,
+                        )
                     )
-                )
+                    draft_lse = tl.load(vp_lse_ptr + req_state_idx * vp_stride + i)
+                    draft_logprob = (
+                        tl.load(vp_token_logit_ptr + req_state_idx * vp_stride + i)
+                        / temp
+                        - draft_lse
+                    )
+                else:
+                    target_logprob, draft_logprob, target_lse, draft_lse = (
+                        _compute_global_logprobs_and_logsumexp(
+                            draft_sampled,
+                            True,  # mask
+                            logit_idx,
+                            req_state_idx,
+                            i,
+                            temp,
+                            target_logits_ptr,
+                            target_logits_stride,
+                            target_local_max_ptr,
+                            target_local_max_stride,
+                            target_local_sumexp_ptr,
+                            target_local_sumexp_stride,
+                            draft_logits_ptr,
+                            draft_logits_stride_0,
+                            draft_logits_stride_1,
+                            draft_local_max_ptr,
+                            draft_local_max_stride,
+                            draft_local_sumexp_ptr,
+                            draft_local_sumexp_stride,
+                            vocab_num_blocks,
+                            PADDED_VOCAB_NUM_BLOCKS,
+                            HAS_DRAFT_LOGITS,
+                        )
+                    )
                 if SYNTHETIC_MODE:
                     rate = tl.load(synthetic_conditional_rates_ptr + i)
                     accepted = u < rate
@@ -1040,14 +1082,24 @@ def rejection_sample(
         watermarking_bytes = watermarking.view(torch.uint8)
         watermark_key_0 = watermark_key & 0xFFFFFFFF
         watermark_key_1 = watermark_key >> 32
+    from vllm.v1.worker.gpu.spec_decode import vocab_parallel as vp_sampling
+
+    vp = vp_sampling.lookup(draft_logits)
+    if vp is not None:
+        assert not use_block_verification, (
+            "vocab-parallel drafts: standard verification only"
+        )
+        assert contexts is None, "vocab-parallel drafts do not support watermarking"
     draft_logits_stride_0 = 0
     draft_logits_stride_1 = 0
     if has_draft_logits := draft_logits is not None:
         draft_logits_stride_0 = draft_logits.stride(0)
         draft_logits_stride_1 = draft_logits.stride(1)
         # In some cases (e.g. MiMo v2.5 Pro + DFlash) the target model's
-        # vocab size is larger than the draft's due to padding.
-        vocab_size = min(vocab_size, draft_logits.size(-1))
+        # vocab size is larger than the draft's due to padding.  A
+        # vocab-parallel draft cache holds one shard; the target stays full.
+        if vp is None:
+            vocab_size = min(vocab_size, draft_logits.size(-1))
 
     # Compute the per-vocab-block logits stats, such as target argmax
     # (for greedy requests), and target max + softmax exponential
@@ -1092,7 +1144,8 @@ def rejection_sample(
         vocab_size,
         num_speculative_steps,
         BLOCK_SIZE=VOCAB_BLOCK_SIZE,
-        HAS_DRAFT_LOGITS=has_draft_logits,
+        # Vocab-parallel drafts carry their logsumexp; only target stats here.
+        HAS_DRAFT_LOGITS=has_draft_logits and vp is None,
     )
 
     # Precompute the running joint ratio and residual mass for block
@@ -1212,12 +1265,50 @@ def rejection_sample(
         local_residual_mass,
         local_residual_mass.stride(0) if local_residual_mass is not None else 0,
         vocab_num_blocks,
+        vp.token_logit if vp is not None else target_rejected_logsumexp,
+        vp.lse if vp is not None else target_rejected_logsumexp,
+        vp.lse.stride(0) if vp is not None else 0,
         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
         HAS_DRAFT_LOGITS=has_draft_logits,
         SYNTHETIC_MODE=synthetic_conditional_rates is not None,
         USE_BLOCK_VERIFICATION=use_block_verification,
+        VP_DRAFT=vp is not None,
         num_warps=1,
     )
+
+    if vp is not None:
+        # Each rank Gumbel-samples its shard of the residual (or of the target
+        # at the bonus position); the per-rank winners play the role of the
+        # vocab blocks of _insert_resampled_kernel.
+        resampled_local_max, resampled_local_argmax = vp_sampling.resample(
+            target_logits,
+            target_rejected_logsumexp,
+            num_sampled,
+            cu_num_logits,
+            expanded_idx_mapping,
+            draft_sampled,
+            temperature,
+            seed,
+            pos,
+            vp,
+            use_fp64=use_fp64,
+        )
+        resample_num_blocks = resampled_local_max.shape[1]
+        _insert_resampled_kernel[(num_reqs,)](
+            sampled,
+            sampled.stride(0),
+            num_sampled,
+            resampled_local_argmax,
+            resampled_local_argmax.stride(0),
+            resampled_local_max,
+            resampled_local_max.stride(0),
+            resample_num_blocks,
+            cu_num_logits,
+            expanded_idx_mapping,
+            temperature,
+            PADDED_RESAMPLE_NUM_BLOCKS=triton.next_power_of_2(resample_num_blocks),
+        )
+        return sampled, num_sampled
 
     # Resample the rejected/bonus tokens.
     RESAMPLE_BLOCK_SIZE = 1024

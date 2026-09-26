@@ -24,6 +24,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -484,7 +485,13 @@ class DFlashQwen3Model(nn.Module):
             ]
         )
         if self.use_aux_hidden_state:
-            self.fc = ReplicatedLinear(
+            # Shard the context projection's output features across TP ranks
+            # and all-gather the result: every output element keeps its full
+            # dot product (bit-identical to a replicated layer) while each rank
+            # streams 1/tp of the [hidden, num_aux * hidden] weight per step.
+            tp_fc = get_tensor_model_parallel_world_size() > 1
+            fc_cls = ColumnParallelLinear if tp_fc else ReplicatedLinear
+            self.fc = fc_cls(
                 input_size=_get_dflash_fc_input_size(
                     vllm_config,
                 ),
@@ -494,6 +501,7 @@ class DFlashQwen3Model(nn.Module):
                 quant_config=self.quant_config,
                 prefix=maybe_prefix(prefix, "fc"),
                 return_bias=False,
+                **({"gather_output": True} if tp_fc else {}),
             )
         self.hidden_norm = RMSNorm(
             self.config.hidden_size,
@@ -912,6 +920,19 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         )
         logits_new[:, targets] = logits
         return logits_new
+
+    def compute_local_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This rank's vocab-shard logits, not gathered, for vocab-parallel
+        drafting (the speculator validates the shard layout: no vocab padding,
+        no added vocab, no draft-to-target id map)."""
+        lp = self.logits_processor
+        logits = lp._apply_head(self.lm_head, hidden_states, None)
+        logits = logits[..., : self.lm_head.shard_indices.num_org_elements]
+        if lp.soft_cap is not None:
+            logits = torch.tanh(logits / lp.soft_cap) * lp.soft_cap
+        if lp.scale != 1.0:
+            logits = logits * lp.scale
+        return logits
 
     def precompute_and_store_context_kv(
         self,
