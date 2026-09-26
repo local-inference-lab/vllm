@@ -14,11 +14,13 @@ from vllm.multimodal.audio import (
     AudioResampler,
     AudioSpec,
     ChannelReduction,
+    MelSpectrogram,
     _get_torchaudio_resampler,
     normalize_audio,
     resample_audio_pyav,
     resample_audio_scipy,
     resample_audio_torchaudio,
+    resample_sinc,
     split_audio,
 )
 
@@ -919,3 +921,86 @@ class TestAudioChunking:
         )
 
         assert len(chunks_48k) >= 2
+
+
+# ============================================================
+# torchaudio-compatible ports (used when torchaudio is not installed)
+# ============================================================
+
+
+def _chirp(num_samples: int, sample_rate: int) -> torch.Tensor:
+    t = torch.arange(num_samples, dtype=torch.float64) / sample_rate
+    wave = 0.4 * torch.sin(2 * math.pi * (200 * t + 1500 * t * t))
+    wave += 0.05 * torch.sin(2 * math.pi * 7000 * t)
+    return wave.to(torch.float32)
+
+
+# MiMo-V2 audio features (MiMoVLProcessor defaults).
+_MIMO_MEL = dict(
+    sample_rate=24000,
+    n_fft=960,
+    hop_length=240,
+    win_length=960,
+    f_min=0.0,
+    f_max=None,
+    n_mels=128,
+    power=1.0,
+    center=True,
+)
+
+
+@pytest.mark.parametrize("orig_sr", [8000, 16000, 22050, 44100, 48000])
+@pytest.mark.parametrize("shape", [(24001,), (2, 16007)])
+def test_resample_sinc_matches_torchaudio(orig_sr, shape):
+    torchaudio = pytest.importorskip("torchaudio")
+    wave = torch.randn(*shape, generator=torch.Generator().manual_seed(orig_sr))
+    expected = torchaudio.transforms.Resample(orig_sr, 24000)(wave)
+    assert torch.equal(resample_sinc(wave, orig_sr, 24000), expected)
+
+
+@pytest.mark.parametrize("kwargs", [_MIMO_MEL, dict(sample_rate=16000, n_fft=400)])
+def test_mel_spectrogram_matches_torchaudio(kwargs):
+    torchaudio = pytest.importorskip("torchaudio")
+    wave = torch.randn(2, 24000 * 3 + 17, generator=torch.Generator().manual_seed(0))
+    expected = torchaudio.transforms.MelSpectrogram(**kwargs)(wave)
+    assert torch.equal(MelSpectrogram(**kwargs)(wave), expected)
+
+
+def test_resample_sinc_reference_values():
+    # Reference: torchaudio 2.11 / torch 2.14 on CPU.
+    out = resample_sinc(_chirp(16000, 16000), 16000, 24000)
+    assert out.shape == (24000,)
+    torch.testing.assert_close(
+        out[[0, 1, 777, 12345, 23999]],
+        torch.tensor([0.0009301, 0.0465538, 0.0830263, -0.4338826, -0.2898649]),
+        rtol=0,
+        atol=2e-6,
+    )
+    assert math.isclose(float((out.double() ** 2).sum()), 1940.9954074553, rel_tol=1e-6)
+
+
+def test_mel_spectrogram_reference_values():
+    # Reference: torchaudio 2.11 / torch 2.14 on CPU.
+    mel = MelSpectrogram(**_MIMO_MEL)(_chirp(24000, 24000)[None])
+    assert mel.shape == (1, 128, 101)
+    torch.testing.assert_close(
+        mel[0, [0, 10, 90], [0, 5, 100]],
+        torch.tensor([6.934449, 0.242444, 2.970764]),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    assert math.isclose(float(mel.double().sum()), 29227.087873592, rel_tol=1e-5)
+
+
+def test_resample_audio_torchaudio_without_torchaudio(monkeypatch):
+    import vllm.multimodal.audio as audio_module
+
+    wave = _chirp(44100, 44100).numpy()
+    monkeypatch.setattr(audio_module, "_HAS_TORCHAUDIO", False)
+    _get_torchaudio_resampler.cache_clear()
+    try:
+        out = resample_audio_torchaudio(wave, orig_sr=44100, target_sr=24000)
+    finally:
+        _get_torchaudio_resampler.cache_clear()
+    expected = resample_sinc(torch.from_numpy(wave), 44100, 24000).numpy()
+    np.testing.assert_array_equal(out, expected)
