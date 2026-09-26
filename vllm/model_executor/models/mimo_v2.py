@@ -7,6 +7,7 @@ from itertools import islice
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
     CacheConfig,
@@ -680,6 +681,83 @@ def _shard_fp8_qkv_proj(
     )
 
 
+_L2_PREFETCH_WINDOW_BYTES = 20 * 1000 * 1000
+
+
+def _in_full_decode_capture() -> bool:
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    return torch.cuda.is_current_stream_capturing() and not (
+        is_forward_context_available()
+        and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+    )
+
+
+def _install_l2_prefetch_windows(
+    layer: "MiMoV2FlashDecoderLayer", nxt: "MiMoV2FlashDecoderLayer | None"
+) -> None:
+    """Prefetch upcoming decode weights into L2 while device memory idles.
+
+    Window A (attention op): this layer's o_proj, router and post-attention
+    norm. Window C (end of the MoE op, before its all-reduce): the next layer's
+    input norm and qkv projection; the last layer rejoins the side stream.
+    Prefetches are issued only inside FULL CUDA-graph decode captures and are
+    cache hints: numerics are unchanged.
+    """
+    from vllm.models.glm5next.nvidia import l2_prefetch
+
+    plans: dict[str, object] = {}
+
+    def build() -> None:
+        device = layer.post_attention_layernorm.weight.device
+        small = 16
+        segments = l2_prefetch.segments_of(layer.self_attn.o_proj, "o_proj.")
+        if layer.is_layer_sparse:
+            segments += l2_prefetch.segments_of(
+                layer.mlp.gate, "gate.", min_bytes=small
+            )
+        segments += l2_prefetch.segments_of(
+            layer.post_attention_layernorm, "post_norm.", min_bytes=small
+        )
+        plans["a"] = l2_prefetch.make_plan(segments, _L2_PREFETCH_WINDOW_BYTES, device)[
+            0
+        ]
+        plans["c"] = None
+        if nxt is not None:
+            segments = l2_prefetch.segments_of(
+                nxt.input_layernorm, "next.input_norm.", min_bytes=small
+            ) + l2_prefetch.segments_of(nxt.self_attn.qkv_proj, "next.qkv_proj.")
+            plans["c"] = l2_prefetch.make_plan(
+                segments, _L2_PREFETCH_WINDOW_BYTES, device
+            )[0]
+        l2_prefetch.L2Prefetcher.get(device)
+
+    def window(name: str, final: bool):
+        def hook(num_tokens: int) -> None:
+            if not plans:
+                if torch.cuda.is_current_stream_capturing():
+                    return
+                build()
+            if not _in_full_decode_capture():
+                return
+            device = layer.post_attention_layernorm.weight.device
+            prefetcher = l2_prefetch.L2Prefetcher.get(device)
+            prefetcher.issue(plans[name], num_tokens)
+            if final:
+                prefetcher.join()
+
+        return hook
+
+    object.__setattr__(layer.self_attn.attn, "_l2_prefetch_hook", window("a", False))
+    if layer.is_layer_sparse:
+        object.__setattr__(
+            layer.mlp.experts,
+            "_l2_prefetch_post_experts_hook",
+            window("c", nxt is None),
+        )
+
+
 @support_torch_compile
 class MiMoV2Model(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -714,6 +792,10 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
+        if envs.VLLM_MIMO_L2_PREFETCH:
+            layers = list(islice(self.layers, self.start_layer, self.end_layer))
+            for layer, nxt in zip(layers, [*layers[1:], None]):
+                _install_l2_prefetch_windows(layer, nxt)
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
