@@ -15,7 +15,9 @@ from tests.v1.core.test_prefix_caching import make_request
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.utils.hashing import sha256
 from vllm.v1.core.boundary_checkpoint import (
+    MIN_CHECKPOINT_ITEM_TOKENS,
     BoundaryCheckpointCache,
+    checkpoint_end_allowed,
     content_token_ids,
 )
 from vllm.v1.request import RequestStatus
@@ -108,3 +110,54 @@ def test_image_inside_the_final_partial_block_is_part_of_the_identity():
     publish(manager, image_request("producer", "image-a", 130, span=8), 140)
     assert hit(manager, image_request("same", "image-a", 130, span=8)) == 140
     assert hit(manager, image_request("other", "image-b", 130, span=8)) == 0
+
+
+def fake_image(identifier, offset=5, length=40, total=60):
+    return SimpleNamespace(
+        all_token_ids=list(range(total)),
+        mm_features=[
+            SimpleNamespace(
+                identifier=identifier,
+                mm_position=PlaceholderRange(offset=offset, length=length),
+            )
+        ],
+    )
+
+
+def test_content_tokens_carry_independent_bits_per_position():
+    # Two real PNGs whose processor hashes collided under the v1 scheme, where
+    # a whole span was a function of one 30-bit seed (Discord report, #904).
+    red = "2373f7d58a45946947a5179eff2f1a6fc5c6ccac30b9ef4e6999b17e54901057"
+    blue = "cd07abfe9657e3a97e5a4c82b6baf82ab190e9a150aba160577c7e92b7b82219"
+    salt = b'{"VLLM_GLM53_VISION_MXFP8": "1"}'
+    a = content_token_ids(fake_image(red), 5, 45, salt)
+    b = content_token_ids(fake_image(blue), 5, 45, salt)
+    assert all(x != y for x, y in zip(a, b))
+    # Positions are not an arithmetic progression of one seed.
+    steps = {(y - x) % (1 << 30) for x, y in zip(a, a[1:])}
+    assert len(steps) > 1
+    # Windows crossing counter blocks match the full view.
+    full = content_token_ids(fake_image(red), 0, 60)
+    for start, end in ((3, 22), (20, 21), (21, 38), (44, 60)):
+        assert content_token_ids(fake_image(red), start, end) == full[start:end]
+
+
+def test_checkpoints_cannot_end_at_the_start_of_an_image():
+    request = fake_image("image-a", offset=5, length=40)
+    allowed = [checkpoint_end_allowed(request, end) for end in range(1, 60)]
+    shallow = range(6, 5 + MIN_CHECKPOINT_ITEM_TOKENS)
+    assert [end for end, ok in zip(range(1, 60), allowed) if not ok] == list(shallow)
+    # A tiny item may end a checkpoint once it is complete.
+    assert checkpoint_end_allowed(fake_image("icon", offset=5, length=2), 7)
+    assert not checkpoint_end_allowed(fake_image("icon", offset=5, length=2), 6)
+
+
+def test_shallow_image_endpoint_is_not_published():
+    manager = make_manager()
+    producer = image_request("producer", "image-a", 20)
+    producer.recurrent_instruction_boundary = 22
+    manager.get_computed_blocks(producer)
+    assert manager.allocate_slots(producer, 22, num_lookahead_tokens=3)
+    producer.num_computed_tokens = 22
+    drain(manager)
+    assert manager.publish_boundary_checkpoint(producer, 22, kind="instruction") is None

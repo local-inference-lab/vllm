@@ -18,6 +18,7 @@ from vllm.v1.core.boundary_checkpoint import (
     BoundaryCheckpointCache,
     BoundaryCheckpointKind,
     boundary_checkpoint_slots,
+    checkpoint_end_allowed,
 )
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
@@ -860,6 +861,8 @@ class KVCacheManager:
         allocation = request.boundary_checkpoint_blocks
         if cache is None or allocation is None or num_tokens <= 0:
             return None
+        if not checkpoint_end_allowed(request, num_tokens):
+            return None
         if kind == "response":
             if (
                 request.status
@@ -984,6 +987,8 @@ class KVCacheManager:
             return None
         if not 0 < num_tokens <= request.num_tokens:
             raise ValueError("Imported boundary must cover an existing request prefix")
+        if not checkpoint_end_allowed(request, num_tokens):
+            return None
         if not 0 <= draft_prefix_len <= num_tokens:
             raise ValueError("Imported draft prefix exceeds the target prefix")
         if (
