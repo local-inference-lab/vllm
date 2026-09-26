@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
+from copy import copy
 from itertools import islice
 
 import torch
@@ -296,6 +297,15 @@ class MiMoV2Attention(nn.Module):
         )
 
         sliding_window = sliding_window_size if sliding_window_size > -1 else None
+        if (
+            sliding_window is None
+            and cache_config is not None
+            and cache_config.sliding_window is not None
+        ):
+            # MiMo declares each layer's window explicitly. Do not let the
+            # model-wide SWA default turn a global layer into sliding attention.
+            cache_config = copy(cache_config)
+            cache_config.sliding_window = None
 
         # Honor B12X and DiffKV selections for unequal QK/V head dimensions.
         if self.v_head_dim != self.head_dim:
@@ -390,6 +400,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
                 layer_id=layer_id,
                 rope_theta=getattr(config, "swa_rope_theta", rope_theta),
                 max_position_embeddings=max_position_embeddings,
+                cache_config=vllm_config.cache_config,
                 quant_config=quant_config,
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
                 prefix=f"{prefix}.self_attn",
@@ -407,6 +418,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
                 layer_id=layer_id,
                 rope_theta=rope_theta,
                 max_position_embeddings=max_position_embeddings,
+                cache_config=vllm_config.cache_config,
                 quant_config=quant_config,
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
                 prefix=f"{prefix}.self_attn",
