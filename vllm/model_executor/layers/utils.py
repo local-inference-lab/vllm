@@ -591,6 +591,13 @@ def dispatch_unquantized_gemm(
     elif not current_platform.is_cuda():
         return default_unquantized_gemm
 
+    if linear_backend == "b12x":
+        from vllm.model_executor.kernels.linear.b12x_unquantized import (
+            b12x_unquantized_gemm,
+        )
+
+        return b12x_unquantized_gemm
+
     backend_spec = _FLASHINFER_BF16_BACKENDS.get(linear_backend)
     if backend_spec is None:
         return default_unquantized_gemm
