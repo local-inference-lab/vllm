@@ -19,6 +19,7 @@ from functools import partial
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from multiprocessing.synchronize import Lock as LockType
+from multiprocessing.util import Finalize
 from threading import Thread
 from typing import Any, cast
 
@@ -115,10 +116,22 @@ class MultiprocExecutor(Executor):
         self.monitor_workers = monitor_workers
         super().__init__(vllm_config)
 
-    def _init_executor(self) -> None:
+    def _register_exit_shutdown(self) -> None:
+        """Shut the workers down when this process exits, however it exits."""
         # Call self.shutdown at exit to clean up
         # and ensure workers will be terminated.
         self._finalizer = weakref.finalize(self, self.shutdown)
+        # Workers are not daemons (their startup compilers may fork), so the
+        # multiprocessing exit handler joins them. If this process exits
+        # without shutting the executor down, e.g. an EngineCore whose
+        # startup failed after the workers started, that join waits forever
+        # on workers that are waiting for this process. Finalizers with an
+        # exit priority run before the join; the weakref finalizer above only
+        # runs at interpreter exit, which a multiprocessing child skips.
+        Finalize(self, self.shutdown, exitpriority=0)
+
+    def _init_executor(self) -> None:
+        self._register_exit_shutdown()
         self.is_failed = False
         self.failure_callback: FailureCallback | None = None
 
