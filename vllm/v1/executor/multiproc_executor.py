@@ -80,9 +80,8 @@ from vllm.v1.worker.worker_base import WorkerWrapperBase
 logger = init_logger(__name__)
 
 
-# How long a gather of every rank's reply blocks on one rank before checking
-# the others for a reply (a failure among them ends the wait).
-RESPONSE_POLL_SECONDS = 0.05
+# How often a gather of every rank's reply checks the pending ranks.
+RESPONSE_POLL_SECONDS = 0.001
 
 
 def _check_response(rank: int, status: Any, result: Any) -> Any:
@@ -106,8 +105,9 @@ def _gather_responses(
     while an earlier rank waited forever, for example in a collective the
     failed rank would never join: TP1's CUDA graph capture fails, TP0 hangs
     in the next all-reduce, and the engine waits on TP0 with TP1's error in
-    its queue. Every pending queue is polled without blocking, and only when
-    none has replied does the gather block, briefly, on the oldest one.
+    its queue. Every pending queue is checked without consuming anything, each
+    reply is read as it arrives, and the gather sleeps 1 ms between rounds in
+    which nothing arrived.
     """
 
     def remaining() -> float | None:
@@ -127,34 +127,30 @@ def _gather_responses(
 
     responses: list[Any] = [None] * len(response_mqs)
     pending = list(range(len(response_mqs)))
-    # A blocking read logs the long-wait message every interval; the short
-    # polls here would not, and operators watch for it, so log it the same way.
+    # A blocking read logs the long-wait message every interval; the polling
+    # here would not, and operators watch for it, so log it the same way.
     started, warnings = time.monotonic(), 0
     interval = envs.VLLM_RINGBUFFER_WARNING_INTERVAL
     while pending:
-        if time.monotonic() - started >= interval * (warnings + 1):
-            warnings += 1
-            logger.info(LONG_WAIT_TIME_LOG_MSG, interval)
+        progressed = False
         for index in list(pending):
-            try:
-                status, result = response_mqs[index].dequeue(timeout=0)
-            except TimeoutError:
+            # ready() never consumes, so a reply is only read once it has
+            # arrived, and then with the RPC's own deadline.
+            if not response_mqs[index].ready():
                 continue
+            try:
+                status, result = response_mqs[index].dequeue(timeout=remaining())
+            except TimeoutError as e:
+                raise TimeoutError(f"RPC call to {method} timed out.") from e
             responses[index] = _check_response(ranks[index], status, result)
             pending.remove(index)
-        if not pending:
-            break
-        left = remaining()
-        wait = (
-            RESPONSE_POLL_SECONDS if left is None else min(RESPONSE_POLL_SECONDS, left)
-        )
-        index = pending[0]
-        try:
-            status, result = response_mqs[index].dequeue(timeout=wait)
-        except TimeoutError:
-            continue
-        responses[index] = _check_response(ranks[index], status, result)
-        pending.remove(index)
+            progressed = True
+        if pending and not progressed:
+            remaining()  # raises once the deadline has passed
+            if time.monotonic() - started >= interval * (warnings + 1):
+                warnings += 1
+                logger.info(LONG_WAIT_TIME_LOG_MSG, interval)
+            time.sleep(RESPONSE_POLL_SECONDS)
     return responses
 
 
