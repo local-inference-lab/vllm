@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-restore-admission",
+  "category": "fix",
+  "summary": "External recurrent checkpoint restores can reserve execution capacity and retain ownership through admission.",
+  "models": ["all"],
+  "compatibility": "Use with the paired LMCache restore-admission change to wait for checkpoint capacity instead of recomputing cached prefixes.",
+  "details": [
+    "Restores reserve GPU blocks and running slots before copies start, and keep restored pages owned until execution takes over.",
+    "Sliding-window and chunked-local continuation reservations count physical pages rather than skipped positions in the block table.",
+    "Requests with reserved capacity can progress past a blocked queue head; cancellation releases reservations after submitted copies drain.",
+    "Existing external-checkpoint callers retain their previous behavior unless they opt into admission reservations."
+  ],
+  "authors": ["ktsaou"],
+  "requires": []
+}

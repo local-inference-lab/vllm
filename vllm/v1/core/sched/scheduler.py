@@ -781,14 +781,30 @@ class Scheduler(SchedulerInterface):
         queue = self._select_waiting_queue_for_scheduling()
         if queue is None:
             return False
-        request = queue.peek_request()
-        checkpoint = request.boundary_checkpoint
-        return (
+        pending_imports = (
+            self.kv_cache_manager.has_pending_external_boundary_admissions()
+        )
+        candidates = itertools.chain(
+            (queue.peek_request(),),
+            (
+                request
+                for request in (
+                    itertools.chain(self.skipped_waiting, self.waiting)
+                    if pending_imports
+                    else ()
+                )
+                if self.kv_cache_manager.external_boundary_admission_ready(
+                    request.request_id
+                )
+            ),
+        )
+        return any(
             request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
             and request.num_computed_tokens == 0
-            and checkpoint is not None
-            and checkpoint.num_tokens == request.num_tokens
+            and request.boundary_checkpoint is not None
+            and request.boundary_checkpoint.num_tokens == request.num_tokens
             and (request.num_stale_output_tokens == 0 or request.drop_stale_output)
+            for request in candidates
         )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
@@ -1368,6 +1384,32 @@ class Scheduler(SchedulerInterface):
                 external_boundary_hit_tokens = 0
 
                 # Get already-cached tokens.
+                if (
+                    request.num_computed_tokens == 0
+                    and self.connector is not None
+                    and self.kv_cache_manager.boundary_checkpoints is not None
+                ):
+                    self.kv_cache_manager.set_external_boundary_admission_context(
+                        self.max_num_running_reqs - num_running,
+                        sum(
+                            self._request_remaining_blocks(req)
+                            for req in self._inflight_prefills
+                            if not (
+                                self.kv_cache_manager.has_external_boundary_admission(
+                                    req.request_id
+                                )
+                            )
+                        ),
+                        has_scheduled_reqs=bool(self.running),
+                    )
+                    if not self.kv_cache_manager.can_admit_external_boundary_request(
+                        request.request_id
+                    ):
+                        request_queue.remove_request(request)
+                        if prefill_interleave_step is not None:
+                            prefill_interleave_step.mark_unavailable(request_id)
+                        step_skipped_waiting.prepend_request(request)
+                        continue
                 if request.num_computed_tokens == 0:
                     if (
                         self.connector is not None
@@ -1748,11 +1790,13 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
-                    if not interleaved_local_prefill:
+                    if not interleaved_local_prefill and not (
+                        self.kv_cache_manager.has_pending_external_boundary_admissions()
+                    ):
                         break
                     request_queue.remove_request(request)
-                    assert prefill_interleave_step is not None
-                    prefill_interleave_step.mark_unavailable(request_id)
+                    if prefill_interleave_step is not None:
+                        prefill_interleave_step.mark_unavailable(request_id)
                     step_skipped_waiting.prepend_request(request)
                     continue
 
