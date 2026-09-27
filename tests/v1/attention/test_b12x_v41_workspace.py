@@ -833,15 +833,13 @@ def test_attention_shared_scratch_graph_replay(
             ),
         )
 
-    context = SimpleNamespace(
-        cudagraph_runtime_mode=CUDAGraphMode.NONE,
-        attn_metadata={
-            layer.swa_cache_layer.prefix: metadata(swa_page),
-            layer.prefix: metadata(main_page),
-            layer.indexer.k_cache.prefix: metadata(main_page),
-        },
-    )
-    monkeypatch.setattr(attention, "get_forward_context", lambda: context)
+    attn_metadata = {
+        layer.swa_cache_layer.prefix: metadata(swa_page),
+        layer.prefix: metadata(main_page),
+        layer.indexer.k_cache.prefix: metadata(main_page),
+    }
+    forward = SimpleNamespace(context=None)
+    monkeypatch.setattr(attention, "get_forward_context", lambda: forward.context)
     kv = torch.randn((length, 512), device=device, dtype=torch.bfloat16)
     for kind, page in (("swa", swa_page), ("indexed", main_page)):
         cache = torch.empty(
@@ -913,6 +911,10 @@ def test_attention_shared_scratch_graph_replay(
     activation_refs: list[tuple[str, StorageWeakRef]] = []
 
     def run():
+        # Like set_forward_context, every forward starts from a fresh context.
+        forward.context = SimpleNamespace(
+            cudagraph_runtime_mode=CUDAGraphMode.NONE, attn_metadata=attn_metadata
+        )
         query = q.clone()
         index_query = packed.clone(), scales.clone(), weights.clone()
         activation_refs.extend(
@@ -956,7 +958,22 @@ def test_attention_shared_scratch_graph_replay(
         torch.cuda.graph(graph, stream=stream),
     ):
         run()
-    # Graph resources own scratch, not the per-layer query activations.
+
+    # Graph resources own scratch, not the per-layer query activations or the
+    # per-forward decode metadata: each replay rewrites it, so graphs of other
+    # shapes share its pool storage instead of pinning one copy per graph.
+    def poison_decode_metadata():
+        shared = getattr(forward.context, "_ds41_decode_metadata", {})
+        tensors = [tensor for entry in shared.values() for tensor in entry[2]]
+        for tensor in tensors:
+            tensor.fill_(-1)
+            activation_refs.append(
+                ("decode_metadata", StorageWeakRef(tensor.untyped_storage()))
+            )
+        return len(tensors)
+
+    assert bool(poison_decode_metadata()) == is_decode
+    forward.context = None
     gc.collect()
     retained = [name for name, reference in activation_refs if not reference.expired()]
     assert not retained, f"Capture resources retained caller activations: {retained}"
