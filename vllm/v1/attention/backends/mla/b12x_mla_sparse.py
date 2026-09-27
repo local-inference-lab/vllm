@@ -355,7 +355,7 @@ def _global_causal_lens_for_ckv_gather(
     return full_seq - chunk_len + (token_idx - chunk_start) + 1
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["padded_rank_tokens"])
 def _map_global_topk_to_gathered_ckv_kernel(
     req_id_ptr,
     token_indices_ptr,
@@ -1098,14 +1098,14 @@ class B12xMLASparseMetadataBuilder(
             accepted.fill_(1)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_reqs", "num_tokens"])
 def _glm_device_token_metadata_kernel(
     query_start_loc,
     seq_lens,
     request_ids,
     causal_lens,
-    NUM_REQS: tl.constexpr,
-    NUM_TOKENS: tl.constexpr,
+    num_reqs,
+    num_tokens,
     SEARCH_STEPS: tl.constexpr,
     DCP_SIZE: tl.constexpr,
     DCP_RANK: tl.constexpr,
@@ -1114,14 +1114,14 @@ def _glm_device_token_metadata_kernel(
 ):
     token = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     lo = tl.full((BLOCK,), 0, tl.int32)
-    hi = tl.full((BLOCK,), NUM_REQS, tl.int32)
+    hi = tl.full((BLOCK,), num_reqs, tl.int32)
     for _ in range(SEARCH_STEPS):
         mid = (lo + hi) // 2
-        end = tl.load(query_start_loc + tl.minimum(mid + 1, NUM_REQS))
+        end = tl.load(query_start_loc + tl.minimum(mid + 1, num_reqs))
         advance = (lo < hi) & (end <= token)
         hi = tl.where((lo < hi) & ~advance, mid, hi)
         lo = tl.where(advance, mid + 1, lo)
-    valid = (token < NUM_TOKENS) & (lo < NUM_REQS)
+    valid = (token < num_tokens) & (lo < num_reqs)
     start = tl.load(query_start_loc + lo, mask=valid, other=0)
     end = tl.load(query_start_loc + lo + 1, mask=valid, other=0)
     length = tl.load(seq_lens + lo, mask=valid, other=0)
@@ -1132,8 +1132,8 @@ def _glm_device_token_metadata_kernel(
             tl.maximum(length - base * DCP_SIZE - DCP_RANK * INTERLEAVE, 0),
             INTERLEAVE,
         )
-    tl.store(request_ids + token, tl.where(valid, lo, 0), token < NUM_TOKENS)
-    tl.store(causal_lens + token, tl.where(valid, length, 0), token < NUM_TOKENS)
+    tl.store(request_ids + token, tl.where(valid, lo, 0), token < num_tokens)
+    tl.store(causal_lens + token, tl.where(valid, length, 0), token < num_tokens)
 
 
 class B12xGLM5NextMLASparseMetadataBuilder(B12xMLASparseMetadataBuilder):
@@ -1150,15 +1150,19 @@ class B12xGLM5NextMLASparseMetadataBuilder(B12xMLASparseMetadataBuilder):
         num_tokens = common.num_actual_tokens
         # Adaptive verification redistributes only the decode prefix. Its total
         # length and the CPU prefill boundaries remain exact.
+        # Request and token counts are runtime arguments: as constexprs they
+        # compiled a new kernel for every distinct prefill chunk, prompt tail and
+        # eager drafter replay, seconds each on the request path. The search
+        # bound covers the largest batch; extra steps are no-ops once lo == hi.
         if num_tokens:
             _glm_device_token_metadata_kernel[(triton.cdiv(num_tokens, 128),)](
                 common.query_start_loc,
                 common.seq_lens,
                 self.req_id_per_token_buffer,
                 self.cache_seq_lens_per_token_buffer,
-                NUM_REQS=common.num_reqs,
-                NUM_TOKENS=num_tokens,
-                SEARCH_STEPS=common.num_reqs.bit_length(),
+                common.num_reqs,
+                num_tokens,
+                SEARCH_STEPS=max(self._ckv_max_reqs, common.num_reqs).bit_length(),
                 DCP_SIZE=self.dcp_world_size,
                 DCP_RANK=self.dcp_rank,
                 INTERLEAVE=self.cp_kv_cache_interleave_size,
