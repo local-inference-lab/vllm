@@ -1,0 +1,13 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-919",
+  "category": "internal",
+  "summary": "DeepSeek-V4.1 workspace tests follow the BF16 attention default and L2 prefetch windows",
+  "models": ["DeepSeek-V4.1-Flash"],
+  "compatibility": "No user action required; test-only change.",
+  "details": [
+    "The CED compact attention oracle compares BF16 attention against exactly dequantized BF16 K/V and keeps its FP8 model for VLLM_DS41_ATTENTION_COMPUTE=auto; hand-built output-projection test layers set the L2 prefetch windows. The V4.1 workspace test file passes in full."
+  ],
+  "pull_requests": [919],
+  "requires": []
+}
