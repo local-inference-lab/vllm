@@ -11,6 +11,7 @@ import pytest
 import torch
 from torch.multiprocessing.reductions import StorageWeakRef
 
+from vllm import envs
 from vllm.config import CUDAGraphMode
 
 pytestmark = pytest.mark.skipif(
@@ -124,6 +125,7 @@ def _layer(attention, layer_id=0, swa_page=32):
             dim=-1,
         )
     )
+    layer._l2pf_wo = layer._l2pf_ffn = None
     layer._ready = False
     return layer
 
@@ -701,12 +703,13 @@ def test_mhc_fixed_capacity_buckets_preserve_decode_policy(
             assert bool(torch.isfinite(y).all())
 
 
-def _v41_fp8_operands(cache, kind):
-    """Decode native cache rows into E4M3 operands and per-64 scales.
+def _v41_cache_operands(cache, kind, *, fp8):
+    """Decode native cache rows into attention operands and per-64 scales.
 
-    This independent operand reference follows B12X's
-    tests/_reference/v41_fp8.py. SWA pairs its E8M0 scales; indexed NVFP4
-    uses a power-of-two scale that bounds four adjacent scale groups.
+    BF16 internals dequantize the native records exactly (unit scales). FP8
+    internals consume E4M3 operands; this independent reference follows
+    B12X's tests/_reference/v41_fp8.py. SWA pairs its E8M0 scales; indexed
+    NVFP4 uses a power-of-two scale that bounds four adjacent scale groups.
     """
     if kind == "swa":
         rows = cache.reshape(-1, 528)
@@ -727,17 +730,21 @@ def _v41_fp8_operands(cache, kind):
         values = lut[codes] * original.repeat_interleave(16, dim=1)
         bound = original.reshape(-1, 8, 4).amax(-1) * (6 / 448)
         exponent = torch.ceil(torch.log2(bound.clamp_min(2.0**-126)))
+    if not fp8:
+        return values.float(), torch.ones_like(exponent, dtype=torch.float32)
     scales = torch.exp2(exponent)
     codes = (values / scales.repeat_interleave(64, dim=1)).float()
     return codes.to(torch.float8_e4m3fn).float(), scales.float()
 
 
-def _v41_fp8_prefill_reference(q, values, scales, valid, sink):
-    """Model BF16 Q/K and per-64-key FP8 probability/value products.
+def _v41_prefill_reference(q, values, scales, valid, sink, *, fp8):
+    """Model BF16 Q/K and per-64-key probability/value products.
 
-    Prefill computes Q/K with BF16 operands. Each output group independently
-    quantizes scaled probabilities to E4M3 before its product with FP8 V;
-    partial numerators remain FP32 until the final LSE merge.
+    Prefill computes Q/K with BF16 operands. With FP8 internals, each output
+    group independently quantizes scaled probabilities to E4M3 before its
+    product with FP8 V; BF16 internals round probabilities to BF16 before the
+    product with dequantized BF16 V. Partial numerators remain FP32 until the
+    final LSE merge.
     """
     keys = (values * scales.repeat_interleave(64, dim=-1)).bfloat16().float()
     logits = torch.einsum("rhd,rkd->rhk", q.float(), keys) * 512**-0.5
@@ -749,14 +756,19 @@ def _v41_fp8_prefill_reference(q, values, scales, valid, sink):
         p = torch.exp(local - maximum[:, :, None])
         p = torch.where(valid[:, None, first : first + 64], p, 0)
         denominator = p.sum(-1)
-        groups = []
-        for group in range(8):
-            weighted = p * scales[:, None, first : first + 64, group]
-            pscale = weighted.abs().amax(-1, keepdim=True).clamp_min(1e-10) / 448
-            pq = (weighted / pscale).to(torch.float8_e4m3fn).float()
-            vq = values[:, first : first + 64, group * 64 : (group + 1) * 64]
-            groups.append(torch.einsum("rhk,rkd->rhd", pq, vq) * pscale)
-        partials.append(torch.cat(groups, -1) / denominator.clamp_min(1e-30)[..., None])
+        if fp8:
+            groups = []
+            for group in range(8):
+                weighted = p * scales[:, None, first : first + 64, group]
+                pscale = weighted.abs().amax(-1, keepdim=True).clamp_min(1e-10) / 448
+                pq = (weighted / pscale).to(torch.float8_e4m3fn).float()
+                vq = values[:, first : first + 64, group * 64 : (group + 1) * 64]
+                groups.append(torch.einsum("rhk,rkd->rhd", pq, vq) * pscale)
+            numerator = torch.cat(groups, -1)
+        else:
+            pb = p.bfloat16().float()
+            numerator = torch.einsum("rhk,rkd->rhd", pb, keys[:, first : first + 64])
+        partials.append(numerator / denominator.clamp_min(1e-30)[..., None])
         lses.append(
             torch.where(denominator > 0, maximum + denominator.log(), -torch.inf)
         )
@@ -1257,6 +1269,7 @@ def test_output_projection_uses_fused_block32_path(native_workspace, monkeypatch
     )
     layer._wo_projection_weights = None
     layer._wo_plans = {3: plan}
+    layer._l2pf_wo = layer._l2pf_ffn = None
 
     layer.setup_wo_projection()
     output = layer._o_proj(
@@ -1659,6 +1672,8 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
     layer.config.cache_config.block_size = main_page
     layer.is_ced_decoder = True
     layer._prepare(device)
+    # Only the tuner's own choice ("auto") may select FP8 internals.
+    fp8 = envs.VLLM_DS41_ATTENTION_COMPUTE == "auto"
     rows, length, boundary = 128, 256, 128
     positions = torch.arange(boundary, length, device=device, dtype=torch.int64)
     reqs = torch.zeros(rows, device=device, dtype=torch.int32)
@@ -1719,7 +1734,7 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
             layer.swa_cache_layer.kv_cache = cache
             swa_values, swa_scales = (
                 part[page : page + length].clone()
-                for part in _v41_fp8_operands(cache, kind)
+                for part in _v41_cache_operands(cache, kind, fp8=fp8)
             )
             # NaN FP8 payloads in every old SWA row: reading below the
             # replay boundary cannot accidentally look like a valid zero page.
@@ -1728,7 +1743,7 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
             layer.kv_cache = cache
             main_values, main_scales = (
                 part[page : page + length].clone()
-                for part in _v41_fp8_operands(cache, kind)
+                for part in _v41_cache_operands(cache, kind, fp8=fp8)
             )
     layer.indexer.k_cache.kv_cache = torch.zeros(
         (
@@ -1795,8 +1810,13 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
             ),
             dim=1,
         ).masked_fill(~valid[..., None], 0)
-        return _v41_fp8_prefill_reference(
-            q[:live], values, scales, valid, layer.attn_sink
+        return _v41_prefill_reference(
+            q[:live],
+            values,
+            scales,
+            valid,
+            layer.attn_sink,
+            fp8=fp8,
         )
 
     workload = B12xWorkload(
