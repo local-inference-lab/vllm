@@ -499,19 +499,21 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         )
 
     def install_prepared_experts(self, layer: torch.nn.Module, prepared: Any) -> None:
-        """Use a prepared EXL3 package without repacking it as ordinary FP4."""
+        """Install EXL3 weights prepared through the common trellis API."""
         fused_moe = _require_b12x_fused_moe()
         if (
             self._source_format != "exl3"
             or not isinstance(prepared, fused_moe.PreparedExperts)
-            or not isinstance(prepared.plan.source, fused_moe.Exl3Source)
+            or not isinstance(prepared.plan.source, fused_moe.TrellisSource)
         ):
-            raise TypeError("EXL3 installation requires a B12X prepared EXL3 package")
+            raise TypeError("EXL3 installation requires B12X prepared trellis weights")
         if (
             prepared.num_experts != self.moe_config.num_experts
             or prepared.hidden_size != self.moe_config.hidden_dim
             or prepared.intermediate_size
-            > self.moe_config.intermediate_size_per_partition
+            != self.moe_config.intermediate_size_per_partition
+            or prepared.plan.activation.mode != "a16"
+            or prepared.plan.activation.rotation_dtype != torch.float16
             or prepared.plan.activation.io_dtype != self.moe_config.in_dtype
             or prepared.plan.activation.nonlinearity
             != _b12x_activation_name(layer.activation)

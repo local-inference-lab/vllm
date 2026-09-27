@@ -14,6 +14,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -616,11 +617,31 @@ class KimiMoE(nn.Module):
             raise NotImplementedError(
                 "Kimi K3 MegaMoE currently requires one expert group."
             )
+        is_exl3 = quant_config is not None and quant_config.get_name() == "exl3"
         self.padded_moe_intermediate_size = moe_intermediate_size
         min_moe_intermediate_per_partition = getattr(
             config, "min_moe_intermediate_per_partition", 256
         )
-        if self.tp_size > 1 and not vllm_config.parallel_config.enable_expert_parallel:
+        if is_exl3:
+            from vllm.model_executor.layers.quantization.utils.exl3 import (
+                load_exl3_manifest,
+                plan_exl3_extent,
+            )
+
+            manifest = load_exl3_manifest(vllm_config.model_config.model)
+            if (
+                manifest.geometry.num_slots * manifest.geometry.slot_channels
+                != moe_intermediate_size
+            ):
+                raise ValueError("EXL3 manifest intermediate size does not match Kimi")
+            extent = plan_exl3_extent(
+                manifest, layer_idx, self.tp_size, get_tensor_model_parallel_rank()
+            )
+            # FusedMoE divides this runtime width by TP; storage uses the extent.
+            self.padded_moe_intermediate_size = extent.intermediate_size * self.tp_size
+        elif (
+            self.tp_size > 1 and not vllm_config.parallel_config.enable_expert_parallel
+        ):
             moe_intermediate_per_partition = moe_intermediate_size // self.tp_size
             if moe_intermediate_per_partition < min_moe_intermediate_per_partition:
                 self.padded_moe_intermediate_size = (
@@ -762,7 +783,7 @@ class KimiMoE(nn.Module):
                 is_sequence_parallel=use_sequence_parallel,
                 runner_cls=LatentMoERunner if self.use_latent_moe else None,
             )
-        if self.padded_moe_intermediate_size != moe_intermediate_size:
+        if not is_exl3 and self.padded_moe_intermediate_size != moe_intermediate_size:
             w13_weight = getattr(self.experts, "w13_weight", None)
             if w13_weight is None:
                 w13_weight = getattr(self.experts, "w13_weight_packed", None)

@@ -3,6 +3,7 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -108,6 +109,106 @@ def test_exl3_defers_expert_storage_to_extent_preparation(moe_config):
     assert config.quant_dtype is None
 
 
+def test_exl3_installs_common_trellis_package_and_checks_local_width(
+    moe_config, monkeypatch
+):
+    from b12x.moe import fused_moe
+
+    from vllm.model_executor.layers.fused_moe import b12x
+    from vllm.model_executor.layers.quantization.exl3 import Exl3MoEMethod
+
+    layer = torch.nn.Module()
+    layer.activation = moe_config.activation
+    layer.apply_router_weight_on_input = False
+    quant = Exl3MoEMethod(moe_config).get_fused_moe_quant_config(layer)
+    backend = b12x.B12xExperts(moe_config, quant)
+    # Weight preparation is GPU-only; exercise the installation boundary on CPU.
+    prepared = Mock(spec=fused_moe.PreparedExperts)
+    prepared.plan = SimpleNamespace(
+        source=Mock(spec=fused_moe.TrellisSource),
+        activation=fused_moe.ActivationSpec(
+            mode="a16",
+            nonlinearity="situ",
+            io_dtype=torch.bfloat16,
+            rotation_dtype=torch.float16,
+        ),
+    )
+    prepared.num_experts = moe_config.num_experts
+    prepared.hidden_size = moe_config.hidden_dim
+    prepared.intermediate_size = moe_config.intermediate_size_per_partition
+    monkeypatch.setattr(
+        b12x, "_register_b12x_moe_output_collective", lambda *a, **k: None
+    )
+    backend.install_prepared_experts(layer, prepared)
+    assert layer._b12x_prepared_experts is prepared
+    assert backend._prepared_experts is prepared
+    prepared.intermediate_size -= 128
+    with pytest.raises(ValueError, match="geometry"):
+        backend.install_prepared_experts(layer, prepared)
+
+
+@pytest.mark.parametrize("tp_size", [9, 10, 16])
+def test_exl3_moe_uses_manifest_width_without_changing_shared_experts(
+    moe_config, monkeypatch, tp_size
+):
+    from vllm.model_executor.layers.quantization.utils import exl3
+    from vllm.models.kimi_k3.nvidia import model as kimi
+    from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+
+    config = KimiLinearConfig(
+        hidden_size=3584,
+        moe_intermediate_size=3072,
+        num_experts=896,
+        num_experts_per_token=16,
+        num_shared_experts=1,
+        hidden_act="situ",
+        activation_situ_beta=4.0,
+        activation_situ_linear_beta=25.0,
+    )
+    manifest = _kimi_manifest()
+    monkeypatch.setattr(exl3, "load_exl3_manifest", lambda root: manifest)
+    monkeypatch.setattr(kimi, "get_tensor_model_parallel_world_size", lambda: tp_size)
+    monkeypatch.setattr(kimi, "GateLinear", lambda **kwargs: torch.nn.Module())
+    shared_widths = []
+
+    def shared_mlp(**kwargs):
+        shared_widths.append(kwargs["intermediate_size"])
+        return torch.nn.Module()
+
+    def experts(**kwargs):
+        layer = torch.nn.Module()
+        layer.moe_config = replace(
+            moe_config,
+            intermediate_size=kwargs["intermediate_size"],
+            moe_parallel_config=replace(
+                moe_config.moe_parallel_config, tp_size=tp_size
+            ),
+        )
+        return layer
+
+    monkeypatch.setattr(kimi, "KimiMLP", shared_mlp)
+    monkeypatch.setattr(kimi, "FusedMoEFactory", experts)
+    runtime = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="b12x"),
+        parallel_config=SimpleNamespace(enable_expert_parallel=False),
+        model_config=SimpleNamespace(model="checkpoint"),
+    )
+    quant = SimpleNamespace(get_name=lambda: "exl3")
+    for rank in range(tp_size):
+        monkeypatch.setattr(
+            kimi, "get_tensor_model_parallel_rank", lambda rank=rank: rank
+        )
+        for layer in (1, 2):
+            moe = kimi.KimiMoE(config, runtime, quant, layer_idx=layer)
+            extent = plan_exl3_extent(manifest, layer, tp_size, rank)
+            assert (
+                moe.experts.moe_config.intermediate_size_per_partition
+                == extent.intermediate_size
+            )
+    assert set(shared_widths) == {3072}
+    assert config.moe_intermediate_size == 3072
+
+
 @pytest.mark.parametrize(
     "fields",
     [
@@ -143,6 +244,20 @@ def checkpoint_quant_config():
         "ignored_layers": ["kv_b_proj", "g_proj", "f_a_proj", "f_b_proj", "b_proj"],
         "exl3": {"manifest": "exl3-manifest.json"},
     }
+
+
+def test_exl3_detection_preserves_explicit_quantization(checkpoint_quant_config):
+    from vllm.model_executor.layers.quantization.exl3 import Exl3Config
+
+    for selected in (None, "exl3"):
+        assert (
+            Exl3Config.override_quantization_method(checkpoint_quant_config, selected)
+            == "exl3"
+        )
+    assert (
+        Exl3Config.override_quantization_method(checkpoint_quant_config, "mxfp4")
+        is None
+    )
 
 
 def test_exl3_config_preserves_serialized_projection_formats(

@@ -469,6 +469,35 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
     """
 
     @staticmethod
+    def update_model_config_for_parallelism(
+        model_config: "ModelConfig", parallel_config: "ParallelConfig"
+    ) -> None:
+        if model_config.quantization != "exl3":
+            return
+        tp_size = parallel_config.tensor_parallel_size
+        if not 2 <= tp_size <= 24 or parallel_config.enable_expert_parallel:
+            raise ValueError("Kimi EXL3 requires TP in 2..24 without EP")
+        text = model_config.hf_text_config
+        original_heads = getattr(
+            text, "original_num_attention_heads", text.num_attention_heads
+        )
+        if not isinstance(original_heads, int) or original_heads <= 0:
+            raise ValueError("Kimi EXL3 requires a positive checkpoint head count")
+        text.original_num_attention_heads = original_heads
+        text.num_attention_heads = round_up(original_heads, tp_size)
+        if text.linear_attn_config is not None:
+            kda = dict(text.linear_attn_config)
+            original_kda_heads = kda.get("original_num_heads", kda["num_heads"])
+            if not isinstance(original_kda_heads, int) or original_kda_heads <= 0:
+                raise ValueError(
+                    "Kimi EXL3 requires a positive checkpoint KDA head count"
+                )
+            kda["original_num_heads"] = original_kda_heads
+            kda["num_heads"] = round_up(original_kda_heads, tp_size)
+            text.linear_attn_config = kda
+        model_config.model_arch_config = model_config.get_model_arch_config()
+
+    @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
         for cfg in (
             model_config.hf_config,

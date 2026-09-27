@@ -72,7 +72,11 @@ class Exl3Config(ModelOptMxFp8Config):
     def override_quantization_method(
         cls, hf_quant_cfg, user_quant, hf_config=None
     ) -> QuantizationMethods | None:
-        if hf_quant_cfg is not None and hf_quant_cfg.get("quant_method") == "exl3":
+        if (
+            user_quant in (None, "exl3")
+            and hf_quant_cfg is not None
+            and hf_quant_cfg.get("quant_method") == "exl3"
+        ):
             return "exl3"
         return None
 

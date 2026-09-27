@@ -1,0 +1,20 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-909",
+  "category": "feature",
+  "summary": "Serve source-aligned EXL3 routed experts without padded weight payloads",
+  "models": [
+    "Kimi-K3"
+  ],
+  "compatibility": "Requires the B12X common trellis preparation API and an EXL3 manifest checkpoint; Kimi serving also requires mixed-precision KDA and MLA projection support.",
+  "details": [
+    "Preserves serialized dense weight formats and BF16 expert activations with FP16 trellis rotations.",
+    "Derives routed-expert runtime widths from source-aligned TP extents while preserving checkpoint dimensions."
+  ],
+  "pull_requests": [
+    909
+  ],
+  "requires": [
+    "b12x-433"
+  ]
+}
