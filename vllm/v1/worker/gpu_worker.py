@@ -89,6 +89,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.worker.gpu_stall_watchdog import GpuStallWatchdog
 from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
@@ -231,6 +232,12 @@ class Worker(WorkerBase):
         self.worker_sentinel: WorkerSentinel | None = None
         if self.parallel_config.enable_fault_tolerance:
             self.worker_sentinel = WorkerSentinel(worker=self)
+        self.gpu_stall_watchdog: GpuStallWatchdog | None = None
+        if envs.VLLM_GPU_STALL_DUMP_SECONDS > 0:
+            self.gpu_stall_watchdog = GpuStallWatchdog(
+                self.rank, envs.VLLM_GPU_STALL_DUMP_SECONDS
+            )
+            self.gpu_stall_watchdog.start()
         # Buffers saved before sleep
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self._sleep_saved_draft_buffers: dict[str, torch.Tensor] = {}
@@ -1319,17 +1326,33 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self._b12x_roce_guarded(self.model_runner.sample_tokens(grammar_output))
+        return self._finish_step(self.model_runner.sample_tokens(grammar_output))
 
     def _b12x_roce_health_check(self) -> Callable[[], None] | None:
-        """The RoCEnante health check of the TP communicator, if one is active.
+        """The RoCEnante health check of every live communicator of this process.
 
         Returns:
             The check callable, or None when RoCEnante is not in use.
         """
-        communicator = get_tp_group().device_communicator
-        comm = getattr(communicator, "b12x_ar_comm", None)
-        return getattr(comm, "check_health", None)
+        from vllm.distributed.device_communicators.b12x_roce_all_reduce import (
+            live_roce_communicators,
+        )
+
+        communicators = live_roce_communicators()
+        if not communicators:
+            return None
+
+        def check() -> None:
+            for communicator in communicators:
+                communicator.check_health()
+
+        return check
+
+    def _finish_step(self, output):
+        """Mark the enqueued step for the stall watchdog, then guard its output."""
+        if self.gpu_stall_watchdog is not None:
+            self.gpu_stall_watchdog.mark()
+        return self._b12x_roce_guarded(output)
 
     def _b12x_roce_guarded(self, output):
         """Fail-stop RoCEnante check once the step's output is on the host.
@@ -1436,7 +1459,7 @@ class Worker(WorkerBase):
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
-                return self._b12x_roce_guarded(output)
+                return self._finish_step(output)
 
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config
