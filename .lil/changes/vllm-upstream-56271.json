@@ -9,7 +9,7 @@
     "When the model wrote a DSML tool-call parameter without its string=\"true|false\" attribute, the parser dropped that parameter, so the client received the tool call without it (for example {\"a\": \"x\"} instead of {\"a\": \"x\", \"n\": 12}). A missing attribute is now treated like string=\"false\": the value is parsed as JSON and otherwise kept as literal text, in streaming and non-streaming responses and in the Python and Rust parsers.",
     "The change preserves the original author and code from vllm-project/vllm#56271."
   ],
-  "pull_requests": [],
+  "pull_requests": [921],
   "authors": ["lazymio"],
   "evidence": ["https://github.com/vllm-project/vllm/pull/56271"],
   "requires": []
