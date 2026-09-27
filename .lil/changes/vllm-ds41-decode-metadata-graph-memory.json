@@ -1,0 +1,19 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-ds41-decode-metadata-graph-memory",
+  "category": "fix",
+  "summary": "DeepSeek-V4.1 CUDA graphs no longer pin a private copy of the decode page metadata",
+  "models": [
+    "DeepSeek-V4.1-Flash"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "Every captured decode CUDA graph kept its own copy of the sparse-attention page metadata: about 117 MiB per graph at the full 1M context on 4x RTX PRO 6000, 3.8 GiB per GPU over the 33 DSpark verification graphs. The CUDA graph memory estimate did not see this per-graph cost, so the KV cache was sized for 1.8 GiB of graphs while they used 5.3 GiB, leaving about 1.2 GiB free; DSpark servers at --gpu-memory-utilization 0.95 could then run out of memory when the sampler or adaptive-verification kernels loaded after startup.",
+    "The metadata is still computed once per KV-cache group per forward, but graphs now share its storage through the CUDA graph pool. Graph memory drops from 5.3 to 1.9 GiB per GPU and matches the estimate; KV cache capacity is unchanged and about 4.1 GiB stays free after startup."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [],
+  "requires": []
+}

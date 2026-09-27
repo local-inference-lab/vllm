@@ -1497,13 +1497,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         # Reuse the shared arena only after indexing completes. Keep full-batch
         # metadata beside, not overlapping, the native attention scratch.
         metadata_specs = self._attention_workspace_specs[mode]
-        buffers = current_workspace_manager().get_simultaneous(
+        arena = current_workspace_manager().get_simultaneous(
             *metadata_specs,
             *((spec.shape, spec.dtype) for spec in state.scratch_plan.scratch_specs()),
         )
+        buffers = arena
         metadata_count = len(metadata_specs)
         # Decode layers sharing cache groups map identical pages, so the first
         # layer of each group keeps its metadata for the rest of the forward.
+        # Every replay rewrites it before use, so it is an ordinary graph-pool
+        # activation: retaining it would pin one copy per captured graph.
         if mode == "decode":
             key = (
                 id(swa),
@@ -1521,10 +1524,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     torch.empty(shape, dtype=dtype, device=q.device)
                     for shape, dtype in metadata_specs
                 )
-                retain_cuda_graph_capture_resource(metadata_buffers)
                 self._write_decode_metadata(metadata_buffers, swa, main, rows)
                 entry = shared[key] = (swa, main, metadata_buffers)
-            buffers = [*entry[2], *buffers[metadata_count:]]
+            buffers = [*entry[2], *arena[metadata_count:]]
         else:
             self._write_decode_metadata(buffers, swa, main, rows)
         swa_indices, swa_lengths, top_lengths = buffers[:3]
@@ -1543,8 +1545,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             swa_lengths=swa_lengths[:rows],
             **kwargs,
         )
-        # Keep scratch and metadata, not aliases of the transient query storage.
-        retain_cuda_graph_capture_resource(buffers)
+        # Keep the borrowed arena, not aliases of the transient query storage.
+        retain_cuda_graph_capture_resource(arena)
         mla.run(
             binding=binding,
             swa_k_cache=self.swa_cache_layer.kv_cache,
