@@ -29,7 +29,11 @@ import torch
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import destroy_distributed_environment, destroy_model_parallel
-from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
+from vllm.distributed.device_communicators.shm_broadcast import (
+    LONG_WAIT_TIME_LOG_MSG,
+    Handle,
+    MessageQueue,
+)
 from vllm.distributed.ec_transfer.ec_connector.utils import ECOutputAggregator
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.distributed.parallel_state import (
@@ -74,6 +78,84 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOu
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
+
+
+# How long a gather of every rank's reply blocks on one rank before checking
+# the others for a reply (a failure among them ends the wait).
+RESPONSE_POLL_SECONDS = 0.05
+
+
+def _check_response(rank: int, status: Any, result: Any) -> Any:
+    if status != WorkerProc.ResponseStatus.SUCCESS:
+        raise RuntimeError(
+            f"Worker {rank} failed with error '{result}', please check the"
+            " stack trace above for the root cause"
+        )
+    return result
+
+
+def _gather_responses(
+    response_mqs: Sequence[MessageQueue],
+    ranks: Sequence[int],
+    deadline: float | None,
+    method: str,
+) -> list[Any]:
+    """Collect one reply per queue, failing as soon as any rank reports one.
+
+    Reading the queues in rank order let a failure on one rank sit unread
+    while an earlier rank waited forever, for example in a collective the
+    failed rank would never join: TP1's CUDA graph capture fails, TP0 hangs
+    in the next all-reduce, and the engine waits on TP0 with TP1's error in
+    its queue. Every pending queue is polled without blocking, and only when
+    none has replied does the gather block, briefly, on the oldest one.
+    """
+
+    def remaining() -> float | None:
+        if deadline is None:
+            return None
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError(f"RPC call to {method} timed out.")
+        return left
+
+    if len(response_mqs) == 1:
+        try:
+            status, result = response_mqs[0].dequeue(timeout=remaining())
+        except TimeoutError as e:
+            raise TimeoutError(f"RPC call to {method} timed out.") from e
+        return [_check_response(ranks[0], status, result)]
+
+    responses: list[Any] = [None] * len(response_mqs)
+    pending = list(range(len(response_mqs)))
+    # A blocking read logs the long-wait message every interval; the short
+    # polls here would not, and operators watch for it, so log it the same way.
+    started, warnings = time.monotonic(), 0
+    interval = envs.VLLM_RINGBUFFER_WARNING_INTERVAL
+    while pending:
+        if time.monotonic() - started >= interval * (warnings + 1):
+            warnings += 1
+            logger.info(LONG_WAIT_TIME_LOG_MSG, interval)
+        for index in list(pending):
+            try:
+                status, result = response_mqs[index].dequeue(timeout=0)
+            except TimeoutError:
+                continue
+            responses[index] = _check_response(ranks[index], status, result)
+            pending.remove(index)
+        if not pending:
+            break
+        left = remaining()
+        wait = (
+            RESPONSE_POLL_SECONDS if left is None else min(RESPONSE_POLL_SECONDS, left)
+        )
+        index = pending[0]
+        try:
+            status, result = response_mqs[index].dequeue(timeout=wait)
+        except TimeoutError:
+            continue
+        responses[index] = _check_response(ranks[index], status, result)
+        pending.remove(index)
+    return responses
 
 
 class FutureWrapper(Future):
@@ -433,25 +515,13 @@ class MultiprocExecutor(Executor):
         self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
 
         response_mqs: Sequence[MessageQueue] = self.response_mqs
+        ranks: Sequence[int] = range(len(response_mqs))
         if output_rank is not None:
             response_mqs = (response_mqs[output_rank],)
+            ranks = (output_rank,)
 
         def get_response():
-            responses = []
-            for mq in response_mqs:
-                dequeue_timeout = (
-                    None if deadline is None else max(0.0, deadline - time.monotonic())
-                )
-                try:
-                    status, result = mq.dequeue(timeout=dequeue_timeout)
-                except TimeoutError as e:
-                    raise TimeoutError(f"RPC call to {method} timed out.") from e
-                if status != WorkerProc.ResponseStatus.SUCCESS:
-                    raise RuntimeError(
-                        f"Worker failed with error '{result}', please check the"
-                        " stack trace above for the root cause"
-                    )
-                responses.append(result)
+            responses = _gather_responses(response_mqs, ranks, deadline, str(method))
             return responses[0] if output_rank is not None else responses
 
         future = FutureWrapper(
