@@ -9,7 +9,33 @@ import math
 import torch
 
 from vllm.utils.b12x import get_b12x_qsa
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVQuantMode
+
+
+def qsa_main_kv_dtype(spec: AttentionSpec) -> torch.dtype:
+    """The b12x QSA main K/V format a manager spec describes."""
+    if spec.kv_quant_mode == KVQuantMode.NVFP4_QSA:
+        qsa = get_b12x_qsa()
+        if qsa is None:
+            raise RuntimeError("b12x QSA is required for NVFP4 K/V records")
+        return qsa.NVFP4_KV_DTYPE
+    return torch.float8_e4m3fn if spec.dtype == torch.uint8 else spec.dtype
+
+
+def qsa_main_kv_slot_bytes(spec: AttentionSpec, *, compress_ratio: int) -> int:
+    """Bytes of one K or V head slot per token, as b12x lays out the page."""
+    qsa = get_b12x_qsa()
+    if qsa is None:
+        raise RuntimeError("b12x QSA is required to size the main cache")
+    requirements = qsa.cache_requirements(
+        main_page_size=int(compress_ratio),
+        kv_heads=int(spec.num_kv_heads),
+        head_dim=int(spec.head_size),
+        compress_ratio=int(compress_ratio),
+        dtype=torch.bfloat16,
+        kv_dtype=qsa_main_kv_dtype(spec),
+    )
+    return int(requirements.main_k_page_nbytes) // int(compress_ratio)
 
 
 def qsa_padded_page_size_bytes(
@@ -33,7 +59,7 @@ def qsa_padded_page_size_bytes(
     # compressed storage back to the probe width. Real manager pages are already
     # ratio-aligned and therefore consume the returned byte count directly.
     geometry_page_size = math.lcm(main_page_size, int(compress_ratio))
-    kv_dtype = torch.float8_e4m3fn if spec.dtype == torch.uint8 else spec.dtype
+    kv_dtype = qsa_main_kv_dtype(spec)
     requirements = qsa.cache_requirements(
         main_page_size=geometry_page_size,
         kv_heads=int(spec.num_kv_heads),
