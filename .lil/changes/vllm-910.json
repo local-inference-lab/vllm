@@ -1,14 +1,21 @@
 {
   "schema": "local-inference-release-change/v1",
-  "id": "vllm-qsa-nvfp4-kv",
+  "id": "vllm-910",
   "category": "feature",
   "summary": "Qwen3.8-Flash-Next: --kv-cache-dtype nvfp4_qsa stores QSA main K/V as B12X NVFP4 records",
-  "models": ["Qwen3.8-Flash-Next"],
+  "models": [
+    "Qwen3.8-Flash-Next"
+  ],
   "compatibility": "No user action required. FP8 remains the default; nvfp4_qsa is an explicit option.",
   "details": [
     "Each token, KV head and side stores a 148-byte NVFP4 record (E2M1 values, E4M3 scales per 16 values, fp32 per-row outer scale) instead of 256 FP8 bytes. The QSA selector cache stays BF16.",
     "The B12X QSA plan owns the NVFP4 writer; attention reads records bitwise-identically to BF16 attention over the decoded values.",
     "KVQuantMode.NVFP4_QSA keeps the generic nvfp4 page geometry and FlashInfer paths from applying to these pages."
   ],
-  "requires": ["b12x-qsa-nvfp4-kv"]
+  "requires": [
+    "b12x-qsa-nvfp4-kv"
+  ],
+  "pull_requests": [
+    910
+  ]
 }
