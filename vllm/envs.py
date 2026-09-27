@@ -216,6 +216,8 @@ if TYPE_CHECKING:
     VLLM_MTP_NVFP4_LM_HEAD: bool = True
     VLLM_DS41_MARKOV_NVFP4: bool = False
     VLLM_DS41_DRAFT_NVFP4_HEAD: bool = False
+    VLLM_DS41_ATTENTION_COMPUTE: Literal["bf16", "reference", "auto"] = "bf16"
+    VLLM_DS41_ENGRAM_OVERLAP: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_HC_TP: bool = True
     VLLM_MIMO_L2_PREFETCH: bool = False
@@ -1841,6 +1843,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Give the DeepSeek V4.1 DSpark drafter its own NVFP4 vocabulary head.
     "VLLM_DS41_DRAFT_NVFP4_HEAD": lambda: bool(
         int(os.getenv("VLLM_DS41_DRAFT_NVFP4_HEAD", "0"))
+    ),
+    # Arithmetic of the DeepSeek V4.1 b12x sparse attention. "bf16" computes
+    # like DeepSeek's reference sparse_attn (BF16 Q, KV dequantized to BF16,
+    # BF16 P, FP32 accumulation) with split-K decode; "reference" also runs
+    # decode rows single-pass, which reproduces the reference kernel's
+    # tile-ordered softmax bit for bit at some low-concurrency decode speed;
+    # "auto" lets the b12x tuner pick FP8 internals (Q and P quantized, KV
+    # re-encoded; about 3% relative error) or BF16 per plan.
+    "VLLM_DS41_ATTENTION_COMPUTE": env_with_choices(
+        "VLLM_DS41_ATTENTION_COMPUTE",
+        "bf16",
+        ["bf16", "reference", "auto"],
+    ),
+    # Read DeepSeek V4.1 disk Engram rows while the target graph starts.
+    "VLLM_DS41_ENGRAM_OVERLAP": lambda: bool(
+        int(os.getenv("VLLM_DS41_ENGRAM_OVERLAP", "1"))
     ),
     # Overlap independent small-batch projections in Qwen3.8-Flash-Next graphs.
     "VLLM_QWEN3_8_FLASH_NEXT_OVERLAP": lambda: bool(

@@ -377,6 +377,10 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
                 and quant_config.get("quant_method") == "fp8"
             ):
                 quant_config["quant_method"] = "deepseek_v41_fp8"
+        # DeepSeek's reference head computes FP32 logits; a BF16 head rounds
+        # them to steps of up to 1/8. An explicit head_dtype override wins.
+        if getattr(model_config.hf_config, "head_dtype", None) is None:
+            model_config.hf_config.head_dtype = "float32"
 
     @staticmethod
     def update_model_config_for_parallelism(
@@ -655,7 +659,6 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
                 and quant_config.get("format") == "mxfp4-pack-quantized"
             ):
                 quant_config["quant_method"] = "mxfp4"
-
 
 
 class Qwen3DSparkConfig(VerifyAndUpdateConfig):
