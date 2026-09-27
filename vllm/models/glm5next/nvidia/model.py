@@ -376,12 +376,15 @@ class Glm5NextDecoderLayer(nn.Module):
             assert config.v_head_dim is not None
             assert config.kv_lora_rank is not None
             # Mixed ModelOpt checkpoints describe each projection independently;
-            # unlisted projections remain BF16.
-            mla_quant_config = (
-                quant_config
-                if quant_config is not None
-                and quant_config.get_name() == "modelopt_mixed"
-                else None
+            # unlisted projections remain BF16. A native block-FP8 checkpoint
+            # serializes q_b_proj and o_proj in FP8: serve them as FP8 instead of
+            # dequantizing them to BF16, which doubles the bytes every decode step
+            # streams. Its fused q_a/kv_a projection keeps the BF16 load path (NoPE
+            # rope padding splits a 128-row scale block).
+            quant_name = quant_config.get_name() if quant_config is not None else None
+            mla_quant_config = quant_config if quant_name == "modelopt_mixed" else None
+            mla_proj_quant_config = (
+                quant_config if quant_name in ("modelopt_mixed", "fp8") else None
             )
             self.self_attn = Glm5NextMLAAttention(
                 vllm_config=vllm_config,
@@ -396,6 +399,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 max_position_embeddings=config.max_position_embeddings,
                 cache_config=cache_config,
                 quant_config=mla_quant_config,
+                proj_quant_config=mla_proj_quant_config,
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 pool_topk_indices_buffer=pool_topk_indices_buffer,

@@ -42,6 +42,36 @@ def _select_sparse_backend(
     return attn_backend
 
 
+def _serve_block_fp8_on_marlin(linear: nn.Module) -> None:
+    """Run a block-FP8 projection on Marlin W8A16 with the checkpoint's block scales.
+
+    Marlin dequantizes the serialized FP8 weight with its own 128x128 scales and
+    keeps BF16 activations, so it computes the checkpoint's weights exactly, as
+    the BF16 load path did, while reading half the bytes. The linear backend's
+    W8A8 block kernel quantizes activations too and measured slower here.
+    """
+    from vllm.model_executor.kernels.linear import init_fp8_linear_kernel
+    from vllm.model_executor.kernels.linear.scaled_mm.marlin import (
+        MarlinFP8ScaledMMLinearKernel,
+    )
+    from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+
+    method = getattr(linear, "quant_method", None)
+    if not isinstance(method, Fp8LinearMethod) or not method.block_quant:
+        return
+    if method.use_marlin:
+        return
+    method.fp8_linear = init_fp8_linear_kernel(
+        activation_quant_key=method.activation_quant_key,
+        weight_quant_key=method.weight_quant_key,
+        weight_shape=linear.weight.shape,
+        input_dtype=method.input_dtype,
+        out_dtype=method.out_dtype,
+        force_kernel=MarlinFP8ScaledMMLinearKernel,
+    )
+    method.use_marlin = True
+
+
 class Glm5NextMLAAttention(nn.Module):
     def __init__(
         self,
@@ -57,6 +87,7 @@ class Glm5NextMLAAttention(nn.Module):
         max_position_embeddings: int = 8192,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
+        proj_quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
         pool_topk_indices_buffer: torch.Tensor | None = None,
@@ -67,6 +98,11 @@ class Glm5NextMLAAttention(nn.Module):
         indexer_scratch: Glm5NextIndexerScratch | None = None,
     ) -> None:
         super().__init__()
+        # q_b_proj and o_proj may carry their own quantization: a native block-FP8
+        # checkpoint serializes them in FP8, while the fused q_a/kv_a projection (rope
+        # padding on NoPE models) and kv_b stay on ``quant_config``.
+        if proj_quant_config is None:
+            proj_quant_config = quant_config
         self.hidden_size = hidden_size
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -96,7 +132,7 @@ class Glm5NextMLAAttention(nn.Module):
                 q_lora_rank,
                 num_heads * self.qk_head_dim,
                 bias=False,
-                quant_config=quant_config,
+                quant_config=proj_quant_config,
                 prefix=f"{prefix}.q_b_proj",
             )
         else:
@@ -127,7 +163,7 @@ class Glm5NextMLAAttention(nn.Module):
             num_heads * v_head_dim,
             hidden_size,
             bias=False,
-            quant_config=quant_config,
+            quant_config=proj_quant_config,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -197,6 +233,9 @@ class Glm5NextMLAAttention(nn.Module):
             is_sparse=self.is_sparse,
             topk_indices_buffer=topk_indices_buffer,
         )
+        if q_lora_rank is not None:
+            _serve_block_fp8_on_marlin(self.q_b_proj)
+        _serve_block_fp8_on_marlin(self.o_proj)
         # TP padding (see Glm5NextForCausalLMConfig) appends zero heads after
         # the checkpoint heads: zero Q and KV-up rows and zero o_proj input
         # columns, so padded heads contribute nothing to the output.
