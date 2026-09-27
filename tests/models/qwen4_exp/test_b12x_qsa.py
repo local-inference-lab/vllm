@@ -615,11 +615,45 @@ def test_qsa_nvfp4_cache_update_uses_the_layer_writer() -> None:
 
     impl.do_kv_cache_update(layer, key, value, storage, slots)
 
-    ((k, v, key_cache, value_cache, slot_mapping),) = calls
+    ((k, v, slot_mapping),) = calls
     assert k.shape == v.shape == (3, 1, 256)
     assert torch.equal(v, value.view(3, 1, 256))
-    assert key_cache.shape == value_cache.shape == (2, 16, 1, 148)
     assert slot_mapping is slots
+
+
+def test_qsa_nvfp4_writer_binds_once_to_the_layer_cache(monkeypatch) -> None:
+    impl = Qwen4ExpQSAImpl.__new__(Qwen4ExpQSAImpl)
+    impl.num_kv_heads = 1
+    impl.head_size = 256
+    impl.kv_cache_dtype = "nvfp4_qsa"
+    storage = torch.zeros(2, 2, 16, 148, dtype=torch.uint8)
+    binds, writes = [], []
+
+    class Writer:
+        def write(self, **kwargs):
+            writes.append(kwargs)
+
+    api = SimpleNamespace(
+        bind_kv_writer=lambda plan, **caches: binds.append((plan, caches)) or Writer()
+    )
+    layer = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
+    layer.impl = impl
+    layer.kv_cache = storage
+    layer._b12x_preparation_prefix = "layer"
+    layer._nvfp4_kv_writer = None
+    layer._qsa_decode_context = SimpleNamespace(prepared_plan="plan")
+    key = torch.zeros(3, 1, 256, dtype=torch.bfloat16)
+    slots = torch.tensor([0, -1, 17], dtype=torch.int64)
+
+    monkeypatch.setattr(qsa_module, "get_b12x_qsa", lambda: api)
+    layer.write_nvfp4_kv(key, key, slots)
+    layer.write_nvfp4_kv(key, key, slots)
+
+    ((plan, caches),) = binds
+    assert plan == "plan"
+    assert caches["main_k_cache"].shape == (2, 16, 1, 148)
+    assert caches["main_v_cache"].data_ptr() == storage[:, 1].data_ptr()
+    assert len(writes) == 2 and writes[1]["slot_mapping"] is slots
 
 
 def test_qsa_caps_without_dcp_accepts_the_base_b12x_contract() -> None:

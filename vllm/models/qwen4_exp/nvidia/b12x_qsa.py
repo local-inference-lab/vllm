@@ -560,13 +560,11 @@ class Qwen4ExpQSAImpl(AttentionImpl[Qwen4ExpQSAMetadata]):
         slot_mapping: torch.Tensor,
     ) -> None:
         if self.kv_cache_dtype == "nvfp4_qsa":
-            # b12x quantizes NVFP4 records with the plan-owned writer.
-            key_cache, value_cache = self._kv_cache_views(kv_cache)
+            # b12x quantizes NVFP4 records with the plan-owned writer, bound
+            # once to the layer's own cache (the ``kv_cache`` passed here).
             cast("Qwen4ExpQSAAttention", layer).write_nvfp4_kv(
                 key.view(-1, self.num_kv_heads, self.head_size),
                 value.view(-1, self.num_kv_heads, self.head_size),
-                key_cache,
-                value_cache,
                 slot_mapping,
             )
             return
@@ -1198,6 +1196,7 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
         self._main_block_table: torch.Tensor | None = None
         self._compressed_cache: torch.Tensor | None = None
         self._qsa_decode_context: _QSAContextPlan | None = None
+        self._nvfp4_kv_writer: Any | None = None
         self._qsa_prefill_bindings: tuple[_QSAContextPlan, ...] = ()
         self._b12x_diagnostic_request_ids: torch.Tensor | None = None
         self._b12x_preparation_prefix = self.layer_name
@@ -1601,11 +1600,16 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
         self,
         key: torch.Tensor,
         value: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
         """Quantize new K/V rows through the layer's prepared NVFP4 writer."""
+        writer = self._nvfp4_kv_writer
+        if writer is None:
+            writer = self._bind_nvfp4_kv_writer()
+        writer.write(key=key, value=value, slot_mapping=slot_mapping)
+
+    def _bind_nvfp4_kv_writer(self) -> Any:
+        """Bind the prepared plan's writer to this layer's cache once."""
         context = self._qsa_decode_context
         plan = None if context is None else context.prepared_plan
         if plan is None:
@@ -1614,14 +1618,12 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
             )
         api = get_b12x_qsa()
         assert api is not None
-        api.write_kv(
-            plan,
-            key=key,
-            value=value,
-            main_k_cache=key_cache,
-            main_v_cache=value_cache,
-            slot_mapping=slot_mapping,
+        impl = cast(Qwen4ExpQSAImpl, self.impl)
+        main_k_cache, main_v_cache = impl._kv_cache_views(self.kv_cache)
+        self._nvfp4_kv_writer = api.bind_kv_writer(
+            plan, main_k_cache=main_k_cache, main_v_cache=main_v_cache
         )
+        return self._nvfp4_kv_writer
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
@@ -2001,6 +2003,7 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
         ):
             raise RuntimeError("QSA received an unexpected main RoPE cache layout")
         self._qsa_decode_context = decode_context
+        self._nvfp4_kv_writer = None
         self._qsa_prefill_bindings = prefill_contexts
         self._main_block_table = None
 
@@ -2074,6 +2077,7 @@ class Qwen4ExpQSAAttention(nn.Module, AttentionLayerBase):
         self._mtp_anchor_state = None
         self._mtp_anchor_storage = None
         self._qsa_decode_context = None
+        self._nvfp4_kv_writer = None
         self._qsa_prefill_bindings = ()
         self._compressed_cache = None
         self._main_block_table = None
