@@ -57,3 +57,38 @@ def test_restore_keeps_page_offsets_above_signed_int32():
     expected = torch.full((3, size), 165, dtype=torch.uint8)
     expected[1].copy_(source[offset : offset + size])
     torch.testing.assert_close(destination.cpu(), expected)
+
+
+def test_restore_compiles_once_across_scalar_classes():
+    """Block and slot vary per request; Triton must not specialize on them.
+
+    Triton specializes an integer argument equal to 1 and one divisible by 16
+    by default, so every new combination would compile on the request path.
+    """
+    from triton import knobs
+
+    size, width = 17, 28
+    pool = torch.zeros((33, width), dtype=torch.uint8, device="cuda")
+    destination = torch.zeros((33, size), dtype=torch.uint8, device="cuda")
+    metadata = torch.tensor(
+        [[destination.data_ptr(), destination.stride(0), size, 5]],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    compiled: list[str] = []
+    previous = knobs.runtime.jit_post_compile_hook
+
+    def record(**kwargs):
+        compiled.append(getattr(kwargs.get("fn"), "name", ""))
+        return previous(**kwargs) if previous is not None else None
+
+    knobs.runtime.jit_post_compile_hook = record
+    try:
+        for block, slot in [(0, 0), (1, 1), (2, 2), (16, 17), (17, 16), (32, 1)]:
+            _restore_auxiliary_state_kernel[(1,)](
+                metadata, pool, pool.stride(0), block, slot, BLOCK=1024
+            )
+        torch.accelerator.synchronize()
+    finally:
+        knobs.runtime.jit_post_compile_hook = previous
+    assert compiled.count("_restore_auxiliary_state_kernel") <= 1

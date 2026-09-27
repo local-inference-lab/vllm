@@ -35,7 +35,7 @@ def _fwht128(x):
     return x * 0.08838834764831845
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows"])
 def _fwht_quant_kernel(
     q,
     q_out,
@@ -276,7 +276,7 @@ def _decode_update_kernel(
         tl.store(tail + base + tail_stride_1 + dim, current_gate, mask=dim_mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["request_offset"])
 def _prefill_pool_kernel(
     cache_fp8,
     cache_fp32,
@@ -415,7 +415,7 @@ def _prefill_pool_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["request_offset"])
 def _prefill_tail_kernel(
     tail,
     state_slots,
@@ -590,7 +590,7 @@ def update_decode_pools(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows", "source_width", "output_width"])
 def _expand_c4_block_table_kernel(
     source,
     output,
@@ -659,7 +659,7 @@ def expand_c4_block_table(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows", "width"])
 def _gather_c4_block_table_rows_kernel(
     source,
     request_ids,
@@ -707,7 +707,7 @@ def gather_c4_block_table_rows(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows", "source_width", "output_width"])
 def _prepare_c4_decode_metadata_kernel(
     source,
     request_ids,
@@ -822,7 +822,7 @@ def prepare_c4_decode_metadata(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows"])
 def _pool_seq_lens_kernel(
     positions,
     output,
