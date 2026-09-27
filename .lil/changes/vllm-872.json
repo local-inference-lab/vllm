@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-872",
+  "category": "performance",
+  "summary": "Fuse the b12x PCIe all-reduce with the residual RMSNorm for MiMo V2 and DFlash",
+  "models": [
+    "XiaomiMiMo/MiMo-V2.6-Flash-RL",
+    "XiaomiMiMo/MiMo-V2.6-Pro-RL"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "Fused all-reduce + RMSNorm plans are keyed by the norm weight's storage, so the compiled graph's parameter aliases find them.",
+    "MiMo V2 and the DFlash drafter declare their fused sites; other models are unchanged."
+  ],
+  "pull_requests": [
+    872
+  ]
+}

@@ -754,7 +754,15 @@ class B12xPcieAllReduce:
 
     @staticmethod
     def _plan_key(operation, shape, dtype, strides, weight=None, epsilon=None):
-        norm = None if operation == "all_reduce" else (id(weight), epsilon)
+        # Key the fused RMSNorm weight by storage, not Python identity: a
+        # compiled graph passes an alias of the declared Parameter (e.g.
+        # ``weight.data``), so ``id()`` never matches and every fused call
+        # would fall back to all-reduce + copy + norm.
+        norm = (
+            None
+            if operation == "all_reduce"
+            else (weight.data_ptr() if weight is not None else None, epsilon)
+        )
         return operation, tuple(shape), dtype, tuple(strides), norm
 
     def _index_declared_plans(self) -> None:
