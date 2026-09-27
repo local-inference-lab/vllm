@@ -1,7 +1,7 @@
 {
   "schema": "local-inference-release-change/v1",
   "id": "vllm-ds41-bf16-attention-fp32-heads",
-  "category": "change",
+  "category": "fix",
   "summary": "DeepSeek-V4.1 computes attention in BF16 and logits in FP32 like the reference",
   "models": [
     "DeepSeek-V4.1-Flash"
