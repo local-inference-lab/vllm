@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-923",
+  "category": "fix",
+  "summary": "Stop Qwen3.8-Flash-Next MTP responses from switching to a repeated token under async scheduling",
+  "models": ["Qwen3.8-Flash-Next", "GLM-5.3-Flash"],
+  "compatibility": "No user action required.",
+  "details": [
+    "With MTP and async scheduling, the next step could rewrite a step's prefill flags before their non-blocking host-to-device copy ran; QSA then read the wrong flags and the response continued as one token repeated. Both prefill-flag buffers are pageable, so each copy is staged through fresh pinned memory.",
+    "GLM-5.3-Flash's pooled-selector prefill flags had the same pattern and use the same change; no GLM-5.3-Flash failure had been reproduced."
+  ],
+  "pull_requests": [923],
+  "requires": []
+}
