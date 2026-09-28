@@ -126,7 +126,8 @@ def test_extract_tool_calls_with_glm45_newline_format():
     extracted = parser.extract_tool_calls(model_output, request=_request(tools))
 
     assert extracted.tools_called
-    assert extracted.content == "I'll check it."
+    # Content is returned exactly as generated; templates normalize it.
+    assert extracted.content == "I'll check it. "
     assert len(extracted.tool_calls) == 1
     tool_call = extracted.tool_calls[0]
     assert tool_call.function.name == "get_current_weather"
