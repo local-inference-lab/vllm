@@ -199,6 +199,16 @@ async def run_server_worker(
         await shutdown_task
     finally:
         sock.close()
+    exit_if_engine_failed(engine_client)
+
+
+def exit_if_engine_failed(engine_client) -> None:
+    """Exit with a failure status when the server stopped because its engine
+    died, so a supervisor or restart policy sees a crash, not a clean stop."""
+    resources = getattr(getattr(engine_client, "engine_core", None), "resources", None)
+    if getattr(resources, "engine_failed", False):
+        logger.error("API server stopped because its engine failed; exiting with 1")
+        raise SystemExit(1)
 
 
 def main():
