@@ -11,6 +11,7 @@ prefilling it again.
 """
 
 import json
+import random
 
 import pytest
 
@@ -203,6 +204,27 @@ def test_whitespace_after_tool_calls_is_not_content(
         )
     assert content is None
     assert [name for name, _ in calls] == ["read", "bash"]
+
+
+def _random_turn(rng: random.Random) -> str:
+    """A GLM turn whose every character the message format can represent."""
+    pieces = ["Plan", " it", ".", "\n", "\n\n", " ", "```python\nx = 1\n```", "`y`"]
+
+    def text() -> str:
+        return "".join(rng.choice(pieces) for _ in range(rng.randint(0, 6)))
+
+    turn = (text() + "</think>" if rng.random() < 0.9 else "</think>") + text()
+    return turn + "".join(rng.choice([READ, BASH]) for _ in range(rng.randint(0, 2)))
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_random_turns_round_trip(glm_parser_cls, glm_tokenizer, seed):
+    rng = random.Random(seed)
+    raw = _random_turn(rng)
+    parsed = _parse(glm_parser_cls, glm_tokenizer, raw)
+    assert _render_turn(*parsed) == raw
+    streamed = _stream(glm_parser_cls, glm_tokenizer, raw, rng.randint(1, 5))
+    assert _render_turn(*streamed) == raw
 
 
 def test_other_parsers_still_drop_whitespace_only_content():
