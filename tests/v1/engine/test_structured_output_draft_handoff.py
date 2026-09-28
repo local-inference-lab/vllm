@@ -328,9 +328,8 @@ def test_skipped_step_keeps_draft_rows_constrained(opt_model_path, consumed_hand
 
 
 def test_deferred_step_without_inflight_batch_samples_immediately():
-    """A deferred step may have no earlier batch to wait for: a request that
-    skipped a step has its output processed already, and only its drafts still
-    need the back-fill."""
+    """A deferred step must not depend on an earlier batch being in flight:
+    with nothing queued, its drafts are handed back and it is sampled at once."""
     done: Future = Future()
     done.set_result(None)
     scheduler_output = SchedulerOutput.make_empty()
