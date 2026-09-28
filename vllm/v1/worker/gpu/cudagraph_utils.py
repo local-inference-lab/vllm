@@ -3,8 +3,9 @@
 import gc
 import itertools
 import os
+from bisect import bisect_left
 from collections import defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from itertools import groupby, product
@@ -351,11 +352,11 @@ class CudaGraphManager:
 
         self._graphs_captured = False
 
-        # Profiling hooks, set only by profile_cudagraph_memory() below: cap
-        # FULL-mode capture at the N largest descriptors and record each
-        # captured FULL graph's memory delta for extrapolation.
-        self._max_full_descs_to_capture: int | None = None
-        self._capture_mem_samples: list[int] | None = None
+        # Profiling hooks, set only by profile_cudagraph_memory() below:
+        # capture a sample of the FULL descriptors and record each captured
+        # FULL graph's memory for extrapolation.
+        self._sample_full_descs = False
+        self._capture_mem_samples: list[_FullGraphMemorySample] | None = None
 
         self._candidates: dict[tuple[int, int], list[BatchExecutionDescriptor]] = {}
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
@@ -700,14 +701,10 @@ class CudaGraphManager:
                     continue
 
                 descs = self._capture_descs[mode]
-                if (
-                    mode == CUDAGraphMode.FULL
-                    and self._max_full_descs_to_capture is not None
-                ):
-                    # Profiling only: capture a sample of the largest FULL
-                    # graphs; the total cost is extrapolated from their
-                    # per-graph memory deltas.
-                    descs = descs[: self._max_full_descs_to_capture]
+                if mode == CUDAGraphMode.FULL and self._sample_full_descs:
+                    # Profiling only: the total FULL cost is extrapolated from
+                    # the memory of a few sampled graphs.
+                    descs = _profiling_full_descs(descs)
                 if is_global_first_rank():
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
                 for desc in descs:
@@ -757,9 +754,9 @@ class CudaGraphManager:
                             set_graph_pool_id(self.pool)
                         else:
                             set_graph_pool_id(current_platform.graph_pool_handle())
-                        if self._capture_mem_samples is not None:
-                            torch.accelerator.synchronize()
-                            free_before = torch.accelerator.get_memory_info()[0]
+                        mem_samples = self._capture_mem_samples
+                        if mem_samples is not None:
+                            memory_before = _flushed_device_memory()
                         with (
                             collect_cuda_graph_capture_resources() as resources,
                             torch.cuda.graph(
@@ -770,10 +767,10 @@ class CudaGraphManager:
                             # Join the offloader copy stream because the last layer
                             # can leave a prefetch pending at capture end.
                             get_offloader().join_after_forward()
-                        if self._capture_mem_samples is not None:
-                            torch.accelerator.synchronize()
-                            free_after = torch.accelerator.get_memory_info()[0]
-                            self._capture_mem_samples.append(free_before - free_after)
+                        if mem_samples is not None:
+                            mem_samples.append(
+                                _measure_full_graph_memory(desc, memory_before)
+                            )
                         self.graphs[desc] = graph
                         self.graph_capture_resources[desc] = resources
                         compilation_counter.num_cudagraph_captured += 1
@@ -1145,11 +1142,75 @@ def prepare_inputs_to_capture(
 # CUDA graph memory profiling
 # ---------------------------------------------------------------------------
 
-# Number of FULL graphs captured during profiling; the total FULL capture
-# cost is extrapolated from this sample to avoid a second full capture.
-_FULL_GRAPH_PROFILING_SAMPLES = 2
+# Number of FULL graphs captured during profiling: the two largest and the
+# smallest. The total FULL capture cost is extrapolated from this sample to
+# avoid a second full capture.
+_FULL_GRAPH_PROFILING_SAMPLES = 3
 # Floor for the extrapolated per-graph cost (driver overhead per graph).
 _MIN_PER_GRAPH_BYTES = 1 << 20
+
+
+class _DeviceMemory(NamedTuple):
+    free: int
+    allocated: int
+    reserved: int
+
+
+class _FullGraphMemorySample(NamedTuple):
+    """Device memory measured around the capture of one FULL graph."""
+
+    desc: BatchExecutionDescriptor
+    # Memory the capture added: new graph pool segments and memory outside
+    # the Torch allocator, such as the instantiated graph.
+    growth: int
+    # Memory the graph keeps while it lives: the tensors it retains, even in
+    # pool blocks freed by earlier captures, and memory outside the Torch
+    # allocator. Pool growth for activations is left out because graphs
+    # captured later reuse it.
+    cost: int
+
+
+def _flushed_device_memory() -> _DeviceMemory:
+    """Read device memory around a sampled capture with the cache empty.
+
+    ``torch.cuda.graph`` empties the allocator cache on entry, so blocks
+    cached by the eager warmup would otherwise be released inside the sample
+    and cancel out the graph's own memory. Flushing after the capture too
+    keeps transient cached blocks out of the sample.
+    """
+    torch.accelerator.synchronize()
+    torch.accelerator.empty_cache()
+    return _DeviceMemory(
+        free=torch.accelerator.get_memory_info()[0],
+        allocated=torch.accelerator.memory_allocated(),
+        reserved=torch.accelerator.memory_reserved(),
+    )
+
+
+def _measure_full_graph_memory(
+    desc: BatchExecutionDescriptor, before: _DeviceMemory
+) -> _FullGraphMemorySample:
+    after = _flushed_device_memory()
+    growth = before.free - after.free
+    outside_allocator = growth - (after.reserved - before.reserved)
+    retained = after.allocated - before.allocated
+    return _FullGraphMemorySample(
+        desc, growth, max(outside_allocator, 0) + max(retained, 0)
+    )
+
+
+def _profiling_full_descs(
+    descs: Sequence[BatchExecutionDescriptor],
+) -> list[BatchExecutionDescriptor]:
+    """Select the FULL graphs captured while profiling, largest first.
+
+    The first sample also covers activations that smaller graphs reuse from
+    the pool. The next largest and the smallest graph then bound the
+    per-graph cost at both ends of the token range.
+    """
+    if len(descs) <= _FULL_GRAPH_PROFILING_SAMPLES:
+        return list(descs)
+    return [*descs[: _FULL_GRAPH_PROFILING_SAMPLES - 1], descs[-1]]
 
 
 def _profiling_cudagraph_managers(runner: "GPUModelRunner") -> list[CudaGraphManager]:
@@ -1178,13 +1239,13 @@ def profile_cudagraph_memory(
     graph capture. Bootstraps a minimal KV cache, runs ``capture_model()``
     once, then releases everything so the real init/capture path starts clean.
 
-    FULL graphs bake in KV cache pointers, so only the largest few are
-    captured (into a throwaway pool) and their total cost is extrapolated.
-    PIECEWISE, encoder and speculator graphs are measured in full. All
-    profiling captures are discarded afterwards: replaying graphs recorded
-    against the throwaway profiling state is unsafe (e.g. inductor graph
-    partition reclaims the storages of earlier cudagraph recordings once the
-    real capture records new ones, leading to use-after-free crashes).
+    FULL graphs bake in KV cache pointers, so only the two largest and the
+    smallest are captured (into a throwaway pool) and their total cost is
+    extrapolated. PIECEWISE, encoder and speculator graphs are measured in
+    full. All profiling captures are discarded afterwards: replaying graphs
+    recorded against the throwaway profiling state is unsafe (e.g. inductor
+    graph partition reclaims the storages of earlier cudagraph recordings once
+    the real capture records new ones, leading to use-after-free crashes).
     """
     runner.cudagraph_native_memory_profile = None
     if runner.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
@@ -1251,12 +1312,8 @@ def profile_cudagraph_memory(
                     for name, value in vars(speculator).items()
                     if isinstance(value, CudaGraphManager)
                 ]
-            manager._max_full_descs_to_capture = (
-                None
-                if _DEBUG_GRAPH_MEMORY_ACCOUNTING
-                else _FULL_GRAPH_PROFILING_SAMPLES
-            )
-            mem_samples: list[int] = []
+            manager._sample_full_descs = not _DEBUG_GRAPH_MEMORY_ACCOUNTING
+            mem_samples: list[_FullGraphMemorySample] = []
             manager._capture_mem_samples = mem_samples
 
             native_before_capture = _non_torch_memory_bytes()
@@ -1274,8 +1331,14 @@ def profile_cudagraph_memory(
             # they share the global pool at runtime, so the overlap is not
             # double-counted.
             full_descs = manager._capture_descs.get(CUDAGraphMode.FULL, [])
+            sampled_growth = sum(sample.growth for sample in mem_samples)
             full_estimate = _extrapolate_full_graph_memory(mem_samples, full_descs)
-            return max(measured - sum(mem_samples) + full_estimate, 0)
+            estimate = max(measured - sampled_growth + full_estimate, 0)
+            if mem_samples:
+                _log_full_graph_estimate(
+                    measured, mem_samples, full_descs, full_estimate, estimate
+                )
+            return estimate
         finally:
             compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
             compilation_counter.num_gpu_runner_capture_triggers = saved_capture_triggers
@@ -1324,29 +1387,77 @@ def _non_torch_memory_bytes() -> int:
 
 
 def _extrapolate_full_graph_memory(
-    mem_samples: list[int],
-    graph_descs: list[BatchExecutionDescriptor],
+    mem_samples: Sequence[_FullGraphMemorySample],
+    graph_descs: Sequence[BatchExecutionDescriptor],
 ) -> int:
-    """Project unsampled FULL graph costs from their descriptor token counts."""
-    if not mem_samples or not graph_descs:
-        return 0
-    assert len(mem_samples) <= len(graph_descs)
+    """Estimate the memory of all FULL graphs from the sampled captures.
 
-    estimate = mem_samples[0] + sum(
-        max(sample, _MIN_PER_GRAPH_BYTES) for sample in mem_samples[1:]
-    )
-    if len(mem_samples) == len(graph_descs) or len(mem_samples) < 2:
+    Sampled graphs count their measured growth. Each unsampled graph costs
+    what the sampled graphs keep, interpolated linearly in its token count,
+    which covers both memory that scales with the batch and a fixed cost per
+    graph, such as the instantiated graph and the capture resources it
+    retains. The first (largest) sample only bounds the pool activations
+    that smaller graphs reuse, so it is not a per-graph reference.
+    """
+    estimate = sum(sample.growth for sample in mem_samples)
+    sampled = {id(sample.desc) for sample in mem_samples}
+    unsampled = [desc for desc in graph_descs if id(desc) not in sampled]
+    if not unsampled:
         return estimate
 
-    reference_desc = graph_descs[len(mem_samples) - 1]
-    reference_cost = max(mem_samples[-1], _MIN_PER_GRAPH_BYTES)
-    reference_tokens = reference_desc.num_tokens
-    for desc in graph_descs[len(mem_samples) :]:
-        scaled_cost = (
-            reference_cost * desc.num_tokens + reference_tokens - 1
-        ) // reference_tokens
-        estimate += max(scaled_cost, _MIN_PER_GRAPH_BYTES)
+    reference: dict[int, int] = {}
+    for sample in mem_samples[1:]:
+        num_tokens = sample.desc.num_tokens
+        reference[num_tokens] = max(sample.cost, reference.get(num_tokens, 0))
+    points = sorted(reference.items())
+    for desc in unsampled:
+        cost = _interpolate_graph_cost(points, desc.num_tokens)
+        estimate += max(cost, _MIN_PER_GRAPH_BYTES)
     return estimate
+
+
+def _interpolate_graph_cost(points: list[tuple[int, int]], num_tokens: int) -> int:
+    """Interpolate sorted ``(num_tokens, cost)`` points, clamped at both ends."""
+    if not points:
+        return 0
+    index = bisect_left(points, num_tokens, key=lambda point: point[0])
+    if index == len(points):
+        return points[-1][1]
+    high_tokens, high_cost = points[index]
+    if index == 0 or high_tokens == num_tokens:
+        return high_cost
+    low_tokens, low_cost = points[index - 1]
+    weighted = low_cost * (high_tokens - num_tokens) + high_cost * (
+        num_tokens - low_tokens
+    )
+    return -(-weighted // (high_tokens - low_tokens))
+
+
+def _log_full_graph_estimate(
+    measured: int,
+    mem_samples: Sequence[_FullGraphMemorySample],
+    graph_descs: Sequence[BatchExecutionDescriptor],
+    full_estimate: int,
+    estimate: int,
+) -> None:
+    mib = 1 << 20
+    sampled_growth = sum(sample.growth for sample in mem_samples)
+    logger.info(
+        "CUDA graph memory profile: capture took %.2f GiB with %d of %d FULL "
+        "graphs (tokens: grown/kept MiB %s); the other %d FULL graphs add "
+        "%.2f GiB; estimate %.2f GiB.",
+        measured / (1 << 30),
+        len(mem_samples),
+        len(graph_descs),
+        ", ".join(
+            f"{sample.desc.num_tokens}: {sample.growth / mib:+.1f}/"
+            f"{sample.cost / mib:.1f}"
+            for sample in mem_samples
+        ),
+        len(graph_descs) - len(mem_samples),
+        (full_estimate - sampled_growth) / (1 << 30),
+        estimate / (1 << 30),
+    )
 
 
 def _init_minimal_kv_cache_for_profiling(
