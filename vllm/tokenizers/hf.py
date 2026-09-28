@@ -126,10 +126,13 @@ def get_cached_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
     # Some tokenizers (e.g., QwenTokenizer) have special tokens that
     # are added and included in the implementation of the vocab_size
     # property, but not in get_vocab(); if there is an implementation
-    # of vocab size, we should take the greater value.
+    # of vocab size, we should take the greater value. vocab_size counts
+    # tokens, so its highest id is vocab_size - 1: taking vocab_size itself
+    # admitted one id past the vocabulary when a backend (e.g. fastokens)
+    # counts the added tokens in vocab_size.
     if hasattr(tokenizer, "vocab_size"):
         with contextlib.suppress(NotImplementedError):
-            max_token_id = max(max_token_id, tokenizer.vocab_size)
+            max_token_id = max(max_token_id, tokenizer.vocab_size - 1)
 
     class CachedTokenizer(tokenizer.__class__):  # type: ignore
         @property
