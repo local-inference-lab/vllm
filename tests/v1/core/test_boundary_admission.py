@@ -777,6 +777,103 @@ def start_decode(scheduler, name="running"):
     return running
 
 
+@pytest.mark.parametrize("policy", ["fcfs", "priority"])
+@pytest.mark.parametrize("state", ["copying", "ready"])
+def test_blocked_queue_head_admits_only_restored_imports_past_it(policy, state):
+    """Ordinary requests keep their queue order while imports are pending."""
+    from tests.v1.core.utils import create_requests
+
+    scheduler, cache, connector = import_scheduler(
+        num_blocks=64, scheduling_policy=policy
+    )
+    importer = request("import", "import", length=48)
+    checkpoint = reserve_import(cache, importer, prefix=32)
+    assert checkpoint is not None
+    if state == "ready":
+        publish(cache, checkpoint)
+    (big,) = create_requests(num_requests=1, num_tokens=2000, req_ids=["big"])
+    small = request("small", "small", length=16)
+    connector.poll_boundary_checkpoint.side_effect = lambda req: (
+        req is not importer or state == "ready"
+    )
+    scheduler.connector = connector
+    for req in (big, small, importer):
+        scheduler.add_request(req)
+    expected = {"import": 16} if state == "ready" else {}
+    assert scheduler.schedule().num_scheduled_tokens == expected
+    assert small.status == big.status == RequestStatus.WAITING
+
+
+@pytest.mark.parametrize("policy", ["fcfs", "priority"])
+def test_pending_import_step_cost_does_not_scale_with_blocked_queue(policy):
+    """A copying import leaves a blocked 500-request queue at one lookup a step."""
+    import time
+
+    from tests.v1.core.utils import create_requests
+
+    def blocked(with_import):
+        scheduler, cache, connector = import_scheduler(
+            num_blocks=256, scheduling_policy=policy
+        )
+        queued = create_requests(num_requests=500, num_tokens=2048)
+        importer = request("import", "import", length=64)
+        if with_import:
+            assert reserve_import(cache, importer, prefix=32) is not None
+        cache.block_pool.get_new_blocks(cache.block_pool.get_num_free_blocks())
+        connector.poll_boundary_checkpoint.side_effect = lambda req: (
+            req is not importer
+        )
+        scheduler.connector = connector
+        for req in (*queued, importer):
+            scheduler.add_request(req)
+        assert scheduler.schedule().num_scheduled_tokens == {}
+        connector.poll_boundary_checkpoint.reset_mock()
+        steps = 20
+        start = time.perf_counter()
+        for _ in range(steps):
+            assert scheduler.schedule().num_scheduled_tokens == {}
+        elapsed = (time.perf_counter() - start) / steps
+        return elapsed, connector.poll_boundary_checkpoint.call_count / steps
+
+    baseline, baseline_polls = blocked(with_import=False)
+    elapsed, polls = blocked(with_import=True)
+    assert polls == baseline_polls == 1
+    assert elapsed < 10 * baseline + 1e-3
+
+
+@pytest.mark.parametrize("state", ["copying", "ready", "ready_but_skipped"])
+def test_ready_import_behind_older_request_keeps_running_decode(state):
+    """Running decodes skip a step only for a saved-logits step actually taken."""
+    scheduler, cache, connector = import_scheduler()
+    running = start_decode(scheduler)
+    importer = request("import", "import", length=32)
+    checkpoint = reserve_import(cache, importer, prefix=32)
+    assert checkpoint is not None
+    if state != "copying":
+        publish(cache, checkpoint)
+    older = request("older", "older", length=16)
+    connector.poll_boundary_checkpoint.side_effect = lambda req: (
+        req is not importer or state == "ready"
+    )
+    connector.boundary_checkpoint_external_tokens.side_effect = lambda req: (
+        32 if req is importer else 0
+    )
+    scheduler.connector = connector
+    scheduler.add_request(older)
+    scheduler.add_request(importer)
+    output = scheduler.schedule()
+    if state == "ready":
+        assert output.boundary_logits_only
+        assert output.num_scheduled_tokens == {"import": 1}
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens["running"] == 1
+        assert output.num_scheduled_tokens["older"] == 16
+    else:
+        assert not output.boundary_logits_only
+        assert output.num_scheduled_tokens == {"running": 1, "older": 16}
+    assert running.num_preemptions == 0
+
+
 def test_unadmitted_import_credits_do_not_preempt_running_decode():
     """Reservations gate new admissions, never the growth of running requests."""
     scheduler, cache, connector = import_scheduler()

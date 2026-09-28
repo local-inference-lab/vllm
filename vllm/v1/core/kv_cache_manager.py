@@ -1285,6 +1285,14 @@ class KVCacheManager:
         """Whether a restore outwaited its capacity bound, so the prompt recomputes."""
         return request_id in self._boundary_import_expired
 
+    def ready_external_boundary_requests(self) -> list[Request]:
+        """Waiting consumers whose imports finished copying, in reservation order."""
+        return [
+            admission.request
+            for admission in self._boundary_import_admissions.values()
+            if admission.ready and not admission.admitted
+        ]
+
     def release_external_boundary_admission(self, request_id: str) -> None:
         """Release an import's credits and slot, or end its capacity wait.
 
