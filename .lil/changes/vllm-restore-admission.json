@@ -18,6 +18,10 @@
   ],
   "requires": [],
   "pull_requests": [
-    922
+    929
+  ],
+  "authors": [
+    "ktsaou",
+    "Local Inference Lab"
   ]
 }
