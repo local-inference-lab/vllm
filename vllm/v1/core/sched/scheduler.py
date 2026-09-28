@@ -3747,6 +3747,12 @@ class Scheduler(SchedulerInterface):
             while self.running:
                 request = self.running.pop()
                 self._preempt_request(request, timestamp, drop_stale_output=True)
+            # Restores that finished copying but were never admitted hold their
+            # pages the same way; their requests fall back to ordinary lookup.
+            for request in self.kv_cache_manager.ready_external_boundary_requests():
+                self.kv_cache_manager.release_external_boundary_admission(
+                    request.request_id
+                )
 
             # Clear scheduled request ids cache. Since we are forcing preemption
             # + resumption in the same step, we must act as if these requests were

@@ -952,6 +952,25 @@ def test_restore_past_its_bounded_wait_is_admitted_to_recompute(monkeypatch):
     assert not cache.external_boundary_wait_expired(waiter.request_id)
 
 
+def test_reset_with_running_requests_releases_ready_unadmitted_import():
+    """A cache reset drops a finished restore; its request then recomputes."""
+    scheduler, cache, connector = import_scheduler()
+    running = start_decode(scheduler)
+    importer = request("import", "import", length=32)
+    checkpoint = reserve_import(cache, importer, prefix=16)
+    assert checkpoint is not None
+    publish(cache, checkpoint)
+    scheduler.connector = connector
+    scheduler.add_request(importer)
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    assert running.status == RequestStatus.PREEMPTED
+    assert importer.boundary_checkpoint is None
+    assert not cache.has_external_boundary_admission(importer.request_id)
+    assert cache.block_pool.get_num_free_blocks() == cache.block_pool.num_gpu_blocks - 1
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens["import"] == 32
+
+
 @pytest.mark.parametrize("release", ["move_victim", "finish_reader"])
 @pytest.mark.parametrize("fairness", [None, 0.4])
 def test_actual_scheduler_runs_decode_after_guard_defers_restore(fairness, release):
