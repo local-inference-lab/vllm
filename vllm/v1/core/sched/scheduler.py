@@ -86,6 +86,7 @@ from vllm.v1.spec_decode.dynamic.acceptance_length import (
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.structured_output.utils import strip_speculative_padding
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
@@ -2816,6 +2817,9 @@ class Scheduler(SchedulerInterface):
         if not structured_output_request_ids:
             return None
 
+        self._reject_unconstrained_drafts(
+            scheduler_output, structured_output_request_ids
+        )
         bitmask = self.structured_output_manager.grammar_bitmask(
             self.requests,
             structured_output_request_ids,
@@ -2826,6 +2830,41 @@ class Scheduler(SchedulerInterface):
             bitmask,
             scheduler_output.num_invalid_spec_tokens,
         )
+
+    def _reject_unconstrained_drafts(
+        self,
+        scheduler_output: SchedulerOutput,
+        structured_output_request_ids: list[str],
+    ) -> None:
+        """Invalidate the drafts whose grammar bitmask rows are unconstrained.
+
+        The grammar bitmask follows this scheduler's copy of the drafts, but the
+        V2 model runner verifies the drafts it holds itself. Rows after a -1
+        placeholder that was never back-filled allow every token, so the
+        runner must reject those drafts instead of accepting tokens the
+        grammar never allowed. Back-filled drafts that the grammar rejected
+        already carry the same count.
+        """
+        if not self.use_v2_model_runner or self.num_sampled_tokens_per_step == 0:
+            return
+        spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+        if not spec_decode_tokens:
+            return
+        num_invalid_spec_tokens = scheduler_output.num_invalid_spec_tokens or {}
+        for req_id in structured_output_request_ids:
+            drafts = spec_decode_tokens.get(req_id)
+            if not drafts:
+                continue
+            num_unconstrained = len(drafts) - len(strip_speculative_padding(drafts))
+            if num_unconstrained > num_invalid_spec_tokens.get(req_id, 0):
+                num_invalid_spec_tokens[req_id] = num_unconstrained
+                logger.warning_once(
+                    "Structured-output drafts were not handed back to the "
+                    "scheduler; rejecting them so every sampled token stays "
+                    "grammar-constrained."
+                )
+        if num_invalid_spec_tokens:
+            scheduler_output.num_invalid_spec_tokens = num_invalid_spec_tokens
 
     def update_from_output(
         self,

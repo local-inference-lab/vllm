@@ -778,6 +778,13 @@ class EngineCore:
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
                     return None, model_executed
+            elif not batch_queue:
+                # Only this step's drafts are outstanding (no prior output is in
+                # flight), so hand them back and sample now.
+                self._sample_deferred_batch(
+                    deferred_scheduler_output, exec_future, deferred_execution_timing
+                )
+                return None, model_executed
 
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should
@@ -821,33 +828,38 @@ class EngineCore:
         # in a field and do it immediately once step_with_batch_queue is
         # re-called. The latter slightly favors TTFT over TPOT/throughput.
         if deferred_scheduler_output:
-            # When draft tokens are used with structured output, validate them
-            # before computing the grammar bitmask for the deferred request.
-            if self.check_for_draft_tokens:
-                draft_token_ids = self.model_executor.take_draft_token_ids()
-                if draft_token_ids is not None:
-                    # Update the draft token ids in the scheduler output to
-                    # filter out the invalid spec tokens, which will be padded
-                    # with -1 and skipped by the grammar bitmask computation.
-                    self.scheduler.update_draft_token_ids_in_output(
-                        draft_token_ids, deferred_scheduler_output
-                    )
-            # We now have the tokens needed to compute the bitmask for the
-            # deferred request. Get the bitmask and call sample tokens.
-            grammar_output = self.scheduler.get_grammar_bitmask(
-                deferred_scheduler_output
-            )
-            future = self.model_executor.sample_tokens(grammar_output, non_block=True)
-            batch_queue.appendleft(
-                (
-                    future,
-                    deferred_scheduler_output,
-                    exec_future,
-                    deferred_execution_timing,
-                )
+            self._sample_deferred_batch(
+                deferred_scheduler_output, exec_future, deferred_execution_timing
             )
 
         return engine_core_outputs, model_executed
+
+    def _sample_deferred_batch(
+        self,
+        scheduler_output: SchedulerOutput,
+        exec_future: Future[Any],
+        execution_timing: float | None,
+    ) -> None:
+        """Back-fill the step's drafts, build its bitmask and queue sampling."""
+        assert self.batch_queue is not None
+        # When draft tokens are used with structured output, validate them
+        # before computing the grammar bitmask for the deferred request.
+        if self.check_for_draft_tokens:
+            draft_token_ids = self.model_executor.take_draft_token_ids()
+            if draft_token_ids is not None:
+                # Update the draft token ids in the scheduler output to
+                # filter out the invalid spec tokens, which will be padded
+                # with -1 and skipped by the grammar bitmask computation.
+                self.scheduler.update_draft_token_ids_in_output(
+                    draft_token_ids, scheduler_output
+                )
+        # We now have the tokens needed to compute the bitmask for the
+        # deferred request. Get the bitmask and call sample tokens.
+        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        future = self.model_executor.sample_tokens(grammar_output, non_block=True)
+        self.batch_queue.appendleft(
+            (future, scheduler_output, exec_future, execution_timing)
+        )
 
     def _process_aborts_queue(self):
         if not self.aborts_queue.empty():
