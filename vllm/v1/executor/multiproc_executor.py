@@ -80,8 +80,9 @@ from vllm.v1.worker.worker_base import WorkerWrapperBase
 logger = init_logger(__name__)
 
 
-# How often a gather of every rank's reply checks the pending ranks.
-RESPONSE_POLL_SECONDS = 0.001
+# How long a gather parks on one queue's notification before checking every
+# other queue it waits on again.
+RESPONSE_WAIT_SLICE_MS = 50
 
 
 def _check_response(rank: int, status: Any, result: Any) -> Any:
@@ -98,6 +99,7 @@ def _gather_responses(
     ranks: Sequence[int],
     deadline: float | None,
     method: str,
+    watched: Sequence[tuple[int, MessageQueue]] = (),
 ) -> list[Any]:
     """Collect one reply per queue, failing as soon as any rank reports one.
 
@@ -105,9 +107,16 @@ def _gather_responses(
     while an earlier rank waited forever, for example in a collective the
     failed rank would never join: TP1's CUDA graph capture fails, TP0 hangs
     in the next all-reduce, and the engine waits on TP0 with TP1's error in
-    its queue. Every pending queue is checked without consuming anything, each
-    reply is read as it arrives, and the gather sleeps 1 ms between rounds in
-    which nothing arrived.
+    its queue. ``watched`` are the other ranks of a single-rank RPC such as
+    ``execute_model``: they reply only when they fail, and the output rank is
+    then blocked in a collective the failed rank has left, so a message from
+    one of them ends the wait with its error.
+
+    Every queue is checked without consuming anything, and a reply is read
+    only once it has arrived, then with the RPC's own deadline. Between checks
+    the gather waits on the oldest pending queue the way a blocking read does:
+    spinning while replies are frequent, otherwise parked on its notification
+    for at most RESPONSE_WAIT_SLICE_MS.
     """
 
     def remaining() -> float | None:
@@ -118,7 +127,7 @@ def _gather_responses(
             raise TimeoutError(f"RPC call to {method} timed out.")
         return left
 
-    if len(response_mqs) == 1:
+    if len(response_mqs) == 1 and not watched:
         try:
             status, result = response_mqs[0].dequeue(timeout=remaining())
         except TimeoutError as e:
@@ -127,8 +136,8 @@ def _gather_responses(
 
     responses: list[Any] = [None] * len(response_mqs)
     pending = list(range(len(response_mqs)))
-    # A blocking read logs the long-wait message every interval; the polling
-    # here would not, and operators watch for it, so log it the same way.
+    # A blocking read logs the long-wait message every interval; the waits
+    # here are sliced, so log it the same way, since operators watch for it.
     started, warnings = time.monotonic(), 0
     interval = envs.VLLM_RINGBUFFER_WARNING_INTERVAL
     while pending:
@@ -145,12 +154,29 @@ def _gather_responses(
             responses[index] = _check_response(ranks[index], status, result)
             pending.remove(index)
             progressed = True
+        for rank, mq in watched:
+            if not mq.ready():
+                continue
+            try:
+                status, result = mq.dequeue(timeout=remaining())
+            except TimeoutError as e:
+                raise TimeoutError(f"RPC call to {method} timed out.") from e
+            _check_response(rank, status, result)
+            logger.warning(
+                "Dropped a reply from rank %d to %s, which only rank %d answers.",
+                rank,
+                method,
+                ranks[0],
+            )
         if pending and not progressed:
-            remaining()  # raises once the deadline has passed
+            left = remaining()  # raises once the deadline has passed
             if time.monotonic() - started >= interval * (warnings + 1):
                 warnings += 1
                 logger.info(LONG_WAIT_TIME_LOG_MSG, interval)
-            time.sleep(RESPONSE_POLL_SECONDS)
+            wait_ms = RESPONSE_WAIT_SLICE_MS
+            if left is not None:
+                wait_ms = max(1, min(wait_ms, int(left * 1000)))
+            response_mqs[pending[0]].wait_for_message(wait_ms)
     return responses
 
 
@@ -512,12 +538,22 @@ class MultiprocExecutor(Executor):
 
         response_mqs: Sequence[MessageQueue] = self.response_mqs
         ranks: Sequence[int] = range(len(response_mqs))
+        watched: Sequence[tuple[int, MessageQueue]] = ()
         if output_rank is not None:
+            # The other ranks reply only if they fail; watch them so a failure
+            # does not wait out the RPC timeout behind the output rank.
+            watched = [
+                (rank, mq)
+                for rank, mq in enumerate(response_mqs)
+                if rank != output_rank
+            ]
             response_mqs = (response_mqs[output_rank],)
             ranks = (output_rank,)
 
         def get_response():
-            responses = _gather_responses(response_mqs, ranks, deadline, str(method))
+            responses = _gather_responses(
+                response_mqs, ranks, deadline, str(method), watched
+            )
             return responses[0] if output_rank is not None else responses
 
         future = FutureWrapper(
@@ -1135,9 +1171,11 @@ class WorkerProc:
                 e.add_note(traceback.format_exc())
             logger.exception("WorkerProc hit an exception.")
             # enqueue_output converts the exception to a FAILURE response
-            # containing its string representation before transport.
-            if output_rank is None or self.rank == output_rank:
-                self.handle_output(e)
+            # containing its string representation before transport. A rank
+            # that does not own the reply sends it too: its peers may be
+            # blocked in a collective it has left, so the output rank would
+            # never answer, and the executor watches every rank for this.
+            self.handle_output(e)
 
     @staticmethod
     def setup_proc_title_and_log_prefix(enable_ep: bool) -> None:

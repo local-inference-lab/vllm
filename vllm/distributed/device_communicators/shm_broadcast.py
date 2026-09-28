@@ -909,6 +909,22 @@ class MessageQueue:
             return bool(self.remote_socket.poll(timeout=0))
         raise RuntimeError("Only readers can check for messages")
 
+    def wait_for_message(self, timeout_ms: int) -> None:
+        """Wait at most ``timeout_ms`` for a message, without consuming one.
+
+        Waits the way a blocking read does, spinning while reads are frequent
+        and parking on the writer's notification otherwise, and may return
+        early, so callers check ``ready()`` again afterwards.
+        """
+        if self._is_local_reader:
+            self._spin_condition.wait(timeout_ms=timeout_ms)
+        elif self._is_remote_reader:
+            self.remote_socket.poll(timeout=timeout_ms)
+        else:
+            raise RuntimeError("Only readers can wait for messages")
+        if self.shutting_down:
+            raise RuntimeError("cancelled")
+
     def dequeue(
         self,
         timeout: float | None = None,

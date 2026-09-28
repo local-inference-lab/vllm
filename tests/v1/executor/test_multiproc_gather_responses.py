@@ -3,7 +3,8 @@
 """The executor's gather of every rank's reply does not wait in rank order.
 
 A rank that never replies (for example, stuck in a collective another rank
-failed out of) must not hide a failure another rank has already reported.
+failed out of) must not hide a failure another rank has already reported,
+including a rank that does not own the reply of a single-rank RPC.
 """
 
 import threading
@@ -38,6 +39,9 @@ class _Queue:
         assert self.reply is not None and self.checks > self.ready_after
         reply, self.reply = self.reply, None
         return reply
+
+    def wait_for_message(self, timeout_ms: int) -> None:
+        self.waits = getattr(self, "waits", 0) + 1
 
 
 def test_a_later_rank_failure_surfaces_while_rank_zero_hangs():
@@ -95,6 +99,131 @@ def test_a_reply_larger_than_a_ring_chunk_is_not_lost():
         for writer, reader in pairs:
             writer.shutdown()
             reader.shutdown()
+
+
+def _queue_pair(max_chunk_bytes: int = 1024) -> tuple[MessageQueue, MessageQueue]:
+    writer = MessageQueue(
+        n_reader=1, n_local_reader=1, max_chunk_bytes=max_chunk_bytes, max_chunks=2
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    writer.wait_until_ready()
+    reader.wait_until_ready()
+    return writer, reader
+
+
+def test_a_watched_rank_failure_ends_a_single_rank_wait():
+    """TP1 fails out of execute_model while TP0, the output rank, waits in a
+    collective TP1 left: the engine must not wait out the RPC timeout."""
+    output = _Queue()
+    watched = [(1, _Queue((FAILURE, "CUDA out of memory"), ready_after=3))]
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="Worker 1 failed.*out of memory"):
+        _gather_responses([output], (0,), time.monotonic() + 300, "m", watched)
+    assert time.monotonic() - started < 1.0
+    assert output.waits >= 3
+
+
+def test_a_single_rank_reply_is_read_while_watching():
+    output = _Queue((SUCCESS, "r0"), ready_after=2)
+    quiet = _Queue()
+    assert _gather_responses([output], (0,), None, "m", [(1, quiet)]) == ["r0"]
+    assert quiet.checks >= 2 and quiet.reply is None
+
+
+def test_an_unexpected_success_from_a_watched_rank_is_dropped():
+    stale = _Queue((SUCCESS, "late"))
+    output = _Queue((SUCCESS, "r0"), ready_after=1)
+    assert _gather_responses([output], (0,), None, "m", [(1, stale)]) == ["r0"]
+    assert stale.reply is None
+
+
+def test_the_deadline_applies_while_watching():
+    with pytest.raises(TimeoutError, match="RPC call to m timed out"):
+        _gather_responses(
+            [_Queue()], (0,), time.monotonic() + 0.2, "m", [(1, _Queue())]
+        )
+
+
+def test_a_watched_failure_on_real_queues_wakes_the_parked_gather():
+    """Real queues with the output rank idle: the gather parks on the output
+    rank's notification in slices and still sees the other rank's failure."""
+    pairs = [_queue_pair(), _queue_pair()]
+    try:
+
+        def fail() -> None:
+            time.sleep(0.2)
+            pairs[1][0].enqueue((FAILURE, "CUDA out of memory"))
+
+        failer = threading.Thread(target=fail)
+        started = time.monotonic()
+        failer.start()
+        with pytest.raises(RuntimeError, match="Worker 1 failed"):
+            _gather_responses(
+                [pairs[0][1]], (0,), time.monotonic() + 30, "m", [(1, pairs[1][1])]
+            )
+        failer.join()
+        assert time.monotonic() - started < 2.0
+    finally:
+        for writer, reader in pairs:
+            writer.shutdown()
+            reader.shutdown()
+
+
+def test_wait_for_message_does_not_consume():
+    writer, reader = _queue_pair()
+    try:
+        started = time.monotonic()
+        reader.wait_for_message(100)
+        assert not reader.ready()
+        assert time.monotonic() - started < 5.0
+        writer.enqueue((SUCCESS, "r"))
+        reader.wait_for_message(1000)
+        assert reader.ready() and reader.ready()
+        assert reader.dequeue(timeout=1) == (SUCCESS, "r")
+        assert not reader.ready()
+    finally:
+        writer.shutdown()
+        reader.shutdown()
+
+
+class _Worker:
+    def fail(self):
+        raise RuntimeError("CUDA out of memory")
+
+    def ok(self):
+        return "done"
+
+
+class _ResponseQueue:
+    def __init__(self) -> None:
+        self.sent: list = []
+
+    def enqueue(self, obj) -> None:
+        self.sent.append(obj)
+
+
+def _worker_proc(rank: int) -> WorkerProc:
+    proc = object.__new__(WorkerProc)
+    proc.worker = _Worker()
+    proc.rank = rank
+    proc.use_async_scheduling = False
+    proc.worker_response_mq = _ResponseQueue()
+    return proc
+
+
+def test_a_rank_that_does_not_own_the_reply_reports_its_failure():
+    proc = _worker_proc(rank=1)
+    proc._execute_worker_rpc(("fail", (), {}, 0))
+    assert proc.worker_response_mq.sent == [(FAILURE, "CUDA out of memory")]
+
+
+def test_a_rank_that_does_not_own_the_reply_stays_quiet_on_success():
+    proc = _worker_proc(rank=1)
+    proc._execute_worker_rpc(("ok", (), {}, 0))
+    assert proc.worker_response_mq.sent == []
+    owner = _worker_proc(rank=0)
+    owner._execute_worker_rpc(("ok", (), {}, 0))
+    assert owner.worker_response_mq.sent == [(SUCCESS, "done")]
 
 
 def test_a_single_reply_names_its_rank():
