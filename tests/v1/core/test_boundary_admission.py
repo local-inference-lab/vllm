@@ -240,23 +240,30 @@ def test_scheduler_preserves_recycling_import_capacity(
     assert cache.block_pool.get_num_free_blocks() == 63
 
 
+def publish(cache, checkpoint):
+    for rank in range(2):
+        cache.acknowledge_external_boundary_checkpoint(checkpoint.checkpoint_id, rank)
+
+
 @pytest.mark.parametrize("cancel_at", ["copying", "ready"])
-def test_external_import_cancellation_releases_only_after_copy_drain(cancel_at):
+def test_external_import_cancellation_releases_only_pages_after_copy_drain(cancel_at):
+    """Cancellation frees the slot and credits at once; pages wait for copies."""
     cache = manager()
+    cache.set_external_boundary_admission_context(1, 0)
     consumer = request("cancel")
     free = cache.block_pool.get_num_free_blocks()
     checkpoint = reserve_import(cache, consumer)
     assert checkpoint is not None
+    assert not cache.can_admit_external_boundary_request("other")
     if cancel_at == "ready":
-        for rank in range(2):
-            cache.acknowledge_external_boundary_checkpoint(
-                checkpoint.checkpoint_id, rank
-            )
+        publish(cache, checkpoint)
     cache.free(consumer)
+    assert cache.external_boundary_reserved_blocks() == 0
+    assert cache.can_admit_external_boundary_request("other")
     if cancel_at == "copying":
         assert cache.block_pool.get_num_free_blocks() < free
-        assert cache.external_boundary_reserved_blocks() > 0
         cache.discard_external_boundary_checkpoint(checkpoint.checkpoint_id)
+    # The connector releases again once the cancelled copy has drained.
     cache.release_external_boundary_admission(consumer.request_id)
     assert cache.external_boundary_reserved_blocks() == 0
     assert cache.block_pool.get_num_free_blocks() == free
@@ -287,28 +294,86 @@ def test_external_import_preflight_does_not_evict_cache_on_execution_pressure():
     assert cache.external_boundary_reserved_blocks() == 0
 
 
-def test_capacity_waiter_prevents_newer_admissions_from_stealing_released_space():
+def refused_waiter_need(cache, waiter):
+    """Refuse a restore on a full pool and return the space it waits for."""
+    probe = manager()
+    free = probe.block_pool.get_num_free_blocks()
+    assert reserve_import(probe, waiter) is not None
+    need = free - probe.block_pool.get_num_free_blocks()
+    need += probe.external_boundary_reserved_blocks()
+    pressure = cache.block_pool.get_new_blocks(cache.block_pool.get_num_free_blocks())
+    assert reserve_import(cache, waiter) is None
+    return pressure, need
+
+
+@pytest.mark.parametrize("released", ["waiter_only", "both"])
+def test_capacity_waiter_holds_back_only_admissions_that_would_take_its_space(
+    released,
+):
     cache = manager()
     older, newer = request("older"), request("newer", "newer")
-    pressure = cache.block_pool.get_new_blocks(cache.block_pool.get_num_free_blocks())
-    assert reserve_import(cache, older) is None
-    cache.block_pool.free_blocks(pressure)
-    assert not cache.can_admit_external_boundary_request(newer.request_id)
-    assert reserve_import(cache, newer) is None
-    assert reserve_import(cache, older) is not None
+    pressure, need = refused_waiter_need(cache, older)
+    cache.block_pool.free_blocks(pressure[: need * (2 if released == "both" else 1)])
     assert cache.can_admit_external_boundary_request(newer.request_id)
+    # A later restore may use only the space beyond the waiter's need.
+    assert (reserve_import(cache, newer) is not None) == (released == "both")
+    assert reserve_import(cache, older) is not None
+
+
+def test_capacity_waiter_does_not_hold_back_requests_considered_before_it():
+    cache = manager()
+    older, newer = request("older"), request("newer", "newer")
+    pressure, need = refused_waiter_need(cache, older)
+    cache.new_step_starts()
+    cache.block_pool.free_blocks(pressure[:need])
+    assert reserve_import(cache, newer) is not None
+    assert reserve_import(cache, older) is None
 
 
 def test_cancelled_capacity_waiter_releases_admission_barrier():
     cache = manager()
-    consumer = request("cancel-waiter")
-    cache.set_external_boundary_admission_context(
-        1, cache.block_pool.get_num_free_blocks()
-    )
-    assert reserve_import(cache, consumer) is None
-    assert not cache.can_admit_external_boundary_request("later")
+    consumer, later = request("cancel-waiter"), request("later", "later")
+    pressure, need = refused_waiter_need(cache, consumer)
+    cache.block_pool.free_blocks(pressure[:need])
     cache.release_external_boundary_admission(consumer.request_id)
-    assert cache.can_admit_external_boundary_request("later")
+    assert reserve_import(cache, later) is not None
+
+
+def bounded_wait_clock(monkeypatch, max_wait):
+    """Drive restore waits from a fake clock and capture the manager's warnings."""
+    import time
+
+    from vllm.v1.core import kv_cache_manager
+
+    clock = [100.0]
+    warnings = []
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        kv_cache_manager.logger, "warning", lambda *args: warnings.append(args)
+    )
+    monkeypatch.setenv("VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S", str(max_wait))
+    return clock, warnings
+
+
+def test_capacity_waiter_stops_waiting_after_bounded_wait(monkeypatch):
+    clock, warnings = bounded_wait_clock(monkeypatch, 30)
+    cache = manager()
+    waiter, later = request("waiter"), request("later", "later")
+    pressure, need = refused_waiter_need(cache, waiter)
+    clock[0] += 29.0
+    assert reserve_import(cache, waiter) is None
+    assert not warnings and not cache.external_boundary_wait_expired("waiter")
+    clock[0] += 1.5
+    assert reserve_import(cache, waiter) is None
+    assert cache.external_boundary_wait_expired(waiter.request_id)
+    assert len(warnings) == 1 and warnings[0][2] == pytest.approx(30.5)
+    # The request recomputes: it neither restores nor holds later requests back.
+    cache.block_pool.free_blocks(pressure[:need])
+    assert reserve_import(cache, waiter) is None
+    assert reserve_import(cache, later) is not None
+    assert len(warnings) == 1
+    cache.release_external_boundary_admission(waiter.request_id)
+    assert not cache.external_boundary_wait_expired(waiter.request_id)
 
 
 def test_import_preflight_preserves_watermark_and_classifies_impossible_restore():
@@ -670,12 +735,124 @@ def test_streaming_owner_can_resume_ahead_of_capacity_waiter():
     scheduler.connector = connector
     scheduler.add_request(consumer)
     assert scheduler.schedule().num_scheduled_tokens == {}
-    assert not cache.can_admit_external_boundary_request(session.request_id)
+    assert consumer.request_id in cache._boundary_import_waiters
     (update,) = create_requests(num_requests=1, num_tokens=1, req_ids=["stream"])
     update.resumable = True
     scheduler.add_request(update)
     assert session.status == RequestStatus.WAITING
     assert scheduler.schedule().num_scheduled_tokens == {"stream": 1}
+
+
+def import_scheduler(**options):
+    """A real scheduler with checkpoint caching and a restore connector mock.
+
+    Tests install the connector after any setup step that processes output.
+    """
+    from unittest.mock import Mock
+
+    scheduler = make_scheduler(
+        **{
+            "enable_prefix_caching": True,
+            "use_v2_model_runner": True,
+            "async_scheduling": True,
+            **options,
+        }
+    )
+    cache = scheduler.kv_cache_manager
+    cache.boundary_checkpoints = BoundaryCheckpointCache(cache.block_pool)
+    connector = Mock()
+    connector.poll_boundary_checkpoint.return_value = True
+    connector.boundary_checkpoint_external_tokens.return_value = 0
+    connector.get_num_new_matched_tokens.return_value = (0, False)
+    connector.has_pending_block_frees.return_value = False
+    return scheduler, cache, connector
+
+
+def start_decode(scheduler, name="running"):
+    from tests.v1.core.utils import create_requests
+
+    (running,) = create_requests(num_requests=1, num_tokens=16, req_ids=[name])
+    scheduler.add_request(running)
+    assert scheduler.schedule().num_scheduled_tokens == {name: 16}
+    return running
+
+
+def test_unadmitted_import_credits_do_not_preempt_running_decode():
+    """Reservations gate new admissions, never the growth of running requests."""
+    scheduler, cache, connector = import_scheduler()
+    running = start_decode(scheduler)
+    importer = request("import", "import", length=64)
+    checkpoint = reserve_import(cache, importer, prefix=16)
+    assert checkpoint is not None
+    publish(cache, checkpoint)
+    credits = cache.external_boundary_reserved_blocks()
+    assert credits > 0
+    # The decode crosses a block boundary with only the import's credits free.
+    cache.block_pool.get_new_blocks(cache.block_pool.get_num_free_blocks() - credits)
+    scheduler.connector = connector
+    scheduler.add_request(importer)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens["running"] == 1
+    assert running.status == RequestStatus.RUNNING
+    assert running.num_preemptions == 0
+
+
+@pytest.mark.parametrize("policy", ["fcfs", "priority"])
+def test_capacity_waiter_does_not_block_requests_ahead_of_it(policy):
+    """A restore waiting for capacity cannot overtake requests ordered before it."""
+    scheduler, cache, connector = import_scheduler(
+        num_blocks=64, scheduling_policy=policy
+    )
+    earlier = request("earlier", "earlier", length=16)
+    waiter = request("waiter", "waiter", length=400)
+    lookup_done = [False]
+
+    def poll(req):
+        if req is earlier:
+            return lookup_done[0]
+        assert reserve_import(cache, req, prefix=384) is None
+        return False
+
+    connector.poll_boundary_checkpoint.side_effect = poll
+    scheduler.connector = connector
+    scheduler.add_request(earlier)
+    scheduler.add_request(waiter)
+    pressure = cache.block_pool.get_new_blocks(cache.block_pool.get_num_free_blocks())
+    assert scheduler.schedule().num_scheduled_tokens == {}
+    assert waiter.request_id in cache._boundary_import_waiters
+    # Space returns for the earlier request, but not for the restore.
+    cache.block_pool.free_blocks(pressure[:16])
+    lookup_done[0] = True
+    assert scheduler.schedule().num_scheduled_tokens == {"earlier": 16}
+    assert waiter.status == RequestStatus.WAITING
+
+
+def test_restore_past_its_bounded_wait_is_admitted_to_recompute(monkeypatch):
+    """The connector keeps deferring the refused restore; the scheduler admits it."""
+    clock, warnings = bounded_wait_clock(monkeypatch, 30)
+    scheduler, cache, connector = import_scheduler(
+        num_blocks=64, long_prefill_token_threshold=64
+    )
+    # A first chunk fits where the whole restore does not.
+    scheduler.scheduler_reserve_full_isl = False
+    waiter = request("waiter", "waiter", length=400)
+
+    def poll(req):
+        assert reserve_import(cache, req, prefix=384) is None
+        return False
+
+    connector.poll_boundary_checkpoint.side_effect = poll
+    scheduler.connector = connector
+    scheduler.add_request(waiter)
+    pressure = cache.block_pool.get_new_blocks(cache.block_pool.get_num_free_blocks())
+    assert scheduler.schedule().num_scheduled_tokens == {}
+    cache.block_pool.free_blocks(pressure[:20])
+    assert scheduler.schedule().num_scheduled_tokens == {}
+    clock[0] += 31.0
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"waiter": 64}
+    assert len(warnings) == 1 and warnings[0][2] == pytest.approx(31.0)
+    assert not cache.external_boundary_wait_expired(waiter.request_id)
 
 
 @pytest.mark.parametrize("release", ["move_victim", "finish_reader"])

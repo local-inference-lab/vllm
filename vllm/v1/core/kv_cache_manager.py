@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
+import vllm.envs as envs
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
@@ -55,6 +57,12 @@ class _BoundaryImportAdmission:
     remaining_blocks: int
     ready: bool = False
     admitted: bool = False
+
+
+@dataclass
+class _BoundaryImportWaiter:
+    need: int
+    since: float
 
 
 @dataclass
@@ -263,7 +271,14 @@ class KVCacheManager:
         )
         self._boundary_imports: set[int] = set()
         self._boundary_import_admissions: dict[str, _BoundaryImportAdmission] = {}
-        self._boundary_import_waiters: dict[str, None] = {}
+        self._boundary_import_waiters: dict[str, _BoundaryImportWaiter] = {}
+        # Requests whose restore outwaited its capacity bound. They recompute
+        # the prompt instead of restoring until they are admitted.
+        self._boundary_import_expired: set[str] = set()
+        # The first restore refused for capacity in this scheduler step and
+        # the blocks it needs. Admissions considered after it must leave them.
+        self._boundary_import_barrier: tuple[str, int] | None = None
+        self._boundary_import_max_wait = envs.VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S
         self._external_admission_slots: int | None = None
         self._external_admission_reserved_blocks = 0
         self._external_admission_has_scheduled_reqs = False
@@ -639,11 +654,17 @@ class KVCacheManager:
                     boundary_blocks += len(boundary_replay_managers)
         # The watermark is applied to waiting/preempted requests only, and only
         # when there's at least one request already scheduled.
-        if has_scheduled_reqs and request.status in (
+        new_admission = request.status in (
             RequestStatus.WAITING,
             RequestStatus.PREEMPTED,
-        ):
+        )
+        if has_scheduled_reqs and new_admission:
             watermark_blocks = self.watermark_blocks
+        # Import reservations hold back new admissions only. Running requests
+        # keep growing and resolve pressure through ordinary preemption.
+        import_reserve = (
+            self._blocks_reserved_for_imports(request) if new_admission else 0
+        )
 
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
@@ -662,10 +683,7 @@ class KVCacheManager:
             required_blocks = (
                 num_blocks_to_allocate + watermark_blocks + boundary_blocks
             )
-            if required_blocks > (
-                self.block_pool.get_num_free_blocks()
-                - self.external_boundary_reserved_blocks(request.request_id)
-            ):
+            if required_blocks > self.block_pool.get_num_free_blocks() - import_reserve:
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -702,9 +720,7 @@ class KVCacheManager:
         # Keep `reserved_blocks` free for other in-flight sequences, and an
         # additional watermark of headroom for waiting/preempted admissions.
         available_blocks = (
-            self.block_pool.get_num_free_blocks()
-            - reserved_blocks
-            - self.external_boundary_reserved_blocks(request.request_id)
+            self.block_pool.get_num_free_blocks() - reserved_blocks - import_reserve
         )
         required_blocks = num_blocks_to_allocate + watermark_blocks + boundary_blocks
         if required_blocks > available_blocks:
@@ -854,6 +870,7 @@ class KVCacheManager:
                     restoring=False,
                 )
         self._boundary_import_waiters.pop(request.request_id, None)
+        self._boundary_import_expired.discard(request.request_id)
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
@@ -1019,12 +1036,15 @@ class KVCacheManager:
         ordinary KV pool, including one page for target/draft auxiliary state.
 
         With reserve_admission, also reserve a running slot and continuation
-        credits. Successful publication retains the consumer pin until ordinary
-        allocation takes ownership. The scheduler must refresh admission context
-        before each candidate; cancellation must release the admission after all
-        copies drain.
+        credits that later new admissions must leave free. Successful
+        publication retains the consumer pin until ordinary allocation takes
+        ownership. The scheduler must refresh admission context whenever it
+        admits a request; cancellation releases credits and the slot at once,
+        while staged pages stay pinned until their copies drain.
 
         Returns None for temporary resource pressure or unavailable caching.
+        A restore refused for VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S keeps getting
+        None, and the scheduler admits its request to recompute the prompt.
         Raises ValueError for incompatible geometry or an import whose checkpoint
         and execution state cannot fit even an otherwise empty pool.
         """
@@ -1055,7 +1075,10 @@ class KVCacheManager:
         count = sum(len(group) for group in page_positions) + 1
         execution_blocks = 0
         if reserve_admission:
-            if request.request_id in self._boundary_import_admissions:
+            if (
+                request.request_id in self._boundary_import_admissions
+                or request.request_id in self._boundary_import_expired
+            ):
                 return None
             if not self.can_admit_external_boundary_request(request.request_id):
                 return None
@@ -1076,14 +1099,17 @@ class KVCacheManager:
             )
             if count + execution_blocks > self.block_pool.num_gpu_blocks - 1:
                 raise ValueError("Checkpoint and execution state exceed the GPU pool")
-        reserved = self.external_boundary_reserved_blocks()
-        if reserve_admission:
-            reserved += self._external_admission_reserved_blocks
+            reserved = (
+                self._blocks_reserved_for_imports(request)
+                + self._external_admission_reserved_blocks
+            )
             if self._external_admission_has_scheduled_reqs:
                 reserved += self.watermark_blocks
+        else:
+            reserved = self.external_boundary_reserved_blocks()
         if count + execution_blocks + reserved > self.block_pool.get_num_free_blocks():
             if reserve_admission:
-                self._boundary_import_waiters.setdefault(request.request_id, None)
+                self._wait_for_import_capacity(request, count + execution_blocks)
             return None
         allocation = self.block_pool.get_new_blocks(count)
         try:
@@ -1164,7 +1190,9 @@ class KVCacheManager:
         *,
         has_scheduled_reqs: bool = False,
     ) -> None:
-        """Refresh scheduler capacity immediately before polling a candidate.
+        """Refresh scheduler capacity before polling candidates.
+
+        The scheduler refreshes it again after every admission in its pass.
 
         Args:
             available_slots: Slots remaining after running and paused sessions.
@@ -1187,14 +1215,54 @@ class KVCacheManager:
             if request_id != owner
         )
 
+    def _blocks_reserved_for_imports(self, request: Request) -> int:
+        """Blocks a new admission must leave free for imports ahead of it."""
+        reserved = self.external_boundary_reserved_blocks(request.request_id)
+        barrier = self._boundary_import_barrier
+        if (
+            barrier is not None
+            and barrier[0] != request.request_id
+            and request.num_computed_tokens == 0
+            and request.request_id not in self._boundary_import_admissions
+        ):
+            reserved += barrier[1]
+        return reserved
+
+    def _wait_for_import_capacity(self, request: Request, need: int) -> None:
+        """Record a capacity refusal and bound how long the restore may wait."""
+        now = time.monotonic()
+        waiter = self._boundary_import_waiters.get(request.request_id)
+        if waiter is None:
+            waiter = _BoundaryImportWaiter(need, now)
+            self._boundary_import_waiters[request.request_id] = waiter
+        waited = now - waiter.since
+        if waited >= self._boundary_import_max_wait:
+            self._forget_import_waiter(request.request_id)
+            self._boundary_import_expired.add(request.request_id)
+            logger.warning(
+                "Checkpoint restore for request %s waited %.1f s for %d GPU "
+                "blocks; recomputing its prompt instead",
+                request.request_id,
+                waited,
+                need,
+            )
+            return
+        waiter.need = need
+        # Later candidates in this step are behind the waiter; earlier ones,
+        # and requests considered first in the next step, are not.
+        if self._boundary_import_barrier is None:
+            self._boundary_import_barrier = (request.request_id, need)
+
+    def _forget_import_waiter(self, request_id: str) -> None:
+        self._boundary_import_waiters.pop(request_id, None)
+        barrier = self._boundary_import_barrier
+        if barrier is not None and barrier[0] == request_id:
+            self._boundary_import_barrier = None
+
     def can_admit_external_boundary_request(self, request_id: str) -> bool:
         """Whether a candidate can use a running slot without stealing a ticket."""
         if request_id in self._boundary_import_admissions:
             return True
-        if self._boundary_import_waiters and request_id != next(
-            iter(self._boundary_import_waiters)
-        ):
-            return False
         return (
             self._external_admission_slots is None
             or sum(
@@ -1213,19 +1281,25 @@ class KVCacheManager:
         admission = self._boundary_import_admissions.get(request_id)
         return admission is not None and admission.ready and not admission.admitted
 
+    def external_boundary_wait_expired(self, request_id: str) -> bool:
+        """Whether a restore outwaited its capacity bound, so the prompt recomputes."""
+        return request_id in self._boundary_import_expired
+
     def release_external_boundary_admission(self, request_id: str) -> None:
-        """Release a finished consumer's credits; in-flight copies must drain first."""
-        self._boundary_import_waiters.pop(request_id, None)
-        admission = self._boundary_import_admissions.get(request_id)
-        if (
-            admission is None
-            or admission.checkpoint.checkpoint_id in self._boundary_imports
-        ):
+        """Release an import's credits and slot, or end its capacity wait.
+
+        A copy that is still in flight keeps only its staged pages pinned, until
+        the connector acknowledges or discards it.
+        """
+        self._forget_import_waiter(request_id)
+        self._boundary_import_expired.discard(request_id)
+        admission = self._boundary_import_admissions.pop(request_id, None)
+        if admission is None or not admission.ready or admission.admitted:
             return
-        del self._boundary_import_admissions[request_id]
-        if admission.ready and not admission.admitted:
-            assert self.boundary_checkpoints is not None
-            self.boundary_checkpoints.release(admission.checkpoint)
+        assert self.boundary_checkpoints is not None
+        self.boundary_checkpoints.release(admission.checkpoint)
+        if admission.request.boundary_checkpoint is admission.checkpoint:
+            admission.request.boundary_checkpoint = None
 
     def _external_boundary_execution_blocks(
         self,
@@ -1655,4 +1729,5 @@ class KVCacheManager:
 
     def new_step_starts(self) -> None:
         """Notify the coordinator that a new step is starting."""
+        self._boundary_import_barrier = None
         self.coordinator.new_step_starts()

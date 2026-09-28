@@ -1415,6 +1415,11 @@ class Scheduler(SchedulerInterface):
                         self.connector is not None
                         and self.kv_cache_manager.boundary_checkpoints is not None
                         and not self.connector.poll_boundary_checkpoint(request)
+                        # The connector still defers a restore that outwaited
+                        # its capacity bound; the request recomputes instead.
+                        and not self.kv_cache_manager.external_boundary_wait_expired(
+                            request_id
+                        )
                     ):
                         request_queue.remove_request(request)
                         if prefill_interleave_step is not None:

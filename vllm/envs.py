@@ -173,6 +173,7 @@ if TYPE_CHECKING:
     VLLM_RUST_FRONTEND_PATH: str | None = "auto"
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
+    VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S: float = 60.0
     VLLM_MLA_DISABLE: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
@@ -1513,6 +1514,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE": lambda: int(
         os.getenv("VLLM_V1_OUTPUT_PROC_CHUNK_SIZE", "128")
     ),
+    # Seconds an external checkpoint restore may wait for GPU capacity before
+    # its request recomputes the prompt instead. 0 recomputes immediately.
+    "VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S": lambda: max(
+        0.0, float(os.getenv("VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S", "60"))
+    ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
     # If set, vLLM will pick up the provided Flash Attention MLA
@@ -2567,6 +2573,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOGGING_COLOR",
         "VLLM_LOG_STATS_INTERVAL",
         "VLLM_REQUEST_STALL_WARNING_S",
+        "VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S",
         "VLLM_LOG_REQUEST_TIMELINE",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
