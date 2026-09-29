@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-restore-admission-stall",
+  "category": "fix",
+  "summary": "Generation no longer stops for good when the KV cache fills while requests are waiting, such as LMCache restores waiting for GPU capacity",
+  "models": ["GLM-5.3-Flash", "DeepSeek-V4.1-Flash", "MiMo-V2.6-Flash"],
+  "compatibility": "No user action required. Affects servers with prefill compute sharing (prefill-compute-share), which the GLM-5.3-Flash, DeepSeek-V4.1-Flash and MiMo-V2.6-Flash profiles enable. Restore admission (vllm-restore-admission) made it common, because restores that wait for capacity stay queued instead of being admitted to recompute.",
+  "details": [
+    "What was wrong: with compute sharing, any waiting request counts as prefill work, so while the waiting requests could not be admitted (all running slots taken, or restores waiting for capacity) every model step was a prefill turn that admitted nothing. Running decodes were served only as leftover work, which may not preempt. When a decode needed a KV block and the cache was full, nothing was preempted, the step was empty, and every later step was the same.",
+    "Consequence: the engine kept stepping with idle GPUs, KV cache usage near 100%, prompt and generation at 0 tok/s, no preemptions and no log lines, until clients aborted the running requests. VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S could not help: with every slot taken the waiting restores were never considered, and a restore that gave up could not be admitted to recompute either.",
+    "Now a prefill turn that schedules no work lets decodes preempt as a decode turn does. Once a running slot frees, waiting restores are considered again, and a restore still refused after VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S recomputes its prompt and logs a warning, as before."
+  ],
+  "pull_requests": [946],
+  "authors": ["Local Inference Lab"],
+  "requires": []
+}
