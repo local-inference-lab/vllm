@@ -12,7 +12,7 @@ import pytest
 
 from vllm import SamplingParams
 from vllm.config import VllmConfig
-from vllm.config.parallel import DataParallelBackend
+from vllm.config.parallel import DataParallelBackend, DataParallelMode
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.inputs import PromptType
 from vllm.outputs import RequestOutput
@@ -77,13 +77,17 @@ async def generate(
         RequestOutputKind.FINAL_ONLY,
     ],
 )
-@pytest.mark.parametrize("data_parallel_backend", ["mp", "ray"])
+@pytest.mark.parametrize(
+    "data_parallel_backend,data_parallel_mode",
+    [("mp", "auto"), ("ray", "auto"), ("mp", "independent")],
+)
 @pytest.mark.parametrize("async_scheduling", [True, False])
 @pytest.mark.asyncio
 async def test_load(
     model: str,
     output_kind: RequestOutputKind,
     data_parallel_backend: DataParallelBackend,
+    data_parallel_mode: DataParallelMode,
     async_scheduling: bool,
 ):
     if async_scheduling and data_parallel_backend == "ray":
@@ -121,10 +125,11 @@ async def test_load(
 
         engine_args = AsyncEngineArgs(
             model=model,
-            enforce_eager=True,
+            enforce_eager=data_parallel_mode != "independent",
             tensor_parallel_size=int(os.getenv("TP_SIZE", 1)),
             data_parallel_size=DP_SIZE,
             data_parallel_backend=data_parallel_backend,
+            data_parallel_mode=data_parallel_mode,
             async_scheduling=async_scheduling,
         )
         engine = AsyncLLM.from_engine_args(
@@ -186,6 +191,134 @@ async def test_load(
             assert slogger.finished_req_count > NUM_REQUESTS // (DP_SIZE + 1), (
                 f"requests are imbalanced: {stats_loggers}"
             )
+
+
+def _count_worker_execution(worker):
+    from vllm.distributed import get_dp_group, get_tp_group, get_world_group
+
+    counts = {"execute_model": 0, "execute_dummy_batch": 0}
+    worker._independent_dp_test_counts = counts
+
+    def counted(method, name):
+        def call(*args, **kwargs):
+            counts[name] += 1
+            return method(*args, **kwargs)
+
+        return call
+
+    for name in counts:
+        setattr(worker, name, counted(getattr(worker, name), name))
+    return {
+        "world_size": get_world_group().world_size,
+        "tp_size": get_tp_group().world_size,
+        "dp_size": get_dp_group().world_size,
+        "replica": worker.parallel_config.data_parallel_index,
+        "device": worker.local_rank,
+    }
+
+
+def _read_worker_execution(worker):
+    return worker._independent_dp_test_counts
+
+
+class IndependentDPTestWorkerExtension:
+    """Collect per-worker topology and execution counts through the dev RPC API."""
+
+    model_runner: Any
+
+    def independent_dp_probe(self, output_dir, reset=False):
+        import json
+        from pathlib import Path
+
+        if not hasattr(self, "_independent_dp_test_topology"):
+            self._independent_dp_test_topology = _count_worker_execution(self)
+        counts = _read_worker_execution(self)
+        if reset:
+            for name in counts:
+                counts[name] = 0
+        result = self._independent_dp_test_topology | {
+            "calls": dict(counts),
+            "expert_partitions": sorted(
+                {
+                    module.moe_config.intermediate_size_per_partition
+                    for module in self.model_runner.model.modules()
+                    if hasattr(module, "moe_config")
+                }
+            ),
+        }
+        path = Path(output_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        (
+            path / f"replica-{result['replica']}-device-{result['device']}.json"
+        ).write_text(json.dumps(result, indent=2))
+        return result
+
+
+@pytest.mark.asyncio
+async def test_independent_moe_replicas_do_not_execute_idle_steps():
+    """Only the selected replica executes, including with CUDA graphs enabled."""
+    tp_size = int(os.getenv("TP_SIZE", 1))
+    args = AsyncEngineArgs(
+        model="ibm-research/PowerMoE-3b",
+        tensor_parallel_size=tp_size,
+        data_parallel_size=DP_SIZE,
+        data_parallel_mode="independent",
+        max_model_len=1024,
+        max_num_seqs=4,
+    )
+    engine = AsyncLLM.from_engine_args(args)
+    try:
+        client = engine.engine_core
+        assert isinstance(client, DPLBAsyncMPClient)
+
+        async def inspect_workers(method):
+            return await asyncio.gather(
+                *(
+                    client._call_utility_async(
+                        "collective_rpc", method, None, (), {}, engine=identity
+                    )
+                    for identity in client.core_engines
+                )
+            )
+
+        topology = await inspect_workers(_count_worker_execution)
+        devices = set()
+        for index, workers in enumerate(topology):
+            assert len(workers) == tp_size
+            for worker in workers:
+                assert worker["world_size"] == worker["tp_size"] == tp_size
+                assert worker["dp_size"] == 1
+                assert worker["replica"] == index
+                devices.add(worker["device"])
+        assert len(devices) == tp_size * DP_SIZE
+
+        for selected in (0, DP_SIZE - 1):
+            before = await inspect_workers(_read_worker_execution)
+            count, _ = await asyncio.wait_for(
+                generate(
+                    engine,
+                    f"replica-{selected}",
+                    "Count to ten:",
+                    RequestOutputKind.DELTA,
+                    16,
+                    data_parallel_rank=selected,
+                ),
+                timeout=60,
+            )
+            assert count == 16
+            after = await inspect_workers(_read_worker_execution)
+            for index, workers in enumerate(after):
+                for rank, counts in enumerate(workers):
+                    if index == selected:
+                        assert (
+                            counts["execute_model"]
+                            > before[index][rank]["execute_model"]
+                        )
+                    else:
+                        assert counts == before[index][rank]
+                    assert counts["execute_dummy_batch"] == 0
+    finally:
+        engine.shutdown()
 
 
 @pytest.mark.parametrize("prefill_schedule_interval", [1, 4])

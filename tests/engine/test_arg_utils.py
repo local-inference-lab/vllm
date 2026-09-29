@@ -46,6 +46,55 @@ def test_optional_type():
     assert optional_type_func("42") == 42
 
 
+@pytest.mark.parametrize("mode", ["auto", "independent"])
+@pytest.mark.parametrize("dp_size", [1, 4])
+def test_data_parallel_mode_cli_creates_replica_config(dummy_opt_path, mode, dp_size):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = EngineArgs.from_cli_args(
+        parser.parse_args(
+            [
+                "--model",
+                dummy_opt_path,
+                "--skip-tokenizer-init",
+                "--hf-overrides",
+                '{"architectures":["OPTForCausalLM"]}',
+                "--tensor-parallel-size",
+                "2",
+                "--data-parallel-size",
+                str(dp_size),
+                "--data-parallel-mode",
+                mode,
+            ]
+        )
+    )
+    config = args.create_engine_config()
+    assert config.parallel_config.data_parallel_mode == mode
+    assert config.parallel_config.data_parallel_size == dp_size
+    assert config.parallel_config.data_parallel_size_local == dp_size
+    assert config.parallel_config.tensor_parallel_size == 2
+    if mode == "independent":
+        assert config.parallel_config.data_parallel_rank_local is None
+
+
+@pytest.mark.parametrize("option", ["data_parallel_rank", "data_parallel_start_rank"])
+def test_independent_dp_rejects_explicit_rank(dummy_opt_path, option):
+    args = EngineArgs(
+        model=dummy_opt_path,
+        hf_overrides={"architectures": ["OPTForCausalLM"]},
+        data_parallel_mode="independent",
+        data_parallel_size=4,
+        **{option: 0},
+    )
+    with pytest.raises(ValueError, match="Independent data parallelism"):
+        args.create_engine_config()
+
+
+def test_independent_dp_rejects_headless_before_loading_model():
+    args = EngineArgs(model="unused", data_parallel_mode="independent")
+    with pytest.raises(ValueError, match="headless"):
+        args.create_engine_config(headless=True)
+
+
 def test_watermark_config_cli():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     args = parser.parse_args(

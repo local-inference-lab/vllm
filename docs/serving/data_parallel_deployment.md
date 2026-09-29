@@ -10,6 +10,39 @@ In these cases, the data parallel ranks are not completely independent. Forward 
 
 By default, expert layers form a tensor parallel group of size `DP × TP`. To use expert parallelism instead, include the `--enable-expert-parallel` CLI arg (on all nodes in the multi-node case). See [Expert Parallel Deployment](expert_parallel_deployment.md) for details on how attention and expert layers behave differently with EP enabled.
 
+## Independent replicas
+
+Use `--data-parallel-mode independent` to replicate the complete model, including
+MoE experts, behind the native load-balanced endpoint:
+
+```bash
+vllm serve $MODEL --tensor-parallel-size 2 --data-parallel-size 4 \
+    --data-parallel-mode independent
+```
+
+This launches four independent TP2 engines on eight GPUs. Each engine executes
+with DP1, owns a separate KV cache, and shards its expert weights only within its
+replica. Increasing the number of replicas does not change expert partition sizes.
+Each replica stores a complete model across its GPUs, so expert memory per GPU is
+the same as a standalone TP2 deployment rather than a TP8 expert shard.
+
+The frontend balances requests using in-flight counts, scheduler queues, and
+KV-cache pressure. A request's output stream and cancellation stay associated
+with its selected engine. Replicas exchange load statistics with the frontend;
+they do not synchronize model execution or run dummy steps for other replicas.
+Prefix caches are local to each replica, without conversation affinity. Capacity
+settings such as `--max-num-seqs` apply per replica. Existing service-wide engine
+failure handling remains in effect; independent mode does not add request retries
+or replica restart support.
+
+Independent mode supports online serving and `AsyncLLM` on one host with local
+multiprocessing and internal load balancing. Ray, multi-node/headless deployment,
+external/hybrid balancing, offline SPMD, elastic EP, and cross-DP Engram options
+are unsupported. The default mode, `auto`, preserves coordinated MoE execution
+and independent dense-model execution.
+
+## Coordinated MoE execution
+
 In vLLM, each DP rank is deployed as a separate "core engine" process that communicates with front-end process(es) via ZMQ sockets. Data Parallel attention can be combined with Tensor Parallel attention, in which case each DP engine owns a number of per-GPU worker processes equal to the configured TP size.
 
 For MoE models, when any requests are in progress in any rank, we must ensure that empty "dummy" forward passes are performed in all ranks that don't currently have any requests scheduled. This is handled via a separate DP Coordinator process that communicates with all ranks, and a collective operation performed every N steps to determine when all ranks become idle and can be paused. When TP is used in conjunction with DP, expert layers form a group of size `DP × TP` (using either tensor parallelism by default, or expert parallelism if `--enable-expert-parallel` is set).

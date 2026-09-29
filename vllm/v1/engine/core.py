@@ -1432,12 +1432,12 @@ class EngineCoreProc(EngineCore):
                 )
 
             parallel_config.data_parallel_index = dp_rank
-            if data_parallel and vllm_config.model_config.is_moe:
+            if vllm_config.uses_coordinated_dp:
                 # Set data parallel rank for this engine process.
                 parallel_config.data_parallel_rank = dp_rank
                 engine_core = DPEngineCoreProc(*args, **kwargs)
             else:
-                # Non-MoE DP ranks are completely independent, so treat like DP=1.
+                # Independent replicas execute with DP=1, including MoE layers.
                 # Note that parallel_config.data_parallel_index will still reflect
                 # the original DP rank.
                 parallel_config.reconfigure_for_independent_dp_rank()

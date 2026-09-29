@@ -229,6 +229,7 @@ def _make_vllm_config_ray_dp_multinode() -> SimpleNamespace:
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
             data_parallel_size=2,
+            data_parallel_mode="auto",
             data_parallel_size_local=1,
             data_parallel_rank=0,
             data_parallel_rank_local=None,
@@ -242,6 +243,7 @@ def _make_vllm_config_ray_dp_multinode() -> SimpleNamespace:
         model_config=SimpleNamespace(multimodal_config=None, is_moe=False),
         cache_config=SimpleNamespace(),
         needs_dp_coordinator=False,
+        uses_coordinated_dp=False,
         kv_transfer_config=None,
         # ``_apply_dp_identity_suffix`` reads and rewrites this.
         instance_id="vllm-ray-dp-regression-test",

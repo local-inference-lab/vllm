@@ -162,6 +162,7 @@ def test_glm_boundary_adapter_requires_gpu_resident_atomic_state(
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=1,
             data_parallel_size=1,
+            effective_data_parallel_size=1,
             decode_context_parallel_size=dcp,
             prefill_context_parallel_size=1,
         ),

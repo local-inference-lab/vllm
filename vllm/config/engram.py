@@ -166,6 +166,13 @@ class EngramConfig:
 
     def verify_parallel_config(self, parallel_config: "ParallelConfig") -> None:
         """Reject unsupported embedding parallel topologies."""
+        if parallel_config.data_parallel_mode == "independent" and (
+            self.embedding_across_dp or self.dp_shared_memory
+        ):
+            raise ValueError(
+                "Independent data parallelism does not support Engram "
+                "embedding_across_dp or dp_shared_memory."
+            )
         if self.dp_shared_memory:
             if parallel_config.data_parallel_size <= 1:
                 raise ValueError("dp_shared_memory requires data_parallel_size > 1.")

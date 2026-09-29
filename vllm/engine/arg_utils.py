@@ -106,6 +106,7 @@ from vllm.config.observability import DetailedTraceModules
 from vllm.config.parallel import (
     All2AllBackend,
     DataParallelBackend,
+    DataParallelMode,
     DCPCommBackend,
     DistributedExecutorBackend,
     ExpertPlacementStrategy,
@@ -555,6 +556,7 @@ class EngineArgs:
     dcp_kv_cache_interleave_size: int = ParallelConfig.dcp_kv_cache_interleave_size
     cp_kv_cache_interleave_size: int | None = None
     data_parallel_size: int = ParallelConfig.data_parallel_size
+    data_parallel_mode: DataParallelMode = ParallelConfig.data_parallel_mode
     data_parallel_rank: int | None = None
     data_parallel_start_rank: int | None = None
     data_parallel_size_local: int | None = None
@@ -1203,6 +1205,9 @@ class EngineArgs:
         )
         parallel_group.add_argument(
             "--data-parallel-size", "-dp", **parallel_kwargs["data_parallel_size"]
+        )
+        parallel_group.add_argument(
+            "--data-parallel-mode", **parallel_kwargs["data_parallel_mode"]
         )
         parallel_group.add_argument(
             "--data-parallel-rank",
@@ -2182,6 +2187,11 @@ class EngineArgs:
 
         NOTE: If VllmConfig is incompatible, we raise an error.
         """
+        if headless and self.data_parallel_mode == "independent":
+            raise ValueError(
+                "Independent data parallelism requires a local frontend; "
+                "headless mode is unsupported."
+            )
         current_platform.pre_register_and_update()
 
         device_config = DeviceConfig(device=cast(Device, current_platform.device_type))
@@ -2354,6 +2364,17 @@ class EngineArgs:
                 self.data_parallel_size_local = max(
                     local_world_size // world_size_within_dp, 1
                 )
+        if self.data_parallel_mode == "independent" and (
+            self.data_parallel_rank is not None
+            or self.data_parallel_start_rank is not None
+            or self.data_parallel_hybrid_lb
+            or self.data_parallel_external_lb
+            or self.data_parallel_multi_port_external_lb
+        ):
+            raise ValueError(
+                "Independent data parallelism requires internal load balancing "
+                "with all replicas launched locally."
+            )
         data_parallel_external_lb = (
             self.data_parallel_external_lb or self.data_parallel_rank is not None
         )
@@ -2481,6 +2502,7 @@ class EngineArgs:
             tensor_parallel_size=self.tensor_parallel_size,
             prefill_context_parallel_size=self.prefill_context_parallel_size,
             data_parallel_size=self.data_parallel_size,
+            data_parallel_mode=self.data_parallel_mode,
             data_parallel_rank=self.data_parallel_rank or 0,
             data_parallel_external_lb=data_parallel_external_lb,
             data_parallel_size_local=data_parallel_size_local,

@@ -1589,6 +1589,151 @@ def test_reconfigure_for_independent_dp_rank_on_multinode_dense_model():
     assert parallel_config.world_size == 8
 
 
+@pytest.mark.parametrize(
+    "mode, is_moe, coordinated",
+    [
+        ("auto", True, True),
+        ("auto", False, False),
+        ("independent", True, False),
+        ("independent", False, False),
+    ],
+)
+def test_independent_dp_keeps_load_balancing_without_wave_coordination(
+    mode, is_moe, coordinated
+):
+    config = object.__new__(VllmConfig)
+    config.parallel_config = ParallelConfig(
+        data_parallel_size=4,
+        data_parallel_size_local=4,
+        data_parallel_mode=mode,
+        distributed_executor_backend="mp",
+    )
+    config.model_config = SimpleNamespace(is_moe=is_moe)
+    assert config.uses_coordinated_dp is coordinated
+    assert config.needs_dp_coordinator
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_independent_moe_preserves_tp_partition_and_replica_identity(monkeypatch, rank):
+    from copy import deepcopy
+
+    import torch
+
+    from vllm.model_executor.layers.fused_moe import config as moe_config
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+    parent = ParallelConfig(
+        tensor_parallel_size=2,
+        data_parallel_size=4,
+        data_parallel_size_local=4,
+        data_parallel_mode="independent",
+        assigned_physical_gpu_ids=list(range(8)),
+    )
+    child = deepcopy(parent)
+    child.data_parallel_index = child.data_parallel_rank_local = rank
+    child.reconfigure_for_independent_dp_rank()
+    assert parent.data_parallel_size == 4
+    assert child.data_parallel_index == child.data_parallel_rank_local == rank
+    assert child.assigned_physical_gpu_ids == list(range(8))
+    assert child.elastic_ep_max_dp_size == 1
+    monkeypatch.setattr(moe_config, "get_tensor_model_parallel_rank", lambda: 0)
+    # Accessing a cross-replica DP group would fail without distributed init.
+    parallel = moe_config.FusedMoEParallelConfig.make(
+        tp_size_=child.tensor_parallel_size,
+        dp_size_=child.data_parallel_size,
+        pcp_size_=1,
+        sp_size_=1,
+        vllm_parallel_config=child,
+    )
+    experts = moe_config.FusedMoEConfig(
+        num_experts=8,
+        experts_per_token=2,
+        hidden_dim=128,
+        intermediate_size=640,
+        num_local_experts=8,
+        num_logical_experts=8,
+        activation=MoEActivation.SILU,
+        device="cpu",
+        routing_method=moe_config.RoutingMethodType.Default,
+        moe_parallel_config=parallel,
+        in_dtype=torch.bfloat16,
+    )
+    assert experts.intermediate_size_per_partition == 320
+    assert experts.dp_size == 1
+    assert parallel.tp_size == 2
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"data_parallel_backend": "ray"},
+        {"distributed_executor_backend": "ray"},
+        {"distributed_executor_backend": "external_launcher"},
+        {"nnodes": 2},
+        {"data_parallel_size_local": 0},
+        {"data_parallel_size_local": 2},
+        {"data_parallel_external_lb": True},
+        {"data_parallel_hybrid_lb": True},
+        {"data_parallel_rank": 1},
+        {"enable_elastic_ep": True},
+    ],
+)
+def test_independent_dp_rejects_unsupported_deployment(options):
+    kwargs = dict(
+        data_parallel_size=4,
+        data_parallel_size_local=4,
+        data_parallel_mode="independent",
+    )
+    with pytest.raises(ValueError, match="Independent data parallelism"):
+        ParallelConfig(**(kwargs | options))
+
+
+def test_independent_dp_rejects_offline_spmd(monkeypatch):
+    monkeypatch.setenv("VLLM_DP_SIZE", "4")
+    with pytest.raises(ValueError, match="offline SPMD"):
+        ParallelConfig(data_parallel_mode="independent")
+
+
+@pytest.mark.parametrize("option", ["embedding_across_dp", "dp_shared_memory"])
+def test_independent_dp_rejects_cross_replica_engram(option):
+    parallel = ParallelConfig(
+        data_parallel_size=4,
+        data_parallel_size_local=4,
+        data_parallel_mode="independent",
+    )
+    with pytest.raises(ValueError, match="Independent data parallelism"):
+        EngramConfig(cpu_offload=True, **{option: True}).verify_parallel_config(
+            parallel
+        )
+
+
+@pytest.mark.parametrize("mode", ["auto", "independent"])
+def test_independent_dp_preserves_dynamic_speculation(mode):
+    config = object.__new__(VllmConfig)
+    config.parallel_config = ParallelConfig(
+        data_parallel_size=4,
+        data_parallel_size_local=4,
+        data_parallel_mode=mode,
+        distributed_executor_backend="mp",
+    )
+    schedule = [(1, 4, 3)]
+    config.speculative_config = SimpleNamespace(
+        uses_dynamic_speculative_decoding=lambda: True,
+        num_speculative_tokens=3,
+        num_speculative_tokens_per_batch_size=schedule,
+        adaptive_speculative_tokens_window=32,
+        adaptive_speculative_tokens_initial=2,
+    )
+    config._maybe_disable_dynamic_sd_for_data_parallel()
+    spec = config.speculative_config
+    assert spec.num_speculative_tokens_per_batch_size == (
+        schedule if mode == "independent" else None
+    )
+    assert spec.adaptive_speculative_tokens_window == (
+        32 if mode == "independent" else None
+    )
+
+
 def test_draft_model_enables_async_scheduling_by_default():
     parallel_config = ParallelConfig(distributed_executor_backend="uni")
     model_config = ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048)

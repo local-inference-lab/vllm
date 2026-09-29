@@ -70,6 +70,11 @@ class LLMEngine:
         self.log_stats = log_stats
 
         parallel_config = vllm_config.parallel_config
+        if parallel_config.data_parallel_mode == "independent":
+            raise ValueError(
+                "Independent data parallelism requires online serving or AsyncLLM; "
+                "the synchronous LLM API is unsupported."
+            )
         executor_backend = parallel_config.distributed_executor_backend
 
         self.external_launcher_dp = (

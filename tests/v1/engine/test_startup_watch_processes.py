@@ -9,6 +9,7 @@ import pytest
 import zmq
 
 import vllm.platforms as platforms
+from vllm.config import ParallelConfig, VllmConfig
 from vllm.v1.engine import core as core_module
 from vllm.v1.engine import utils as engine_utils
 from vllm.v1.engine.core import EngineCoreProc, EngineShutdownState
@@ -101,7 +102,9 @@ def test_freeze_gc_after_clean_rocm_engine_core_shutdown(
     expected_calls: list[str],
 ):
     calls: list[str] = []
-    vllm_config = SimpleNamespace(shutdown_timeout=shutdown_timeout)
+    vllm_config = SimpleNamespace(
+        shutdown_timeout=shutdown_timeout, uses_coordinated_dp=False
+    )
     proc = SimpleNamespace(
         shutdown_state=EngineShutdownState.RUNNING,
         has_work=lambda: has_work,
@@ -144,6 +147,61 @@ def test_freeze_gc_after_clean_rocm_engine_core_shutdown(
         EngineCoreProc.run_engine_core(vllm_config=vllm_config)
 
     assert calls == expected_calls
+
+
+@pytest.mark.parametrize("mode", ["auto", "independent"])
+def test_moe_engine_startup_selects_replica_execution(monkeypatch, mode):
+    config = object.__new__(VllmConfig)
+    config.parallel_config = ParallelConfig(
+        tensor_parallel_size=2,
+        data_parallel_size=4,
+        data_parallel_size_local=4,
+        data_parallel_mode=mode,
+        distributed_executor_backend="mp",
+    )
+    config.model_config = SimpleNamespace(is_moe=True)
+    config.kv_transfer_config = None
+    observed = []
+
+    def construct(coordinated, **kwargs):
+        parallel = kwargs["vllm_config"].parallel_config
+        observed.append(
+            (
+                coordinated,
+                parallel.data_parallel_size,
+                parallel.data_parallel_index,
+                parallel.data_parallel_rank_local,
+                kwargs.get("engine_index"),
+            )
+        )
+        return SimpleNamespace(run_busy_loop=lambda: None, shutdown=lambda: None)
+
+    for name in (
+        "maybe_register_config_serialize_by_value",
+        "set_process_title",
+        "maybe_init_worker_tracer",
+        "decorate_logs",
+    ):
+        monkeypatch.setattr(core_module, name, lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        core_module, "EngineCoreProc", lambda **kw: construct(False, **kw)
+    )
+    monkeypatch.setattr(
+        core_module, "DPEngineCoreProc", lambda **kw: construct(True, **kw)
+    )
+    monkeypatch.setattr(
+        core_module,
+        "SignalCallback",
+        lambda callback: SimpleNamespace(
+            trigger=lambda: None,
+            stop=lambda: None,
+        ),
+    )
+    monkeypatch.setattr(core_module.signal, "signal", lambda *args: None)
+    EngineCoreProc.run_engine_core(vllm_config=config, dp_rank=3, local_dp_rank=3)
+    assert observed == (
+        [(False, 1, 3, 3, 3) if mode == "independent" else (True, 4, 3, 3, None)]
+    )
 
 
 class _FinishedProcess:

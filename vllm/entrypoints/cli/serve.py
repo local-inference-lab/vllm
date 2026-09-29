@@ -77,6 +77,11 @@ class ServeSubcommand(CLISubcommand):
 
     @staticmethod
     def cmd(args: argparse.Namespace) -> None:
+        if args.headless and args.data_parallel_mode == "independent":
+            raise ValueError(
+                "Independent data parallelism requires a local frontend; "
+                "--headless is unsupported."
+            )
         # If model is specified in CLI (as positional arg), it takes precedence
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag

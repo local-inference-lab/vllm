@@ -684,7 +684,7 @@ class VllmConfig:
                 )
             )
             and parallel.pipeline_parallel_size == 1
-            and parallel.data_parallel_size == 1
+            and parallel.effective_data_parallel_size == 1
             and (
                 parallel.decode_context_parallel_size == 1
                 or model.hf_text_config.model_type in ("glm5_next_text", "glm5_next")
@@ -932,25 +932,29 @@ class VllmConfig:
         return enabled
 
     @property
+    def uses_coordinated_dp(self) -> bool:
+        """Whether model execution requires communication across DP replicas."""
+        return self.parallel_config.effective_data_parallel_size > 1 and (
+            self.model_config is None or self.model_config.is_moe
+        )
+
+    @property
     def needs_dp_coordinator(self) -> bool:
         """
         Determine if the DPCoordinator process is needed.
 
         The DPCoordinator is needed in two cases:
-        1. For MoE models with DP > 1: to handle wave coordination
+        1. For coordinated MoE models with DP > 1: to handle wave coordination
            (even in external LB mode, since wave coordination runs in the coordinator)
-        2. For non-MoE models in internal/hybrid LB mode: to collect and publish
+        2. For replicas in internal/hybrid LB mode: to collect and publish
            queue stats for load balancing across DP ranks
 
         Returns:
             True if DPCoordinator process is needed, False otherwise.
         """
 
-        # For non-MoE models, only need coordinator in internal/hybrid LB mode
-        # (for stats collection).
         return self.parallel_config.data_parallel_size > 1 and (
-            self.model_config is None
-            or self.model_config.is_moe
+            self.uses_coordinated_dp
             or not self.parallel_config.data_parallel_external_lb
         )
 
@@ -1151,7 +1155,7 @@ class VllmConfig:
         if (
             speculative_config is None
             or not speculative_config.uses_dynamic_speculative_decoding()
-            or self.parallel_config.data_parallel_size <= 1
+            or self.parallel_config.effective_data_parallel_size <= 1
         ):
             return
 
@@ -1446,7 +1450,7 @@ class VllmConfig:
 
         if (
             self.scheduler_config.prefill_compute_share is not None
-            and self.parallel_config.data_parallel_size > 1
+            and self.parallel_config.effective_data_parallel_size > 1
         ):
             raise ValueError(
                 "prefill_compute_share does not yet support data parallelism; all DP "
@@ -1671,9 +1675,7 @@ class VllmConfig:
 
         if self.parallel_config.disable_nccl_for_dp_synchronization is None:
             if self.scheduler_config.async_scheduling:
-                if self.parallel_config.data_parallel_size > 1 and (
-                    self.model_config is None or self.model_config.is_moe
-                ):
+                if self.uses_coordinated_dp:
                     logger.info_once(
                         "Disabling NCCL for DP synchronization "
                         "when using async scheduling.",
@@ -2048,9 +2050,7 @@ class VllmConfig:
 
         # Do this after all the updates to compilation_config.mode
         effective_dp_size = (
-            self.parallel_config.data_parallel_size
-            if self.model_config is None or self.model_config.is_moe
-            else 1
+            self.parallel_config.data_parallel_size if self.uses_coordinated_dp else 1
         )
         self.compilation_config.set_splitting_ops_for_v1(
             all2all_backend=self.parallel_config.all2all_backend,
