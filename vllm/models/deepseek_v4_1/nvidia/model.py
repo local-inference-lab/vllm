@@ -369,7 +369,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
         if vllm_config.lora_config is not None:
             raise ValueError("V4.1 native kernels do not support LoRA adapters")
-        if quant_config is None or quant_config.get_name() != "deepseek_v41_fp8":
+        if quant_config is None or quant_config.get_name() not in (
+            "deepseek_v41_fp8",
+            "exact_mxfp4",
+        ):
             raise ValueError("V4.1 requires its native block32 quantization config")
         self.vocab_size = config.vocab_size
         self.hc_eps = config.hc_eps
