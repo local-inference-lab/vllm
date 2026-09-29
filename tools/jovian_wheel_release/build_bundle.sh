@@ -16,6 +16,12 @@ lock_value() {
 
 source_commit=$(git -C "${repo_root}" rev-parse HEAD)
 source_tree=$(git -C "${repo_root}" rev-parse 'HEAD^{tree}')
+# A worktree's .git file refers outside Docker's source context. A standalone
+# snapshot may supply the context, but must contain exactly the reviewed tree.
+source_context=${VLLM_BUILD_CONTEXT:-${repo_root}}
+test "$(git -C "${source_context}" rev-parse HEAD)" = "${source_commit}"
+test "$(git -C "${source_context}" rev-parse 'HEAD^{tree}')" = "${source_tree}"
+test -z "$(git -C "${source_context}" status --porcelain)"
 # FetchContent applies tracked patches inside dependency checkouts. Different
 # recipes cannot safely share those mutable checkouts or their native objects.
 dependency_recipe=$(git -C "${repo_root}" rev-parse HEAD:cmake/external_projects)
@@ -24,6 +30,42 @@ repository=${GITHUB_REPOSITORY:-local-inference-lab/vllm}
 release_tag=${VLLM_RELEASE_TAG:-"vllm-jovian-cu134-beta-${source_commit}"}
 builder=$(lock_value buildx.builder)
 test -z "$(git -C "${repo_root}" status --porcelain)"
+build_target='export'
+native_args=()
+native_source_commit=
+native_wheel_sha256=
+if [[ -n ${VLLM_PRECOMPILED_BUNDLE:-} ]]; then
+  native_bundle=$(realpath "${VLLM_PRECOMPILED_BUNDLE}")
+  (cd "${native_bundle}" && sha256sum --check SHA256SUMS)
+  native_manifest=${native_bundle}/manifest.json
+  jq -e '.schema == "local-inference-vllm-wheel-release/v2"' \
+    "${native_manifest}" >/dev/null
+  native_source_commit=$(jq -er .source.commit "${native_manifest}")
+  native_wheel_sha256=$(jq -er '.packages[] | select(.name == "vllm") | .sha256' \
+    "${native_manifest}")
+  for field in builder_image python cuda pytorch pytorch_commit cuda_arch_list cutlass_dsl; do
+    case "$field" in
+      builder_image) key=builder.image ;;
+      python) key=python.version ;;
+      cuda) key=cuda.version ;;
+      pytorch) key=pytorch.version ;;
+      pytorch_commit) key=pytorch.commit ;;
+      cuda_arch_list) key=cuda.arch-list ;;
+      cutlass_dsl) key=cutlass-dsl.version ;;
+    esac
+    test "$(jq -er --arg key "$field" '.runtime[$key]' "${native_manifest}")" \
+      = "$(lock_value "$key")"
+  done
+  # Python-only releases may reuse binaries only with identical native inputs.
+  git -C "${repo_root}" diff --exit-code "${native_source_commit}" HEAD -- \
+    csrc cmake rust requirements CMakeLists.txt setup.py pyproject.toml \
+    vllm/vllm_flash_attn vllm/third_party \
+    tools/jovian_wheel_release/runtime.lock \
+    tools/jovian_wheel_release/build-requirements.lock \
+    tools/jovian_wheel_release/normalize_wheel.py
+  build_target=export-precompiled
+  native_args=(--build-context "native-bundle=${native_bundle}")
+fi
 
 mkdir -p "$(dirname "${output_dir}")"
 if ! mkdir "${output_dir}"; then
@@ -44,9 +86,10 @@ docker buildx build \
   --build-arg "DEPENDENCY_RECIPE=${dependency_recipe}" \
   --build-arg "CUTLASS_DSL_VERSION=$(lock_value cutlass-dsl.version)" \
   --build-arg "VLLM_BUILD_CUTLASS_SCALED_MM_C2X=$(lock_value build.cutlass-scaled-mm-c2x)" \
-  --target export \
+  --target "${build_target}" \
+  "${native_args[@]}" \
   --output "type=local,dest=${output_dir}/raw" \
-  "${repo_root}"
+  "${source_context}"
 cp -a "${output_dir}/raw/wheels/." "${output_dir}/bundle/wheels/"
 
 wheel=$(find "${output_dir}/bundle/wheels" -maxdepth 1 -name 'vllm-*.whl' -print -quit)
@@ -108,9 +151,14 @@ jq -n \
   --arg cuda_arch_list "$(lock_value cuda.arch-list)" \
   --arg cutlass_scaled_mm_c2x "$(lock_value build.cutlass-scaled-mm-c2x)" \
   --arg cutlass_dsl "$(lock_value cutlass-dsl.version)" \
+  --arg native_source_commit "${native_source_commit}" \
+  --arg native_wheel_sha256 "${native_wheel_sha256}" \
   '{schema: "local-inference-vllm-wheel-release/v2", status: $status,
     scope: "vLLM native and Python runtime for Qwen3.8 SM120 serving",
     source: {repository: $repository, commit: $commit, tree: $tree},
+    native_reuse: (if $native_source_commit == "" then null else
+      {source_commit: $native_source_commit, wheel_sha256: $native_wheel_sha256,
+       contract: "identical native source, dependency recipe and runtime ABI"} end),
     package_version: $package_version, release_tag: $release_tag,
     runtime: {builder_image: $builder_image, rust_image: $rust_image,
       uv_image: $uv_image, python: $python, cuda: $cuda, pytorch: $pytorch,
