@@ -38,6 +38,14 @@ if ! test -f "${dense_source}/kernel_selector.h" \
   done < <(find "${source_root}/build" -type f -name CMakeCache.txt -print0)
 fi
 
+# Every branch with the same dependency recipe shares the native build cache.
+# setuptools stages Python modules under build/lib.* and bdist.*, and the wheel
+# packages everything staged there, so a module that exists only on another
+# branch would ship in this wheel. Compiled objects stay cached in build/temp.*;
+# CMake installs them into the staging directory again.
+find "${source_root}/build" -mindepth 1 -maxdepth 1 \
+  \( -name 'lib.*' -o -name 'bdist.*' \) -exec rm -rf -- {} +
+
 env -u PYTHONPATH \
   VLLM_TARGET_DEVICE=cuda \
   CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=120a -DFETCHCONTENT_BASE_DIR=/tmp/vllm-fetchcontent -DVLLM_BUILD_CUTLASS_SCALED_MM_C2X=${VLLM_BUILD_CUTLASS_SCALED_MM_C2X:?}" \
