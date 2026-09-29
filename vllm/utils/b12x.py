@@ -244,6 +244,14 @@ def get_b12x_dense_activation_mode(recipe: Literal["nvfp4", "mxfp8"]) -> str:
     return override if override is not None else envs.VLLM_B12X_DENSE_ACTIVATION_MODE
 
 
+def get_b12x_a16_max_tokens() -> int:
+    """Read the NVFP4 A16 token cutoff during layer preparation."""
+    cutoff = envs.VLLM_B12X_ACTIVATION_MODE_A16_M
+    if cutoff < 0:
+        raise ValueError("VLLM_B12X_ACTIVATION_MODE_A16_M must be nonnegative")
+    return cutoff
+
+
 _HAS_B12X = importlib.util.find_spec("b12x") is not None
 
 

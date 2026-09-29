@@ -796,12 +796,17 @@ def test_b12x_nvfp4_layer_max_input_scales_are_independent(
 
 
 @pytest.mark.parametrize("uniform", [True, False])
+@pytest.mark.parametrize("cutoff", [0, 32])
 def test_b12x_nvfp4_preparation_preserves_static_scale_contract(
-    monkeypatch: pytest.MonkeyPatch, uniform: bool
+    monkeypatch: pytest.MonkeyPatch, uniform: bool, cutoff: int
 ) -> None:
     """Loaded uniform scales admit shared quantization without losing the vector."""
     fused_moe = pytest.importorskip("b12x.moe.fused_moe")
-    from b12x.moe.fused_moe._impl import B12XFP4ExpertWeights
+    monkeypatch.setenv("VLLM_B12X_ACTIVATION_MODE_A16_M", str(cutoff))
+    from b12x.moe.fused_moe._impl import (
+        B12XFP4ExpertWeights,
+        _PreparedWeightRepresentation,
+    )
 
     # Keep the real scale-ownership check; only CUDA weight packing is excluded.
     def prepare_weights(*, plan, weights):
@@ -816,6 +821,15 @@ def test_b12x_nvfp4_preparation_preserves_static_scale_contract(
             w2_blockscale=weights.w2_block_scales,
             w2_alphas=weights.w2_global_scales,
             immutable_input_scales=weights.immutable_input_scales,
+            representation=(
+                _PreparedWeightRepresentation(
+                    quant_mode="w4a16",
+                    layout="source_native",
+                    value=SimpleNamespace(w13=weights.w13, w2=weights.w2),
+                )
+                if cutoff
+                else None
+            ),
         )
 
     monkeypatch.setattr(fused_moe, "prepare_weights", prepare_weights)
@@ -843,6 +857,7 @@ def test_b12x_nvfp4_preparation_preserves_static_scale_contract(
     )
 
     assert prepared.a1_gscale is scales
+    assert prepared.plan.quant_modes == ({"nvfp4", "w4a16"} if cutoff else {"nvfp4"})
     assert prepared.can_share_input(input_scales_static=True) is uniform
     assert not prepared.can_share_input(input_scales_static=False)
     scales[-1] = 2.0
@@ -1186,6 +1201,8 @@ def _make_b12x_moe_case(
         )
         w1_q, w1_scale, w1_alpha, a1_scale = prepared[:4]
         w2_q, w2_scale, w2_alpha, a2_scale = prepared[4:]
+        w1_alpha = torch.nn.Parameter(w1_alpha, requires_grad=False)
+        w2_alpha = torch.nn.Parameter(w2_alpha, requires_grad=False)
         if activation_dtype is None:
             quant_config = nvfp4_w4a16_moe_quant_config(
                 g1_alphas=w1_alpha,
@@ -1442,21 +1459,25 @@ def test_b12x_moe_tuning_times_native_candidate_without_capture(
 @pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
 @pytest.mark.parametrize(
     "weight_dtype,activation_dtype",
-    [("nvfp4", "nvfp4"), ("mxfp4", "mxfp8"), ("nvfp4", None)],
-    ids=["nvfp4", "w4a8", "w4a16"],
+    [("nvfp4", "nvfp4"), ("mxfp4", "mxfp8"), ("nvfp4", None), ("nvfp4", "mxfp8")],
+    ids=["nvfp4", "w4a8", "w4a16", "nvfp4-a8"],
 )
 @torch.inference_mode()
 @pytest.mark.parametrize("capacity", [4, 128])
+@pytest.mark.parametrize("cutoff", [0, 32])
 def test_b12x_moe_prefill_capacity_and_exact_decode_reuse(
     weight_dtype,
     activation_dtype,
     workspace_init,
     capacity,
+    cutoff,
+    monkeypatch,
 ) -> None:
     from b12x._lib.runtime_control import kernel_resolution_guard
 
     from vllm.v1.worker.workspace import current_workspace_manager, lock_workspace
 
+    monkeypatch.setenv("VLLM_B12X_ACTIVATION_MODE_A16_M", str(cutoff))
     with set_current_vllm_config(
         VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
     ):
@@ -1468,7 +1489,7 @@ def test_b12x_moe_prefill_capacity_and_exact_decode_reuse(
             case.topk,
             case.activation,
             case.quant_config,
-            fixed_token_counts=(4,) if capacity > 4 else (),
+            fixed_token_counts=(3, 4, 5, 6) if capacity > 4 else (3,),
         )
         weights, ids, _ = fused_topk(
             case.hidden_states,
@@ -1477,6 +1498,18 @@ def test_b12x_moe_prefill_capacity_and_exact_decode_reuse(
             renormalize=False,
         )
         ids64 = ids.to(torch.int64)
+        if cutoff and weight_dtype == "nvfp4":
+            plan = kernel.fused_experts._plan
+            children = plan.variants if hasattr(plan, "variants") else {capacity: plan}
+            for rows, child in children.items():
+                if rows <= cutoff or activation_dtype is None:
+                    assert child.selection.config.backend == "w4a16"
+                    assert child.query.quant_modes == ("w4a16",)
+                else:
+                    assert child.selection.config.backend != "w4a16"
+                    assert child.query.quant_modes == (
+                        "nvfp4" if activation_dtype == "nvfp4" else "w4a8_nvfp4",
+                    )
         if activation_dtype == "nvfp4":
             reference = _nvfp4_activation_reference(
                 case.hidden_states,
@@ -1510,15 +1543,39 @@ def test_b12x_moe_prefill_capacity_and_exact_decode_reuse(
                 apply_router_weight_on_input=False,
             )
 
+        a16_reference = torch_moe(
+            case.hidden_states,
+            case.w1_ref,
+            case.w2_ref,
+            case.score,
+            case.topk,
+            activation=case.activation,
+        )
+        if cutoff and weight_dtype == "nvfp4":
+            expected_weights, expected_ids = torch.topk(
+                torch.softmax(case.score, dim=-1, dtype=torch.float32), case.topk
+            )
+            torch.testing.assert_close(ids[:4].long(), expected_ids[:4])
+            torch.testing.assert_close(weights[:4], expected_weights[:4])
+        original_input = case.hidden_states.clone()
+
         def check(output, rows):
+            torch.testing.assert_close(
+                case.hidden_states, original_input, rtol=0, atol=0
+            )
+            expected = (
+                a16_reference
+                if weight_dtype == "nvfp4" and rows <= cutoff
+                else reference
+            )[:rows]
             assert torch.isfinite(output).all() and torch.count_nonzero(output)
-            torch.testing.assert_close(output, reference[:rows], atol=2e-1, rtol=2e-1)
+            torch.testing.assert_close(output, expected, atol=2e-1, rtol=2e-1)
             cosine = torch.nn.functional.cosine_similarity(
                 output.flatten().float(),
-                reference[:rows].flatten().float(),
+                expected.flatten().float(),
                 dim=0,
             )
-            assert cosine > 0.99
+            assert cosine > 0.99, (rows, cutoff, float(cosine))
 
         try:
             apply(capacity)
@@ -1534,19 +1591,30 @@ def test_b12x_moe_prefill_capacity_and_exact_decode_reuse(
             session.freeze()
             with kernel_resolution_guard("prepared MoE capacity reuse"):
                 for rows in (
-                    count for count in (4, 3, 11, 31, 125, 128) if count <= capacity
+                    count
+                    for count in (4, 3, 5, 6, 7, 11, 31, 32, 33, 125, 128)
+                    if count <= capacity
                 ):
                     for route_ids in (ids, ids64):
                         check(apply(rows, route_ids), rows)
-                graph = torch.cuda.CUDAGraph()
-                try:
-                    with session.capture(), torch.cuda.graph(graph):
-                        actual = apply(4)
-                    graph.replay()
-                    torch.accelerator.synchronize()
-                    check(actual, 4)
-                finally:
-                    graph.reset()
+                graph_rows = (
+                    (3, 5, 31, 32, 33) if cutoff and capacity > cutoff else (3, 4)
+                )
+                for rows in graph_rows:
+                    graph = torch.cuda.CUDAGraph()
+                    try:
+                        with session.capture(), torch.cuda.graph(graph):
+                            actual = apply(rows)
+                        pointer = actual.data_ptr()
+                        actual.fill_(float("nan"))
+                        allocated = torch.accelerator.memory_allocated()
+                        graph.replay()
+                        torch.accelerator.synchronize()
+                        assert allocated == torch.accelerator.memory_allocated()
+                        assert pointer == actual.data_ptr()
+                        check(actual, rows)
+                    finally:
+                        graph.reset()
             assert buffers == tuple(
                 (buffer.data_ptr(), buffer.numel())
                 for buffer in current_workspace_manager()._current_workspaces

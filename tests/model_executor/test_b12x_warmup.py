@@ -535,7 +535,8 @@ def test_blockscaled_holder_declares_provided_workspace_under_the_cap(
             assert set(prepare_calls) == set(self.token_counts) == set(benchmark_calls)
             return _Request(name)
 
-    def plan_regimes(query, *, exact_m):
+    def plan_regimes(query, *, exact_m, a16_max_tokens):
+        assert a16_max_tokens == 0
         regimes.append(exact_m)
         return _Plan()
 

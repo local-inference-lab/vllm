@@ -83,7 +83,9 @@ class Nvfp4OnlineLinearMethod(OnlineLinearBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.use_a16:
+        if self.use_a16 or (
+            x.numel() // x.shape[-1] <= layer.b12x_linear.a16_max_tokens
+        ):
             return self.kernel.apply_weights(layer, x, bias)
         amax = x.abs().amax().float().clamp_min(1e-8)
         input_scale = amax / (FLOAT4_E2M1_MAX * FLOAT8_E4M3_MAX)

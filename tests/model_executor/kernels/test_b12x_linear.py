@@ -1148,6 +1148,26 @@ def test_b12x_nvfp4_can_implement_supported_config() -> None:
     assert reason is None
 
 
+@pytest.mark.parametrize("value,expected", [(None, 0), ("0", 0), ("32", 32)])
+def test_b12x_a16_cutoff_environment(monkeypatch, value, expected):
+    from vllm.utils.b12x import get_b12x_a16_max_tokens
+
+    if value is None:
+        monkeypatch.delenv("VLLM_B12X_ACTIVATION_MODE_A16_M", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_B12X_ACTIVATION_MODE_A16_M", value)
+    assert get_b12x_a16_max_tokens() == expected
+
+
+@pytest.mark.parametrize("value", ["-1", "1.5", "auto"])
+def test_b12x_a16_cutoff_rejects_invalid_environment(monkeypatch, value):
+    from vllm.utils.b12x import get_b12x_a16_max_tokens
+
+    monkeypatch.setenv("VLLM_B12X_ACTIVATION_MODE_A16_M", value)
+    with pytest.raises(ValueError):
+        get_b12x_a16_max_tokens()
+
+
 def test_b12x_backend_selects_native_w4a16(monkeypatch) -> None:
     import vllm.model_executor.kernels.linear as linear_mod
     from vllm.model_executor.kernels.linear.nvfp4.marlin import MarlinNvFp4LinearKernel
@@ -1371,6 +1391,7 @@ def _serialized_probe_layer(name: str) -> torch.nn.Module:
     layer.b12x_activation_mode = "quantized"
     layer.b12x_bf16_input_supported = True
     layer.b12x_nvfp4_serialized_activations = True
+    layer.b12x_linear = types.SimpleNamespace(a16_max_tokens=0)
     layer.b12x_nvfp4_packed_weight = types.SimpleNamespace(
         in_features=256,
         padded_in_features=256,
@@ -1632,7 +1653,10 @@ def test_b12x_dense_precision_rejects_invalid_override(monkeypatch, recipe):
 
 @pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("mode", ["auto", "a16", "quantized"])
-def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, tmp_path, recipe, mode):
+@pytest.mark.parametrize("cutoff", [0, 32])
+def test_b12x_dense_precision_gpu_graph_replay(
+    monkeypatch, tmp_path, recipe, mode, cutoff
+):
     """Prepare real exact-M executions, then verify numerical and graph replay."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (12, 0),
@@ -1640,6 +1664,9 @@ def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, tmp_path, recipe, mo
     ):
         pytest.skip("SM120/SM121 required")
     blockscaled = pytest.importorskip("b12x.gemm.blockscaled")
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.preparation import require_prepared
+
     from tests.kernels.quantization.nvfp4_utils import dequantize_nvfp4_to_dtype
     from vllm._custom_ops import scaled_fp4_quant
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
@@ -1648,6 +1675,7 @@ def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, tmp_path, recipe, mo
     from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
 
     monkeypatch.setenv(f"VLLM_B12X_{recipe.upper()}_ACTIVATION_MODE", mode)
+    monkeypatch.setenv("VLLM_B12X_ACTIVATION_MODE_A16_M", str(cutoff))
     torch.manual_seed(1234)
     n, k = 4096, 5376
     layer = torch.nn.Module()
@@ -1664,7 +1692,7 @@ def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, tmp_path, recipe, mo
         layer.input_global_scale_inv = torch.tensor([128.0], device="cuda")
         layer.alpha = layer.weight_global_scale / layer.input_global_scale_inv
         kernel = B12xNvFp4LinearKernel(NvFp4LinearLayerConfig())
-        counts: tuple[int, ...] = (1, 8, 32)
+        counts: tuple[int, ...] = (1, 8, 64) if cutoff else (1, 8, 32)
     else:
         values = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
         exponents = torch.randint(
@@ -1740,15 +1768,24 @@ def test_b12x_dense_precision_gpu_graph_replay(monkeypatch, tmp_path, recipe, mo
 
         reference_plans = {}
 
-        for m in reversed(counts):
+        state = require_prepared(layer.b12x_linear.plan, "gemm.blockscaled_precision")
+        live_counts = (
+            (1, 8, 17, 31, 32, 33, 64) if cutoff and recipe == "nvfp4" else counts
+        )
+        for m in reversed(live_counts):
             source = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-            config = layer.b12x_linear.plan.variants[m].selection.config
+            config = state.resolve(source).config
+            if cutoff and recipe == "nvfp4":
+                if m <= cutoff:
+                    assert config.mode == "a16"
+                elif mode != "auto":
+                    assert config.mode == mode
             expected = reference(source, config.mode == "a16")
             for _ in range(3):
                 actual = kernel.apply_weights(layer, source, bias)
             torch.testing.assert_close(actual, expected, atol=0.5, rtol=0.02)
             graph = torch.cuda.CUDAGraph()
-            with session.capture():
+            with kernel_resolution_guard("NVFP4 A16 cutoff replay"), session.capture():
                 with torch.cuda.graph(graph):
                     output = kernel.apply_weights(layer, source, bias)
                 pointer = output.data_ptr()

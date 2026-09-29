@@ -33,6 +33,7 @@ from vllm.utils.b12x import (
     B12xPreparationUnit,
     B12xWorkload,
     PreparationResourceUnavailableError,
+    get_b12x_a16_max_tokens,
     get_b12x_fused_moe,
     reuse_packed_weight_storage,
     set_b12x_preparation_provider,
@@ -272,6 +273,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 f"unsupported b12x MoE quantization scheme {scheme}"
             ) from exc
         self._prepared_experts: Any | None = None
+        self._a16_max_tokens = (
+            get_b12x_a16_max_tokens() if self._source_format == "modelopt_nvfp4" else 0
+        )
         self._source_parameters_released = False
         self._unit_scales: dict[torch.device, torch.Tensor] = {}
         self._apply_router_weight_on_input = False
@@ -412,6 +416,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 swiglu_limit=limit,
                 swiglu_alpha=alpha,
                 swiglu_beta=beta,
+                a16_max_tokens=self._a16_max_tokens,
             ),
             geometry=fused_moe.MoEGeometry(
                 num_experts=num_experts,
@@ -780,6 +785,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             )
         key = (
             self._quant_mode,
+            self._a16_max_tokens,
             self._source_format,
             self._w13_layout,
             activation,

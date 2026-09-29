@@ -158,8 +158,9 @@ def test_runtime_lm_head_defaults_preserve_ineligible_heads(
 
 
 @pytest.mark.parametrize("use_a16", [False, True, None])
+@pytest.mark.parametrize("cutoff", [0, 2])
 def test_draft_nvfp4_head_preserves_verifier_and_dynamic_graph_scales(
-    monkeypatch, mxfp8_head_config, use_a16
+    monkeypatch, mxfp8_head_config, use_a16, cutoff
 ):
     from vllm._custom_ops import scaled_fp4_quant
     from vllm.model_executor.layers.quantization.online.nvfp4 import (
@@ -173,6 +174,7 @@ def test_draft_nvfp4_head_preserves_verifier_and_dynamic_graph_scales(
 
     if not current_platform.is_device_capability_family(120):
         pytest.skip("Requires b12x on SM120/SM121")
+    monkeypatch.setenv("VLLM_B12X_ACTIVATION_MODE_A16_M", str(cutoff))
     if use_a16 is None:
         for name in (
             "VLLM_MXFP8_LM_HEAD",
@@ -227,10 +229,9 @@ def test_draft_nvfp4_head_preserves_verifier_and_dynamic_graph_scales(
     w_ref = (
         break_fp4_bytes(qw, torch.float32) * sw.float().repeat_interleave(16, 1) / w_inv
     )
-    if use_a16:
-        w_ref = (
-            break_fp4_bytes(qw, torch.float32) * sw.float().repeat_interleave(16, 1)
-        ).bfloat16().float() / w_inv
+    w_a16_ref = (
+        break_fp4_bytes(qw, torch.float32) * sw.float().repeat_interleave(16, 1)
+    ).bfloat16().float() / w_inv
     from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
 
     reset_workspace_manager()
@@ -258,9 +259,10 @@ def test_draft_nvfp4_head_preserves_verifier_and_dynamic_graph_scales(
                 * sx.float().repeat_interleave(16, 1)
                 / x_inv
             )
-            if use_a16:
+            if use_a16 or tokens <= cutoff:
                 x_ref = x.float()
-            expected = (x_ref @ w_ref.T).to(torch.bfloat16)
+            expected_weight = w_a16_ref if use_a16 or tokens <= cutoff else w_ref
+            expected = (x_ref @ expected_weight.T).to(torch.bfloat16)
             torch.testing.assert_close(result, expected, rtol=0.016, atol=0.001)
             assert torch.isfinite(result).all()
         graph.reset()

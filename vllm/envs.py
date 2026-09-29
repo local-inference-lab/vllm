@@ -195,6 +195,7 @@ if TYPE_CHECKING:
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
+    VLLM_B12X_ACTIVATION_MODE_A16_M: int = 0
     VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE: Literal["0", "1", "all", "w13", "w2"] = "0"
     VLLM_DEFAULT_MOE_BACKEND: str = "auto"
     VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
@@ -1748,6 +1749,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Force b12x FP4 MoE to use BF16 activations.
     "VLLM_B12X_MOE_FP4_FORCE_A16": lambda: bool(
         int(os.getenv("VLLM_B12X_MOE_FP4_FORCE_A16", "0"))
+    ),
+    # Force NVFP4 dense and MoE A16 at M <= cutoff, including small prefills.
+    # Zero disables the cutoff; larger M retains its configured precision.
+    "VLLM_B12X_ACTIVATION_MODE_A16_M": lambda: int(
+        os.getenv("VLLM_B12X_ACTIVATION_MODE_A16_M", "0")
     ),
     # Select layer-wide activation scales for b12x NVFP4 MoE projections.
     "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE": env_with_choices(

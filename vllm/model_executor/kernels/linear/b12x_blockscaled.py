@@ -23,6 +23,7 @@ from vllm.utils.b12x import (
     B12xPreparationUnit,
     B12xWorkload,
     PreparationResourceUnavailableError,
+    get_b12x_a16_max_tokens,
     get_b12x_blockscaled,
 )
 
@@ -61,6 +62,7 @@ class B12xBlockscaledLinear:
         self.packed = packed
         self.recipe = recipe
         self.activation_mode = activation_mode
+        self.a16_max_tokens = get_b12x_a16_max_tokens() if recipe == "nvfp4" else 0
         self.layer_name = layer_name
         self.activation_scale = activation_scale
         self.plan = None
@@ -94,6 +96,7 @@ class B12xBlockscaledLinear:
         return (
             self.recipe,
             self.activation_mode,
+            self.a16_max_tokens,
             self.in_features,
             int(self.packed.padded_in_features),
             self.out_features,
@@ -148,7 +151,11 @@ class B12xBlockscaledLinear:
             workspace_nbytes=envs.VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES,
             expected_m=None,
         )
-        self.plan = api.plan_regimes(query, exact_m=workload.fixed_token_counts)
+        self.plan = api.plan_regimes(
+            query,
+            exact_m=workload.fixed_token_counts,
+            a16_max_tokens=self.a16_max_tokens,
+        )
         self._plan_key = key
         return self.plan
 

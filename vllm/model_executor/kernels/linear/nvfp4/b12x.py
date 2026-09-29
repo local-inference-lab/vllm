@@ -17,6 +17,7 @@ from vllm.utils.b12x import (
     B12xWorkload,
     b12x_layer,
     b12x_layer_prefix,
+    get_b12x_a16_max_tokens,
     get_b12x_dense_activation_mode,
     register_b12x_layer,
     run_b12x_blockscaled_linear,
@@ -75,7 +76,7 @@ def _serialized_call(layer: torch.nn.Module, rows: int, out_dtype: torch.dtype):
         source = torch.empty(
             (rows, packed.in_features), dtype=out_dtype, device=weight.device
         )
-        quantized = []
+        quantized: list[torch.Tensor] = []
 
         def produce():
             indices = torch.arange(
@@ -271,9 +272,10 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
                 )
             mode = "a16"
         layer.b12x_activation_mode = mode
+        a16_max_tokens = get_b12x_a16_max_tokens()
         n, packed_k = layer.weight.shape
         logical_k = int(packed_k) * 2
-        if mode == "a16" and logical_k % 32:
+        if (mode == "a16" or a16_max_tokens) and logical_k % 32:
             stored_k = (logical_k + 31) // 32 * 32
             # Align serialized storage without changing the model's logical K
             # or splitting a 16-element quantization group.
@@ -307,9 +309,11 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
         layer.b12x_nvfp4_packed_weight = replace(packed, in_features=logical_k)
         layer.b12x_bf16_input_supported = (
             current_platform.is_device_capability_family(120)
-            and (logical_k % 128 == 0 or mode == "a16")
+            and (logical_k % 128 == 0 or mode == "a16" or a16_max_tokens > 0)
             and n % 8 == 0
         )
+        if a16_max_tokens and not layer.b12x_bf16_input_supported:
+            raise ValueError("b12x NVFP4 A16 token cutoff requires SM12x and N%8=0")
         name = b12x_layer_prefix(layer)
         activation_scale = (
             None if layer.b12x_weight_only else layer.input_global_scale_inv
@@ -347,6 +351,9 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
             and layer.b12x_bf16_input_supported
             and not getattr(layer, "b12x_nvfp4_serialized_activations", False)
         )
+        cutoff = layer.b12x_linear.a16_max_tokens
+        if cutoff and workload.output_dtype != torch.bfloat16:
+            raise ValueError("b12x NVFP4 A16 token cutoff requires BF16 activations")
         if layer.b12x_activation_mode == "a16" and not packed_input:
             raise ValueError(
                 "b12x W4A16 preparation requires BF16 activations and N%8=0"
@@ -373,7 +380,7 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
             )
         if not requests:
             return ()
-        return (
+        units: tuple[B12xPreparationUnit, ...] = (
             B12xPreparationUnit(
                 name="NVFP4",
                 key=(prefix, "serialized", tuple(sorted(plans))),
@@ -381,6 +388,29 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
                 stage="weights",
             ),
         )
+        if cutoff:
+            max_tokens = min(cutoff, workload.max_tokens)
+            linear_workload = replace(
+                workload,
+                max_tokens=max_tokens,
+                token_counts=tuple(
+                    sorted(
+                        {
+                            max_tokens,
+                            *(n for n in workload.token_counts if n <= max_tokens),
+                        }
+                    )
+                ),
+                fixed_token_counts=tuple(
+                    n for n in workload.fixed_token_counts if n < max_tokens
+                ),
+            )
+            units += (
+                layer.b12x_linear.unit(
+                    linear_workload, name=f"linear.nvfp4.{prefix}.a16"
+                ),
+            )
+        return units
 
     def get_workspace_size(self, layer: torch.nn.Module, rows: int) -> int:
         linear = getattr(layer, "b12x_linear", None)
