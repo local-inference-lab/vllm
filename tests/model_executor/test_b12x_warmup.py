@@ -314,15 +314,17 @@ def test_tuning_pool_preserves_final_group_layout_with_less_storage(
 def test_tuning_pool_teardown_releases_all_plans_even_on_failure(monkeypatch, failure):
     from vllm.v1.worker.gpu import cudagraph_utils
 
-    released = []
+    released, release_batches = [], []
 
-    def release(plan):
-        released.append(plan)
-        if failure and plan == "second":
+    def release_many(plans):
+        plans = tuple(plans)
+        release_batches.append(plans)
+        released.extend(plans)
+        if failure:
             raise RuntimeError("release failed")
 
     batch = b12x_prepare.B12xPreparedBatch(
-        SimpleNamespace(release=release), ("first", "second")
+        SimpleNamespace(release_many=release_many), ("first", "second")
     )
     worker = SimpleNamespace(
         _b12x_tuning_cache=True, _b12x_tuning_batch=batch, model_runner=object()
@@ -343,6 +345,7 @@ def test_tuning_pool_teardown_releases_all_plans_even_on_failure(monkeypatch, fa
     batch.release()
     b12x_prepare.release_b12x_tuning_cache(worker)
     assert released == ["second", "first", "pool"]
+    assert release_batches == [("second", "first")]
 
 
 def test_collect_units_filters_by_stage_and_tunes_eager_shapes() -> None:
@@ -654,7 +657,7 @@ def test_profile_prepares_collectives_and_releases_only_fresh_plans(
     session = SimpleNamespace(
         state="OPEN",
         begin=begin,
-        release=lambda plan: released.append(plan.name),
+        release_many=lambda plans: released.extend(plan.name for plan in plans),
         cancel_tuning=lambda: None,
     )
     monkeypatch.setattr(b12x_prepare, "b12x_native_supported", lambda worker: True)
