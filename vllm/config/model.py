@@ -1285,6 +1285,7 @@ class ModelConfig:
                 "modelopt_mixed",
                 "exl3",
                 "trellis_dense",
+                "exact_mxfp4",
                 # Ensure heavy backends are probed last to avoid unnecessary
                 # imports during override detection (e.g., MXFP4 imports Triton)
                 "mxfp4",
