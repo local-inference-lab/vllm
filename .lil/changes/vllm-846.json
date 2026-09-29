@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-846",
+  "category": "performance",
+  "summary": "Reuse verified native wheel payloads and recover incomplete FlashInfer autotune caches",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Python-only wheel rebuilds reuse native binaries only when native source, dependency and ABI signatures agree.",
+    "Autotune cache writes are atomic; an incomplete cache is discarded and regenerated."
+  ],
+  "pull_requests": [846],
+  "requires": []
+}
