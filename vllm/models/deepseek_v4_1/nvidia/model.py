@@ -369,7 +369,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
         if vllm_config.lora_config is not None:
             raise ValueError("V4.1 native kernels do not support LoRA adapters")
-        if quant_config is None or quant_config.get_name() != "deepseek_v41_fp8":
+        if quant_config is None or quant_config.get_name() not in (
+            "deepseek_v41_fp8", "trellis_dense"
+        ):
             raise ValueError("V4.1 requires its native block32 quantization config")
         self.vocab_size = config.vocab_size
         self.hc_eps = config.hc_eps
@@ -921,6 +923,8 @@ class DeepseekV41LLMForCausalLM(UpstreamDeepseekV41LLMForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        if vllm_config.quant_config.get_name() == "trellis_dense":
+            self.allow_patterns_overrides = ["retained-*.safetensors"]
         self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(
             getattr(self.config, "expert_dtype", "fp4"), "weight_scale_inv"
         )

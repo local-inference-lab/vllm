@@ -47,6 +47,7 @@ _B12X_MOE_MODES: dict[
     ("mxfp4", "mxfp8"): ("w4a8_mx", "fp4_e8m0_k32", "w31"),
     ("mxfp4", None): ("w4a16", "fp4_e8m0_k32", "w31"),
     ("exl3", None): ("w4a16", "exl3", "w31"),
+    ("trellis_dense", None): ("w4a16", "trellis_dense", "w31"),
     ("nvfp4", "nvfp4"): ("nvfp4", "modelopt_nvfp4", "w31"),
     ("nvfp4", "mxfp8"): ("w4a8_nvfp4", "modelopt_nvfp4", "w31"),
     ("nvfp4", None): ("w4a16", "modelopt_nvfp4", "w31"),
@@ -250,6 +251,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             "mxfp4",
             "nvfp4",
             "exl3",
+            "trellis_dense",
             "iq2_xs",
             "iq2_xxs",
             "q8_0",
@@ -474,8 +476,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         return prepared
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if self._source_format == "exl3":
-            raise RuntimeError("EXL3 weights require install_prepared_experts")
+        if self._source_format in ("exl3", "trellis_dense"):
+            raise RuntimeError("Trellis weights require install_prepared_experts")
         self._apply_router_weight_on_input = layer.apply_router_weight_on_input
         if self._apply_router_weight_on_input and self._quant_mode != "w4a16":
             raise ValueError(
@@ -499,14 +501,14 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         )
 
     def install_prepared_experts(self, layer: torch.nn.Module, prepared: Any) -> None:
-        """Install EXL3 weights prepared through the common trellis API."""
+        """Install weights prepared through the container-independent trellis API."""
         fused_moe = _require_b12x_fused_moe()
         if (
-            self._source_format != "exl3"
+            self._source_format not in ("exl3", "trellis_dense")
             or not isinstance(prepared, fused_moe.PreparedExperts)
             or not isinstance(prepared.plan.source, fused_moe.TrellisSource)
         ):
-            raise TypeError("EXL3 installation requires B12X prepared trellis weights")
+            raise TypeError("Installation requires B12X prepared trellis weights")
         if (
             prepared.num_experts != self.moe_config.num_experts
             or prepared.hidden_size != self.moe_config.hidden_dim
@@ -520,7 +522,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             or layer.apply_router_weight_on_input
         ):
             raise ValueError(
-                "Prepared EXL3 geometry, activation or routing does not match the layer"
+                "Prepared trellis geometry, activation or routing does not match the layer"
             )
         self._apply_router_weight_on_input = False
         self._reuse_prepared_storage(layer, prepared)

@@ -62,6 +62,8 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
         model_config = vllm_config.model_config
         config = model_config.hf_config
         self.config = config
+        if vllm_config.quant_config.get_name() == "trellis_dense":
+            self.allow_patterns_overrides = ["retained-*.safetensors"]
         self.multimodal_config = model_config.multimodal_config
         assert self.multimodal_config is not None
 
