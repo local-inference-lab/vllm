@@ -183,7 +183,6 @@ class ExactMXFP4MoEMethod(FusedMoEMethodBase):
             geometry=fused_moe.MoEGeometry(
                 num_experts=e, hidden_size=h, intermediate_size=n
             ),
-            constraints=fused_moe.WeightPlanConstraints(required_packing="mma_packed"),
         )
         prepared = fused_moe.prepare_weights(plan=plan, weights=weights)
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
