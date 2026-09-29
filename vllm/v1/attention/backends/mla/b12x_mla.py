@@ -7,6 +7,7 @@ from typing import Any, ClassVar
 
 import torch
 
+from vllm import envs
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_dcp_group
@@ -342,6 +343,11 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                 v_head_dim=self.kv_lora_rank,
                 physical_record_width=cache.shape[2],
                 use_cuda_graph=True,
+                partial_dtype=(
+                    torch.float32
+                    if envs.VLLM_K3_DENSE_MLA_PARTIAL_DTYPE == "fp32"
+                    else torch.bfloat16
+                ),
             )
 
             def descriptor(shape, strides, dtype):
