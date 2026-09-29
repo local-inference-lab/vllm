@@ -499,28 +499,36 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         )
 
     def install_prepared_experts(self, layer: torch.nn.Module, prepared: Any) -> None:
-        """Install EXL3 weights prepared through the common trellis API."""
+        """Install canonical prepared experts without retaining source parameters."""
         fused_moe = _require_b12x_fused_moe()
-        if (
-            self._source_format != "exl3"
-            or not isinstance(prepared, fused_moe.PreparedExperts)
-            or not isinstance(prepared.plan.source, fused_moe.TrellisSource)
-        ):
-            raise TypeError("EXL3 installation requires B12X prepared trellis weights")
+        if not isinstance(prepared, fused_moe.PreparedExperts):
+            raise TypeError("Installation requires B12X PreparedExperts")
+        trellis = self._source_format == "exl3" and isinstance(
+            prepared.plan.source, fused_moe.TrellisSource
+        )
+        packed = (
+            self._source_format == "fp4_e8m0_k32"
+            and isinstance(prepared.plan.source, fused_moe.PackedSource)
+            and prepared.plan.source.format == "fp4_e8m0_k32"
+        )
+        if not (trellis or packed):
+            raise TypeError("Prepared expert encoding does not match the backend")
         if (
             prepared.num_experts != self.moe_config.num_experts
             or prepared.hidden_size != self.moe_config.hidden_dim
             or prepared.intermediate_size
             != self.moe_config.intermediate_size_per_partition
             or prepared.plan.activation.mode != "a16"
-            or prepared.plan.activation.rotation_dtype != torch.float16
+            or (trellis and prepared.plan.activation.rotation_dtype != torch.float16)
             or prepared.plan.activation.io_dtype != self.moe_config.in_dtype
             or prepared.plan.activation.nonlinearity
             != _b12x_activation_name(layer.activation)
+            or prepared.plan.activation.swiglu_limit != self.moe_config.swiglu_limit
             or layer.apply_router_weight_on_input
         ):
             raise ValueError(
-                "Prepared EXL3 geometry, activation or routing does not match the layer"
+                "Prepared expert geometry, activation or routing "
+                "does not match the layer"
             )
         self._apply_router_weight_on_input = False
         self._reuse_prepared_storage(layer, prepared)
