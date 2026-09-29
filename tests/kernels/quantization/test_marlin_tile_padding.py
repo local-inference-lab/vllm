@@ -449,6 +449,19 @@ def test_mxfp8_marlin_padded_round_trip(shape):
     assert output.shape == (8, size_n)
     torch.testing.assert_close(output, ref, rtol=2e-2, atol=2e-2)
 
+    padded_n, _ = marlin_repacked_nk(layer.weight, num_bits=8)
+    caller_output = torch.full((8, padded_n), float("nan"), dtype=dtype, device="cuda")
+    actual = apply_mxfp8_marlin_linear(
+        input=x,
+        weight=layer.weight,
+        weight_scale=layer.weight_scale,
+        workspace=layer.workspace,
+        size_n=size_n,
+        size_k=size_k,
+        output=caller_output,
+    )
+    torch.testing.assert_close(actual, output, rtol=0, atol=0)
+
 
 @pytest.mark.skipif(
     _gpu_marlin_unsupported(),

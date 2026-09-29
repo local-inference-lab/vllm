@@ -121,6 +121,9 @@ class DSparkSpeculator(DFlashSpeculator):
         target_attn_layer_names: set[str],
     ) -> torch.nn.Module:
         model = load_dspark_model(target_model, self.vllm_config)
+        bind_auxiliary_stream = getattr(model, "bind_target_auxiliary_stream", None)
+        if callable(bind_auxiliary_stream):
+            bind_auxiliary_stream(target_model, self.hidden_states)
         # Reduced draft vocab: probabilistic rejection sampling indexes draft
         # logits by target id, so precompute the draft->target column map and a
         # scratch buffer to scatter logits into target vocab before sampling.
@@ -139,7 +142,7 @@ class DSparkSpeculator(DFlashSpeculator):
             )
         self.use_confidence_head = (
             self.enable_adaptive_verification
-            and model.model.confidence_head is not None
+            and getattr(model.model, "confidence_head", None) is not None
         )
         if self.use_confidence_head:
             # The acceptance estimator is not needed when a trained confidence head
@@ -201,7 +204,12 @@ class DSparkSpeculator(DFlashSpeculator):
         # Per-(req, position) head hidden, ordered (req, step).
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
         # Draft-vocab logits; sampled ids are remapped to target vocab below.
-        base_logits = self.model.compute_draft_logits(sample_hidden)
+        local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
+        base_logits = (
+            self.model.compute_local_draft_logits(sample_hidden)
+            if local_head
+            else self.model.compute_draft_logits(sample_hidden)
+        )
         vocab_size = base_logits.shape[-1]
         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
 
@@ -218,6 +226,22 @@ class DSparkSpeculator(DFlashSpeculator):
             markov_embed = self.model.markov_embed(prev)
             if self.use_confidence_head:
                 confidence_markov_embeds.append(markov_embed)
+            if local_head:
+                bias = self.model.compute_local_markov_bias(markov_embed)
+                if self.draft_logits is None and self.acceptance_estimator is None:
+                    draft_sampled_i = self.model.sample_local_draft_logits(
+                        base_logits[:, i], bias
+                    )
+                else:
+                    logits_i = self.model.gather_local_draft_logits(
+                        base_logits[:, i], bias
+                    )
+                    draft_sampled_i = self._sample_logits(
+                        logits_i, idx_map[:, i], sample_pos[:, i], i
+                    )
+                self.draft_tokens[:num_reqs, i] = draft_sampled_i
+                prev = draft_sampled_i
+                continue
             bias = self.model.markov_bias(markov_embed)
             if (
                 self.draft_logits is None

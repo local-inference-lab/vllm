@@ -272,6 +272,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
 
 
 class TritonAttentionBackend(AttentionBackend):
+    # Replicated draft KV uses complete local sequence metadata, not DCP shards.
+    supports_dcp_replicated: ClassVar[bool] = True
+
     @classmethod
     def customize_spec(cls, spec: "AttentionSpec") -> "AttentionSpec":
         """Per-token-head modes pack inline fp32 scales after each head's

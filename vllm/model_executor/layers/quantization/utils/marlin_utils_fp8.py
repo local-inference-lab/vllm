@@ -405,12 +405,26 @@ def apply_mxfp8_marlin_linear(
     size_k: int,
     bias: torch.Tensor | None = None,
     use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
+    *,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     reshaped_x = input.reshape(-1, input.shape[-1])
     out_shape = input.shape[:-1] + (size_n,)
 
     padded_n, padded_k = marlin_repacked_nk(weight, num_bits=8)
     reshaped_x = marlin_pad_dim(reshaped_x, size_k, padded_k)
+
+    if output is not None and (
+        output.shape != (reshaped_x.shape[0], padded_n)
+        or output.dtype != input.dtype
+        or output.device != input.device
+        or not output.is_contiguous()
+        or output.untyped_storage().data_ptr() == input.untyped_storage().data_ptr()
+    ):
+        raise ValueError(
+            "Marlin output must be contiguous, disjoint from input, and match "
+            "the padded output shape, activation dtype and device"
+        )
 
     use_atomic_add = should_use_atomic_add_reduce(
         m=reshaped_x.size(0),
@@ -422,7 +436,7 @@ def apply_mxfp8_marlin_linear(
 
     output = ops.marlin_gemm(
         a=reshaped_x,
-        c=None,
+        c=output,
         b_q_weight=weight,
         b_bias=bias,
         b_scales=weight_scale,

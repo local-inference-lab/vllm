@@ -2,14 +2,60 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
 import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
+from vllm.config import (
+    AttentionConfig,
+    CacheConfig,
+    ParallelConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
 from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.models.qwen3_dflash import DFlashAttention
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.selector import _cached_get_attn_backend
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+
+def test_dflash_selects_local_triton_without_relaxing_target_dcp():
+    """A replicated draft selects local attention; a sharded target cannot."""
+    config = VllmConfig(
+        attention_config=AttentionConfig(backend=AttentionBackendEnum.TRITON_ATTN),
+        cache_config=CacheConfig(block_size=16),
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=16,
+            decode_context_parallel_size=16,
+            distributed_executor_backend="mp",
+        ),
+    )
+    _cached_get_attn_backend.cache_clear()
+    with set_current_vllm_config(config):
+        draft = DFlashAttention(
+            2,
+            128,
+            128**-0.5,
+            num_kv_heads=1,
+            cache_config=config.cache_config,
+            prefix="draft",
+        )
+        assert draft.get_attn_backend().get_name() == "TRITON_ATTN"
+        assert draft.get_kv_cache_spec(config).dcp_replicated
+        with pytest.raises(ValueError, match="DCP not supported"):
+            Attention(
+                2,
+                128,
+                128**-0.5,
+                num_kv_heads=1,
+                cache_config=config.cache_config,
+                prefix="target",
+            )
+    assert config.parallel_config.decode_context_parallel_size == 16
 
 
 def test_dflash_sliding_window_cache_uses_aligned_block_size():
@@ -133,10 +179,11 @@ def test_dflash_uses_draft_group_dcp_slot_parameters(
         ),
         dp_size=1,
         dp_rank=0,
+        pcp_manager=None,
         _group_causal=False,
         kv_cache_config=SimpleNamespace(),
         draft_tokens=torch.zeros((1, 1), dtype=torch.int64),
-        _build_draft_attn_metadata=lambda **_kwargs: {},
+        _build_uniform_attn_metadata=lambda **_kwargs: {},
         _prepare_eplb_forward=lambda *_args: None,
         _generate_draft=lambda *_args, **_kwargs: query_runs.append("eager"),
     )
@@ -181,7 +228,7 @@ def test_replicated_draft_metadata_uses_full_sequence_lengths(monkeypatch):
 
     monkeypatch.setattr(
         dflash_speculator.DraftModelSpeculator,
-        "_build_draft_attn_metadata",
+        "_build_attn_metadata",
         capture_metadata,
     )
     speculator = object.__new__(dflash_speculator.DFlashSpeculator)
@@ -198,10 +245,10 @@ def test_replicated_draft_metadata_uses_full_sequence_lengths(monkeypatch):
     )
     object.__setattr__(speculator, "num_query_per_req", 4)
 
-    result = speculator._build_draft_attn_metadata(
+    result = speculator._build_attn_metadata(
         num_reqs=2,
-        num_reqs_padded=2,
-        num_tokens_padded=8,
+        batch_desc=SimpleNamespace(num_reqs=2, num_tokens=8),
+        query_start_loc_np=np.array([0, 4, 8], dtype=np.int32),
         seq_lens_cpu_upper_bound=seq_lens,
         step=0,
     )
