@@ -47,6 +47,7 @@ class DeepseekV41TrellisConfig(DeepseekV41FP8Config):
     def override_quantization_method(cls, hf_quant_cfg, user_quant, hf_config=None):
         if (
             user_quant in (None, cls.get_name())
+            and hf_quant_cfg is not None
             and hf_quant_cfg.get("quant_method") == cls.get_name()
             and getattr(hf_config, "model_type", None)
             in ("deepseek_v41", "deepseek_v41_text")
