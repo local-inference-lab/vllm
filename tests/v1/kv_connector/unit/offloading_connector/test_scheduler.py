@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, call
@@ -57,6 +58,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
@@ -195,7 +197,57 @@ def test_swa_offload_window_covers_unaligned_hit(
     manager.complete_load(job.keys, state.req_context)
 
 
-def _make_partial_tail_scheduler() -> OffloadingConnectorScheduler:
+@pytest.mark.parametrize("dcp_size", [1, 8, 16])
+@pytest.mark.parametrize("replicated", [False, True])
+def test_offload_store_retains_draft_window_in_group_coordinates(dcp_size, replicated):
+    """Replicated draft pages must not inherit the target's DCP token width."""
+    config = _make_vllm_config(
+        tensor_parallel_size=dcp_size, decode_context_parallel_size=dcp_size
+    )
+    config.speculative_config = None
+    config.cache_config.block_size = 768
+    config.cache_config.prefix_cache_retention_interval = 0
+    groups = [
+        KVCacheGroupSpec(
+            ["target"],
+            FullAttentionSpec(
+                block_size=768, num_kv_heads=1, head_size=1, dtype=torch.float32
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["draft"],
+            SlidingWindowMLASpec(
+                block_size=768,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=32768,
+                dcp_replicated=replicated,
+            ),
+        ),
+    ]
+    caches = KVCacheConfig(num_blocks=128, kv_cache_tensors=[], kv_cache_groups=groups)
+    spec = MockOffloadingSpec(build_offloading_config(config, caches))
+    scheduler = OffloadingConnectorScheduler(spec, config, caches)
+    group = scheduler.config.kv_group_configs[1]
+    prompt_tokens = 78114
+    end = prompt_tokens // group.tokens_per_block
+    mask = scheduler._reachable_store_block_mask(
+        group, 0, end, end, (prompt_tokens - 1,)
+    )
+    alignment = 768 * dcp_size
+    boundary = (prompt_tokens - 1) // alignment * alignment
+    last_block = boundary // group.tokens_per_block
+    needed = (32768 - 2) // group.tokens_per_block + 1
+    assert mask is not None
+    assert [index for index, keep in enumerate(mask) if keep] == list(
+        range(last_block - needed, last_block)
+    )
+
+
+def _make_partial_tail_scheduler(
+    *, recurrent_groups: int = 1, recurrent_first: bool = False
+) -> OffloadingConnectorScheduler:
     vllm_config = _make_vllm_config(extra_config={"self_describing_kv_events": True})
     vllm_config.cache_config.prefix_match_unit = 4
     vllm_config.speculative_config = None
@@ -203,6 +255,14 @@ def _make_partial_tail_scheduler() -> OffloadingConnectorScheduler:
         enable_kv_cache_events=True, publisher="null"
     )
     kv_cache_config = _make_mamba_hybrid_kv_cache_config()
+    full_group, recurrent_group = kv_cache_config.kv_cache_groups
+    recurrent = [
+        replace(recurrent_group, layer_names=[f"mamba_layer_{index}"])
+        for index in range(recurrent_groups)
+    ]
+    kv_cache_config.kv_cache_groups = (
+        [*recurrent, full_group] if recurrent_first else [full_group, *recurrent]
+    )
     spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
     return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
 
@@ -371,14 +431,22 @@ def test_aligned_boundary_store_flushes_before_block_reuse(cow_reuse):
     assert meta.jobs_to_flush == {job_id}
 
 
-def test_normal_store_excludes_align_mode_mamba_sources():
-    scheduler = _make_partial_tail_scheduler()
+@pytest.mark.parametrize(
+    "recurrent_groups,recurrent_first", [(1, False), (1, True), (3, True)]
+)
+def test_normal_store_excludes_align_mode_mamba_sources(
+    recurrent_groups, recurrent_first
+):
+    scheduler = _make_partial_tail_scheduler(
+        recurrent_groups=recurrent_groups, recurrent_first=recurrent_first
+    )
     request = _make_partial_tail_request(scheduler)
     request.num_computed_tokens = 0
     request.status = RequestStatus.RUNNING
     req_status = scheduler._req_status["req"]
-    req_status.group_states[0].block_ids[:] = [11]
-    req_status.group_states[1].block_ids[:] = [99]
+    full_group_idx = recurrent_groups if recurrent_first else 0
+    for index, state in enumerate(req_status.group_states):
+        state.block_ids[:] = [11 if index == full_group_idx else 90 + index]
     req_status.update_offload_keys()
     scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
         generate_store_output(keys)
@@ -395,7 +463,10 @@ def test_normal_store_excludes_align_mode_mamba_sources():
     src_spec = job.src_spec
     assert isinstance(src_spec, GPULoadStoreSpec)
     assert src_spec.block_ids.tolist() == [11]
-    assert src_spec.group_sizes == [1, 0]
+    expected_sizes = [0] * (recurrent_groups + 1)
+    expected_sizes[full_group_idx] = 1
+    assert src_spec.group_sizes == expected_sizes
+    assert src_spec.block_indices == [0] * len(expected_sizes)
 
 
 def test_partial_lookup_returns_exact_boundary_and_group_load_keys():

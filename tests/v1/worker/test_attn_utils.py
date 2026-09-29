@@ -15,6 +15,7 @@ import torch
 
 import vllm.v1.hisparse.binding as attn_utils_module
 from tests.v1.attention.utils import dense_kv_cache_views
+from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport, MultipleOf
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
@@ -221,6 +222,9 @@ def test_attention_builders_keep_target_and_draft_model_configs(monkeypatch):
             super().__init__(AttentionCGSupport.ALWAYS)
             self.config = config
 
+        def set_kernel_block_size(self, block_size):
+            self.kernel_block_size = block_size
+
     class Backend:
         @staticmethod
         def full_cls_name():
@@ -235,7 +239,12 @@ def test_attention_builders_keep_target_and_draft_model_configs(monkeypatch):
             return Builder
 
     configs = [
-        SimpleNamespace(cache_config=SimpleNamespace(kv_cache_layout=None))
+        SimpleNamespace(
+            cache_config=SimpleNamespace(
+                kv_cache_layout=None, kv_sharing_fast_prefill=False
+            ),
+            parallel_config=SimpleNamespace(use_ubatching=False),
+        )
         for _ in range(2)
     ]
     layers = {
@@ -268,6 +277,100 @@ def test_attention_builders_keep_target_and_draft_model_configs(monkeypatch):
     assert len(groups[0]) == 2
     for group, expected_config in zip(groups[0], configs):
         assert group.get_metadata_builder(0).config is expected_config
+
+
+@pytest.mark.parametrize("num_ubatches", [1, 2])
+@pytest.mark.parametrize("num_target_groups,num_draft_groups", [(4, 1), (8, 2)])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_mla_prefill_scratch_shares_groups_but_isolates_execution_lanes(
+    monkeypatch, num_ubatches, num_target_groups, num_draft_groups, device
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+
+    class Builder(MLACommonMetadataBuilder):
+        def __init__(self, spec, layer_names, config, device):
+            self.chunked_prefill_workspace = torch.empty(
+                (128, spec.head_size), dtype=spec.dtype, device=device
+            )
+
+        def get_cudagraph_support(self, *_args):
+            return AttentionCGSupport.ALWAYS
+
+    class Backend:
+        @staticmethod
+        def full_cls_name():
+            return (__name__, "MLABackend")
+
+        @staticmethod
+        def get_supported_kernel_block_sizes():
+            return [16]
+
+        @staticmethod
+        def get_builder_cls():
+            return Builder
+
+    configs = [
+        SimpleNamespace(
+            cache_config=SimpleNamespace(
+                kv_cache_layout=None, kv_sharing_fast_prefill=False
+            ),
+            parallel_config=SimpleNamespace(
+                use_ubatching=num_ubatches > 1, num_ubatches=num_ubatches
+            ),
+        )
+        for _ in range(2)
+    ]
+    names = [f"target.{i}" for i in range(num_target_groups)] + [
+        f"draft.{i}" for i in range(num_draft_groups)
+    ]
+    layers = {
+        name: SimpleNamespace(get_attn_backend=lambda: Backend, num_heads=6)
+        for name in names
+    }
+    monkeypatch.setattr(attn_utils, "get_shared_kv_cache_layers", lambda _: {})
+    monkeypatch.setattr(
+        attn_utils,
+        "get_layers_from_vllm_config",
+        lambda config, layer_type, names: {name: layers[name] for name in names},
+    )
+    spec = MLAAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=576, dtype=torch.bfloat16
+    )
+    cache = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec([name], spec) for name in names],
+    )
+    groups, _, _ = init_attn_backend(
+        cache,
+        configs[0],
+        torch.device(device),
+        layer_vllm_configs={
+            name: configs[1] for name in names if name.startswith("draft")
+        },
+    )
+    target = [group[0] for group in groups[:num_target_groups]]
+    draft = [group[0] for group in groups[num_target_groups:]]
+    pointers = set()
+    for lane, lane_groups in enumerate((target, draft)):
+        for ubatch in range(num_ubatches):
+            scratch = (
+                lane_groups[0].get_metadata_builder(ubatch).chunked_prefill_workspace
+            )
+            pointers.add(scratch.data_ptr())
+            scratch.fill_(1 + lane * num_ubatches + ubatch)
+            assert all(
+                group.get_metadata_builder(ubatch).chunked_prefill_workspace is scratch
+                for group in lane_groups
+            )
+    assert len(pointers) == 2 * num_ubatches
+    for lane, lane_groups in enumerate((target, draft)):
+        for ubatch in range(num_ubatches):
+            scratch = (
+                lane_groups[0].get_metadata_builder(ubatch).chunked_prefill_workspace
+            )
+            assert torch.all(scratch == 1 + lane * num_ubatches + ubatch)
 
 
 def test_attention_checks_preserve_global_and_target_scoped_support():
