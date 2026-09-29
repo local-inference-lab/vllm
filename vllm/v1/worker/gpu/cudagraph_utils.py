@@ -422,25 +422,8 @@ class CudaGraphManager:
             desc, num_ubatches=num_ubatches, uniform_token_count=uniform_token_count
         )
 
-    def _init_candidates(self) -> None:
-        """Build priority-ordered candidate lists for each token count."""
-        capture_sizes = self.compilation_config.cudagraph_capture_sizes
-        if not (self.cudagraph_mode and capture_sizes):
-            return
-
-        capture_sizes = sorted(capture_sizes)
-        max_decode_tokens = self.max_num_reqs * self.decode_query_len
-        decode_mode = self.cudagraph_mode.decode_mode()
-        mixed_mode = self.cudagraph_mode.mixed_mode()
-        separate_decode_routine = self.cudagraph_mode.separate_routine() or (
-            self.cudagraph_mode == CUDAGraphMode.FULL and self.specialize_full_decode
-        )
-        max_cg_capture_size = self.compilation_config.max_cudagraph_capture_size
-
-        descs_by_mode: defaultdict[CUDAGraphMode, list[BatchExecutionDescriptor]] = (
-            defaultdict(list)
-        )
-
+    def _get_decode_query_lens(self) -> list[int]:
+        """Return the query widths this manager's forward can execute."""
         # When using Dynamic SD, num_speculative_tokens is the max number of
         # draft tokens. The scheduler might use a smaller number so we need
         # to capture graphs for all possible values during decode.
@@ -493,6 +476,27 @@ class CudaGraphManager:
             )
         else:
             decode_query_lens = [self.decode_query_len]
+        return decode_query_lens
+
+    def _init_candidates(self) -> None:
+        """Build priority-ordered candidate lists for each token count."""
+        capture_sizes = self.compilation_config.cudagraph_capture_sizes
+        if not (self.cudagraph_mode and capture_sizes):
+            return
+
+        capture_sizes = sorted(capture_sizes)
+        max_decode_tokens = self.max_num_reqs * self.decode_query_len
+        decode_mode = self.cudagraph_mode.decode_mode()
+        mixed_mode = self.cudagraph_mode.mixed_mode()
+        separate_decode_routine = self.cudagraph_mode.separate_routine() or (
+            self.cudagraph_mode == CUDAGraphMode.FULL and self.specialize_full_decode
+        )
+        max_cg_capture_size = self.compilation_config.max_cudagraph_capture_size
+
+        descs_by_mode: defaultdict[CUDAGraphMode, list[BatchExecutionDescriptor]] = (
+            defaultdict(list)
+        )
+        decode_query_lens = self._get_decode_query_lens()
 
         capture_varlen_decode = (
             separate_decode_routine and bool(decode_mode) and self.varlen_decode
