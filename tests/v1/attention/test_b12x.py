@@ -41,12 +41,14 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheLayout
 )
 @pytest.mark.parametrize("parallel_drafting", [False, True])
 @pytest.mark.parametrize("page_padding", [0, 192])
+@pytest.mark.parametrize("partial_dtype", ["bf16", "fp32"])
 @torch.inference_mode()
 def test_b12x_dense_mla_prepared_capacity_replay_and_high_pages(
-    dtype, dcp_size, parallel_drafting, page_padding, monkeypatch
+    dtype, dcp_size, parallel_drafting, page_padding, partial_dtype, monkeypatch
 ):
     """Real prepared kernels consume high page IDs and mutable graph inputs."""
     _require_b12x_paged_attention()
+    monkeypatch.setenv("VLLM_K3_DENSE_MLA_PARTIAL_DTYPE", partial_dtype)
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.attention import dense_mla
     from b12x.preparation import PreparationSession

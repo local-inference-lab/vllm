@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-dense-mla-partial-precision",
+  "category": "feature",
+  "summary": "Select BF16 or FP32 split partials for B12X dense MLA",
+  "models": ["Kimi-K3"],
+  "compatibility": "BF16 MLA partials remain the default. VLLM_K3_DENSE_MLA_PARTIAL_DTYPE=fp32 requires the B12X FP32-partials companion.",
+  "details": [
+    "Passes the declared partial dtype to prepared B12X MLA plans.",
+    "Covers both partial dtypes in CUDA Graph replay with capacity changes and page addresses beyond the signed 32-bit offset boundary."
+  ],
+  "pull_requests": [],
+  "authors": ["voipmonitor"],
+  "requires": ["b12x-dense-mla-fp32-partials"]
+}
