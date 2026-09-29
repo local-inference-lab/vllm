@@ -34,6 +34,11 @@ if TYPE_CHECKING:
     from vllm.v1.worker.utils import AttentionGroup
 
 
+# Consecutive steps that may schedule drafts yet verify none before one step
+# verifies a draft per request anyway (see ``get_num_tokens``).
+EXPLORE_AFTER_IDLE_STEPS = 32
+
+
 def resolve_adaptive_cudagraph_mode(
     mode: CUDAGraphMode, *, piecewise_capture_available: bool
 ) -> CUDAGraphMode:
@@ -451,6 +456,19 @@ class AdaptiveVerificationManager:
         }
         utilities = num_tokens_to_estimated_accepted_tokens / costs
         draft_budget = int(np.argmax(utilities))
+        # The confidences come from an estimator that learns only from admitted
+        # drafts, so a long run of empty budgets would leave it without the
+        # evidence to ever admit one again. Periodically verify one draft per
+        # request to keep it grounded.
+        idle = getattr(self, "_steps_without_drafts", 0)
+        if draft_budget == 0 and max_draft_budget > 0:
+            idle += 1
+            if idle >= EXPLORE_AFTER_IDLE_STEPS:
+                draft_budget = min(num_reqs, max_draft_budget)
+                idle = 0
+        else:
+            idle = 0
+        self._steps_without_drafts = idle
         logger.debug(
             "DSpark adaptive verification selected %d/%d draft rows for %d "
             "requests at cost scale %.3g (selected utility %.4g, full utility "

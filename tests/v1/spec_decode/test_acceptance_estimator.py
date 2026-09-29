@@ -292,3 +292,26 @@ def test_feature_ignores_which_token_was_drawn():
         atol=2e-3,
         rtol=2e-3,
     )
+
+
+def test_refit_stays_bounded_after_a_confidently_wrong_draft():
+    """One confidently wrong draft must not end drafting.
+
+    A draft predicted near certain carries almost no IRLS weight, so dividing
+    its residual by that weight plus the small ridge moved the position-0
+    intercept by about -20 in one refit. Every later prediction then rounded
+    to ~1e-8, adaptive verification admitted no drafts, and no graded drafts
+    arrived to move it back.
+    """
+    device = torch.device("cuda")
+    estimator = OnlineAcceptanceEstimator(MAX_NUM_REQS, NUM_STEPS, device)
+    estimator.REFIT_INTERVAL = 1
+    before = estimator.intercepts.clone()
+    slots = torch.zeros(1, dtype=torch.int32, device=device)
+    features = torch.full((1, NUM_STEPS), 30.0, device=device)
+    _drive_round(estimator, features, torch.zeros(1, device=device), slots)
+
+    typical = torch.sigmoid(estimator.slope * 3.0 + estimator.intercepts[0])
+    assert typical.item() > 0.05
+    step = (estimator.intercepts - before).abs().max().item()
+    assert step <= estimator.MAX_STEP + 1e-6
