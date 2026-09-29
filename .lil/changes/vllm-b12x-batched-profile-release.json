@@ -1,0 +1,12 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-b12x-batched-profile-release",
+  "category": "performance",
+  "summary": "Release B12X profiling plans with one compiler-resource reclamation pass",
+  "models": ["all"],
+  "compatibility": "Requires B12X PreparationSession.release_many; serving arithmetic and cache allocation are unchanged.",
+  "details": ["Preserves reverse release order, cleanup on failure, and idempotent teardown without collecting global Python objects once per plan."],
+  "pull_requests": [],
+  "authors": ["voipmonitor"],
+  "requires": []
+}
