@@ -1877,11 +1877,13 @@ class Scheduler(SchedulerInterface):
         # A prefill turn gives prefills first use of the model-step capacity.
         # Existing decodes then consume only capacity genuinely left over. New
         # requests admitted above are excluded by running_req_ids_at_step_start,
-        # so no request can be scheduled twice in one step.
+        # so no request can be scheduled twice in one step. A turn that
+        # scheduled nothing has no admitted work to protect; its decodes preempt
+        # as in a decode turn, or a full pool would leave every step empty.
         if adaptive_prefill_turn and token_budget > 0:
             schedule_running_requests(
                 "decode",
-                allow_preemption=False,
+                allow_preemption=not num_scheduled_tokens,
                 enforce_lora_limit=True,
             )
 
