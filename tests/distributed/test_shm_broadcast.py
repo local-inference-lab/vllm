@@ -14,6 +14,8 @@ import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
+from hypothesis import given
+from hypothesis import strategies as st
 
 from vllm.distributed.device_communicators import shm_broadcast
 from vllm.distributed.device_communicators.shm_broadcast import (
@@ -247,6 +249,7 @@ def test_message_queue_shutdown_idle():
 
 @worker_fn_wrapper
 def worker_fn_test_idle_to_busy():
+    """Readers pinned to the fixed 1s grace stay busy-spinning on writes."""
     rank = dist.get_rank()
     writer_rank = 2
     message_queue = MessageQueue.create_from_process_group(
@@ -255,49 +258,33 @@ def worker_fn_test_idle_to_busy():
 
     message1 = "hello world"
     message2 = np.random.randint(1, 100, 100)
-    with mock.patch.object(
-        message_queue._spin_condition, "wait", wraps=message_queue._spin_condition.wait
-    ) as wrapped_wait:
-        if not message_queue._is_writer:
-            # Put into idle mode
-            message_queue._spin_condition.last_read = 0
+    cond = message_queue._spin_condition
+    if not message_queue._is_writer:
+        cond.last_read = 0
+        with pytest.raises(TimeoutError):
+            message_queue.dequeue(timeout=0.01)
 
-            # no messages, so expect a TimeoutError
-            with pytest.raises(TimeoutError):
-                message_queue.dequeue(timeout=0.01)
-            # wait should only be called once while idle
-            assert wrapped_wait.call_count == 1
+        dist.barrier()
+        assert message_queue.dequeue(timeout=5) == message1
 
-            # sync with the writer and wait for message1
-            dist.barrier()
-            recv_message = message_queue.dequeue(timeout=5)
-            assert recv_message == message1
-            # second call to wait, with a message read, this puts in a busy spin
-            assert wrapped_wait.call_count == 2
+        dist.barrier()
+        assert np.array_equal(message_queue.dequeue(timeout=1), message2)
+    else:
+        dist.barrier()
+        time.sleep(0.1)
+        message_queue.enqueue(message1)
 
-            # sync with the writer and wait for message2
-            dist.barrier()
-            recv_message = message_queue.dequeue(timeout=1)
-            assert np.array_equal(recv_message, message2)
-            # in busy mode, we expect wait to have been called multiple times
-            assert wrapped_wait.call_count > 3
-        else:
-            # writer writes two messages in sync with the reader
-            dist.barrier()
-            # sleep delays the send to ensure reader enters the read loop
-            time.sleep(0.1)
-            message_queue.enqueue(message1)
-
-            dist.barrier()
-            time.sleep(0.1)
-            message_queue.enqueue(message2)
+        dist.barrier()
+        time.sleep(0.1)
+        message_queue.enqueue(message2)
 
     message_queue.shutdown()
     assert message_queue.shutting_down
     print(f"torch distributed passed the test! Rank {rank}")
 
 
-def test_message_queue_idle_wake():
+def test_message_queue_idle_wake(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("VLLM_EXPERIMENTAL_SHM_BROADCAST_ADAPTIVE_SPIN", raising=False)
     distributed_run(worker_fn_test_idle_to_busy, 4)
 
 
@@ -807,3 +794,634 @@ def test_remote_subscribe_addr_unique_concurrent_writers(
 
     for q in queues:
         q.remote_socket.close(linger=0)
+
+
+# ---------------------------------------------------------------------------
+# Adaptive spin grace tests
+# ---------------------------------------------------------------------------
+
+
+def _make_adaptive_reader():
+    """Construct a SpinCondition reader with default adaptive env tunables."""
+
+    ctx = mock.Mock()
+    ctx.socket.return_value = mock.Mock()
+    with mock.patch.dict(
+        "os.environ", {"VLLM_EXPERIMENTAL_SHM_BROADCAST_ADAPTIVE_SPIN": "1"}
+    ):
+        return shm_broadcast.SpinCondition(
+            is_reader=True, context=ctx, notify_address="inproc://unused"
+        )
+
+
+@pytest.mark.parametrize("value", [None, "0"])
+@pytest.mark.skip_global_cleanup
+def test_default_reader_grace_is_fixed_and_spins_before_parking(
+    monkeypatch: pytest.MonkeyPatch, value: str | None
+):
+    """The default policy retains the historical one-second reader grace."""
+    if value is None:
+        monkeypatch.delenv(
+            "VLLM_EXPERIMENTAL_SHM_BROADCAST_ADAPTIVE_SPIN", raising=False
+        )
+    else:
+        monkeypatch.setenv("VLLM_EXPERIMENTAL_SHM_BROADCAST_ADAPTIVE_SPIN", value)
+    ctx = mock.Mock()
+    socket = mock.Mock()
+    ctx.socket.return_value = socket
+    cond = shm_broadcast.SpinCondition(
+        is_reader=True, context=ctx, notify_address="inproc://unused"
+    )
+    assert cond._grace.mode == "fixed"
+    assert cond.busy_loop_s == 1.0
+    cond._train_interval_ema(0.0001)
+    cond._train_interval_ema(10.0)
+    assert cond.busy_loop_s == 1.0
+
+    cond.last_read = 100.0
+    with (
+        mock.patch.object(shm_broadcast.time, "monotonic", return_value=100.5),
+        mock.patch.object(shm_broadcast, "sched_yield") as yield_mock,
+        mock.patch.object(cond.poller, "poll") as poll_mock,
+    ):
+        cond.wait()
+    yield_mock.assert_called_once()
+    poll_mock.assert_not_called()
+
+    with (
+        mock.patch.object(shm_broadcast.time, "monotonic", return_value=101.0),
+        mock.patch.object(shm_broadcast, "sched_yield") as yield_mock,
+        mock.patch.object(cond.poller, "poll") as poll_mock,
+    ):
+        cond.wait()
+    yield_mock.assert_not_called()
+    poll_mock.assert_called_once_with(timeout=None)
+
+
+@pytest.mark.skip_global_cleanup
+def test_shm_broadcast_wait_metrics_publish_batched(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Blocked wait metrics publish only at the batch boundary or flush."""
+    reports: list[tuple[str, int, float]] = []
+    monkeypatch.setattr(
+        shm_broadcast,
+        "_shm_broadcast_metrics_queue",
+        mock.Mock(put=reports.append),
+    )
+    monkeypatch.setattr(
+        shm_broadcast, "_start_shm_broadcast_metrics_thread", lambda: None
+    )
+    metrics = shm_broadcast._BatchedShmBroadcastWaitMetrics("reader")
+    for _ in range(shm_broadcast._SHM_BROADCAST_METRIC_BATCH_SIZE):
+        metrics.record(0.001)
+
+    assert reports == [
+        (
+            "reader",
+            shm_broadcast._SHM_BROADCAST_METRIC_BATCH_SIZE,
+            pytest.approx(shm_broadcast._SHM_BROADCAST_METRIC_BATCH_SIZE * 0.001),
+        )
+    ]
+
+    metrics.record(0.002)
+    assert len(reports) == 1
+    metrics.flush()
+    assert reports[1] == ("reader", 1, pytest.approx(0.002))
+
+
+@pytest.mark.skip_global_cleanup
+def test_shm_broadcast_wait_metrics_support_fake_accelerator_device(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Metrics export does not initialize the configured accelerator."""
+    monkeypatch.setattr(shm_broadcast, "_shm_broadcast_blocked_waits", None)
+    monkeypatch.setattr(shm_broadcast, "_shm_broadcast_blocked_wait_seconds", None)
+    reports: list[tuple[str, int, float]] = []
+    monkeypatch.setattr(
+        shm_broadcast,
+        "_shm_broadcast_metrics_queue",
+        mock.Mock(put=reports.append),
+    )
+    monkeypatch.setattr(
+        shm_broadcast, "_start_shm_broadcast_metrics_thread", lambda: None
+    )
+
+    metrics = shm_broadcast._BatchedShmBroadcastWaitMetrics("cuda")
+    with mock.patch.object(
+        torch.cuda,
+        "_lazy_init",
+        side_effect=AssertionError("accelerator initialized"),
+    ):
+        metrics.record(0.003)
+        metrics.flush()
+        shm_broadcast._report_shm_broadcast_wait_metrics(*reports[0])
+
+    assert (
+        shm_broadcast._shm_broadcast_blocked_waits.labels(role="cuda")._value.get() == 1
+    )
+    assert shm_broadcast._shm_broadcast_blocked_wait_seconds.labels(
+        role="cuda"
+    )._value.get() == pytest.approx(0.003)
+    assert reports == [("cuda", 1, pytest.approx(0.003))]
+
+
+@pytest.mark.skip_global_cleanup
+def test_disabled_queues_do_not_parse_adaptive_tunables(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Disabled queues retain fixed/yield behavior without reading tunables."""
+    monkeypatch.setenv("VLLM_EXPERIMENTAL_SHM_BROADCAST_ADAPTIVE_SPIN", "0")
+    monkeypatch.setenv("VLLM_SHM_BROADCAST_ADAPTIVE_BUDGET_MS", "invalid")
+    monkeypatch.setenv("VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS", "invalid")
+    writer = MessageQueue(
+        n_reader=1, n_local_reader=1, max_chunk_bytes=1024, max_chunks=1
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    try:
+        assert reader._spin_condition.busy_loop_s == 1.0
+        assert writer._write_grace is None
+    finally:
+        writer.shutdown()
+        reader.shutdown()
+        for s in (
+            writer.local_socket,
+            writer._spin_condition.local_notify_socket,
+            reader.local_socket,
+            reader._spin_condition.local_notify_socket,
+            reader._spin_condition.read_cancel_socket,
+            reader._spin_condition.write_cancel_socket,
+        ):
+            s.close(linger=0)
+
+    monkeypatch.setenv("VLLM_EXPERIMENTAL_SHM_BROADCAST_ADAPTIVE_SPIN", "1")
+    with pytest.raises(ValueError, match="could not convert string to float"):
+        MessageQueue(n_reader=1, n_local_reader=1, max_chunk_bytes=1024, max_chunks=1)
+
+
+@pytest.mark.skip_global_cleanup
+def test_disabled_writer_yields_without_parking(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The default writer acquires a freed block without adaptive sleeps."""
+    monkeypatch.setenv("VLLM_EXPERIMENTAL_SHM_BROADCAST_ADAPTIVE_SPIN", "0")
+    writer = MessageQueue(
+        n_reader=1, n_local_reader=1, max_chunk_bytes=1024, max_chunks=1
+    )
+    try:
+        with writer.buffer.get_metadata(writer.current_idx) as metadata:
+            metadata[0] = 1
+            metadata[1] = 0
+
+        def release_block() -> None:
+            with writer.buffer.get_metadata(writer.current_idx) as metadata:
+                metadata[1] = 1
+
+        with (
+            mock.patch.object(shm_broadcast, "SPINLOOP_EXT_ENABLED", False),
+            mock.patch.object(shm_broadcast, "sched_yield", side_effect=release_block),
+            mock.patch.object(
+                shm_broadcast.time,
+                "sleep",
+                side_effect=AssertionError("disabled writer must not park"),
+            ),
+            writer.acquire_write(timeout=1.0),
+        ):
+            pass
+    finally:
+        writer.shutdown()
+        writer.local_socket.close(linger=0)
+        writer._spin_condition.local_notify_socket.close(linger=0)
+
+
+@pytest.mark.parametrize(
+    ("interval_s", "expect"),
+    [
+        (0.0001, "high"),
+        (0.001, "pivot"),
+        (0.050, "low"),
+    ],
+)
+@pytest.mark.skip_global_cleanup
+def test_adaptive_grace_direction(interval_s, expect):
+    """Adaptive grace moves inverse to observed inter-read intervals."""
+    cond = _make_adaptive_reader()
+    assert cond._grace.mode == "adaptive"
+    budget = cond._grace.budget_s
+    t0, times = 100.0, [100.0 + interval_s * (i + 1) for i in range(20)]
+    with mock.patch.object(shm_broadcast.time, "monotonic", side_effect=times):
+        cond.last_read = t0
+        for _ in range(20):
+            cond.record_read()
+
+    g = cond.busy_loop_s
+    assert cond._grace.min_s <= g <= cond._grace.max_s
+    if expect == "high":
+        assert g > budget
+    elif expect == "low":
+        assert g < budget
+    else:
+        assert g == pytest.approx(budget)
+
+
+@pytest.mark.skip_global_cleanup
+def test_adaptive_grace_fixed_pin_supersedes():
+    """A pinned busy_loop_s freezes the grace regardless of traffic."""
+
+    ctx = mock.Mock()
+    ctx.socket.return_value = mock.Mock()
+    with mock.patch.dict(
+        "os.environ", {"VLLM_EXPERIMENTAL_SHM_BROADCAST_ADAPTIVE_SPIN": "1"}
+    ):
+        for fixed_s in (0.5, 0.0):
+            fixed_cond = shm_broadcast.SpinCondition(
+                is_reader=True,
+                context=ctx,
+                notify_address="inproc://unused",
+                busy_loop_s=fixed_s,
+            )
+            assert fixed_cond._grace.mode == "fixed"
+            for dt in (0.0001, 0.050):
+                fixed_cond._train_interval_ema(dt)
+            assert fixed_cond.busy_loop_s == fixed_s
+
+
+@given(
+    intervals=st.lists(
+        st.floats(min_value=1e-6, max_value=100.0), min_size=1, max_size=50
+    )
+)
+@pytest.mark.skip_global_cleanup
+def test_grace_always_within_bounds(intervals):
+    """Property: adaptive grace stays clamped to [min, max]."""
+    cond = _make_adaptive_reader()
+    for dt in intervals:
+        cond._train_interval_ema(dt)
+        assert cond._grace.min_s <= cond.busy_loop_s <= cond._grace.max_s
+
+
+@pytest.mark.skip_global_cleanup
+def test_remaining_grace_s_counts_down_and_clamps():
+    """remaining_grace_s(now) decreases toward zero and never goes negative."""
+    cond = _make_adaptive_reader()
+    cond.busy_loop_s = 0.010
+    cond.last_read = 100.0
+    assert cond.remaining_grace_s(now=100.0) == pytest.approx(0.010)
+    assert cond.remaining_grace_s(now=100.005) == pytest.approx(0.005)
+    assert cond.remaining_grace_s(now=100.010) == 0.0
+    assert cond.remaining_grace_s(now=120.0) == 0.0
+
+
+@pytest.mark.skip_global_cleanup
+def test_acquire_read_native_wait_policy(monkeypatch: pytest.MonkeyPatch):
+    """Native spinloop receives min(remaining grace, ext ceiling); zero
+    remaining grace skips the native call; native success skips park."""
+    writer = MessageQueue(
+        n_reader=1,
+        n_local_reader=1,
+        max_chunk_bytes=1024 * 1024,
+        max_chunks=1,
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    try:
+        writer.wait_until_ready()
+        reader.wait_until_ready()
+        cond = reader._spin_condition
+        cond._grace.mode = "fixed"
+        cond._grace.fixed_s = 1.0
+        cond.busy_loop_s = 1.0
+        cond.last_read = time.monotonic()
+
+        calls: list[float] = []
+
+        def fake_spinloop(buf, check, timeout=0.0):
+            """Record the timeout the caller passed and report no data."""
+            calls.append(timeout)
+            return False
+
+        with (
+            mock.patch.object(shm_broadcast, "SPINLOOP_EXT_ENABLED", True),
+            mock.patch.object(shm_broadcast, "spinloop", fake_spinloop, create=True),
+            pytest.raises(TimeoutError),
+        ):
+            reader.dequeue(timeout=0.05)
+        assert calls, "native spinloop must be attempted while grace remains"
+        ext_ceiling = shm_broadcast.SPINLOOP_TIMEOUT_SECONDS
+        assert ext_ceiling < 1.0
+        assert all(0.0 < t <= ext_ceiling for t in calls)
+
+        # (b) Zero remaining grace: no native call.
+        calls.clear()
+        cond.last_read = 0.0
+        with (
+            mock.patch.object(shm_broadcast, "SPINLOOP_EXT_ENABLED", True),
+            mock.patch.object(shm_broadcast, "spinloop", fake_spinloop, create=True),
+            pytest.raises(TimeoutError),
+        ):
+            reader.dequeue(timeout=0.05)
+        assert calls == []
+
+        # An explicit zero pin still skips the native wait with the experiment
+        # enabled; it also preserves native wake behavior for a positive pin.
+        monkeypatch.setenv("VLLM_EXPERIMENTAL_SHM_BROADCAST_ADAPTIVE_SPIN", "1")
+        enabled_writer = MessageQueue(
+            n_reader=1,
+            n_local_reader=1,
+            max_chunk_bytes=1024,
+            max_chunks=1,
+        )
+        enabled_reader = MessageQueue.create_from_handle(
+            enabled_writer.export_handle(), rank=0
+        )
+        try:
+            enabled_writer.wait_until_ready()
+            enabled_reader.wait_until_ready()
+            enabled_cond = enabled_reader._spin_condition
+            enabled_cond._grace.mode = "fixed"
+            enabled_cond._grace.fixed_s = 0.0
+            enabled_cond.busy_loop_s = 0.0
+            calls.clear()
+            with (
+                mock.patch.object(shm_broadcast, "SPINLOOP_EXT_ENABLED", True),
+                mock.patch.object(
+                    shm_broadcast, "spinloop", fake_spinloop, create=True
+                ),
+                pytest.raises(TimeoutError),
+            ):
+                enabled_reader.dequeue(timeout=0.05)
+            assert calls == []
+
+            enabled_cond._grace.fixed_s = 1.0
+            enabled_cond.busy_loop_s = 1.0
+            enabled_cond.last_read = time.monotonic()
+            wake_message = {"payload": "opt-in-native-ready"}
+
+            def enqueue_enabled(buf, check, timeout=0.0):
+                """Publish data during the native wait."""
+                enabled_writer.enqueue(wake_message)
+                return check()
+
+            with (
+                mock.patch.object(shm_broadcast, "SPINLOOP_EXT_ENABLED", True),
+                mock.patch.object(
+                    shm_broadcast, "spinloop", side_effect=enqueue_enabled, create=True
+                ),
+            ):
+                assert enabled_reader.dequeue(timeout=0.5) == wake_message
+        finally:
+            enabled_writer.shutdown()
+            enabled_reader.shutdown()
+            for s in (
+                enabled_writer.local_socket,
+                enabled_writer._spin_condition.local_notify_socket,
+                enabled_reader.local_socket,
+                enabled_reader._spin_condition.local_notify_socket,
+                enabled_reader._spin_condition.read_cancel_socket,
+                enabled_reader._spin_condition.write_cancel_socket,
+            ):
+                s.close(linger=0)
+
+        # (c) Native success skips park.
+        cond.last_read = time.monotonic()
+        message = {"payload": "native-ready"}
+
+        def enqueue_now(buf, check, timeout=0.0):
+            """Publish a message inside the native wait, as a store would."""
+            writer.enqueue(message)
+            return check()
+
+        wait_mock = mock.Mock()
+        with (
+            mock.patch.object(shm_broadcast, "SPINLOOP_EXT_ENABLED", True),
+            mock.patch.object(
+                shm_broadcast, "spinloop", side_effect=enqueue_now, create=True
+            ),
+            mock.patch.object(cond, "wait", wait_mock),
+        ):
+            got = reader.dequeue(timeout=0.5)
+        assert got == message
+        wait_mock.assert_not_called()
+    finally:
+        writer.shutdown()
+        reader.shutdown()
+        for s in (
+            writer.local_socket,
+            writer._spin_condition.local_notify_socket,
+            reader.local_socket,
+            reader._spin_condition.local_notify_socket,
+            reader._spin_condition.read_cancel_socket,
+            reader._spin_condition.write_cancel_socket,
+        ):
+            s.close(linger=0)
+
+
+@pytest.mark.skip_global_cleanup
+def test_acquire_write_grace_trains_on_block_wait_only(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The writer grace trains on the wait for a free block, excluding the
+    time the caller spends writing its payload."""
+    monkeypatch.setenv("VLLM_EXPERIMENTAL_SHM_BROADCAST_ADAPTIVE_SPIN", "1")
+    writer = MessageQueue(
+        n_reader=1,
+        n_local_reader=1,
+        max_chunk_bytes=1024,
+        max_chunks=1,
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    try:
+        writer.wait_until_ready()
+        reader.wait_until_ready()
+        grace = writer._write_grace
+        assert grace is not None
+        assert grace.mode == "adaptive"
+
+        clock = {"now": 100.0}
+        trained: list[float] = []
+        with (
+            mock.patch.object(shm_broadcast.time, "monotonic", lambda: clock["now"]),
+            mock.patch.object(grace, "train", side_effect=trained.append),
+            writer.acquire_write(),
+        ):
+            # The block was free, so the wait is zero; the caller then spends
+            # a long time copying its payload into the buffer.
+            clock["now"] += 5.0
+        assert trained == [pytest.approx(0.0)]
+    finally:
+        writer.shutdown()
+        reader.shutdown()
+        for s in (
+            writer.local_socket,
+            writer._spin_condition.local_notify_socket,
+            reader.local_socket,
+            reader._spin_condition.local_notify_socket,
+            reader._spin_condition.read_cancel_socket,
+            reader._spin_condition.write_cancel_socket,
+        ):
+            s.close(linger=0)
+
+
+@pytest.mark.parametrize("park_max_ms", [None, 0.2])
+@pytest.mark.skip_global_cleanup
+def test_acquire_write_parks_in_bounded_doubling_steps(
+    monkeypatch: pytest.MonkeyPatch, park_max_ms: float | None
+):
+    """Writer parks in doubling sleep steps once the grace expires, instead
+    of yielding indefinitely, capped at VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS.
+    """
+    monkeypatch.setenv("VLLM_EXPERIMENTAL_SHM_BROADCAST_ADAPTIVE_SPIN", "1")
+    if park_max_ms is not None:
+        monkeypatch.setenv("VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS", str(park_max_ms))
+    writer = MessageQueue(
+        n_reader=1,
+        n_local_reader=1,
+        max_chunk_bytes=1024,
+        max_chunks=1,
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    try:
+        writer.wait_until_ready()
+        reader.wait_until_ready()
+        park_max_s = writer._write_park_max_s
+        if park_max_ms is not None:
+            assert park_max_s == pytest.approx(park_max_ms / 1000.0)
+        # Force fixed-0 grace so the first failed check goes straight to the
+        # park path; deterministic without mocking the clock.
+        assert writer._write_grace is not None
+        writer._write_grace.mode = "fixed"
+        writer._write_grace.fixed_s = 0.0
+
+        # Occupy the single block so the next acquire must wait for readers.
+        with writer.acquire_write():
+            pass
+
+        sleeps: list[float] = []
+
+        clock = {"now": 100.0}
+
+        def fake_sleep(s):
+            """Record a park step and advance the fake clock by it."""
+            sleeps.append(s)
+            clock["now"] += s
+
+        def fake_monotonic():
+            """Read the fake clock driven by ``fake_sleep``."""
+            return clock["now"]
+
+        with (
+            mock.patch.object(shm_broadcast, "SPINLOOP_EXT_ENABLED", False),
+            mock.patch.object(shm_broadcast.time, "monotonic", fake_monotonic),
+            mock.patch.object(shm_broadcast.time, "sleep", fake_sleep),
+            pytest.raises(TimeoutError),
+            writer.acquire_write(timeout=0.05),
+        ):
+            pass
+
+        # Park steps grow from the floor and cap at the configured ceiling.
+        assert sleeps, "writer never parked"
+        assert sleeps[0] == pytest.approx(shm_broadcast._WRITE_PARK_MIN_S)
+        assert max(sleeps) == pytest.approx(park_max_s)
+        assert sleeps == sorted(sleeps)
+        # Doubling until the cap.
+        for prev, nxt in zip(sleeps, sleeps[1:]):
+            if nxt < park_max_s:
+                assert nxt == pytest.approx(prev * 2)
+    finally:
+        writer.shutdown()
+        reader.shutdown()
+        for s in (
+            writer.local_socket,
+            writer._spin_condition.local_notify_socket,
+            reader.local_socket,
+            reader._spin_condition.local_notify_socket,
+            reader._spin_condition.read_cancel_socket,
+            reader._spin_condition.write_cancel_socket,
+        ):
+            s.close(linger=0)
+
+
+@pytest.mark.skip_global_cleanup
+def test_acquire_write_native_wait_policy(monkeypatch: pytest.MonkeyPatch):
+    """Native spinloop receives min(ext ceiling, remaining grace, caller
+    budget); an exhausted budget skips the native call."""
+    monkeypatch.setenv("VLLM_EXPERIMENTAL_SHM_BROADCAST_ADAPTIVE_SPIN", "1")
+    writer = MessageQueue(
+        n_reader=1,
+        n_local_reader=1,
+        max_chunk_bytes=1024,
+        max_chunks=1,
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    try:
+        writer.wait_until_ready()
+        reader.wait_until_ready()
+        grace = writer._write_grace
+        assert grace is not None
+        grace.mode = "fixed"
+        grace.fixed_s = 1.0
+
+        # Occupy the single block so the next acquire must wait for readers.
+        with writer.acquire_write():
+            pass
+
+        calls: list[float] = []
+
+        def fake_spinloop(buf, check, timeout=0.0):
+            """Record the timeout the caller passed and report no data."""
+            calls.append(timeout)
+            return False
+
+        ext_ceiling = shm_broadcast.SPINLOOP_TIMEOUT_SECONDS
+        # The ceiling must exceed the budgets asserted below, so the
+        # budget/grace caps are the active ones.
+        assert ext_ceiling > 0.05
+
+        # (a) Caller budget below the ext ceiling: the native timeout is
+        # capped by the remaining budget.
+        with (
+            mock.patch.object(shm_broadcast, "SPINLOOP_EXT_ENABLED", True),
+            mock.patch.object(shm_broadcast, "spinloop", fake_spinloop, create=True),
+            pytest.raises(TimeoutError),
+            writer.acquire_write(timeout=0.05),
+        ):
+            pass
+        assert calls, "native spinloop must be attempted while grace remains"
+        assert max(calls) <= 0.05
+
+        # (b) Grace below the ext ceiling: the native timeout is capped by
+        # the remaining grace.
+        calls.clear()
+        grace.fixed_s = 0.02
+        with (
+            mock.patch.object(shm_broadcast, "SPINLOOP_EXT_ENABLED", True),
+            mock.patch.object(shm_broadcast, "spinloop", fake_spinloop, create=True),
+            pytest.raises(TimeoutError),
+            writer.acquire_write(timeout=0.05),
+        ):
+            pass
+        assert calls, "native spinloop must be attempted while grace remains"
+        assert max(calls) <= 0.02
+
+        # (c) Exhausted grace: no native call, the writer parks instead.
+        calls.clear()
+        grace.fixed_s = 0.0
+        with (
+            mock.patch.object(shm_broadcast, "SPINLOOP_EXT_ENABLED", True),
+            mock.patch.object(shm_broadcast, "spinloop", fake_spinloop, create=True),
+            pytest.raises(TimeoutError),
+            writer.acquire_write(timeout=0.05),
+        ):
+            pass
+        assert calls == []
+    finally:
+        writer.shutdown()
+        reader.shutdown()
+        for s in (
+            writer.local_socket,
+            writer._spin_condition.local_notify_socket,
+            reader.local_socket,
+            reader._spin_condition.local_notify_socket,
+            reader._spin_condition.read_cancel_socket,
+            reader._spin_condition.write_cancel_socket,
+        ):
+            s.close(linger=0)
