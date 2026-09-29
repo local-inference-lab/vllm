@@ -474,6 +474,12 @@ class Worker(WorkerBase):
             # Set random seed.
             set_random_seed(self.model_config.seed)
 
+            if current_platform.is_cuda():
+                # cuBLAS allocates outside the Torch cache. Initialize its
+                # per-thread handle before weights can fill physical memory,
+                # and include its retained storage in the admission snapshot.
+                torch.cuda.current_blas_handle()
+
             # Now take memory snapshot after NCCL is initialized
             gc.collect()
             torch.accelerator.empty_cache()
