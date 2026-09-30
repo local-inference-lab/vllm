@@ -445,10 +445,12 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             sm_scale=self.scale,
         )
         state.prime(binding)
+        # PreparationSession synchronizes the priming call before discarding it.
+        # Serving binds its own operands; the plan retains compiled launchers,
+        # not the temporary tensors used to prime each layer and capacity.
         return PreparedCall(
             run=lambda: state.run(binding),
             output=output,
-            owners=(scratch, q, output, lengths, cu, pages, scale, binding),
         )
 
     def forward_mqa(self, q, kv_c_and_k_pe_cache, attn_metadata, layer):
