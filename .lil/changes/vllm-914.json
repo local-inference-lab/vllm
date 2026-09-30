@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-914",
+  "category": "performance",
+  "summary": "Request-path Triton kernels stop recompiling per batch",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Kernels that run eagerly on prefill and on a full prefix-hit restore specialized on per-batch counts, offsets and indices, so they kept compiling new variants on the request path on every rank, each compile stalling the step. On GB10 the GLM token-metadata kernel compiled 78 times per boot and the prefix-restore kernel 0.3-0.8 s per new shape on warm resends.",
+    "Per-batch scalars are now runtime arguments or listed in do_not_specialize; per-boot constants keep their specialization."
+  ],
+  "pull_requests": [914],
+  "authors": ["tobymao"],
+  "requires": []
+}
