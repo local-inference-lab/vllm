@@ -1,0 +1,17 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-874",
+  "category": "fix",
+  "summary": "Load MiMo V2 fused FP8 QKV exactly below TP4",
+  "models": [
+    "XiaomiMiMo/MiMo-V2.6-Flash-RL",
+    "XiaomiMiMo/MiMo-V2.6-Pro-RL"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "At TP1/TP2 the fused QKV kept the checkpoint's FP8 block scales instead of being re-quantized (which changed 40% of the global layers' K and 65% of their V weights at TP2). TP4 is unchanged."
+  ],
+  "pull_requests": [
+    874
+  ]
+}

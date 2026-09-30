@@ -104,6 +104,9 @@ def _build_config(
     kv_connector_extra_config: dict | None = None,
     enable_sleep_mode: bool = False,
     enable_cumem_allocator: bool = False,
+    model_type: str | None = None,
+    recurrent_checkpoint_policy: str | None = None,
+    decode_context_parallel_size: int = 1,
 ) -> VllmConfig:
     """Build a model-free config for KV-transfer compatibility checks.
 
@@ -112,6 +115,7 @@ def _build_config(
         kv_connector_extra_config: Optional connector-specific configuration.
         enable_sleep_mode: Whether sleep mode is enabled.
         enable_cumem_allocator: Whether the cuMem allocator is enabled.
+        model_type: Optional Hugging Face model type.
 
     Returns:
         A VllmConfig suitable for exercising KV-transfer compatibility checks.
@@ -135,9 +139,70 @@ def _build_config(
     cfg.model_config = SimpleNamespace(
         enable_sleep_mode=enable_sleep_mode,
         enable_cumem_allocator=(enable_cumem_allocator or enable_sleep_mode),
+        hf_text_config=SimpleNamespace(model_type=model_type),
     )
+    if recurrent_checkpoint_policy is not None:
+        cfg.cache_config = SimpleNamespace(
+            recurrent_checkpoint_policy=recurrent_checkpoint_policy
+        )
+        cfg.parallel_config = SimpleNamespace(
+            decode_context_parallel_size=decode_context_parallel_size
+        )
     cfg._verify_kv_transfer_compat()
     return cfg
+
+
+@pytest.mark.parametrize("supports_atomic_checkpoints", [False, True])
+def test_qwen_qsa_requires_atomic_checkpoint_connector(
+    monkeypatch, supports_atomic_checkpoints
+):
+    class _StubConnector:
+        @classmethod
+        def supports_request_boundary_checkpoints(cls, config):
+            del config
+            return supports_atomic_checkpoints
+
+    monkeypatch.setattr(
+        KVConnectorFactory,
+        "get_connector_class",
+        lambda config: _StubConnector,
+    )
+
+    if supports_atomic_checkpoints:
+        _build_config(kv_connector="stub", model_type="qwen3_8_flash_next_text")
+    else:
+        with pytest.raises(ValueError, match="atomic request-boundary"):
+            _build_config(kv_connector="stub", model_type="qwen3_8_flash_next_text")
+
+
+@pytest.mark.parametrize(
+    ("kv_connector", "policy", "dcp", "allowed"),
+    [
+        ("SimpleCPUOffloadConnector", "aligned", 1, True),
+        ("OffloadingConnector", "aligned", 1, True),
+        ("SimpleCPUOffloadConnector", "auto", 1, False),
+        ("SimpleCPUOffloadConnector", "request_boundaries", 1, False),
+        ("SimpleCPUOffloadConnector", "aligned", 2, False),
+        ("LMCacheMPConnector", "aligned", 1, False),
+        ("NixlConnector", "aligned", 1, False),
+    ],
+)
+def test_qwen_aligned_retention_needs_an_aligned_hybrid_connector(
+    kv_connector, policy, dcp, allowed
+):
+    """CACHE_MODE=native (SimpleCPU, aligned) must boot Qwen; other
+    connectors and DCP keep the atomic checkpoint requirement."""
+    build = lambda: _build_config(  # noqa: E731
+        kv_connector=kv_connector,
+        model_type="qwen3_8_flash_next_text",
+        recurrent_checkpoint_policy=policy,
+        decode_context_parallel_size=dcp,
+    )
+    if allowed:
+        build()
+    else:
+        with pytest.raises(ValueError, match="atomic request-boundary"):
+            build()
 
 
 @pytest.mark.parametrize(

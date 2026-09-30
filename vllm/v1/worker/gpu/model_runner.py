@@ -305,7 +305,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.use_aux_hidden_state_outputs = True
 
         # Draft tokens propagation - for spec-dec + struct outputs.
-        self.draft_tokens_handler = DraftTokensHandler(self.device)
+        self.draft_tokens_handler = DraftTokensHandler(
+            self.device,
+            track_consumed_drafts=bool(self.scheduler_config.async_scheduling)
+            and self.speculative_config is not None
+            and self.is_last_pp_rank,
+        )
 
         self.pcp_manager: pcp.PCPManager | None = None
 
@@ -1961,6 +1966,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert batch_req_state is not None
             input_batch = self.prepare_inputs(
                 scheduler_output, batch_req_state, batch_desc
+            )
+            # Deferred structured-output sampling back-fills the scheduler's
+            # draft placeholders with exactly the drafts these inputs hold.
+            self.draft_tokens_handler.set_consumed_draft_tokens(
+                input_batch, self.req_states.draft_tokens
             )
             if scheduler_output.boundary_logits_only:
                 assert self.boundary_checkpoint_state is not None

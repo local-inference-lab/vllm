@@ -260,10 +260,12 @@ _B12X_SUBMODULES = {
     module_name: _import_submodule(module_name)
     for module_name in (
         "b12x.attention.paged",
+        "b12x.attention.paged_decode",
         "b12x.attention.sparse_mla",
         "b12x.attention.compressed_sparse_mla",
         "b12x.attention.dsa_indexer",
         "b12x.attention.qsa",
+        "b12x.gemm.bf16_gemv",
         "b12x.gemm.bf16_vocab_projection",
         "b12x.gemm.blockscaled",
         "b12x.gemm.mla_query_projection",
@@ -297,6 +299,10 @@ def _get_submodule(module_name: str) -> ModuleType | None:
 
 def get_b12x_blockscaled() -> ModuleType | None:
     return _get_submodule("b12x.gemm.blockscaled")
+
+
+def get_b12x_bf16_gemv() -> ModuleType | None:
+    return _get_submodule("b12x.gemm.bf16_gemv")
 
 
 def get_b12x_bf16_vocab_projection() -> ModuleType | None:
@@ -345,6 +351,11 @@ def get_b12x_fused_moe() -> ModuleType | None:
 
 def get_b12x_paged_attention() -> ModuleType | None:
     return _get_submodule("b12x.attention.paged")
+
+
+def get_b12x_paged_decode() -> ModuleType | None:
+    """Split-KV decode/verify attention; absent in b12x releases without it."""
+    return _get_submodule("b12x.attention.paged_decode")
 
 
 def get_b12x_qsa() -> ModuleType | None:

@@ -1,0 +1,12 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-903",
+  "category": "fix",
+  "summary": "The boundary-checkpoint copy wait has the same timeout as model execution",
+  "models": ["GLM-5.3-Flash", "Qwen3.8-Flash-Next"],
+  "compatibility": "Uses VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS (default 300 s); the healthy path is unchanged.",
+  "details": [
+    "wait_for_boundary_checkpoint_copies was the only RPC on the engine step path without a timeout, so a wedged copy stream would stall the engine forever without an error. It now fails the engine after the execute-model timeout, and /health reports it."
+  ],
+  "pull_requests": [903]
+}

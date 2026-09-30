@@ -19,6 +19,7 @@ from vllm.entrypoints.serve.utils.api_utils import (
     log_non_default_args,
     log_version_and_model,
 )
+from vllm.entrypoints.serve.utils.task_dump import log_asyncio_tasks
 from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParserManager
 from vllm.tool_parsers import ToolParserManager
@@ -134,6 +135,8 @@ async def serve_http(
 
     loop.add_signal_handler(signal.SIGINT, signal_handler)
     loop.add_signal_handler(signal.SIGTERM, signal_handler)
+    # `kill -USR1 <pid>` logs where every request task is suspended.
+    loop.add_signal_handler(signal.SIGUSR1, log_asyncio_tasks)
 
     async def handle_shutdown() -> None:
         await shutdown_event.wait()

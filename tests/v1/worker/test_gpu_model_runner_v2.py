@@ -427,6 +427,8 @@ def test_boundary_logits_only_dispatches_pending_cache_tasks(
         gather_batch_req_state=lambda *args: (SimpleNamespace(num_tokens=1), 1),
         prepare_inputs=lambda *args: input_batch,
         prepare_attn=lambda *args: pytest.fail("logits-only must skip attention"),
+        draft_tokens_handler=SimpleNamespace(set_consumed_draft_tokens=lambda *a: None),
+        req_states=SimpleNamespace(draft_tokens=None),
     )
     monkeypatch.setattr(
         model_runner_module,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from importlib import import_module
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -8,6 +9,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from vllm.config import ModelConfig, ParallelConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.models.config import (
     Qwen3_5ForConditionalGenerationConfig,
@@ -285,3 +287,32 @@ def test_qwen4_exp_model_state_prepares_stable_dummy_ngram_inputs() -> None:
     )
     assert second["query_start_loc"].data_ptr() == query_start_loc_ptr
     assert second["ngram_context"].data_ptr() == ngram_context_ptr
+
+
+@pytest.mark.parametrize(
+    ("model_type", "architecture"),
+    [
+        ("qwen4_exp", "Qwen4ExpForConditionalGeneration"),
+        ("qwen3_8_flash_next", "Qwen3_8FlashNextForConditionalGeneration"),
+    ],
+)
+def test_qwen_tp4_allows_dcp4_with_two_kv_heads(
+    tmp_path, model_type: str, architecture: str
+) -> None:
+    """Qwen3.8 checkpoints declare either qwen4_exp or qwen3_8_flash_next and
+    load the same model. Both must pass the TP4/DCP4 gate with two KV heads."""
+    text_config = _text_config(num_attention_heads=16, num_key_value_heads=2).to_dict()
+    text_config["model_type"] = f"{model_type}_text"
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": model_type,
+                "architectures": [architecture],
+                "text_config": text_config,
+            }
+        )
+    )
+    model_config = ModelConfig(model=str(tmp_path), skip_tokenizer_init=True)
+    model_config.verify_with_parallel_config(
+        ParallelConfig(tensor_parallel_size=4, decode_context_parallel_size=4)
+    )

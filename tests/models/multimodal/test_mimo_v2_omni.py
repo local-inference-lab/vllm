@@ -182,6 +182,45 @@ def test_fp8_qkv_merges_training_shards(num_kv_heads, tp_rank, metadata_only):
     torch.testing.assert_close(actual, expected)
 
 
+def _mimo_processor():
+    from vllm.transformers_utils.processors.mimo_v2_omni import MiMoVLProcessor
+
+    return MiMoVLProcessor(
+        tokenizer=None,
+        patch_size=16,
+        image_min_pixels=8192,
+        image_max_pixels=8388608,
+        video_min_pixels=8192,
+        video_max_pixels=8388608,
+        video_total_max_pixels=268435456,
+        fps=1.0,
+    )
+
+
+def test_audio_features_without_torchaudio(monkeypatch):
+    """Audio preprocessing works without torchaudio and matches it."""
+    import vllm.transformers_utils.processors.mimo_v2_omni as processor_module
+    from vllm.multimodal.audio import MelSpectrogram
+
+    wave = torch.randn(32000, generator=torch.Generator().manual_seed(7))
+    audio = (wave, 16000)  # resampled to 24 kHz inside the processor
+
+    reference = None
+    if processor_module._HAS_TORCHAUDIO:
+        reference = _mimo_processor().preprocess_audio(audio)
+
+    monkeypatch.setattr(processor_module, "_MelSpectrogram", MelSpectrogram)
+    monkeypatch.setattr(processor_module, "_HAS_TORCHAUDIO", False)
+    spec, token_len = _mimo_processor().preprocess_audio(audio)
+
+    # 48000 samples at 24 kHz, hop 240: 201 frames of 128 log-mel bins.
+    assert spec.shape == (201, 128)
+    assert token_len == 13
+    if reference is not None:
+        assert torch.equal(spec, reference[0])
+        assert token_len == reference[1]
+
+
 @pytest.mark.parametrize("scale_first", [False, True])
 def test_fp8_qkv_loads_across_interleaved_modules(monkeypatch, scale_first):
     from vllm.model_executor.models import mimo_v2

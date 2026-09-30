@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-karmic-canonical-sync-20260929b",
+  "category": "fix",
+  "summary": "Carry the current canonical Karmic runtime into beta: DeepSeek-V4.1 Engram lookups finish before graph replay, and startup fetches tuning winners from the tuning rank",
+  "models": ["all"],
+  "compatibility": "No user action required. VLLM_DS41_ENGRAM_OVERLAP is removed and has no effect.",
+  "details": [
+    "DeepSeek-V4.1 enqueues its disk Engram gathers on the current stream before the target graph replays. A side-stream lookup could be starved by graph polling kernels, time out and leave stale rows visible to the model.",
+    "At startup, ranks that did not compile a tuning winner fetch its compiled program from the rank that did, with digest validation and a fallback to compiling locally.",
+    "Profiling plans are released in one batch (canonical's version of vllm#941). The Spark RDMA launch scripts use four compiler workers."
+  ],
+  "authors": ["lukealonso"],
+  "requires": ["b12x-master-sync-20260929b"]
+}

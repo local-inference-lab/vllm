@@ -1,0 +1,27 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-restore-admission",
+  "category": "fix",
+  "summary": "External recurrent checkpoint restores wait for GPU capacity instead of recomputing cached prefixes, with fair scheduling and a bounded wait.",
+  "models": [
+    "all"
+  ],
+  "compatibility": "Use with the paired LMCache restore-admission change. VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S (default 60) bounds how long a restore may wait for capacity before its request recomputes the prompt; 0 recomputes immediately.",
+  "details": [
+    "Restores reserve GPU blocks and a running slot before copies start, and keep restored pages owned until execution takes over.",
+    "Reservations hold back only new admissions. Running requests keep growing, requests ordered ahead of a waiting restore are never blocked by it, and later requests are admitted when they fit beside it.",
+    "Queue order is kept: a request that does not fit still stops ordinary admission, and only restores that already own their capacity are admitted past it, without rescanning the waiting queue each step.",
+    "A finished full-prefix restore gets its isolated saved-logits step directly, and running decodes skip a step only when that step is taken.",
+    "Cancelling a restore frees its slot and reserved capacity at once; only the copied pages wait for in-flight transfers. A forced prefix-cache reset releases finished restores that were not yet admitted.",
+    "Sliding-window and chunked-local continuation reservations count physical pages rather than skipped positions in the block table.",
+    "Existing external-checkpoint callers retain their previous behavior unless they opt into admission reservations."
+  ],
+  "requires": [],
+  "pull_requests": [
+    929
+  ],
+  "authors": [
+    "ktsaou",
+    "Local Inference Lab"
+  ]
+}

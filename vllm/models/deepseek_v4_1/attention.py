@@ -14,6 +14,7 @@ from b12x.attention.compressed_sparse_mla import rotary, weight_scale
 from b12x.gemm import wo_projection
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
@@ -676,10 +677,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         )
         self._attention_workspace_specs = {}
         self._attention_declarations = {}
+        compute = envs.VLLM_DS41_ATTENTION_COMPUTE
         for mode, capacity in (
             ("decode", min(self.capacity, decode_rows)),
             ("extend", self.capacity),
         ):
+            # "reference" gives decode rows the single-pass kernel as well.
+            kernel_mode = "extend" if compute == "reference" else mode
             caps = mla.Caps(
                 device=device,
                 num_q_heads=self.n_local_heads,
@@ -690,12 +694,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 swa_page_size=self.swa_cache_layer.block_size,
                 indexed_page_size=self._main_page,
                 max_page_table_width=self._main_width,
-                mode=mode,
+                mode=kernel_mode,
                 # DSpark's two-span reservation can exceed the generic
                 # 256-row cutoff even when replaying a six-row C1 graph.
                 # Keep the entire reserved decode capacity on its decode
                 # split contract; prefill retains its separate plan.
-                decode_row_capacity=capacity if mode == "decode" else None,
+                decode_row_capacity=capacity if kernel_mode == "decode" else None,
                 cache_format="deepseek_v41",
                 use_cuda_graph=True,
             )
@@ -705,29 +709,36 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 if self.compress_ratio
                 else None
             )
-            declaration = mla.plan(
-                caps,
-                invocation=mla.invocation_from_descriptors(
-                    q={
-                        "shape": (capacity, self.n_local_heads, 512),
-                        "stride": (self.n_local_heads * 512, 512, 1),
-                        "alignment": 16,
-                        "dtype": "bfloat16",
-                    },
-                    swa_cache=descriptor(
-                        swa_cache, page_size=self.swa_cache_layer.block_size, kind="swa"
-                    ),
-                    indexed_cache=(
-                        descriptor(
-                            indexed_cache, page_size=self._main_page, kind="indexed"
-                        )
-                        if self.compress_ratio
-                        else None
-                    ),
-                    attn_sink_present=True,
-                    output_mode="provided",
+            invocation = mla.invocation_from_descriptors(
+                q={
+                    "shape": (capacity, self.n_local_heads, 512),
+                    "stride": (self.n_local_heads * 512, 512, 1),
+                    "alignment": 16,
+                    "dtype": "bfloat16",
+                },
+                swa_cache=descriptor(
+                    swa_cache, page_size=self.swa_cache_layer.block_size, kind="swa"
                 ),
+                indexed_cache=(
+                    descriptor(indexed_cache, page_size=self._main_page, kind="indexed")
+                    if self.compress_ratio
+                    else None
+                ),
+                attn_sink_present=True,
+                output_mode="provided",
             )
+            declaration = mla.plan(caps, invocation=invocation)
+            if compute != "auto":
+                # Pin BF16 arithmetic; the split/single-pass lowering stays the
+                # plan's own default for this query.
+                default = declaration.contract.default_config(declaration.query, None)
+                declaration = mla.plan(
+                    caps,
+                    invocation=invocation,
+                    override=replace(
+                        default, v41_compute_mode="bf16", v41_heads_per_block=16
+                    ),
+                )
             metadata_specs = (
                 ((capacity, self.swa_width), torch.int32),
                 ((capacity,), torch.int32),
@@ -1484,13 +1495,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         # Reuse the shared arena only after indexing completes. Keep full-batch
         # metadata beside, not overlapping, the native attention scratch.
         metadata_specs = self._attention_workspace_specs[mode]
-        buffers = current_workspace_manager().get_simultaneous(
+        arena = current_workspace_manager().get_simultaneous(
             *metadata_specs,
             *((spec.shape, spec.dtype) for spec in state.scratch_plan.scratch_specs()),
         )
+        buffers = arena
         metadata_count = len(metadata_specs)
         # Decode layers sharing cache groups map identical pages, so the first
         # layer of each group keeps its metadata for the rest of the forward.
+        # Every replay rewrites it before use, so it is an ordinary graph-pool
+        # activation: retaining it would pin one copy per captured graph.
         if mode == "decode":
             key = (
                 id(swa),
@@ -1508,10 +1522,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     torch.empty(shape, dtype=dtype, device=q.device)
                     for shape, dtype in metadata_specs
                 )
-                retain_cuda_graph_capture_resource(metadata_buffers)
                 self._write_decode_metadata(metadata_buffers, swa, main, rows)
                 entry = shared[key] = (swa, main, metadata_buffers)
-            buffers = [*entry[2], *buffers[metadata_count:]]
+            buffers = [*entry[2], *arena[metadata_count:]]
         else:
             self._write_decode_metadata(buffers, swa, main, rows)
         swa_indices, swa_lengths, top_lengths = buffers[:3]
@@ -1530,8 +1543,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             swa_lengths=swa_lengths[:rows],
             **kwargs,
         )
-        # Keep scratch and metadata, not aliases of the transient query storage.
-        retain_cuda_graph_capture_resource(buffers)
+        # Keep the borrowed arena, not aliases of the transient query storage.
+        retain_cuda_graph_capture_resource(arena)
         mla.run(
             binding=binding,
             swa_k_cache=self.swa_cache_layer.kv_cache,

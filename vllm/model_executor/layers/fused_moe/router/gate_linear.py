@@ -208,26 +208,14 @@ class GateLinear(ReplicatedLinear):
 
         # Tier 4: cuBLAS bf16→fp32
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
-            graph_pool_guard = None
             if self._sm120_graph_pool_lifetime_guard:
-                from vllm.compilation.breakable_cudagraph import (
-                    BreakableCUDAGraphCapture,
+                # Keep the stream-capture query and allocation at runtime.
+                # Dynamo cannot trace the CUDA query's non-Tensor result.
+                return (
+                    torch.ops.vllm.sm120_cublas_router_gemm(x, self.weight),
+                    None,
                 )
-
-                if (
-                    BreakableCUDAGraphCapture.current() is not None
-                    or torch.cuda.is_current_stream_capturing()
-                ):
-                    # The former linear-plus-cast path reserved a BF16 router
-                    # output before its FP32 result. Preserve that graph-pool
-                    # address layout while using the fused FP32 cuBLAS output;
-                    # auxiliary-stream graph nodes retain addresses across the
-                    # differently sized captures that share this pool.
-                    graph_pool_guard = x.new_empty(
-                        (*x.shape[:-1], self.weight.shape[0])
-                    )
             output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
-            del graph_pool_guard
             return output, None
 
         # Tier 5: F.linear (ReplicatedLinear)
@@ -240,6 +228,38 @@ class GateLinear(ReplicatedLinear):
 
 
 _FP32_ROUTER_GEMM_MAX_TOKENS = GateLinear.FP32_MAX_TOKENS
+
+
+def sm120_cublas_router_gemm_impl(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+    graph_pool_guard = None
+    if (
+        BreakableCUDAGraphCapture.current() is not None
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        # Preserve the former BF16-output allocation before the fused FP32
+        # result. Auxiliary-stream graph nodes retain these addresses across
+        # differently sized captures that share a graph memory pool.
+        graph_pool_guard = x.new_empty((*x.shape[:-1], weight.shape[0]))
+    output = torch.mm(x, weight.T, out_dtype=torch.float32)
+    del graph_pool_guard
+    return output
+
+
+def sm120_cublas_router_gemm_fake(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], weight.shape[0]), dtype=torch.float32)
+
+
+direct_register_custom_op(
+    op_name="sm120_cublas_router_gemm",
+    op_func=sm120_cublas_router_gemm_impl,
+    fake_impl=sm120_cublas_router_gemm_fake,
+)
 
 
 def fp32_router_gemm_dispatch_impl(

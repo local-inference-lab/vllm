@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-939",
+  "category": "fix",
+  "summary": "The vLLM wheel contains only the Python modules of its own source commit",
+  "models": ["all"],
+  "compatibility": "No user action required. Nothing imported the stray modules, so serving is unchanged.",
+  "details": [
+    "Beta and canonical wheels share one native build cache, and Python modules that a build of the other branch had staged there were packaged too: beta 39ac37fa42 carried 8 canonical-only modules and canonical 502d6cb5ac 7 beta-only ones.",
+    "The wheel build now removes the staged Python before building. Compiled objects stay cached, so build time is unchanged."
+  ],
+  "pull_requests": [939],
+  "requires": []
+}

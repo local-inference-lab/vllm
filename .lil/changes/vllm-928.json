@@ -1,0 +1,24 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-928",
+  "category": "fix",
+  "summary": "A GPU worker that fails mid-step stops the engine at once, and the server exits with status 1 so a restart policy can bring it back",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required. To have the server restart after such a failure, run the container with a restart policy (for example --restart on-failure).",
+  "details": [
+    "When one tensor-parallel rank failed inside a step, for example with a CUDA out-of-memory error on TP1, its peers could stay blocked in a collective the failed rank never joined. The engine read replies in rank order and only from the output rank, so the server stayed up but answered nothing until VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS (300 s) ran out.",
+    "Every rank now reports its failure, including ranks that do not return the step's output, and the engine reads replies from all ranks in any order (includes #917). The first failure stops the engine within a second, and the log names the failing rank and its error.",
+    "When the server stops because its engine failed, it now exits with status 1 instead of 0, so Docker's on-failure policy and other supervisors see a crash.",
+    "Waiting for a step still spins while replies are frequent, so decode speed is unchanged (GLM-5.3-Flash Spark TP2: steps/s within 0.4%)."
+  ],
+  "pull_requests": [
+    928
+  ],
+  "authors": [
+    "tobymao",
+    "Local Inference Lab"
+  ],
+  "requires": []
+}

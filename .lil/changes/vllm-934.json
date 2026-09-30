@@ -1,0 +1,17 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-934",
+  "category": "fix",
+  "summary": "Prompts with a token id one past the vocabulary are rejected again when the tokenizer counts added tokens in its size",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "The largest accepted prompt token id was taken from the tokenizer's vocabulary size instead of size minus one. With VLLM_USE_FASTOKENS=1, whose size includes added tokens, DeepSeek-V4.x accepted token 129280, one past the embedding table; such prompts now get a validation error."
+  ],
+  "pull_requests": [
+    934
+  ],
+  "requires": []
+}

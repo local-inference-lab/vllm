@@ -191,6 +191,10 @@ class PriorityRequestQueue(RequestQueue):
         """Get number of requests in queue."""
         return len(self._heap)
 
+    def __contains__(self, request: object) -> bool:
+        """Check membership without the ordered iteration's heap copy."""
+        return request in self._heap
+
     def __iter__(self) -> Iterator[Request]:
         """Iterate over the queue according to priority policy."""
         heap_copy = self._heap[:]

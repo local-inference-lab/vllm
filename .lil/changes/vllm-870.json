@@ -1,0 +1,21 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-870",
+  "category": "fix",
+  "summary": "Serve external prefix hits for align-mode Mamba hybrids through the offloading connector",
+  "models": [
+    "Qwen3.8-Flash-Next"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "Boundary states are captured in dedicated blocks and QSA pages transfer their padded selector tail, so OffloadingConnector prefix hits on Qwen3.8 are correct.",
+    "A restored boundary checkpoint keeps its QSA selector pools instead of treating the slot as fresh; GPU prefix-hit and LMCache restore answers were unchanged in our Qwen TP2 MTP3 checks.",
+    "Qwen still rejects OffloadingConnector until a connector declares atomic support."
+  ],
+  "pull_requests": [
+    870
+  ],
+  "authors": [
+    "@llitz"
+  ]
+}

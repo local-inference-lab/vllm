@@ -1,0 +1,13 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-897",
+  "category": "fix",
+  "summary": "A server whose engine fails to start now exits instead of hanging",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "When engine startup fails after the GPU workers have started (for example an invalid CP_KV_CACHE_INTERLEAVE_SIZE), the workers are stopped and the container exits with an error within seconds, so restart policies take effect.",
+    "Previously the engine process waited for its workers forever and the container stayed up without serving."
+  ],
+  "pull_requests": [897]
+}

@@ -76,6 +76,33 @@ def mxfp8_head_config(monkeypatch, default_vllm_config):
 
 
 @pytest.mark.cpu_test
+def test_fp32_head_dtype_widens_quantized_head_logits(mxfp8_head_config):
+    """A runtime-quantized head (e.g. the NVFP4 DSpark drafter head) keeps its
+    own kernel under an FP32 head_dtype; its logits are widened, not rejected."""
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
+    mxfp8_head_config.model_config.head_dtype = torch.float32
+    processor = LogitsProcessor(8)
+    calls = []
+
+    class QuantizedHeadMethod:
+        def apply(self, layer, x, bias=None):
+            calls.append(x.dtype)
+            return x @ layer.weight.t()
+
+    head = SimpleNamespace(
+        quant_method=QuantizedHeadMethod(),
+        weight=torch.randn(8, 4).bfloat16(),
+        tp_size=1,
+    )
+    hidden = torch.randn(3, 4, dtype=torch.bfloat16)
+    logits = processor(head, hidden, skip_gather=True)
+    assert calls == [torch.bfloat16]
+    assert logits.dtype == torch.float32
+    torch.testing.assert_close(logits, (hidden @ head.weight.t()).float())
+
+
+@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     ("env_value", "enabled"), [(None, False), ("0", False), ("1", True)]
 )

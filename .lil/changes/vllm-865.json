@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-865",
+  "category": "fix",
+  "summary": "Stop Qwen QSA from corrupting the KV cache when CUDA graphs are larger than the decode-row limit",
+  "models": ["Qwen3.8-Flash-Next"],
+  "compatibility": "No user action required. The shipped profile was not affected; deployments that lowered max-num-seqs without lowering the CUDA graph capture size were.",
+  "details": [
+    "Mixed batches replayed in graphs with more rows than max-num-seqs times (1 + draft tokens) could write another request's compressed KV page, causing wrong output without an error, or an illegal memory access.",
+    "QSA now sizes captured graphs for the full model length."
+  ],
+  "pull_requests": [865],
+  "evidence": ["https://github.com/local-inference-lab/vllm/pull/865"]
+}

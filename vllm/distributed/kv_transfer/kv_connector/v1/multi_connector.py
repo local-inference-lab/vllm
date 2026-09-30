@@ -261,6 +261,13 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         for c in self._connectors:
             c.bind_gpu_block_pool(gpu_block_pool)
 
+    def bind_boundary_capture_releaser(self, releaser: Callable[[int], None]) -> None:
+        # OffloadingConnector as a MultiConnector child still owns capture
+        # pins (enablement checks has_connector, which sees children): every
+        # child gets the releaser; the base no-op absorbs the rest.
+        for c in self._connectors:
+            c.bind_boundary_capture_releaser(releaser)
+
     # We must override the base class method here because we need to bind
     # the metadata to each connector in the order of the connectors in the
     # MultiKVConnectorMetadata.

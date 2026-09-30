@@ -7,6 +7,7 @@ from typing import ClassVar, Literal
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import (
     get_ep_group,
@@ -77,6 +78,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
     sequence_parallel_chunk,
 )
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.weight_transfer import materialize_weight
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
@@ -96,6 +98,8 @@ from vllm.utils.b12x import get_b12x_mhc, set_b12x_preparation_provider
 
 from . import l2_prefetch as _l2pf
 from .attention import Glm5NextMLAAttention
+from .glm53_fp8_dense import enable_glm53_fp8_dense, enable_glm53_fp8_lm_head
+from .glm53_low_latency_gemm import enable_glm53_low_latency_gemm
 from .kda import Glm5NextLinearAttention
 from .pooled_indexer import Glm5NextIndexerScratch, Glm5NextPooledIndexer
 
@@ -259,10 +263,15 @@ class Glm5NextMoE(nn.Module):
             self.shared_experts = None
         else:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+            # TP padding (see Glm5NextForCausalLMConfig) widens the shared
+            # expert with zero gate/up rows and zero down_proj input columns.
+            padded_size = getattr(
+                config, "shared_expert_intermediate_size", intermediate_size
+            )
 
             self.shared_experts = Glm5NextMLP(
                 hidden_size=config.hidden_size,
-                intermediate_size=intermediate_size,
+                intermediate_size=padded_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 is_sequence_parallel=self.is_sequence_parallel,
@@ -270,6 +279,9 @@ class Glm5NextMoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
                 swiglu_limit=swiglu_limit,
             )
+            if padded_size != intermediate_size:
+                for param in self.shared_experts.parameters():
+                    set_weight_attrs(param, {"allow_tp_padding": True})
 
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
@@ -970,6 +982,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 config.hidden_size,
                 prefix=f"{prefix}.embed_tokens",
             )
+            host_embedding_if_requested(self.embed_tokens)
         else:
             self.embed_tokens = PPMissingLayer()
 
@@ -1332,6 +1345,9 @@ class Glm5NextForCausalLM(
         self.model = Glm5NextModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        # TP3-only decode GEMM selection; both are no-ops at other TP sizes.
+        enable_glm53_low_latency_gemm(self.model, self.model_config.dtype)
+        enable_glm53_fp8_dense(self.model)
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 self.config.vocab_size,
@@ -1339,6 +1355,7 @@ class Glm5NextForCausalLM(
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
+            enable_glm53_fp8_lm_head(self.lm_head)
         else:
             self.lm_head = PPMissingLayer()
         logit_scale = getattr(self.config, "logit_scale", 1.0)
@@ -1526,8 +1543,9 @@ class Glm5NextForConditionalGeneration(
                 # the latter onto text_config (1e-5), silently ignoring the
                 # vision tower's own (1e-6) rms_norm_eps.
                 norm_eps=config.vision_config.rms_norm_eps,
-                # The vision tower ships BF16 weights and is not quantized.
-                quant_config=None,
+                # The vision tower ships BF16 weights; it is quantized only
+                # on request (VLLM_GLM53_VISION_MXFP8).
+                quant_config=_vision_quant_config(),
                 prefix=maybe_prefix(prefix, "visual"),
             )
 
@@ -1664,6 +1682,38 @@ def _try_load_fp8_attn_proj(
         param.weight_loader(param, weight_bf16, shard_id)
     loaded_params.add(target_w)
     return True
+
+
+def host_embedding_if_requested(embed: VocabParallelEmbedding) -> None:
+    """Move the vocabulary table to pinned host RAM (VLLM_GLM53_EMBED_HOST).
+
+    A lookup reads one row per token, so the GPU reads the rows it needs
+    through a UVA view instead of keeping the table in device memory.
+    Checkpoint loading writes through the same view.
+    """
+    if not envs.VLLM_GLM53_EMBED_HOST:
+        return
+    from vllm.utils.platform_utils import is_uva_available
+    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+    if not is_uva_available():
+        raise RuntimeError("VLLM_GLM53_EMBED_HOST requires UVA and pinned memory")
+    weight = embed.weight
+    host = torch.empty(weight.shape, dtype=weight.dtype, device="cpu", pin_memory=True)
+    weight.data = get_accelerator_view_from_cpu_tensor(host)
+    weight._vllm_is_uva_offloaded = True
+
+
+def _vision_quant_config() -> QuantizationConfig | None:
+    """Online MXFP8 for the vision tower's linear layers, when requested."""
+    if not envs.VLLM_GLM53_VISION_MXFP8:
+        return None
+    from vllm.config.quantization import QuantizationConfigArgs
+    from vllm.model_executor.layers.quantization.online.base import (
+        OnlineQuantizationConfig,
+    )
+
+    return OnlineQuantizationConfig(QuantizationConfigArgs(linear="mxfp8"))
 
 
 def _try_load_mxfp8_bf16_attn_proj(

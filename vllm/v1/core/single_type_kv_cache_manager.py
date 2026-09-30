@@ -962,6 +962,14 @@ class SingleTypeKVCacheManager(ABC):
     def new_step_starts(self) -> None:
         return None
 
+    def release_boundary_capture(self, block_id: int) -> None:
+        """Drop a frozen-capture pin. Only Mamba managers own capture blocks."""
+        return None
+
+    def release_all_boundary_captures(self) -> None:
+        """Release every frozen-capture pin (cache reset). No-op by default."""
+        return None
+
 
 class FullAttentionManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
@@ -1907,6 +1915,18 @@ class MambaManager(SingleTypeKVCacheManager):
             self.mamba_cache_mode == "align"
             and kv_cache_spec.num_prefill_checkpoint_blocks > 0
         )
+        # Frozen boundary capture is align-mode only; MambaSpec carries the
+        # enablement decision (align + OffloadingConnector + kv_offloading).
+        # The bookkeeping exists for every mamba manager: the cache-manager
+        # release paths consult it unconditionally.
+        self.boundary_capture = (
+            kv_cache_spec.boundary_capture and self.mamba_cache_mode == "align"
+        )
+        # Recorded crossings (promoted at the next schedule pass) and the
+        # manager pins on promoted capture blocks (released on store ack):
+        # dedicated single-writer blocks holding state@B.
+        self._pending_captures: dict[str, list[tuple[Request, KVCacheBlock, int]]] = {}
+        self._capture_pinned: dict[int, KVCacheBlock] = {}
         # Mamba checkpoints follow Eagle's global replay boundary.
         self.drop_eagle_checkpoint_block = False
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
@@ -1926,6 +1946,112 @@ class MambaManager(SingleTypeKVCacheManager):
             # source directly.
             self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
             self._packed_prefill_checkpoint_reqs: set[str] = set()
+
+    def release_boundary_capture(self, block_id: int) -> None:
+        """Drop the manager pin on a frozen capture block once its store job
+        completed (or the connector dropped the offer). Safe against
+        in-flight DMA races: the connector fences block reuse for pending
+        store jobs, and the copy rail already retained the endpoints until
+        the copy step was processed."""
+        block = self._capture_pinned.pop(block_id, None)
+        if block is not None:
+            self.block_pool.free_blocks([block])
+
+    def release_all_boundary_captures(self) -> None:
+        """Release every capture pin and pending record (cache reset)."""
+        blocks = list(self._capture_pinned.values())
+        self._capture_pinned.clear()
+        for entries in self._pending_captures.values():
+            blocks.extend(column for _, column, _ in entries)
+        self._pending_captures.clear()
+        self.block_pool.free_blocks(blocks)
+
+    def _record_boundary_capture(
+        self, request: Request, column_block: KVCacheBlock, boundary: int
+    ) -> None:
+        """Remember that the step scheduled right now will write state at
+        ``boundary`` into ``column_block``. Promoted (copy + offer) at the
+        start of the next schedule pass, before the column can advance."""
+        # Invariant (connector-aligned-builder ownership): a capture boundary
+        # is a state-block multiple, so the offload chunk grid claims it.
+        assert boundary % self.block_size == 0
+        # Hold the column against retirement until promotion (next pass).
+        self.block_pool.touch([column_block])
+        self._pending_captures.setdefault(request.request_id, []).append(
+            (request, column_block, boundary)
+        )
+
+    def _promote_boundary_captures(self) -> None:
+        """Turn recorded crossings into frozen capture blocks.
+
+        Runs at the start of the schedule pass after the producing step was
+        dispatched. The producing forward has completed (or is queued ahead of
+        everything on the worker's compute stream), so:
+        - the copy rail (``kv_cache_block_copies``, executed in the next
+          worker step after zeroing and BEFORE ``preprocess_state``'s precopy
+          and the forward) reads the column exactly at state@boundary;
+        - the connector offer ships with the same scheduler output, and the
+          store DMA is submitted one further step later, chained behind the
+          copy on the transfer stream.
+        The capture block is a dedicated pool block: never in a request's
+        column table, so precopy/postprocess/spec relocation cannot touch it,
+        and it is hashed at the boundary so local hits can resume past the
+        last live column too.
+        """
+        pending, self._pending_captures = self._pending_captures, {}
+        for req_id, entries in pending.items():
+            req_blocks = self.req_to_blocks.get(req_id, [])
+            for request, column_block, boundary in entries:
+                column_idx = boundary // self.block_size - 1
+                if (
+                    column_block.is_null
+                    or column_block.block_hash is None
+                    or column_block.block_hash_num_tokens != boundary
+                    or column_idx >= len(req_blocks)
+                    or req_blocks[column_idx] is not column_block
+                ):
+                    # The column was retired, re-hashed, CoW-moved, or the
+                    # producing step was rewound before committing state@B.
+                    # (Never gate on request.num_computed_tokens here: under
+                    # async scheduling it is an optimistic mirror that lags
+                    # the dispatched step.)
+                    self.block_pool.free_blocks([column_block])
+                    continue
+                try:
+                    capture_block = self.block_pool.get_new_blocks(1)[0]
+                except ValueError:
+                    # Pool pressure: skip the capture. The boundary is simply
+                    # not stored; hits fall back to recompute (correct, slower).
+                    self.block_pool.free_blocks([column_block])
+                    continue
+                # Ref plan (I4): the capture block keeps its allocation ref
+                # as a manager pin until the store DMA ack releases it
+                # (release_boundary_capture); it can then never be re-allocated
+                # as a copy destination, a live column, or zero-filled while
+                # its own content is still owed to the CPU tier. `touch` adds
+                # the copy-rail ref on each endpoint (released when the copy
+                # step is processed by take_kv_cache_block_copies /
+                # _free_cow_retained_blocks); the record-time ref on the
+                # column is dropped here.
+                self.block_pool.touch([column_block, capture_block])
+                self._pending_cow_copies.append((column_block, capture_block))
+                self._capture_pinned[capture_block.block_id] = capture_block
+                block_hash = self.block_pool.cache_partial_block(
+                    request=request,
+                    block=capture_block,
+                    num_tokens=boundary,
+                    kv_cache_group_id=self.kv_cache_group_id,
+                    block_size=self.block_size,
+                    replace_existing_hashes=True,
+                )
+                if block_hash is not None:
+                    # Content lands with the copy at the start of this step's
+                    # execution; defer same-step local hits (CoW precedent).
+                    self.cached_blocks_this_step.add(block_hash)
+                self._pending_boundary_state_offloads.append(
+                    (req_id, self.kv_cache_group_id, capture_block, boundary)
+                )
+                self.block_pool.free_blocks([column_block])
 
     @classmethod
     def find_longest_cache_hit(
@@ -2463,6 +2589,14 @@ class MambaManager(SingleTypeKVCacheManager):
                 for entry in self._pending_boundary_state_offloads
                 if entry[0] != request_id
             ]
+            # Recorded-but-not-yet-promoted crossings can never ship a copy
+            # now that the column table is going away: drop them along with
+            # the record-time pin on each column. (Already-promoted captures
+            # are pool-owned pins held for the store ack, not for this
+            # request, and stay pinned.)
+            dropped = self._pending_captures.pop(request_id, ())
+            if dropped:
+                self.block_pool.free_blocks([col for _, col, _ in dropped])
         return super().pop_blocks_for_free(request_id)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
@@ -2515,6 +2649,35 @@ class MambaManager(SingleTypeKVCacheManager):
                 self.cached_blocks_this_step.add(block.block_hash)
                 if self.mamba_cache_mode == "align":
                     assert block.block_hash_num_tokens is not None
+                    if self.boundary_capture:
+                        # Frozen capture: the step scheduled right now is the
+                        # producer for this boundary only when the chunk ends
+                        # exactly at it and this is the last (live) column the
+                        # forward writes. Offer the live column never; the
+                        # dedicated capture block is the sole store source.
+                        # The producing step is the one that COMPUTES the
+                        # boundary, i.e. its dispatched chunk still has the
+                        # boundary ahead of it (nct < boundary). When the
+                        # mirror already sits at the boundary, the crossing
+                        # was produced by an EARLIER step (connector-load
+                        # delay: the producing allocate ran with
+                        # delay_cache_blocks and cache_blocks only catches
+                        # up now). Promoting that record copies the column
+                        # AFTER the later step's forward advanced it past
+                        # the boundary -- state@prompt_final stored under
+                        # key@boundary, the original mislabel defect.
+                        # Reject: the boundary simply keeps no capture and
+                        # hits fall back to recompute (correct, slower).
+                        if (
+                            idx == num_cached_blocks_after - 1
+                            and num_tokens % self.block_size == 0
+                            and block.block_hash_num_tokens == num_tokens
+                            and request.num_computed_tokens < num_tokens
+                        ):
+                            self._record_boundary_capture(
+                                request, block, num_tokens
+                            )
+                        continue
                     # Offer every retained boundary with its exact block.
                     # The connector filters against its save window, which may
                     # extend past the original prompt during resumed prefill.
@@ -2529,6 +2692,12 @@ class MambaManager(SingleTypeKVCacheManager):
 
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()
+        if self.boundary_capture:
+            # Promote last step's crossings before this pass allocates for the
+            # new step: the recorded live column still holds state@B until the
+            # producing forward's successor retires it, and the copy rail ships
+            # with this step's output.
+            self._promote_boundary_captures()
 
     def _cache_partial_tail_block(
         self,

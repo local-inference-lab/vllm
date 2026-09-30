@@ -264,6 +264,18 @@ def _get_parameter_for_reload(model: nn.Module, name: str) -> nn.Parameter:
     return module.get_parameter(parameter_name)
 
 
+def _flushed_free_memory() -> int:
+    """Read free device memory around a graph memory sample, cache empty.
+
+    ``torch.cuda.graph`` empties the allocator cache on entry. Blocks cached
+    before the sample would otherwise be released inside it and subtracted
+    from the graphs' memory, and blocks cached at its end would be added.
+    """
+    torch.accelerator.synchronize()
+    torch.accelerator.empty_cache()
+    return torch.accelerator.get_memory_info()[0]
+
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -6898,7 +6910,7 @@ class GPUModelRunner(
                     mem_samples: list[int] = []
 
                     for i, desc in enumerate(profile_descs):
-                        mem_before = torch.accelerator.get_memory_info()[0]
+                        mem_before = _flushed_free_memory()
                         self._warmup_and_capture(
                             desc,
                             cudagraph_runtime_mode=mode,
@@ -6911,9 +6923,7 @@ class GPUModelRunner(
                                 else None
                             ),
                         )
-                        torch.accelerator.synchronize()
-                        free_after = torch.accelerator.get_memory_info()[0]
-                        mem_samples.append(mem_before - free_after)
+                        mem_samples.append(mem_before - _flushed_free_memory())
 
                     first_capture = mem_samples[0]
                     # Use at least 1 MiB per graph for driver overhead
@@ -6934,11 +6944,11 @@ class GPUModelRunner(
                     )
 
                 if encoder_cudagraph_manager is not None:
-                    mem_before = torch.accelerator.get_memory_info()[0]
+                    mem_before = _flushed_free_memory()
                     encoder_cudagraph_manager.capture(graph_pool=encoder_profiling_pool)
-                    torch.accelerator.synchronize()
-                    free_after = torch.accelerator.get_memory_info()[0]
-                    encoder_memory_estimate = max(mem_before - free_after, 0)
+                    encoder_memory_estimate = max(
+                        mem_before - _flushed_free_memory(), 0
+                    )
 
                     logger.debug(
                         "Estimated encoder CUDA graph memory: %.2f MiB for %d graphs",
