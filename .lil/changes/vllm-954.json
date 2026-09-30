@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-954",
+  "category": "internal",
+  "summary": "vLLM wheels build with CUTLASS DSL 4.7.1 in the build environment",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "The wheel builder checks that its build environment has the CUTLASS DSL version the wheel will require. After vllm-951 moved that to 4.7.1, the builder still had the NGC image's 4.6.2 and stopped. It now installs 4.7.1 with pinned hashes, as the FlashInfer builder and the runtime image do."
+  ],
+  "pull_requests": [954],
+  "authors": ["Local Inference Lab"],
+  "requires": []
+}
