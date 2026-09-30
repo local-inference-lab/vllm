@@ -18,11 +18,11 @@ from tools.jovian_wheel_release.normalize_wheel import (
 @pytest.mark.parametrize(
     "source_cutlass,target_cutlass",
     [
-        ("4.6.2", "4.6.2"),
-        ("4.7.1", "4.6.2"),
-        ("4.8.0", "4.6.2"),
+        ("4.7.1", "4.7.1"),
         ("4.6.2", "4.7.1"),
-        ("4.6.2", "4.8.0"),
+        ("4.8.0", "4.7.1"),
+        ("4.7.1", "4.6.2"),
+        ("4.7.1", "4.8.0"),
     ],
 )
 def test_rewrites_foundation_dependencies(source_cutlass, target_cutlass) -> None:
@@ -47,7 +47,7 @@ Requires-Dist: humming-kernels[cu13]==0.1.12
 Requires-Dist: click>=8
 
 """.replace(b"CUTLASS_VERSION", source_cutlass.encode())
-    if source_cutlass == "4.8.0" or target_cutlass != "4.6.2":
+    if source_cutlass == "4.8.0" or target_cutlass != "4.7.1":
         with pytest.raises(ValueError, match="unreviewed CUTLASS DSL"):
             rewrite_requirements(
                 metadata,
@@ -69,7 +69,7 @@ Requires-Dist: click>=8
         "torch==2.14.0a0+nv",
         "torchvision==0.29.0a0+nv",
         "flashinfer-python==0.6.18",
-        "nvidia-cutlass-dsl[cu13]==4.6.2",
+        "nvidia-cutlass-dsl[cu13]==4.7.1",
         'fastsafetensors>=0.3.3; extra == "fastsafetensors"',
         "click>=8",
     ]
