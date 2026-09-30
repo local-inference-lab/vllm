@@ -1806,13 +1806,31 @@ def test_b12x_mxfp8_auto_selection_when_nothing_else_supports(
     """With every established backend unsupported, b12x wins over emulation."""
     import vllm.model_executor.layers.fused_moe.oracle.mxfp8 as mxfp8_oracle
 
-    def b12x_supported(
-        cls, k_cls, moe_config, weight_key, activation_key, activation_format
-    ):
-        del cls, k_cls, moe_config, weight_key, activation_key, activation_format
+    def supported(cls, config, weight_key, activation_key, activation_format):
+        del config, weight_key, activation_key, activation_format
         return True, None
 
-    monkeypatch.setattr(B12xExperts, "is_supported_config", classmethod(b12x_supported))
+    def unsupported(cls, config, weight_key, activation_key, activation_format):
+        del config, weight_key, activation_key, activation_format
+        return False, "established backend disabled"
+
+    # Disable every established backend explicitly: on SM12x hardware Marlin
+    # genuinely supports MXFP8 and outranks b12x.
+    established = type(
+        "EstablishedExperts",
+        (mk.FusedMoEExperts,),
+        {"is_supported_config": staticmethod(unsupported)},
+    )
+    monkeypatch.setattr(B12xExperts, "is_supported_config", staticmethod(supported))
+    monkeypatch.setattr(
+        mxfp8_oracle,
+        "_mxfp8_backend_to_kernel_cls",
+        lambda backend: (
+            [B12xExperts]
+            if backend is mxfp8_oracle.Fp8MoeBackend.B12X_MXFP8
+            else [established]
+        ),
+    )
     config = make_dummy_moe_config(
         hidden_dim=2560, intermediate_size=640, experts_per_token=10
     )
