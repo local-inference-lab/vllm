@@ -299,7 +299,12 @@ class B12xRoceAllReduce:
         """The runtime's protocol state from host memory, safe while wedged."""
         if self.disabled or self._runtime is None:
             return {}
-        return self._runtime.snapshot()
+        # b12x#438 added snapshot() without an API version bump; an older b12x
+        # still gets a dump, without the protocol state.
+        snapshot = getattr(self._runtime, "snapshot", None)
+        if snapshot is None:
+            return {"snapshot": "unavailable in this b12x"}
+        return snapshot()
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         return not self.disabled and self._runtime.should_allreduce(inp)
