@@ -247,6 +247,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         moe_config: mk.FusedMoEConfig,
         quant_config: FusedMoEQuantConfig,
     ):
+        """Bind the b12x quant mode, packed source format and W13 layout.
+
+        Raises ValueError when no b12x kernel covers the configured weight
+        dtype or the (weight, activation) scheme; no weights are prepared.
+        """
         super().__init__(moe_config, quant_config)
         if quant_config.weight_quant_dtype not in (
             "mxfp4",
@@ -342,6 +347,14 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         activation: MoEActivation,
         params_dtype: torch.dtype,
     ) -> Any:
+        """Build the b12x prepared-experts representation for these weights.
+
+        Block-quantized sources are planned straight from the packed extents
+        with a ``BlockQuantWeights`` binding; every other mode requires the
+        w1/w2 block scales, recovers the logical intermediate size from the
+        packed extent (FP4 holds two values per byte) and binds the weight and
+        activation global scales. Raises RuntimeError under CUDA graph capture.
+        """
         quant_mode = self._quant_mode
         if _is_current_stream_capturing():
             raise RuntimeError(
@@ -546,6 +559,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         activation_key: QuantKey | None,
         activation_format: mk.FusedMoEActivationFormat,
     ) -> tuple[bool, str | None]:
+        """Report whether b12x can run this MoE config, with the reason if not.
+
+        Applies the kernel-specific bias, dtype, activation and alignment
+        gates, then defers to the base-class checks.
+        """
         if moe_config.has_bias:
             return False, "kernel does not support expert biases"
         if moe_config.in_dtype not in (torch.float16, torch.bfloat16):
@@ -628,6 +646,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
     ) -> bool:
+        """Check the (weight, activation) pair against the b12x kernel set."""
         return (weight_key, activation_key) in (
             (kMxfp4Static, kMxfp8Dynamic),
             (kMxfp4Static, None),
@@ -826,6 +845,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         w2: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> tuple[int, int, int, int, int]:
+        """Return (experts, tokens, N, K, topk) for the current problem.
+
+        Delegates to the base implementation while the weight tensors still
+        hold data; once they are released, the geometry comes from the
+        prepared plan, with N doubled for the packed FP4 sources.
+        """
         if w1.numel() and w2.numel():
             return super().moe_problem_size(a1, w1, w2, topk_ids)
         prepared = self._prepared()

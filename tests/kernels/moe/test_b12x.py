@@ -454,6 +454,11 @@ def test_explicit_b12x_mxfp4_selection(
     force_a16: bool,
     expected_backend: Mxfp4MoeBackend,
 ) -> None:
+    """An explicit `moe_backend='b12x'` selects the b12x MXFP4 W4A8 experts.
+
+    The activation key -- dynamic MXFP8 or absent -- does not change the
+    choice while A16 forcing is off.
+    """
     monkeypatch.setattr(B12xExperts, "_supports_current_device", lambda: True)
     monkeypatch.setattr(mxfp4_oracle, "_user_moe_activation_override", lambda: None)
     monkeypatch.setattr(
@@ -509,6 +514,11 @@ def test_deepseek_v4_b12x_activation_selection(
     force_a16: bool,
     expected_backend: Mxfp4MoeBackend,
 ) -> None:
+    """DeepSeek V4 b12x selection follows the forced-A16 knob.
+
+    MXFP4 weights keep the dynamic-MXFP8 activation contract unless A16 is
+    forced, which selects the BF16 contract.
+    """
     monkeypatch.setattr(B12xExperts, "_supports_current_device", lambda: True)
     monkeypatch.setattr(
         mxfp4_oracle.envs,
@@ -1109,6 +1119,12 @@ def _make_b12x_moe_case(
     intermediate_size: int = 128,
     topk: int = 2,
 ) -> _B12xMoeCase:
+    """Build one deterministic B12X MoE case for a weight/activation pair.
+
+    Quantizes freshly seeded BF16 expert weights, keeps the dequantized
+    tensors as the reference, and assembles the quant config matching the
+    requested activation dtype.
+    """
     set_random_seed(seed)
     dtype = torch.bfloat16
     hidden_states = torch.randn((tokens, hidden_size), device="cuda", dtype=dtype) / 10
@@ -1276,6 +1292,7 @@ def test_b12x_moe_matches_torch(
     activation: MoEActivation,
     workspace_init,
 ) -> None:
+    """Each b12x MoE quantization lane matches the dequantized PyTorch MoE."""
     with set_current_vllm_config(
         VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
     ):
@@ -1355,6 +1372,7 @@ def test_b12x_moe_cuda_graph_replay(
     activation_dtype: str | None,
     workspace_init,
 ) -> None:
+    """A captured b12x MoE graph replays with the eager call's output."""
     from vllm.v1.worker.workspace import lock_workspace
 
     with set_current_vllm_config(
@@ -1550,6 +1568,12 @@ def test_b12x_moe_prefill_capacity_and_exact_decode_reuse(
     workspace_init,
     capacity,
 ) -> None:
+    """One prepared kernel serves every row count up to its capacity.
+
+    Once the session is frozen, eager calls at mixed row counts and route-id
+    dtypes, plus a capture-scope graph replay, must stay correct without
+    reallocating workspace buffers.
+    """
     from b12x._lib.runtime_control import kernel_resolution_guard
 
     from vllm.v1.worker.workspace import current_workspace_manager, lock_workspace
@@ -1733,6 +1757,7 @@ def test_b12x_mxfp8_w8a8_config_support(
 def test_b12x_mxfp8_w8a8_rejects_non_silu_activation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """MXFP8 W8A8 on b12x supports SiLU only."""
     monkeypatch.setattr(B12xExperts, "_supports_current_device", lambda: True)
     config = make_dummy_moe_config(
         hidden_dim=256,
@@ -1779,6 +1804,7 @@ def test_b12x_mxfp8_auto_selection_keeps_conservative_priority(
     assert backends[-2] is mxfp8_oracle.Fp8MoeBackend.B12X_MXFP8
 
     def always_supported(cls, config, weight_key, activation_key, activation_format):
+        """Stand-in: the established backend claims every config."""
         del config, weight_key, activation_key, activation_format
         return True, None
 
@@ -1813,10 +1839,12 @@ def test_b12x_mxfp8_auto_selection_when_nothing_else_supports(
     import vllm.model_executor.layers.fused_moe.oracle.mxfp8 as mxfp8_oracle
 
     def supported(cls, config, weight_key, activation_key, activation_format):
+        """Stand-in: the b12x experts claim the config."""
         del config, weight_key, activation_key, activation_format
         return True, None
 
     def unsupported(cls, config, weight_key, activation_key, activation_format):
+        """Stand-in: the established backend rejects every config."""
         del config, weight_key, activation_key, activation_format
         return False, "established backend disabled"
 
