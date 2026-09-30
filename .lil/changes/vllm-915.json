@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-915",
+  "category": "performance",
+  "summary": "Serve native block-FP8 GLM-5.3 DSA q_b_proj and o_proj on Marlin on GB10",
+  "models": ["GLM-5.3-Flash"],
+  "compatibility": "No user action required. Only native block-FP8 checkpoints on GB10 (SM121) change; ModelOpt checkpoints and other GPUs keep their current path.",
+  "details": [
+    "A native block-FP8 checkpoint serializes the DSA q_b_proj and o_proj in FP8, but the loader dequantized both to BF16. On GB10 they now run on Marlin W8A16 with the checkpoint's 128x128 block scales and BF16 activations, reading half the weight bytes per decode step.",
+    "GB10 TP4 MTP3 decode at an 8K warm context: 76.6 to 74.3 ms/step at c1, 239.1 to 233.6 at c8; weights 78.87 to 77.93 GiB per rank."
+  ],
+  "pull_requests": [915],
+  "authors": ["tobymao"],
+  "requires": []
+}
