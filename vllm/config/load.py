@@ -39,6 +39,8 @@ class LoadConfig:
       the b12x checkpoint loader provided by `flashinfer-python[b12x]`.
     - "exact_mxfp4" reads losslessly compressed DS4.1 MXFP4 expert scales and
       retains file-backed loading for Engram tables.
+    - "nvfp4_lsc" reads losslessly compressed GLM NVFP4 expert scales and
+      retains native NVFP4 activation quantization.
     - "instanttensor" will load the Safetensors weights on CUDA devices using
       InstantTensor, which enables distributed loading with pipelined prefetching
       and fast direct I/O.
