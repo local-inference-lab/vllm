@@ -766,7 +766,7 @@ class KimiMoE(nn.Module):
             config, "min_moe_intermediate_per_partition", 256
         )
         native_b12x_mxfp4 = (
-            vllm_config.model_config.quantization == "mxfp4"
+            vllm_config.model_config.quantization in ("mxfp4", "kimi_x4t")
             and vllm_config.kernel_config.moe_backend == "b12x"
         )
         self._aligned_decode_projections = (
