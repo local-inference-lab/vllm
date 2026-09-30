@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-951",
+  "category": "internal",
+  "summary": "vLLM wheels require CUTLASS DSL 4.7.1, the compiler B12X and FlashInfer now use",
+  "models": ["all"],
+  "compatibility": "No user action required. The first start after updating compiles B12X kernels again for the new compiler.",
+  "details": [
+    "B12X moved to CUTLASS DSL 4.7.1. The runtime image keeps one compiler for B12X, FlashInfer and vLLM, so vLLM's wheel metadata now names 4.7.1 instead of 4.6.2."
+  ],
+  "pull_requests": [951],
+  "authors": ["Local Inference Lab"],
+  "requires": []
+}
