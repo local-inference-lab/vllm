@@ -25,6 +25,7 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
     MoEPrepareAndFinalizeNoDPEPModular,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+from vllm.utils.torch_utils import set_default_torch_num_threads
 
 from .quant_config import DeepseekV41FP8Config
 
@@ -169,18 +170,21 @@ class ExactMXFP4MoEMethod(FusedMoEMethodBase):
             t.shape != shape or t.device != device for t, shape in zip(scratch, shapes)
         ):
             raise ValueError("X4T shared scale scratch geometry/device mismatch")
-        weights = read_exact_mxfp4_layer(
-            self.owner.checkpoint_root,
-            self.layer_index,
-            num_experts=e,
-            hidden_size=h,
-            intermediate_size=n * tp,
-            tp_rank=rank,
-            tp_size=tp,
-            device=device,
-            w13_scale_scratch=scratch[0],
-            w2_scale_scratch=scratch[1],
-        )
+        # Per-expert CPU slices are too small to amortize intra-op barriers.
+        # Restore the serving thread policy before kernel preparation.
+        with set_default_torch_num_threads(1):
+            weights = read_exact_mxfp4_layer(
+                self.owner.checkpoint_root,
+                self.layer_index,
+                num_experts=e,
+                hidden_size=h,
+                intermediate_size=n * tp,
+                tp_rank=rank,
+                tp_size=tp,
+                device=device,
+                w13_scale_scratch=scratch[0],
+                w2_scale_scratch=scratch[1],
+            )
         plan = fused_moe.plan_weights(
             source=fused_moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w31"),
             activation=fused_moe.ActivationSpec(

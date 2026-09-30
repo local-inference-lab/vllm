@@ -73,6 +73,32 @@ def test_exact_config_and_loader_are_registered():
     )
 
 
+def test_x4t_cpu_shard_reader_bounds_threads_and_restores_on_failure(
+    monkeypatch, moe, owner
+):
+    from b12x.moe.checkpoints import exact_mxfp4 as checkpoint
+
+    from vllm.models.deepseek_v4_1 import exact_mxfp4
+    from vllm.utils.torch_utils import set_default_torch_num_threads
+
+    monkeypatch.setattr(exact_mxfp4, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(exact_mxfp4, "get_tensor_model_parallel_rank", lambda: 0)
+    method = ExactMXFP4MoEMethod(moe, owner)
+    layer = torch.nn.Module()
+    layer.layer_name = "model.layers.17.ffn.experts"
+    method.create_weights(layer, 384, 5120, 576, torch.bfloat16)
+
+    def fail_reader(*args, **kwargs):
+        assert torch.get_num_threads() == 1
+        raise OSError("checkpoint read failed")
+
+    monkeypatch.setattr(checkpoint, "read_exact_mxfp4_layer", fail_reader)
+    with set_default_torch_num_threads(4):
+        with pytest.raises(OSError, match="checkpoint read failed"):
+            method.process_weights_after_loading(layer)
+        assert torch.get_num_threads() == 4
+
+
 @pytest.mark.parametrize("mode", ["normal", "pipeline", "ubatching", "wrong_loader"])
 def test_target_uses_x4t_while_dense_and_draft_keep_native_methods(
     monkeypatch, moe, owner, mode
