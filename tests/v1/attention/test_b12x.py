@@ -1074,6 +1074,64 @@ def test_b12x_attention_runtime_page_size_comes_from_cache() -> None:
         _kv_page_size(key_cache, torch.empty((3, 128, 4, 128), device="meta"))
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_b12x_dense_mla_preparation_releases_temporary_buffers(
+    dtype, monkeypatch
+) -> None:
+    from vllm.v1.attention.backends.mla import b12x_mla
+    from vllm.v1.worker import workspace
+
+    impl = object.__new__(b12x_mla.B12xMLAImpl)
+    impl.num_heads, impl.dcp_world_size = 6, 16
+    impl.head_size, impl.kv_lora_rank = 576, 512
+    impl.kv_cache_dtype = "fp8" if dtype == torch.float8_e4m3fn else "bfloat16"
+    impl.scale = 192**-0.5
+    impl._plans = {
+        8: SimpleNamespace(scratch_specs=lambda: [SimpleNamespace(nbytes=64)])
+    }
+    monkeypatch.setattr(
+        workspace,
+        "_manager",
+        SimpleNamespace(
+            get_simultaneous=lambda *args: None, reserve_by_lane=lambda: None
+        ),
+    )
+    monkeypatch.setattr(
+        b12x_mla,
+        "get_b12x_scratch_buffers",
+        lambda state: (torch.empty(64, dtype=torch.uint8),),
+    )
+    references = []
+
+    def bind(**kwargs):
+        references.extend(
+            weakref.ref(kwargs[name])
+            for name in (
+                "scratch",
+                "q",
+                "output",
+                "cache_seqlens",
+                "cu_seqlens_q",
+                "page_table",
+            )
+        )
+        return kwargs
+
+    state = SimpleNamespace(
+        bind=bind,
+        prime=lambda binding: None,
+        run=lambda binding: binding["output"].zero_(),
+    )
+    layer = SimpleNamespace(kv_cache=torch.empty(2, 64, 576, dtype=dtype))
+    call = impl._prepared_call(layer, state, 8)
+    call.invoke()
+    assert all(reference() is not None for reference in references)
+    published = SimpleNamespace(state=state, owners=call.owners)
+    del call
+    assert all(reference() is None for reference in references)
+    assert published.state is state
+
+
 def test_b12x_attention_preparation_releases_temporary_buffers() -> None:
     impl = object.__new__(B12xPagedAttentionImpl)
     impl._noncausal = None

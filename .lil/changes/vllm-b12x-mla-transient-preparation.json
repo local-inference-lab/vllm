@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-b12x-mla-transient-preparation",
+  "category": "fix",
+  "summary": "Release temporary dense MLA operands after synchronized kernel preparation.",
+  "models": [
+    "Kimi-K3"
+  ],
+  "compatibility": "Prepared serving rebinds caller-owned buffers. Kernel arithmetic, cache representation and public configuration are unchanged.",
+  "pull_requests": [],
+  "authors": [
+    "voipmonitor"
+  ]
+}
