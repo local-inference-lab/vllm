@@ -51,6 +51,7 @@ class _VllmConfig:
 
 
 def _config(target_moe: str, draft_moe: str | None) -> _VllmConfig:
+    """Build the minimal config stand-in consumed by the draft-loading path."""
     return _VllmConfig(
         attention_config=_AttentionConfig(),
         kernel_config=_KernelConfig(moe_backend=target_moe),

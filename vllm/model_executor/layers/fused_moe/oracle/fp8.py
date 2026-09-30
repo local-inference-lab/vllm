@@ -502,6 +502,13 @@ def convert_to_fp8_moe_kernel_format(
     w13_input_scale: torch.Tensor | None,
     w2_input_scale: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Convert canonical FP8/MXFP8 expert weights into `fp8_backend`'s layout.
+
+    Returns the (w13, w2, w13_scale, w2_scale) the kernel consumes: backends
+    with no load-time conversion pass the tensors through unchanged, HUMMING
+    rewrites the layer parameters and they are read back from the layer, and a
+    backend without a converter raises ValueError.
+    """
     block_quant = hasattr(layer, "weight_block_size")
     if fp8_backend in [Fp8MoeBackend.DEEPGEMM, Fp8MoeBackend.BATCHED_DEEPGEMM]:
         assert block_quant

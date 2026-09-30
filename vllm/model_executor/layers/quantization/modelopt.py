@@ -1395,6 +1395,13 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        """Convert the loaded MXFP8 weights and build the MoE kernel once.
+
+        Runs the selected backend's weight converter, refreshes the quant
+        config and kernel, lets the experts class prepare its own
+        representation, and dequantizes to BF16 at load time on the emulation
+        backend. A second call for the same layer is a no-op.
+        """
         # TODO(bnell): why is this required only for mxfp8?
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
