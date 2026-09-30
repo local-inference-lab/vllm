@@ -381,6 +381,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         # FP4 weights pack two values per byte, so the loaded w2 last dim is
         # half the logical channel count; MXFP8 stores one byte per value and
         # the loaded extent is already logical.
+        w1_scale, w2_scale = self.w1_scale, self.w2_scale
         if quant_mode in ("w8a8_mx",):
             intermediate_size = int(w2.shape[2])
         else:
@@ -434,8 +435,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             weights=fused_moe.PackedWeights(
                 w13=w1,
                 w2=w2,
-                w13_block_scales=self.w1_scale,
-                w2_block_scales=self.w2_scale,
+                w13_block_scales=w1_scale,
+                w2_block_scales=w2_scale,
                 w13_global_scales=w1_global_scale,
                 w2_global_scales=w2_global_scale,
                 input_scale=a1_gscale,
@@ -594,19 +595,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         if weight_key == kMxfp8Static:
             if moe_config.activation != MoEActivation.SILU:
                 return False, "MXFP8 W8A8 supports only SiLU"
-            unpadded_intermediate_size = (
-                moe_config.intermediate_size_per_partition_unpadded
-                or moe_config.intermediate_size_per_partition
-            )
-            if (
-                moe_config.hidden_dim % 128 != 0
-                or unpadded_intermediate_size % 128 != 0
-            ):
+            if moe_config.hidden_dim % 128 != 0 or unpadded_intermediate_size % 32 != 0:
                 return (
                     False,
                     (
-                        "MXFP8 W8A8 requires hidden size and per-rank "
-                        "intermediate size divisible by 128"
+                        "MXFP8 W8A8 requires hidden size divisible by 128 and "
+                        "per-rank intermediate size divisible by 32"
                     ),
                 )
         return mk.FusedMoEExperts.is_supported_config(

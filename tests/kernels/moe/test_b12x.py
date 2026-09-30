@@ -1677,7 +1677,8 @@ def test_b12x_moe_prefill_capacity_and_exact_decode_reuse(
 
 
 _MXFP8_W8A8_ALIGNMENT_REASON = (
-    "MXFP8 W8A8 requires hidden size and per-rank intermediate size divisible by 128"
+    "MXFP8 W8A8 requires hidden size divisible by 128 and "
+    "per-rank intermediate size divisible by 32"
 )
 
 
@@ -1690,9 +1691,14 @@ _MXFP8_W8A8_ALIGNMENT_REASON = (
             id="step5500-shape-supported",
         ),
         pytest.param(
-            {"hidden_dim": 256, "intermediate_size": 64},
+            {"hidden_dim": 2560, "intermediate_size": 320},
+            None,
+            id="step5500-tp2-shard-supported",
+        ),
+        pytest.param(
+            {"hidden_dim": 256, "intermediate_size": 48},
             _MXFP8_W8A8_ALIGNMENT_REASON,
-            id="intermediate-64-rejected",
+            id="intermediate-48-rejected",
         ),
         pytest.param(
             {"hidden_dim": 100, "intermediate_size": 128},
@@ -1949,12 +1955,11 @@ def test_b12x_mxfp8_preparation_passes_source_tensors_verbatim(
 
 _MXFP8_E = 16
 _MXFP8_K = 2560
-_MXFP8_I = 640
 _MXFP8_TOPK = 10
 _MXFP8_TOKENS = 16
 
 
-def _modelopt_mxfp8_method():
+def _modelopt_mxfp8_method(intermediate: int):
     """Build the real ModelOptMxFp8FusedMoE with moe_backend='b12x' at
     reduced step5500 geometry, with weights allocated on the layer."""
     from vllm.model_executor.layers.quantization.modelopt import (
@@ -1971,7 +1976,7 @@ def _modelopt_mxfp8_method():
         num_experts=_MXFP8_E,
         experts_per_token=_MXFP8_TOPK,
         hidden_dim=_MXFP8_K,
-        intermediate_size=_MXFP8_I,
+        intermediate_size=intermediate,
         in_dtype=torch.bfloat16,
         max_num_tokens=128,
     )
@@ -1981,7 +1986,7 @@ def _modelopt_mxfp8_method():
     assert method.experts_cls is B12xExperts
 
     layer = torch.nn.Module()
-    layer.intermediate_size_per_partition = _MXFP8_I
+    layer.intermediate_size_per_partition = intermediate
     layer.hidden_size = _MXFP8_K
     layer.moe_config = moe_config
     layer.activation = MoEActivation.SILU
@@ -2000,7 +2005,7 @@ def _modelopt_mxfp8_method():
             layer,
             num_experts=_MXFP8_E,
             hidden_size=_MXFP8_K,
-            intermediate_size_per_partition=_MXFP8_I,
+            intermediate_size_per_partition=intermediate,
             params_dtype=torch.bfloat16,
         )
     return method, layer
@@ -2008,9 +2013,13 @@ def _modelopt_mxfp8_method():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @torch.inference_mode()
+# 640 is the TP=1 expert width; 320 is the TP=2 shard, which B12X prepares
+# unpadded (split up/gate FC1 descriptors, TMA zero-filled tail tile).
+@pytest.mark.parametrize("intermediate", [640, 320], ids=["tp1-i640", "tp2-i320"])
 def test_b12x_modelopt_mxfp8_post_load_prepares_and_matches_torch(
     dist_init,
     workspace_init,
+    intermediate: int,
 ) -> None:
     """Drive the real ModelOptMxFp8FusedMoE lifecycle (create_weights ->
     serialized weights -> process_weights_after_loading -> declare+prepare ->
@@ -2036,7 +2045,7 @@ def test_b12x_modelopt_mxfp8_post_load_prepares_and_matches_torch(
                 lambda *_, **__: None,
             )
             with torch.device("cuda"):
-                method, layer = _modelopt_mxfp8_method()
+                method, layer = _modelopt_mxfp8_method(intermediate)
                 set_random_seed(29)
                 hidden_states = (
                     torch.randn(
@@ -2049,7 +2058,7 @@ def test_b12x_modelopt_mxfp8_post_load_prepares_and_matches_torch(
                 )
                 w1_bf16 = (
                     torch.randn(
-                        (_MXFP8_E, 2 * _MXFP8_I, _MXFP8_K),
+                        (_MXFP8_E, 2 * intermediate, _MXFP8_K),
                         device="cuda",
                         dtype=torch.bfloat16,
                     )
@@ -2057,7 +2066,7 @@ def test_b12x_modelopt_mxfp8_post_load_prepares_and_matches_torch(
                 )
                 w2_bf16 = (
                     torch.randn(
-                        (_MXFP8_E, _MXFP8_K, _MXFP8_I),
+                        (_MXFP8_E, _MXFP8_K, intermediate),
                         device="cuda",
                         dtype=torch.bfloat16,
                     )
@@ -2082,6 +2091,10 @@ def test_b12x_modelopt_mxfp8_post_load_prepares_and_matches_torch(
             # Preparation consumed the source parameters.
             assert layer.w13_weight.numel() == 0
             assert layer.w2_weight.numel() == 0
+            assert (
+                experts._prepared_experts.plan.geometry.intermediate_size
+                == intermediate
+            )
 
             # Declare and prepare the serving shapes exactly as the warmup
             # driver does; apply() resolves only session-prepared plans.
