@@ -24,8 +24,10 @@ class ExactMXFP4ModelLoader(DefaultModelLoader):
     def _root(self, model_config):
         from b12x.moe.checkpoints.exact_mxfp4 import checkpoint_contract
 
-        quant = model_config.hf_config.quantization_config
-        if quant.get("quant_method") != "exact_mxfp4":
+        text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
+        quant = getattr(model_config.hf_config, "quantization_config", None)
+        quant = quant or text_config.quantization_config
+        if quant.get("quant_method") not in ("exact_mxfp4", "kimi_x4t"):
             raise ValueError("exact_mxfp4 loading requires the X4T model config")
         root = Path(quant["checkpoint_root"])
         if not root.is_absolute():
@@ -41,7 +43,8 @@ class ExactMXFP4ModelLoader(DefaultModelLoader):
             raise NotImplementedError("X4T does not support secondary weight sources")
         file_filter = getattr(model, "checkpoint_file_weight_filter", None)
         prefixes = getattr(model, "checkpoint_weight_name_prefixes", None)
-        layers = model_config.hf_config.num_hidden_layers
+        text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
+        layers = text_config.num_hidden_layers
         self.counter_before_loading_weights = time.perf_counter()
         for filename in sorted(set(contract["source_names"].values())):
             path = str(root / "tensors" / filename)
@@ -50,7 +53,10 @@ class ExactMXFP4ModelLoader(DefaultModelLoader):
                 for name in sorted(descriptors):
                     if prefixes is not None and not name.startswith(prefixes):
                         continue
-                    match = re.match(r"layers\.(\d+)\.ffn\.experts\.", name)
+                    match = re.search(
+                        r"(?:^|\.)layers\.(\d+)\.(?:ffn|block_sparse_moe)\.experts\.",
+                        name,
+                    )
                     if match and int(match.group(1)) < layers:
                         continue
                     if callable(file_filter) and file_filter(name):
