@@ -65,6 +65,10 @@ class Fp8MoeBackend(Enum):
     TRITON_MXFP8 = "TRITON_MXFP8"
     # MXFP8 MoE via AITER (FlyDSL two-stage grouped GEMM) on gfx950.
     AITER_MXFP8 = "AITER_MXFP8"
+    # MXFP8 MoE through the b12x SM12x planned-expert API (w8a8_mx): raw
+    # E4M3 weights and UE8M0 K/32 scales pass through verbatim; BF16
+    # activations are quantized inside the kernel.
+    B12X_MXFP8 = "B12X_MXFP8"
 
 
 def _get_priority_backends(
@@ -590,8 +594,11 @@ def convert_to_fp8_moe_kernel_format(
             Fp8MoeBackend.HPC,
             # EMULATION dequantizes weights at runtime; NATIVE_MXFP8 consumes
             # the MXFP8 weights as-is — neither needs a load-time layout change.
+            # B12X_MXFP8 likewise binds the raw E4M3/E8M0 tensors during its
+            # process_weights_after_loading preparation.
             Fp8MoeBackend.EMULATION,
             Fp8MoeBackend.TRITON_MXFP8,
+            Fp8MoeBackend.B12X_MXFP8,
         ]:
             raise ValueError(f"Unsupported FP8 MoE backend: {fp8_backend.value}")
 

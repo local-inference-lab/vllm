@@ -19,6 +19,11 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 
 
 @dataclass
+class _AttentionConfig:
+    backend: str | None = None
+
+
+@dataclass
 class _KernelConfig:
     moe_backend: str | None = None
 
@@ -38,6 +43,7 @@ class _SpeculativeConfig:
 
 @dataclass
 class _VllmConfig:
+    attention_config: _AttentionConfig
     kernel_config: _KernelConfig
     cache_config: _CacheConfig
     speculative_config: _SpeculativeConfig
@@ -46,6 +52,7 @@ class _VllmConfig:
 
 def _config(target_moe: str, draft_moe: str | None) -> _VllmConfig:
     return _VllmConfig(
+        attention_config=_AttentionConfig(),
         kernel_config=_KernelConfig(moe_backend=target_moe),
         cache_config=_CacheConfig(),
         speculative_config=_SpeculativeConfig(moe_backend=draft_moe),

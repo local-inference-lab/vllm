@@ -24,6 +24,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kMxfp4Static,
     kMxfp8Dynamic,
+    kMxfp8Static,
     kNvfp4Dynamic,
     kNvfp4Static,
 )
@@ -45,6 +46,7 @@ _B12X_MOE_MODES: dict[
     tuple[str, str, str],
 ] = {
     ("mxfp4", "mxfp8"): ("w4a8_mx", "fp4_e8m0_k32", "w31"),
+    ("mxfp8", "mxfp8"): ("w8a8_mx", "mxfp8_e8m0_k32", "w31"),
     ("mxfp4", None): ("w4a16", "fp4_e8m0_k32", "w31"),
     ("exl3", None): ("w4a16", "exl3", "w31"),
     ("nvfp4", "nvfp4"): ("nvfp4", "modelopt_nvfp4", "w31"),
@@ -248,6 +250,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         super().__init__(moe_config, quant_config)
         if quant_config.weight_quant_dtype not in (
             "mxfp4",
+            "mxfp8",
             "nvfp4",
             "exl3",
             "iq2_xs",
@@ -255,8 +258,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             "q8_0",
         ):
             raise ValueError(
-                "b12x MoE requires MXFP4, NVFP4, EXL3, IQ2_XS, IQ2_XXS or "
-                "Q8_0 weights, got "
+                "b12x MoE requires MXFP4, MXFP8, NVFP4, EXL3, IQ2_XS, IQ2_XXS "
+                "or Q8_0 weights, got "
                 f"{quant_config.weight_quant_dtype}"
             )
         scheme = (
@@ -375,7 +378,13 @@ class B12xExperts(mk.FusedMoEExpertsModular):
 
         num_experts = int(w1.shape[0])
         hidden_size = int(w2.shape[1])
-        intermediate_size = int(w2.shape[2]) * 2
+        # FP4 weights pack two values per byte, so the loaded w2 last dim is
+        # half the logical channel count; MXFP8 stores one byte per value and
+        # the loaded extent is already logical.
+        if quant_mode in ("w8a8_mx",):
+            intermediate_size = int(w2.shape[2])
+        else:
+            intermediate_size = int(w2.shape[2]) * 2
         unit_scale = self._unit_scale(w1.device, num_experts)
         w1_global_scale = self._weight_global_scale(
             w1.device, num_experts, self.g1_alphas, "w1 global scales"
@@ -397,6 +406,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         mode = {
             "w4a16": fused_moe.ActivationMode.A16,
             "w4a8_mx": fused_moe.ActivationMode.A8,
+            "w8a8_mx": fused_moe.ActivationMode.A8,
             "w4a8_nvfp4": fused_moe.ActivationMode.A8,
             "nvfp4": fused_moe.ActivationMode.A4,
         }[quant_mode]
@@ -581,6 +591,24 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                         "per-rank intermediate size divisible by 32"
                     ),
                 )
+        if weight_key == kMxfp8Static:
+            if moe_config.activation != MoEActivation.SILU:
+                return False, "MXFP8 W8A8 supports only SiLU"
+            unpadded_intermediate_size = (
+                moe_config.intermediate_size_per_partition_unpadded
+                or moe_config.intermediate_size_per_partition
+            )
+            if (
+                moe_config.hidden_dim % 128 != 0
+                or unpadded_intermediate_size % 128 != 0
+            ):
+                return (
+                    False,
+                    (
+                        "MXFP8 W8A8 requires hidden size and per-rank "
+                        "intermediate size divisible by 128"
+                    ),
+                )
         return mk.FusedMoEExperts.is_supported_config(
             cls, moe_config, weight_key, activation_key, activation_format
         )
@@ -609,6 +637,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         return (weight_key, activation_key) in (
             (kMxfp4Static, kMxfp8Dynamic),
             (kMxfp4Static, None),
+            (kMxfp8Static, kMxfp8Dynamic),
             (kNvfp4Static, kNvfp4Dynamic),
             (kNvfp4Static, kMxfp8Dynamic),
             (kNvfp4Static, None),
@@ -807,10 +836,17 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             return super().moe_problem_size(a1, w1, w2, topk_ids)
         prepared = self._prepared()
         tokens = int(a1.shape[0] if a1.ndim == 2 else a1.shape[1])
+        # The prepared intermediate width is already logical for every
+        # supported format; only FP4 sources double their packed FC1 extent.
+        problem_n = (
+            int(prepared.intermediate_size) * 2
+            if self._source_format != "mxfp8_e8m0_k32"
+            else int(prepared.intermediate_size)
+        )
         return (
             int(prepared.num_experts),
             tokens,
-            int(prepared.intermediate_size) * 2,
+            problem_n,
             int(a1.shape[-1]),
             int(topk_ids.shape[1]),
         )
