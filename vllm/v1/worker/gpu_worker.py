@@ -930,7 +930,10 @@ class Worker(WorkerBase):
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         with set_current_vllm_config(self.vllm_config):
-            return self._compile_or_warm_up_model_after_preparation()
+            compilation_times = self._compile_or_warm_up_model_after_preparation()
+        if self.gpu_stall_watchdog is not None:
+            self.gpu_stall_watchdog.arm_host_steps()
+        return compilation_times
 
     def _compile_or_warm_up_model_after_preparation(self) -> CompilationTimes:
         warmup_sizes: list[int] = []
@@ -1326,7 +1329,14 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self._finish_step(self.model_runner.sample_tokens(grammar_output))
+        with self._host_step():
+            return self._finish_step(self.model_runner.sample_tokens(grammar_output))
+
+    def _host_step(self) -> contextlib.AbstractContextManager[None]:
+        """Let the stall watchdog time this step call on the host."""
+        if self.gpu_stall_watchdog is None:
+            return contextlib.nullcontext()
+        return self.gpu_stall_watchdog.host_step()
 
     def _b12x_roce_health_check(self) -> Callable[[], None] | None:
         """The RoCEnante health check of every live communicator of this process.
@@ -1387,6 +1397,12 @@ class Worker(WorkerBase):
     @torch.inference_mode()
     @with_gpu_sync_check
     def execute_model(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        with self._host_step():
+            return self._execute_model(scheduler_output)
+
+    def _execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         # Wait for the previous step's sends so this forward pass cannot

@@ -12,13 +12,18 @@ After each step the worker enqueues, the stream itself writes the step's
 number into a pinned host word (``cuStreamWriteValue32``) once it gets there,
 and a daemon thread compares that word with the steps enqueued. The thread
 makes no CUDA call: a query of an event or stream from another thread while
-the worker captures a CUDA graph invalidates the capture. When a step has
-been outstanding for ``VLLM_GPU_STALL_DUMP_SECONDS``, or a RoCEnante
+the worker captures a CUDA graph invalidates the capture. Once warm-up is
+over (its steps compile for minutes), the worker also records when it enters
+and leaves each step call, so a step that blocks on the host before its work
+is enqueued is caught too. When either has been
+outstanding for ``VLLM_GPU_STALL_DUMP_SECONDS``, or a RoCEnante
 wait on this rank timed out, it writes one dump under
 ``$VLLM_CACHE_ROOT/gpu_stall/``: every RoCEnante runtime's host-side protocol
 state, every Python thread's stack, and the kernels the GPU is running, read
-by attaching ``cuda-gdb`` to this process. It never tries to recover; a wedged
-GPU is past that from inside the process.
+by attaching ``cuda-gdb`` to this process (which needs ptrace permission: in a
+container, ``SYS_PTRACE`` or ``--privileged``; without it the dump keeps the
+stacks and RoCEnante state). It never tries to recover; a wedged GPU is past
+that from inside the process.
 """
 
 from __future__ import annotations
@@ -46,6 +51,10 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 POLL_SECONDS = 1.0
+# Step numbers live in a 32-bit word the stream writes, so they wrap; a step
+# counts as reached when the word is at most half the range past it.
+STEP_MASK = 0xFFFFFFFF
+STEP_HALF_RANGE = 1 << 31
 CUDA_GDB_TIMEOUT_SECONDS = 120
 # cuda-gdb finishes attaching to the GPU asynchronously: it resumes the process
 # to run its attach stub and completes only while it waits for input, so the
@@ -113,6 +122,10 @@ class GpuStallWatchdog:
         # (step number, time enqueued) of every step the GPU has not reached.
         self._pending: collections.deque[tuple[int, float]] = collections.deque()
         self._next_step = 0
+        # When the worker thread entered the step call it has not left, if any;
+        # only timed once warm-up, whose steps compile for minutes, is over.
+        self._host_steps_armed = False
+        self._host_step_started: float | None = None
         # Pinned host word the stream writes each finished step's number into;
         # allocated on the first mark, from the worker thread.
         self._done_tensor: torch.Tensor | None = None
@@ -135,13 +148,29 @@ class GpuStallWatchdog:
             self._stall_seconds,
         )
 
+    def arm_host_steps(self) -> None:
+        """Start timing step calls on the host; warm-up is over."""
+        self._host_steps_armed = True
+
+    @contextlib.contextmanager
+    def host_step(self):
+        """Time one step call on the worker thread, whatever it blocks on."""
+        if not self._host_steps_armed:
+            yield
+            return
+        self._host_step_started = time.monotonic()
+        try:
+            yield
+        finally:
+            self._host_step_started = None
+
     def mark(self) -> None:
         """Have the current stream report this step once it has run."""
         if self._done is None:
             self._done_tensor = torch.zeros(1, dtype=torch.int32, pin_memory=True)
             self._done = self._done_tensor.numpy().view(np.uint32)
         assert self._done_tensor is not None
-        self._next_step += 1
+        self._next_step = (self._next_step + 1) & STEP_MASK
         _stream_write_u32(self._done_tensor.data_ptr(), self._next_step)
         with self._lock:
             self._pending.append((self._next_step, time.monotonic()))
@@ -152,11 +181,19 @@ class GpuStallWatchdog:
             return None
         done = int(self._done[0])
         with self._lock:
-            while self._pending and self._pending[0][0] <= done:
+            while (
+                self._pending
+                and (done - self._pending[0][0]) & STEP_MASK < STEP_HALF_RANGE
+            ):
                 self._pending.popleft()
             if not self._pending:
                 return None
             return time.monotonic() - self._pending[0][1]
+
+    def _host_step_age(self) -> float | None:
+        """Seconds the worker thread has been inside its current step call."""
+        started = self._host_step_started
+        return None if started is None else time.monotonic() - started
 
     def _run(self) -> None:
         while True:
@@ -174,20 +211,33 @@ class GpuStallWatchdog:
             live_roce_communicators,
         )
 
-        age = self._oldest_pending_age()
+        gpu_age = self._oldest_pending_age()
+        host_age = self._host_step_age()
         if not self._roce_reported and any(
             comm.poisoned for comm in live_roce_communicators()
         ):
             self._roce_reported = True
             self._dump(f"RoCEnante on rank {self._rank} timed out or its proxy failed")
-        if age is None or age < self._stall_seconds:
+        stalled = [
+            age
+            for age in (gpu_age, host_age)
+            if age is not None and age >= self._stall_seconds
+        ]
+        if not stalled:
             self._stall_reported = False
         elif not self._stall_reported:
             self._stall_reported = True
-            self._dump(
-                f"GPU work enqueued {age:.0f} s ago has not finished on rank "
-                f"{self._rank}"
-            )
+            if gpu_age is not None and gpu_age >= self._stall_seconds:
+                reason = (
+                    f"GPU work enqueued {gpu_age:.0f} s ago has not finished on "
+                    f"rank {self._rank}"
+                )
+            else:
+                reason = (
+                    f"The worker thread on rank {self._rank} has been inside one "
+                    f"step for {host_age:.0f} s"
+                )
+            self._dump(reason)
 
     def _dump(self, reason: str) -> None:
         from vllm.distributed.device_communicators.b12x_roce_all_reduce import (
@@ -228,16 +278,26 @@ class GpuStallWatchdog:
         )
         with tempfile.TemporaryFile(mode="w+") as output, _sigint_ignored():
             try:
-                subprocess.run(
+                process = subprocess.Popen(
                     ["bash", "-c", script],
                     stdin=subprocess.DEVNULL,
                     stdout=output,
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
-                    timeout=CUDA_GDB_TIMEOUT_SECONDS,
-                    check=False,
                 )
-            except (OSError, subprocess.TimeoutExpired) as exc:
+            except OSError as exc:
                 output.write(f"\ncuda-gdb failed: {exc}\n")
+            else:
+                try:
+                    process.wait(timeout=CUDA_GDB_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired as exc:
+                    # Kill the whole session, gdb included, not just the shell;
+                    # a tracer that dies can leave this process stopped, so
+                    # continue it.
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+                    os.kill(os.getpid(), signal.SIGCONT)
+                    output.write(f"\ncuda-gdb failed: {exc}\n")
             output.seek(0)
             return output.read()
