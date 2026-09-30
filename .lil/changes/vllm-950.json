@@ -1,0 +1,23 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-950",
+  "category": "fix",
+  "summary": "GLM-5.3-Flash and Qwen3.8-Flash-Next on two or more GPUs no longer stop with \"RPC call to wait_for_boundary_checkpoint_copies timed out\"",
+  "models": [
+    "GLM-5.3-Flash",
+    "Qwen3.8-Flash-Next"
+  ],
+  "compatibility": "No user action required. Affected were beta images from karmic-kraken-beta-20260928-d7935130 on, serving a hybrid model (request-boundary checkpoints) with tensor parallelism. Canonical images were not affected. Models without recurrent layers, such as DeepSeek-V4.1-Flash and MiMo-V2.6-Flash, were not affected.",
+  "details": [
+    "What was wrong: ranks other than the output rank answer execute_model and sample_tokens only when they fail, and vllm-928 made the engine watch them for such a failure. With async scheduling the engine can send the next request to every rank, such as waiting for the boundary checkpoint copies of a finished prompt, before it has read the earlier replies. The other ranks answer that request first, and the engine took their answers for stray replies and dropped them.",
+    "Consequence: the engine then waited for answers that never came. After about a minute it logged that an engine step was blocked, and after VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS (300 s) it stopped with TimeoutError, failing the requests in flight. The GPUs were idle the whole time. Parallel long prompts triggered it most: 8 simultaneous 30K-token prompts on GLM-5.3-Flash TP4/DCP4 stopped the engine in the first burst. Such a stop is preceded by \"Dropped a reply from rank N to execute_model\" (or sample_tokens) warnings in the log.",
+    "Now a reply that answers a later request is kept for it, and a failure from any rank still stops the engine at once. Reported by thecrimea with a reproducer."
+  ],
+  "pull_requests": [
+    950
+  ],
+  "authors": [
+    "Local Inference Lab"
+  ],
+  "requires": []
+}

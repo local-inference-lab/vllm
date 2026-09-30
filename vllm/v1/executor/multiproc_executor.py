@@ -100,6 +100,7 @@ def _gather_responses(
     deadline: float | None,
     method: str,
     watched: Sequence[tuple[int, MessageQueue]] = (),
+    held: dict[int, deque[tuple[Any, Any]]] | None = None,
 ) -> list[Any]:
     """Collect one reply per queue, failing as soon as any rank reports one.
 
@@ -109,8 +110,14 @@ def _gather_responses(
     in the next all-reduce, and the engine waits on TP0 with TP1's error in
     its queue. ``watched`` are the other ranks of a single-rank RPC such as
     ``execute_model``: they reply only when they fail, and the output rank is
-    then blocked in a collective the failed rank has left, so a message from
+    then blocked in a collective the failed rank has left, so a failure from
     one of them ends the wait with its error.
+
+    A success from a watched rank answers a later RPC that rank has already
+    run: with the batch queue, the engine sends a collective RPC such as
+    ``wait_for_boundary_checkpoint_copies`` before it has gathered the replies
+    of earlier single-rank RPCs. Such a reply is kept in ``held``, per rank in
+    arrival order, and the gather of the RPC it answers takes it first.
 
     Every queue is checked without consuming anything, and a reply is read
     only once it has arrived, then with the RPC's own deadline. Between checks
@@ -118,6 +125,8 @@ def _gather_responses(
     spinning while replies are frequent, otherwise parked on its notification
     for at most RESPONSE_WAIT_SLICE_MS.
     """
+    if held is None:
+        held = {}
 
     def remaining() -> float | None:
         if deadline is None:
@@ -128,10 +137,13 @@ def _gather_responses(
         return left
 
     if len(response_mqs) == 1 and not watched:
-        try:
-            status, result = response_mqs[0].dequeue(timeout=remaining())
-        except TimeoutError as e:
-            raise TimeoutError(f"RPC call to {method} timed out.") from e
+        if replies := held.get(ranks[0]):
+            status, result = replies.popleft()
+        else:
+            try:
+                status, result = response_mqs[0].dequeue(timeout=remaining())
+            except TimeoutError as e:
+                raise TimeoutError(f"RPC call to {method} timed out.") from e
         return [_check_response(ranks[0], status, result)]
 
     responses: list[Any] = [None] * len(response_mqs)
@@ -143,14 +155,17 @@ def _gather_responses(
     while pending:
         progressed = False
         for index in list(pending):
-            # ready() never consumes, so a reply is only read once it has
-            # arrived, and then with the RPC's own deadline.
-            if not response_mqs[index].ready():
-                continue
-            try:
-                status, result = response_mqs[index].dequeue(timeout=remaining())
-            except TimeoutError as e:
-                raise TimeoutError(f"RPC call to {method} timed out.") from e
+            if replies := held.get(ranks[index]):
+                status, result = replies.popleft()
+            else:
+                # ready() never consumes, so a reply is only read once it has
+                # arrived, and then with the RPC's own deadline.
+                if not response_mqs[index].ready():
+                    continue
+                try:
+                    status, result = response_mqs[index].dequeue(timeout=remaining())
+                except TimeoutError as e:
+                    raise TimeoutError(f"RPC call to {method} timed out.") from e
             responses[index] = _check_response(ranks[index], status, result)
             pending.remove(index)
             progressed = True
@@ -162,12 +177,7 @@ def _gather_responses(
             except TimeoutError as e:
                 raise TimeoutError(f"RPC call to {method} timed out.") from e
             _check_response(rank, status, result)
-            logger.warning(
-                "Dropped a reply from rank %d to %s, which only rank %d answers.",
-                rank,
-                method,
-                ranks[0],
-            )
+            held.setdefault(rank, deque()).append((status, result))
         if pending and not progressed:
             left = remaining()  # raises once the deadline has passed
             if time.monotonic() - started >= interval * (warnings + 1):
@@ -366,6 +376,8 @@ class MultiprocExecutor(Executor):
                 response_mq.wait_until_ready()
 
             self.futures_queue = deque[FutureWrapper]()
+            # Replies gathered ahead of the RPC they answer, by rank.
+            self.held_replies: dict[int, deque[tuple[Any, Any]]] = {}
 
             self._post_init_executor()
 
@@ -552,7 +564,7 @@ class MultiprocExecutor(Executor):
 
         def get_response():
             responses = _gather_responses(
-                response_mqs, ranks, deadline, str(method), watched
+                response_mqs, ranks, deadline, str(method), watched, self.held_replies
             )
             return responses[0] if output_rank is not None else responses
 

@@ -4,16 +4,22 @@
 
 A rank that never replies (for example, stuck in a collective another rank
 failed out of) must not hide a failure another rank has already reported,
-including a rank that does not own the reply of a single-rank RPC.
+including a rank that does not own the reply of a single-rank RPC. A reply
+read while gathering an earlier RPC is kept for the RPC it answers.
 """
 
 import threading
 import time
+from collections import deque
 
 import pytest
 
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
-from vllm.v1.executor.multiproc_executor import WorkerProc, _gather_responses
+from vllm.v1.executor.multiproc_executor import (
+    MultiprocExecutor,
+    WorkerProc,
+    _gather_responses,
+)
 
 SUCCESS = WorkerProc.ResponseStatus.SUCCESS
 FAILURE = WorkerProc.ResponseStatus.FAILURE
@@ -130,11 +136,60 @@ def test_a_single_rank_reply_is_read_while_watching():
     assert quiet.checks >= 2 and quiet.reply is None
 
 
-def test_an_unexpected_success_from_a_watched_rank_is_dropped():
-    stale = _Queue((SUCCESS, "late"))
+def test_a_success_from_a_watched_rank_is_held_for_the_rpc_it_answers():
+    early = _Queue((SUCCESS, "copies 1"))
     output = _Queue((SUCCESS, "r0"), ready_after=1)
-    assert _gather_responses([output], (0,), None, "m", [(1, stale)]) == ["r0"]
-    assert stale.reply is None
+    held: dict = {}
+    assert _gather_responses([output], (0,), None, "m", [(1, early)], held) == ["r0"]
+    later = [_Queue((SUCCESS, "copies 0")), _Queue()]
+    assert _gather_responses(later, range(2), None, "copies", held=held) == [
+        "copies 0",
+        "copies 1",
+    ]
+    assert not held[1]
+
+
+class _Replies:
+    """One rank's reply queue, holding what the rank has already sent."""
+
+    def __init__(self, *replies) -> None:
+        self.replies = list(replies)
+
+    def ready(self) -> bool:
+        return bool(self.replies)
+
+    def dequeue(self, timeout=None):
+        assert self.replies
+        return self.replies.pop(0)
+
+    def wait_for_message(self, timeout_ms: int) -> None:
+        time.sleep(timeout_ms / 1000)
+
+
+class _Broadcast:
+    def enqueue(self, obj) -> None:
+        pass
+
+
+def test_a_collective_rpc_sent_behind_a_single_rank_rpc_gets_every_reply():
+    """The batch queue sends wait_for_boundary_checkpoint_copies to every rank
+    before it gathers execute_model, which only rank 0 answers. Ranks 1 and 2
+    run both and answer the collective first. Dropping those replies left the
+    collective waiting out its timeout, which ended the engine (GLM TP4)."""
+    executor = object.__new__(MultiprocExecutor)
+    executor.rpc_broadcast_mq = _Broadcast()
+    executor.is_failed = False
+    executor.futures_queue = deque()
+    executor.held_replies = {}
+    executor.response_mqs = [
+        _Replies((SUCCESS, "step"), (SUCCESS, "copies 0")),
+        _Replies((SUCCESS, "copies 1")),
+        _Replies((SUCCESS, "copies 2")),
+    ]
+    step = executor.collective_rpc("execute_model", non_block=True, unique_reply_rank=0)
+    copies = executor.collective_rpc("wait_for_boundary_checkpoint_copies", timeout=1)
+    assert copies == ["copies 0", "copies 1", "copies 2"]
+    assert step.result() == "step"
 
 
 def test_the_deadline_applies_while_watching():

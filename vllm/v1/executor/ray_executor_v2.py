@@ -477,6 +477,7 @@ class RayExecutorV2(MultiprocExecutor):
             response_mq.wait_until_ready()
 
         self.futures_queue = deque[FutureWrapper]()
+        self.held_replies = {}
         self._post_init_executor()
 
         self.start_worker_monitor()
