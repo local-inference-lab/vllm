@@ -45,10 +45,11 @@ def _select_sparse_backend(
 def _serve_block_fp8_on_marlin(linear: nn.Module) -> None:
     """Run a block-FP8 projection on Marlin W8A16 with the checkpoint's block scales.
 
-    Marlin dequantizes the serialized FP8 weight with its own 128x128 scales and
-    keeps BF16 activations, so it computes the checkpoint's weights exactly, as
-    the BF16 load path did, while reading half the bytes. The linear backend's
-    W8A8 block kernel quantizes activations too and measured slower here.
+    Marlin dequantizes the serialized FP8 weight with its 128x128 scales and keeps
+    BF16 activations, as the BF16 load path does, while reading half the bytes.
+    Outputs are close to that path's, not bit-identical: Marlin applies the scales
+    in BF16. The linear backend's W8A8 block kernel quantizes activations too and
+    measured slower.
     """
     from vllm.model_executor.kernels.linear import init_fp8_linear_kernel
     from vllm.model_executor.kernels.linear.scaled_mm.marlin import (
@@ -69,7 +70,9 @@ def _serve_block_fp8_on_marlin(linear: nn.Module) -> None:
         out_dtype=method.out_dtype,
         force_kernel=MarlinFP8ScaledMMLinearKernel,
     )
-    method.use_marlin = True
+    # A forced kernel that cannot implement the layer falls back to another one;
+    # weight processing must follow the kernel actually chosen.
+    method.use_marlin = isinstance(method.fp8_linear, MarlinFP8ScaledMMLinearKernel)
 
 
 class Glm5NextMLAAttention(nn.Module):

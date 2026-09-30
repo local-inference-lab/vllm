@@ -383,13 +383,18 @@ class Glm5NextDecoderLayer(nn.Module):
             # serializes q_b_proj and o_proj in FP8: serve them as FP8 instead of
             # dequantizing them to BF16, which doubles the bytes every decode step
             # streams. Its fused q_a/kv_a projection keeps the BF16 load path (NoPE
-            # rope padding splits a 128-row scale block).
+            # rope padding splits a 128-row scale block). Only GB10 (SM121) was
+            # measured, so other GPUs keep the BF16 load path for both.
             mixed = isinstance(quant_config, ModelOptMixedPrecisionConfig)
             mla_quant_config = quant_config if mixed else None
             mla_proj_quant_config = (
                 quant_config
                 if mixed
-                or (quant_config is not None and quant_config.get_name() == "fp8")
+                or (
+                    quant_config is not None
+                    and quant_config.get_name() == "fp8"
+                    and current_platform.is_device_capability(121)
+                )
                 else None
             )
             self.self_attn = Glm5NextMLAAttention(
