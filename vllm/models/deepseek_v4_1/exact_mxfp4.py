@@ -25,6 +25,7 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
     MoEPrepareAndFinalizeNoDPEPModular,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+from vllm.utils.torch_utils import set_default_torch_num_threads
 
 from .quant_config import DeepseekV41FP8Config
 
@@ -106,11 +107,18 @@ class ExactMXFP4MoEMethod(FusedMoEMethodBase):
         ):
             raise NotImplementedError("X4T DS4.1 supports TP without EP/DP")
         if (
-            moe.activation != MoEActivation.SILU
+            moe.activation not in (MoEActivation.SILU, MoEActivation.SITU)
             or moe.in_dtype != torch.bfloat16
             or moe.has_bias
+            or (
+                moe.activation == MoEActivation.SITU
+                and (
+                    moe.activation_situ_beta != 4.0
+                    or moe.activation_situ_linear_beta != 25.0
+                )
+            )
         ):
-            raise ValueError("X4T DS4.1 requires bias-free BF16 SwiGLU experts")
+            raise ValueError("X4T requires bias-free BF16 SwiGLU or SiTU(4,25) experts")
 
     def create_weights(
         self,
@@ -152,7 +160,7 @@ class ExactMXFP4MoEMethod(FusedMoEMethodBase):
         e, h, n = self.num_experts, self.hidden_size, self.local_intermediate
         shapes = ((e, h // 32, 2 * n), (e, n // 32, h))
         if self.owner.scale_scratch is None:
-            # DS4.1 disallows ubatching: every layer consumes these scale grids
+            # X4T disallows ubatching: every layer consumes these scale grids
             # before its successor may overwrite them on the same stream.
             self.owner.scale_scratch = tuple(
                 torch.empty(s, dtype=torch.uint8, device=device) for s in shapes
@@ -162,23 +170,28 @@ class ExactMXFP4MoEMethod(FusedMoEMethodBase):
             t.shape != shape or t.device != device for t, shape in zip(scratch, shapes)
         ):
             raise ValueError("X4T shared scale scratch geometry/device mismatch")
-        weights = read_exact_mxfp4_layer(
-            self.owner.checkpoint_root,
-            self.layer_index,
-            num_experts=e,
-            hidden_size=h,
-            intermediate_size=n * tp,
-            tp_rank=rank,
-            tp_size=tp,
-            device=device,
-            w13_scale_scratch=scratch[0],
-            w2_scale_scratch=scratch[1],
-        )
+        # Per-expert CPU slices are too small to amortize intra-op barriers.
+        # Restore the serving thread policy before kernel preparation.
+        with set_default_torch_num_threads(1):
+            weights = read_exact_mxfp4_layer(
+                self.owner.checkpoint_root,
+                self.layer_index,
+                num_experts=e,
+                hidden_size=h,
+                intermediate_size=n * tp,
+                tp_rank=rank,
+                tp_size=tp,
+                device=device,
+                w13_scale_scratch=scratch[0],
+                w2_scale_scratch=scratch[1],
+            )
         plan = fused_moe.plan_weights(
             source=fused_moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w31"),
             activation=fused_moe.ActivationSpec(
                 mode="a16",
-                nonlinearity="silu",
+                nonlinearity="situ"
+                if self.moe.activation == MoEActivation.SITU
+                else "silu",
                 io_dtype=torch.bfloat16,
                 swiglu_limit=self.moe.swiglu_limit,
             ),

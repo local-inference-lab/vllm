@@ -39,6 +39,7 @@ QuantizationMethods = Literal[
     "deepseek_v4_fp8",
     "deepseek_v41_fp8",
     "exact_mxfp4",
+    "kimi_x4t",
     "online",
     # Below are online quant shorthand names (see vllm.config.quantization).
     # Listed here as strings to avoid a circular import; kept in sync with
@@ -148,6 +149,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .fp_quant import FPQuantConfig
     from .humming import HummingConfig
     from .inc import INCConfig
+    from .kimi_x4t import KimiX4TConfig
     from .modelopt import (
         ModelOptFp8Config,
         ModelOptMixedPrecisionConfig,
@@ -185,6 +187,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "deepseek_v4_fp8": deepseek_config,
         "deepseek_v41_fp8": DeepseekV41FP8Config,
         "exact_mxfp4": DeepseekV41ExactMXFP4Config,
+        "kimi_x4t": KimiX4TConfig,
         "humming": HummingConfig,
         "online": OnlineQuantizationConfig,
         # MiniMax-style checkpoints tag `quant_method: "mxfp8"`; load with the

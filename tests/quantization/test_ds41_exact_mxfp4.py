@@ -73,6 +73,32 @@ def test_exact_config_and_loader_are_registered():
     )
 
 
+def test_x4t_cpu_shard_reader_bounds_threads_and_restores_on_failure(
+    monkeypatch, moe, owner
+):
+    from b12x.moe.checkpoints import exact_mxfp4 as checkpoint
+
+    from vllm.models.deepseek_v4_1 import exact_mxfp4
+    from vllm.utils.torch_utils import set_default_torch_num_threads
+
+    monkeypatch.setattr(exact_mxfp4, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(exact_mxfp4, "get_tensor_model_parallel_rank", lambda: 0)
+    method = ExactMXFP4MoEMethod(moe, owner)
+    layer = torch.nn.Module()
+    layer.layer_name = "model.layers.17.ffn.experts"
+    method.create_weights(layer, 384, 5120, 576, torch.bfloat16)
+
+    def fail_reader(*args, **kwargs):
+        assert torch.get_num_threads() == 1
+        raise OSError("checkpoint read failed")
+
+    monkeypatch.setattr(checkpoint, "read_exact_mxfp4_layer", fail_reader)
+    with set_default_torch_num_threads(4):
+        with pytest.raises(OSError, match="checkpoint read failed"):
+            method.process_weights_after_loading(layer)
+        assert torch.get_num_threads() == 4
+
+
 @pytest.mark.parametrize("mode", ["normal", "pipeline", "ubatching", "wrong_loader"])
 def test_target_uses_x4t_while_dense_and_draft_keep_native_methods(
     monkeypatch, moe, owner, mode
@@ -215,3 +241,74 @@ def test_loader_preserves_file_backed_engram_and_native_draft(tmp_path):
     assert list(dict(loader.get_all_weights(config, model))) == [
         "layers.40.ffn.experts.0.w1.weight"
     ]
+
+
+def test_kimi_x4t_keeps_bf16_dense_and_situ_experts(monkeypatch, moe):
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+    from vllm.model_executor.layers.quantization import kimi_x4t
+
+    owner = kimi_x4t.KimiX4TConfig.from_config(
+        {"format_version": 1, "checkpoint_root": "/x4t"}
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1, use_ubatching=False),
+        load_config=SimpleNamespace(load_format="exact_mxfp4"),
+    )
+    monkeypatch.setattr(kimi_x4t, "get_current_vllm_config", lambda: config)
+    experts = Mock(spec=RoutedExperts)
+    experts.moe_config = replace(
+        moe,
+        activation=MoEActivation.SITU,
+        activation_situ_beta=4.0,
+        activation_situ_linear_beta=25.0,
+        swiglu_limit=None,
+    )
+    assert isinstance(
+        owner.get_quant_method(experts, "model.layers.1.mlp.experts"),
+        ExactMXFP4MoEMethod,
+    )
+    assert isinstance(
+        owner.get_quant_method(Mock(spec=LinearBase), "model.layers.0.q_proj"),
+        UnquantizedLinearMethod,
+    )
+    config.parallel_config.use_ubatching = True
+    with pytest.raises(NotImplementedError, match="PP1 without ubatching"):
+        owner.get_quant_method(experts, "model.layers.1.mlp.experts")
+
+
+def test_kimi_loader_skips_compressed_experts_with_nested_text_config(tmp_path):
+    from b12x.moe.checkpoints.exact_mxfp4 import CODEC, SCHEMA
+
+    tensor_dir = tmp_path / "tensors"
+    tensor_dir.mkdir()
+    filename = "model-00001.safetensors"
+    expert = "language_model.model.layers.1.block_sparse_moe.experts.0.w1."
+    dense = "language_model.model.layers.0.mlp.gate_proj.weight"
+    tensors = {
+        expert + "weight_packed": torch.ones(8, dtype=torch.uint8),
+        expert + "weight_scale.exact_mxfp4_fixed": torch.ones(8, dtype=torch.uint8),
+        dense: torch.ones((8, 8), dtype=torch.bfloat16),
+    }
+    save_file(tensors, tensor_dir / filename)
+    common = {"schema": SCHEMA, "codec": CODEC, "family": "kimi_k3"}
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({**common, "shards": [{"file": filename}]})
+    )
+    (tmp_path / "build-contract.json").write_text(
+        json.dumps({**common, "source_names": {k: filename for k in tensors}})
+    )
+    config = SimpleNamespace(
+        hf_config=SimpleNamespace(),
+        hf_text_config=SimpleNamespace(
+            num_hidden_layers=93,
+            quantization_config={
+                "quant_method": "kimi_x4t",
+                "checkpoint_root": str(tmp_path),
+            },
+        ),
+    )
+    loader = ExactMXFP4ModelLoader(LoadConfig(load_format="exact_mxfp4"))
+    result = dict(loader.get_all_weights(config, SimpleNamespace()))
+    assert list(result) == [dense]
+    assert torch.equal(result[dense], tensors[dense])
