@@ -1286,6 +1286,7 @@ class ModelConfig:
                 "exl3",
                 "exact_mxfp4",
                 "kimi_x4t",
+                "nvfp4_lsc",
                 # Ensure heavy backends are probed last to avoid unnecessary
                 # imports during override detection (e.g., MXFP4 imports Triton)
                 "mxfp4",

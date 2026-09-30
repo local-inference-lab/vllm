@@ -380,7 +380,7 @@ class Glm5NextDecoderLayer(nn.Module):
             mla_quant_config = (
                 quant_config
                 if quant_config is not None
-                and quant_config.get_name() == "modelopt_mixed"
+                and quant_config.get_name() in ("modelopt_mixed", "nvfp4_lsc")
                 else None
             )
             self.self_attn = Glm5NextMLAAttention(
@@ -1708,12 +1708,15 @@ def _vision_quant_config() -> QuantizationConfig | None:
     """Online MXFP8 for the vision tower's linear layers, when requested."""
     if not envs.VLLM_GLM53_VISION_MXFP8:
         return None
-    from vllm.config.quantization import QuantizationConfigArgs
+    from vllm.config.quantization import QuantizationConfigArgs, QuantSpec
     from vllm.model_executor.layers.quantization.online.base import (
         OnlineQuantizationConfig,
     )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 
-    return OnlineQuantizationConfig(QuantizationConfigArgs(linear="mxfp8"))
+    return OnlineQuantizationConfig(
+        QuantizationConfigArgs(linear=QuantSpec(weight=kMxfp8Dynamic))
+    )
 
 
 def _try_load_mxfp8_bf16_attn_proj(

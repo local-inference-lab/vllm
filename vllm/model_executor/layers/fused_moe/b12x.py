@@ -511,14 +511,21 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             and isinstance(prepared.plan.source, fused_moe.PackedSource)
             and prepared.plan.source.format == "fp4_e8m0_k32"
         )
-        if not (trellis or packed):
+        nvfp4 = (
+            self._source_format == "modelopt_nvfp4"
+            and self._quant_mode == "nvfp4"
+            and isinstance(prepared.plan.source, fused_moe.PackedSource)
+            and prepared.plan.source.format == "modelopt_nvfp4"
+            and prepared.plan.source.w13_layout in (self._w13_layout, "w13")
+        )
+        if not (trellis or packed or nvfp4):
             raise TypeError("Prepared expert encoding does not match the backend")
         if (
             prepared.num_experts != self.moe_config.num_experts
             or prepared.hidden_size != self.moe_config.hidden_dim
             or prepared.intermediate_size
             != self.moe_config.intermediate_size_per_partition
-            or prepared.plan.activation.mode != "a16"
+            or prepared.plan.activation.mode != ("a4" if nvfp4 else "a16")
             or (trellis and prepared.plan.activation.rotation_dtype != torch.float16)
             or prepared.plan.activation.io_dtype != self.moe_config.in_dtype
             or prepared.plan.activation.nonlinearity
