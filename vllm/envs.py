@@ -223,7 +223,11 @@ if TYPE_CHECKING:
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
     VLLM_B12X_PAGED_DECODE: Literal["auto", "0", "1"] = "auto"
-    VLLM_PLE_TABLE_MEMORY: Literal["ram", "disk"] | None = None
+    VLLM_PLE_TABLE_MEMORY: Literal["ram", "disk", "shared"] | None = None
+    VLLM_PLE_SHARED_TABLE_DIR: str = "/dev/shm/vllm-ple"
+    VLLM_PLE_SHARED_TABLE_ROLE: Literal["auto", "populate", "attach"] = "auto"
+    VLLM_PLE_SHARED_TABLE_LOCK_TIMEOUT_S: float = 3600.0
+    VLLM_PLE_SHARED_TABLE_IDENTITY: str | None = None
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
@@ -1868,10 +1872,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_B12X_PAGED_DECODE", "auto", ["auto", "0", "1"]
     ),
     # Qwen3.8-Flash-Next PLE offload policy, resolved by vLLM for b12x.
+    # "shared" keeps one host-RAM table per host in VLLM_PLE_SHARED_TABLE_DIR
+    # for every process serving the same checkpoint, such as TP1 replicas.
     "VLLM_PLE_TABLE_MEMORY": env_with_choices(
         "VLLM_PLE_TABLE_MEMORY",
         None,
-        ["ram", "disk"],
+        ["ram", "disk", "shared"],
+    ),
+    # tmpfs directory of the shared PLE tables.
+    "VLLM_PLE_SHARED_TABLE_DIR": lambda: os.getenv(
+        "VLLM_PLE_SHARED_TABLE_DIR", "/dev/shm/vllm-ple"
+    ),
+    # "auto" attaches to a complete table or populates it, "attach" requires
+    # one, "populate" always rewrites it.
+    "VLLM_PLE_SHARED_TABLE_ROLE": env_with_choices(
+        "VLLM_PLE_SHARED_TABLE_ROLE", "auto", ["auto", "populate", "attach"]
+    ),
+    # Seconds to wait while another process populates the shared table.
+    "VLLM_PLE_SHARED_TABLE_LOCK_TIMEOUT_S": lambda: float(
+        os.getenv("VLLM_PLE_SHARED_TABLE_LOCK_TIMEOUT_S", "3600")
+    ),
+    # Checkpoint identity in the shared table key, for example a content hash
+    # supplied by a launcher; derived from the checkpoint location when unset.
+    "VLLM_PLE_SHARED_TABLE_IDENTITY": lambda: os.getenv(
+        "VLLM_PLE_SHARED_TABLE_IDENTITY"
     ),
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(

@@ -46,6 +46,7 @@ from .b12x_ple import (
     B12xNGramEmbedding,
     _b12x_module,
     _register_ple_compilation_context,
+    _resolve_ple_shared_table,
     _resolve_ple_table_memory,
 )
 from .backend import uses_b12x
@@ -145,6 +146,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 _resolve_ple_table_memory(
                     vllm_config.additional_config, config.ple_embedding_dtype
                 ),
+                shared_table=_resolve_ple_shared_table(vllm_config),
             )
         else:
             self.ple_embedding = Qwen4ExpNGramEmbedding(
