@@ -27,6 +27,11 @@ _SUPPORTED_BACKENDS = (
     Fp8MoeBackend.AITER_MXFP8,
     Fp8MoeBackend.HUMMING,
     Fp8MoeBackend.TRITON_MXFP8,
+    # b12x (SM12x) is registered at the most conservative priority: every
+    # deployment an established backend already serves keeps that backend,
+    # and b12x only wins over the dequantize-to-BF16 emulation. Prefer
+    # moe_backend="b12x" to select it explicitly.
+    Fp8MoeBackend.B12X_MXFP8,
     Fp8MoeBackend.EMULATION,
 )
 
@@ -36,6 +41,7 @@ _BACKEND_NAME_MAP: dict[str, Fp8MoeBackend] = {
     "marlin": Fp8MoeBackend.MARLIN,
     "xpu": Fp8MoeBackend.XPU,
     "aiter": Fp8MoeBackend.AITER_MXFP8,
+    "b12x": Fp8MoeBackend.B12X_MXFP8,
     "triton": Fp8MoeBackend.TRITON_MXFP8,
     "humming": Fp8MoeBackend.HUMMING,
 }
@@ -68,6 +74,10 @@ def _mxfp8_backend_to_kernel_cls(
         )
 
         return [Mxfp8NativeTritonExperts]
+    if backend == Fp8MoeBackend.B12X_MXFP8:
+        from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
+
+        return [B12xExperts]
     if backend == Fp8MoeBackend.EMULATION:
         from vllm.model_executor.layers.fused_moe.experts.mxfp8_emulation_moe import (
             Mxfp8EmulationTritonExperts,
@@ -106,8 +116,15 @@ def _select_kernel_cls(
 
 def select_mxfp8_moe_backend(
     config: FusedMoEConfig,
+    *,
+    prepares_b12x: bool = False,
 ) -> tuple[Fp8MoeBackend, type[mk.FusedMoEExperts]]:
     """Select the MXFP8 MoE backend and the best expert class.
+
+    Args:
+        config: The MoE layer configuration.
+        prepares_b12x: Whether the caller's quantization method prepares
+            B12X experts after loading. Only those methods may use B12X.
 
     Returns:
         A tuple of (fp8_backend, experts_cls).
@@ -122,6 +139,12 @@ def select_mxfp8_moe_backend(
                 f"MXFP8 MoE. Expected one of "
                 f"{list(_BACKEND_NAME_MAP.keys())}."
             )
+        if backend == Fp8MoeBackend.B12X_MXFP8 and not prepares_b12x:
+            raise ValueError(
+                "moe_backend='b12x' runs MXFP8 MoE only for ModelOpt MXFP8 "
+                "checkpoints; this quantization method does not prepare B12X "
+                "experts."
+            )
         logger.info_once(
             "Using '%s' MxFp8 MoE backend (user-requested).",
             backend.value,
@@ -130,6 +153,8 @@ def select_mxfp8_moe_backend(
 
     # Auto-select: pick the first supported backend.
     for backend in _SUPPORTED_BACKENDS:
+        if backend == Fp8MoeBackend.B12X_MXFP8 and not prepares_b12x:
+            continue
         try:
             experts_cls = _select_kernel_cls(backend, config)
         except ValueError:
