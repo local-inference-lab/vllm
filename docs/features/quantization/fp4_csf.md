@@ -7,8 +7,8 @@ the needed scales into shared GPU scratch before expert computation.
 
 Use `--quantization mxfp4_csf --load-format mxfp4_csf` for supported Kimi-K3
 or DeepSeek-V4.1-Flash MXFP4 containers. Use
-`--quantization nvfp4_csf --load-format nvfp4_csf` for GLM-5.3-Flash NVFP4
-containers. Automatic loading does not select these container readers;
+`--quantization nvfp4_csf --load-format nvfp4_csf` for GLM-5.3-Flash or
+Qwen3.8-Flash-Next NVFP4 containers. Automatic loading does not select these readers;
 set the load format explicitly.
 
 MXFP4 uses a one-bit unsigned offset from a row's base byte. NVFP4 uses a
@@ -45,16 +45,46 @@ This example reserves 1 GiB/GPU for KV cache. Increase
 graphs leave enough memory. The loader supports tensor parallel execution
 with pipeline parallel size 1, without expert/data parallelism or ubatching.
 Separate concurrent execution streams need separate decoded-scale scratch.
-NVFP4-CSF does not accept `VLLM_B12X_MOE_FP4_FORCE_A16=1` because that changes
-the source activation arithmetic.
+Leave `VLLM_B12X_MOE_FP4_FORCE_A16=0` (the default) to retain the source
+NVFP4 activation arithmetic.
+
+## Qwen3.8-Flash-Next on two 96 GiB Blackwell GPUs
+
+Use the same serving-directory metadata contract as GLM. Main routed
+experts retain calibrated four-bit activations; MTP, vision, shared experts
+and the PLE embedding table retain their source precision.
+
+```bash
+VLLM_PLE_TABLE_MEMORY=ram vllm serve /models/Qwen3.8-Flash-Next-NVFP4-CSF/serve \
+  --quantization nvfp4_csf --load-format nvfp4_csf \
+  --tensor-parallel-size 2 --pipeline-parallel-size 1 --dtype bfloat16 \
+  --moe-backend b12x --linear-backend b12x --no-enable-flashinfer-autotune \
+  --mm-encoder-tp-mode data --mamba-cache-mode align \
+  --no-enable-prefix-caching --enable-chunked-prefill \
+  --kv-cache-dtype bfloat16 --kv-cache-memory-bytes 2147483648 --block-size 16 \
+  --max-model-len 8192 --max-num-seqs 4 --max-num-batched-tokens 1024 \
+  --compilation-config '{"cudagraph_capture_sizes":[1,2,4]}' \
+  --reasoning-parser qwen3 --host 0.0.0.0 --port 8000
+```
+
+`VLLM_PLE_TABLE_MEMORY` is unset by default and leaves placement to the
+model configuration. The explicit `ram` setting above requires about 26.8
+GiB of host RAM for both TP ranks' table payloads, plus loading and process
+memory. `VLLM_PLE_TABLE_MEMORY=disk` selects file-backed table access; its
+performance depends on storage and is not represented by the RAM example.
+The example reserves 2 GiB/GPU for KV cache. Qwen's intermediate dimension
+supports TP1 and TP2 in this reader; TP4 does not satisfy the 64-channel
+local alignment requirement.
 
 ## Compatibility
 
-`kimi_x4t` and `exact_mxfp4` quantization names remain supported. The
-`exact_mxfp4` load format remains an alias for the MXFP4 container reader.
-The `nvfp4_lsc` quantization and load names remain supported for existing
-serving configurations. Original schema identifiers, tensor suffixes and
-checkpoint files remain unchanged; renaming does not require re-encoding.
+Readers require `lil-mxfp4-csf-checkpoint/1` or
+`lil-nvfp4-csf-checkpoint/1` and their `.mxfp4_csf_*` or `.nvfp4_csf_*`
+tensor components. Predecessor X4T/LSC names, schemas and suffixes are not
+accepted. Migrate the checkpoint metadata, headers and receipts, verify
+the reconstructed source hashes, and update the serving configuration
+before removing a predecessor. Migration preserves compressed payload
+values; it does not requantize the model.
 
 Distribute compressed weights separately from an uncompressed checkpoint.
 Consumers without a CSF loader can restore the original files. Including
