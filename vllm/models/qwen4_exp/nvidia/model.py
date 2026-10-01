@@ -77,7 +77,7 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from ..config import Qwen4ExpConfig
-from .b12x_ple import _resolve_ple_table_memory
+from .b12x_ple import B12xNGramEmbedding, _resolve_ple_table_memory
 from .b12x_qsa import Qwen4ExpQSAAttention as B12xQSAAttention
 from .backend import uses_b12x
 from .hyperconnection import (
@@ -888,13 +888,23 @@ class Qwen4ExpForCausalLM(
 
     @property
     def checkpoint_file_weight_filter(self) -> Callable[[str], bool] | None:
+        if not (uses_b12x(self.vllm_config) and self.config.ple_layer_ids):
+            return None
         if (
-            uses_b12x(self.vllm_config)
-            and self.config.ple_layer_ids
-            and _resolve_ple_table_memory(
+            _resolve_ple_table_memory(
                 self.vllm_config.additional_config, self.config.ple_embedding_dtype
             )
             == "io_uring"
+        ):
+            return _is_file_backed_ple_weight
+        embeddings = [
+            module
+            for module in self.modules()
+            if isinstance(module, B12xNGramEmbedding)
+        ]
+        # Attached shared tables already hold every shard row: skip reading them.
+        if embeddings and all(
+            embedding.ngram_embedding.shared_table_attached for embedding in embeddings
         ):
             return _is_file_backed_ple_weight
         return None

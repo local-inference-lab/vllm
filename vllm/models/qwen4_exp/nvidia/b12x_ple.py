@@ -36,6 +36,12 @@ from vllm.utils.b12x import (
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from ..config import Qwen4ExpTextConfig
+from .ple_shared_table import (
+    SharedTableConfig,
+    SharedTableGeometry,
+    checkpoint_identity,
+    open_shared_table,
+)
 
 logger = init_logger(__name__)
 
@@ -94,7 +100,7 @@ def _resolve_ple_table_memory(
             if envs.is_set("VLLM_PLE_CPU_OFFLOAD"):
                 return "mapped_host" if envs.VLLM_PLE_CPU_OFFLOAD else "device"
             return "io_uring" if embedding_dtype == "bfloat16" else "device"
-    if table_memory == "ram":
+    if table_memory in ("ram", "shared"):
         return "mapped_host"
     if table_memory == "disk":
         return "io_uring"
@@ -102,7 +108,37 @@ def _resolve_ple_table_memory(
         return "device"
     raise ValueError(
         "additional_config.ple_table_memory must be 'device', "
-        f"'ram', or 'disk', got {table_memory!r}"
+        f"'ram', 'shared', or 'disk', got {table_memory!r}"
+    )
+
+
+def _resolve_ple_shared_table(vllm_config: Any) -> SharedTableConfig | None:
+    """Return the host-shared table settings when ``shared`` is selected."""
+    additional_config = vllm_config.additional_config
+    config = additional_config if isinstance(additional_config, dict) else {}
+    table_memory = config.get("ple_table_memory", envs.VLLM_PLE_TABLE_MEMORY)
+    if table_memory != "shared":
+        return None
+    model_config = vllm_config.model_config
+    identity = config.get(
+        "ple_shared_table_identity", envs.VLLM_PLE_SHARED_TABLE_IDENTITY
+    )
+    return SharedTableConfig(
+        directory=str(
+            config.get("ple_shared_table_dir", envs.VLLM_PLE_SHARED_TABLE_DIR)
+        ),
+        role=str(config.get("ple_shared_table_role", envs.VLLM_PLE_SHARED_TABLE_ROLE)),
+        lock_timeout_s=float(
+            config.get(
+                "ple_shared_table_lock_timeout_s",
+                envs.VLLM_PLE_SHARED_TABLE_LOCK_TIMEOUT_S,
+            )
+        ),
+        model_path=str(model_config.model),
+        revision=model_config.revision,
+        identity=str(identity)
+        if identity
+        else checkpoint_identity(str(model_config.model), model_config.revision),
     )
 
 
@@ -128,10 +164,19 @@ def _copy_embedding_shard(
 
 
 class _NGramEmbeddingStorage(nn.Module):
-    def __init__(self, layout: Any, shard_rows: int) -> None:
+    def __init__(
+        self,
+        layout: Any,
+        shard_rows: int,
+        *,
+        shared_table: SharedTableConfig | None = None,
+        embedding_dim: int = 0,
+        dense_layer_ordinal: int = 0,
+    ) -> None:
         super().__init__()
         self.disk_table = None
         self._table_storage = None
+        self._shared_table = None
         if layout.caps.table_memory == "io_uring":
             api = _b12x_module("ple_embedding")
             self.disk_table = api.DiskTable(layout, shard_rows)
@@ -147,6 +192,29 @@ class _NGramEmbeddingStorage(nn.Module):
                     if shape == (1,)
                     else None
                 )
+        elif shared_table is not None:
+            geometry = SharedTableGeometry.from_layout(
+                layout,
+                model_path=shared_table.model_path,
+                revision=shared_table.revision,
+                identity=shared_table.identity,
+                embedding_dim=embedding_dim,
+                dense_layer_ordinal=dense_layer_ordinal,
+            )
+            self._shared_table = open_shared_table(
+                geometry, shared_table, device=layout.caps.device
+            )
+            try:
+                self._table_storage = layout.allocate_storage(
+                    host_allocator=self._shared_table.region
+                )
+            except BaseException:
+                self._shared_table.close()
+                raise
+            tensors = {
+                name: getattr(self._table_storage, name)
+                for name in ("weight", "weight_scale", "weight_scale_2")
+            }
         else:
             self._table_storage = layout.allocate_storage()
             tensors = {
@@ -181,6 +249,24 @@ class _NGramEmbeddingStorage(nn.Module):
     def mapped_host_nbytes(self) -> int:
         return int(self._table_storage.mapped_host_nbytes) if self._table_storage else 0
 
+    @property
+    def shared_table_attached(self) -> bool:
+        """Whether another process already filled every row of this table."""
+        return self._shared_table is not None and self._shared_table.attached
+
+    def abort_shared_table(self) -> None:
+        """Give up a shared table this process was populating."""
+        if self._shared_table is not None and self._shared_table.populating:
+            self._shared_table.abort()
+
+    def publish_shared_table(self) -> None:
+        """Mark a populated shared table complete for other processes."""
+        if self._shared_table is None or not self._shared_table.populating:
+            return
+        flush_weight_transfers()
+        torch.cuda.synchronize()
+        self._shared_table.publish()
+
 
 class B12xNGramEmbedding(nn.Module):
     """Prime-hashed learned n-gram embedding with fixed b12x storage."""
@@ -205,6 +291,7 @@ class B12xNGramEmbedding(nn.Module):
         prefix: str,
         dtype: torch.dtype,
         table_memory: str,
+        shared_table: SharedTableConfig | None = None,
     ) -> None:
         super().__init__()
         self.embedding_dim = int(embedding_dim)
@@ -268,12 +355,19 @@ class B12xNGramEmbedding(nn.Module):
         shard_rows = (
             self._table_layout.padded_vocab_size + self.split_ngram_parts - 1
         ) // self.split_ngram_parts
-        self.ngram_embedding = _NGramEmbeddingStorage(self._table_layout, shard_rows)
+        self.ngram_embedding = _NGramEmbeddingStorage(
+            self._table_layout,
+            shard_rows,
+            shared_table=shared_table,
+            embedding_dim=self.embedding_dim,
+            dense_layer_ordinal=int(ple_dense_layer_id),
+        )
         if self.ngram_embedding.mapped_host_nbytes:
             logger.info(
-                "Using %.2f GiB of CUDA-mapped host memory for this TP rank's "
+                "Using %.2f GiB of %s CUDA-mapped host memory for this TP rank's "
                 "PLE table",
                 self.ngram_embedding.mapped_host_nbytes / (1 << 30),
+                "shared" if shared_table is not None else "private",
             )
         scratch_spec = self._table_layout.scratch_specs()[0]
         self.register_buffer(
@@ -546,49 +640,22 @@ class B12xNGramEmbedding(nn.Module):
     def _validate_embedding_loaded(self) -> None:
         if self._embedding_validated:
             return
-
-        covered_until = self._table_layout.shard_start
-        for start, end in sorted(self._embedding_load_ranges):
-            if start > covered_until:
-                raise ValueError(
-                    "PLE embedding shards do not cover the local table: "
-                    f"expected row {covered_until}, got {start}"
-                )
-            covered_until = max(covered_until, end)
-        if covered_until != self._table_layout.shard_end:
-            raise ValueError(
-                "PLE embedding shards do not cover the local table: "
-                f"stopped at row {covered_until}, "
-                f"expected {self._table_layout.shard_end}"
+        try:
+            _require_embedding_coverage(self)
+        except ValueError:
+            # Waiting replicas must not attach to a table this process cannot fill.
+            abort_shared_table = getattr(
+                self.ngram_embedding, "abort_shared_table", None
             )
-
-        if self._table_layout.weight_scale_shape is not None:
-            if self._quant_mode == "fp8_e4m3_per_tensor":
-                if not self._weight_scale_loaded:
-                    raise ValueError(
-                        "FP8 PLE embedding checkpoint is missing weight_scale"
-                    )
-            else:
-                scale_covered_until = self._table_layout.shard_start
-                for start, end in sorted(self._scale_load_ranges):
-                    if start > scale_covered_until:
-                        raise ValueError(
-                            "NVFP4 PLE scale shards do not cover the local table: "
-                            f"expected row {scale_covered_until}, got {start}"
-                        )
-                    scale_covered_until = max(scale_covered_until, end)
-                if scale_covered_until != self._table_layout.shard_end:
-                    raise ValueError(
-                        "NVFP4 PLE scale shards do not cover the local table: "
-                        f"stopped at row {scale_covered_until}, expected "
-                        f"{self._table_layout.shard_end}"
-                    )
-        if (
-            self._table_layout.weight_scale_2_shape is not None
-            and not self._weight_scale_2_loaded
-        ):
-            raise ValueError("NVFP4 PLE embedding checkpoint is missing weight_scale_2")
+            if abort_shared_table is not None:
+                abort_shared_table()
+            raise
         self._embedding_validated = True
+        publish_shared_table = getattr(
+            self.ngram_embedding, "publish_shared_table", None
+        )
+        if publish_shared_table is not None:
+            publish_shared_table()
 
     def forward(
         self,
@@ -797,6 +864,9 @@ class B12xNGramEmbedding(nn.Module):
                             source.offset,
                             scale=suffix == "weight_scale",
                         )
+                elif getattr(embedding, "shared_table_attached", False):
+                    # The attached table already holds every row of this shard.
+                    pass
                 else:
                     parameter = getattr(embedding, suffix)
                     destination = getattr(
@@ -835,6 +905,49 @@ class B12xNGramEmbedding(nn.Module):
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
         return loaded
+
+
+def _require_embedding_coverage(embedding: B12xNGramEmbedding) -> None:
+    """Raise when the loaded shards or scales do not cover the local table."""
+    covered_until = embedding._table_layout.shard_start
+    for start, end in sorted(embedding._embedding_load_ranges):
+        if start > covered_until:
+            raise ValueError(
+                "PLE embedding shards do not cover the local table: "
+                f"expected row {covered_until}, got {start}"
+            )
+        covered_until = max(covered_until, end)
+    if covered_until != embedding._table_layout.shard_end:
+        raise ValueError(
+            "PLE embedding shards do not cover the local table: "
+            f"stopped at row {covered_until}, "
+            f"expected {embedding._table_layout.shard_end}"
+        )
+
+    if embedding._table_layout.weight_scale_shape is not None:
+        if embedding._quant_mode == "fp8_e4m3_per_tensor":
+            if not embedding._weight_scale_loaded:
+                raise ValueError("FP8 PLE embedding checkpoint is missing weight_scale")
+        else:
+            scale_covered_until = embedding._table_layout.shard_start
+            for start, end in sorted(embedding._scale_load_ranges):
+                if start > scale_covered_until:
+                    raise ValueError(
+                        "NVFP4 PLE scale shards do not cover the local table: "
+                        f"expected row {scale_covered_until}, got {start}"
+                    )
+                scale_covered_until = max(scale_covered_until, end)
+            if scale_covered_until != embedding._table_layout.shard_end:
+                raise ValueError(
+                    "NVFP4 PLE scale shards do not cover the local table: "
+                    f"stopped at row {scale_covered_until}, expected "
+                    f"{embedding._table_layout.shard_end}"
+                )
+    if (
+        embedding._table_layout.weight_scale_2_shape is not None
+        and not embedding._weight_scale_2_loaded
+    ):
+        raise ValueError("NVFP4 PLE embedding checkpoint is missing weight_scale_2")
 
 
 def _ple_embedding_op(

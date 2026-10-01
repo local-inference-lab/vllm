@@ -34,6 +34,8 @@ contract below.
 Choose the PLE offload backing with `VLLM_PLE_TABLE_MEMORY`:
 
 - `ram`: CUDA-mapped, pinned host tables.
+- `shared`: CUDA-mapped host tables in tmpfs files that every process serving
+  the same checkpoint on the host maps, instead of one private copy each.
 - `disk`: bounded `O_DIRECT` reads from checkpoint files using io_uring.
 
 Select the public policy in vLLM:
@@ -49,8 +51,37 @@ are not valid environment values.
 
 When the selector is unset, `VLLM_PLE_CPU_OFFLOAD=1` retains host-RAM offload;
 otherwise tables remain GPU-resident. Explicit `additional_config.ple_table_memory`
-overrides the environment. It accepts `ram`, `disk`, or `device`; `device`
-explicitly selects GPU-resident tables. Matching vLLM and b12x packages are required.
+overrides the environment. It accepts `ram`, `shared`, `disk`, or `device`;
+`device` explicitly selects GPU-resident tables. Matching vLLM and b12x packages
+are required.
+
+### Shared host tables
+
+With `shared`, the table of each TP rank lives in
+`VLLM_PLE_SHARED_TABLE_DIR/<key>/` (default `/dev/shm/vllm-ple`), which must be a
+tmpfs: the CUDA driver pins only shmem-backed file mappings. The first process
+takes `<key>.lock`, fills the files through the ordinary weight loader and
+publishes them with a manifest and a `READY` marker once every row is loaded.
+Later processes wait on the lock, check the manifest against their own table
+geometry and checkpoint identity, then map the files and skip reading the table
+shards from the checkpoint. A mismatch fails startup naming the field; there is
+no fallback to a private copy. For the 26.8 GiB NVFP4 table of
+Qwen3.8-Flash-Next, two TP1 replicas hold 26.8 GiB of host RAM instead of 53.6.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `VLLM_PLE_SHARED_TABLE_DIR` | `/dev/shm/vllm-ple` | tmpfs table root, created `0700` |
+| `VLLM_PLE_SHARED_TABLE_ROLE` | `auto` | `auto` attaches or populates, `attach` requires a complete table, `populate` always rewrites |
+| `VLLM_PLE_SHARED_TABLE_LOCK_TIMEOUT_S` | `3600` | seconds to wait for another populator |
+| `VLLM_PLE_SHARED_TABLE_IDENTITY` | derived | checkpoint identity in the key, for example a content hash from a launcher |
+
+The `additional_config` keys `ple_shared_table_dir`, `ple_shared_table_role`,
+`ple_shared_table_lock_timeout_s` and `ple_shared_table_identity` take precedence
+over the environment. Without an explicit identity, a Hugging Face snapshot
+resolves to its commit and a local directory to the names, sizes and
+modification times of its checkpoint files. Every process sharing a table must
+run as the same user. Tables stay in tmpfs until removed; list or prune them
+with `python -m vllm.models.qwen4_exp.nvidia.ple_shared_table {list,prune}`.
 
 The io_uring reader does not map, pin, or prewarm the entire table. It
 deduplicates requested 4 KiB blocks, coalesces adjacent blocks into reads of at
