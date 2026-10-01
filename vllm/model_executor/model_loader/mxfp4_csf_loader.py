@@ -20,18 +20,20 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 
 
-class ExactMXFP4ModelLoader(DefaultModelLoader):
+class Mxfp4CsfModelLoader(DefaultModelLoader):
     def _root(self, model_config):
-        from b12x.moe.checkpoints.exact_mxfp4 import checkpoint_contract
+        from b12x.moe.checkpoints.mxfp4_csf import checkpoint_contract
 
         text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
         quant = getattr(model_config.hf_config, "quantization_config", None)
         quant = quant or text_config.quantization_config
-        if quant.get("quant_method") not in ("exact_mxfp4", "kimi_x4t"):
-            raise ValueError("exact_mxfp4 loading requires the X4T model config")
+        if quant.get("quant_method") not in ("mxfp4_csf",):
+            raise ValueError(
+                "MXFP4-CSF loading requires a compressed-scale model config"
+            )
         root = Path(quant["checkpoint_root"])
         if not root.is_absolute():
-            raise ValueError("X4T checkpoint_root must be an absolute local path")
+            raise ValueError("MXFP4-CSF checkpoint_root must be an absolute local path")
         return root, checkpoint_contract(str(root.resolve()))
 
     def download_model(self, model_config):
@@ -40,7 +42,9 @@ class ExactMXFP4ModelLoader(DefaultModelLoader):
     def get_all_weights(self, model_config, model):
         root, contract = self._root(model_config)
         if getattr(model, "secondary_weights", ()):
-            raise NotImplementedError("X4T does not support secondary weight sources")
+            raise NotImplementedError(
+                "MXFP4-CSF does not support secondary weight sources"
+            )
         file_filter = getattr(model, "checkpoint_file_weight_filter", None)
         prefixes = getattr(model, "checkpoint_weight_name_prefixes", None)
         text_config = getattr(model_config, "hf_text_config", model_config.hf_config)

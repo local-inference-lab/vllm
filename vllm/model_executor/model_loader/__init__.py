@@ -11,10 +11,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
-from vllm.model_executor.model_loader.exact_mxfp4_loader import ExactMXFP4ModelLoader
 from vllm.model_executor.model_loader.modelexpress_loader import (
     ModelExpressModelLoader,
 )
+from vllm.model_executor.model_loader.mxfp4_csf_loader import Mxfp4CsfModelLoader
 from vllm.model_executor.model_loader.runai_streamer_loader import (
     RunaiModelStreamerLoader,
 )
@@ -37,7 +37,7 @@ LoadFormats = Literal[
     "dummy",
     "fastsafetensors",
     "instanttensor",
-    "exact_mxfp4",
+    "mxfp4_csf",
     "ipc_cache",
     "mistral",
     "modelexpress",
@@ -55,7 +55,7 @@ _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
     "dummy": DummyModelLoader,
     "fastsafetensors": DefaultModelLoader,
     "instanttensor": DefaultModelLoader,
-    "exact_mxfp4": ExactMXFP4ModelLoader,
+    "mxfp4_csf": Mxfp4CsfModelLoader,
     "ipc_cache": IpcModelLoader,
     "mistral": DefaultModelLoader,
     "modelexpress": ModelExpressModelLoader,
