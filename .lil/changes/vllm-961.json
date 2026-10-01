@@ -1,0 +1,25 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-961",
+  "category": "feature",
+  "summary": "Qwen3.8-Flash-Next servers on one host can share one host-RAM copy of the 26.8 GiB PLE table",
+  "models": [
+    "Qwen3.8-Flash-Next"
+  ],
+  "compatibility": "No user action required. Opt in with VLLM_PLE_TABLE_MEMORY=shared; the launcher sets it for REPLICAS=2 or more (docker replicas mode). Tables stay in /dev/shm until removed, so with --ipc host they outlive the container; python -m vllm.models.qwen4_exp.nvidia.ple_shared_table list|prune manages them.",
+  "details": [
+    "With VLLM_PLE_TABLE_MEMORY=shared the PLE table lives in tmpfs files keyed by the checkpoint and table geometry. The first server loads and validates it, and the others map the same bytes instead of keeping their own 26.8 GiB copy and reading the table again.",
+    "A failed table check abandons the shared copy, so no server maps an incomplete table.",
+    "Ported from René Honig's vLLM #774; awsdl (carrion256) showed the 2xTP1 setup it serves."
+  ],
+  "authors": [
+    "renehonig",
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    961
+  ],
+  "requires": [
+    "b12x-454"
+  ]
+}
