@@ -1,0 +1,26 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-957",
+  "category": "feature",
+  "summary": "MXFP8 MTP draft experts can run on B12X",
+  "models": [
+    "Qwen3.8-Flash-Next"
+  ],
+  "compatibility": "No user action required. The default is unchanged: the launcher keeps moe_backend auto for MXFP8 drafters (docker-114), which picks Marlin. To try B12X, pass an explicit --speculative-config with \"moe_backend\": \"b12x\".",
+  "details": [
+    "The Qwen3.8-Flash-Next QAD step 5500 checkpoint (revision qad-step5500-ple1000) ships its MTP draft experts as MXFP8 while the target experts are NVFP4. With moe_backend b12x in the speculative config, ModelOpt MXFP8 experts now run on B12X instead of failing kernel selection.",
+    "On RTX PRO 6000 TP2 the B12X drafter is correct and accepts slightly more draft tokens (2.34-2.37 against 2.30-2.34 per step with Marlin), but decode is not faster: C1 196-209 against 200-220 tok/s, C8 949-955 against 960-961 tok/s.",
+    "moe_backend b12x for MXFP8 experts is rejected at startup, with a message, when the installed B12X has no MXFP8 recipe or when the checkpoint is not a ModelOpt MXFP8 export (compressed-tensors, INC, online MXFP8).",
+    "Contributed by Naadir Jeewa."
+  ],
+  "authors": [
+    "randomvariable",
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    957
+  ],
+  "requires": [
+    "b12x-452"
+  ]
+}
