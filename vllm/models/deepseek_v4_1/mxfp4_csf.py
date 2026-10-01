@@ -5,6 +5,7 @@
 import regex as re
 import torch
 
+import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -87,16 +88,23 @@ class DeepseekV41Mxfp4CsfConfig(DeepseekV41FP8Config):
                     )
                 if config.load_config.load_format not in ("mxfp4_csf",):
                     raise ValueError("MXFP4-CSF requires --load-format mxfp4_csf ")
-                return Mxfp4CsfMoEMethod(layer.moe_config, self)
+                return Mxfp4CsfMoEMethod(
+                    layer.moe_config,
+                    self,
+                    activation_mode="a16" if envs.VLLM_B12X_MOE_FP4_FORCE_A16 else "a8",
+                )
         return super().get_quant_method(layer, prefix)
 
 
 class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
     """Expand scales for routed experts into serialized, model-owned scratch."""
 
-    def __init__(self, moe, owner):
+    def __init__(self, moe, owner, *, activation_mode="a16"):
         super().__init__(moe)
         self.owner = owner
+        if activation_mode not in ("a16", "a8"):
+            raise ValueError("MXFP4-CSF requires A16 or MXFP8 activations")
+        self.activation_mode = activation_mode
         parallel = moe.moe_parallel_config
         if (
             parallel.use_ep
@@ -143,9 +151,10 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
             )
 
     def get_fused_moe_quant_config(self, layer):
+        activation = "mxfp8" if self.activation_mode == "a8" else None
         return FusedMoEQuantConfig(
-            _a1=FusedMoEQuantDesc(),
-            _a2=FusedMoEQuantDesc(),
+            _a1=FusedMoEQuantDesc(dtype=activation),
+            _a2=FusedMoEQuantDesc(dtype=activation),
             _w1=FusedMoEQuantDesc(dtype="mxfp4"),
             _w2=FusedMoEQuantDesc(dtype="mxfp4"),
         )
@@ -193,7 +202,7 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
         plan = fused_moe.plan_weights(
             source=fused_moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w31"),
             activation=fused_moe.ActivationSpec(
-                mode="a16",
+                mode=self.activation_mode,
                 nonlinearity="situ"
                 if self.moe.activation == MoEActivation.SITU
                 else "silu",
@@ -212,11 +221,12 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
             MoEPrepareAndFinalizeNoDPEPModular(), backend
         )
         logger.info(
-            "MXFP4-CSF lossless MXFP4 layer %d rank %d/%d: BF16 activations, "
+            "MXFP4-CSF lossless MXFP4 layer %d rank %d/%d: %s activations, "
             "compressed scales, shared scratch %d bytes",
             self.layer_index,
             rank,
             tp,
+            "MXFP8" if self.activation_mode == "a8" else "BF16",
             sum(t.numel() for t in scratch),
         )
 

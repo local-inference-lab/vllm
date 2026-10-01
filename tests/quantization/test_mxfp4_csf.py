@@ -106,11 +106,14 @@ def test_csf_cpu_shard_reader_bounds_threads_and_restores_on_failure(
 
 
 @pytest.mark.parametrize("mode", ["normal", "pipeline", "ubatching", "wrong_loader"])
+@pytest.mark.parametrize("force_a16", [False, True])
 def test_target_uses_csf_while_dense_and_draft_keep_native_methods(
-    monkeypatch, moe, owner, mode
+    monkeypatch, moe, owner, mode, force_a16
 ):
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
     from vllm.models.deepseek_v4_1 import mxfp4_csf
+
+    monkeypatch.setattr(mxfp4_csf.envs, "VLLM_B12X_MOE_FP4_FORCE_A16", force_a16)
 
     config = SimpleNamespace(
         model_config=SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=40)),
@@ -132,9 +135,11 @@ def test_target_uses_csf_while_dense_and_draft_keep_native_methods(
     layer = Mock(spec=RoutedExperts)
     layer.moe_config = moe
     if mode == "normal":
-        assert isinstance(
-            owner.get_quant_method(layer, "model.layers.39.ffn.experts"),
-            Mxfp4CsfMoEMethod,
+        method = owner.get_quant_method(layer, "model.layers.39.ffn.experts")
+        assert isinstance(method, Mxfp4CsfMoEMethod)
+        assert method.activation_mode == ("a16" if force_a16 else "a8")
+        assert method.get_fused_moe_quant_config(layer).quant_dtype == (
+            None if force_a16 else "mxfp8"
         )
     elif mode == "wrong_loader":
         with pytest.raises(ValueError, match="load-format"):
@@ -155,8 +160,9 @@ def test_exact_experts_reject_non_tp_execution(moe, owner, field, value):
         Mxfp4CsfMoEMethod(replace(moe, moe_parallel_config=parallel), owner)
 
 
+@pytest.mark.parametrize("activation_mode", ["a16", "a8"])
 def test_prepared_native_experts_validate_source_shape_and_swiglu_limit(
-    monkeypatch, moe, owner
+    monkeypatch, moe, owner, activation_mode
 ):
     from b12x.moe import fused_moe
 
@@ -165,11 +171,16 @@ def test_prepared_native_experts_validate_source_shape_and_swiglu_limit(
     layer = torch.nn.Module()
     layer.activation = moe.activation
     layer.apply_router_weight_on_input = False
-    quant = Mxfp4CsfMoEMethod(moe, owner).get_fused_moe_quant_config(layer)
+    quant = Mxfp4CsfMoEMethod(
+        moe, owner, activation_mode=activation_mode
+    ).get_fused_moe_quant_config(layer)
     backend = b12x.B12xExperts(moe, quant)
     prepared = Mock(spec=fused_moe.PreparedExperts)
     activation = fused_moe.ActivationSpec(
-        mode="a16", nonlinearity="silu", io_dtype=torch.bfloat16, swiglu_limit=10.0
+        mode=activation_mode,
+        nonlinearity="silu",
+        io_dtype=torch.bfloat16,
+        swiglu_limit=10.0,
     )
     prepared.plan = SimpleNamespace(
         source=fused_moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w31"),
@@ -184,6 +195,11 @@ def test_prepared_native_experts_validate_source_shape_and_swiglu_limit(
     backend.install_prepared_experts(layer, prepared)
     assert layer._b12x_prepared_experts is prepared
     assert backend._prepared_experts is prepared
+    prepared.plan.activation = replace(
+        activation, mode="a16" if activation_mode == "a8" else "a8"
+    )
+    with pytest.raises(ValueError, match="activation"):
+        backend.install_prepared_experts(layer, prepared)
     prepared.plan.activation = replace(activation, swiglu_limit=None)
     with pytest.raises(ValueError, match="activation"):
         backend.install_prepared_experts(layer, prepared)
@@ -270,10 +286,10 @@ def test_kimi_mxfp4_csf_keeps_bf16_dense_and_situ_experts(monkeypatch, moe):
         activation_situ_linear_beta=25.0,
         swiglu_limit=None,
     )
-    assert isinstance(
-        owner.get_quant_method(experts, "model.layers.1.mlp.experts"),
-        Mxfp4CsfMoEMethod,
-    )
+    method = owner.get_quant_method(experts, "model.layers.1.mlp.experts")
+    assert isinstance(method, Mxfp4CsfMoEMethod)
+    assert method.activation_mode == "a16"
+    assert method.get_fused_moe_quant_config(experts).quant_dtype is None
     assert isinstance(
         owner.get_quant_method(Mock(spec=LinearBase), "model.layers.0.q_proj"),
         UnquantizedLinearMethod,

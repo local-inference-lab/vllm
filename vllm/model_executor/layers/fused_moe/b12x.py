@@ -531,7 +531,13 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             or prepared.intermediate_size
             != self.moe_config.intermediate_size_per_partition
             or prepared.plan.activation.mode
-            != ("a4" if nvfp4 and self._quant_mode == "nvfp4" else "a16")
+            != (
+                "a4"
+                if nvfp4 and self._quant_mode == "nvfp4"
+                else "a8"
+                if packed and self._quant_mode == "w4a8_mx"
+                else "a16"
+            )
             or (trellis and prepared.plan.activation.rotation_dtype != torch.float16)
             or prepared.plan.activation.io_dtype != self.moe_config.in_dtype
             or prepared.plan.activation.nonlinearity
