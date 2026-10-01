@@ -371,7 +371,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             raise ValueError("V4.1 native kernels do not support LoRA adapters")
         if quant_config is None or quant_config.get_name() not in (
             "deepseek_v41_fp8",
-            "exact_mxfp4",
             "mxfp4_csf",
         ):
             raise ValueError("V4.1 requires its native block32 quantization config")

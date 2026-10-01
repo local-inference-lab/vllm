@@ -513,7 +513,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         )
         nvfp4 = (
             self._source_format == "modelopt_nvfp4"
-            and self._quant_mode == "nvfp4"
+            and self._quant_mode in ("nvfp4", "w4a16")
             and isinstance(prepared.plan.source, fused_moe.PackedSource)
             and prepared.plan.source.format == "modelopt_nvfp4"
             and prepared.plan.source.w13_layout in (self._w13_layout, "w13")
@@ -525,7 +525,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             or prepared.hidden_size != self.moe_config.hidden_dim
             or prepared.intermediate_size
             != self.moe_config.intermediate_size_per_partition
-            or prepared.plan.activation.mode != ("a4" if nvfp4 else "a16")
+            or prepared.plan.activation.mode
+            != ("a4" if nvfp4 and self._quant_mode == "nvfp4" else "a16")
             or (trellis and prepared.plan.activation.rotation_dtype != torch.float16)
             or prepared.plan.activation.io_dtype != self.moe_config.in_dtype
             or prepared.plan.activation.nonlinearity

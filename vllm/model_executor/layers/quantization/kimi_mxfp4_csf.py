@@ -7,16 +7,16 @@ import torch
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4Config
-from vllm.models.deepseek_v4_1.exact_mxfp4 import ExactMXFP4MoEMethod
+from vllm.models.deepseek_v4_1.mxfp4_csf import Mxfp4CsfMoEMethod
 
 
-class KimiX4TConfig(Mxfp4Config):
+class KimiMxfp4CsfConfig(Mxfp4Config):
     checkpoint_root: str
     scale_scratch: tuple[torch.Tensor, ...] | None
 
     @classmethod
     def get_name(cls):
-        return "kimi_x4t"
+        return "mxfp4_csf"
 
     @classmethod
     def get_min_capability(cls):
@@ -54,9 +54,7 @@ class KimiX4TConfig(Mxfp4Config):
                 raise NotImplementedError(
                     "MXFP4-CSF shared scale scratch requires PP1 without ubatching"
                 )
-            if config.load_config.load_format not in ("exact_mxfp4", "mxfp4_csf"):
-                raise ValueError(
-                    "Kimi MXFP4-CSF requires --load-format mxfp4_csf (or exact_mxfp4)"
-                )
-            return ExactMXFP4MoEMethod(layer.moe_config, self)
+            if config.load_config.load_format not in ("mxfp4_csf",):
+                raise ValueError("Kimi MXFP4-CSF requires --load-format mxfp4_csf ")
+            return Mxfp4CsfMoEMethod(layer.moe_config, self)
         return super().get_quant_method(layer, prefix)
