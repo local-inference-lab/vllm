@@ -277,7 +277,11 @@ def test_kimi_x4t_keeps_bf16_dense_and_situ_experts(monkeypatch, moe):
         owner.get_quant_method(experts, "model.layers.1.mlp.experts")
 
 
-def test_kimi_loader_skips_compressed_experts_with_nested_text_config(tmp_path):
+@pytest.mark.parametrize("quant_method", ["kimi_x4t", "mxfp4_csf"])
+@pytest.mark.parametrize("load_format", ["exact_mxfp4", "mxfp4_csf"])
+def test_kimi_loader_skips_compressed_experts_with_nested_text_config(
+    tmp_path, quant_method, load_format
+):
     from b12x.moe.checkpoints.exact_mxfp4 import CODEC, SCHEMA
 
     tensor_dir = tmp_path / "tensors"
@@ -303,12 +307,62 @@ def test_kimi_loader_skips_compressed_experts_with_nested_text_config(tmp_path):
         hf_text_config=SimpleNamespace(
             num_hidden_layers=93,
             quantization_config={
-                "quant_method": "kimi_x4t",
+                "quant_method": quant_method,
                 "checkpoint_root": str(tmp_path),
             },
         ),
     )
-    loader = ExactMXFP4ModelLoader(LoadConfig(load_format="exact_mxfp4"))
+    loader = ExactMXFP4ModelLoader(LoadConfig(load_format=load_format))
     result = dict(loader.get_all_weights(config, SimpleNamespace()))
     assert list(result) == [dense]
     assert torch.equal(result[dense], tensors[dense])
+
+
+@pytest.mark.parametrize("family", ["kimi_k3", "deepseek_v41"])
+def test_mxfp4_csf_selects_retained_precision_and_accepts_legacy_configs(
+    monkeypatch, moe, family
+):
+    from b12x.moe.checkpoints import mxfp4_csf as checkpoint
+
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+    from vllm.model_executor.layers.quantization import (
+        get_quantization_config,
+        kimi_x4t,
+    )
+    from vllm.model_executor.layers.quantization.mxfp4_csf import Mxfp4CsfConfig
+    from vllm.models.deepseek_v4_1 import exact_mxfp4
+
+    monkeypatch.setattr(checkpoint, "checkpoint_contract", lambda _: {"family": family})
+    owner = get_quantization_config("mxfp4_csf").from_config(
+        {"format_version": 1, "checkpoint_root": "/compressed-scales"}
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=40)),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1, use_ubatching=False),
+        load_config=SimpleNamespace(load_format="mxfp4_csf"),
+    )
+    for module in (kimi_x4t, exact_mxfp4):
+        monkeypatch.setattr(module, "get_current_vllm_config", lambda: config)
+    layer = Mock(spec=RoutedExperts)
+    layer.moe_config = moe
+    assert owner.get_name() == "mxfp4_csf"
+    assert isinstance(
+        owner.get_quant_method(layer, "model.layers.3.mlp.experts"), ExactMXFP4MoEMethod
+    )
+    if family == "deepseek_v41":
+        assert owner.is_checkpoint_fp8_serialized
+        assert owner.weight_block_size == [32, 32] and owner.is_scale_e8m0
+        assert isinstance(owner, DeepseekV41ExactMXFP4Config)
+    else:
+        assert isinstance(
+            owner.get_quant_method(Mock(spec=LinearBase), "model.layers.0.q_proj"),
+            UnquantizedLinearMethod,
+        )
+    for legacy in ("exact_mxfp4", "kimi_x4t", "mxfp4_csf"):
+        assert (
+            Mxfp4CsfConfig.override_quantization_method(
+                {"quant_method": legacy}, "mxfp4_csf"
+            )
+            == "mxfp4_csf"
+        )

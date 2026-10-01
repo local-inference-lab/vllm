@@ -36,7 +36,9 @@ class KimiX4TConfig(Mxfp4Config):
     @classmethod
     def from_config(cls, config):
         if config.get("format_version") != 1 or not config.get("checkpoint_root"):
-            raise ValueError("Kimi X4T requires format_version=1 and checkpoint_root")
+            raise ValueError(
+                "Kimi MXFP4-CSF requires format_version=1 and checkpoint_root"
+            )
         result = cls()
         result.checkpoint_root = config["checkpoint_root"]
         result.scale_scratch = None
@@ -50,9 +52,11 @@ class KimiX4TConfig(Mxfp4Config):
                 or config.parallel_config.use_ubatching
             ):
                 raise NotImplementedError(
-                    "X4T shared scale scratch requires PP1 without ubatching"
+                    "MXFP4-CSF shared scale scratch requires PP1 without ubatching"
                 )
-            if config.load_config.load_format != "exact_mxfp4":
-                raise ValueError("Kimi X4T requires --load-format exact_mxfp4")
+            if config.load_config.load_format not in ("exact_mxfp4", "mxfp4_csf"):
+                raise ValueError(
+                    "Kimi MXFP4-CSF requires --load-format mxfp4_csf (or exact_mxfp4)"
+                )
             return ExactMXFP4MoEMethod(layer.moe_config, self)
         return super().get_quant_method(layer, prefix)

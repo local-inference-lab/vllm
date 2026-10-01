@@ -19,6 +19,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
     nvfp4_moe_quant_config,
 )
+from vllm.model_executor.layers.quantization.nvfp4_csf import Nvfp4CsfConfig
 from vllm.model_executor.layers.quantization.nvfp4_lsc import (
     Nvfp4LscConfig,
     Nvfp4LscMoEMethod,
@@ -26,7 +27,8 @@ from vllm.model_executor.layers.quantization.nvfp4_lsc import (
 from vllm.model_executor.model_loader.nvfp4_lsc_loader import Nvfp4LscModelLoader
 
 
-def test_lsc_config_preserves_source_recipes_and_avoids_expert_allocations():
+@pytest.mark.parametrize("config_cls", [Nvfp4CsfConfig, Nvfp4LscConfig])
+def test_csf_config_preserves_source_recipes_and_avoids_expert_allocations(config_cls):
     original = {
         "quant_method": "modelopt",
         "quant_algo": "MIXED_PRECISION",
@@ -35,7 +37,7 @@ def test_lsc_config_preserves_source_recipes_and_avoids_expert_allocations():
             "model.layers.45.mlp.experts": {"quant_algo": "MXFP8"},
         },
     }
-    owner = Nvfp4LscConfig.from_config(
+    owner = config_cls.from_config(
         {
             "format_version": 1,
             "checkpoint_root": "/lsc",
@@ -111,7 +113,11 @@ def test_prepared_nvfp4_accepts_kernel_order_and_rejects_activation_change(monke
         backend.install_prepared_experts(layer, prepared)
 
 
-def test_loader_excludes_compressed_main_experts_and_retains_native_tensors(tmp_path):
+@pytest.mark.parametrize("quant_method", ["nvfp4_csf", "nvfp4_lsc"])
+@pytest.mark.parametrize("load_format", ["nvfp4_csf", "nvfp4_lsc"])
+def test_loader_excludes_compressed_main_experts_and_retains_native_tensors(
+    tmp_path, quant_method, load_format
+):
     from b12x.moe.checkpoints.nvfp4_lsc import CODEC, SCHEMA
 
     from vllm.model_executor.layers.quantization import get_quantization_config
@@ -144,13 +150,13 @@ def test_loader_excludes_compressed_main_experts_and_retains_native_tensors(tmp_
     config = SimpleNamespace(
         hf_config=SimpleNamespace(
             quantization_config={
-                "quant_method": "nvfp4_lsc",
+                "quant_method": quant_method,
                 "checkpoint_root": str(tmp_path),
             }
         ),
         hf_text_config=SimpleNamespace(num_hidden_layers=45),
     )
-    loader = get_model_loader(LoadConfig(load_format="nvfp4_lsc"))
+    loader = get_model_loader(LoadConfig(load_format=load_format))
     assert isinstance(loader, Nvfp4LscModelLoader)
     assert get_quantization_config("nvfp4_lsc") is Nvfp4LscConfig
     actual = dict(loader.get_all_weights(config, SimpleNamespace()))
