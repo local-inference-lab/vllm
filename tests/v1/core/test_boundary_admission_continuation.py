@@ -111,7 +111,7 @@ def test_nonisolated_continuation_deferral_serves_existing_decoder(
         )
     base.queue_matching(scheduler, unrelated)
     base.victim_at_head(cache, checkpoint)
-    assert not scheduler._has_waiting_boundary_logits()
+    assert scheduler._waiting_boundary_logits_request() is None
     output = scheduler.schedule()
     assert not output.boundary_logits_only
     assert output.num_scheduled_tokens == {"first": 4}

@@ -48,7 +48,7 @@ def rewrite_requirements(
     cutlass_dsl_version: str,
 ) -> bytes:
     """Return wheel metadata with dependencies matching the foundation ABI."""
-    if cutlass_dsl_version != "4.6.2":
+    if cutlass_dsl_version != "4.7.1":
         raise ValueError(f"unreviewed CUTLASS DSL foundation: {cutlass_dsl_version}")
     message = BytesParser(policy=compat32).parsebytes(metadata)
     requirements = message.get_all("Requires-Dist", [])
@@ -63,9 +63,9 @@ def rewrite_requirements(
     for value in requirements:
         requirement = Requirement(value)
         name = canonicalize_name(requirement.name)
-        # The SM120 foundation, B12X and FlashInfer share DSL 4.6.2. Upstream's
-        # 4.7.1 bump accompanies FA4, which does not support SM120. Keep the
-        # explicitly supported foundation contract; re-review future bumps.
+        # The SM120 foundation, B12X and FlashInfer share DSL 4.7.1 since B12X
+        # moved to it (b12x 4bacd509). Keep the explicitly supported
+        # foundation contract; re-review future bumps.
         if name == "nvidia-cutlass-dsl" and str(requirement.specifier) not in {
             "==4.6.2",
             "==4.7.1",

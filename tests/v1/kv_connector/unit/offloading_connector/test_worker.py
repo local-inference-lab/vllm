@@ -636,3 +636,231 @@ def test_register_kv_caches_uniform_type(backend):
     # opaque mapping rather than a certified, parallelism-agnostic one
     assert group_refs[0].mapping.parallelism_agnostic
     assert not group_refs[1].mapping.parallelism_agnostic
+
+
+@pytest.mark.parametrize("backend", ATTN_BACKENDS)
+def test_register_kv_caches_padded_attention_ref_carries_full_row(backend):
+    """The narrow-branch refs must transport the FULL padded row for
+    attention pages whose spec carries a padded tail.
+
+    The QSA compressed-K tail lives in [unpadded, padded) of every padded
+    attention page and the consumer reads it through
+    compressed_block_table, so a ref sized to the unpadded page never
+    transports it.
+
+    Also pins the non-regression half: an attention spec WITHOUT a padded
+    tail keeps the identical ref width (page == unpadded), and the CPU
+    tensor row of the padded group is the padded page (the store/load DMA
+    sizes now match it).
+    """
+    from vllm.v1.worker.utils import AttentionGroup
+
+    backend_cls = AttentionBackendEnum[backend].get_class()
+
+    TAIL_BYTES = 4096
+    plain_layer = "model.layers.0.self_attn"
+    padded_layer = "model.layers.1.self_attn"
+    plain_spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=DTYPE,
+    )
+    padded_spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=DTYPE,
+        page_size_padded=plain_spec.page_size_bytes + TAIL_BYTES,
+    )
+    assert padded_spec.unpadded_page_size_bytes == plain_spec.page_size_bytes
+    assert padded_spec.page_size_bytes == plain_spec.page_size_bytes + TAIL_BYTES
+
+    # Two independent groups, each with its own dense per-block run over
+    # one shared backing allocation (the model runner's convention).
+    window = plain_spec.page_size_bytes + padded_spec.page_size_bytes
+    kv_cache_config = KVCacheConfig(
+        num_blocks=NUM_BLOCKS,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=window * NUM_BLOCKS,
+                layers=[plain_layer],
+                layer_stride=plain_spec.page_size_bytes * NUM_BLOCKS,
+                block_stride=plain_spec.page_size_bytes,
+            ),
+            KVCacheTensor(
+                size=window * NUM_BLOCKS,
+                layers=[padded_layer],
+                layer_stride=padded_spec.page_size_bytes * NUM_BLOCKS,
+                block_stride=padded_spec.page_size_bytes,
+                offset=plain_spec.page_size_bytes * NUM_BLOCKS,
+            ),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=[plain_layer], kv_cache_spec=plain_spec
+            ),
+            KVCacheGroupSpec(
+                layer_names=[padded_layer], kv_cache_spec=padded_spec
+            ),
+        ],
+    )
+    attn_groups = [
+        [
+            AttentionGroup(
+                backend=backend_cls,
+                layer_names=[plain_layer],
+                kv_cache_spec=plain_spec,
+                kv_cache_group_id=0,
+            ),
+        ],
+        [
+            AttentionGroup(
+                backend=backend_cls,
+                layer_names=[padded_layer],
+                kv_cache_spec=padded_spec,
+                kv_cache_group_id=1,
+            ),
+        ],
+    ]
+    kv_caches = _allocate_kv_caches(
+        kv_cache_config,
+        attn_groups,
+        device=torch.device(f"{DEVICE_TYPE}:0"),
+    )
+
+    worker, spec = _make_worker(kv_cache_config)
+    worker.register_kv_caches(kv_caches)
+
+    canonical = spec.get_worker.call_args[0][0]
+    assert isinstance(canonical, CanonicalKVCaches)
+
+    plain_refs = canonical.group_data_refs[0]
+    padded_refs = canonical.group_data_refs[1]
+    # Non-regression: no padded tail -> ref width unchanged (== page ==
+    # unpadded).
+    for ref in plain_refs:
+        assert ref.page_size_bytes == plain_spec.page_size_bytes
+    # The fix: the padded group's ref transports the whole row.
+    for ref in padded_refs:
+        assert ref.page_size_bytes == padded_spec.page_size_bytes
+        # The mapping still certifies the UNPADDED content width, so the
+        # [unpadded, padded) tail stays distinguishable from the payload.
+        assert ref.mapping is not None
+        assert ref.mapping.local_page_size_bytes == (
+            padded_spec.unpadded_page_size_bytes
+        )
+    # The block tensor row is the padded page on both sides.
+    for block_tensor in canonical.tensors:
+        assert block_tensor.tensor.shape[1] in (
+            plain_spec.page_size_bytes,
+            padded_spec.page_size_bytes,
+        )
+
+
+@pytest.mark.skipif(
+    DEVICE_TYPE != "cuda", reason="Real GPU DMA + pinned CPU tier required"
+)
+def test_padded_attention_tail_survives_store_load_roundtrip():
+    """End-to-end: the compressed-K tail bytes land in the CPU tier on
+    store and come back on load.
+
+    Drives the REAL register_kv_caches path (so the narrow refs are what
+    the worker transports) through a real CPUOffloadingWorker: fill the
+    padded GPU row with distinct bytes, store, wipe the GPU row, load
+    back, and require the FULL row -- [unpadded, padded) tail included
+    -- to match."""
+    from vllm.v1.worker.utils import AttentionGroup
+    from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+    from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+
+    backend_cls = AttentionBackendEnum["FLASH_ATTN"].get_class()
+
+    TAIL_BYTES = 4096
+    layer = "model.layers.0.self_attn"
+    spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=DTYPE,
+        page_size_padded=(
+            2 * BLOCK_SIZE * NUM_KV_HEADS * HEAD_SIZE * get_dtype_size(DTYPE)
+            + TAIL_BYTES
+        ),
+    )
+    unpadded = spec.unpadded_page_size_bytes
+    padded = spec.page_size_bytes
+    assert padded - unpadded == TAIL_BYTES
+
+    kv_cache_config = KVCacheConfig(
+        num_blocks=NUM_BLOCKS,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=padded * NUM_BLOCKS,
+                layers=[layer],
+                layer_stride=padded * NUM_BLOCKS,
+                block_stride=padded,
+            ),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=[layer], kv_cache_spec=spec)
+        ],
+    )
+    attn_groups = [
+        [
+            AttentionGroup(
+                backend=backend_cls,
+                layer_names=[layer],
+                kv_cache_spec=spec,
+                kv_cache_group_id=0,
+            ),
+        ]
+    ]
+    kv_caches = _allocate_kv_caches(
+        kv_cache_config, attn_groups, device=torch.device("cuda:0")
+    )
+
+    worker, spec_mock = _make_worker(kv_cache_config)
+    worker.register_kv_caches(kv_caches)
+    canonical = spec_mock.get_worker.call_args[0][0]
+    # The transport width the roundtrip below must observe.
+    assert canonical.group_data_refs[0][0].page_size_bytes == padded
+
+    offload_worker = CPUOffloadingWorker(
+        kv_caches=canonical,
+        blocks_per_chunk=1,
+        num_cpu_chunks=4,
+    )
+    try:
+        gpu_row = canonical.tensors[0].tensor[3]  # GPU block 3
+        # Distinct, position-dependent bytes so a zero tail is detectable.
+        pattern = (
+            torch.arange(padded, dtype=torch.int64) % 251
+        ).to(torch.int8)
+        gpu_row.copy_(pattern.to(gpu_row.device))
+
+        assert offload_worker.submit_store(
+            1,
+            GPULoadStoreSpec([3], group_sizes=(1,), block_indices=(0,)),
+            CPULoadStoreSpec([1]),
+        )
+        offload_worker.wait({1})
+
+        # Wipe the GPU row; only the CPU tier can bring the tail back.
+        gpu_row.zero_()
+        torch.cuda.synchronize()
+
+        assert offload_worker.submit_load(
+            2,
+            CPULoadStoreSpec([1]),
+            GPULoadStoreSpec([3], group_sizes=(1,), block_indices=(0,)),
+        )
+        offload_worker.wait({2})
+
+        reloaded = gpu_row.cpu()
+        # Regression guard: [unpadded, padded) must leave the GPU on store.
+        tail = reloaded[unpadded:padded]
+        assert tail.abs().sum().item() != 0, "tail bytes were never transported"
+        torch.testing.assert_close(reloaded, pattern.cpu())
+    finally:
+        offload_worker.shutdown()

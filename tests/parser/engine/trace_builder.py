@@ -872,7 +872,8 @@ def _build_glm47_moe(scenario: Scenario, validate: bool = True) -> Sample:
         vocab=_GLM47_MOE_VOCAB,
         segments=_glm47_moe_segments(scenario),
         expected_reasoning=scenario.reasoning if scenario.reasoning is not None else "",
-        expected_content=_qwen3_expected_content(scenario),
+        # GLM keeps whitespace-only content before calls; templates render it.
+        expected_content=scenario.content,
         expected_tool_calls=_expected_tc(scenario),
         tools=_expected_tools(scenario),
     )

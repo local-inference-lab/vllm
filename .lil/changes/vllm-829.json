@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-829",
+  "category": "fix",
+  "summary": "MiMo-V2 router logits stay FP32 and the DFlash drafter applies its value scale",
+  "models": [
+    "XiaomiMiMo/MiMo-V2.6-Flash-RL",
+    "XiaomiMiMo/MiMo-V2.6-Pro-RL"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "Backport of vllm-project/vllm#57784 (Zyann7): MiMo's BF16 gate weights produce FP32 router logits, as in the model's reference code, so near-tie expert choices no longer flip.",
+    "The DFlash decoder applies its non-unit value scale exactly once to query-path and cached-context values, which raises draft acceptance."
+  ],
+  "pull_requests": [
+    829
+  ]
+}

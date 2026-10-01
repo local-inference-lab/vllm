@@ -236,6 +236,42 @@ def test_piecewise_capture_uses_pcp_dummy_slot_mappings():
     block_tables.get_dummy_slot_mappings.assert_not_called()
 
 
+@pytest.mark.parametrize("full_cudagraph", [False, True])
+def test_capture_marks_dummy_batch_for_every_graph_mode(full_cudagraph):
+    """Operations recorded in PIECEWISE graphs can size metadata for replay."""
+    num_reqs = 8
+    num_tokens = 56
+    input_buffers = InputBuffers(num_reqs, num_tokens, torch.device("cpu"))
+    block_tables = MagicMock()
+    block_tables.cp_size = 1
+    block_tables.get_dummy_block_tables.return_value = ()
+    block_tables.get_dummy_slot_mappings.return_value = torch.zeros(
+        1, num_tokens, dtype=torch.int64
+    )
+    model_state = MagicMock()
+    model_state.prepare_attn.return_value = {}
+    kv_cache_config = KVCacheConfig(
+        num_blocks=0,
+        kv_cache_tensors=[],
+        kv_cache_groups=[],
+    )
+
+    gpu_cudagraph_utils.prepare_inputs_to_capture(
+        num_reqs,
+        num_tokens,
+        model_state,
+        input_buffers,
+        block_tables,
+        [],
+        kv_cache_config,
+        full_cudagraph=full_cudagraph,
+    )
+
+    input_batch = model_state.prepare_attn.call_args.args[0]
+    assert input_batch.cudagraph_capture is True
+    assert model_state.prepare_attn.call_args.kwargs["for_capture"] is full_cudagraph
+
+
 def test_capture_synchronizes_auxiliary_warmup_streams(monkeypatch):
     """CUDA graph capture starts only after warmup work has completed."""
     lifecycle: list[str] = []

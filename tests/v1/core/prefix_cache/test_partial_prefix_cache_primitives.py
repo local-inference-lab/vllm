@@ -182,6 +182,45 @@ def test_glm_boundary_adapter_requires_gpu_resident_atomic_state(
     assert adapter_enabled is not external_cache
 
 
+@pytest.mark.parametrize("dcp", [1, 2, 4])
+def test_qwen_b12x_boundary_adapter_supports_dcp(monkeypatch, dcp):
+    monkeypatch.setattr(
+        "vllm.platforms.current_platform",
+        SimpleNamespace(is_cuda=lambda: True),
+    )
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            recurrent_checkpoint_policy="request_boundaries",
+            enable_prefix_caching=True,
+            mamba_cache_mode="align",
+            kv_cache_layout=None,
+            kv_offloading_size=None,
+        ),
+        model_config=SimpleNamespace(
+            enable_sleep_mode=False,
+            enable_return_routed_experts=False,
+            hf_text_config=SimpleNamespace(model_type="qwen3_8_flash_next_text"),
+        ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            decode_context_parallel_size=dcp,
+            prefill_context_parallel_size=1,
+        ),
+        speculative_config=SimpleNamespace(
+            method="mtp",
+            uses_dynamic_speculative_decoding=lambda: False,
+        ),
+        use_v2_model_runner=True,
+        lora_config=None,
+        kv_transfer_config=object(),
+        external_boundary_checkpoint_adapter_available=True,
+        kernel_config=SimpleNamespace(linear_backend="b12x", moe_backend="b12x"),
+    )
+
+    assert VllmConfig.use_request_boundary_checkpoints.fget(config)
+
+
 def test_request_boundary_branches_deduplicate_and_survive_sibling_eviction():
     pool = BlockPool(12, True, 8)
     cache = BoundaryCheckpointCache(pool)

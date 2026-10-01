@@ -3,6 +3,7 @@
 
 """Exact request-boundary lookup and ownership for recurrent prefix caches."""
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -13,6 +14,75 @@ if TYPE_CHECKING:
     from vllm.v1.core.block_pool import BlockPool
 
 MAX_BOUNDARY_STOP_TOKENS = 128
+
+# Modalities whose placeholder spans are fully identified by their content hash.
+CHECKPOINT_MODALITIES = frozenset({"image", "video"})
+# Placeholder positions map into [2**30, 2**31): above every vocabulary and
+# inside LMCache's token wire domain. Each position carries 30 independent
+# bits of the item's full content hash.
+_CONTENT_TOKEN_BASE = 1 << 30
+# A checkpoint may not end within an item's first positions: with fewer of
+# them its key would hold under 150 bits of that item's identity.
+MIN_CHECKPOINT_ITEM_TOKENS = 5
+
+
+def content_token_ids(
+    request: Request, start: int, end: int, salt: bytes = b""
+) -> tuple[int, ...]:
+    """Token IDs of ``[start, end)`` with each multimodal span named by content.
+
+    Placeholder tokens are identical for every image, so a checkpoint keyed by
+    token IDs alone could restore one image's state for another. Positions in
+    a multimodal span are replaced by pseudo-IDs derived from the item's
+    content hash and the position inside the span. Text requests are unchanged.
+
+    Args:
+        request: Request whose ``all_token_ids`` and ``mm_features`` are read.
+        start: First position, inclusive.
+        end: Last position, exclusive.
+        salt: Extra identity (for example encoder precision) mixed into the IDs.
+    """
+    tokens = request.all_token_ids[start:end]
+    features = request.mm_features
+    if not features:
+        return tuple(tokens)
+    tokens = list(tokens)
+    for feature in features:
+        offset = feature.mm_position.offset
+        length = feature.mm_position.length
+        lo, hi = max(offset, start), min(offset + length, end)
+        if lo >= hi:
+            continue
+        key = hashlib.sha256(
+            b"vllm-mm-content-tokens-v2\0" + salt + b"\0" + feature.identifier.encode()
+        ).digest()
+        # Counter-mode BLAKE2b keyed by the full digest: 16 values per call,
+        # independent across positions, so a span is not one 30-bit seed.
+        first, last = lo - offset, hi - offset
+        for block in range(first // 16, (last - 1) // 16 + 1):
+            words = hashlib.blake2b(
+                block.to_bytes(8, "little"), key=key, digest_size=64
+            ).digest()
+            for index in range(max(first, block * 16), min(last, block * 16 + 16)):
+                word = words[(index % 16) * 4 : (index % 16) * 4 + 4]
+                value = int.from_bytes(word, "little") & (_CONTENT_TOKEN_BASE - 1)
+                tokens[offset + index - start] = _CONTENT_TOKEN_BASE + value
+    return tuple(tokens)
+
+
+def checkpoint_end_allowed(request: Request, num_tokens: int) -> bool:
+    """Whether a checkpoint may end after ``num_tokens`` of this request.
+
+    It must not end within the first MIN_CHECKPOINT_ITEM_TOKENS positions of
+    a multimodal item: its key would identify that item by too few bits.
+    """
+    for feature in request.mm_features or ():
+        offset = feature.mm_position.offset
+        depth = min(MIN_CHECKPOINT_ITEM_TOKENS, feature.mm_position.length)
+        if offset < num_tokens < offset + depth:
+            return False
+    return True
+
 
 # Optional checkpoints have fixed slots; absent slots contain no KV blocks.
 PROMPT_CHECKPOINT_SLOT = 0
@@ -187,7 +257,10 @@ class BoundaryCheckpointCache:
         return (
             request.prompt_token_ids is not None
             and request.prompt_embeds is None
-            and not request.mm_features
+            and all(
+                feature.modality in CHECKPOINT_MODALITIES and feature.identifier
+                for feature in request.mm_features or ()
+            )
             and not request.resumable
             and request.sampling_params is not None
             and len(request.sampling_params.stop_token_ids or ())
@@ -206,6 +279,8 @@ class BoundaryCheckpointCache:
             raise ValueError("Boundary checkpoints require a text generation request")
         if not 0 < checkpoint.num_tokens <= request.num_tokens:
             raise ValueError("Checkpoint must cover an existing, nonempty prefix")
+        if not checkpoint_end_allowed(request, checkpoint.num_tokens):
+            raise ValueError("Checkpoint cannot end at the start of a multimodal item")
         if not 0 <= checkpoint.draft_prefix_len <= checkpoint.num_tokens:
             raise ValueError("Draft prefix cannot extend beyond the target prefix")
         if num_ranks < 1:
@@ -222,7 +297,7 @@ class BoundaryCheckpointCache:
         pending = _PendingCheckpoint(
             checkpoint,
             self._root_key(request, start),
-            tuple(request.all_token_ids[start : checkpoint.num_tokens]),
+            content_token_ids(request, start, checkpoint.num_tokens),
             num_ranks,
         )
         self.block_pool.touch(blocks)
@@ -289,10 +364,8 @@ class BoundaryCheckpointCache:
             root = self._roots.get(self._root_key(request, offset))
             if root is None:
                 continue
-            tokens = tuple(
-                request.all_token_ids[
-                    offset : min(offset + self.hash_block_size, max_length)
-                ]
+            tokens = content_token_ids(
+                request, offset, min(offset + self.hash_block_size, max_length)
             )
             checkpoint_id = root.find(tokens)
             if checkpoint_id is not None:

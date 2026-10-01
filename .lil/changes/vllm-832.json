@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-832",
+  "category": "fix",
+  "summary": "--kv-cache-dtype fp8 reaches the MiMo target and MTP attention layers",
+  "models": [
+    "XiaomiMiMo/MiMo-V2.6-Flash-RL",
+    "XiaomiMiMo/MiMo-V2.6-Pro-RL"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "The MiMo target decoder and native MTP layers now receive the cache configuration, so an FP8 KV request allocates FP8 pages instead of BF16 and keeps scale calibration.",
+    "Global layers keep full attention: the model-wide sliding-window fallback is cleared on a copy of the configuration for them."
+  ],
+  "pull_requests": [
+    832
+  ]
+}

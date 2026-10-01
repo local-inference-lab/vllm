@@ -66,6 +66,22 @@ def test_mark_b12x_eager_shapes_covers_encoder_and_connector_profile_shapes(
         assert all(module.b12x_eager_only for module in connector.modules())
 
 
+def test_mark_b12x_eager_shapes_skips_missing_vision_stage() -> None:
+    from vllm.model_executor.models.utils import StageMissingLayer
+    from vllm.model_executor.warmup.b12x_prepare import mark_b12x_eager_shapes
+
+    model = nn.Module()
+    model.visual = StageMissingLayer("vision_tower")
+    model.get_mm_lora_token_counts = lambda **kwargs: (1, 1)
+    model.get_mm_mapping = lambda: SimpleNamespace(connector=("visual.merger",))
+    worker = SimpleNamespace(
+        get_model=lambda: model,
+        model_runner=SimpleNamespace(mm_registry=object()),
+    )
+
+    mark_b12x_eager_shapes(worker)
+
+
 def test_b12x_workload_covers_target_and_draft_profile_shapes() -> None:
     from vllm.model_executor.warmup.b12x_prepare import b12x_workload
 
@@ -162,6 +178,23 @@ def test_startup_plan_apply_gate(plan_env):
     explicit = _plan_worker(kv_bytes=7 * GiB_bytes)
     maybe_apply_startup_plan(explicit)
     assert explicit.cache_config.kv_cache_memory_bytes == 7 * GiB_bytes
+
+
+def test_startup_plan_survives_profiling_config_rewrites(plan_env):
+    """A boot saves under the key computed before profiling, so the next
+    boot finds the plan although profiling rewrote the config (DS4 falls
+    back from FULL_AND_PIECEWISE to FULL_DECODE_ONLY graphs)."""
+    config_hash = ["before-profiling"]
+    first = _plan_worker()
+    first.vllm_config = SimpleNamespace(compute_hash=lambda: config_hash[0])
+    maybe_apply_startup_plan(first)
+    assert first.cache_config.kv_cache_memory_bytes is None
+    config_hash[0] = "after-capture"
+    maybe_save_startup_plan(first, 50 * GiB_bytes)
+
+    second = _plan_worker(config_hash="before-profiling")
+    maybe_apply_startup_plan(second)
+    assert second.cache_config.kv_cache_memory_bytes == 50 * GiB_bytes
 
 
 # Memory accounting of the profiling run (Worker.determine_available_memory).

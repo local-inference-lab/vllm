@@ -1,0 +1,19 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-931",
+  "category": "fix",
+  "summary": "JSON-schema and other grammar-constrained requests with MTP or other speculative decoding no longer fail with \"grammar rejected tokens\" after sitting out a step",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "With speculative decoding and async scheduling, a grammar-constrained request can be left out of a step: during a prefill turn while other prompts prefill, or during the isolated step of a restored checkpoint. Its next step then checked the model's draft tokens against grammar rows that allowed every token. The request could emit tokens outside its schema and fail with HTTP 500 (\"Failed to advance FSM ... grammar rejected tokens\"), issue #726.",
+    "The scheduler now receives exactly the draft tokens each step verifies, so these requests stay constrained and keep their speculative speed-up.",
+    "A draft token whose grammar row cannot be built is now rejected instead of accepted, and the server logs a one-time warning when this happens."
+  ],
+  "requires": [],
+  "pull_requests": [
+    931
+  ]
+}

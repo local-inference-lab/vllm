@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-943-long-context",
+  "category": "fix",
+  "summary": "More on the DeepSeek-V4.1 compressor-ring fix (vllm-943): long prompts, multi-turn chats and images",
+  "models": ["DeepSeek-V4.1-Flash"],
+  "compatibility": "No user action required. Corrects vllm-943's statement that prompt processing was correct: long prompts were affected slightly at chunk boundaries.",
+  "details": [
+    "The ring was not written during prompt processing either. A long prompt is processed in chunks (4,096 tokens per step in the ds41-flash profile), and only the compression windows that span a chunk boundary were built from stale state. That is a small part of a long prompt; it was not measured separately.",
+    "Generated text feeds compressed entries once it leaves the 128-token sliding window, which is why the drift grew with answer length. In multi-turn chats and agent sessions that reuse earlier answers from the prefix cache, those stale entries stayed in the context of every later turn. Long sessions where the model wrote much of the context were therefore likely affected the most; this was not measured.",
+    "Images are processed with the prompt, so they were affected like prompt text. Answers about them drifted like any other output."
+  ],
+  "authors": ["MadeBy561"],
+  "pull_requests": [943, 926],
+  "requires": []
+}

@@ -220,6 +220,14 @@ def glm47_moe_config(thinking: bool = True) -> ParserEngineConfig:
         stream_arg_deltas=True,
         tool_args_json=False,
         validate_tool_names=True,
+        # GLM templates put reasoning verbatim between <think> and </think> and
+        # add no whitespace around content or tool calls. Returning the text
+        # exactly as generated lets a whitespace-preserving template re-render
+        # the assistant turn token for token, so the next request can reuse
+        # the response checkpoint instead of prefilling the whole response.
+        strip_trailing_reasoning_whitespace=False,
+        drop_whitespace_only_content_before_tools=False,
+        strip_content_whitespace_with_tools=False,
     )
 
 

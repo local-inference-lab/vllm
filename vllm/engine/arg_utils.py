@@ -720,6 +720,9 @@ class EngineArgs:
     prefill_compute_half_life: PrefillComputeHalfLife | None = (
         SchedulerConfig.prefill_compute_half_life
     )
+    max_num_prefill_tokens_per_step: int = (
+        SchedulerConfig.max_num_prefill_tokens_per_step
+    )
     max_parallel_prefills: MaxParallelPrefills = SchedulerConfig.max_parallel_prefills
     prefill_policy: PrefillPolicy = SchedulerConfig.prefill_policy
     decode_refill_target: DecodeRefillTarget = SchedulerConfig.decode_refill_target
@@ -1736,6 +1739,10 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--prefill-compute-half-life", **prefill_compute_half_life_kwargs
         )
+        scheduler_group.add_argument(
+            "--max-num-prefill-tokens-per-step",
+            **scheduler_kwargs["max_num_prefill_tokens_per_step"],
+        )
         max_parallel_prefills_kwargs = scheduler_kwargs["max_parallel_prefills"]
         max_parallel_prefills_kwargs.pop("choices", None)
         max_parallel_prefills_kwargs["type"] = positive_int_or_auto_type
@@ -2583,6 +2590,9 @@ class EngineArgs:
             prefill_schedule_interval=self.prefill_schedule_interval,
             prefill_compute_share=self.prefill_compute_share,
             prefill_compute_half_life=self.prefill_compute_half_life,
+            max_num_prefill_tokens_per_step=(
+                self.max_num_prefill_tokens_per_step
+            ),
             max_parallel_prefills=self.max_parallel_prefills,
             prefill_policy=self.prefill_policy,
             decode_refill_target=self.decode_refill_target,

@@ -72,6 +72,26 @@ class MambaBase(AttentionLayerBase):
         mamba_block_size = vllm_config.cache_config.mamba_block_size
         assert mamba_block_size is not None
         page_size_padded = vllm_config.cache_config.mamba_page_size_padded
+        cache_config = vllm_config.cache_config
+        kv_transfer_config = vllm_config.kv_transfer_config
+        # Frozen boundary capture: the align-mode column-migration defect
+        # (a deferred connector boundary store sourcing a live column the
+        # next forward clobbers) only exists when the complex offloading
+        # connector moves state off-GPU. With it enabled, the manager copies
+        # each retention-grid crossing into a dedicated single-writer pool
+        # block before the column advances, and that block -- never the
+        # column -- is the store source. The copy rail is backend-agnostic
+        # (post-forward D2D of the whole page), so no scan rework is needed.
+        boundary_capture = (
+            cache_config.mamba_cache_mode == "align"
+            and cache_config.kv_offloading_size is not None
+            and kv_transfer_config is not None
+            and kv_transfer_config.has_connector("OffloadingConnector")
+            # Atomic request-boundary checkpoints own the same columns with
+            # their own capture path; the two features are mutually exclusive
+            # (kv_offloading_size already asserts it) -- never double-capture.
+            and not vllm_config.use_request_boundary_checkpoints
+        )
         return MambaSpec(
             shapes=tuple(self.get_state_shape()),
             dtypes=self.get_state_dtype(),
@@ -79,12 +99,13 @@ class MambaBase(AttentionLayerBase):
             page_size_padded=page_size_padded,
             mamba_type=self.mamba_type,
             tp_replicated=self.is_kv_cache_tp_replicated,
-            mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
+            mamba_cache_mode=cache_config.mamba_cache_mode,
+            boundary_capture=boundary_capture,
             # RecoverSSM verifies the whole window off one checkpoint, so it
             # never writes the baseline's per-draft-token state slots.
             num_speculative_blocks=(
                 0
-                if vllm_config.cache_config.use_kda_recoverssm
+                if cache_config.use_kda_recoverssm
                 else vllm_config.num_speculative_tokens
             ),
         )

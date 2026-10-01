@@ -323,10 +323,19 @@ class LogitsProcessor(PluggableLayer):
         if not isinstance(
             lm_head.quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
         ):
-            raise ValueError(
-                "A head_dtype different from the model dtype is only "
-                "supported for an unquantized lm_head."
+            # A runtime-quantized head (for example a drafter's NVFP4 head next
+            # to an FP32 target head) keeps its own kernel; its logits are only
+            # widened, since the quantized weights already bound its precision.
+            logger.warning_once(
+                "head_dtype=%s: a quantized LM head computes in its own format; "
+                "its logits are widened to %s.",
+                self.head_dtype,
+                self.head_dtype,
             )
+            logits = lm_head.quant_method.apply(
+                lm_head, hidden_states, bias=embedding_bias
+            )
+            return logits.to(self.head_dtype)
         if (
             self.head_dtype == torch.float32
             and (current_platform.is_cuda() or current_platform.is_rocm())

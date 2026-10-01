@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-karmic-canonical-sync-20260929c",
+  "category": "fix",
+  "summary": "Carry the current canonical Karmic runtime into beta: MiMo-V2.6 FP8 QKV loads with InstantTensor's tensor order, and Qwen3.8 GDN prefill tuning keeps its state pool",
+  "models": ["MiMo-V2.6-Flash", "Qwen3.8-Flash-Next"],
+  "compatibility": "No user action required.",
+  "details": [
+    "MiMo-V2.6 keeps a pending FP8 QKV weight or scale until its partner arrives, even when the loader is called separately for module groups. With InstantTensor's checkpoint order (QKV scales before lm_head, weights after it), incomplete pairs were discarded.",
+    "Qwen3.8's B12X GDN prefill tuning trials reset and restore the recurrent state pool they were bound to, even if the layer replaces or clears its KV cache meanwhile.",
+    "Canonical's merge of vllm #926 is identical to beta's #943."
+  ],
+  "authors": ["lukealonso"],
+  "requires": []
+}

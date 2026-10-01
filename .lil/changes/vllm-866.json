@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-866",
+  "category": "feature",
+  "summary": "Log where a request or the engine-core loop is held",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "A warning names the stage when a request spends more than VLLM_REQUEST_STALL_WARNING_S (default 60) outside engine work, or ends without output after that long; VLLM_LOG_REQUEST_TIMELINE=1 logs every request's stages.",
+    "The engine core warns about ADD requests that waited in its input queue and logs the loop stack when one step runs longer than the threshold.",
+    "SIGUSR1 to the API server logs every asyncio task's await chain and every thread's stack, without prompt or output text."
+  ],
+  "pull_requests": [866]
+}

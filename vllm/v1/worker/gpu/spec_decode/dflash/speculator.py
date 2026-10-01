@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -183,7 +184,131 @@ class DFlashSpeculator(DraftModelSpeculator):
         target_model: nn.Module,
         target_attn_layer_names: set[str],
     ) -> nn.Module:
-        return load_dflash_model(target_model, self.vllm_config)
+        model = load_dflash_model(target_model, self.vllm_config)
+        self._setup_vocab_parallel_drafting(model)
+        return model
+
+    def _setup_vocab_parallel_drafting(self, model: nn.Module) -> None:
+        """Keep draft logits vocab-sharded (VLLM_DFLASH_VOCAB_PARALLEL_DRAFT=1).
+
+        Probabilistic drafts are Gumbel-sampled per vocab shard and combined
+        from per-rank winners (spec_decode.vocab_parallel), so the [rows, vocab]
+        logits all-gather disappears; the cache holds this rank's shard.  Any
+        layout the sampler does not cover keeps the full-vocab path.
+        """
+        from vllm.distributed import get_tensor_model_parallel_world_size
+
+        self._vocab_parallel = None
+        if not envs.VLLM_DFLASH_VOCAB_PARALLEL_DRAFT or self.draft_logits is None:
+            return
+        head = getattr(model, "lm_head", None)
+        si = getattr(head, "shard_indices", None)
+        tp = get_tensor_model_parallel_world_size()
+        if (
+            tp == 1
+            or si is None
+            or not hasattr(model, "compute_local_logits")
+            or getattr(model, "draft_id_to_target_id", None) is not None
+            or self.draft_watermarker is not None
+            or self.speculative_config.rejection_sample_method != "standard"
+            or si.num_org_vocab_padding != 0
+            or si.num_added_elements != 0
+            or si.num_org_elements * tp != self.vocab_size
+        ):
+            logger.info_once(
+                "DFlash vocab-parallel drafting not applicable; "
+                "keeping the full-vocab draft path"
+            )
+            return
+        from vllm.v1.worker.gpu.spec_decode.vocab_parallel import VPDraftCache
+
+        dtype, fill = self.draft_logits_spec(self.vllm_config)
+        self.draft_logits = torch.full(
+            (self.max_num_reqs, self.num_speculative_steps, si.num_org_elements),
+            fill,
+            dtype=dtype,
+            device=self.device,
+        )
+        self._vocab_parallel = VPDraftCache(
+            self.draft_logits, si.org_vocab_start_index, self.vocab_size, None
+        )
+        logger.info_once(
+            "DFlash vocab-parallel drafting: shard [%d, %d) of %d, no draft-logits "
+            "all-gather",
+            si.org_vocab_start_index,
+            si.org_vocab_end_index,
+            self.vocab_size,
+        )
+
+    def sample_draft(
+        self,
+        hidden_states: torch.Tensor,
+        sample_src_positions: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        draft_step: torch.Tensor,
+        draft_logits: torch.Tensor | None,
+    ) -> torch.Tensor:
+        vp = getattr(self, "_vocab_parallel", None)
+        if vp is None or draft_logits is None or draft_logits is not vp.logits:
+            return super().sample_draft(
+                hidden_states,
+                sample_src_positions,
+                idx_mapping,
+                temperature,
+                seeds,
+                draft_step,
+                draft_logits,
+            )
+        from vllm.v1.worker.gpu.spec_decode import vocab_parallel as vp_sampling
+
+        local = self.model.compute_local_logits(hidden_states)
+        col = draft_step if draft_step.dim() > 0 else draft_step.expand(local.shape[0])
+        tokens, maxes, sums = vp_sampling.draft_sample(
+            local,
+            idx_mapping,
+            temperature,
+            seeds,
+            sample_src_positions,
+            col,
+            vp,
+            use_fp64=self.use_fp64_gumbel,
+        )
+        est = self.acceptance_estimator
+        if est is not None:
+            # Same predictor as acceptance_estimator.predict, fed with per-rank
+            # (max, sum-exp) partials of logits / T instead of vocab blocks.
+            from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
+                _MAX_LOG_ODDS,
+                _predict_kernel,
+            )
+
+            num_tokens, nparts = maxes.shape
+            _predict_kernel[(num_tokens,)](
+                est.features,
+                est.features.stride(0),
+                est.predictions,
+                est.predictions.stride(0),
+                self.draft_token_confidence_probs,
+                self.draft_token_confidence_probs.stride(0),
+                est.slope,
+                est.intercepts,
+                maxes,
+                maxes.stride(0),
+                sums,
+                sums.stride(0),
+                idx_mapping,
+                idx_mapping.stride(0),
+                draft_step,
+                num_tokens,
+                nparts,
+                per_token_step=draft_step.dim() > 0,
+                NUM_SPECULATIVE_STEPS=est.num_speculative_steps,
+                MAX_LOG_ODDS=_MAX_LOG_ODDS,
+                PADDED_VOCAB_NUM_BLOCKS=triton.next_power_of_2(nparts),
+            )
+        return tokens
 
     def set_attn(
         self,

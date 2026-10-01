@@ -183,6 +183,10 @@ def test_qsa_backend_selects_the_manager_block_without_dense_page_limits(
         assert Qwen4ExpQSABackend.get_preferred_block_size(70) == 72
 
 
+def test_qsa_backend_supports_atomic_kv_connectors() -> None:
+    assert Qwen4ExpQSABackend.supports_kv_connector()
+
+
 def test_qsa_dcp_packs_qkv_into_one_collective() -> None:
     layer = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
     torch.nn.Module.__init__(layer)
@@ -787,6 +791,47 @@ def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
 
         owner.unbind_kv_cache()
         assert owner.get_b12x_preparation_units(owner, workload) == ()
+
+
+def test_qsa_capture_metadata_covers_max_model_len() -> None:
+    """A PIECEWISE capture must not size QSA metadata for dummy lengths.
+
+    Breakable PIECEWISE graphs record B12X QSA context selection and staging.
+    A context chosen for the dummy batch's few tokens bakes a too-narrow block
+    table, and replays at long positions read past it (b12x#416).
+    """
+    builder = Qwen4ExpQSAMetadataBuilder.__new__(Qwen4ExpQSAMetadataBuilder)
+    builder._request_ids = torch.empty(8, dtype=torch.int32)
+    builder.max_speculative_tokens = 3
+    builder._capture_state_slot_ids = torch.arange(2, dtype=torch.int32)
+    builder._capture_state_is_fresh = torch.ones(2, dtype=torch.bool)
+    builder._capture_num_accepted_tokens = torch.ones(2, dtype=torch.int32)
+    builder._capture_is_prefilling = torch.zeros(2, dtype=torch.bool)
+    common = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 4, 8], dtype=torch.int32),
+        seq_lens=torch.tensor([7, 7], dtype=torch.int32),
+        num_reqs=2,
+        num_actual_tokens=8,
+        max_query_len=4,
+        max_seq_len=7,
+        block_table_tensor=torch.zeros((2, 1), dtype=torch.int32),
+        slot_mapping=torch.full((8,), -1, dtype=torch.int64),
+        is_prefilling=torch.zeros(2, dtype=torch.bool),
+    )
+    common._token_to_req_indices_cache = torch.tensor(
+        [0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.int32
+    )
+
+    eager = builder.build(common_prefix_len=0, common_attn_metadata=common)
+    captured = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        qsa_max_seq_len=1_048_576,
+    )
+
+    assert eager.max_seq_len == 7
+    assert captured.max_seq_len == 1_048_576
 
 
 def test_qsa_registers_piecewise_splitting_op_once() -> None:

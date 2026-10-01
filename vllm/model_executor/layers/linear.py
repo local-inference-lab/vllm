@@ -215,6 +215,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         linear_backend = (
             config.kernel_config.linear_backend if config is not None else "auto"
         )
+        self._linear_backend = linear_backend
         self._gemm_impl = dispatch_unquantized_gemm(linear_backend)
 
     def create_weights(
@@ -247,6 +248,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self._linear_backend == "b12x" and current_platform.is_cuda():
+            from vllm.model_executor.kernels.linear.b12x_unquantized import (
+                maybe_attach_b12x_bf16_gemv,
+            )
+
+            maybe_attach_b12x_bf16_gemv(layer)
         if current_platform.is_cpu():
             # MLA's kv_b_proj (see `skip_weight_relayout`): not perf-critical,
             # so skip packing and use a plain fallback.

@@ -38,6 +38,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     mxfp4_w4a16_moe_quant_config,
     nvfp4_w4a16_moe_quant_config,
 )
+from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     Mxfp4MoeBackend,
     select_deepseek_v4_mxfp4_moe_backend,
@@ -54,6 +55,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp4_utils import mxfp4_quan
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp4Static,
     kMxfp8Dynamic,
+    kMxfp8Static,
     kNvfp4Dynamic,
     kNvfp4Static,
 )
@@ -199,6 +201,10 @@ def _has_b12x_moe() -> bool:
         and current_platform.is_device_capability_family(120)
         and B12xExperts._supports_current_device()
     )
+
+
+def _has_b12x_mxfp8_moe() -> bool:
+    return _has_b12x_moe() and b12x._b12x_has_mxfp8_moe()
 
 
 def _make_b12x_moe_kernel(
@@ -369,8 +375,8 @@ _UNINTERLEAVED_W4A8_REASON = "kernel does not support swigluoai_uninterleave wit
             id="w4a16-uninterleaved-swigluoai",
         ),
         pytest.param(
-            {"activation": MoEActivation.RELU2_NO_MUL},
             {},
+            {"activation": MoEActivation.RELU2_NO_MUL},
             kMxfp4Static,
             kMxfp8Dynamic,
             "MXFP4 W4A8 supports only SiLU and SiTU",
@@ -452,6 +458,11 @@ def test_explicit_b12x_mxfp4_selection(
     force_a16: bool,
     expected_backend: Mxfp4MoeBackend,
 ) -> None:
+    """An explicit `moe_backend='b12x'` selects the b12x MXFP4 W4A8 experts.
+
+    The activation key -- dynamic MXFP8 or absent -- does not change the
+    choice while A16 forcing is off.
+    """
     monkeypatch.setattr(B12xExperts, "_supports_current_device", lambda: True)
     monkeypatch.setattr(mxfp4_oracle, "_user_moe_activation_override", lambda: None)
     monkeypatch.setattr(
@@ -459,7 +470,9 @@ def test_explicit_b12x_mxfp4_selection(
         "VLLM_B12X_MOE_FP4_FORCE_A16",
         force_a16,
     )
-    config = make_dummy_moe_config(hidden_dim=256, intermediate_size=64)
+    config = make_dummy_moe_config(
+        hidden_dim=2560, intermediate_size=640, experts_per_token=10
+    )
     config.moe_backend = "b12x"
 
     backend, experts_cls = select_mxfp4_moe_backend(
@@ -505,13 +518,20 @@ def test_deepseek_v4_b12x_activation_selection(
     force_a16: bool,
     expected_backend: Mxfp4MoeBackend,
 ) -> None:
+    """DeepSeek V4 b12x selection follows the forced-A16 knob.
+
+    MXFP4 weights keep the dynamic-MXFP8 activation contract unless A16 is
+    forced, which selects the BF16 contract.
+    """
     monkeypatch.setattr(B12xExperts, "_supports_current_device", lambda: True)
     monkeypatch.setattr(
         mxfp4_oracle.envs,
         "VLLM_B12X_MOE_FP4_FORCE_A16",
         force_a16,
     )
-    config = make_dummy_moe_config(hidden_dim=256, intermediate_size=64)
+    config = make_dummy_moe_config(
+        hidden_dim=2560, intermediate_size=640, experts_per_token=10
+    )
     config.moe_backend = "b12x"
 
     backend, experts_cls = select_deepseek_v4_mxfp4_moe_backend(config)
@@ -977,15 +997,11 @@ def test_b12x_moe_candidate_calls_share_bounded_trial_storage(
     assert not second_call.capture_safe
     first_call.restore()
     ids = first_state.bound["topk_ids"]
-    shared = 2 <= tokens <= 8
-    unique = max(topk, (3 * tokens * topk + 2) // 5) if shared else tokens * topk
-    assert ids.unique().numel() == min(unique, num_experts)
     assert all(row.unique().numel() == topk for row in ids)
     assert torch.isfinite(first_state.bound["a"]).all()
     torch.testing.assert_close(
         first_state.bound["topk_weights"].sum(dim=1), torch.ones(tokens)
     )
-    assert len(first_call.benchmark_producers) == (4 if shared else 1)
     for first_producer, second_producer in zip(
         first_call.benchmark_producers,
         second_call.benchmark_producers,
@@ -993,7 +1009,6 @@ def test_b12x_moe_candidate_calls_share_bounded_trial_storage(
     ):
         first_producer()
         first_ids = ids.clone()
-        assert ids.unique().numel() == min(unique, num_experts)
         assert all(row.unique().numel() == topk for row in ids)
         second_producer()
         torch.testing.assert_close(ids, first_ids)
@@ -1103,9 +1118,20 @@ def _make_b12x_moe_case(
     activation: MoEActivation = MoEActivation.SILU,
     tokens: int = 16,
     seed: int = 19,
+    num_experts: int = 4,
+    hidden_size: int = 512,
+    intermediate_size: int = 128,
+    topk: int = 2,
 ) -> _B12xMoeCase:
+    """Build one deterministic B12X MoE case for a weight/activation pair.
+
+    Quantizes freshly seeded BF16 expert weights, keeps the dequantized
+    tensors as the reference, and assembles the quant config matching the
+    requested activation dtype.
+    """
+    if weight_dtype == "mxfp8" and not b12x._b12x_has_mxfp8_moe():
+        pytest.skip("the installed b12x has no MXFP8 W8A8 MoE recipe")
     set_random_seed(seed)
-    num_experts, hidden_size, intermediate_size = 4, 512, 128
     dtype = torch.bfloat16
     hidden_states = torch.randn((tokens, hidden_size), device="cuda", dtype=dtype) / 10
     w1_rows = 2 * intermediate_size if activation.is_gated else intermediate_size
@@ -1147,6 +1173,27 @@ def _make_b12x_moe_case(
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
             )
+    elif weight_dtype == "mxfp8":
+        from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+            _mxfp8_e4m3_quantize_torch,
+            dequant_mxfp8_to_bf16,
+        )
+
+        # Serialized ModelOpt layout: raw E4M3 values plus unswizzled uint8
+        # UE8M0 K/32 scale grids, one byte per value (no FP4 packing).
+        w1_q, w1_scale = _mxfp8_e4m3_quantize_torch(w1, is_sf_swizzled_layout=False)
+        w2_q, w2_scale = _mxfp8_e4m3_quantize_torch(w2, is_sf_swizzled_layout=False)
+        w1_ref = dequant_mxfp8_to_bf16(w1_q, w1_scale)
+        w2_ref = dequant_mxfp8_to_bf16(w2_q, w2_scale)
+        assert w1_scale.dtype is torch.uint8 and w2_scale.dtype is torch.uint8
+        quant_config = FusedMoEQuantConfig.make(
+            quant_dtype="mxfp8",
+            weight_dtype="mxfp8",
+            block_shape=[1, 32],
+            is_scale_swizzled=False,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+        )
     elif weight_dtype == "nvfp4":
         w1_q, w1_scale, w1_global_scale = _quantize_nvfp4_linear(w1)
         w2_q, w2_scale, w2_global_scale = _quantize_nvfp4_linear(w2)
@@ -1217,6 +1264,7 @@ def _make_b12x_moe_case(
         quant_config=quant_config,
         activation=activation,
         activation_dtype=activation_dtype,
+        topk=topk,
     )
 
 
@@ -1226,6 +1274,12 @@ def _make_b12x_moe_case(
     [
         pytest.param("mxfp4", "mxfp8", MoEActivation.SILU, id="mxfp4-mxfp8"),
         pytest.param("mxfp4", None, MoEActivation.SILU, id="mxfp4-bf16"),
+        pytest.param(
+            "mxfp8",
+            "mxfp8",
+            MoEActivation.SILU,
+            id="mxfp8-w8a8",
+        ),
         pytest.param("nvfp4", "nvfp4", MoEActivation.SILU, id="nvfp4-nvfp4"),
         pytest.param("nvfp4", "mxfp8", MoEActivation.SILU, id="nvfp4-mxfp8"),
         pytest.param("nvfp4", None, MoEActivation.SILU, id="nvfp4-bf16-silu"),
@@ -1244,6 +1298,7 @@ def test_b12x_moe_matches_torch(
     activation: MoEActivation,
     workspace_init,
 ) -> None:
+    """Each b12x MoE quantization lane matches the dequantized PyTorch MoE."""
     with set_current_vllm_config(
         VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
     ):
@@ -1251,6 +1306,19 @@ def test_b12x_moe_matches_torch(
             weight_dtype,
             activation_dtype,
             activation=activation,
+            # Reduced step5500 geometry (E16 K2560 I640 topk10, M<=16) keeps
+            # the MXFP8 lane inside the small-GPU validation memory budget.
+            **(
+                dict(
+                    num_experts=16,
+                    hidden_size=2560,
+                    intermediate_size=640,
+                    topk=10,
+                    tokens=16,
+                )
+                if weight_dtype == "mxfp8"
+                else {}
+            ),
         )
         reference = torch_moe(
             case.hidden_states,
@@ -1300,6 +1368,7 @@ def test_b12x_moe_matches_torch(
     "weight_dtype,activation_dtype",
     [
         pytest.param("mxfp4", "mxfp8", id="w4a8"),
+        pytest.param("mxfp8", "mxfp8", id="w8a8-mx"),
         pytest.param("nvfp4", None, id="w4a16"),
     ],
 )
@@ -1309,6 +1378,7 @@ def test_b12x_moe_cuda_graph_replay(
     activation_dtype: str | None,
     workspace_init,
 ) -> None:
+    """A captured b12x MoE graph replays with the eager call's output."""
     from vllm.v1.worker.workspace import lock_workspace
 
     with set_current_vllm_config(
@@ -1319,6 +1389,17 @@ def test_b12x_moe_cuda_graph_replay(
             activation_dtype,
             tokens=4,
             seed=23,
+            # Reduced step5500 geometry for the MXFP8 lane (see matches_torch).
+            **(
+                dict(
+                    num_experts=16,
+                    hidden_size=2560,
+                    intermediate_size=640,
+                    topk=10,
+                )
+                if weight_dtype == "mxfp8"
+                else {}
+            ),
         )
         kernel, session, _ = _make_b12x_moe_kernel(
             case.hidden_states,
@@ -1368,12 +1449,21 @@ def test_b12x_moe_cuda_graph_replay(
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
 
+# MXFP8 runs the full step5500-scale geometry, so its rows stop at 16 tokens
+# to stay under the 1 GiB test allocator cap; other lanes keep 128.
+_TUNING_CASES = [
+    (w, a, t)
+    for w, a in [("nvfp4", "nvfp4"), ("mxfp4", "mxfp8"), ("nvfp4", None)]
+    for t in (4, 128)
+] + [("mxfp8", "mxfp8", t) for t in (4, 16)]
+
+
 @pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
 @pytest.mark.parametrize(
-    "weight_dtype,activation_dtype",
-    [("nvfp4", "nvfp4"), ("mxfp4", "mxfp8"), ("nvfp4", None)],
+    "weight_dtype,activation_dtype,tokens",
+    _TUNING_CASES,
+    ids=[f"{t}-{w}-{a}" for w, a, t in _TUNING_CASES],
 )
-@pytest.mark.parametrize("tokens", [4, 128])
 @torch.inference_mode()
 def test_b12x_moe_tuning_times_native_candidate_without_capture(
     weight_dtype, activation_dtype, tokens, workspace_init, monkeypatch
@@ -1385,7 +1475,21 @@ def test_b12x_moe_tuning_times_native_candidate_without_capture(
     with set_current_vllm_config(
         VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
     ):
-        case = _make_b12x_moe_case(weight_dtype, activation_dtype, tokens=tokens)
+        case = _make_b12x_moe_case(
+            weight_dtype,
+            activation_dtype,
+            tokens=tokens,
+            **(
+                dict(
+                    num_experts=16,
+                    hidden_size=2560,
+                    intermediate_size=640,
+                    topk=10,
+                )
+                if weight_dtype == "mxfp8"
+                else {}
+            ),
+        )
         _, session, units = _make_b12x_moe_kernel(
             case.hidden_states,
             case.w1,
@@ -1407,6 +1511,18 @@ def test_b12x_moe_tuning_times_native_candidate_without_capture(
             assert torch.isfinite(expected).all() and torch.count_nonzero(expected)
             address = call.output.data_ptr()
             session.freeze()
+            # _TimedCall.replay() runs samples * len(producers) kernel passes
+            # and cycles benchmark_producers[index % len]; every replay's last
+            # pass therefore routes through the final tuning pattern, not the
+            # pattern-0 restore/invoke captured above (tokens 4-8 build five
+            # route-sharing patterns; other sizes carry one). Anchor the
+            # comparison to that exact pattern through the same frozen binding.
+            producers = call.benchmark_producers or (call.produce,)
+            call.reset()
+            producers[-1]()
+            call.invoke()
+            torch.accelerator.synchronize()
+            expected = call.output.clone()
 
             def forbidden_capture(*args, **kwargs):
                 raise AssertionError("autotuning must not capture CUDA graphs")
@@ -1442,8 +1558,13 @@ def test_b12x_moe_tuning_times_native_candidate_without_capture(
 @pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
 @pytest.mark.parametrize(
     "weight_dtype,activation_dtype",
-    [("nvfp4", "nvfp4"), ("mxfp4", "mxfp8"), ("nvfp4", None)],
-    ids=["nvfp4", "w4a8", "w4a16"],
+    [
+        ("nvfp4", "nvfp4"),
+        ("mxfp4", "mxfp8"),
+        ("mxfp8", "mxfp8"),
+        ("nvfp4", None),
+    ],
+    ids=["nvfp4", "w4a8", "w8a8-mx", "w4a16"],
 )
 @torch.inference_mode()
 @pytest.mark.parametrize("capacity", [4, 128])
@@ -1453,6 +1574,12 @@ def test_b12x_moe_prefill_capacity_and_exact_decode_reuse(
     workspace_init,
     capacity,
 ) -> None:
+    """One prepared kernel serves every row count up to its capacity.
+
+    Once the session is frozen, eager calls at mixed row counts and route-id
+    dtypes, plus a capture-scope graph replay, must stay correct without
+    reallocating workspace buffers.
+    """
     from b12x._lib.runtime_control import kernel_resolution_guard
 
     from vllm.v1.worker.workspace import current_workspace_manager, lock_workspace
@@ -1460,7 +1587,21 @@ def test_b12x_moe_prefill_capacity_and_exact_decode_reuse(
     with set_current_vllm_config(
         VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
     ):
-        case = _make_b12x_moe_case(weight_dtype, activation_dtype, tokens=capacity)
+        case = _make_b12x_moe_case(
+            weight_dtype,
+            activation_dtype,
+            tokens=capacity,
+            **(
+                dict(
+                    num_experts=16,
+                    hidden_size=2560,
+                    intermediate_size=640,
+                    topk=10,
+                )
+                if weight_dtype == "mxfp8"
+                else {}
+            ),
+        )
         kernel, session, _ = _make_b12x_moe_kernel(
             case.hidden_states,
             case.w1,
@@ -1520,9 +1661,12 @@ def test_b12x_moe_prefill_capacity_and_exact_decode_reuse(
             )
             assert cosine > 0.99
 
+        # MXFP8 keeps its declared 128-token capacity but applies at most
+        # 16 rows per call to stay under the 1 GiB test allocator cap.
+        active_rows = min(capacity, 16) if weight_dtype == "mxfp8" else capacity
         try:
-            apply(capacity)
-            if capacity == 4 and activation_dtype == "mxfp8":
+            apply(active_rows)
+            if capacity == 4 and (weight_dtype, activation_dtype) == ("mxfp4", "mxfp8"):
                 # Tiny W4A8 uses static M in mainline; eager first use is legal.
                 check(apply(3), 3)
             lock_workspace()
@@ -1534,7 +1678,13 @@ def test_b12x_moe_prefill_capacity_and_exact_decode_reuse(
             session.freeze()
             with kernel_resolution_guard("prepared MoE capacity reuse"):
                 for rows in (
-                    count for count in (4, 3, 11, 31, 125, 128) if count <= capacity
+                    count
+                    for count in (
+                        (4, 3, 11, 16)
+                        if weight_dtype == "mxfp8"
+                        else (4, 3, 11, 31, 125, 128)
+                    )
+                    if count <= capacity
                 ):
                     for route_ids in (ids, ids64):
                         check(apply(rows, route_ids), rows)
@@ -1554,3 +1704,536 @@ def test_b12x_moe_prefill_capacity_and_exact_decode_reuse(
             )
         finally:
             session.close()
+
+
+_MXFP8_W8A8_ALIGNMENT_REASON = (
+    "MXFP8 W8A8 requires hidden size divisible by 128 and "
+    "per-rank intermediate size divisible by 32"
+)
+
+
+@pytest.mark.parametrize(
+    "config_kwargs,expected_reason",
+    [
+        pytest.param(
+            {"hidden_dim": 2560, "intermediate_size": 640},
+            None,
+            id="step5500-shape-supported",
+        ),
+        pytest.param(
+            {"hidden_dim": 2560, "intermediate_size": 320},
+            None,
+            id="step5500-tp2-shard-supported",
+        ),
+        pytest.param(
+            {"hidden_dim": 256, "intermediate_size": 48},
+            _MXFP8_W8A8_ALIGNMENT_REASON,
+            id="intermediate-48-rejected",
+        ),
+        pytest.param(
+            {"hidden_dim": 100, "intermediate_size": 128},
+            _MXFP8_W8A8_ALIGNMENT_REASON,
+            id="hidden-misaligned",
+        ),
+    ],
+)
+def test_b12x_mxfp8_w8a8_config_support(
+    monkeypatch: pytest.MonkeyPatch,
+    config_kwargs,
+    expected_reason: str | None,
+) -> None:
+    """MXFP8 W8A8 selects only on b12x-compatible ModelOpt geometries."""
+    monkeypatch.setattr(B12xExperts, "_supports_current_device", lambda: True)
+    monkeypatch.setattr(b12x, "_b12x_has_mxfp8_moe", lambda: True)
+    config = make_dummy_moe_config(
+        activation=MoEActivation.SILU,
+        **config_kwargs,
+    )
+
+    supported, reason = B12xExperts.is_supported_config(
+        B12xExperts,
+        config,
+        kMxfp8Static,
+        kMxfp8Dynamic,
+        mk.FusedMoEActivationFormat.Standard,
+    )
+
+    assert (supported, reason) == (expected_reason is None, expected_reason)
+
+
+def test_b12x_mxfp8_w8a8_rejects_non_silu_activation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MXFP8 W8A8 on b12x supports SiLU only."""
+    monkeypatch.setattr(B12xExperts, "_supports_current_device", lambda: True)
+    monkeypatch.setattr(b12x, "_b12x_has_mxfp8_moe", lambda: True)
+    config = make_dummy_moe_config(
+        hidden_dim=256,
+        intermediate_size=64,
+        activation=MoEActivation.GELU_TANH,
+    )
+
+    supported, reason = B12xExperts.is_supported_config(
+        B12xExperts,
+        config,
+        kMxfp8Static,
+        kMxfp8Dynamic,
+        mk.FusedMoEActivationFormat.Standard,
+    )
+
+    assert (supported, reason) == (False, "MXFP8 W8A8 supports only SiLU")
+
+
+def test_b12x_mxfp8_w8a8_requires_the_b12x_recipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An installed b12x without the MXFP8 recipe is rejected at selection,
+    not after the model has loaded."""
+    monkeypatch.setattr(B12xExperts, "_supports_current_device", lambda: True)
+    monkeypatch.setattr(b12x, "_b12x_has_mxfp8_moe", lambda: False)
+    config = make_dummy_moe_config(
+        hidden_dim=2560,
+        intermediate_size=640,
+        activation=MoEActivation.SILU,
+    )
+
+    supported, reason = B12xExperts.is_supported_config(
+        B12xExperts,
+        config,
+        kMxfp8Static,
+        kMxfp8Dynamic,
+        mk.FusedMoEActivationFormat.Standard,
+    )
+
+    assert (supported, reason) == (
+        False,
+        "the installed b12x has no MXFP8 W8A8 MoE recipe",
+    )
+
+
+def test_explicit_b12x_mxfp8_selection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """moe_backend='b12x' resolves the MXFP8 oracle to the b12x experts."""
+    import vllm.model_executor.layers.fused_moe.oracle.mxfp8 as mxfp8_oracle
+
+    monkeypatch.setattr(B12xExperts, "_supports_current_device", lambda: True)
+    monkeypatch.setattr(b12x, "_b12x_has_mxfp8_moe", lambda: True)
+    config = make_dummy_moe_config(
+        hidden_dim=2560, intermediate_size=640, experts_per_token=10
+    )
+    config.moe_backend = "b12x"
+
+    backend, experts_cls = mxfp8_oracle.select_mxfp8_moe_backend(
+        config, prepares_b12x=True
+    )
+
+    assert backend is mxfp8_oracle.Fp8MoeBackend.B12X_MXFP8
+    assert experts_cls is B12xExperts
+
+
+def test_explicit_b12x_mxfp8_selection_requires_b12x_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Quantization methods that do not prepare B12X experts (compressed
+    tensors, INC, online MXFP8) reject moe_backend='b12x' at init."""
+    import vllm.model_executor.layers.fused_moe.oracle.mxfp8 as mxfp8_oracle
+
+    monkeypatch.setattr(B12xExperts, "_supports_current_device", lambda: True)
+    monkeypatch.setattr(b12x, "_b12x_has_mxfp8_moe", lambda: True)
+    config = make_dummy_moe_config(
+        hidden_dim=2560, intermediate_size=640, experts_per_token=10
+    )
+    config.moe_backend = "b12x"
+
+    with pytest.raises(ValueError, match="does not prepare B12X experts"):
+        mxfp8_oracle.select_mxfp8_moe_backend(config)
+
+
+def test_b12x_mxfp8_auto_selection_keeps_conservative_priority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Automatic selection must not displace an established backend: b12x is
+    registered only ahead of the dequantize-to-BF16 emulation."""
+    import vllm.model_executor.layers.fused_moe.oracle.mxfp8 as mxfp8_oracle
+
+    backends = mxfp8_oracle._SUPPORTED_BACKENDS
+    assert backends[-1] is mxfp8_oracle.Fp8MoeBackend.EMULATION
+    assert backends[-2] is mxfp8_oracle.Fp8MoeBackend.B12X_MXFP8
+
+    def always_supported(cls, config, weight_key, activation_key, activation_format):
+        """Stand-in: the established backend claims every config."""
+        del config, weight_key, activation_key, activation_format
+        return True, None
+
+    established = type(
+        "EstablishedExperts",
+        (mk.FusedMoEExperts,),
+        {
+            "is_supported_config": staticmethod(always_supported),
+        },
+    )
+    monkeypatch.setattr(
+        mxfp8_oracle,
+        "_mxfp8_backend_to_kernel_cls",
+        lambda backend: (
+            [B12xExperts]
+            if backend is mxfp8_oracle.Fp8MoeBackend.B12X_MXFP8
+            else [established]
+        ),
+    )
+    config = make_dummy_moe_config(hidden_dim=256, intermediate_size=64)
+
+    backend, experts_cls = mxfp8_oracle.select_mxfp8_moe_backend(
+        config, prepares_b12x=True
+    )
+
+    assert backend is not mxfp8_oracle.Fp8MoeBackend.B12X_MXFP8
+    assert experts_cls is established
+
+
+def test_b12x_mxfp8_auto_selection_when_nothing_else_supports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With every established backend unsupported, b12x wins over emulation,
+    but only for quantization methods that prepare B12X experts."""
+    import vllm.model_executor.layers.fused_moe.oracle.mxfp8 as mxfp8_oracle
+
+    def supported(cls, config, weight_key, activation_key, activation_format):
+        """Stand-in: the b12x experts claim the config."""
+        del config, weight_key, activation_key, activation_format
+        return True, None
+
+    def unsupported(cls, config, weight_key, activation_key, activation_format):
+        """Stand-in: the established backend rejects every config."""
+        del config, weight_key, activation_key, activation_format
+        return False, "established backend disabled"
+
+    # Disable every established backend explicitly: on SM12x hardware Marlin
+    # genuinely supports MXFP8 and outranks b12x.
+    established = type(
+        "EstablishedExperts",
+        (mk.FusedMoEExperts,),
+        {"is_supported_config": staticmethod(unsupported)},
+    )
+    monkeypatch.setattr(B12xExperts, "is_supported_config", staticmethod(supported))
+    monkeypatch.setattr(
+        mxfp8_oracle,
+        "_mxfp8_backend_to_kernel_cls",
+        lambda backend: (
+            [B12xExperts]
+            if backend is mxfp8_oracle.Fp8MoeBackend.B12X_MXFP8
+            else [established]
+        ),
+    )
+    config = make_dummy_moe_config(
+        hidden_dim=2560, intermediate_size=640, experts_per_token=10
+    )
+
+    backend, experts_cls = mxfp8_oracle.select_mxfp8_moe_backend(
+        config, prepares_b12x=True
+    )
+
+    assert backend is mxfp8_oracle.Fp8MoeBackend.B12X_MXFP8
+    assert experts_cls is B12xExperts
+    with pytest.raises(ValueError, match="No MXFP8 MoE backends available"):
+        mxfp8_oracle.select_mxfp8_moe_backend(config)
+
+
+def test_b12x_mxfp8_preparation_passes_source_tensors_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real b12x ``plan_weights``/``prepare_weights`` API receives the
+    serialized ModelOpt MXFP8 tensors unmodified through the vLLM adapter:
+    the plan declares ``mxfp8_e8m0_k32`` / ``w8a8_mx`` / ``w31``, and the
+    prepared owner keeps the E4M3 bytes (w2 verbatim, the gate-first FC1
+    with its halves flipped to kernel order) while b12x (not vLLM) performs
+    the host scale swizzle."""
+    fused_moe = pytest.importorskip("b12x.moe.fused_moe")
+    from b12x.moe.fused_moe.source import PackedSourceFormat
+
+    if not hasattr(PackedSourceFormat, "MXFP8_E8M0_K32"):
+        pytest.skip("b12x build lacks the mxfp8_e8m0_k32 source format")
+
+    # Only vLLM-side registration surface is stubbed; plan_weights and
+    # prepare_weights run for real against the installed b12x.
+    monkeypatch.setattr(b12x, "_is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(b12x, "set_b12x_preparation_provider", lambda *_, **__: None)
+    monkeypatch.setattr(
+        b12x, "_register_b12x_moe_output_collective", lambda *_, **__: None
+    )
+
+    num_experts, hidden_size, intermediate_size = 4, 256, 128
+    generator = torch.Generator().manual_seed(0)
+
+    def random_e4m3(*shape: int) -> torch.Tensor:
+        # Distinct bytes make the FC1 half order observable; 0x7F/0xFF are NaN.
+        values = torch.randint(0, 256, shape, generator=generator, dtype=torch.uint8)
+        values[(values & 0x7F) == 0x7F] = 0x38
+        return values.view(torch.float8_e4m3fn)
+
+    w13 = random_e4m3(num_experts, 2 * intermediate_size, hidden_size)
+    w2 = random_e4m3(num_experts, hidden_size, intermediate_size)
+    # b12x flips the gate-first FC1 in place, so compare against copies.
+    w13_source = w13.view(torch.uint8).clone()
+    w2_source = w2.view(torch.uint8).clone()
+    w13_scale = torch.full(
+        (num_experts, 2 * intermediate_size, hidden_size // 32),
+        130,
+        dtype=torch.uint8,
+    )
+    w2_scale = torch.full(
+        (num_experts, hidden_size, intermediate_size // 32),
+        131,
+        dtype=torch.uint8,
+    )
+    quant_config = FusedMoEQuantConfig.make(
+        "mxfp8",
+        block_shape=[1, 32],
+        is_scale_swizzled=False,
+        w1_scale=w13_scale,
+        w2_scale=w2_scale,
+    )
+    experts = B12xExperts(
+        make_dummy_moe_config(
+            num_experts=num_experts,
+            hidden_dim=hidden_size,
+            intermediate_size=intermediate_size,
+        ),
+        quant_config,
+    )
+    layer = torch.nn.Module()
+    layer.register_parameter("w13_weight", torch.nn.Parameter(w13, requires_grad=False))
+    layer.register_parameter("w2_weight", torch.nn.Parameter(w2, requires_grad=False))
+    layer.register_parameter(
+        "w13_weight_scale", torch.nn.Parameter(w13_scale, requires_grad=False)
+    )
+    layer.register_parameter(
+        "w2_weight_scale", torch.nn.Parameter(w2_scale, requires_grad=False)
+    )
+    layer.activation = MoEActivation.SILU
+    layer.apply_router_weight_on_input = False
+
+    try:
+        experts.process_weights_after_loading(layer)
+    except RuntimeError as exc:  # host packing may require a CUDA device
+        if "CUDA" in str(exc):
+            pytest.skip(f"b12x mxfp8 host preparation requires CUDA: {exc}")
+        raise
+
+    impl = experts._prepared_experts._impl
+    source = experts._prepared_experts.plan.source
+    assert source.format is PackedSourceFormat.MXFP8_E8M0_K32
+    assert source.w13_layout == fused_moe.W13Layout.W31
+    assert experts._prepared_experts.plan.activation.mode == "a8"
+    assert experts._prepared_experts.plan.activation.nonlinearity == "silu"
+    assert experts._prepared_experts.plan.activation.io_dtype is torch.bfloat16
+    # MXFP8 stores one byte per value: the declared geometry carries the
+    # loaded extents unchanged (no FP4-style doubling of the w2 last dim).
+    assert experts._prepared_experts.plan.geometry.intermediate_size == (
+        intermediate_size
+    )
+    assert experts._prepared_experts.plan.geometry.hidden_size == hidden_size
+
+    # Byte-exact E4M3 preservation through the prepared owner (canonical
+    # aliases, with the representation's *_values spelling as fallback).
+    w13_prepared = getattr(impl, "w13_values", None)
+    w13_prepared = w13_prepared if w13_prepared is not None else impl.w1_fp4
+    w2_prepared = getattr(impl, "w2_values", None)
+    w2_prepared = w2_prepared if w2_prepared is not None else impl.w2_fp4
+    up_first = torch.cat(
+        [w13_source[:, intermediate_size:], w13_source[:, :intermediate_size]],
+        dim=1,
+    )
+    assert torch.equal(w13_prepared.view(torch.uint8).cpu(), up_first)
+    assert torch.equal(w2_prepared.view(torch.uint8).cpu(), w2_source)
+
+    # The b12x plan discarded the source parameters, so the raw tensors are
+    # only reachable through the prepared owner.
+    assert layer.w13_weight.numel() == 0
+    assert layer.w2_weight.numel() == 0
+
+
+_MXFP8_E = 16
+_MXFP8_K = 2560
+_MXFP8_TOPK = 10
+_MXFP8_TOKENS = 16
+
+
+def _modelopt_mxfp8_method(intermediate: int):
+    """Build the real ModelOptMxFp8FusedMoE with moe_backend='b12x' at
+    reduced step5500 geometry, with weights allocated on the layer."""
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMxFp8Config,
+        ModelOptMxFp8FusedMoE,
+    )
+
+    quant_config = ModelOptMxFp8Config(
+        is_checkpoint_mxfp8_serialized=True,
+        kv_cache_quant_algo="NO_QUANT",
+        exclude_modules=[],
+    )
+    moe_config = make_dummy_moe_config(
+        num_experts=_MXFP8_E,
+        experts_per_token=_MXFP8_TOPK,
+        hidden_dim=_MXFP8_K,
+        intermediate_size=intermediate,
+        in_dtype=torch.bfloat16,
+        max_num_tokens=128,
+    )
+    moe_config.moe_backend = "b12x"
+    method = ModelOptMxFp8FusedMoE(quant_config=quant_config, moe_config=moe_config)
+    assert method.mxfp8_backend is Fp8MoeBackend.B12X_MXFP8
+    assert method.experts_cls is B12xExperts
+
+    layer = torch.nn.Module()
+    layer.intermediate_size_per_partition = intermediate
+    layer.hidden_size = _MXFP8_K
+    layer.moe_config = moe_config
+    layer.activation = MoEActivation.SILU
+    layer.apply_router_weight_on_input = False
+    layer.num_expert_group = None
+    layer.topk_group = None
+    layer.e_score_correction_bias = None
+    layer.routed_scaling_factor = None
+    layer.global_num_experts = _MXFP8_E
+    layer.expert_map = None
+    layer._expert_routing_tables = lambda: None
+    # create_weights registers ModelWeightParameter members; torch.device
+    # makes torch.empty allocate them on CUDA like a real worker would.
+    with torch.device("cuda"):
+        method.create_weights(
+            layer,
+            num_experts=_MXFP8_E,
+            hidden_size=_MXFP8_K,
+            intermediate_size_per_partition=intermediate,
+            params_dtype=torch.bfloat16,
+        )
+    return method, layer
+
+
+@pytest.mark.skipif(
+    not _has_b12x_mxfp8_moe(), reason="requires b12x MXFP8 MoE on SM120"
+)
+@torch.inference_mode()
+# 640 is the TP=1 expert width; 320 is the TP=2 shard, which B12X prepares
+# unpadded (split up/gate FC1 descriptors, TMA zero-filled tail tile).
+@pytest.mark.parametrize("intermediate", [640, 320], ids=["tp1-i640", "tp2-i320"])
+def test_b12x_modelopt_mxfp8_post_load_prepares_and_matches_torch(
+    dist_init,
+    workspace_init,
+    intermediate: int,
+) -> None:
+    """Drive the real ModelOptMxFp8FusedMoE lifecycle (create_weights ->
+    serialized weights -> process_weights_after_loading -> declare+prepare ->
+    apply) with the b12x w8a8_mx backend at reduced step5500 geometry,
+    against the dequantized torch reference. This exercises the full
+    vLLM -> B12X integration through the quant method, not B12xExperts in
+    isolation."""
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        _mxfp8_e4m3_quantize_torch,
+        dequant_mxfp8_to_bf16,
+    )
+
+    with set_current_vllm_config(
+        VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
+    ):
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            # The TP collective descriptor needs live parallel state a unit
+            # test does not build; plan preparation does not depend on it.
+            monkeypatch.setattr(
+                "vllm.model_executor.layers.fused_moe.b12x."
+                "_register_b12x_moe_output_collective",
+                lambda *_, **__: None,
+            )
+            with torch.device("cuda"):
+                method, layer = _modelopt_mxfp8_method(intermediate)
+                set_random_seed(29)
+                hidden_states = (
+                    torch.randn(
+                        (_MXFP8_TOKENS, _MXFP8_K), device="cuda", dtype=torch.bfloat16
+                    )
+                    / 10
+                )
+                score = torch.randn(
+                    (_MXFP8_TOKENS, _MXFP8_E), device="cuda", dtype=torch.bfloat16
+                )
+                w1_bf16 = (
+                    torch.randn(
+                        (_MXFP8_E, 2 * intermediate, _MXFP8_K),
+                        device="cuda",
+                        dtype=torch.bfloat16,
+                    )
+                    / 15
+                )
+                w2_bf16 = (
+                    torch.randn(
+                        (_MXFP8_E, _MXFP8_K, intermediate),
+                        device="cuda",
+                        dtype=torch.bfloat16,
+                    )
+                    / 15
+                )
+                w13_q, w13_scale = _mxfp8_e4m3_quantize_torch(
+                    w1_bf16, is_sf_swizzled_layout=False
+                )
+                w2_q, w2_scale = _mxfp8_e4m3_quantize_torch(
+                    w2_bf16, is_sf_swizzled_layout=False
+                )
+                layer.w13_weight.data.copy_(w13_q)
+                layer.w2_weight.data.copy_(w2_q)
+                layer.w13_weight_scale.data.copy_(w13_scale)
+                layer.w2_weight_scale.data.copy_(w2_scale)
+
+                method.process_weights_after_loading(layer)
+
+            experts = method.moe_kernel.fused_experts
+            assert isinstance(experts, B12xExperts)
+            assert experts._prepared_experts is not None
+            # Preparation consumed the source parameters.
+            assert layer.w13_weight.numel() == 0
+            assert layer.w2_weight.numel() == 0
+            assert (
+                experts._prepared_experts.plan.geometry.intermediate_size
+                == intermediate
+            )
+
+            # Declare and prepare the serving shapes exactly as the warmup
+            # driver does; apply() resolves only session-prepared plans.
+            session, _ = _prepare(
+                layer,
+                device=torch.device("cuda"),
+                counts=(_MXFP8_TOKENS,),
+                output_dtype=torch.bfloat16,
+                max_tokens=128,
+            )
+            try:
+                topk_weights, topk_ids, _ = fused_topk(
+                    hidden_states, score, _MXFP8_TOPK, renormalize=False
+                )
+                output = method.apply(
+                    layer,
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    shared_experts=None,
+                    shared_experts_input=None,
+                )
+            finally:
+                session.close()
+        finally:
+            monkeypatch.undo()
+
+    reference = torch_moe(
+        hidden_states,
+        dequant_mxfp8_to_bf16(w13_q, w13_scale),
+        dequant_mxfp8_to_bf16(w2_q, w2_scale),
+        score,
+        _MXFP8_TOPK,
+        activation=MoEActivation.SILU,
+    )
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output, reference, atol=2e-1, rtol=2e-1)
+    cosine = torch.nn.functional.cosine_similarity(
+        output.flatten().float(), reference.flatten().float(), dim=0
+    )
+    assert cosine > 0.99

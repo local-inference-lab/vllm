@@ -1,0 +1,13 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-813-withdrawal",
+  "category": "internal",
+  "summary": "DeepSeek V4 routed-MoE tuning again times candidates without the concurrent shared expert",
+  "models": ["DeepSeek-V4-Flash"],
+  "compatibility": "No user action required.",
+  "details": [
+    "The current routed MoE kernel selects the same serving grid either way; an isolated comparison measured no C1, C8 or prefill difference."
+  ],
+  "pull_requests": [813],
+  "evidence": ["https://github.com/local-inference-lab/vllm/pull/813#issuecomment-5794090484"]
+}

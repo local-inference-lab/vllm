@@ -72,6 +72,7 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine.stall_diagnostics import EngineLoopWatchdog
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -705,7 +706,12 @@ class EngineCore:
         self, model_output: ModelRunnerOutput
     ) -> None:
         if model_output.boundary_checkpoint_tokens is not None:
-            self.model_executor.collective_rpc("wait_for_boundary_checkpoint_copies")
+            # Bounded like execute_model: a wedged copy stream ends the engine
+            # instead of stalling the step loop forever.
+            self.model_executor.collective_rpc(
+                "wait_for_boundary_checkpoint_copies",
+                timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+            )
 
     def step_with_batch_queue(
         self,
@@ -772,6 +778,13 @@ class EngineCore:
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
                     return None, model_executed
+            elif not batch_queue:
+                # Only this step's drafts are outstanding (no prior output is in
+                # flight), so hand them back and sample now.
+                self._sample_deferred_batch(
+                    deferred_scheduler_output, exec_future, deferred_execution_timing
+                )
+                return None, model_executed
 
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should
@@ -815,33 +828,38 @@ class EngineCore:
         # in a field and do it immediately once step_with_batch_queue is
         # re-called. The latter slightly favors TTFT over TPOT/throughput.
         if deferred_scheduler_output:
-            # When draft tokens are used with structured output, validate them
-            # before computing the grammar bitmask for the deferred request.
-            if self.check_for_draft_tokens:
-                draft_token_ids = self.model_executor.take_draft_token_ids()
-                if draft_token_ids is not None:
-                    # Update the draft token ids in the scheduler output to
-                    # filter out the invalid spec tokens, which will be padded
-                    # with -1 and skipped by the grammar bitmask computation.
-                    self.scheduler.update_draft_token_ids_in_output(
-                        draft_token_ids, deferred_scheduler_output
-                    )
-            # We now have the tokens needed to compute the bitmask for the
-            # deferred request. Get the bitmask and call sample tokens.
-            grammar_output = self.scheduler.get_grammar_bitmask(
-                deferred_scheduler_output
-            )
-            future = self.model_executor.sample_tokens(grammar_output, non_block=True)
-            batch_queue.appendleft(
-                (
-                    future,
-                    deferred_scheduler_output,
-                    exec_future,
-                    deferred_execution_timing,
-                )
+            self._sample_deferred_batch(
+                deferred_scheduler_output, exec_future, deferred_execution_timing
             )
 
         return engine_core_outputs, model_executed
+
+    def _sample_deferred_batch(
+        self,
+        scheduler_output: SchedulerOutput,
+        exec_future: Future[Any],
+        execution_timing: float | None,
+    ) -> None:
+        """Back-fill the step's drafts, build its bitmask and queue sampling."""
+        assert self.batch_queue is not None
+        # When draft tokens are used with structured output, validate them
+        # before computing the grammar bitmask for the deferred request.
+        if self.check_for_draft_tokens:
+            draft_token_ids = self.model_executor.take_draft_token_ids()
+            if draft_token_ids is not None:
+                # Update the draft token ids in the scheduler output to
+                # filter out the invalid spec tokens, which will be padded
+                # with -1 and skipped by the grammar bitmask computation.
+                self.scheduler.update_draft_token_ids_in_output(
+                    draft_token_ids, scheduler_output
+                )
+        # We now have the tokens needed to compute the bitmask for the
+        # deferred request. Get the bitmask and call sample tokens.
+        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        future = self.model_executor.sample_tokens(grammar_output, non_block=True)
+        self.batch_queue.appendleft(
+            (future, scheduler_output, exec_future, execution_timing)
+        )
 
     def _process_aborts_queue(self):
         if not self.aborts_queue.empty():
@@ -1153,6 +1171,15 @@ class EngineCoreProc(EngineCore):
     ):
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
         self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
+        # Monotonic time at which the input thread queued each ADD request
+        # that the loop has not handled yet.
+        self._add_received: dict[str, float] = {}
+        self._stall_warning_s = envs.VLLM_REQUEST_STALL_WARNING_S
+        self._loop_watchdog = (
+            EngineLoopWatchdog(self._stall_warning_s)
+            if self._stall_warning_s > 0
+            else None
+        )
         executor_fail_callback = lambda: self.input_queue.put_nowait(
             (EngineCoreRequestType.EXECUTOR_FAILED, b"")
         )
@@ -1515,6 +1542,12 @@ class EngineCoreProc(EngineCore):
         """Returns true if shutdown has not been requested."""
         return self.shutdown_state == EngineShutdownState.RUNNING
 
+    def shutdown(self):
+        # Teardown is not a loop step; do not report it as a stalled one.
+        if self._loop_watchdog is not None:
+            self._loop_watchdog.stop()
+        super().shutdown()
+
     @fault_tolerant_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
@@ -1557,6 +1590,8 @@ class EngineCoreProc(EngineCore):
                     logger.debug("EngineCore waiting for work.")
                     waited = True
             block = self.process_input_queue_block
+            if block and self._loop_watchdog is not None:
+                self._loop_watchdog.idle()
             try:
                 req = self.input_queue.get(block=block)
                 self._handle_client_request(*req)
@@ -1576,6 +1611,8 @@ class EngineCoreProc(EngineCore):
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
 
+        if self._loop_watchdog is not None:
+            self._loop_watchdog.busy("engine step")
         # Step the engine core.
         outputs, model_executed = self.step_fn()
         # Put EngineCoreOutputs into the output queue.
@@ -1650,10 +1687,28 @@ class EngineCoreProc(EngineCore):
     ) -> None:
         """Dispatch request from client."""
 
+        if self._loop_watchdog is not None:
+            self._loop_watchdog.busy(
+                f"{request[2]} utility call"
+                if request_type == EngineCoreRequestType.UTILITY
+                else f"{request_type.name} client request"
+            )
         if request_type == EngineCoreRequestType.WAKEUP:
             return
         elif request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
+            received = self._add_received.pop(req.request_id, None)
+            if (
+                received is not None
+                and self._stall_warning_s > 0
+                and (waited := time.monotonic() - received) > self._stall_warning_s
+            ):
+                logger.warning(
+                    "Request %s waited %.1f s in the engine-core input queue "
+                    "before the scheduler received it",
+                    req.request_id,
+                    waited,
+                )
             if self._reject_add_in_shutdown(req):
                 return
             self.add_request(req, request_wave)
@@ -1899,6 +1954,8 @@ class EngineCoreProc(EngineCore):
                             # aborting in the scheduler is idempotent.
                             self.aborts_queue.put_nowait(request)
 
+                    if request_type == EngineCoreRequestType.ADD:
+                        self._add_received[request[0].request_id] = time.monotonic()
                     # Push to input queue for core busy loop.
                     self.input_queue.put_nowait((request_type, request))
 

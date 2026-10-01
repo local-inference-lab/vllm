@@ -790,6 +790,9 @@ class ParserEngine(Parser):
         reasoning_parts: list[str] = []
 
         carried_deferred = self._deferred_content
+        # Content always precedes the tool calls in a message, so only
+        # whitespace from before the first call can be kept as content.
+        before_first_tool = not self._tool_slots
         seen_tool_event = False
         suppress = self._suppress_tool_calls
         for event in events:
@@ -825,6 +828,18 @@ class ParserEngine(Parser):
         if len(tool_call_deltas) > 1:
             tool_call_deltas = self._coalesce_tool_call_deltas(tool_call_deltas)
 
+        if (
+            carried_deferred
+            and before_first_tool
+            and self._tool_slots
+            and not self._drop_ws_only_content_before_tools
+        ):
+            # Whitespace deferred while no tool call existed precedes the
+            # first one; emit it now rather than behind the call's deltas.
+            content_parts.insert(0, carried_deferred)
+            self._deferred_content = self._deferred_content[len(carried_deferred) :]
+            carried_deferred = ""
+
         if self._deferred_content and (not seen_tool_event or not tool_call_deltas):
             # Deferred content carried in from a previous delta precedes this
             # delta's content; content deferred during this call (text after
@@ -845,7 +860,7 @@ class ParserEngine(Parser):
             if stripped:
                 self._content_has_nonws = True
             elif self._tool_slots:
-                if self._drop_ws_only_content_before_tools:
+                if self._drop_ws_only_content_before_tools or not before_first_tool:
                     content_str = ""
             elif not finished:
                 self._deferred_content = content_str

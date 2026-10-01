@@ -55,8 +55,24 @@ def limit_draft_tokens(
 
 
 class DraftTokensHandler:
-    def __init__(self, device: torch.device | None = None):
+    """Hands draft tokens back to the scheduler for grammar validation.
+
+    With synchronous scheduling the scheduler takes the drafts proposed for the
+    next step. With async scheduling (``track_consumed_drafts``) it takes them
+    only to back-fill the -1 placeholders of a step whose inputs were already
+    prepared, so the handler records the drafts that step's inputs consumed.
+    The drafts of the last proposing step would miss every request that
+    skipped it, and the scheduler would then build unconstrained grammar rows
+    for drafts that the model still verifies.
+    """
+
+    def __init__(
+        self,
+        device: torch.device | None = None,
+        track_consumed_drafts: bool = False,
+    ):
         self.device = device
+        self.track_consumed_drafts = track_consumed_drafts
         self.copy_stream = torch.cuda.Stream(device)
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
@@ -68,9 +84,39 @@ class DraftTokensHandler:
     def set_draft_tokens(
         self, input_batch: InputBatch, draft_tokens: torch.Tensor
     ) -> None:
-        self.req_ids = input_batch.req_ids
+        """Record the drafts proposed for the next step."""
+        if self.track_consumed_drafts:
+            return
+        self._set(
+            input_batch.req_ids, draft_tokens, input_batch.has_structured_output_reqs
+        )
+
+    def set_consumed_draft_tokens(
+        self, input_batch: InputBatch, draft_tokens: torch.Tensor
+    ) -> None:
+        """Record the drafts that this step's inputs were built from.
+
+        Args:
+            input_batch: The prepared step.
+            draft_tokens: The persistent per-request draft buffer, read on the
+                current stream after the step's input ids were built from it.
+        """
+        if not self.track_consumed_drafts:
+            return
+        num_drafts = input_batch.num_draft_tokens_per_req
+        if num_drafts is None or not input_batch.has_structured_output_reqs:
+            self._set(input_batch.req_ids, draft_tokens[:0, :0], False)
+            return
+        self._set(
+            input_batch.req_ids,
+            draft_tokens[input_batch.idx_mapping, : int(num_drafts.max())],
+            True,
+        )
+
+    def _set(self, req_ids: list[str], draft_tokens: torch.Tensor, copy: bool) -> None:
+        self.req_ids = req_ids
         self.num_draft_tokens = draft_tokens.shape[1]
-        if not input_batch.has_structured_output_reqs:
+        if not copy:
             # No draft token validation needs to be performed by
             # the scheduler for this batch.
             self.draft_tokens_np = None
@@ -93,7 +139,8 @@ class DraftTokensHandler:
             self.copy_event.synchronize()
             draft_token_ids = self.draft_tokens_np.tolist()
         else:
-            # This case only happens when async scheduling is disabled.
+            # The batch carried no structured-output request, so its drafts
+            # need no grammar validation.
             draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
         return DraftTokenIds(self.req_ids, draft_token_ids)
 

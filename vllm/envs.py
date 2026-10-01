@@ -45,9 +45,15 @@ if TYPE_CHECKING:
     VLLM_LOGGING_COLOR: str = "auto"
     NO_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
+    VLLM_REQUEST_STALL_WARNING_S: float = 60.0
+    VLLM_LOG_REQUEST_TIMELINE: bool = False
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_GLM53_MTP_DRAFT_HEAD: Literal["bf16", "nvfp4"] = "bf16"
+    VLLM_GLM53_VISION_MXFP8: bool = False
+    VLLM_GLM53_EMBED_HOST: bool = False
+    VLLM_SHARE_PYNCCL_COMMS: bool = False
+    VLLM_DFLASH_VOCAB_PARALLEL_DRAFT: bool = False
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -171,6 +177,8 @@ if TYPE_CHECKING:
     VLLM_RUST_FRONTEND_PATH: str | None = "auto"
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
+    VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS: bool = False
+    VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S: float = 60.0
     VLLM_MLA_DISABLE: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
@@ -195,6 +203,7 @@ if TYPE_CHECKING:
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
+    VLLM_B12X_BF16_GEMV: bool = False
     VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE: Literal["0", "1", "all", "w13", "w2"] = "0"
     VLLM_DEFAULT_MOE_BACKEND: str = "auto"
     VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
@@ -208,11 +217,14 @@ if TYPE_CHECKING:
     VLLM_MTP_NVFP4_LM_HEAD: bool = True
     VLLM_DS41_MARKOV_NVFP4: bool = False
     VLLM_DS41_DRAFT_NVFP4_HEAD: bool = False
+    VLLM_DS41_ATTENTION_COMPUTE: Literal["bf16", "reference", "auto"] = "bf16"
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_HC_TP: bool = True
+    VLLM_MIMO_L2_PREFETCH: bool = False
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
+    VLLM_B12X_PAGED_DECODE: Literal["auto", "0", "1"] = "auto"
     VLLM_PLE_TABLE_MEMORY: Literal["ram", "disk"] | None = None
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
@@ -901,6 +913,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if (val := float(os.getenv("VLLM_LOG_STATS_INTERVAL", "10."))) > 0.0
         else 10.0
     ),
+    # Warn when a request takes longer than this many seconds to get from
+    # rendering to the engine core, waits that long in the engine-core input
+    # queue, or leaves its final output unread by the client that long; also
+    # warn, with the loop's stack, when one engine-core loop iteration runs
+    # that long. 0 disables these warnings.
+    "VLLM_REQUEST_STALL_WARNING_S": lambda: max(
+        0.0, float(os.getenv("VLLM_REQUEST_STALL_WARNING_S", "60"))
+    ),
+    # If set, the API server logs one line per request with the time each
+    # stage took: rendering, input processing, engine submission, first and
+    # final output, and the client reading the final output.
+    "VLLM_LOG_REQUEST_TIMELINE": lambda: (
+        os.getenv("VLLM_LOG_REQUEST_TIMELINE", "0").lower() in ("1", "true")
+    ),
     # Trace function calls
     # If set to 1, vllm will trace function calls
     # Useful for debugging
@@ -920,6 +946,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "bf16",
         ["bf16", "nvfp4"],
         case_sensitive=False,
+    ),
+    # Quantize the GLM-5.3 vision tower's linear layers to MXFP8 while loading
+    # its BF16 weights. Convolutions and norms stay BF16.
+    "VLLM_GLM53_VISION_MXFP8": lambda: bool(
+        int(os.getenv("VLLM_GLM53_VISION_MXFP8", "0"))
+    ),
+    # Keep the GLM-5.3 input embedding table in pinned host RAM; the GPU reads
+    # the rows of the current tokens through a UVA view.
+    "VLLM_GLM53_EMBED_HOST": lambda: bool(int(os.getenv("VLLM_GLM53_EMBED_HOST", "0"))),
+    # Groups over the same ranks share one PyNCCL communicator.
+    "VLLM_SHARE_PYNCCL_COMMS": lambda: bool(
+        int(os.getenv("VLLM_SHARE_PYNCCL_COMMS", "0"))
+    ),
+    # Sample probabilistic DFlash drafts per vocab shard (exact: same draws and
+    # verification outcomes) instead of all-gathering the draft logits.
+    "VLLM_DFLASH_VOCAB_PARALLEL_DRAFT": lambda: (
+        os.getenv("VLLM_DFLASH_VOCAB_PARALLEL_DRAFT", "0") == "1"
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
@@ -1496,6 +1539,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE": lambda: int(
         os.getenv("VLLM_V1_OUTPUT_PROC_CHUNK_SIZE", "128")
     ),
+    # Let a scheduling step with no runnable decode use the full
+    # max_num_batched_tokens for prefill instead of max_num_scheduled_tokens,
+    # which only exists to keep decode streams moving.
+    "VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS": lambda: (
+        os.getenv("VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS", "0") == "1"
+    ),
+    # Seconds an external checkpoint restore may wait for GPU capacity before
+    # its request recomputes the prompt instead. 0 recomputes immediately.
+    "VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S": lambda: max(
+        0.0, float(os.getenv("VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S", "60"))
+    ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
     # If set, vLLM will pick up the provided Flash Attention MLA
@@ -1749,6 +1803,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_B12X_MOE_FP4_FORCE_A16": lambda: bool(
         int(os.getenv("VLLM_B12X_MOE_FP4_FORCE_A16", "0"))
     ),
+    # Opt-in: under --linear-backend b12x, serve decode-sized (<= 8 row) BF16
+    # linears through b12x gemm.bf16_gemv plans autotuned against cuBLAS.
+    "VLLM_B12X_BF16_GEMV": lambda: os.getenv("VLLM_B12X_BF16_GEMV", "0") == "1",
     # Select layer-wide activation scales for b12x NVFP4 MoE projections.
     "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE": env_with_choices(
         "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE",
@@ -1793,6 +1850,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DS41_DRAFT_NVFP4_HEAD": lambda: bool(
         int(os.getenv("VLLM_DS41_DRAFT_NVFP4_HEAD", "0"))
     ),
+    # Arithmetic of the DeepSeek V4.1 b12x sparse attention. "bf16" computes
+    # like DeepSeek's reference sparse_attn (BF16 Q, KV dequantized to BF16,
+    # BF16 P, FP32 accumulation) with split-K decode; "reference" also runs
+    # decode rows single-pass, which reproduces the reference kernel's
+    # tile-ordered softmax bit for bit at some low-concurrency decode speed;
+    # "auto" lets the b12x tuner pick FP8 internals (Q and P quantized, KV
+    # re-encoded; about 3% relative error) or BF16 per plan.
+    "VLLM_DS41_ATTENTION_COMPUTE": env_with_choices(
+        "VLLM_DS41_ATTENTION_COMPUTE",
+        "bf16",
+        ["bf16", "reference", "auto"],
+    ),
     # Overlap independent small-batch projections in Qwen3.8-Flash-Next graphs.
     "VLLM_QWEN3_8_FLASH_NEXT_OVERLAP": lambda: bool(
         int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_OVERLAP", "1"))
@@ -1801,6 +1870,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_QWEN3_8_FLASH_NEXT_HC_TP": lambda: bool(
         int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_HC_TP", "1"))
     ),
+    # MiMo-V2: prefetch upcoming decode weights into L2 on a side stream
+    # during FULL CUDA-graph decode (cache hints only; numerics unchanged).
+    "VLLM_MIMO_L2_PREFETCH": lambda: os.getenv("VLLM_MIMO_L2_PREFETCH", "0") == "1",
     # Gather DCP-sharded C4 records before B12X sparse-MLA prefill. This avoids
     # query replication plus the per-rank LSE combine and is opt-in while the
     # path is being qualified on GLM5Next.
@@ -1812,6 +1884,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS", "524288")
+    ),
+    # B12X attention decode/verify through b12x.attention.paged_decode:
+    # "auto" for layers with unequal Q/K and V head dims and for non-causal
+    # FP8-KV layers, "1" for every supported layer, "0" never.
+    "VLLM_B12X_PAGED_DECODE": env_with_choices(
+        "VLLM_B12X_PAGED_DECODE", "auto", ["auto", "0", "1"]
     ),
     # Qwen3.8-Flash-Next PLE offload policy, resolved by vLLM for b12x.
     "VLLM_PLE_TABLE_MEMORY": env_with_choices(
@@ -2544,6 +2622,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOGGING_CONFIG_PATH",
         "VLLM_LOGGING_COLOR",
         "VLLM_LOG_STATS_INTERVAL",
+        "VLLM_REQUEST_STALL_WARNING_S",
+        "VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S",
+        "VLLM_LOG_REQUEST_TIMELINE",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",

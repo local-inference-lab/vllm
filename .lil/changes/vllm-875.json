@@ -1,0 +1,17 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-875",
+  "category": "performance",
+  "summary": "Optional L2 weight prefetch for MiMo V2 decode",
+  "models": [
+    "XiaomiMiMo/MiMo-V2.6-Flash-RL",
+    "XiaomiMiMo/MiMo-V2.6-Pro-RL"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "VLLM_MIMO_L2_PREFETCH=1 prefetches upcoming decode weights into L2 on a side stream inside FULL CUDA-graph decode. Cache hints only; numerics unchanged. Default off."
+  ],
+  "pull_requests": [
+    875
+  ]
+}

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """b12x modular tensor-parallel fused MoE backend."""
 
+import functools
 import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kMxfp4Static,
     kMxfp8Dynamic,
+    kMxfp8Static,
     kNvfp4Dynamic,
     kNvfp4Static,
 )
@@ -45,6 +47,7 @@ _B12X_MOE_MODES: dict[
     tuple[str, str, str],
 ] = {
     ("mxfp4", "mxfp8"): ("w4a8_mx", "fp4_e8m0_k32", "w31"),
+    ("mxfp8", "mxfp8"): ("w8a8_mx", "mxfp8_e8m0_k32", "w31"),
     ("mxfp4", None): ("w4a16", "fp4_e8m0_k32", "w31"),
     ("exl3", None): ("w4a16", "exl3", "w31"),
     ("nvfp4", "nvfp4"): ("nvfp4", "modelopt_nvfp4", "w31"),
@@ -237,6 +240,16 @@ def _normalize_expert_scale(scale: torch.Tensor) -> torch.Tensor:
     return scale.to(dtype=torch.float32).contiguous()
 
 
+@functools.cache
+def _b12x_has_mxfp8_moe() -> bool:
+    """Whether the installed b12x prepares MXFP8 (w8a8_mx) MoE experts."""
+    try:
+        from b12x.moe.fused_moe import PackedSourceFormat
+    except ImportError:
+        return False
+    return "mxfp8_e8m0_k32" in {fmt.value for fmt in PackedSourceFormat}
+
+
 class B12xExperts(mk.FusedMoEExpertsModular):
     """Packed MoE experts backed by the b12x SM12x planned API."""
 
@@ -245,9 +258,15 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         moe_config: mk.FusedMoEConfig,
         quant_config: FusedMoEQuantConfig,
     ):
+        """Bind the b12x quant mode, packed source format and W13 layout.
+
+        Raises ValueError when no b12x kernel covers the configured weight
+        dtype or the (weight, activation) scheme; no weights are prepared.
+        """
         super().__init__(moe_config, quant_config)
         if quant_config.weight_quant_dtype not in (
             "mxfp4",
+            "mxfp8",
             "nvfp4",
             "exl3",
             "iq2_xs",
@@ -255,8 +274,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             "q8_0",
         ):
             raise ValueError(
-                "b12x MoE requires MXFP4, NVFP4, EXL3, IQ2_XS, IQ2_XXS or "
-                "Q8_0 weights, got "
+                "b12x MoE requires MXFP4, MXFP8, NVFP4, EXL3, IQ2_XS, IQ2_XXS "
+                "or Q8_0 weights, got "
                 f"{quant_config.weight_quant_dtype}"
             )
         scheme = (
@@ -339,6 +358,14 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         activation: MoEActivation,
         params_dtype: torch.dtype,
     ) -> Any:
+        """Build the b12x prepared-experts representation for these weights.
+
+        Block-quantized sources are planned straight from the packed extents
+        with a ``BlockQuantWeights`` binding; every other mode requires the
+        w1/w2 block scales, recovers the logical intermediate size from the
+        packed extent (FP4 holds two values per byte) and binds the weight and
+        activation global scales. Raises RuntimeError under CUDA graph capture.
+        """
         quant_mode = self._quant_mode
         if _is_current_stream_capturing():
             raise RuntimeError(
@@ -375,7 +402,14 @@ class B12xExperts(mk.FusedMoEExpertsModular):
 
         num_experts = int(w1.shape[0])
         hidden_size = int(w2.shape[1])
-        intermediate_size = int(w2.shape[2]) * 2
+        # FP4 weights pack two values per byte, so the loaded w2 last dim is
+        # half the logical channel count; MXFP8 stores one byte per value and
+        # the loaded extent is already logical.
+        w1_scale, w2_scale = self.w1_scale, self.w2_scale
+        if quant_mode in ("w8a8_mx",):
+            intermediate_size = int(w2.shape[2])
+        else:
+            intermediate_size = int(w2.shape[2]) * 2
         unit_scale = self._unit_scale(w1.device, num_experts)
         w1_global_scale = self._weight_global_scale(
             w1.device, num_experts, self.g1_alphas, "w1 global scales"
@@ -397,6 +431,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         mode = {
             "w4a16": fused_moe.ActivationMode.A16,
             "w4a8_mx": fused_moe.ActivationMode.A8,
+            "w8a8_mx": fused_moe.ActivationMode.A8,
             "w4a8_nvfp4": fused_moe.ActivationMode.A8,
             "nvfp4": fused_moe.ActivationMode.A4,
         }[quant_mode]
@@ -424,8 +459,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             weights=fused_moe.PackedWeights(
                 w13=w1,
                 w2=w2,
-                w13_block_scales=self.w1_scale,
-                w2_block_scales=self.w2_scale,
+                w13_block_scales=w1_scale,
+                w2_block_scales=w2_scale,
                 w13_global_scales=w1_global_scale,
                 w2_global_scales=w2_global_scale,
                 input_scale=a1_gscale,
@@ -535,6 +570,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         activation_key: QuantKey | None,
         activation_format: mk.FusedMoEActivationFormat,
     ) -> tuple[bool, str | None]:
+        """Report whether b12x can run this MoE config, with the reason if not.
+
+        Applies the kernel-specific bias, dtype, activation and alignment
+        gates, then defers to the base-class checks.
+        """
         if moe_config.has_bias:
             return False, "kernel does not support expert biases"
         if moe_config.in_dtype not in (torch.float16, torch.bfloat16):
@@ -581,6 +621,19 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                         "per-rank intermediate size divisible by 32"
                     ),
                 )
+        if weight_key == kMxfp8Static:
+            if not _b12x_has_mxfp8_moe():
+                return False, "the installed b12x has no MXFP8 W8A8 MoE recipe"
+            if moe_config.activation != MoEActivation.SILU:
+                return False, "MXFP8 W8A8 supports only SiLU"
+            if moe_config.hidden_dim % 128 != 0 or unpadded_intermediate_size % 32 != 0:
+                return (
+                    False,
+                    (
+                        "MXFP8 W8A8 requires hidden size divisible by 128 and "
+                        "per-rank intermediate size divisible by 32"
+                    ),
+                )
         return mk.FusedMoEExperts.is_supported_config(
             cls, moe_config, weight_key, activation_key, activation_format
         )
@@ -606,9 +659,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
     ) -> bool:
+        """Check the (weight, activation) pair against the b12x kernel set."""
         return (weight_key, activation_key) in (
             (kMxfp4Static, kMxfp8Dynamic),
             (kMxfp4Static, None),
+            (kMxfp8Static, kMxfp8Dynamic),
             (kNvfp4Static, kNvfp4Dynamic),
             (kNvfp4Static, kMxfp8Dynamic),
             (kNvfp4Static, None),
@@ -803,6 +858,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         w2: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> tuple[int, int, int, int, int]:
+        """Return (experts, tokens, N, K, topk) for the current problem.
+
+        Delegates to the base implementation while the weight tensors still
+        hold data; once they are released, the geometry comes from the
+        prepared plan, with N = 2 * intermediate (the gate and up rows).
+        """
         if w1.numel() and w2.numel():
             return super().moe_problem_size(a1, w1, w2, topk_ids)
         prepared = self._prepared()

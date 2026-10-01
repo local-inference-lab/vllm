@@ -891,6 +891,40 @@ class MessageQueue:
         if self.n_remote_reader > 0:
             self.remote_socket.send_multipart(all_buffers, copy=False)
 
+    def ready(self) -> bool:
+        """Whether a message is waiting for this reader, without consuming it.
+
+        A probe that dequeues with a zero timeout is not safe: a message larger
+        than a ring chunk marks its slot first and follows over the socket, so
+        the probe can claim the slot and time out before the payload lands,
+        losing the message.
+        """
+        if self._is_local_reader:
+            with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
+                memory_fence()
+                return bool(metadata_buffer[0]) and not bool(
+                    metadata_buffer[self.local_reader_rank + 1]
+                )
+        if self._is_remote_reader:
+            return bool(self.remote_socket.poll(timeout=0))
+        raise RuntimeError("Only readers can check for messages")
+
+    def wait_for_message(self, timeout_ms: int) -> None:
+        """Wait at most ``timeout_ms`` for a message, without consuming one.
+
+        Waits the way a blocking read does, spinning while reads are frequent
+        and parking on the writer's notification otherwise, and may return
+        early, so callers check ``ready()`` again afterwards.
+        """
+        if self._is_local_reader:
+            self._spin_condition.wait(timeout_ms=timeout_ms)
+        elif self._is_remote_reader:
+            self.remote_socket.poll(timeout=timeout_ms)
+        else:
+            raise RuntimeError("Only readers can wait for messages")
+        if self.shutting_down:
+            raise RuntimeError("cancelled")
+
     def dequeue(
         self,
         timeout: float | None = None,

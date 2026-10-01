@@ -656,3 +656,22 @@ def test_tp_confidence_publication_keeps_graph_and_request_budgets_consistent():
     torch.multiprocessing.spawn(
         _run_tp_confidence_consistency, args=(get_open_port(),), nprocs=2, join=True
     )
+
+
+def test_budget_probes_after_steps_without_drafts():
+    """An estimator that stopped trusting the drafter must keep being graded.
+
+    Confidences learned only from admitted drafts cannot recover once no draft
+    is admitted, so after EXPLORE_AFTER_IDLE_STEPS empty budgets one step
+    verifies a draft per request, then budgeting resumes as before.
+    """
+    manager = make_manager(
+        np.array([[1e-9, 1e-9]], dtype=np.float32),
+        np.array([1.0, 2.0, 3.0, 4.0]),
+    )
+    idle = getattr(adaptive_module, "EXPLORE_AFTER_IDLE_STEPS", 32)
+    budgets = []
+    for _ in range(2 * idle):
+        manager.get_num_tokens({"low": 3}, {"low": [1, 2]})
+        budgets.append(manager._batch_budget[2])
+    assert budgets == ([0] * (idle - 1) + [1]) * 2

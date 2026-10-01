@@ -14,6 +14,7 @@ import contextlib
 import gc
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 from weakref import ref
 
 import pytest
@@ -44,8 +45,8 @@ class _FakeCudaGraphManager(cgu.CudaGraphManager):
         else:
             self._capture_descs = {CUDAGraphMode.FULL: descs} if needs_capture else {}
         # Profiling hooks set by profile_cudagraph_memory.
-        self._max_full_descs_to_capture: int | None = None
-        self._capture_mem_samples: list[int] | None = None
+        self._sample_full_descs = False
+        self._capture_mem_samples: list[Any] | None = None
         self.use_breakable_cg = False
         self.graphs: dict[Any, Any] = {}
         self.graph_capture_resources: dict[Any, list[Any]] = {}
@@ -82,8 +83,9 @@ def _make_profiling_runner(
     num_full_descs: int = 3,
     piecewise_only: bool = False,
     captured_bytes: int = 7 << 30,
-    mem_samples: list[int] | None = None,
+    mem_samples: list[tuple[int, int, int]] | None = None,
 ) -> Any:
+    """Build a runner whose capture records ``(desc index, growth, cost)``."""
     runner: Any = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
     runner.compilation_config = SimpleNamespace(cudagraph_mode=cudagraph_mode)
     runner.cudagraph_manager = _FakeCudaGraphManager(
@@ -101,9 +103,14 @@ def _make_profiling_runner(
         events.append("capture")
         runner.pool_during_capture = runner.cudagraph_manager.pool
         # Simulate the manager's per-FULL-graph memory sampling.
-        samples = runner.cudagraph_manager._capture_mem_samples
-        if samples is not None:
-            samples.extend(mem_samples or [])
+        manager = runner.cudagraph_manager
+        samples = manager._capture_mem_samples
+        if samples is not None and mem_samples:
+            descs = manager._capture_descs[CUDAGraphMode.FULL]
+            samples.extend(
+                cgu._FullGraphMemorySample(descs[index], growth, cost)
+                for index, growth, cost in mem_samples
+            )
         return captured_bytes
 
     runner.capture_model = _capture_model
@@ -173,32 +180,51 @@ def test_profile_cudagraph_memory_no_graphs_tears_down(monkeypatch):
 
 def test_profile_cudagraph_memory_samples_and_extrapolates(monkeypatch):
     _patch_module(monkeypatch)
-    gib = 1 << 30
-    # Measured delta 1000 MiB includes the sampled FULL graphs (100 + 20 MiB).
-    # The sampled graphs have sizes 3 and 2. Scale the second sample by the
-    # remaining graph's 1/2 token ratio: 100 + 20 + 10 = 130 MiB.
+    mib = 1 << 20
+    # The measured delta includes the sampled FULL graphs of 4, 3 and 1
+    # tokens. The unsampled 2-token graph costs the per-graph samples
+    # interpolated between 1 token (10 MiB) and 3 tokens (30 MiB).
     runner = _make_profiling_runner(
         CUDAGraphMode.FULL,
-        num_full_descs=3,
-        captured_bytes=1000 * gib,
-        mem_samples=[100 * gib, 20 * gib],
+        num_full_descs=4,
+        captured_bytes=1000 * mib,
+        mem_samples=[
+            (0, 100 * mib, 100 * mib),
+            (1, 30 * mib, 30 * mib),
+            (3, 0, 10 * mib),
+        ],
     )
 
     result = cgu.profile_cudagraph_memory(
         runner, lambda: runner.events.append("prepare")
     )
 
-    assert result == (1000 - (100 + 20) + (100 + 20 + 10)) * gib
+    assert result == (1000 + 20) * mib
     # Bootstrap, capture, and teardown run in order.
     assert runner.events == ["init", "prepare", "capture", "teardown"]
     # Capture must use a throwaway pool, not the persistent global pool.
     assert runner.pool_during_capture == THROWAWAY_POOL
     assert runner.cudagraph_manager.pool == GLOBAL_POOL
-    # FULL capture must be limited to the largest few graphs.
-    assert (
-        runner.cudagraph_manager._max_full_descs_to_capture
-        == cgu._FULL_GRAPH_PROFILING_SAMPLES
+    # FULL capture must be limited to a sample of the graphs.
+    assert runner.cudagraph_manager._sample_full_descs
+
+
+def test_profile_cudagraph_memory_debug_accounting_captures_every_full_graph(
+    monkeypatch,
+):
+    _patch_module(monkeypatch)
+    monkeypatch.setattr(cgu, "_DEBUG_GRAPH_MEMORY_ACCOUNTING", True)
+    mib = 1 << 20
+    runner = _make_profiling_runner(
+        CUDAGraphMode.FULL,
+        num_full_descs=2,
+        captured_bytes=1000 * mib,
+        mem_samples=[(0, 100 * mib, 100 * mib), (1, 0, 50 * mib)],
     )
+
+    # Every graph was captured, so the measured delta is the estimate.
+    assert cgu.profile_cudagraph_memory(runner) == 1000 * mib
+    assert not runner.cudagraph_manager._sample_full_descs
 
 
 def test_profile_cudagraph_memory_piecewise_only_returns_measured(monkeypatch):
@@ -349,25 +375,251 @@ def test_model_runner_delegates_to_cudagraph_utils(monkeypatch):
     assert runner.profile_cudagraph_memory(prepare) == (runner, prepare)
 
 
+def _full_descs(*token_counts: int) -> list[cgu.BatchExecutionDescriptor]:
+    return [
+        cgu.BatchExecutionDescriptor(CUDAGraphMode.FULL, num_tokens, num_tokens)
+        for num_tokens in token_counts
+    ]
+
+
+def test_profiling_samples_two_largest_and_smallest_full_graphs():
+    descs = _full_descs(40, 32, 24, 16, 8)
+
+    assert cgu._profiling_full_descs(descs) == [descs[0], descs[1], descs[-1]]
+    assert cgu._profiling_full_descs(descs[:3]) == descs[:3]
+
+
 def test_extrapolate_full_graph_memory():
     mib = 1 << 20
-    descs = [
-        cgu.BatchExecutionDescriptor(CUDAGraphMode.FULL, num_tokens, None)
-        for num_tokens in (40, 32, 16, 8)
-    ]
+    descs = _full_descs(40, 32, 24, 16, 8)
+
+    def sample(index: int, growth: int, cost: int | None = None) -> Any:
+        return cgu._FullGraphMemorySample(
+            descs[index], growth * mib, (growth if cost is None else cost) * mib
+        )
+
     # No samples (e.g. no FULL graphs): nothing to add.
     assert cgu._extrapolate_full_graph_memory([], []) == 0
-    # A single graph costs exactly its sample.
-    assert cgu._extrapolate_full_graph_memory([100 * mib], descs[:1]) == 100 * mib
-    # Preserve sampled costs and scale the rest by their token counts.
-    assert (
-        cgu._extrapolate_full_graph_memory([100 * mib, 20 * mib], descs)
-        == (100 + 20 + 10 + 5) * mib
+    # Sampled graphs cost exactly their measured growth.
+    assert cgu._extrapolate_full_graph_memory([sample(0, 100)], descs[:1]) == (
+        100 * mib
     )
-    # Per-graph cost is floored to account for driver overhead.
+    # Unsampled graphs interpolate the per-graph samples by token count.
     assert (
-        cgu._extrapolate_full_graph_memory([100 * mib, 0], descs) == (100 + 3 * 1) * mib
+        cgu._extrapolate_full_graph_memory(
+            [sample(0, 100), sample(1, 32), sample(4, 8)], descs
+        )
+        == (100 + 32 + 8 + 24 + 16) * mib
     )
+    # A fixed retained cost is charged to every unsampled graph, even when
+    # the sampled graphs found room for it in the pool, and one-time pool
+    # growth of a sampled graph is not.
+    assert (
+        cgu._extrapolate_full_graph_memory(
+            [sample(0, 300), sample(1, 80, 122), sample(4, 6, 122)], descs
+        )
+        == (300 + 80 + 6 + 2 * 122) * mib
+    )
+    # The largest graph's sample is not a per-graph reference, and the
+    # per-graph cost is floored for driver overhead.
+    assert (
+        cgu._extrapolate_full_graph_memory(
+            [sample(0, 300), sample(1, 0), sample(4, 0)], descs
+        )
+        == (300 + 2 * 1) * mib
+    )
+
+
+_MIB = 1 << 20
+# Decode page metadata that a buggy attention backend retains in every FULL
+# graph (the DeepSeek-V4.1 per-graph copy fixed in vLLM #918).
+_METADATA_BYTES = 116 * _MIB
+_GRAPH_EXEC_BYTES = 6 * _MIB
+
+
+class _FakeDevice:
+    """One device as the graph memory sampler reads it, in bytes.
+
+    Eager blocks stay cached after they are freed until ``empty_cache()``.
+    The private graph pool reuses its free blocks but never returns memory,
+    and every captured graph adds ``_GRAPH_EXEC_BYTES`` outside the Torch
+    allocator, like an instantiated CUDA graph.
+    """
+
+    def __init__(self) -> None:
+        self.eager_allocated = 0
+        self.eager_reserved = 0
+        self.pool_allocated = 0
+        self.pool_reserved = 0
+        self.native = 0
+        self.capturing = False
+        # Cached bytes that torch.cuda.graph's own flush found on entry.
+        self.flushed_by_capture: list[int] = []
+
+    def get_memory_info(self) -> tuple[int, int]:
+        total = 96 << 30
+        used = self.eager_reserved + self.pool_reserved + self.native
+        return total - used, total
+
+    def memory_allocated(self) -> int:
+        return self.eager_allocated + self.pool_allocated
+
+    def memory_reserved(self) -> int:
+        return self.eager_reserved + self.pool_reserved
+
+    def empty_cache(self) -> None:
+        self.eager_reserved = self.eager_allocated
+
+    def allocate(self, nbytes: int) -> None:
+        if self.capturing:
+            self.pool_allocated += nbytes
+            self.pool_reserved = max(self.pool_reserved, self.pool_allocated)
+        else:
+            self.eager_allocated += nbytes
+            self.eager_reserved = max(self.eager_reserved, self.eager_allocated)
+
+    def free(self, nbytes: int) -> None:
+        if self.capturing:
+            self.pool_allocated -= nbytes
+        else:
+            self.eager_allocated -= nbytes
+
+    @contextlib.contextmanager
+    def cuda_graph(self, *_args, **_kwargs):
+        # Like torch.cuda.graph, flush the allocator cache before capturing.
+        self.flushed_by_capture.append(self.eager_reserved - self.eager_allocated)
+        self.empty_cache()
+        self.capturing = True
+        try:
+            yield
+        finally:
+            self.capturing = False
+            self.native += _GRAPH_EXEC_BYTES
+
+    def create_forward_fn(self, retain_metadata: bool):
+        """Decode forward: activations scale with tokens, metadata is fixed."""
+
+        def create_forward_fn(desc, warmup):
+            def forward_fn(_mode):
+                activations = 2 * _MIB * desc.num_tokens
+                self.allocate(activations + _METADATA_BYTES)
+                self.free(activations)
+                if not (self.capturing and retain_metadata):
+                    self.free(_METADATA_BYTES)
+
+            return forward_fn
+
+        return create_forward_fn
+
+    def capture_model(self, manager: cgu.CudaGraphManager, create_forward_fn):
+        """Mirror GPUModelRunner.capture_model's measured delta."""
+        self.empty_cache()
+        free_before = self.get_memory_info()[0]
+        manager.capture(create_forward_fn)
+        return free_before - self.get_memory_info()[0]
+
+
+class _CapturingGraphManager(cgu.CudaGraphManager):
+    """Runs the real capture loop over FULL decode graphs of the given sizes."""
+
+    def __init__(self, token_counts: list[int]) -> None:
+        self.device = torch.device("cpu")
+        self.pool: Any = GLOBAL_POOL
+        self.ubatch_runner = None
+        self.use_breakable_cg = False
+        self._capture_descs = {
+            CUDAGraphMode.FULL: _full_descs(*sorted(token_counts, reverse=True))
+        }
+        self._sample_full_descs = False
+        self._capture_mem_samples: list[Any] | None = None
+        self.graphs: dict[Any, Any] = {}
+        self.graph_capture_resources: dict[Any, list[Any]] = {}
+        self._graphs_captured = False
+
+    def needs_capture(self) -> bool:
+        return True
+
+    def _capture_stream(self, desc):
+        return None
+
+
+def _patch_capture(monkeypatch, device: _FakeDevice) -> None:
+    accelerator = cgu.torch.accelerator
+    monkeypatch.setattr(accelerator, "synchronize", lambda: None)
+    for name in ("get_memory_info", "memory_allocated", "memory_reserved"):
+        monkeypatch.setattr(accelerator, name, getattr(device, name))
+    monkeypatch.setattr(accelerator, "empty_cache", device.empty_cache)
+    monkeypatch.setattr(cgu.torch.cuda, "graph", device.cuda_graph)
+    monkeypatch.setattr(cgu.torch.cuda, "CUDAGraph", MagicMock)
+    monkeypatch.setattr(cgu, "graph_capture", lambda **_: contextlib.nullcontext())
+    monkeypatch.setattr(cgu, "get_offloader", MagicMock)
+    monkeypatch.setattr(cgu, "set_graph_pool_id", lambda _pool: None)
+    monkeypatch.setattr(cgu, "is_global_first_rank", lambda: False)
+
+
+# Decode graph sizes shaped like DeepSeek-V4.1's DSpark verification graphs.
+_DECODE_TOKENS = [*range(128, 0, -8), *range(7, 0, -1)]
+
+
+@pytest.mark.parametrize("retain_metadata", [False, True])
+def test_full_graph_sample_excludes_released_warmup_cache(monkeypatch, retain_metadata):
+    """The baseline is read after the warmup's cached blocks are flushed.
+
+    ``torch.cuda.graph`` empties the allocator cache when it is entered. A
+    baseline read before that flush subtracts the eager warmup's cached
+    activations and metadata from the graph's own memory.
+    """
+    device = _FakeDevice()
+    _patch_capture(monkeypatch, device)
+    manager = _CapturingGraphManager([128, 120, 1])
+    samples: list[Any] = []
+    manager._capture_mem_samples = samples
+
+    manager.capture(device.create_forward_fn(retain_metadata))
+
+    # Nothing is left for the capture's own flush to release in the sample.
+    assert device.flushed_by_capture == [0, 0, 0]
+    # With retained metadata, the 120-token graph needs 100 MiB more pool and
+    # the 1-token graph fits in blocks freed by earlier graphs; each graph
+    # still keeps its own metadata.
+    retained = _METADATA_BYTES if retain_metadata else 0
+    pool_growth = [256 * _MIB + _METADATA_BYTES, 100 * _MIB if retained else 0, 0]
+    assert [sample.growth for sample in samples] == [
+        pool + _GRAPH_EXEC_BYTES for pool in pool_growth
+    ]
+    assert [sample.cost for sample in samples] == [retained + _GRAPH_EXEC_BYTES] * 3
+
+
+@pytest.mark.parametrize("retain_metadata", [False, True])
+def test_profile_estimate_covers_every_full_graph(monkeypatch, retain_metadata):
+    """Three sampled graphs must account for memory each graph retains.
+
+    Compare the profiled estimate with a capture of every graph. A per-graph
+    retained buffer must shrink the KV cache instead of running out of memory
+    after the real capture.
+    """
+    _patch_module(monkeypatch)
+    full_device = _FakeDevice()
+    _patch_capture(monkeypatch, full_device)
+    all_graphs_bytes = full_device.capture_model(
+        _CapturingGraphManager(_DECODE_TOKENS),
+        full_device.create_forward_fn(retain_metadata),
+    )
+
+    device = _FakeDevice()
+    _patch_capture(monkeypatch, device)
+    runner = _make_profiling_runner(CUDAGraphMode.FULL)
+    runner.cudagraph_manager = _CapturingGraphManager(_DECODE_TOKENS)
+    runner.capture_model = lambda *, profile_only: device.capture_model(
+        runner.cudagraph_manager, device.create_forward_fn(retain_metadata)
+    )
+
+    estimate = cgu.profile_cudagraph_memory(runner)
+
+    assert all_graphs_bytes <= estimate <= all_graphs_bytes * 21 // 20
+    assert device.flushed_by_capture == [0, 0, 0]
+    if not retain_metadata:
+        assert estimate == all_graphs_bytes
 
 
 def test_profile_cudagraph_memory_clears_captured_graphs(monkeypatch):
@@ -920,3 +1172,65 @@ def test_legacy_profile_tears_down_after_partial_init_error(monkeypatch):
     assert not hasattr(runner, "kv_cache_config")
     assert runner.cache_config.num_gpu_blocks is None
     assert runner._mamba_bufs is None
+
+
+def test_legacy_profile_samples_exclude_cached_blocks(monkeypatch):
+    """Model runner V1 samples each graph with the allocator cache empty."""
+    from vllm.v1.worker import gpu_model_runner as legacy_runner_module
+
+    device = _FakeDevice()
+    _patch_capture(monkeypatch, device)
+    runner = legacy_runner_module.GPUModelRunner.__new__(
+        legacy_runner_module.GPUModelRunner
+    )
+    runner.vllm_config = object()
+    runner.lora_config = None
+    runner.device = torch.device("cpu")
+    runner.max_model_len = 1024
+    runner.max_num_tokens = 128
+    runner.cudagraph_dispatcher = SimpleNamespace(
+        get_capture_descs=lambda: [(CUDAGraphMode.FULL, _full_descs(128, 120, 1))],
+        cudagraph_keys={},
+        keys_initialized=True,
+    )
+    runner._init_minimal_kv_cache_for_profiling = lambda: None
+    runner._cleanup_profiling_kv_cache = lambda: None
+    runner._create_encoder_cudagraph_manager = lambda: None
+    runner._freeze_gc = contextlib.nullcontext
+    runner.maybe_remove_all_loras = lambda _config: None
+    create_forward_fn = device.create_forward_fn(retain_metadata=True)
+
+    def warmup_and_capture(desc, cudagraph_runtime_mode, profile_seq_lens=None):
+        forward_fn = create_forward_fn(desc, warmup=True)
+        forward_fn(CUDAGraphMode.NONE)
+        with device.cuda_graph():
+            forward_fn(cudagraph_runtime_mode)
+        # The dummy run's eager outputs stay cached after the capture.
+        device.allocate(64 * _MIB)
+        device.free(64 * _MIB)
+
+    runner._warmup_and_capture = warmup_and_capture
+    monkeypatch.setattr(
+        legacy_runner_module,
+        "set_current_vllm_config",
+        lambda _config: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(
+        legacy_runner_module, "graph_capture", lambda **_: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        legacy_runner_module, "set_cudagraph_capturing_enabled", lambda _: None
+    )
+    monkeypatch.setattr(
+        legacy_runner_module,
+        "current_platform",
+        SimpleNamespace(graph_pool_handle=object, is_rocm=lambda: False),
+    )
+
+    estimate = runner.profile_cudagraph_memory()
+
+    # The largest graph costs its pool and instantiated graph; the next one
+    # the pool growth for its retained metadata, charged to both others.
+    first_graph = 256 * _MIB + _METADATA_BYTES + _GRAPH_EXEC_BYTES
+    per_graph = 100 * _MIB + _GRAPH_EXEC_BYTES
+    assert estimate == first_graph + 2 * per_graph
