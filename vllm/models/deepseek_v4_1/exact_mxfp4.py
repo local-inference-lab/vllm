@@ -33,7 +33,7 @@ logger = init_logger(__name__)
 
 
 class DeepseekV41ExactMXFP4Config(DeepseekV41FP8Config):
-    """X4T main experts; unchanged native dense, shared and draft weights."""
+    """MXFP4-CSF main experts; unchanged native dense, shared and draft weights."""
 
     checkpoint_root: str
     scale_scratch: tuple[torch.Tensor, ...] | None
@@ -61,7 +61,7 @@ class DeepseekV41ExactMXFP4Config(DeepseekV41FP8Config):
     @classmethod
     def from_config(cls, config):
         if config.get("format_version") != 1 or not config.get("checkpoint_root"):
-            raise ValueError("X4T requires format_version=1 and checkpoint_root")
+            raise ValueError("MXFP4-CSF requires format_version=1 and checkpoint_root")
         result = cls(
             is_checkpoint_fp8_serialized=True,
             activation_scheme="dynamic",
@@ -83,10 +83,12 @@ class DeepseekV41ExactMXFP4Config(DeepseekV41FP8Config):
                     or config.parallel_config.use_ubatching
                 ):
                     raise NotImplementedError(
-                        "X4T shared scale scratch requires PP1 without ubatching"
+                        "MXFP4-CSF shared scale scratch requires PP1 without ubatching"
                     )
-                if config.load_config.load_format != "exact_mxfp4":
-                    raise ValueError("X4T requires --load-format exact_mxfp4")
+                if config.load_config.load_format not in ("exact_mxfp4", "mxfp4_csf"):
+                    raise ValueError(
+                        "MXFP4-CSF requires --load-format mxfp4_csf (or exact_mxfp4)"
+                    )
                 return ExactMXFP4MoEMethod(layer.moe_config, self)
         return super().get_quant_method(layer, prefix)
 
@@ -105,7 +107,7 @@ class ExactMXFP4MoEMethod(FusedMoEMethodBase):
             or parallel.use_all2all_kernels
             or parallel.enable_eplb
         ):
-            raise NotImplementedError("X4T DS4.1 supports TP without EP/DP")
+            raise NotImplementedError("MXFP4-CSF DS4.1 supports TP without EP/DP")
         if (
             moe.activation not in (MoEActivation.SILU, MoEActivation.SITU)
             or moe.in_dtype != torch.bfloat16
@@ -118,7 +120,9 @@ class ExactMXFP4MoEMethod(FusedMoEMethodBase):
                 )
             )
         ):
-            raise ValueError("X4T requires bias-free BF16 SwiGLU or SiTU(4,25) experts")
+            raise ValueError(
+                "MXFP4-CSF requires bias-free BF16 SwiGLU or SiTU(4,25) experts"
+            )
 
     def create_weights(
         self,
@@ -131,7 +135,7 @@ class ExactMXFP4MoEMethod(FusedMoEMethodBase):
     ):
         match = re.search(r"(?:^|\.)layers\.(\d+)\.", layer.layer_name)
         if match is None or params_dtype != torch.bfloat16:
-            raise ValueError("X4T requires a numbered BF16 expert layer")
+            raise ValueError("MXFP4-CSF requires a numbered BF16 expert layer")
         self.layer_index = int(match.group(1))
         self.num_experts, self.hidden_size = num_experts, hidden_size
         self.local_intermediate = intermediate_size_per_partition
@@ -160,7 +164,7 @@ class ExactMXFP4MoEMethod(FusedMoEMethodBase):
         e, h, n = self.num_experts, self.hidden_size, self.local_intermediate
         shapes = ((e, h // 32, 2 * n), (e, n // 32, h))
         if self.owner.scale_scratch is None:
-            # X4T disallows ubatching: every layer consumes these scale grids
+            # MXFP4-CSF disallows ubatching: every layer consumes these scale grids
             # before its successor may overwrite them on the same stream.
             self.owner.scale_scratch = tuple(
                 torch.empty(s, dtype=torch.uint8, device=device) for s in shapes
@@ -169,7 +173,7 @@ class ExactMXFP4MoEMethod(FusedMoEMethodBase):
         if any(
             t.shape != shape or t.device != device for t, shape in zip(scratch, shapes)
         ):
-            raise ValueError("X4T shared scale scratch geometry/device mismatch")
+            raise ValueError("MXFP4-CSF shared scale scratch geometry/device mismatch")
         # Per-expert CPU slices are too small to amortize intra-op barriers.
         # Restore the serving thread policy before kernel preparation.
         with set_default_torch_num_threads(1):
@@ -207,7 +211,7 @@ class ExactMXFP4MoEMethod(FusedMoEMethodBase):
             MoEPrepareAndFinalizeNoDPEPModular(), backend
         )
         logger.info(
-            "X4T lossless MXFP4 layer %d rank %d/%d: BF16 activations, "
+            "MXFP4-CSF lossless MXFP4 layer %d rank %d/%d: BF16 activations, "
             "compressed scales, shared scratch %d bytes",
             self.layer_index,
             rank,

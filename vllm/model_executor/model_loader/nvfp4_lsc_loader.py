@@ -17,11 +17,11 @@ class Nvfp4LscModelLoader(DefaultModelLoader):
 
         quant = getattr(model_config.hf_config, "quantization_config", None)
         quant = quant or model_config.hf_text_config.quantization_config
-        if quant.get("quant_method") != "nvfp4_lsc":
-            raise ValueError("NVFP4-LSC loader requires quant_method=nvfp4_lsc")
+        if quant.get("quant_method") not in ("nvfp4_csf", "nvfp4_lsc"):
+            raise ValueError("NVFP4-CSF loader requires quant_method=nvfp4_csf")
         root = Path(quant["checkpoint_root"])
         if not root.is_absolute():
-            raise ValueError("NVFP4-LSC checkpoint_root must be an absolute local path")
+            raise ValueError("NVFP4-CSF checkpoint_root must be an absolute local path")
         return root, checkpoint_contract(str(root.resolve()))
 
     def download_model(self, model_config):
@@ -31,7 +31,7 @@ class Nvfp4LscModelLoader(DefaultModelLoader):
         root, contract = self._root(model_config)
         if getattr(model, "secondary_weights", ()):
             raise NotImplementedError(
-                "NVFP4-LSC does not support secondary weight sources"
+                "NVFP4-CSF does not support secondary weight sources"
             )
         prefixes = getattr(model, "checkpoint_weight_name_prefixes", None)
         layers = model_config.hf_text_config.num_hidden_layers

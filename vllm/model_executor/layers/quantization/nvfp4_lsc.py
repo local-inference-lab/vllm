@@ -55,10 +55,10 @@ class Nvfp4LscConfig(ModelOptMixedPrecisionConfig):
     @classmethod
     def from_config(cls, config):
         if config.get("format_version") != 1 or not config.get("checkpoint_root"):
-            raise ValueError("NVFP4-LSC requires format_version=1 and checkpoint_root")
+            raise ValueError("NVFP4-CSF requires format_version=1 and checkpoint_root")
         original = config.get("source_quantization_config")
         if not isinstance(original, dict):
-            raise ValueError("NVFP4-LSC requires source_quantization_config")
+            raise ValueError("NVFP4-CSF requires source_quantization_config")
         result = super().from_config(original)
         assert isinstance(result, cls)
         result.checkpoint_root = config["checkpoint_root"]
@@ -69,26 +69,26 @@ class Nvfp4LscConfig(ModelOptMixedPrecisionConfig):
         if isinstance(layer, RoutedExperts):
             match = re.search(r"(?:^|\.)layers\.(\d+)\.", prefix)
             if match is None:
-                raise ValueError("NVFP4-LSC routed experts require a numbered layer")
+                raise ValueError("NVFP4-CSF routed experts require a numbered layer")
             config = get_current_vllm_config()
             if (
                 int(match.group(1))
                 < config.model_config.hf_text_config.num_hidden_layers
             ):
                 if config.model_config.hf_text_config.model_type != "glm5_next_text":
-                    raise ValueError("NVFP4-LSC supports GLM-5.3-Flash expert geometry")
+                    raise ValueError("NVFP4-CSF supports GLM-5.3-Flash expert geometry")
                 if (
                     config.parallel_config.pipeline_parallel_size != 1
                     or config.parallel_config.use_ubatching
                 ):
                     raise NotImplementedError(
-                        "NVFP4-LSC shared scratch requires PP1 without ubatching"
+                        "NVFP4-CSF shared scratch requires PP1 without ubatching"
                     )
-                if config.load_config.load_format != "nvfp4_lsc":
-                    raise ValueError("NVFP4-LSC requires --load-format nvfp4_lsc")
+                if config.load_config.load_format not in ("nvfp4_csf", "nvfp4_lsc"):
+                    raise ValueError("NVFP4-CSF requires --load-format nvfp4_csf")
                 if self._resolve_quant_algo(prefix) != "NVFP4":
                     raise ValueError(
-                        "NVFP4-LSC requires NVFP4 source expert calibration"
+                        "NVFP4-CSF requires NVFP4 source expert calibration"
                     )
                 return Nvfp4LscMoEMethod(layer.moe_config, self)
         return super().get_quant_method(layer, prefix)
@@ -108,15 +108,15 @@ class Nvfp4LscMoEMethod(FusedMoEMethodBase):
             or parallel.use_all2all_kernels
             or parallel.enable_eplb
         ):
-            raise NotImplementedError("NVFP4-LSC supports TP without EP/DP")
+            raise NotImplementedError("NVFP4-CSF supports TP without EP/DP")
         if (
             moe.activation != MoEActivation.SILU
             or moe.in_dtype != torch.bfloat16
             or moe.has_bias
         ):
-            raise ValueError("NVFP4-LSC requires bias-free BF16 SwiGLU experts")
+            raise ValueError("NVFP4-CSF requires bias-free BF16 SwiGLU experts")
         if envs.VLLM_B12X_MOE_FP4_FORCE_A16:
-            raise NotImplementedError("NVFP4-LSC requires native NVFP4 A4 activations")
+            raise NotImplementedError("NVFP4-CSF requires native NVFP4 A4 activations")
 
     def create_weights(
         self,
@@ -129,7 +129,7 @@ class Nvfp4LscMoEMethod(FusedMoEMethodBase):
     ):
         match = re.search(r"(?:^|\.)layers\.(\d+)\.", layer.layer_name)
         if match is None or params_dtype != torch.bfloat16:
-            raise ValueError("NVFP4-LSC requires a numbered BF16 expert layer")
+            raise ValueError("NVFP4-CSF requires a numbered BF16 expert layer")
         self.layer_index = int(match.group(1))
         self.num_experts, self.hidden_size = num_experts, hidden_size
         self.local_intermediate = intermediate_size_per_partition
@@ -160,7 +160,7 @@ class Nvfp4LscMoEMethod(FusedMoEMethodBase):
         if any(
             tuple(t.shape) != s or t.device != device for t, s in zip(scratch, shapes)
         ):
-            raise ValueError("NVFP4-LSC shared scratch geometry/device mismatch")
+            raise ValueError("NVFP4-CSF shared scratch geometry/device mismatch")
         with set_default_torch_num_threads(1):
             weights = read_nvfp4_lsc_layer(
                 self.owner.checkpoint_root,
@@ -218,7 +218,7 @@ class Nvfp4LscMoEMethod(FusedMoEMethodBase):
             MoEPrepareAndFinalizeNoDPEPModular(), backend
         )
         logger.info(
-            "NVFP4-LSC layer %d rank %d/%d: native NVFP4 A4, "
+            "NVFP4-CSF layer %d rank %d/%d: native NVFP4 A4, "
             "shared scale scratch %d bytes",
             self.layer_index,
             rank,

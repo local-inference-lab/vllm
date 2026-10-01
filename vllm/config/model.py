@@ -1284,8 +1284,10 @@ class ModelConfig:
                 "mxfp8",
                 "modelopt_mixed",
                 "exl3",
+                "mxfp4_csf",
                 "exact_mxfp4",
                 "kimi_x4t",
+                "nvfp4_csf",
                 "nvfp4_lsc",
                 # Ensure heavy backends are probed last to avoid unnecessary
                 # imports during override detection (e.g., MXFP4 imports Triton)
