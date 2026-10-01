@@ -203,6 +203,10 @@ def _has_b12x_moe() -> bool:
     )
 
 
+def _has_b12x_mxfp8_moe() -> bool:
+    return _has_b12x_moe() and b12x._b12x_has_mxfp8_moe()
+
+
 def _make_b12x_moe_kernel(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1140,6 +1144,8 @@ def _make_b12x_moe_case(
     tensors as the reference, and assembles the quant config matching the
     requested activation dtype.
     """
+    if weight_dtype == "mxfp8" and not b12x._b12x_has_mxfp8_moe():
+        pytest.skip("the installed b12x has no MXFP8 W8A8 MoE recipe")
     set_random_seed(seed)
     dtype = torch.bfloat16
     hidden_states = torch.randn((tokens, hidden_size), device="cuda", dtype=dtype) / 10
@@ -1839,6 +1845,33 @@ def test_b12x_mxfp8_w8a8_rejects_non_silu_activation(
     assert (supported, reason) == (False, "MXFP8 W8A8 supports only SiLU")
 
 
+def test_b12x_mxfp8_w8a8_requires_the_b12x_recipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An installed b12x without the MXFP8 recipe is rejected at selection,
+    not after the model has loaded."""
+    monkeypatch.setattr(B12xExperts, "_supports_current_device", lambda: True)
+    monkeypatch.setattr(b12x, "_b12x_has_mxfp8_moe", lambda: False)
+    config = make_dummy_moe_config(
+        hidden_dim=2560,
+        intermediate_size=640,
+        activation=MoEActivation.SILU,
+    )
+
+    supported, reason = B12xExperts.is_supported_config(
+        B12xExperts,
+        config,
+        kMxfp8Static,
+        kMxfp8Dynamic,
+        mk.FusedMoEActivationFormat.Standard,
+    )
+
+    assert (supported, reason) == (
+        False,
+        "the installed b12x has no MXFP8 W8A8 MoE recipe",
+    )
+
+
 def test_explicit_b12x_mxfp8_selection(monkeypatch: pytest.MonkeyPatch) -> None:
     """moe_backend='b12x' resolves the MXFP8 oracle to the b12x experts."""
     import vllm.model_executor.layers.fused_moe.oracle.mxfp8 as mxfp8_oracle
@@ -1856,6 +1889,24 @@ def test_explicit_b12x_mxfp8_selection(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert backend is mxfp8_oracle.Fp8MoeBackend.B12X_MXFP8
     assert experts_cls is B12xExperts
+
+
+def test_explicit_b12x_mxfp8_selection_requires_b12x_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Quantization methods that do not prepare B12X experts (compressed
+    tensors, INC, online MXFP8) reject moe_backend='b12x' at init."""
+    import vllm.model_executor.layers.fused_moe.oracle.mxfp8 as mxfp8_oracle
+
+    monkeypatch.setattr(B12xExperts, "_supports_current_device", lambda: True)
+    monkeypatch.setattr(b12x, "_b12x_has_mxfp8_moe", lambda: True)
+    config = make_dummy_moe_config(
+        hidden_dim=2560, intermediate_size=640, experts_per_token=10
+    )
+    config.moe_backend = "b12x"
+
+    with pytest.raises(ValueError, match="does not prepare B12X experts"):
+        mxfp8_oracle.select_mxfp8_moe_backend(config)
 
 
 def test_b12x_mxfp8_auto_selection_keeps_conservative_priority(
@@ -1903,7 +1954,8 @@ def test_b12x_mxfp8_auto_selection_keeps_conservative_priority(
 def test_b12x_mxfp8_auto_selection_when_nothing_else_supports(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With every established backend unsupported, b12x wins over emulation."""
+    """With every established backend unsupported, b12x wins over emulation,
+    but only for quantization methods that prepare B12X experts."""
     import vllm.model_executor.layers.fused_moe.oracle.mxfp8 as mxfp8_oracle
 
     def supported(cls, config, weight_key, activation_key, activation_format):
@@ -1943,6 +1995,8 @@ def test_b12x_mxfp8_auto_selection_when_nothing_else_supports(
 
     assert backend is mxfp8_oracle.Fp8MoeBackend.B12X_MXFP8
     assert experts_cls is B12xExperts
+    with pytest.raises(ValueError, match="No MXFP8 MoE backends available"):
+        mxfp8_oracle.select_mxfp8_moe_backend(config)
 
 
 def test_b12x_mxfp8_preparation_passes_source_tensors_verbatim(
@@ -1951,8 +2005,9 @@ def test_b12x_mxfp8_preparation_passes_source_tensors_verbatim(
     """The real b12x ``plan_weights``/``prepare_weights`` API receives the
     serialized ModelOpt MXFP8 tensors unmodified through the vLLM adapter:
     the plan declares ``mxfp8_e8m0_k32`` / ``w8a8_mx`` / ``w31``, and the
-    prepared owner preserves the E4M3 values byte-exact while b12x (not
-    vLLM) performs the host scale swizzle."""
+    prepared owner keeps the E4M3 bytes (w2 verbatim, the gate-first FC1
+    with its halves flipped to kernel order) while b12x (not vLLM) performs
+    the host scale swizzle."""
     fused_moe = pytest.importorskip("b12x.moe.fused_moe")
     from b12x.moe.fused_moe.source import PackedSourceFormat
 
@@ -1968,16 +2023,19 @@ def test_b12x_mxfp8_preparation_passes_source_tensors_verbatim(
     )
 
     num_experts, hidden_size, intermediate_size = 4, 256, 128
-    w13 = torch.full(
-        (num_experts, 2 * intermediate_size, hidden_size),
-        0.5,
-        dtype=torch.float8_e4m3fn,
-    )
-    w2 = torch.full(
-        (num_experts, hidden_size, intermediate_size),
-        0.25,
-        dtype=torch.float8_e4m3fn,
-    )
+    generator = torch.Generator().manual_seed(0)
+
+    def random_e4m3(*shape: int) -> torch.Tensor:
+        # Distinct bytes make the FC1 half order observable; 0x7F/0xFF are NaN.
+        values = torch.randint(0, 256, shape, generator=generator, dtype=torch.uint8)
+        values[(values & 0x7F) == 0x7F] = 0x38
+        return values.view(torch.float8_e4m3fn)
+
+    w13 = random_e4m3(num_experts, 2 * intermediate_size, hidden_size)
+    w2 = random_e4m3(num_experts, hidden_size, intermediate_size)
+    # b12x flips the gate-first FC1 in place, so compare against copies.
+    w13_source = w13.view(torch.uint8).clone()
+    w2_source = w2.view(torch.uint8).clone()
     w13_scale = torch.full(
         (num_experts, 2 * intermediate_size, hidden_size // 32),
         130,
@@ -2042,8 +2100,12 @@ def test_b12x_mxfp8_preparation_passes_source_tensors_verbatim(
     w13_prepared = w13_prepared if w13_prepared is not None else impl.w1_fp4
     w2_prepared = getattr(impl, "w2_values", None)
     w2_prepared = w2_prepared if w2_prepared is not None else impl.w2_fp4
-    assert torch.equal(w13_prepared.view(torch.uint8), w13.view(torch.uint8))
-    assert torch.equal(w2_prepared.view(torch.uint8), w2.view(torch.uint8))
+    up_first = torch.cat(
+        [w13_source[:, intermediate_size:], w13_source[:, :intermediate_size]],
+        dim=1,
+    )
+    assert torch.equal(w13_prepared.view(torch.uint8).cpu(), up_first)
+    assert torch.equal(w2_prepared.view(torch.uint8).cpu(), w2_source)
 
     # The b12x plan discarded the source parameters, so the raw tensors are
     # only reachable through the prepared owner.
@@ -2109,7 +2171,9 @@ def _modelopt_mxfp8_method(intermediate: int):
     return method, layer
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    not _has_b12x_mxfp8_moe(), reason="requires b12x MXFP8 MoE on SM120"
+)
 @torch.inference_mode()
 # 640 is the TP=1 expert width; 320 is the TP=2 shard, which B12X prepares
 # unpadded (split up/gate FC1 descriptors, TMA zero-filled tail tile).
