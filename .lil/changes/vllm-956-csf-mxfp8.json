@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-956-csf-mxfp8",
+  "category": "fix",
+  "summary": "Preserve native MXFP8 expert activations for DS4.1 CSF checkpoints",
+  "models": ["DeepSeek-V4.1-Flash"],
+  "compatibility": "Install the paired B12X MXFP8-CSF preparation update. Checkpoint files and launch flags are unchanged. Expert results can differ from the previous BF16 CSF execution because the native activation quantizer is restored.",
+  "details": [
+    "DS4.1 CSF uses MXFP8 expert activations unless VLLM_B12X_MOE_FP4_FORCE_A16=1 requests BF16, matching the native MXFP4 backend policy.",
+    "Attention precision, logits precision, dense layers and Kimi BF16 expert activations are unchanged.",
+    "Checkpoint loading remains in vLLM and invokes ordinary B12X weight preparation."
+  ],
+  "pull_requests": [956],
+  "requires": ["b12x-450-csf-mxfp8", "vllm-956-csf-preparation"]
+}

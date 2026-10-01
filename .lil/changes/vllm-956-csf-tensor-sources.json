@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-956-csf-tensor-sources",
+  "category": "compatibility",
+  "summary": "Keep CSF checkpoint discovery and model tensor mapping in vLLM",
+  "models": ["Kimi-K3", "DeepSeek-V4.1-Flash", "GLM-5.3-Flash", "Qwen3.8-Flash-Next"],
+  "compatibility": "Requires the B12X CsfMatrix tensor-source loader API. Canonical CSF checkpoints and launch commands remain compatible.",
+  "details": [
+    "vLLM validates manifests and model geometry, then passes lazy expert projection sources to B12X.",
+    "Shared shard handling preserves TP-bounded weight reads and closes files after loading or failure.",
+    "Retained tensors, FP32 calibration and native expert execution preserve their existing behavior."
+  ],
+  "pull_requests": [956],
+  "requires": ["b12x-450-csf-tensor-sources"]
+}

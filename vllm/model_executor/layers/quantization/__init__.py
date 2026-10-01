@@ -38,8 +38,8 @@ QuantizationMethods = Literal[
     "gpt_oss_mxfp4",
     "deepseek_v4_fp8",
     "deepseek_v41_fp8",
-    "exact_mxfp4",
-    "kimi_x4t",
+    "mxfp4_csf",
+    "nvfp4_csf",
     "online",
     # Below are online quant shorthand names (see vllm.config.quantization).
     # Listed here as strings to avoid a circular import; kept in sync with
@@ -134,7 +134,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
 
         deepseek_config = DeepseekV4FP8Config
 
-    from vllm.models.deepseek_v4_1.exact_mxfp4 import DeepseekV41ExactMXFP4Config
     from vllm.models.deepseek_v4_1.quant_config import DeepseekV41FP8Config
 
     from .auto_awq import AutoAWQConfig
@@ -149,7 +148,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .fp_quant import FPQuantConfig
     from .humming import HummingConfig
     from .inc import INCConfig
-    from .kimi_x4t import KimiX4TConfig
     from .modelopt import (
         ModelOptFp8Config,
         ModelOptMixedPrecisionConfig,
@@ -158,6 +156,8 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     )
     from .moe_wna16 import MoeWNA16Config
     from .mxfp4 import GptOssMxfp4Config, Mxfp4Config
+    from .mxfp4_csf import Mxfp4CsfConfig
+    from .nvfp4_csf import Nvfp4CsfConfig
     from .online.base import OnlineQuantizationConfig
     from .torchao import TorchAOConfig
 
@@ -186,8 +186,8 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "gpt_oss_mxfp4": GptOssMxfp4Config,
         "deepseek_v4_fp8": deepseek_config,
         "deepseek_v41_fp8": DeepseekV41FP8Config,
-        "exact_mxfp4": DeepseekV41ExactMXFP4Config,
-        "kimi_x4t": KimiX4TConfig,
+        "mxfp4_csf": Mxfp4CsfConfig,
+        "nvfp4_csf": Nvfp4CsfConfig,
         "humming": HummingConfig,
         "online": OnlineQuantizationConfig,
         # MiniMax-style checkpoints tag `quant_method: "mxfp8"`; load with the

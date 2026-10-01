@@ -35,8 +35,11 @@ class LoadConfig:
       back to the pytorch bin format if safetensors format is not available.
     - "pt" will load the weights in the pytorch bin format.
     - "safetensors" will load the weights in the safetensors format.
-    - "exact_mxfp4" reads losslessly compressed DS4.1 MXFP4 expert scales and
-      retains file-backed loading for Engram tables.
+    - "mxfp4_csf" reads losslessly compressed Kimi/DS4.1
+      MXFP4 expert scales and retains file-backed loading for Engram tables.
+    - "nvfp4_csf" reads losslessly compressed GLM-5.3-Flash or
+      Qwen3.8-Flash-Next NVFP4 expert scales and retains native activation
+      quantization and calibration.
     - "instanttensor" will load the Safetensors weights on CUDA devices using
       InstantTensor, which enables distributed loading with pipelined prefetching
       and fast direct I/O.
