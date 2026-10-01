@@ -152,7 +152,10 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer):
         from b12x.moe import fused_moe
-        from b12x.moe.checkpoints.mxfp4_csf import read_mxfp4_csf_layer
+
+        from vllm.model_executor.model_loader.mxfp4_csf_loader import (
+            read_mxfp4_csf_layer,
+        )
 
         tp, rank = (
             get_tensor_model_parallel_world_size(),

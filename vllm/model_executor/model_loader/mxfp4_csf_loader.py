@@ -8,22 +8,94 @@ CPU/GPU staging allocations for the host-mapped embedding tables.
 """
 
 import time
+from functools import lru_cache
 from pathlib import Path
 
 import regex as re
 from safetensors import safe_open
 
+from vllm.model_executor.model_loader.csf_utils import (
+    CsfTensorReader,
+    read_csf_contract,
+)
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.weight_utils import (
     file_source_tensor,
     safetensors_file_sources,
 )
 
+SCHEMA = "lil-mxfp4-csf-checkpoint/1"
+CODEC = "row-base-offset1-u24-exceptions/1"
+FAMILIES = {
+    "deepseek_v41": (384, 5120, 2304),
+    "kimi_k3": (896, 3584, 3072),
+}
+
+
+@lru_cache(maxsize=4)
+def checkpoint_contract(root: str) -> dict:
+    """Validate the MXFP4-CSF container before loading model tensors."""
+    return read_csf_contract(root, schema=SCHEMA, codec=CODEC, families=FAMILIES)
+
+
+def read_mxfp4_csf_layer(
+    root,
+    layer_index,
+    *,
+    num_experts,
+    hidden_size,
+    intermediate_size,
+    tp_rank,
+    tp_size,
+    device,
+    w13_scale_scratch,
+    w2_scale_scratch,
+):
+    """Resolve model tensor names and pass gate/up/down sources to B12X."""
+    from b12x.moe.checkpoints.mxfp4_csf import load_mxfp4_csf_weights
+
+    contract = checkpoint_contract(str(Path(root).resolve()))
+    family = contract["family"]
+    if (num_experts, hidden_size, intermediate_size) != FAMILIES[family]:
+        raise ValueError("MXFP4-CSF expert geometry differs from the checkpoint family")
+    supported_tp = (1, 2, 4, 8) if family == "deepseek_v41" else (1, 2, 4, 8, 12, 16)
+    if tp_size not in supported_tp or not 0 <= tp_rank < tp_size:
+        raise ValueError(
+            f"MXFP4-CSF {family} supports TP {supported_tp} with a valid rank"
+        )
+    with CsfTensorReader(root, contract["source_names"], "mxfp4") as reader:
+
+        def experts():
+            for expert in range(num_experts):
+                if family == "kimi_k3":
+                    prefix = (
+                        f"language_model.model.layers.{layer_index}."
+                        f"block_sparse_moe.experts.{expert}"
+                    )
+                    weight, scale = "weight_packed", "weight_scale"
+                else:
+                    prefix = f"layers.{layer_index}.ffn.experts.{expert}"
+                    weight, scale = "weight", "scale"
+                yield tuple(
+                    reader.matrix(f"{prefix}.{p}.{weight}", f"{prefix}.{p}.{scale}")
+                    for p in ("w1", "w3", "w2")
+                )
+
+        return load_mxfp4_csf_weights(
+            experts(),
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            device=device,
+            w13_scale_scratch=w13_scale_scratch,
+            w2_scale_scratch=w2_scale_scratch,
+        )
+
 
 class Mxfp4CsfModelLoader(DefaultModelLoader):
     def _root(self, model_config):
-        from b12x.moe.checkpoints.mxfp4_csf import checkpoint_contract
-
         text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
         quant = getattr(model_config.hf_config, "quantization_config", None)
         quant = quant or text_config.quantization_config

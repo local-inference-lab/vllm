@@ -117,10 +117,9 @@ def test_prepared_nvfp4_accepts_kernel_order_and_rejects_activation_change(monke
 def test_loader_excludes_compressed_main_experts_and_retains_native_tensors(
     tmp_path, quant_method, load_format
 ):
-    from b12x.moe.checkpoints.nvfp4_csf import CODEC, SCHEMA
-
     from vllm.model_executor.layers.quantization import get_quantization_config
     from vllm.model_executor.model_loader import get_model_loader
+    from vllm.model_executor.model_loader.nvfp4_csf_loader import CODEC, SCHEMA
 
     directory = tmp_path / "tensors"
     directory.mkdir()

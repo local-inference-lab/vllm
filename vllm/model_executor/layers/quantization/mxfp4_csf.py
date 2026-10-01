@@ -23,7 +23,9 @@ class Mxfp4CsfConfig(KimiMxfp4CsfConfig):
 
     @classmethod
     def from_config(cls, config):
-        from b12x.moe.checkpoints.mxfp4_csf import checkpoint_contract
+        from vllm.model_executor.model_loader.mxfp4_csf_loader import (
+            checkpoint_contract,
+        )
 
         if config.get("format_version") != 1 or not config.get("checkpoint_root"):
             raise ValueError("MXFP4-CSF requires format_version=1 and checkpoint_root")

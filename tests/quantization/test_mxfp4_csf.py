@@ -77,8 +77,7 @@ def test_exact_config_and_loader_are_registered():
 def test_csf_cpu_shard_reader_bounds_threads_and_restores_on_failure(
     monkeypatch, moe, owner
 ):
-    from b12x.moe.checkpoints import mxfp4_csf as checkpoint
-
+    from vllm.model_executor.model_loader import mxfp4_csf_loader as checkpoint
     from vllm.models.deepseek_v4_1 import mxfp4_csf
     from vllm.utils.torch_utils import set_default_torch_num_threads
 
@@ -193,7 +192,7 @@ def test_prepared_native_experts_validate_source_shape_and_swiglu_limit(
 
 
 def test_loader_preserves_file_backed_engram_and_native_draft(tmp_path):
-    from b12x.moe.checkpoints.mxfp4_csf import CODEC, SCHEMA
+    from vllm.model_executor.model_loader.mxfp4_csf_loader import CODEC, SCHEMA
 
     tensor_dir = tmp_path / "tensors"
     tensor_dir.mkdir()
@@ -283,7 +282,7 @@ def test_kimi_mxfp4_csf_keeps_bf16_dense_and_situ_experts(monkeypatch, moe):
 def test_kimi_loader_skips_compressed_experts_with_nested_text_config(
     tmp_path, quant_method, load_format
 ):
-    from b12x.moe.checkpoints.mxfp4_csf import CODEC, SCHEMA
+    from vllm.model_executor.model_loader.mxfp4_csf_loader import CODEC, SCHEMA
 
     tensor_dir = tmp_path / "tensors"
     tensor_dir.mkdir()
@@ -323,8 +322,6 @@ def test_kimi_loader_skips_compressed_experts_with_nested_text_config(
 def test_mxfp4_csf_selects_retained_precision_and_rejects_other_configs(
     monkeypatch, moe, family
 ):
-    from b12x.moe.checkpoints import mxfp4_csf as checkpoint
-
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
     from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
     from vllm.model_executor.layers.quantization import (
@@ -332,6 +329,7 @@ def test_mxfp4_csf_selects_retained_precision_and_rejects_other_configs(
         kimi_mxfp4_csf,
     )
     from vllm.model_executor.layers.quantization.mxfp4_csf import Mxfp4CsfConfig
+    from vllm.model_executor.model_loader import mxfp4_csf_loader as checkpoint
     from vllm.models.deepseek_v4_1 import mxfp4_csf
 
     monkeypatch.setattr(checkpoint, "checkpoint_contract", lambda _: {"family": family})
@@ -373,3 +371,88 @@ def test_mxfp4_csf_selects_retained_precision_and_rejects_other_configs(
             )
             is None
         )
+
+
+@pytest.mark.parametrize("codec", ["mxfp4", "nvfp4"])
+@pytest.mark.parametrize("fault", ["schema", "codec", "family", "inventory", "path"])
+def test_csf_contract_rejects_mismatched_identity_and_shard_inventory(
+    tmp_path, codec, fault
+):
+    from vllm.model_executor.model_loader import mxfp4_csf_loader, nvfp4_csf_loader
+
+    reader = mxfp4_csf_loader if codec == "mxfp4" else nvfp4_csf_loader
+    identity = {
+        "schema": reader.SCHEMA,
+        "codec": reader.CODEC,
+        "family": next(iter(reader.FAMILIES)),
+    }
+    manifest = {**identity, "shards": [{"file": "weights.safetensors"}]}
+    contract = {**identity, "source_names": {"weight": "weights.safetensors"}}
+    if fault in ("schema", "codec", "family"):
+        contract[fault] = "unrecognized"
+    elif fault == "inventory":
+        contract["source_names"]["weight"] = "missing.safetensors"
+    else:
+        contract["source_names"]["weight"] = "../weights.safetensors"
+        manifest["shards"][0]["file"] = "../weights.safetensors"
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    (tmp_path / "build-contract.json").write_text(json.dumps(contract))
+    with pytest.raises(ValueError):
+        reader.checkpoint_contract(str(tmp_path))
+
+
+def test_csf_tensor_reader_resolves_separate_shards_and_closes_after_failure(
+    tmp_path, monkeypatch
+):
+    from vllm.model_executor.model_loader import csf_utils
+
+    tensors = tmp_path / "tensors"
+    tensors.mkdir()
+    weight = torch.arange(128, dtype=torch.uint8).reshape(16, 8)
+    fixed = torch.arange(32, dtype=torch.uint8).reshape(1, 32)
+    exceptions = torch.tensor([0xFE000009], dtype=torch.uint32)
+    save_file({"arbitrary.packed": weight}, tensors / "weights.safetensors")
+    save_file(
+        {
+            "arbitrary.scales.mxfp4_csf_fixed": fixed,
+            "arbitrary.scales.mxfp4_csf_exceptions": exceptions,
+        },
+        tensors / "scales.safetensors",
+    )
+    index = {
+        "arbitrary.packed": "weights.safetensors",
+        "arbitrary.scales": "scales.safetensors",
+    }
+    opened, closed = [], []
+    original_open = csf_utils.safe_open
+
+    class TrackedShard:
+        def __init__(self, path, **kwargs):
+            self.path = path
+            self.shard = original_open(path, **kwargs)
+
+        def __enter__(self):
+            opened.append(self.path.name)
+            return self.shard.__enter__()
+
+        def __exit__(self, *exc):
+            closed.append(self.path.name)
+            return self.shard.__exit__(*exc)
+
+    monkeypatch.setattr(csf_utils, "safe_open", TrackedShard)
+    with (
+        pytest.raises(RuntimeError, match="preparation failed"),
+        csf_utils.CsfTensorReader(tmp_path, index, "mxfp4") as reader,
+    ):
+        for _ in range(2):
+            source = reader.matrix("arbitrary.packed", "arbitrary.scales")
+            assert source.weight.get_shape() == [16, 8]
+            assert torch.equal(source.weight[8:16, 2:6], weight[8:16, 2:6])
+            assert torch.equal(source.fixed, fixed)
+            assert torch.equal(source.exceptions, exceptions)
+        raise RuntimeError("preparation failed")
+    assert (
+        sorted(opened)
+        == sorted(closed)
+        == ["scales.safetensors", "weights.safetensors"]
+    )
