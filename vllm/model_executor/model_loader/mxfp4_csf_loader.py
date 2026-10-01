@@ -8,15 +8,20 @@ CPU/GPU staging allocations for the host-mapped embedding tables.
 """
 
 import time
+from collections.abc import Iterable
 from functools import lru_cache
 from pathlib import Path
 
+import numpy as np
 import regex as re
+import torch
 from safetensors import safe_open
 
 from vllm.model_executor.model_loader.csf_utils import (
+    CsfMatrix,
     CsfTensorReader,
     read_csf_contract,
+    tp_extent,
 )
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.weight_utils import (
@@ -51,9 +56,7 @@ def read_mxfp4_csf_layer(
     w13_scale_scratch,
     w2_scale_scratch,
 ):
-    """Resolve model tensor names and pass gate/up/down sources to B12X."""
-    from b12x.moe.checkpoints.mxfp4_csf import load_mxfp4_csf_weights
-
+    """Read rank-local gate/up/down tensors and unprepared compressed scales."""
     contract = checkpoint_contract(str(Path(root).resolve()))
     family = contract["family"]
     if (num_experts, hidden_size, intermediate_size) != FAMILIES[family]:
@@ -81,7 +84,7 @@ def read_mxfp4_csf_layer(
                     for p in ("w1", "w3", "w2")
                 )
 
-        return load_mxfp4_csf_weights(
+        return _load_mxfp4_csf_weights(
             experts(),
             num_experts=num_experts,
             hidden_size=hidden_size,
@@ -92,6 +95,137 @@ def read_mxfp4_csf_layer(
             w13_scale_scratch=w13_scale_scratch,
             w2_scale_scratch=w2_scale_scratch,
         )
+
+
+POSITION_MASK = (1 << 24) - 1
+
+
+def _slice_scale_plane(fixed, exceptions, rows, columns, row_slice, column_slice):
+    """Slice compressed bytes without floating-point reconstruction or fitting."""
+    r0, r1 = row_slice
+    c0, c1 = column_slice
+    if not (0 <= r0 < r1 <= rows and r0 % 16 == r1 % 16 == 0):
+        raise ValueError("MXFP4-CSF row slices must contain complete 16-row slabs")
+    if not 0 <= c0 < c1 <= columns:
+        raise ValueError("MXFP4-CSF column slice is outside the scale plane")
+    if fixed.dtype != torch.uint8 or exceptions.dtype != torch.uint32:
+        raise TypeError("MXFP4-CSF requires uint8 fixed bytes and uint32 exceptions")
+    selectors = (columns + 7) // 8
+    stream = fixed.numpy().reshape(rows // 16, 16 * (1 + selectors))
+    bases = stream[:, :16]
+    if (bases > 254).any():
+        raise ValueError("MXFP4-CSF palette bases must be in 0..254")
+    bits = np.unpackbits(
+        stream[:, 16:].reshape(rows, selectors), axis=1, bitorder="little"
+    )
+    if bits[:, columns:].any():
+        raise ValueError("MXFP4-CSF unused selector bits must be zero")
+    selected = np.packbits(bits[r0:r1, c0:c1], axis=1, bitorder="little")
+    result = np.concatenate(
+        (bases[r0 // 16 : r1 // 16], selected.reshape((r1 - r0) // 16, -1)), 1
+    )
+    words = exceptions.numpy().reshape(-1)
+    positions = words & POSITION_MASK
+    if len(words) and (
+        positions[-1] >= rows * columns or (positions[1:] <= positions[:-1]).any()
+    ):
+        raise ValueError(
+            "MXFP4-CSF exception positions must be unique, sorted and in range"
+        )
+    rr, cc = positions // columns, positions % columns
+    keep = (rr >= r0) & (rr < r1) & (cc >= c0) & (cc < c1)
+    positions = (rr[keep] - r0) * (c1 - c0) + cc[keep] - c0
+    words = (words[keep] & np.uint32(0xFF000000)) | positions
+    return torch.from_numpy(result.copy()), torch.from_numpy(words.astype(np.uint32))
+
+
+def _load_mxfp4_csf_weights(
+    experts: Iterable[tuple[CsfMatrix, CsfMatrix, CsfMatrix]],
+    *,
+    num_experts,
+    hidden_size,
+    intermediate_size,
+    tp_rank,
+    tp_size,
+    device,
+    w13_scale_scratch,
+    w2_scale_scratch,
+):
+    """Slice and upload gate/up/down-ordered expert projections.
+
+    The iterable must yield exactly ``num_experts`` projection triples. Tensor
+    stores, manifests and model-specific tensor names belong to the caller.
+    Expanded scale buffers remain caller-owned for serialized layer execution.
+    """
+    from b12x.moe.fused_moe import CsfScalePlanes, Mxfp4CsfWeights
+
+    if num_experts <= 0 or hidden_size <= 0 or hidden_size % 64:
+        raise ValueError("MXFP4-CSF requires experts and 64-aligned hidden channels")
+    first, last = tp_extent(intermediate_size, tp_rank, tp_size, 32)
+    local = last - first
+    w13 = torch.empty(
+        (num_experts, 2 * local, hidden_size // 2), dtype=torch.uint8, device="cpu"
+    )
+    w2 = torch.empty(
+        (num_experts, hidden_size, local // 2), dtype=torch.uint8, device="cpu"
+    )
+    fixed13, fixed2, exceptions13, exceptions2 = [], [], [], []
+    for expert, (first_projection, second_projection, down) in zip(
+        range(num_experts), experts, strict=True
+    ):
+        f13, e13 = [], []
+        for matrix, projection in enumerate(
+            (first_projection, second_projection, down)
+        ):
+            view = projection.weight
+            expected = (
+                [intermediate_size, hidden_size // 2]
+                if matrix < 2
+                else [hidden_size, intermediate_size // 2]
+            )
+            if view.get_shape() != expected or view.get_dtype() not in ("I8", "U8"):
+                raise ValueError(
+                    f"MXFP4-CSF nibble geometry/dtype mismatch: "
+                    f"expert={expert}, projection={matrix}"
+                )
+            if matrix < 2:
+                w13[expert, matrix * local : (matrix + 1) * local].copy_(
+                    view[first:last, :].view(torch.uint8)
+                )
+                rows, columns = intermediate_size, hidden_size // 32
+                row_slice, column_slice = (first, last), (0, columns)
+            else:
+                w2[expert].copy_(view[:, first // 2 : last // 2].view(torch.uint8))
+                rows, columns = hidden_size, intermediate_size // 32
+                row_slice, column_slice = (0, rows), (first // 32, last // 32)
+            fixed, exceptions = _slice_scale_plane(
+                projection.fixed,
+                projection.exceptions,
+                rows,
+                columns,
+                row_slice,
+                column_slice,
+            )
+            if matrix < 2:
+                f13.append(fixed)
+                if matrix:
+                    words = exceptions.numpy().copy()
+                    words += np.uint32(local * columns)
+                    exceptions = torch.from_numpy(words)
+                e13.append(exceptions)
+            else:
+                fixed2.append(fixed)
+                exceptions2.append(exceptions)
+        fixed13.append(torch.cat(f13))
+        exceptions13.append(torch.cat(e13))
+    return Mxfp4CsfWeights(
+        w13=w13.to(device),
+        w2=w2.to(device),
+        w13_scales=CsfScalePlanes(tuple(fixed13), tuple(exceptions13)),
+        w2_scales=CsfScalePlanes(tuple(fixed2), tuple(exceptions2)),
+        w13_scale_scratch=w13_scale_scratch,
+        w2_scale_scratch=w2_scale_scratch,
+    )
 
 
 class Mxfp4CsfModelLoader(DefaultModelLoader):

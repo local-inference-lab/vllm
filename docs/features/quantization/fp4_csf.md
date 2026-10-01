@@ -79,8 +79,9 @@ local alignment requirement.
 ## Compatibility
 
 Install matching vLLM and B12X CSF support. vLLM owns the checkpoint manifest,
-model tensor names and file access; B12X receives tensor sources for TP slicing
-and GPU preparation. This API boundary does not change checkpoint contents,
+model tensor names, file access and TP slicing. B12X receives rank-local weights
+and compressed CPU scale planes; its ordinary `prepare_weights` post-processing
+uploads and rearranges them for the selected kernels. This API boundary does not change checkpoint contents,
 serving flags or native expert arithmetic.
 
 Readers require `lil-mxfp4-csf-checkpoint/1` or
