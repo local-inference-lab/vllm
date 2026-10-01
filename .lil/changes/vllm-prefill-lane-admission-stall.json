@@ -1,0 +1,23 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-prefill-lane-admission-stall",
+  "category": "fix",
+  "summary": "Servers with --max-parallel-prefills 2 or more no longer stop generating when all running slots hold long prompts and more requests wait",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required. Affected only servers started with --max-parallel-prefills 2 or more (or auto). The profiles keep 1, the default.",
+  "details": [
+    "What was wrong: prefill lanes went to never-scheduled requests first, including queued requests that could not be admitted because every running slot (--max-num-seqs) was taken or new requests were paused. The running requests that were still prefilling long prompts got no lane.",
+    "Consequence: every step scheduled nothing. Running stayed at max-num-seqs with requests waiting, the GPUs idled, and generation stopped for good without an error. netwalker4370 hit it on DeepSeek-V4.1-Flash TP4 with --max-parallel-prefills 2 and 40 concurrent 150K-token prompts at --max-num-seqs 32.",
+    "Now queued requests compete for prefill lanes only while one of them can be admitted. Reported, with the root cause and this fix, by netwalker4370."
+  ],
+  "pull_requests": [
+    959,
+    960
+  ],
+  "authors": [
+    "Local Inference Lab"
+  ],
+  "requires": []
+}
