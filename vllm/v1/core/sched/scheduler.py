@@ -860,11 +860,19 @@ class Scheduler(SchedulerInterface):
             else 0
         )
         has_eligible_decode = num_runnable_decodes > 0
+        # Queued requests compete for prefill lanes only while the waiting pass
+        # can admit one. Otherwise lanes given to them would idle while running
+        # chunked prefills wait for a lane, and the step would schedule nothing.
+        admission_open = (
+            self._pause_state == PauseState.UNPAUSED
+            and len(self.running) + self.num_waiting_for_streaming_input
+            < self.max_num_running_reqs
+        )
         prefill_interleave_step = (
             self.prefill_interleave_controller.begin_step(
                 running=self.running,
-                waiting=self.waiting,
-                skipped_waiting=self.skipped_waiting,
+                waiting=self.waiting if admission_open else (),
+                skipped_waiting=self.skipped_waiting if admission_open else (),
                 request_lookup=self.requests,
                 is_local_prefill=self._request_has_local_prefill,
                 max_parallel_prefills=self.max_parallel_prefills,
