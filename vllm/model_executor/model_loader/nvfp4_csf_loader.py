@@ -1,7 +1,60 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""NVFP4-CSF reader retaining the serialized compressed-scale contract."""
+"""Load retained tensors while the quantization method owns compressed experts."""
 
-from .nvfp4_lsc_loader import Nvfp4LscModelLoader as Nvfp4CsfModelLoader
+import time
+from pathlib import Path
 
-__all__ = ["Nvfp4CsfModelLoader"]
+import regex as re
+from safetensors import safe_open
+
+from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+from vllm.model_executor.model_loader.weight_utils import (
+    file_source_tensor,
+    safetensors_file_sources,
+)
+
+
+class Nvfp4CsfModelLoader(DefaultModelLoader):
+    def _root(self, model_config):
+        from b12x.moe.checkpoints.nvfp4_csf import checkpoint_contract
+
+        quant = getattr(model_config.hf_config, "quantization_config", None)
+        quant = quant or model_config.hf_text_config.quantization_config
+        if quant.get("quant_method") != "nvfp4_csf":
+            raise ValueError("NVFP4-CSF loader requires quant_method=nvfp4_csf")
+        root = Path(quant["checkpoint_root"])
+        if not root.is_absolute():
+            raise ValueError("NVFP4-CSF checkpoint_root must be an absolute local path")
+        return root, checkpoint_contract(str(root.resolve()))
+
+    def download_model(self, model_config):
+        self._root(model_config)
+
+    def get_all_weights(self, model_config, model):
+        root, contract = self._root(model_config)
+        if getattr(model, "secondary_weights", ()):
+            raise NotImplementedError(
+                "NVFP4-CSF does not support secondary weight sources"
+            )
+        prefixes = getattr(model, "checkpoint_weight_name_prefixes", None)
+        file_filter = getattr(model, "checkpoint_file_weight_filter", None)
+        layers = model_config.hf_text_config.num_hidden_layers
+        self.counter_before_loading_weights = time.perf_counter()
+        for filename in sorted(set(contract["source_names"].values())):
+            descriptors = safetensors_file_sources(str(root / "tensors" / filename))
+            with safe_open(
+                root / "tensors" / filename, framework="pt", device="cpu"
+            ) as handle:
+                for name in sorted(handle.keys()):
+                    if prefixes is not None and not name.startswith(prefixes):
+                        continue
+                    match = re.search(
+                        r"^model\.language_model\.layers\.(\d+)\.mlp\.experts\.", name
+                    )
+                    if match and int(match.group(1)) < layers:
+                        continue
+                    if callable(file_filter) and file_filter(name):
+                        yield name, file_source_tensor(descriptors[name])
+                    else:
+                        yield name, handle.get_tensor(name)

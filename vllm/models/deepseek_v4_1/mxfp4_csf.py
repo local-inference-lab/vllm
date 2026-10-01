@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Lossless NVFP4 expert scale storage with native ModelOpt arithmetic."""
-
-from dataclasses import replace
+"""Losslessly compressed DS4.1 routed experts with native dense tensors."""
 
 import regex as re
 import torch
 
-import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -17,7 +14,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
-from vllm.model_executor.layers.fused_moe.config import nvfp4_moe_quant_config
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEQuantConfig,
+    FusedMoEQuantDesc,
+)
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
@@ -27,20 +27,20 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.utils.torch_utils import set_default_torch_num_threads
 
-from .modelopt import ModelOptMixedPrecisionConfig
+from .quant_config import DeepseekV41FP8Config
 
 logger = init_logger(__name__)
 
 
-class Nvfp4LscConfig(ModelOptMixedPrecisionConfig):
-    """Compressed main experts; retained ModelOpt formats for all other tensors."""
+class DeepseekV41Mxfp4CsfConfig(DeepseekV41FP8Config):
+    """MXFP4-CSF main experts; unchanged native dense, shared and draft weights."""
 
     checkpoint_root: str
     scale_scratch: tuple[torch.Tensor, ...] | None
 
     @classmethod
     def get_name(cls):
-        return "nvfp4_lsc"
+        return "mxfp4_csf"
 
     @classmethod
     def get_min_capability(cls):
@@ -48,19 +48,25 @@ class Nvfp4LscConfig(ModelOptMixedPrecisionConfig):
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant, hf_config=None):
-        if (hf_quant_cfg or {}).get("quant_method") == cls.get_name():
+        if (
+            user_quant in (None, cls.get_name())
+            and hf_quant_cfg is not None
+            and hf_quant_cfg.get("quant_method") == cls.get_name()
+            and getattr(hf_config, "model_type", None)
+            in ("deepseek_v41", "deepseek_v41_text")
+        ):
             return cls.get_name()
         return None
 
     @classmethod
     def from_config(cls, config):
         if config.get("format_version") != 1 or not config.get("checkpoint_root"):
-            raise ValueError("NVFP4-CSF requires format_version=1 and checkpoint_root")
-        original = config.get("source_quantization_config")
-        if not isinstance(original, dict):
-            raise ValueError("NVFP4-CSF requires source_quantization_config")
-        result = super().from_config(original)
-        assert isinstance(result, cls)
+            raise ValueError("MXFP4-CSF requires format_version=1 and checkpoint_root")
+        result = cls(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[32, 32],
+        )
         result.checkpoint_root = config["checkpoint_root"]
         result.scale_scratch = None
         return result
@@ -69,33 +75,24 @@ class Nvfp4LscConfig(ModelOptMixedPrecisionConfig):
         if isinstance(layer, RoutedExperts):
             match = re.search(r"(?:^|\.)layers\.(\d+)\.", prefix)
             if match is None:
-                raise ValueError("NVFP4-CSF routed experts require a numbered layer")
+                raise ValueError("DS4.1 routed experts require a numbered layer")
             config = get_current_vllm_config()
-            if (
-                int(match.group(1))
-                < config.model_config.hf_text_config.num_hidden_layers
-            ):
-                if config.model_config.hf_text_config.model_type != "glm5_next_text":
-                    raise ValueError("NVFP4-CSF supports GLM-5.3-Flash expert geometry")
+            if int(match.group(1)) < config.model_config.hf_config.num_hidden_layers:
                 if (
                     config.parallel_config.pipeline_parallel_size != 1
                     or config.parallel_config.use_ubatching
                 ):
                     raise NotImplementedError(
-                        "NVFP4-CSF shared scratch requires PP1 without ubatching"
+                        "MXFP4-CSF shared scale scratch requires PP1 without ubatching"
                     )
-                if config.load_config.load_format not in ("nvfp4_csf", "nvfp4_lsc"):
-                    raise ValueError("NVFP4-CSF requires --load-format nvfp4_csf")
-                if self._resolve_quant_algo(prefix) != "NVFP4":
-                    raise ValueError(
-                        "NVFP4-CSF requires NVFP4 source expert calibration"
-                    )
-                return Nvfp4LscMoEMethod(layer.moe_config, self)
+                if config.load_config.load_format not in ("mxfp4_csf",):
+                    raise ValueError("MXFP4-CSF requires --load-format mxfp4_csf ")
+                return Mxfp4CsfMoEMethod(layer.moe_config, self)
         return super().get_quant_method(layer, prefix)
 
 
-class Nvfp4LscMoEMethod(FusedMoEMethodBase):
-    """Decode selected scale planes into model-owned native E4M3 scratch."""
+class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
+    """Expand scales for routed experts into serialized, model-owned scratch."""
 
     def __init__(self, moe, owner):
         super().__init__(moe)
@@ -108,15 +105,22 @@ class Nvfp4LscMoEMethod(FusedMoEMethodBase):
             or parallel.use_all2all_kernels
             or parallel.enable_eplb
         ):
-            raise NotImplementedError("NVFP4-CSF supports TP without EP/DP")
+            raise NotImplementedError("MXFP4-CSF DS4.1 supports TP without EP/DP")
         if (
-            moe.activation != MoEActivation.SILU
+            moe.activation not in (MoEActivation.SILU, MoEActivation.SITU)
             or moe.in_dtype != torch.bfloat16
             or moe.has_bias
+            or (
+                moe.activation == MoEActivation.SITU
+                and (
+                    moe.activation_situ_beta != 4.0
+                    or moe.activation_situ_linear_beta != 25.0
+                )
+            )
         ):
-            raise ValueError("NVFP4-CSF requires bias-free BF16 SwiGLU experts")
-        if envs.VLLM_B12X_MOE_FP4_FORCE_A16:
-            raise NotImplementedError("NVFP4-CSF requires native NVFP4 A4 activations")
+            raise ValueError(
+                "MXFP4-CSF requires bias-free BF16 SwiGLU or SiTU(4,25) experts"
+            )
 
     def create_weights(
         self,
@@ -129,7 +133,7 @@ class Nvfp4LscMoEMethod(FusedMoEMethodBase):
     ):
         match = re.search(r"(?:^|\.)layers\.(\d+)\.", layer.layer_name)
         if match is None or params_dtype != torch.bfloat16:
-            raise ValueError("NVFP4-CSF requires a numbered BF16 expert layer")
+            raise ValueError("MXFP4-CSF requires a numbered BF16 expert layer")
         self.layer_index = int(match.group(1))
         self.num_experts, self.hidden_size = num_experts, hidden_size
         self.local_intermediate = intermediate_size_per_partition
@@ -139,11 +143,16 @@ class Nvfp4LscMoEMethod(FusedMoEMethodBase):
             )
 
     def get_fused_moe_quant_config(self, layer):
-        return self.moe_quant_config
+        return FusedMoEQuantConfig(
+            _a1=FusedMoEQuantDesc(),
+            _a2=FusedMoEQuantDesc(),
+            _w1=FusedMoEQuantDesc(dtype="mxfp4"),
+            _w2=FusedMoEQuantDesc(dtype="mxfp4"),
+        )
 
     def process_weights_after_loading(self, layer):
         from b12x.moe import fused_moe
-        from b12x.moe.checkpoints.nvfp4_lsc import read_nvfp4_lsc_layer
+        from b12x.moe.checkpoints.mxfp4_csf import read_mxfp4_csf_layer
 
         tp, rank = (
             get_tensor_model_parallel_world_size(),
@@ -151,18 +160,22 @@ class Nvfp4LscMoEMethod(FusedMoEMethodBase):
         )
         device = layer.w13_weight.device
         e, h, n = self.num_experts, self.hidden_size, self.local_intermediate
-        shapes = ((e, 2 * n, h // 16), (e, h, n // 16))
+        shapes = ((e, h // 32, 2 * n), (e, n // 32, h))
         if self.owner.scale_scratch is None:
+            # MXFP4-CSF disallows ubatching: every layer consumes these scale grids
+            # before its successor may overwrite them on the same stream.
             self.owner.scale_scratch = tuple(
-                torch.empty(s, dtype=torch.float8_e4m3fn, device=device) for s in shapes
+                torch.empty(s, dtype=torch.uint8, device=device) for s in shapes
             )
         scratch = self.owner.scale_scratch
         if any(
-            tuple(t.shape) != s or t.device != device for t, s in zip(scratch, shapes)
+            t.shape != shape or t.device != device for t, shape in zip(scratch, shapes)
         ):
-            raise ValueError("NVFP4-CSF shared scratch geometry/device mismatch")
+            raise ValueError("MXFP4-CSF shared scale scratch geometry/device mismatch")
+        # Per-expert CPU slices are too small to amortize intra-op barriers.
+        # Restore the serving thread policy before kernel preparation.
         with set_default_torch_num_threads(1):
-            weights = read_nvfp4_lsc_layer(
+            weights = read_mxfp4_csf_layer(
                 self.owner.checkpoint_root,
                 self.layer_index,
                 num_experts=e,
@@ -174,27 +187,13 @@ class Nvfp4LscMoEMethod(FusedMoEMethodBase):
                 w13_scale_scratch=scratch[0],
                 w2_scale_scratch=scratch[1],
             )
-        packed = weights.packed
-        layer_max = envs.VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE
-        packed = replace(
-            packed,
-            input_scale=(
-                packed.input_scale.amin()
-                if layer_max in ("1", "all", "w13")
-                else packed.input_scale
-            ),
-            intermediate_scale=(
-                packed.intermediate_scale.amin()
-                if layer_max in ("1", "all", "w2")
-                else packed.intermediate_scale
-            ),
-        )
-        weights = replace(weights, packed=packed)
         plan = fused_moe.plan_weights(
-            source=fused_moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
+            source=fused_moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w31"),
             activation=fused_moe.ActivationSpec(
-                mode="a4",
-                nonlinearity="silu",
+                mode="a16",
+                nonlinearity="situ"
+                if self.moe.activation == MoEActivation.SITU
+                else "silu",
                 io_dtype=torch.bfloat16,
                 swiglu_limit=self.moe.swiglu_limit,
             ),
@@ -203,23 +202,15 @@ class Nvfp4LscMoEMethod(FusedMoEMethodBase):
             ),
         )
         prepared = fused_moe.prepare_weights(plan=plan, weights=weights)
-        self.moe_quant_config = nvfp4_moe_quant_config(
-            g1_alphas=packed.w13_global_scales,
-            g2_alphas=packed.w2_global_scales,
-            a1_gscale=packed.input_scale,
-            a2_gscale=packed.intermediate_scale,
-            w1_scale=scratch[0],
-            w2_scale=scratch[1],
-            gemm1_clamp_limit=self.moe.swiglu_limit,
-        )
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         backend = B12xExperts(self.moe, self.moe_quant_config)
         backend.install_prepared_experts(layer, prepared)
         self.moe_kernel = mk.FusedMoEKernel(
             MoEPrepareAndFinalizeNoDPEPModular(), backend
         )
         logger.info(
-            "NVFP4-CSF layer %d rank %d/%d: native NVFP4 A4, "
-            "shared scale scratch %d bytes",
+            "MXFP4-CSF lossless MXFP4 layer %d rank %d/%d: BF16 activations, "
+            "compressed scales, shared scratch %d bytes",
             self.layer_index,
             rank,
             tp,

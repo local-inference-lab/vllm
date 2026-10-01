@@ -2,18 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MXFP4 lossless scale compression with model-specific retained precision."""
 
-from vllm.models.deepseek_v4_1.exact_mxfp4 import DeepseekV41ExactMXFP4Config
+from vllm.models.deepseek_v4_1.mxfp4_csf import DeepseekV41Mxfp4CsfConfig
 
-from .kimi_x4t import KimiX4TConfig
-
-
-class _DeepseekV41Mxfp4CsfConfig(DeepseekV41ExactMXFP4Config):
-    @classmethod
-    def get_name(cls):
-        return "mxfp4_csf"
+from .kimi_mxfp4_csf import KimiMxfp4CsfConfig
 
 
-class Mxfp4CsfConfig(KimiX4TConfig):
+class Mxfp4CsfConfig(KimiMxfp4CsfConfig):
     """Select Kimi or DeepSeek dense precision from the checkpoint contract."""
 
     @classmethod
@@ -23,13 +17,7 @@ class Mxfp4CsfConfig(KimiX4TConfig):
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant, hf_config=None):
         stored = (hf_quant_cfg or {}).get("quant_method")
-        if user_quant == cls.get_name() and stored in (
-            cls.get_name(),
-            "kimi_x4t",
-            "exact_mxfp4",
-        ):
-            return cls.get_name()
-        if user_quant is None and stored == cls.get_name():
+        if user_quant in (None, cls.get_name()) and stored == cls.get_name():
             return cls.get_name()
         return None
 
@@ -41,7 +29,7 @@ class Mxfp4CsfConfig(KimiX4TConfig):
             raise ValueError("MXFP4-CSF requires format_version=1 and checkpoint_root")
         family = checkpoint_contract(config["checkpoint_root"])["family"]
         if family == "deepseek_v41":
-            return _DeepseekV41Mxfp4CsfConfig.from_config(config)
+            return DeepseekV41Mxfp4CsfConfig.from_config(config)
         if family == "kimi_k3":
             return super().from_config(config)
         raise ValueError(f"Unsupported MXFP4-CSF model family: {family}")
