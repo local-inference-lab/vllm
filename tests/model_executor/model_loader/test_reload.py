@@ -6,7 +6,7 @@ import inspect
 import sys
 import types
 from unittest.mock import Mock
-from weakref import WeakKeyDictionary, ref
+from weakref import ReferenceType, WeakKeyDictionary, ref
 
 import pytest
 import torch
@@ -170,7 +170,7 @@ class _DeferredOnlineQuantAttention(_ReloadableAttentionLayer):
 
     def __init__(self):
         torch.nn.Module.__init__(self)
-        self.source_refs = []
+        self.source_refs: list[ReferenceType[torch.Tensor]] = []
         self.quant_method = _SourceLifetimeQuantMethod(self.source_refs)
 
         def tracking_weight_loader(param, loaded_weight):
@@ -770,6 +770,30 @@ class _LateBiasLayer(torch.nn.Module):
         bias = torch.nn.Parameter(torch.zeros(4))
         bias.weight_loader = default_weight_loader
         self.register_parameter("bias", bias)
+
+
+@pytest.mark.parametrize("load_order", [("w13", "w2"), ("w2", "w13")])
+def test_online_processing_releases_replaced_full_precision_weights(load_order):
+    """Loader temporaries must not retain BF16 storage during kernel packing."""
+
+    class ReplacingMethod(_RecordingQuantMethod):
+        def process_weights_after_loading(self, layer):
+            references = [ref(layer.w13), ref(layer.w2)]
+            layer.w13 = torch.nn.Parameter(torch.empty(1), requires_grad=False)
+            layer.w2 = torch.nn.Parameter(torch.empty(1), requires_grad=False)
+            assert all(reference() is None for reference in references)
+
+    layer = torch.nn.Module()
+    layer.quant_method = ReplacingMethod()
+    for name in ("w13", "w2"):
+        parameter = torch.nn.Parameter(torch.empty(4, 4, device="meta"))
+        parameter.weight_loader = default_weight_loader
+        layer.register_parameter(name, parameter)
+    initialize_online_processing(layer)
+    checkpoint_parameters = dict(layer.named_parameters())
+    for name in load_order:
+        parameter = checkpoint_parameters[name]
+        parameter.weight_loader(parameter, torch.ones(4, 4))
 
 
 def test_online_processing_waits_for_late_registered_bias():
