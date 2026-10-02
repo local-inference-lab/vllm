@@ -261,6 +261,124 @@ samples and artifact hashes. The separate local diagnostic artifact
 launch records. Source code and weight encoding remain unchanged throughout
 these scheduler-budget comparisons.
 
+## Expert-weight composition and activation scales
+
+A controlled checkpoint composition tests whether the main NVFP4 expert weights
+explain the saved Spark checkpoint's prefill advantage. The base is Spark
+`a608241037e4c2565356bff7ca293f2133888f88`; the donor is the QAD source
+`cfd47bd7680e68408924df09b179d5bed25b2ae9`. Exactly 108864 tensors are replaced:
+`weight`, `weight_scale` and `weight_scale_2` for gate, up and down projections in
+all 288 routed experts in main layers 3–44. Spark input activation scales, routers,
+MXFP8 projections, MTP weights, configuration and tokenizer are preserved.
+
+The composition is **implemented and qualified for byte preservation** through
+complete shard readback hashes and 21 independent complete-tensor checks. Its
+throughput evidence is **research-only**; hybrid quality, decode and speculative
+decoding are **unsupported by this validation**. No production loader, encoder or
+B12X implementation is changed by the experiment, and source checkpoints remain
+unmodified. The composition is a performance artifact, not a quality-qualified
+replacement model.
+
+All accepted runs use Frank1 GPUs 12/13, RTX PRO 6000 Blackwell Workstation 96 GB,
+600 W, dynamic graphics clocks, the pinned image listed above and frozen
+`online-weights-12` source. Configuration is TP2/DCP1, no MTP, a 3072-token
+scheduler budget, 65536 context limit, eight maximum sequences, 3 GiB FP8 KV per
+rank and compressed main NVFP4 scales. MXFP8 scales remain uncompressed. The
+sequence is Spark, composition, Spark reload; all 104 cached kernel-selection
+configurations match before and after every run.
+
+Two 32K warmups precede four 2K, four 8K and ten 32K measurements using identical
+token IDs across variants. Each request has a distinct prefix-cache salt, and
+metrics verify zero cached tokens. Server prefill histogram deltas give:
+
+| Prompt tokens | Spark before, tok/s | QAD expert weights, tok/s | Spark reload, tok/s | Paired throughput change |
+| ---: | ---: | ---: | ---: | ---: |
+| 2048 | 11893.7 | 11854.9 | 11896.7 | -0.316% |
+| 8192 | 12623.4 | 12605.3 | 12610.8 | -0.106% |
+| 32768 | 12803.5 | 12788.8 | 12778.8 | -0.015% |
+
+The paired change compares each composition request with the mean latency for
+the same prompt in the two Spark loads. The 32K conditional prompt-bootstrap
+interval is [-0.101%, +0.010%], while Spark reload drift is -0.184%. These short
+measurements do not establish that a difference as small as 0.015% is meaningful;
+they show that expert-weight replacement does not reproduce a 5% regression.
+The fixed token corpus differs from the preceding benchmark's generated prompts.
+Running that benchmark in the same three loads gives approximately 32K prefill
+rates of 13285, 13313 and 13272 tok/s, respectively.
+
+The composition and exact launch records are under
+`expert-weight-ablation/spark-qad-nvfp4-experts` and
+`serving/expert-swap-{spark-a-controlled,qad-b,spark-a-repeat}` in the evidence
+root. `expert-weight-ablation/results.json` records paired samples, telemetry,
+configuration identities and artifact hashes. Scripts under the work root are
+`build_spark_qad_experts.py`, `run_expert_weight_ablation.py` and
+`summarize_expert_weight_ablation.py`.
+
+An independent composition replaces only the 36288 main expert `input_scale`
+tensors, totaling 145152 payload bytes. These scalars calibrate activation
+quantization; they are distinct from the block weight scales compressed by CSF.
+All expert weights, block/global weight scales, routers and MXFP8 projections
+remain Spark bytes. Complete byte comparisons verify every replacement and every
+preserved range in `model-inputscales.safetensors`; other shards retain their
+source storage through read-only mounts.
+
+In all 42 main expert layers, Spark has one input scale shared by all experts.
+QAD gate/up scales have 17–124 distinct values per layer; down-projection scales
+have 59–169. Installed B12X validates uniform, immutable input scales in
+`moe/fused_moe/_impl.py:can_share_input` before permitting one quantized input to
+serve multiple experts. Spark's eight prepared MoE configurations enable
+`nvfp4_share_input`; QAD's eight configurations disable it. Uniformity is part of
+the tuning query, so forcing the sharing flag on nonuniform QAD scales would
+violate the kernel contract.
+
+The activation-scale composition and a complete online-QAD run use the same
+hardware, prompts and serving settings described above, followed by another
+Spark control. The 104 Spark cache choices are preserved. Eight valid MoE queries
+for nonuniform scales are added, and all 112 choices remain fixed before and
+after these runs. The full QAD model converts only the selected attention/shared
+projections to MXFP8; the scale-only composition uses serialized Spark projections.
+
+| Variant | 2K fixed prompts, tok/s | 8K fixed prompts, tok/s | 32K fixed prompts, tok/s | Paired 32K change |
+| --- | ---: | ---: | ---: | ---: |
+| Spark before | 11896.7 | 12610.8 | 12778.8 | Reference |
+| Spark with QAD activation scales only | 12119.0 | 12584.0 | 12632.2 | -1.191% |
+| Complete online QAD | 12107.0 | 12546.2 | 12575.2 | -1.599% |
+| Spark after | 11893.8 | 12605.7 | 12771.8 | Reference |
+
+Paired changes use the mean latency of the bracketing Spark requests. The
+conditional 32K prompt-bootstrap intervals are [-1.246%, -1.089%] for the
+scale-only composition and [-1.638%, -1.484%] for full QAD. The generated-prompt
+benchmark corresponding to the preceding approximately 13.3K-versus-12.7K
+comparison gives:
+
+| Variant | Approximately 32K prefill, tok/s |
+| --- | ---: |
+| Spark before | 13272 |
+| Spark with QAD activation scales only | 12818 |
+| Complete online QAD | 12712 |
+| Spark after | 13265 |
+
+Activation-scale replacement reproduces approximately 3.4% slowdown in the
+generated-prompt benchmark and 1.2% on the fixed corpus; complete online QAD is
+approximately 4.2% and 1.6% slower, respectively. It therefore reproduces most of
+the gap under both measured workloads. The packed expert weights and their
+weight scales do not reproduce it. This is evidence for activation-scale
+uniformity and its execution consequences, not proof that one kernel accounts
+for every difference. Scale replacement also changes numerical behavior and
+subsequent routing, while the nonuniform contract selects other legal MoE
+configurations. The full QAD model additionally differs in routers and trained
+projections. No production model scale values were changed to recover throughput,
+and the hybrid models have no quality qualification.
+
+These follow-up measurements retain the research-only scope above. Receipts are
+`expert-weight-ablation/input-scale-{composition,comparison,results}.json` and
+`input-scale-composition-mount.json`. Serving artifacts are
+`serving/input-scale-swap-qad-mounted`, `serving/online-qad-scale-contract` and
+`serving/input-scale-swap-spark-control`. The work-root scripts
+`build_spark_qad_input_scales.py`, `run_activation_scale_ablation.py` and
+`summarize_activation_scale_ablation.py` reproduce the composition and comparison.
+The adjacent machine-readable results include both ablation result objects.
+
 ## Quality sample
 
 Quality uses a 1024-token scheduler budget. The 3072-token performance

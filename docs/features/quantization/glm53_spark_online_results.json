@@ -1750,5 +1750,2652 @@
       "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/prefill-budget-diagnosis.json",
       "sha256": "46e88144f7f3ccbf1e881ef14c92cf6268e10c4ab351bcc066bba1c8deda04c7"
     }
+  },
+  "expert_weight_ablation": {
+    "status": "research-only bounded throughput comparison; byte-preserving composition qualified",
+    "summary": {
+      "2048": {
+        "samples_per_run": 4,
+        "spark_first_median_tok_s": 11893.72342519535,
+        "hybrid_median_tok_s": 11854.88942512712,
+        "spark_repeat_median_tok_s": 11896.669052775316,
+        "median_paired_throughput_change_pct": -0.31625847156617204,
+        "paired_prompt_bootstrap_95_pct": [
+          -1.472897636348247,
+          -0.03544977638273439
+        ],
+        "median_reference_reload_change_pct": 0.03602361468161286
+      },
+      "8192": {
+        "samples_per_run": 4,
+        "spark_first_median_tok_s": 12623.405955023194,
+        "hybrid_median_tok_s": 12605.305020128202,
+        "spark_repeat_median_tok_s": 12610.829153518462,
+        "median_paired_throughput_change_pct": -0.10648786124417553,
+        "paired_prompt_bootstrap_95_pct": [
+          -0.2797048231804711,
+          -0.04700633699833423
+        ],
+        "median_reference_reload_change_pct": -0.12542897109346085
+      },
+      "32768": {
+        "samples_per_run": 10,
+        "spark_first_median_tok_s": 12803.487158477981,
+        "hybrid_median_tok_s": 12788.831994243637,
+        "spark_repeat_median_tok_s": 12778.763377950834,
+        "median_paired_throughput_change_pct": -0.015170115456253352,
+        "paired_prompt_bootstrap_95_pct": [
+          -0.10079838721148149,
+          0.010300229667292715
+        ],
+        "median_reference_reload_change_pct": -0.18350069269676972
+      }
+    },
+    "paired_prompts": [
+      {
+        "identity": "prefill-2048-00",
+        "tokens": 2048,
+        "reference_seconds_mean": 0.1723096845089458,
+        "hybrid_seconds": 0.17303012101911008,
+        "hybrid_throughput_change_pct": -0.4163647958639105,
+        "reference_reload_change_pct": -0.3042060629283694
+      },
+      {
+        "identity": "prefill-2048-01",
+        "tokens": 2048,
+        "reference_seconds_mean": 0.17210937099298462,
+        "hybrid_seconds": 0.17248219496104866,
+        "hybrid_throughput_change_pct": -0.21615214726843357,
+        "reference_reload_change_pct": 0.14234218953534938
+      },
+      {
+        "identity": "prefill-2048-02",
+        "tokens": 2048,
+        "reference_seconds_mean": 0.17221211551805027,
+        "hybrid_seconds": 0.1722731859772466,
+        "hybrid_throughput_change_pct": -0.03544977638273439,
+        "reference_reload_change_pct": -0.07029496017212367
+      },
+      {
+        "identity": "prefill-2048-03",
+        "tokens": 2048,
+        "reference_seconds_mean": 0.17238785399240442,
+        "hybrid_seconds": 0.1749649079865776,
+        "hybrid_throughput_change_pct": -1.472897636348247,
+        "reference_reload_change_pct": 0.4212025125514218
+      },
+      {
+        "identity": "prefill-8192-00",
+        "tokens": 8192,
+        "reference_seconds_mean": 0.649108512501698,
+        "hybrid_seconds": 0.6501147849485278,
+        "hybrid_throughput_change_pct": -0.15478381204782066,
+        "reference_reload_change_pct": -0.16315705431684258
+      },
+      {
+        "identity": "prefill-8192-01",
+        "tokens": 8192,
+        "reference_seconds_mean": 0.6495599304907955,
+        "hybrid_seconds": 0.6513818770181388,
+        "hybrid_throughput_change_pct": -0.2797048231804711,
+        "reference_reload_change_pct": -0.1987629690674675
+      },
+      {
+        "identity": "prefill-8192-02",
+        "tokens": 8192,
+        "reference_seconds_mean": 0.6492187835101504,
+        "hybrid_seconds": 0.6495241009979509,
+        "hybrid_throughput_change_pct": -0.04700633699833423,
+        "reference_reload_change_pct": 0.009677175999378562
+      },
+      {
+        "identity": "prefill-8192-03",
+        "tokens": 8192,
+        "reference_seconds_mean": 0.6492775439983234,
+        "hybrid_seconds": 0.6496555909980088,
+        "hybrid_throughput_change_pct": -0.0581919104405304,
+        "reference_reload_change_pct": -0.08770088787007913
+      },
+      {
+        "identity": "prefill-32768-00",
+        "tokens": 32768,
+        "reference_seconds_mean": 2.5551263015076984,
+        "hybrid_seconds": 2.5571931889862753,
+        "hybrid_throughput_change_pct": -0.08082641106189614,
+        "reference_reload_change_pct": -0.09496244373639051
+      },
+      {
+        "identity": "prefill-32768-01",
+        "tokens": 32768,
+        "reference_seconds_mean": 2.55839876702521,
+        "hybrid_seconds": 2.5577222399879247,
+        "hybrid_throughput_change_pct": 0.02645037161221886,
+        "reference_reload_change_pct": -0.2125707550116318
+      },
+      {
+        "identity": "prefill-32768-02",
+        "tokens": 32768,
+        "reference_seconds_mean": 2.5576324634894263,
+        "hybrid_seconds": 2.5607871750253253,
+        "hybrid_throughput_change_pct": -0.12319303871348719,
+        "reference_reload_change_pct": -0.18538074725005238
+      },
+      {
+        "identity": "prefill-32768-03",
+        "tokens": 32768,
+        "reference_seconds_mean": 2.5584610590012744,
+        "hybrid_seconds": 2.5604685620055534,
+        "hybrid_throughput_change_pct": -0.07840373570947579,
+        "reference_reload_change_pct": -0.14626313396244317
+      },
+      {
+        "identity": "prefill-32768-04",
+        "tokens": 32768,
+        "reference_seconds_mean": 2.560813390504336,
+        "hybrid_seconds": 2.560787894995883,
+        "hybrid_throughput_change_pct": 0.0009956118780074519,
+        "reference_reload_change_pct": -0.19358388696033568
+      },
+      {
+        "identity": "prefill-32768-05",
+        "tokens": 32768,
+        "reference_seconds_mean": 2.563150025496725,
+        "hybrid_seconds": 2.5665531510021538,
+        "hybrid_throughput_change_pct": -0.13259516967727425,
+        "reference_reload_change_pct": -0.22416766926180998
+      },
+      {
+        "identity": "prefill-32768-06",
+        "tokens": 32768,
+        "reference_seconds_mean": 2.5638835665013175,
+        "hybrid_seconds": 2.563684846041724,
+        "hybrid_throughput_change_pct": 0.007751360698660115,
+        "reference_reload_change_pct": -0.186212345447323
+      },
+      {
+        "identity": "prefill-32768-07",
+        "tokens": 32768,
+        "reference_seconds_mean": 2.56396862649126,
+        "hybrid_seconds": 2.5644010749529116,
+        "hybrid_throughput_change_pct": -0.016863526765587,
+        "reference_reload_change_pct": -0.09717746988253673
+      },
+      {
+        "identity": "prefill-32768-08",
+        "tokens": 32768,
+        "reference_seconds_mean": 2.5654908280121163,
+        "hybrid_seconds": 2.5649879660340957,
+        "hybrid_throughput_change_pct": 0.01960484745657798,
+        "reference_reload_change_pct": -0.18162063814348706
+      },
+      {
+        "identity": "prefill-32768-09",
+        "tokens": 32768,
+        "reference_seconds_mean": 2.565084421512438,
+        "hybrid_seconds": 2.5654301569447853,
+        "hybrid_throughput_change_pct": -0.013476704146919705,
+        "reference_reload_change_pct": -0.14118921254401284
+      }
+    ],
+    "benchmark_bridge": {
+      "expert-swap-spark-a-controlled": {
+        "2048": 11955.0,
+        "8192": 12831.0,
+        "32768": 13285.0
+      },
+      "expert-swap-qad-b": {
+        "2048": 11930.0,
+        "8192": 12822.0,
+        "32768": 13313.0
+      },
+      "expert-swap-spark-a-repeat": {
+        "2048": 11931.0,
+        "8192": 12814.0,
+        "32768": 13272.0
+      }
+    },
+    "identical_kernel_selection_count": 104,
+    "telemetry": {
+      "expert-swap-spark-a-controlled": {
+        "12": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2535.0,
+            "mean": 2568.181818181818,
+            "max": 2595.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "mean": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 500.0,
+            "mean": 528.1757575757575,
+            "max": 542.42
+          },
+          "power.limit [W]": {
+            "min": 600.0,
+            "mean": 600.0,
+            "max": 600.0
+          },
+          "temperature.gpu": {
+            "min": 43.0,
+            "mean": 53.03030303030303,
+            "max": 58.0
+          }
+        },
+        "13": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2640.0,
+            "mean": 2669.823529411765,
+            "max": 2700.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "mean": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 288.94,
+            "mean": 552.7258823529412,
+            "max": 574.18
+          },
+          "power.limit [W]": {
+            "min": 600.0,
+            "mean": 600.0,
+            "max": 600.0
+          },
+          "temperature.gpu": {
+            "min": 49.0,
+            "mean": 58.3235294117647,
+            "max": 65.0
+          }
+        }
+      },
+      "expert-swap-qad-b": {
+        "12": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2542.0,
+            "mean": 2563.3939393939395,
+            "max": 2595.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "mean": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 325.97,
+            "mean": 523.9051515151515,
+            "max": 543.79
+          },
+          "power.limit [W]": {
+            "min": 600.0,
+            "mean": 600.0,
+            "max": 600.0
+          },
+          "temperature.gpu": {
+            "min": 48.0,
+            "mean": 54.878787878787875,
+            "max": 60.0
+          }
+        },
+        "13": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2640.0,
+            "mean": 2658.4545454545455,
+            "max": 2700.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "mean": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 521.32,
+            "mean": 565.1124242424243,
+            "max": 579.31
+          },
+          "power.limit [W]": {
+            "min": 600.0,
+            "mean": 600.0,
+            "max": 600.0
+          },
+          "temperature.gpu": {
+            "min": 55.0,
+            "mean": 62.45454545454545,
+            "max": 67.0
+          }
+        }
+      },
+      "expert-swap-spark-a-repeat": {
+        "12": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2535.0,
+            "mean": 2563.4242424242425,
+            "max": 2595.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "mean": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 158.43,
+            "mean": 520.0960606060606,
+            "max": 543.86
+          },
+          "power.limit [W]": {
+            "min": 600.0,
+            "mean": 600.0,
+            "max": 600.0
+          },
+          "temperature.gpu": {
+            "min": 45.0,
+            "mean": 55.27272727272727,
+            "max": 60.0
+          }
+        },
+        "13": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2625.0,
+            "mean": 2656.6060606060605,
+            "max": 2700.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "mean": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 175.53,
+            "mean": 553.9075757575757,
+            "max": 579.12
+          },
+          "power.limit [W]": {
+            "min": 600.0,
+            "mean": 600.0,
+            "max": 600.0
+          },
+          "temperature.gpu": {
+            "min": 54.0,
+            "mean": 63.39393939393939,
+            "max": 68.0
+          }
+        }
+      }
+    },
+    "conditions": {
+      "host": "Frank1",
+      "gpus": [
+        12,
+        13
+      ],
+      "gpu_type": "RTX PRO 6000 Blackwell Workstation 96GB",
+      "power_limit_w": 600,
+      "graphics_clocks": "dynamic, not locked",
+      "image": "ghcr.io/local-inference-lab/vllm@sha256:2230db60afb4fd06dc2ef2b7f7f27dc7f78d7a50be70a08461b4df9fa5e90732",
+      "runtime": "online-weights-12 frozen overlay",
+      "tp": 2,
+      "dcp": 1,
+      "mtp": false,
+      "max_num_batched_tokens": 3072,
+      "max_model_len": 65536,
+      "max_num_seqs": 8,
+      "kv_cache_bytes_per_rank": 3221225472,
+      "kv_dtype": "fp8",
+      "main_fp4_csf": true,
+      "mxfp8_scale_compression": false,
+      "prefix_caching": true,
+      "request_cache_salt": "unique per prompt, identical across runs"
+    },
+    "limits": [
+      "One hybrid model load bracketed by two baseline loads; prompt bootstrap does not measure all between-load variation.",
+      "The fixed token corpus differs from the preceding approximately 32K benchmark prompts; compare paired variants within a corpus.",
+      "This changes expert weights and their weight scales together; it does not isolate packed codes from scales.",
+      "Spark routers and activation scales are retained. Weight changes can alter subsequent hidden states and expert routing.",
+      "No hybrid quality, decode, speculative decoding or other TP configuration is qualified."
+    ],
+    "artifacts": [
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/expert-weight-ablation/checkpoint-composition.json",
+        "sha256": "7a8969677a17d2733eb3c00d6b00c9d2818d37f83eb97788ad9d4995a48c7634"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/expert-weight-ablation/independent-tensor-check.json",
+        "sha256": "82a4297b1e917782ece1815f364019f94fd5bf69bb348891829146bca85cb799"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/expert-weight-ablation/prompts.json",
+        "sha256": "cfb246e197e56fc59ae2dd2b9a9bfe85a94638990d9e2916f128ddab1d28ec35"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/expert-weight-ablation/comparison.json",
+        "sha256": "98fac8fbc6af1aeba76b9ec011c40b11fea305d974d4640a9dec507a4120f78f"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-spark-a-controlled/launch.json",
+        "sha256": "2f51a499d38c5a81ab5e89b2d6a38a0fa08df46eaac191a225ebf3dda871438e"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-spark-a-controlled/selection-cache-before.json",
+        "sha256": "b76da750996f7c47519c92a00d69e8d135396c39fb9fc3d320b5fc38dd5bad70"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-spark-a-controlled/selection-cache-after.json",
+        "sha256": "b76da750996f7c47519c92a00d69e8d135396c39fb9fc3d320b5fc38dd5bad70"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-spark-a-controlled/controlled-prefill/results.json",
+        "sha256": "c70b82f435e52a26f0b6cfd14a9bab1e4e3944b436bc2ccd4de40b39ac562432"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-spark-a-controlled/controlled-prefill/telemetry.csv",
+        "sha256": "f1d1e741e6d0ffe536db6912db31d7d3bb4e7ac1c1ba291d8ad8aff61355f9a7"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-spark-a-controlled/benchmark/prefill.json",
+        "sha256": "3dea52fc3e585fc92081dfeff48cde82ded77f1225eedb0c32bf41eedb86ac9d"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-qad-b/launch.json",
+        "sha256": "97d4ccf9fe723a13b49c80a28d4be66fae7d9ca0546548669302e9dad142db69"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-qad-b/selection-cache-before.json",
+        "sha256": "b76da750996f7c47519c92a00d69e8d135396c39fb9fc3d320b5fc38dd5bad70"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-qad-b/selection-cache-after.json",
+        "sha256": "b76da750996f7c47519c92a00d69e8d135396c39fb9fc3d320b5fc38dd5bad70"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-qad-b/controlled-prefill/results.json",
+        "sha256": "a30ce81f913243bdff6c5f89be1c2b5a51da7cc08fce53ab7d30f011f0dc2c0e"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-qad-b/controlled-prefill/telemetry.csv",
+        "sha256": "79dc33096dde7b979744f17d5670cdf275ad1ff052efda61178ba9bbcd414fc8"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-qad-b/benchmark/prefill.json",
+        "sha256": "a75aa238ea8245e5fc598a29c2853a4bf454543686ac5127abccc4e5208d140c"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-spark-a-repeat/launch.json",
+        "sha256": "63f379884c79a7c78c3b68349ad5c1cbd1101ecceac66f20b1666fddbaa6471a"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-spark-a-repeat/selection-cache-before.json",
+        "sha256": "b76da750996f7c47519c92a00d69e8d135396c39fb9fc3d320b5fc38dd5bad70"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-spark-a-repeat/selection-cache-after.json",
+        "sha256": "b76da750996f7c47519c92a00d69e8d135396c39fb9fc3d320b5fc38dd5bad70"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-spark-a-repeat/controlled-prefill/results.json",
+        "sha256": "a2214b56033ed47576784551d885a14647f3aacd1ba98aacbfb8511965ab1454"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-spark-a-repeat/controlled-prefill/telemetry.csv",
+        "sha256": "27d4ac032483dab35af3f36aa242b2e5d10f1d24614d9eb620f7d735633e76a6"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-spark-a-repeat/benchmark/prefill.json",
+        "sha256": "f06d1019811cc8615c17e946a67ba568ff7151269a22408a3251558570bf9867"
+      }
+    ]
+  },
+  "activation_scale_ablation": {
+    "status": "research-only bounded prefill comparison; byte-preserving activation-scale composition qualified",
+    "conditions": {
+      "host": "Frank1",
+      "gpus": [
+        12,
+        13
+      ],
+      "gpu_type": "RTX PRO 6000 Blackwell Workstation 96GB",
+      "power_limit_w": 600,
+      "graphics_clocks": "dynamic, not locked",
+      "image": "ghcr.io/local-inference-lab/vllm@sha256:2230db60afb4fd06dc2ef2b7f7f27dc7f78d7a50be70a08461b4df9fa5e90732",
+      "runtime": "online-weights-12 frozen overlay",
+      "tp": 2,
+      "dcp": 1,
+      "mtp": false,
+      "max_num_batched_tokens": 3072,
+      "max_model_len": 65536,
+      "max_num_seqs": 8,
+      "kv_cache_bytes_per_rank": 3221225472,
+      "kv_dtype": "fp8",
+      "main_fp4_csf": true,
+      "mxfp8_scale_compression": false,
+      "prefix_caching": true,
+      "request_cache_salt": "unique per prompt, identical across runs"
+    },
+    "variants": {
+      "expert-swap-spark-a-repeat": {
+        "2048": {
+          "samples": 4,
+          "median_server_tok_s": 11896.669052775316,
+          "median_paired_change_pct": 0.003959469269837479,
+          "paired_prompt_bootstrap_95_pct": [
+            -0.07660592685833079,
+            0.014266776791815872
+          ]
+        },
+        "8192": {
+          "samples": 4,
+          "median_server_tok_s": 12610.829153518462,
+          "median_paired_change_pct": 0.01777295856479899,
+          "paired_prompt_bootstrap_95_pct": [
+            -0.03922558534779075,
+            0.05124919514969406
+          ]
+        },
+        "32768": {
+          "samples": 10,
+          "median_server_tok_s": 12778.763377950834,
+          "median_paired_change_pct": 0.04358768885794895,
+          "paired_prompt_bootstrap_95_pct": [
+            0.027840122872668793,
+            0.0764988439878822
+          ]
+        }
+      },
+      "input-scale-swap-qad-mounted": {
+        "2048": {
+          "samples": 4,
+          "median_server_tok_s": 12118.992435721011,
+          "median_paired_change_pct": 1.8614800211774196,
+          "paired_prompt_bootstrap_95_pct": [
+            1.6398388938426933,
+            1.9986847669827723
+          ]
+        },
+        "8192": {
+          "samples": 4,
+          "median_server_tok_s": 12584.015993101284,
+          "median_paired_change_pct": -0.15012383718123745,
+          "paired_prompt_bootstrap_95_pct": [
+            -0.26813779593021225,
+            -0.09735770391502419
+          ]
+        },
+        "32768": {
+          "samples": 10,
+          "median_server_tok_s": 12632.200830810296,
+          "median_paired_change_pct": -1.190838692970131,
+          "paired_prompt_bootstrap_95_pct": [
+            -1.2460289632416632,
+            -1.0888546757785167
+          ]
+        }
+      },
+      "online-qad-scale-contract": {
+        "2048": {
+          "samples": 4,
+          "median_server_tok_s": 12106.991809732885,
+          "median_paired_change_pct": 1.7408360982294258,
+          "paired_prompt_bootstrap_95_pct": [
+            1.4837382506976748,
+            1.8587221754719385
+          ]
+        },
+        "8192": {
+          "samples": 4,
+          "median_server_tok_s": 12546.216313373661,
+          "median_paired_change_pct": -0.5212179089290392,
+          "paired_prompt_bootstrap_95_pct": [
+            -0.5895780989452537,
+            -0.3702257782228102
+          ]
+        },
+        "32768": {
+          "samples": 10,
+          "median_server_tok_s": 12575.168628107984,
+          "median_paired_change_pct": -1.5991656810170118,
+          "paired_prompt_bootstrap_95_pct": [
+            -1.6379986351970799,
+            -1.4843678284661932
+          ]
+        }
+      },
+      "input-scale-swap-spark-control": {
+        "2048": {
+          "samples": 4,
+          "median_server_tok_s": 11893.76000451548,
+          "median_paired_change_pct": -0.00395766570160383,
+          "paired_prompt_bootstrap_95_pct": [
+            -0.014262707134649055,
+            0.07672347631864085
+          ]
+        },
+        "8192": {
+          "samples": 4,
+          "median_server_tok_s": 12605.711423565968,
+          "median_paired_change_pct": -0.017765838291333713,
+          "paired_prompt_bootstrap_95_pct": [
+            -0.051196719336499275,
+            0.03925638243937879
+          ]
+        },
+        "32768": {
+          "samples": 10,
+          "median_server_tok_s": 12771.787634372811,
+          "median_paired_change_pct": -0.04354970462303043,
+          "paired_prompt_bootstrap_95_pct": [
+            -0.07638198132242646,
+            -0.027821514417353255
+          ]
+        }
+      }
+    },
+    "benchmark_bridge": {
+      "expert-swap-spark-a-repeat": {
+        "2048": 11931.0,
+        "8192": 12814.0,
+        "32768": 13272.0
+      },
+      "input-scale-swap-qad-mounted": {
+        "2048": 12195.0,
+        "8192": 12578.0,
+        "32768": 12818.0
+      },
+      "online-qad-scale-contract": {
+        "2048": 12196.0,
+        "8192": 12534.0,
+        "32768": 12712.0
+      },
+      "input-scale-swap-spark-control": {
+        "2048": 11884.0,
+        "8192": 12783.0,
+        "32768": 13265.0
+      }
+    },
+    "telemetry": {
+      "expert-swap-spark-a-repeat": {
+        "12": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2535.0,
+            "mean": 2563.4242424242425,
+            "max": 2595.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "mean": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 158.43,
+            "mean": 520.0960606060606,
+            "max": 543.86
+          },
+          "power.limit [W]": {
+            "min": 600.0,
+            "mean": 600.0,
+            "max": 600.0
+          },
+          "temperature.gpu": {
+            "min": 45.0,
+            "mean": 55.27272727272727,
+            "max": 60.0
+          }
+        },
+        "13": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2625.0,
+            "mean": 2656.6060606060605,
+            "max": 2700.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "mean": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 175.53,
+            "mean": 553.9075757575757,
+            "max": 579.12
+          },
+          "power.limit [W]": {
+            "min": 600.0,
+            "mean": 600.0,
+            "max": 600.0
+          },
+          "temperature.gpu": {
+            "min": 54.0,
+            "mean": 63.39393939393939,
+            "max": 68.0
+          }
+        }
+      },
+      "input-scale-swap-qad-mounted": {
+        "12": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2565.0,
+            "mean": 2593.909090909091,
+            "max": 2625.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "mean": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 482.83,
+            "mean": 538.639696969697,
+            "max": 553.6
+          },
+          "power.limit [W]": {
+            "min": 600.0,
+            "mean": 600.0,
+            "max": 600.0
+          },
+          "temperature.gpu": {
+            "min": 45.0,
+            "mean": 53.303030303030305,
+            "max": 59.0
+          }
+        },
+        "13": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2647.0,
+            "mean": 2670.6060606060605,
+            "max": 2700.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "mean": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 528.6,
+            "mean": 569.1166666666667,
+            "max": 582.55
+          },
+          "power.limit [W]": {
+            "min": 600.0,
+            "mean": 600.0,
+            "max": 600.0
+          },
+          "temperature.gpu": {
+            "min": 48.0,
+            "mean": 57.03030303030303,
+            "max": 64.0
+          }
+        }
+      },
+      "online-qad-scale-contract": {
+        "12": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2565.0,
+            "mean": 2586.6470588235293,
+            "max": 2625.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "mean": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 203.94,
+            "mean": 533.8376470588236,
+            "max": 557.7
+          },
+          "power.limit [W]": {
+            "min": 600.0,
+            "mean": 600.0,
+            "max": 600.0
+          },
+          "temperature.gpu": {
+            "min": 48.0,
+            "mean": 56.794117647058826,
+            "max": 62.0
+          }
+        },
+        "13": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2632.0,
+            "mean": 2656.735294117647,
+            "max": 2700.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "mean": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 247.59,
+            "mean": 565.2505882352941,
+            "max": 588.3
+          },
+          "power.limit [W]": {
+            "min": 600.0,
+            "mean": 600.0,
+            "max": 600.0
+          },
+          "temperature.gpu": {
+            "min": 55.0,
+            "mean": 63.294117647058826,
+            "max": 69.0
+          }
+        }
+      },
+      "input-scale-swap-spark-control": {
+        "12": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2542.0,
+            "mean": 2560.151515151515,
+            "max": 2587.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "mean": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 304.14,
+            "mean": 525.5715151515152,
+            "max": 545.64
+          },
+          "power.limit [W]": {
+            "min": 600.0,
+            "mean": 600.0,
+            "max": 600.0
+          },
+          "temperature.gpu": {
+            "min": 50.0,
+            "mean": 56.75757575757576,
+            "max": 61.0
+          }
+        },
+        "13": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2632.0,
+            "mean": 2653.121212121212,
+            "max": 2700.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "mean": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 343.41,
+            "mean": 561.1424242424242,
+            "max": 579.91
+          },
+          "power.limit [W]": {
+            "min": 600.0,
+            "mean": 600.0,
+            "max": 600.0
+          },
+          "temperature.gpu": {
+            "min": 58.0,
+            "mean": 64.45454545454545,
+            "max": 69.0
+          }
+        }
+      }
+    },
+    "comparison": "Paired prompt throughput relative to mean latency of Spark loads immediately before and after the activation-scale and full-QAD measurements.",
+    "scale_census": {
+      "layer_10_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0370163694024086,
+          "max": 0.0370163694024086
+        },
+        "qad": {
+          "unique": 108,
+          "min": 0.0049293152987957,
+          "max": 0.0370163694024086
+        }
+      },
+      "layer_10_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0006888253265060484,
+          "max": 0.0006888253265060484
+        },
+        "qad": {
+          "unique": 33,
+          "min": 0.0006336030783131719,
+          "max": 0.0007847376982681453
+        }
+      },
+      "layer_10_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0006888253265060484,
+          "max": 0.0006888253265060484
+        },
+        "qad": {
+          "unique": 33,
+          "min": 0.0006336030783131719,
+          "max": 0.0007847376982681453
+        }
+      },
+      "layer_11_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.00827752985060215,
+          "max": 0.00827752985060215
+        },
+        "qad": {
+          "unique": 109,
+          "min": 0.0043480284512043,
+          "max": 0.011579240672290325
+        }
+      },
+      "layer_11_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0006016322295181453,
+          "max": 0.0006016322295181453
+        },
+        "qad": {
+          "unique": 28,
+          "min": 0.0005900065298192203,
+          "max": 0.0006742931436747313
+        }
+      },
+      "layer_11_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0006016322295181453,
+          "max": 0.0006016322295181453
+        },
+        "qad": {
+          "unique": 28,
+          "min": 0.0005900065298192203,
+          "max": 0.0006742931436747313
+        }
+      },
+      "layer_12_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0372023805975914,
+          "max": 0.0372023805975914
+        },
+        "qad": {
+          "unique": 118,
+          "min": 0.00344122014939785,
+          "max": 0.01037016324698925
+        }
+      },
+      "layer_12_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0005812871968373656,
+          "max": 0.0005812871968373656
+        },
+        "qad": {
+          "unique": 30,
+          "min": 0.0005405970732681453,
+          "max": 0.0006539481109939516
+        }
+      },
+      "layer_12_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0005812871968373656,
+          "max": 0.0005812871968373656
+        },
+        "qad": {
+          "unique": 30,
+          "min": 0.0005405970732681453,
+          "max": 0.0006539481109939516
+        }
+      },
+      "layer_13_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.01422991044819355,
+          "max": 0.01422991044819355
+        },
+        "qad": {
+          "unique": 138,
+          "min": 0.0068359375,
+          "max": 0.02380952425301075
+        }
+      },
+      "layer_13_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0007556733908131719,
+          "max": 0.0007556733908131719
+        },
+        "qad": {
+          "unique": 23,
+          "min": 0.0007091703591868281,
+          "max": 0.0008428664295934141
+        }
+      },
+      "layer_13_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0007556733908131719,
+          "max": 0.0007556733908131719
+        },
+        "qad": {
+          "unique": 23,
+          "min": 0.0007091703591868281,
+          "max": 0.0008428664295934141
+        }
+      },
+      "layer_14_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0372023805975914,
+          "max": 0.0372023805975914
+        },
+        "qad": {
+          "unique": 128,
+          "min": 0.00583612360060215,
+          "max": 0.0372023805975914
+        }
+      },
+      "layer_14_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0008486793376505375,
+          "max": 0.0008486793376505375
+        },
+        "qad": {
+          "unique": 17,
+          "min": 0.0007963634561747313,
+          "max": 0.0009184337686747313
+        }
+      },
+      "layer_14_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0008486793376505375,
+          "max": 0.0008486793376505375
+        },
+        "qad": {
+          "unique": 17,
+          "min": 0.0007963634561747313,
+          "max": 0.0009184337686747313
+        }
+      },
+      "layer_15_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0372023805975914,
+          "max": 0.0372023805975914
+        },
+        "qad": {
+          "unique": 143,
+          "min": 0.005068824626505375,
+          "max": 0.0362723208963871
+        }
+      },
+      "layer_15_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0008544921875,
+          "max": 0.0008544921875
+        },
+        "qad": {
+          "unique": 19,
+          "min": 0.0007789248484186828,
+          "max": 0.0009300595265813172
+        }
+      },
+      "layer_15_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0008544921875,
+          "max": 0.0008544921875
+        },
+        "qad": {
+          "unique": 19,
+          "min": 0.0007789248484186828,
+          "max": 0.0009300595265813172
+        }
+      },
+      "layer_16_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0372023805975914,
+          "max": 0.0372023805975914
+        },
+        "qad": {
+          "unique": 136,
+          "min": 0.00390625,
+          "max": 0.0370163694024086
+        }
+      },
+      "layer_16_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0007440476329065859,
+          "max": 0.0007440476329065859
+        },
+        "qad": {
+          "unique": 24,
+          "min": 0.0007004510844126344,
+          "max": 0.0008021763642318547
+        }
+      },
+      "layer_16_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0007440476329065859,
+          "max": 0.0007440476329065859
+        },
+        "qad": {
+          "unique": 24,
+          "min": 0.0007004510844126344,
+          "max": 0.0008021763642318547
+        }
+      },
+      "layer_17_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0364583320915699,
+          "max": 0.0364583320915699
+        },
+        "qad": {
+          "unique": 140,
+          "min": 0.0023600261192768812,
+          "max": 0.0364583320915699
+        }
+      },
+      "layer_17_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0006975446594879031,
+          "max": 0.0006975446594879031
+        },
+        "qad": {
+          "unique": 26,
+          "min": 0.0006481352029368281,
+          "max": 0.0007498604827560484
+        }
+      },
+      "layer_17_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0006975446594879031,
+          "max": 0.0006975446594879031
+        },
+        "qad": {
+          "unique": 26,
+          "min": 0.0006481352029368281,
+          "max": 0.0007498604827560484
+        }
+      },
+      "layer_18_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0372023805975914,
+          "max": 0.0372023805975914
+        },
+        "qad": {
+          "unique": 120,
+          "min": 0.00439453125,
+          "max": 0.0372023805975914
+        }
+      },
+      "layer_18_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0008138020639307797,
+          "max": 0.0008138020639307797
+        },
+        "qad": {
+          "unique": 29,
+          "min": 0.0007731119985692203,
+          "max": 0.0011044456623494625
+        }
+      },
+      "layer_18_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0008138020639307797,
+          "max": 0.0008138020639307797
+        },
+        "qad": {
+          "unique": 29,
+          "min": 0.0007731119985692203,
+          "max": 0.0011044456623494625
+        }
+      },
+      "layer_19_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0372023805975914,
+          "max": 0.0372023805975914
+        },
+        "qad": {
+          "unique": 151,
+          "min": 0.0032319568563252687,
+          "max": 0.0372023805975914
+        }
+      },
+      "layer_19_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0006946382345631719,
+          "max": 0.0006946382345631719
+        },
+        "qad": {
+          "unique": 35,
+          "min": 0.0006801060517318547,
+          "max": 0.0009765625
+        }
+      },
+      "layer_19_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0006946382345631719,
+          "max": 0.0006946382345631719
+        },
+        "qad": {
+          "unique": 35,
+          "min": 0.0006801060517318547,
+          "max": 0.0009765625
+        }
+      },
+      "layer_20_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0372023805975914,
+          "max": 0.0372023805975914
+        },
+        "qad": {
+          "unique": 152,
+          "min": 0.0027320499066263437,
+          "max": 0.0368303582072258
+        }
+      },
+      "layer_20_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0006946382345631719,
+          "max": 0.0006946382345631719
+        },
+        "qad": {
+          "unique": 31,
+          "min": 0.0006684802938252687,
+          "max": 0.0008486793376505375
+        }
+      },
+      "layer_20_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0006946382345631719,
+          "max": 0.0006946382345631719
+        },
+        "qad": {
+          "unique": 31,
+          "min": 0.0006684802938252687,
+          "max": 0.0008486793376505375
+        }
+      },
+      "layer_21_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0331101194024086,
+          "max": 0.0331101194024086
+        },
+        "qad": {
+          "unique": 144,
+          "min": 0.0026274181436747313,
+          "max": 0.0331101194024086
+        }
+      },
+      "layer_21_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0007731119985692203,
+          "max": 0.0007731119985692203
+        },
+        "qad": {
+          "unique": 42,
+          "min": 0.0006655738689005375,
+          "max": 0.0011218843283131719
+        }
+      },
+      "layer_21_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0007731119985692203,
+          "max": 0.0007731119985692203
+        },
+        "qad": {
+          "unique": 42,
+          "min": 0.0006655738689005375,
+          "max": 0.0011218843283131719
+        }
+      },
+      "layer_22_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.02585565485060215,
+          "max": 0.02585565485060215
+        },
+        "qad": {
+          "unique": 147,
+          "min": 0.0022553943563252687,
+          "max": 0.0310639888048172
+        }
+      },
+      "layer_22_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0007178896921686828,
+          "max": 0.0007178896921686828
+        },
+        "qad": {
+          "unique": 38,
+          "min": 0.0006452287780120969,
+          "max": 0.0011393228778615594
+        }
+      },
+      "layer_22_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0007178896921686828,
+          "max": 0.0007178896921686828
+        },
+        "qad": {
+          "unique": 38,
+          "min": 0.0006452287780120969,
+          "max": 0.0011393228778615594
+        }
+      },
+      "layer_23_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0305059514939785,
+          "max": 0.0305059514939785
+        },
+        "qad": {
+          "unique": 153,
+          "min": 0.0030459449626505375,
+          "max": 0.0332961305975914
+        }
+      },
+      "layer_23_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0006888253265060484,
+          "max": 0.0006888253265060484
+        },
+        "qad": {
+          "unique": 55,
+          "min": 0.0006306965951807797,
+          "max": 0.0011742000933736563
+        }
+      },
+      "layer_23_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0006888253265060484,
+          "max": 0.0006888253265060484
+        },
+        "qad": {
+          "unique": 55,
+          "min": 0.0006306965951807797,
+          "max": 0.0011742000933736563
+        }
+      },
+      "layer_24_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.032738097012043,
+          "max": 0.032738097012043
+        },
+        "qad": {
+          "unique": 169,
+          "min": 0.0037667411379516125,
+          "max": 0.0338541679084301
+        }
+      },
+      "layer_24_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0007382347248494625,
+          "max": 0.0007382347248494625
+        },
+        "qad": {
+          "unique": 35,
+          "min": 0.0007091703591868281,
+          "max": 0.0012672061566263437
+        }
+      },
+      "layer_24_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0007382347248494625,
+          "max": 0.0007382347248494625
+        },
+        "qad": {
+          "unique": 35,
+          "min": 0.0007091703591868281,
+          "max": 0.0012672061566263437
+        }
+      },
+      "layer_25_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0372023805975914,
+          "max": 0.0372023805975914
+        },
+        "qad": {
+          "unique": 146,
+          "min": 0.0033017112873494625,
+          "max": 0.0372023805975914
+        }
+      },
+      "layer_25_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0012439546408131719,
+          "max": 0.0012439546408131719
+        },
+        "qad": {
+          "unique": 47,
+          "min": 0.000732421875,
+          "max": 0.0013369605876505375
+        }
+      },
+      "layer_25_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0012439546408131719,
+          "max": 0.0012439546408131719
+        },
+        "qad": {
+          "unique": 47,
+          "min": 0.000732421875,
+          "max": 0.0013369605876505375
+        }
+      },
+      "layer_26_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.02511160634458065,
+          "max": 0.02511160634458065
+        },
+        "qad": {
+          "unique": 147,
+          "min": 0.00344122014939785,
+          "max": 0.0372023805975914
+        }
+      },
+      "layer_26_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0010346912313252687,
+          "max": 0.0010346912313252687
+        },
+        "qad": {
+          "unique": 36,
+          "min": 0.0007731119985692203,
+          "max": 0.0010695684468373656
+        }
+      },
+      "layer_26_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0010346912313252687,
+          "max": 0.0010346912313252687
+        },
+        "qad": {
+          "unique": 36,
+          "min": 0.0007731119985692203,
+          "max": 0.0010695684468373656
+        }
+      },
+      "layer_27_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0370163694024086,
+          "max": 0.0370163694024086
+        },
+        "qad": {
+          "unique": 141,
+          "min": 0.003162202425301075,
+          "max": 0.0368303582072258
+        }
+      },
+      "layer_27_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0010811941465362906,
+          "max": 0.0010811941465362906
+        },
+        "qad": {
+          "unique": 23,
+          "min": 0.0007847376982681453,
+          "max": 0.0010056268656626344
+        }
+      },
+      "layer_27_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0010811941465362906,
+          "max": 0.0010811941465362906
+        },
+        "qad": {
+          "unique": 23,
+          "min": 0.0007847376982681453,
+          "max": 0.0010056268656626344
+        }
+      },
+      "layer_28_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0372023805975914,
+          "max": 0.0372023805975914
+        },
+        "qad": {
+          "unique": 140,
+          "min": 0.0042317709885537624,
+          "max": 0.0370163694024086
+        }
+      },
+      "layer_28_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0008835565531626344,
+          "max": 0.0008835565531626344
+        },
+        "qad": {
+          "unique": 23,
+          "min": 0.0008428664295934141,
+          "max": 0.0010056268656626344
+        }
+      },
+      "layer_28_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0008835565531626344,
+          "max": 0.0008835565531626344
+        },
+        "qad": {
+          "unique": 23,
+          "min": 0.0008428664295934141,
+          "max": 0.0010056268656626344
+        }
+      },
+      "layer_29_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0372023805975914,
+          "max": 0.0372023805975914
+        },
+        "qad": {
+          "unique": 143,
+          "min": 0.005068824626505375,
+          "max": 0.0372023805975914
+        }
+      },
+      "layer_29_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0011044456623494625,
+          "max": 0.0011044456623494625
+        },
+        "qad": {
+          "unique": 26,
+          "min": 0.0009184337686747313,
+          "max": 0.0011276971781626344
+        }
+      },
+      "layer_29_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0011044456623494625,
+          "max": 0.0011044456623494625
+        },
+        "qad": {
+          "unique": 26,
+          "min": 0.0009184337686747313,
+          "max": 0.0011276971781626344
+        }
+      },
+      "layer_3_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0372023805975914,
+          "max": 0.0372023805975914
+        },
+        "qad": {
+          "unique": 59,
+          "min": 0.01422991044819355,
+          "max": 0.0372023805975914
+        }
+      },
+      "layer_3_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0010928199626505375,
+          "max": 0.0010928199626505375
+        },
+        "qad": {
+          "unique": 32,
+          "min": 0.0009533109841868281,
+          "max": 0.001232328824698925
+        }
+      },
+      "layer_3_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0010928199626505375,
+          "max": 0.0010928199626505375
+        },
+        "qad": {
+          "unique": 32,
+          "min": 0.0009533109841868281,
+          "max": 0.001232328824698925
+        }
+      },
+      "layer_30_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.03515625,
+          "max": 0.03515625
+        },
+        "qad": {
+          "unique": 147,
+          "min": 0.0050223213620483875,
+          "max": 0.0362723208963871
+        }
+      },
+      "layer_30_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0015229724813252687,
+          "max": 0.0015229724813252687
+        },
+        "qad": {
+          "unique": 53,
+          "min": 0.0009474981343373656,
+          "max": 0.0014880952658131719
+        }
+      },
+      "layer_30_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0015229724813252687,
+          "max": 0.0015229724813252687
+        },
+        "qad": {
+          "unique": 53,
+          "min": 0.0009474981343373656,
+          "max": 0.0014880952658131719
+        }
+      },
+      "layer_31_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0362723208963871,
+          "max": 0.0362723208963871
+        },
+        "qad": {
+          "unique": 148,
+          "min": 0.0044875373132526875,
+          "max": 0.0372023805975914
+        }
+      },
+      "layer_31_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0016159784281626344,
+          "max": 0.0016159784281626344
+        },
+        "qad": {
+          "unique": 44,
+          "min": 0.0009474981343373656,
+          "max": 0.0015462239971384406
+        }
+      },
+      "layer_31_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0016159784281626344,
+          "max": 0.0016159784281626344
+        },
+        "qad": {
+          "unique": 44,
+          "min": 0.0009474981343373656,
+          "max": 0.0015462239971384406
+        }
+      },
+      "layer_32_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.021484375,
+          "max": 0.021484375
+        },
+        "qad": {
+          "unique": 162,
+          "min": 0.0042550223879516125,
+          "max": 0.0305059514939785
+        }
+      },
+      "layer_32_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0010811941465362906,
+          "max": 0.0010811941465362906
+        },
+        "qad": {
+          "unique": 44,
+          "min": 0.0010463169310241938,
+          "max": 0.0013834635028615594
+        }
+      },
+      "layer_32_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0010811941465362906,
+          "max": 0.0010811941465362906
+        },
+        "qad": {
+          "unique": 44,
+          "min": 0.0010463169310241938,
+          "max": 0.0013834635028615594
+        }
+      },
+      "layer_33_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0372023805975914,
+          "max": 0.0372023805975914
+        },
+        "qad": {
+          "unique": 150,
+          "min": 0.0052315848879516125,
+          "max": 0.0372023805975914
+        }
+      },
+      "layer_33_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0015927269123494625,
+          "max": 0.0015927269123494625
+        },
+        "qad": {
+          "unique": 46,
+          "min": 0.0010056268656626344,
+          "max": 0.0014997209655120969
+        }
+      },
+      "layer_33_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0015927269123494625,
+          "max": 0.0015927269123494625
+        },
+        "qad": {
+          "unique": 46,
+          "min": 0.0010056268656626344,
+          "max": 0.0014997209655120969
+        }
+      },
+      "layer_34_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0372023805975914,
+          "max": 0.0372023805975914
+        },
+        "qad": {
+          "unique": 153,
+          "min": 0.004138764925301075,
+          "max": 0.0370163694024086
+        }
+      },
+      "layer_34_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0012788318563252687,
+          "max": 0.0012788318563252687
+        },
+        "qad": {
+          "unique": 61,
+          "min": 0.0010056268656626344,
+          "max": 0.0016392299439758062
+        }
+      },
+      "layer_34_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0012788318563252687,
+          "max": 0.0012788318563252687
+        },
+        "qad": {
+          "unique": 61,
+          "min": 0.0010056268656626344,
+          "max": 0.0016392299439758062
+        }
+      },
+      "layer_35_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0254836305975914,
+          "max": 0.0254836305975914
+        },
+        "qad": {
+          "unique": 157,
+          "min": 0.00534784235060215,
+          "max": 0.03125
+        }
+      },
+      "layer_35_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0017438615905120969,
+          "max": 0.0017438615905120969
+        },
+        "qad": {
+          "unique": 98,
+          "min": 0.0009998140158131719,
+          "max": 0.0022321429569274187
+        }
+      },
+      "layer_35_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0017438615905120969,
+          "max": 0.0017438615905120969
+        },
+        "qad": {
+          "unique": 98,
+          "min": 0.0009998140158131719,
+          "max": 0.0022321429569274187
+        }
+      },
+      "layer_36_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0323660708963871,
+          "max": 0.0323660708963871
+        },
+        "qad": {
+          "unique": 152,
+          "min": 0.0049758185632526875,
+          "max": 0.0362723208963871
+        }
+      },
+      "layer_36_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0016857328591868281,
+          "max": 0.0016857328591868281
+        },
+        "qad": {
+          "unique": 94,
+          "min": 0.0010695684468373656,
+          "max": 0.00217401422560215
+        }
+      },
+      "layer_36_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0016857328591868281,
+          "max": 0.0016857328591868281
+        },
+        "qad": {
+          "unique": 94,
+          "min": 0.0010695684468373656,
+          "max": 0.00217401422560215
+        }
+      },
+      "layer_37_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0372023805975914,
+          "max": 0.0372023805975914
+        },
+        "qad": {
+          "unique": 138,
+          "min": 0.006603422574698925,
+          "max": 0.0372023805975914
+        }
+      },
+      "layer_37_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.00197637639939785,
+          "max": 0.00197637639939785
+        },
+        "qad": {
+          "unique": 99,
+          "min": 0.0011858259094879031,
+          "max": 0.0023716518189758062
+        }
+      },
+      "layer_37_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.00197637639939785,
+          "max": 0.00197637639939785
+        },
+        "qad": {
+          "unique": 99,
+          "min": 0.0011858259094879031,
+          "max": 0.0023716518189758062
+        }
+      },
+      "layer_38_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0372023805975914,
+          "max": 0.0372023805975914
+        },
+        "qad": {
+          "unique": 132,
+          "min": 0.0077659972012043,
+          "max": 0.0372023805975914
+        }
+      },
+      "layer_38_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0018019903218373656,
+          "max": 0.0018019903218373656
+        },
+        "qad": {
+          "unique": 70,
+          "min": 0.0012381417909637094,
+          "max": 0.0022321429569274187
+        }
+      },
+      "layer_38_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0018019903218373656,
+          "max": 0.0018019903218373656
+        },
+        "qad": {
+          "unique": 70,
+          "min": 0.0012381417909637094,
+          "max": 0.0022321429569274187
+        }
+      },
+      "layer_39_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0271577388048172,
+          "max": 0.0271577388048172
+        },
+        "qad": {
+          "unique": 140,
+          "min": 0.004952567163854837,
+          "max": 0.0372023805975914
+        }
+      },
+      "layer_39_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0022553943563252687,
+          "max": 0.0022553943563252687
+        },
+        "qad": {
+          "unique": 57,
+          "min": 0.0014183407183736563,
+          "max": 0.0022437686566263437
+        }
+      },
+      "layer_39_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0022553943563252687,
+          "max": 0.0022553943563252687
+        },
+        "qad": {
+          "unique": 57,
+          "min": 0.0014183407183736563,
+          "max": 0.0022437686566263437
+        }
+      },
+      "layer_4_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.01134672574698925,
+          "max": 0.01134672574698925
+        },
+        "qad": {
+          "unique": 128,
+          "min": 0.00341796875,
+          "max": 0.01609002985060215
+        }
+      },
+      "layer_4_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0006742931436747313,
+          "max": 0.0006742931436747313
+        },
+        "qad": {
+          "unique": 38,
+          "min": 0.0006219773204065859,
+          "max": 0.0007498604827560484
+        }
+      },
+      "layer_4_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0006742931436747313,
+          "max": 0.0006742931436747313
+        },
+        "qad": {
+          "unique": 38,
+          "min": 0.0006219773204065859,
+          "max": 0.0007498604827560484
+        }
+      },
+      "layer_40_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0372023805975914,
+          "max": 0.0372023805975914
+        },
+        "qad": {
+          "unique": 125,
+          "min": 0.010974702425301075,
+          "max": 0.0372023805975914
+        }
+      },
+      "layer_40_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.00217401422560215,
+          "max": 0.00217401422560215
+        },
+        "qad": {
+          "unique": 62,
+          "min": 0.0015694753965362906,
+          "max": 0.0028018043376505375
+        }
+      },
+      "layer_40_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.00217401422560215,
+          "max": 0.00217401422560215
+        },
+        "qad": {
+          "unique": 62,
+          "min": 0.0015694753965362906,
+          "max": 0.0028018043376505375
+        }
+      },
+      "layer_41_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0372023805975914,
+          "max": 0.0372023805975914
+        },
+        "qad": {
+          "unique": 112,
+          "min": 0.01506696455180645,
+          "max": 0.0372023805975914
+        }
+      },
+      "layer_41_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0026157924439758062,
+          "max": 0.0026157924439758062
+        },
+        "qad": {
+          "unique": 65,
+          "min": 0.0018949962686747313,
+          "max": 0.002918061800301075
+        }
+      },
+      "layer_41_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0026157924439758062,
+          "max": 0.0026157924439758062
+        },
+        "qad": {
+          "unique": 65,
+          "min": 0.0018949962686747313,
+          "max": 0.002918061800301075
+        }
+      },
+      "layer_42_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0372023805975914,
+          "max": 0.0372023805975914
+        },
+        "qad": {
+          "unique": 91,
+          "min": 0.01888020895421505,
+          "max": 0.0372023805975914
+        }
+      },
+      "layer_42_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0029994419310241938,
+          "max": 0.0029994419310241938
+        },
+        "qad": {
+          "unique": 57,
+          "min": 0.0022553943563252687,
+          "max": 0.0035342262126505375
+        }
+      },
+      "layer_42_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0029994419310241938,
+          "max": 0.0029994419310241938
+        },
+        "qad": {
+          "unique": 57,
+          "min": 0.0022553943563252687,
+          "max": 0.0035342262126505375
+        }
+      },
+      "layer_43_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0372023805975914,
+          "max": 0.0372023805975914
+        },
+        "qad": {
+          "unique": 126,
+          "min": 0.011997767724096775,
+          "max": 0.0372023805975914
+        }
+      },
+      "layer_43_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.002453031949698925,
+          "max": 0.002453031949698925
+        },
+        "qad": {
+          "unique": 41,
+          "min": 0.0023600261192768812,
+          "max": 0.0029994419310241938
+        }
+      },
+      "layer_43_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.002453031949698925,
+          "max": 0.002453031949698925
+        },
+        "qad": {
+          "unique": 41,
+          "min": 0.0023600261192768812,
+          "max": 0.0029994419310241938
+        }
+      },
+      "layer_44_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0372023805975914,
+          "max": 0.0372023805975914
+        },
+        "qad": {
+          "unique": 161,
+          "min": 0.0074404762126505375,
+          "max": 0.0372023805975914
+        }
+      },
+      "layer_44_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0035109748132526875,
+          "max": 0.0035109748132526875
+        },
+        "qad": {
+          "unique": 124,
+          "min": 0.0025925408117473125,
+          "max": 0.010881696827709675
+        }
+      },
+      "layer_44_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0035109748132526875,
+          "max": 0.0035109748132526875
+        },
+        "qad": {
+          "unique": 124,
+          "min": 0.0025925408117473125,
+          "max": 0.010881696827709675
+        }
+      },
+      "layer_5_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.01027715764939785,
+          "max": 0.01027715764939785
+        },
+        "qad": {
+          "unique": 115,
+          "min": 0.003673735074698925,
+          "max": 0.01999627985060215
+        }
+      },
+      "layer_5_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0007120768423192203,
+          "max": 0.0007120768423192203
+        },
+        "qad": {
+          "unique": 32,
+          "min": 0.00067138671875,
+          "max": 0.0008079892140813172
+        }
+      },
+      "layer_5_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0007120768423192203,
+          "max": 0.0007120768423192203
+        },
+        "qad": {
+          "unique": 32,
+          "min": 0.00067138671875,
+          "max": 0.0008079892140813172
+        }
+      },
+      "layer_6_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0372023805975914,
+          "max": 0.0372023805975914
+        },
+        "qad": {
+          "unique": 119,
+          "min": 0.0059988838620483875,
+          "max": 0.0364583320915699
+        }
+      },
+      "layer_6_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0007614862406626344,
+          "max": 0.0007614862406626344
+        },
+        "qad": {
+          "unique": 28,
+          "min": 0.0006946382345631719,
+          "max": 0.0008312406716868281
+        }
+      },
+      "layer_6_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0007614862406626344,
+          "max": 0.0007614862406626344
+        },
+        "qad": {
+          "unique": 28,
+          "min": 0.0006946382345631719,
+          "max": 0.0008312406716868281
+        }
+      },
+      "layer_7_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.009765625,
+          "max": 0.009765625
+        },
+        "qad": {
+          "unique": 118,
+          "min": 0.0034877231810241938,
+          "max": 0.01906622014939785
+        }
+      },
+      "layer_7_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0006917317514307797,
+          "max": 0.0006917317514307797
+        },
+        "qad": {
+          "unique": 37,
+          "min": 0.0006277901702560484,
+          "max": 0.0008021763642318547
+        }
+      },
+      "layer_7_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0006917317514307797,
+          "max": 0.0006917317514307797
+        },
+        "qad": {
+          "unique": 37,
+          "min": 0.0006277901702560484,
+          "max": 0.0008021763642318547
+        }
+      },
+      "layer_8_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0254836305975914,
+          "max": 0.0254836305975914
+        },
+        "qad": {
+          "unique": 122,
+          "min": 0.0036969867069274187,
+          "max": 0.0254836305975914
+        }
+      },
+      "layer_8_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0006626673857681453,
+          "max": 0.0006626673857681453
+        },
+        "qad": {
+          "unique": 36,
+          "min": 0.0005841936217620969,
+          "max": 0.0007266090251505375
+        }
+      },
+      "layer_8_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0006626673857681453,
+          "max": 0.0006626673857681453
+        },
+        "qad": {
+          "unique": 36,
+          "min": 0.0005841936217620969,
+          "max": 0.0007266090251505375
+        }
+      },
+      "layer_9_down_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.013392857275903225,
+          "max": 0.013392857275903225
+        },
+        "qad": {
+          "unique": 124,
+          "min": 0.0033482143189758062,
+          "max": 0.01897321455180645
+        }
+      },
+      "layer_9_gate_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0006481352029368281,
+          "max": 0.0006481352029368281
+        },
+        "qad": {
+          "unique": 35,
+          "min": 0.0005841936217620969,
+          "max": 0.0006975446594879031
+        }
+      },
+      "layer_9_up_proj": {
+        "spark": {
+          "unique": 1,
+          "min": 0.0006481352029368281,
+          "max": 0.0006481352029368281
+        },
+        "qad": {
+          "unique": 35,
+          "min": 0.0005841936217620969,
+          "max": 0.0006975446594879031
+        }
+      }
+    },
+    "kernel_selection": {
+      "preserved_spark_queries": 104,
+      "fixed_cache_queries": 112,
+      "additional_nonuniform_scale_moe_configs": {
+        "259939fbc97817fa7d6bb5dd19e7da1a286cdcdc0bb92213798aeaa60ddb2ec2": {
+          "backend": "dynamic",
+          "dynamic_route_mode": "direct",
+          "dynamic_tile_m": 16,
+          "max_active_clusters": null,
+          "nvfp4_inline_scales": false,
+          "nvfp4_materialize_intermediate": false,
+          "nvfp4_share_input": false,
+          "route_planner": "internal",
+          "w4a16_block_size_m": null,
+          "w4a16_pipeline_stages": null,
+          "w4a16_route_mode": null,
+          "w4a16_tile_config": null
+        },
+        "25a8aa5fc2b63843c001c66808da2c14aed80cd089f999fe80201be6a751838c": {
+          "backend": "dynamic",
+          "dynamic_route_mode": "grouped",
+          "dynamic_tile_m": 16,
+          "max_active_clusters": 141,
+          "nvfp4_inline_scales": true,
+          "nvfp4_materialize_intermediate": false,
+          "nvfp4_share_input": false,
+          "route_planner": "triton",
+          "w4a16_block_size_m": null,
+          "w4a16_pipeline_stages": null,
+          "w4a16_route_mode": null,
+          "w4a16_tile_config": null
+        },
+        "5c276ef3ce7a4e3392a2dd9fe268b7bba73950d9c4db31d002971ee04f8a7c22": {
+          "backend": "micro",
+          "dynamic_route_mode": null,
+          "dynamic_tile_m": null,
+          "max_active_clusters": null,
+          "nvfp4_inline_scales": false,
+          "nvfp4_materialize_intermediate": false,
+          "nvfp4_share_input": false,
+          "route_planner": "internal",
+          "w4a16_block_size_m": null,
+          "w4a16_pipeline_stages": null,
+          "w4a16_route_mode": null,
+          "w4a16_tile_config": null
+        },
+        "60807264105c9bc105603a8a6927311c5cd61db9e316c709738320c77597124e": {
+          "backend": "dynamic",
+          "dynamic_route_mode": "grouped",
+          "dynamic_tile_m": 32,
+          "max_active_clusters": null,
+          "nvfp4_inline_scales": false,
+          "nvfp4_materialize_intermediate": false,
+          "nvfp4_share_input": false,
+          "route_planner": "internal",
+          "w4a16_block_size_m": null,
+          "w4a16_pipeline_stages": null,
+          "w4a16_route_mode": null,
+          "w4a16_tile_config": null
+        },
+        "6b3f3d34fb0f7bf872be9016001f22ca28d41b5105178acc48bf682bae323058": {
+          "backend": "dynamic",
+          "dynamic_route_mode": "grouped",
+          "dynamic_tile_m": 16,
+          "max_active_clusters": null,
+          "nvfp4_inline_scales": true,
+          "nvfp4_materialize_intermediate": false,
+          "nvfp4_share_input": false,
+          "route_planner": "triton",
+          "w4a16_block_size_m": null,
+          "w4a16_pipeline_stages": null,
+          "w4a16_route_mode": null,
+          "w4a16_tile_config": null
+        },
+        "85d91f730673fe8c5ef82675314b221e39bc2f6322f016b3f9dd79a6054213ca": {
+          "backend": "dynamic",
+          "dynamic_route_mode": "grouped",
+          "dynamic_tile_m": 16,
+          "max_active_clusters": null,
+          "nvfp4_inline_scales": true,
+          "nvfp4_materialize_intermediate": false,
+          "nvfp4_share_input": false,
+          "route_planner": "internal",
+          "w4a16_block_size_m": null,
+          "w4a16_pipeline_stages": null,
+          "w4a16_route_mode": null,
+          "w4a16_tile_config": null
+        },
+        "955ec087d1b717a7c38b9c740911372580c10e5807fc8afba0be1341502d6955": {
+          "backend": "dynamic",
+          "dynamic_route_mode": "grouped",
+          "dynamic_tile_m": 16,
+          "max_active_clusters": 128,
+          "nvfp4_inline_scales": false,
+          "nvfp4_materialize_intermediate": false,
+          "nvfp4_share_input": false,
+          "route_planner": "triton",
+          "w4a16_block_size_m": null,
+          "w4a16_pipeline_stages": null,
+          "w4a16_route_mode": null,
+          "w4a16_tile_config": null
+        },
+        "c5ec84a3a6e601088d73fc630110705ba9bef1d7373a9c129d3f720622045694": {
+          "backend": "dynamic",
+          "dynamic_route_mode": "grouped",
+          "dynamic_tile_m": 16,
+          "max_active_clusters": 128,
+          "nvfp4_inline_scales": true,
+          "nvfp4_materialize_intermediate": false,
+          "nvfp4_share_input": false,
+          "route_planner": "triton",
+          "w4a16_block_size_m": null,
+          "w4a16_pipeline_stages": null,
+          "w4a16_route_mode": null,
+          "w4a16_tile_config": null
+        }
+      }
+    },
+    "limits": [
+      "One load per modified model; prompt bootstrap excludes general between-load variation.",
+      "The activation-only composition changes gate, up and down input_scale tensors together.",
+      "Scale changes alter the legal shared-input optimization, selected MoE configuration and numerical model behavior; these components are not isolated from one another.",
+      "Hybrid quality, decode and other hardware or TP configurations are unqualified.",
+      "Full QAD also differs in routers, trained projections and online conversion; its remaining differences cannot all be attributed to activation scales."
+    ],
+    "artifacts": [
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/expert-weight-ablation/input-scale-composition.json",
+        "sha256": "2cc34f57cb5925bace74a2674336f3451e95e6bfad0b884d58a8a20f04c77362"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/expert-weight-ablation/input-scale-composition-mount.json",
+        "sha256": "0eada1cab1b9226726e823a6a0053b029a9f567b5fc85945cf0e7634f73f29ad"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/expert-weight-ablation/input-scale-comparison.json",
+        "sha256": "c68cc3d8f597194dda1dd6993fa4a8beb022a13c7a52bd79dbeb860e550d5d4f"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/expert-weight-ablation/prompts.json",
+        "sha256": "cfb246e197e56fc59ae2dd2b9a9bfe85a94638990d9e2916f128ddab1d28ec35"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/expert-weight-ablation/results.json",
+        "sha256": "1a22214d58b4a757f9ae421a22b5b415ccb6911350c2b5e1282b056bbee73148"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-spark-a-repeat/launch.json",
+        "sha256": "63f379884c79a7c78c3b68349ad5c1cbd1101ecceac66f20b1666fddbaa6471a"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-spark-a-repeat/selection-cache-before.json",
+        "sha256": "b76da750996f7c47519c92a00d69e8d135396c39fb9fc3d320b5fc38dd5bad70"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-spark-a-repeat/selection-cache-after.json",
+        "sha256": "b76da750996f7c47519c92a00d69e8d135396c39fb9fc3d320b5fc38dd5bad70"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-spark-a-repeat/controlled-prefill/results.json",
+        "sha256": "a2214b56033ed47576784551d885a14647f3aacd1ba98aacbfb8511965ab1454"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-spark-a-repeat/controlled-prefill/telemetry.csv",
+        "sha256": "27d4ac032483dab35af3f36aa242b2e5d10f1d24614d9eb620f7d735633e76a6"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/expert-swap-spark-a-repeat/benchmark/prefill.json",
+        "sha256": "f06d1019811cc8615c17e946a67ba568ff7151269a22408a3251558570bf9867"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/input-scale-swap-qad-mounted/launch.json",
+        "sha256": "57f838d461d78e3da6cf4ecba88ef87549dac7ebb29cfadc5e3a070717286a54"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/input-scale-swap-qad-mounted/selection-cache-before.json",
+        "sha256": "bc319b6ef0dc2ee5ce77580a45379ebbec92e0bea067a8ccbc72b776a5659652"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/input-scale-swap-qad-mounted/selection-cache-after.json",
+        "sha256": "bc319b6ef0dc2ee5ce77580a45379ebbec92e0bea067a8ccbc72b776a5659652"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/input-scale-swap-qad-mounted/controlled-prefill/results.json",
+        "sha256": "5741c3c80cd31ae2ed84a59f42c8252af51fd3d578408dabe97ca537481b1230"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/input-scale-swap-qad-mounted/controlled-prefill/telemetry.csv",
+        "sha256": "da0a240a5100a2807d54dca26afb4e4fa8309642470d02a5d46667e502b6c0dc"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/input-scale-swap-qad-mounted/benchmark/prefill.json",
+        "sha256": "ef11daa1f451685b9e3063135d50224983c3518f1d48a97cfc5f8d550d91096f"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/online-qad-scale-contract/launch.json",
+        "sha256": "fdec283ac68f7402f06d93d93516ade0e8a8329d880cbd7ab4df02253f3ad2a2"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/online-qad-scale-contract/selection-cache-before.json",
+        "sha256": "bc319b6ef0dc2ee5ce77580a45379ebbec92e0bea067a8ccbc72b776a5659652"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/online-qad-scale-contract/selection-cache-after.json",
+        "sha256": "bc319b6ef0dc2ee5ce77580a45379ebbec92e0bea067a8ccbc72b776a5659652"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/online-qad-scale-contract/controlled-prefill/results.json",
+        "sha256": "aba4f69ce4c17da276e60d287e572e961383d0e6bb38876eca942d49aa23bf13"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/online-qad-scale-contract/controlled-prefill/telemetry.csv",
+        "sha256": "a9dbc8424898bfb525f44ab9ac8ac5ade92568b0fa3542c932dfbd0d3fec0ea9"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/online-qad-scale-contract/benchmark/prefill.json",
+        "sha256": "3c37f7fdacf1ac4d66a5c0fc31970acb11ad3f7ff2bf4b50da52fc313fc9eb12"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/input-scale-swap-spark-control/launch.json",
+        "sha256": "963f4fc9513ca6b5f3464467d04cf5a1323b02c4a2b134a80a52be9c6e409215"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/input-scale-swap-spark-control/selection-cache-before.json",
+        "sha256": "bc319b6ef0dc2ee5ce77580a45379ebbec92e0bea067a8ccbc72b776a5659652"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/input-scale-swap-spark-control/selection-cache-after.json",
+        "sha256": "bc319b6ef0dc2ee5ce77580a45379ebbec92e0bea067a8ccbc72b776a5659652"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/input-scale-swap-spark-control/controlled-prefill/results.json",
+        "sha256": "ce47c3fa234477ccee813990afd7afe5a2f20dbcb594f5bc23f2a44b8d653cd2"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/input-scale-swap-spark-control/controlled-prefill/telemetry.csv",
+        "sha256": "1b0eeb3220b94c9195cfbdcf38967392153b3b47df7b5528d6d80bbf42f7193e"
+      },
+      {
+        "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/serving/input-scale-swap-spark-control/benchmark/prefill.json",
+        "sha256": "bfadad67412355aa90831cb72669512d7ad1da97564355d60cdb9136a65459f7"
+      }
+    ]
   }
 }
