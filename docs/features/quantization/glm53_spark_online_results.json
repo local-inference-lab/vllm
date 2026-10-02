@@ -1,0 +1,998 @@
+{
+  "status": "qualified bounded serving; research-only throughput and corpus quality",
+  "source_revision": "cfd47bd7680e68408924df09b179d5bed25b2ae9",
+  "selection_revision": "a608241037e4c2565356bff7ca293f2133888f88",
+  "image": "ghcr.io/local-inference-lab/vllm@sha256:2230db60afb4fd06dc2ef2b7f7f27dc7f78d7a50be70a08461b4df9fa5e90732",
+  "vllm_base": "93dabce32fd4d5355662608296e64d720711cdcc",
+  "b12x": "a77b3f85e5e2a81315ff4a90088912f187708005",
+  "performance": {
+    "teacher-nospec-1": {
+      "description": "BF16 selected projections; no MTP",
+      "decode": {
+        "1": {
+          "samples_tok_s": [
+            121.84282083984469,
+            121.70497062162926,
+            121.62979813698016
+          ],
+          "median_tok_s": 121.70497062162926
+        },
+        "8": {
+          "samples_tok_s": [
+            511.33227335024776,
+            513.9170365383151,
+            509.6490772502626
+          ],
+          "median_tok_s": 511.33227335024776
+        }
+      },
+      "prefill": {
+        "4096": {
+          "ttft_seconds": 0.649,
+          "prefill_seconds": 0.649,
+          "tok_per_sec": 6423.0,
+          "client_ttft_seconds": 0.649,
+          "client_tok_per_sec": 6423.0,
+          "prompt_tokens": 4169,
+          "samples": 4,
+          "method": "client",
+          "server_validation": {
+            "method": "prometheus",
+            "tok_per_sec": 6545.0,
+            "prefill_seconds": 0.637,
+            "prompt_tokens": 4169,
+            "request_prompt_tokens": 4169,
+            "cached_tokens": 0,
+            "token_source": "kv_computed",
+            "samples": 4,
+            "invalid_reason": ""
+          },
+          "hardware_summary": {}
+        }
+      },
+      "benchmark_directory": "serving/teacher-nospec-1/benchmark",
+      "telemetry": {
+        "12": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2602.0,
+            "median": 2782.0,
+            "max": 2812.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "median": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 101.64,
+            "median": 408.57,
+            "max": 434.25
+          },
+          "memory.used [MiB]": {
+            "min": 95033.0,
+            "median": 95033.0,
+            "max": 95033.0
+          }
+        },
+        "13": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2610.0,
+            "median": 2835.0,
+            "max": 2895.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "median": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 100.03,
+            "median": 448.53,
+            "max": 480.5
+          },
+          "memory.used [MiB]": {
+            "min": 94413.0,
+            "median": 94413.0,
+            "max": 94413.0
+          }
+        }
+      }
+    },
+    "weights-nospec-5": {
+      "description": "MXFP8 selected projections; no MTP",
+      "decode": {
+        "1": {
+          "samples_tok_s": [
+            145.37628811528387,
+            145.0706734267356,
+            144.99730512396076
+          ],
+          "median_tok_s": 145.0706734267356
+        },
+        "8": {
+          "samples_tok_s": [
+            559.5284217015267,
+            558.6305373340452,
+            556.9707369201229
+          ],
+          "median_tok_s": 558.6305373340452
+        }
+      },
+      "prefill": {
+        "4096": {
+          "ttft_seconds": 0.828,
+          "prefill_seconds": 0.828,
+          "tok_per_sec": 5037.0,
+          "client_ttft_seconds": 0.828,
+          "client_tok_per_sec": 5037.0,
+          "prompt_tokens": 4169,
+          "samples": 4,
+          "method": "client",
+          "server_validation": {
+            "method": "prometheus",
+            "tok_per_sec": 5115.0,
+            "prefill_seconds": 0.815,
+            "prompt_tokens": 4169,
+            "request_prompt_tokens": 4169,
+            "cached_tokens": 0,
+            "token_source": "kv_computed",
+            "samples": 4,
+            "invalid_reason": ""
+          },
+          "hardware_summary": {}
+        }
+      },
+      "benchmark_directory": "serving/weights-nospec-5/benchmark",
+      "telemetry": {
+        "12": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2602.0,
+            "median": 2775.0,
+            "max": 2812.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "median": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 100.68,
+            "median": 412.96,
+            "max": 431.44
+          },
+          "memory.used [MiB]": {
+            "min": 91847.0,
+            "median": 91847.0,
+            "max": 91867.0
+          }
+        },
+        "13": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2610.0,
+            "median": 2835.0,
+            "max": 2895.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "median": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 105.85,
+            "median": 461.99,
+            "max": 485.6
+          },
+          "memory.used [MiB]": {
+            "min": 91247.0,
+            "median": 91247.0,
+            "max": 91267.0
+          }
+        }
+      }
+    },
+    "teacher-prefill32k-9": {
+      "description": "BF16 selected projections; no MTP; 65536 model limit",
+      "decode": {},
+      "prefill": {
+        "4096": {
+          "ttft_seconds": 0.642,
+          "prefill_seconds": 0.642,
+          "tok_per_sec": 6490.0,
+          "client_ttft_seconds": 0.642,
+          "client_tok_per_sec": 6490.0,
+          "prompt_tokens": 4169,
+          "samples": 4,
+          "method": "client",
+          "server_validation": {
+            "method": "prometheus",
+            "tok_per_sec": 6618.0,
+            "prefill_seconds": 0.63,
+            "prompt_tokens": 4169,
+            "request_prompt_tokens": 4169,
+            "cached_tokens": 0,
+            "token_source": "kv_computed",
+            "samples": 4,
+            "invalid_reason": ""
+          },
+          "hardware_summary": {}
+        },
+        "32768": {
+          "ttft_seconds": 4.197,
+          "prefill_seconds": 4.197,
+          "tok_per_sec": 7702.0,
+          "client_ttft_seconds": 4.197,
+          "client_tok_per_sec": 7702.0,
+          "prompt_tokens": 32328,
+          "samples": 2,
+          "method": "client",
+          "server_validation": {
+            "method": "prometheus",
+            "tok_per_sec": 7796.0,
+            "prefill_seconds": 4.147,
+            "prompt_tokens": 32328,
+            "request_prompt_tokens": 32328,
+            "cached_tokens": 0,
+            "token_source": "kv_computed",
+            "samples": 2,
+            "invalid_reason": ""
+          },
+          "hardware_summary": {}
+        }
+      },
+      "benchmark_directory": "serving/teacher-prefill32k-9/benchmark",
+      "telemetry": {
+        "14": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2632.0,
+            "median": 2819.5,
+            "max": 2880.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "median": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 101.19,
+            "median": 267.605,
+            "max": 462.87
+          },
+          "memory.used [MiB]": {
+            "min": 93707.0,
+            "median": 93715.0,
+            "max": 93715.0
+          }
+        },
+        "15": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2775.0,
+            "median": 2864.5,
+            "max": 2910.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "median": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 110.51,
+            "median": 279.87,
+            "max": 438.68
+          },
+          "memory.used [MiB]": {
+            "min": 93707.0,
+            "median": 93719.0,
+            "max": 93719.0
+          }
+        }
+      }
+    },
+    "weights-prefill32k-9": {
+      "description": "MXFP8 selected projections; no MTP; 65536 model limit",
+      "decode": {},
+      "prefill": {
+        "4096": {
+          "ttft_seconds": 0.84,
+          "prefill_seconds": 0.84,
+          "tok_per_sec": 4965.0,
+          "client_ttft_seconds": 0.84,
+          "client_tok_per_sec": 4965.0,
+          "prompt_tokens": 4170,
+          "samples": 4,
+          "method": "client",
+          "server_validation": {
+            "method": "prometheus",
+            "tok_per_sec": 5039.0,
+            "prefill_seconds": 0.828,
+            "prompt_tokens": 4170,
+            "request_prompt_tokens": 4170,
+            "cached_tokens": 0,
+            "token_source": "kv_computed",
+            "samples": 4,
+            "invalid_reason": ""
+          },
+          "hardware_summary": {}
+        },
+        "32768": {
+          "ttft_seconds": 5.414,
+          "prefill_seconds": 5.414,
+          "tok_per_sec": 5969.0,
+          "client_ttft_seconds": 5.414,
+          "client_tok_per_sec": 5969.0,
+          "prompt_tokens": 32312,
+          "samples": 2,
+          "method": "client",
+          "server_validation": {
+            "method": "prometheus",
+            "tok_per_sec": 6022.0,
+            "prefill_seconds": 5.365,
+            "prompt_tokens": 32312,
+            "request_prompt_tokens": 32312,
+            "cached_tokens": 0,
+            "token_source": "kv_computed",
+            "samples": 2,
+            "invalid_reason": ""
+          },
+          "hardware_summary": {}
+        }
+      },
+      "benchmark_directory": "serving/weights-prefill32k-9/benchmark",
+      "telemetry": {
+        "12": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2662.0,
+            "median": 2699.5,
+            "max": 2820.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "median": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 105.13,
+            "median": 242.39,
+            "max": 357.63
+          },
+          "memory.used [MiB]": {
+            "min": 90487.0,
+            "median": 90489.0,
+            "max": 90489.0
+          }
+        },
+        "13": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2602.0,
+            "median": 2812.0,
+            "max": 2895.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "median": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 101.64,
+            "median": 272.09,
+            "max": 381.52
+          },
+          "memory.used [MiB]": {
+            "min": 90487.0,
+            "median": 90489.0,
+            "max": 90489.0
+          }
+        }
+      }
+    },
+    "weights-mtp-native-scales-10": {
+      "description": "MXFP8 projections; NVFP4 W4A16 MTP; native draft scales; 65536 model limit",
+      "decode": {
+        "1": {
+          "samples_tok_s": [
+            210.979054062759,
+            212.88086335034905,
+            217.0756068188855
+          ],
+          "median_tok_s": 212.88086335034905
+        },
+        "8": {
+          "samples_tok_s": [
+            718.1112851538443,
+            710.2694680236079,
+            712.6668885004123
+          ],
+          "median_tok_s": 712.6668885004123
+        }
+      },
+      "prefill": {
+        "4096": {
+          "ttft_seconds": 0.85,
+          "prefill_seconds": 0.85,
+          "tok_per_sec": 4903.0,
+          "client_ttft_seconds": 0.85,
+          "client_tok_per_sec": 4903.0,
+          "prompt_tokens": 4169,
+          "samples": 4,
+          "method": "client",
+          "server_validation": {
+            "method": "prometheus",
+            "tok_per_sec": 4977.0,
+            "prefill_seconds": 0.838,
+            "prompt_tokens": 4169,
+            "request_prompt_tokens": 4169,
+            "cached_tokens": 0,
+            "token_source": "kv_computed",
+            "samples": 4,
+            "invalid_reason": ""
+          },
+          "hardware_summary": {}
+        },
+        "32768": {
+          "ttft_seconds": 5.565,
+          "prefill_seconds": 5.565,
+          "tok_per_sec": 5808.0,
+          "client_ttft_seconds": 5.565,
+          "client_tok_per_sec": 5808.0,
+          "prompt_tokens": 32322,
+          "samples": 2,
+          "method": "client",
+          "server_validation": {
+            "method": "prometheus",
+            "tok_per_sec": 5865.0,
+            "prefill_seconds": 5.511,
+            "prompt_tokens": 32322,
+            "request_prompt_tokens": 32322,
+            "cached_tokens": 0,
+            "token_source": "kv_computed",
+            "samples": 2,
+            "invalid_reason": ""
+          },
+          "hardware_summary": {}
+        }
+      },
+      "benchmark_directory": "serving/weights-mtp-native-scales-10/benchmark-verified",
+      "telemetry": {
+        "14": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2670.0,
+            "median": 2835.0,
+            "max": 2872.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "median": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 102.39,
+            "median": 439.92499999999995,
+            "max": 522.93
+          },
+          "memory.used [MiB]": {
+            "min": 92853.0,
+            "median": 92853.0,
+            "max": 92913.0
+          }
+        },
+        "15": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2610.0,
+            "median": 2850.0,
+            "max": 2910.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "median": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 101.72,
+            "median": 441.28999999999996,
+            "max": 518.29
+          },
+          "memory.used [MiB]": {
+            "min": 92811.0,
+            "median": 92811.0,
+            "max": 92871.0
+          }
+        }
+      },
+      "mtp_counters": {
+        "vllm:spec_decode_num_drafts_total": 41120.0,
+        "vllm:spec_decode_num_draft_tokens_total": 123360.0,
+        "vllm:spec_decode_num_accepted_tokens_total": 64721.0
+      },
+      "accepted_fraction": 0.5246514267185474
+    },
+    "weights-mtp-csf-shared-11": {
+      "description": "MXFP8 projections; NVFP4 W4A16 MTP; CSF draft scales; 65536 model limit",
+      "decode": {
+        "1": {
+          "samples_tok_s": [
+            215.56934204059746,
+            204.01704843287465,
+            216.56517218188094
+          ],
+          "median_tok_s": 215.56934204059746
+        },
+        "8": {
+          "samples_tok_s": [
+            707.2981880520518,
+            714.2207982071544,
+            700.7351298312094
+          ],
+          "median_tok_s": 707.2981880520518
+        }
+      },
+      "prefill": {
+        "4096": {
+          "ttft_seconds": 0.872,
+          "prefill_seconds": 0.872,
+          "tok_per_sec": 4781.0,
+          "client_ttft_seconds": 0.872,
+          "client_tok_per_sec": 4781.0,
+          "prompt_tokens": 4170,
+          "samples": 4,
+          "method": "client",
+          "server_validation": {
+            "method": "prometheus",
+            "tok_per_sec": 4848.0,
+            "prefill_seconds": 0.86,
+            "prompt_tokens": 4170,
+            "request_prompt_tokens": 4170,
+            "cached_tokens": 0,
+            "token_source": "kv_computed",
+            "samples": 4,
+            "invalid_reason": ""
+          },
+          "hardware_summary": {}
+        },
+        "32768": {
+          "ttft_seconds": 5.628,
+          "prefill_seconds": 5.628,
+          "tok_per_sec": 5743.0,
+          "client_ttft_seconds": 5.628,
+          "client_tok_per_sec": 5743.0,
+          "prompt_tokens": 32321,
+          "samples": 2,
+          "method": "client",
+          "server_validation": {
+            "method": "prometheus",
+            "tok_per_sec": 5792.0,
+            "prefill_seconds": 5.58,
+            "prompt_tokens": 32321,
+            "request_prompt_tokens": 32321,
+            "cached_tokens": 0,
+            "token_source": "kv_computed",
+            "samples": 2,
+            "invalid_reason": ""
+          },
+          "hardware_summary": {}
+        }
+      },
+      "benchmark_directory": "serving/weights-mtp-csf-shared-11/benchmark",
+      "telemetry": {
+        "12": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2610.0,
+            "median": 2775.0,
+            "max": 2812.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "median": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 102.48,
+            "median": 403.61,
+            "max": 478.35
+          },
+          "memory.used [MiB]": {
+            "min": 92673.0,
+            "median": 92773.0,
+            "max": 92793.0
+          }
+        },
+        "13": {
+          "clocks.current.graphics [MHz]": {
+            "min": 2610.0,
+            "median": 2835.0,
+            "max": 2887.0
+          },
+          "clocks.current.memory [MHz]": {
+            "min": 16365.0,
+            "median": 16365.0,
+            "max": 16365.0
+          },
+          "power.draw [W]": {
+            "min": 104.98,
+            "median": 455.2,
+            "max": 534.0
+          },
+          "memory.used [MiB]": {
+            "min": 92633.0,
+            "median": 92733.0,
+            "max": 92753.0
+          }
+        }
+      },
+      "mtp_counters": {
+        "vllm:spec_decode_num_drafts_total": 40981.0,
+        "vllm:spec_decode_num_draft_tokens_total": 122943.0,
+        "vllm:spec_decode_num_accepted_tokens_total": 64659.0
+      },
+      "accepted_fraction": 0.5259266489348723
+    }
+  },
+  "evidence_sha256": {
+    "serving/teacher-nospec-1/launch.json": "ead0c8df00750e2a8ce21f82281f5292bc0268c959d1a062baf14475f20269d9",
+    "serving/teacher-nospec-1/benchmark/completed.json": "32cc8bea074b05ccc1bd5babe81e05e255fcc185f4757dd5fe9721cf6fb36031",
+    "serving/teacher-nospec-1/benchmark/decode-2.json": "fad6fd31a15ac9be8741a290063cd564e3dbaffe99e5163da9522f051a6e1082",
+    "serving/teacher-nospec-1/benchmark/decode-1.json": "58d01e594d674c20a7e096e86c021c70b9b34d8ece1340b7ddc5190e68ffd4cd",
+    "serving/teacher-nospec-1/benchmark/prefill.json": "92ea65197b772ed798ffd1987c3a4e046feafbb9a1f42cd1088b4cd66c2aef92",
+    "serving/teacher-nospec-1/benchmark/decode-3.json": "7000a581b8edb984ad76bfd43e565b0fa267967ef3d345b9678dd5673f03c3f2",
+    "serving/teacher-nospec-1/benchmark/metrics-before.txt": "e6885b2b76d4d81889ac5d11234324f0942c555cd394968971a83626455bd064",
+    "serving/teacher-nospec-1/benchmark/metrics-after.txt": "e62ef9321887acbdbef77101f8c0ac5c142005497afd399dd8763e0ba75a1b1f",
+    "serving/teacher-nospec-1/benchmark/telemetry.csv": "16d962ba345169388ba4888bb0e45202461b0bba972c6619e6b4fa7661ca46c9",
+    "serving/weights-nospec-5/launch.json": "3662cfb5463f86c4e32f0ac8a910e68bdeb23b1d93a7e920c051807fafb544ee",
+    "serving/weights-nospec-5/benchmark/completed.json": "fe371c27134b2d3772c2bbac5d6f29cce2dd4a6b0018f2eb3d4fb066a8fa0486",
+    "serving/weights-nospec-5/benchmark/decode-2.json": "e5ca3dfdaaeb811b2adc228afe93e1d192049734889da5fb2e74095e82c801f7",
+    "serving/weights-nospec-5/benchmark/decode-1.json": "1d002d41e7a99dbd66f87d215faa80c17074503fb0ca70f807f1d8992cd60aed",
+    "serving/weights-nospec-5/benchmark/prefill.json": "eecbdacae5bca624313ac9f3d619e599931edc69ffddee258fca0c065a2bb49f",
+    "serving/weights-nospec-5/benchmark/decode-3.json": "0c4ca73322bd06ef9e643925f25eb8b834e8e82c560ca2556748eec45439e634",
+    "serving/weights-nospec-5/benchmark/metrics-before.txt": "3e28ade689706d6d10683d9b253000b3537b10f1d0f17d5af0df79d1abd514e5",
+    "serving/weights-nospec-5/benchmark/metrics-after.txt": "d06ea4e7079eb8a0e1c4503f57b1661692327788350fbb74fb650bcafc3e2ea7",
+    "serving/weights-nospec-5/benchmark/telemetry.csv": "a027aa787540a9999624bec25347b965d6ef1b3671129b169e3bba189342e756",
+    "serving/teacher-prefill32k-9/launch.json": "2ea8d4c162231979fa1984d8f615a431a4cd32274fab90f5b23af4d5e94ab710",
+    "serving/teacher-prefill32k-9/benchmark/completed.json": "3cfa4362a565478ecea49635a0959aa08005c8318511353c2dc58d285a3f84c4",
+    "serving/teacher-prefill32k-9/benchmark/prefill.json": "0bf29414b48a556399501f0a675612364b10997f2dcfeb40d980a58e14ce3ff8",
+    "serving/teacher-prefill32k-9/benchmark/metrics-before.txt": "7ad438f72c7f36d6af8aef203f62cad1fdae72e545b34e6ac647f3283dcc5591",
+    "serving/teacher-prefill32k-9/benchmark/metrics-after.txt": "2a1865a88a6b044dce0fc97f5772e3b02f95dbd5f0a50333976ae764fb3de04f",
+    "serving/teacher-prefill32k-9/benchmark/telemetry.csv": "267ff48c4ebde3ee578450810090f479c2c064e2ef947e3aa92b06188f0b2283",
+    "serving/weights-prefill32k-9/launch.json": "5fdbe34e859ebfbbbd757088dccfeca1e148d7df560a77371e52203108b0d885",
+    "serving/weights-prefill32k-9/benchmark/completed.json": "8deb1e0e08032b546950ab8b292ca7bc382d9540a3ff6d0921de358fd0c81200",
+    "serving/weights-prefill32k-9/benchmark/prefill.json": "b2b89202e70ff3536eb7bd33a00ad1ab5178f90cdbe73c8e88b63a9dd3204ed3",
+    "serving/weights-prefill32k-9/benchmark/metrics-before.txt": "ec61521cb2cf9f6e503a31156aa218e7ca37076aed2588c54b79bba49a9338e0",
+    "serving/weights-prefill32k-9/benchmark/metrics-after.txt": "eb2a45b0fd750483d8179740b719ef4da26d91abc28da304ee0f19e8d80afc67",
+    "serving/weights-prefill32k-9/benchmark/telemetry.csv": "0d70ce9503a8ddba9a25dc16ced0acb1e5a123ec2cbee9447d9c236520cdb843",
+    "serving/weights-mtp-native-scales-10/launch.json": "f3c27a4307eeea20be958a51dabe068d078a1300f48386ec53c1fce10351c9ca",
+    "serving/weights-mtp-native-scales-10/benchmark-verified/completed.json": "7dded15ae766df42f48eeeadc22bb4a0817aa9ea9a399059e9879853ef8108c2",
+    "serving/weights-mtp-native-scales-10/benchmark-verified/decode-2.json": "76eaaccf71cd2efff1c46b15e4aca62c406fdcd777c02d556212fac1e696f3e3",
+    "serving/weights-mtp-native-scales-10/benchmark-verified/decode-1.json": "30d37c565ddd95c9c63975a2d2a40c3b3a7c5e7e89401a3ffb608a8739b8a171",
+    "serving/weights-mtp-native-scales-10/benchmark-verified/prefill.json": "01e2b93a189d3e5ed57ed2da0b83472a273b4a60f50cc29d92e88d1fc0551204",
+    "serving/weights-mtp-native-scales-10/benchmark-verified/decode-3.json": "445d4995fff260e116cc794e91e77ff0f3452335252d55e99bb4074c9c372318",
+    "serving/weights-mtp-native-scales-10/benchmark-verified/metrics-before.txt": "66f76be207c40a250a9c995d7fb7618d25762c23de91e011b462364e566e3343",
+    "serving/weights-mtp-native-scales-10/benchmark-verified/metrics-after.txt": "bae82d4c44ed9e3a48739311368989247143fa6e02ac6ebf69649cb1108fde5b",
+    "serving/weights-mtp-native-scales-10/benchmark-verified/telemetry.csv": "32197e920bd6aceeef57a58766a3bce4145c5be65596a45e033401c85c93d294",
+    "serving/weights-mtp-csf-shared-11/launch.json": "5c5821e14c064d0a13c556164070dc42e28ae7f46f82b9ff0835509ca5d9cdb2",
+    "serving/weights-mtp-csf-shared-11/benchmark/completed.json": "cfdd73ff4b73c7cd401488992d254d99f1441193c5d0149e886b106471553d88",
+    "serving/weights-mtp-csf-shared-11/benchmark/decode-2.json": "be1556f271ce8c1d7dc542b64d583d0005bc2369b2dccbd1a254336058bb3cb7",
+    "serving/weights-mtp-csf-shared-11/benchmark/decode-1.json": "32039b1b6290c4ce795bdb576539b53e942aa6d2542a95bfe1761b34faa07ffa",
+    "serving/weights-mtp-csf-shared-11/benchmark/prefill.json": "0c0d9afe1d53627ee798fd12b87181f0e80f127c5787f66ee3654a604392497e",
+    "serving/weights-mtp-csf-shared-11/benchmark/decode-3.json": "5ae0a99c591e55bd0a645d3b5bc18355ebd65dcb5e7853ddd4cbec987562f0eb",
+    "serving/weights-mtp-csf-shared-11/benchmark/metrics-before.txt": "361097025e701ae218dbd1285b2e82a27a1634a9bec9931d14d7230058379d32",
+    "serving/weights-mtp-csf-shared-11/benchmark/metrics-after.txt": "cf8e740874e953854e893ccd3686e279299f92417ae8ec80d90e9eb49295a23a",
+    "serving/weights-mtp-csf-shared-11/benchmark/telemetry.csv": "586a09c552b6514f5012aab03ce0e50a297fa810573aef4b85ce5f7d80adbb47",
+    "deterministic-target-weight-kld.json": "b76d76b193268fb1cd9c1f50d212335592c46298974bc492fb66ad4ddb436d36",
+    "teacher-deterministic-repeat-kld.json": "ce2a0dcf13615299f007cbc4231807bf57d7867f027e88a1e8c93e0d875f0e38",
+    "weights-deterministic-repeat-kld.json": "904f85a39f31711a58c367bfa5dbca5a68524eab65112f05e94c93b7a2d96c2b",
+    "mtp-shared-scale-storage.json": "8df9565e29a2fca882a9c458b71362973f7b4b1fcb91e747b082d3aea6272f32",
+    "runtime/online-weights-5/source-manifest.json": "8ae290a747a8a9b16904c5ccc4897b3dacbe3cfd5c70d23000921a96acebe5e5",
+    "runtime/online-weights-9/source-manifest.json": "1671b5f90ef023154c3920b6ad924bcb54281d8dfd15a374d2744ee8cdb0be7f",
+    "runtime/online-weights-10/source-manifest.json": "74140249a0f529fc9942909b3c28c7b273ca3da7363fdf433c02eec01e6797a5",
+    "runtime/online-weights-11/source-manifest.json": "9c4f31119f22a197e84242bac10244d281aae22452acb67a916ccc6bc24f0dc7",
+    "runtime/online-weights-12/source-manifest.json": "5bf5da66bf121c8e6962c924e0973980d234414f0b65a5688c3fb638abb4d5dc"
+  },
+  "deterministic-target-weight-kld": {
+    "status": "research-only corpus sample",
+    "reference": "teacher-deterministic-9",
+    "candidate": "weights-deterministic-9",
+    "suite_sha256": "dece045c0b507d3288d667e281a76b12cbe75c2e4afc16e91f26657e234e821a",
+    "tokens": 16384,
+    "documents": 16,
+    "kl_reference_to_candidate_nats": 0.09906274189189136,
+    "kl_document_bootstrap_95ci": [
+      0.08623137288821077,
+      0.11259775924828845
+    ],
+    "token_kl_p50_p95_p99_max": [
+      0.016504917107353557,
+      0.47367210955316136,
+      1.3810139618908281,
+      5.173324854301812
+    ],
+    "top1_agreement": 0.9027099609375,
+    "reference_next_token_nll": 1.082596153236953,
+    "candidate_next_token_nll": 1.0844808511546482,
+    "next_token_nll_delta": 0.0018846979176948863,
+    "contexts": [
+      {
+        "identity": "wikitext-00",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.11131872200420771,
+        "top1_agreement": 0.9345703125,
+        "reference_next_token_nll": 0.40357539258426417,
+        "candidate_next_token_nll": 0.36308193546633516
+      },
+      {
+        "identity": "wikitext-01",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.1185448879944423,
+        "top1_agreement": 0.876953125,
+        "reference_next_token_nll": 1.2112969753196674,
+        "candidate_next_token_nll": 1.2238979596954738
+      },
+      {
+        "identity": "wikitext-02",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.07656047209253383,
+        "top1_agreement": 0.8916015625,
+        "reference_next_token_nll": 1.849874805715175,
+        "candidate_next_token_nll": 1.8607922260070509
+      },
+      {
+        "identity": "wikitext-03",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.07832152472746895,
+        "top1_agreement": 0.880859375,
+        "reference_next_token_nll": 1.3812466062935482,
+        "candidate_next_token_nll": 1.4041399553228688
+      },
+      {
+        "identity": "wikitext-04",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.14463040013322748,
+        "top1_agreement": 0.8916015625,
+        "reference_next_token_nll": 0.8031721409148892,
+        "candidate_next_token_nll": 0.8417296723868074
+      },
+      {
+        "identity": "wikitext-05",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.07131466940997426,
+        "top1_agreement": 0.900390625,
+        "reference_next_token_nll": 1.2210565472705324,
+        "candidate_next_token_nll": 1.213732918457036
+      },
+      {
+        "identity": "wikitext-06",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.0774508336498039,
+        "top1_agreement": 0.9140625,
+        "reference_next_token_nll": 1.1748393665391414,
+        "candidate_next_token_nll": 1.1661294484255964
+      },
+      {
+        "identity": "wikitext-07",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.1246185370793977,
+        "top1_agreement": 0.91796875,
+        "reference_next_token_nll": 0.4679520988474231,
+        "candidate_next_token_nll": 0.44820882891921154
+      },
+      {
+        "identity": "wikitext-08",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.08623249982722075,
+        "top1_agreement": 0.9052734375,
+        "reference_next_token_nll": 1.27873588822562,
+        "candidate_next_token_nll": 1.2880745432494753
+      },
+      {
+        "identity": "wikitext-09",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.1205612537845416,
+        "top1_agreement": 0.875,
+        "reference_next_token_nll": 1.4105616734055144,
+        "candidate_next_token_nll": 1.4260845499718757
+      },
+      {
+        "identity": "wikitext-10",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.05892768218876722,
+        "top1_agreement": 0.9189453125,
+        "reference_next_token_nll": 1.9188928978336859,
+        "candidate_next_token_nll": 1.922317478066043
+      },
+      {
+        "identity": "wikitext-11",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.06765564999797602,
+        "top1_agreement": 0.91015625,
+        "reference_next_token_nll": 1.128555845669739,
+        "candidate_next_token_nll": 1.127592121337466
+      },
+      {
+        "identity": "wikitext-12",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.13863661586822645,
+        "top1_agreement": 0.888671875,
+        "reference_next_token_nll": 0.6921470492375534,
+        "candidate_next_token_nll": 0.7044482058149273
+      },
+      {
+        "identity": "wikitext-13",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.09232832276023241,
+        "top1_agreement": 0.9296875,
+        "reference_next_token_nll": 0.47553393921191556,
+        "candidate_next_token_nll": 0.4608402805549296
+      },
+      {
+        "identity": "wikitext-14",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.13359469117090367,
+        "top1_agreement": 0.9267578125,
+        "reference_next_token_nll": 0.4127217628571434,
+        "candidate_next_token_nll": 0.39758844019294154
+      },
+      {
+        "identity": "wikitext-15",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.0843071075813377,
+        "top1_agreement": 0.880859375,
+        "reference_next_token_nll": 1.4913754618654378,
+        "candidate_next_token_nll": 1.503035054606331
+      }
+    ],
+    "limits": "English WikiText prefixes only; no downstream capability, multilingual, tool-use or long-context qualification. MTP proposal quality is measured separately from target logits."
+  },
+  "teacher-deterministic-repeat-kld": {
+    "status": "research-only corpus sample",
+    "reference": "teacher-deterministic-9",
+    "candidate": "teacher-deterministic-9",
+    "suite_sha256": "dece045c0b507d3288d667e281a76b12cbe75c2e4afc16e91f26657e234e821a",
+    "tokens": 4096,
+    "documents": 4,
+    "kl_reference_to_candidate_nats": 0.0,
+    "kl_document_bootstrap_95ci": [
+      0.0,
+      0.0
+    ],
+    "token_kl_p50_p95_p99_max": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "top1_agreement": 1.0,
+    "reference_next_token_nll": 1.2114984449781636,
+    "candidate_next_token_nll": 1.2114984449781636,
+    "next_token_nll_delta": 0.0,
+    "contexts": [
+      {
+        "identity": "wikitext-00",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.0,
+        "top1_agreement": 1.0,
+        "reference_next_token_nll": 0.40357539258426417,
+        "candidate_next_token_nll": 0.40357539258426417
+      },
+      {
+        "identity": "wikitext-01",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.0,
+        "top1_agreement": 1.0,
+        "reference_next_token_nll": 1.2112969753196674,
+        "candidate_next_token_nll": 1.2112969753196674
+      },
+      {
+        "identity": "wikitext-02",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.0,
+        "top1_agreement": 1.0,
+        "reference_next_token_nll": 1.849874805715175,
+        "candidate_next_token_nll": 1.849874805715175
+      },
+      {
+        "identity": "wikitext-03",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.0,
+        "top1_agreement": 1.0,
+        "reference_next_token_nll": 1.3812466062935482,
+        "candidate_next_token_nll": 1.3812466062935482
+      }
+    ],
+    "limits": "English WikiText prefixes only; no downstream capability, multilingual, tool-use or long-context qualification. MTP proposal quality is measured separately from target logits."
+  },
+  "weights-deterministic-repeat-kld": {
+    "status": "research-only corpus sample",
+    "reference": "weights-deterministic-9",
+    "candidate": "weights-deterministic-9",
+    "suite_sha256": "dece045c0b507d3288d667e281a76b12cbe75c2e4afc16e91f26657e234e821a",
+    "tokens": 4096,
+    "documents": 4,
+    "kl_reference_to_candidate_nats": 0.0,
+    "kl_document_bootstrap_95ci": [
+      0.0,
+      0.0
+    ],
+    "token_kl_p50_p95_p99_max": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "top1_agreement": 1.0,
+    "reference_next_token_nll": 1.212978019122932,
+    "candidate_next_token_nll": 1.212978019122932,
+    "next_token_nll_delta": 0.0,
+    "contexts": [
+      {
+        "identity": "wikitext-00",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.0,
+        "top1_agreement": 1.0,
+        "reference_next_token_nll": 0.36308193546633516,
+        "candidate_next_token_nll": 0.36308193546633516
+      },
+      {
+        "identity": "wikitext-01",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.0,
+        "top1_agreement": 1.0,
+        "reference_next_token_nll": 1.2238979596954738,
+        "candidate_next_token_nll": 1.2238979596954738
+      },
+      {
+        "identity": "wikitext-02",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.0,
+        "top1_agreement": 1.0,
+        "reference_next_token_nll": 1.8607922260070509,
+        "candidate_next_token_nll": 1.8607922260070509
+      },
+      {
+        "identity": "wikitext-03",
+        "tokens": 1024,
+        "kl_reference_to_candidate_nats": 0.0,
+        "top1_agreement": 1.0,
+        "reference_next_token_nll": 1.4041399553228688,
+        "candidate_next_token_nll": 1.4041399553228688
+      }
+    ],
+    "limits": "English WikiText prefixes only; no downstream capability, multilingual, tool-use or long-context qualification. MTP proposal quality is measured separately from target logits."
+  },
+  "mtp-shared-scale-storage": {
+    "status": "qualified full-model loader allocation and scratch alias audit; not total NVML VRAM",
+    "ranks": [
+      {
+        "rank": 0,
+        "main_layers": 42,
+        "draft_layers": 1,
+        "shared_scratch_bytes": 226492416,
+        "same_process_and_storage_addresses": true,
+        "native_model_allocated_bytes": 92054232064,
+        "csf_model_allocated_bytes": 91945603584,
+        "saving_bytes": 108628480,
+        "evidence": {
+          "serving/weights-mtp-native-scales-10/weights/Glm5NextMTP-rank0.json": "4aedcb0781495cf6ba5a19a7ee1a92948096cc60af2b485f32767e5f03f0c428",
+          "serving/weights-mtp-csf-shared-11/weights/Glm5NextForConditionalGeneration-rank0.json": "1acccd79df177b76f7305fed9d90a7e0ae33417952704a76251dfe1b5b66fe96",
+          "serving/weights-mtp-csf-shared-11/weights/Glm5NextMTP-rank0.json": "ea7905c67c714170639e949ff21dcf3586b00b4d28de5fff824bdcd2c859d5a4"
+        }
+      },
+      {
+        "rank": 1,
+        "main_layers": 42,
+        "draft_layers": 1,
+        "shared_scratch_bytes": 226492416,
+        "same_process_and_storage_addresses": true,
+        "native_model_allocated_bytes": 92054067200,
+        "csf_model_allocated_bytes": 91945442304,
+        "saving_bytes": 108624896,
+        "evidence": {
+          "serving/weights-mtp-native-scales-10/weights/Glm5NextMTP-rank1.json": "5e7945281fd6f91254d104ed63ed04e0ec7d56a3c15b53cbd04f60d03755cb2d",
+          "serving/weights-mtp-csf-shared-11/weights/Glm5NextForConditionalGeneration-rank1.json": "169e207f8a8a225fd13913902c7f5ebaf6c99ffdb4b8bd05b33870360b9247ea",
+          "serving/weights-mtp-csf-shared-11/weights/Glm5NextMTP-rank1.json": "678c0da1dc63ee7b68cdeacbfd3945403f5066da38bccad62b4cb2e6dfe765ec"
+        }
+      }
+    ],
+    "saving_tp2_bytes": 217253376
+  },
+  "limits": "Short runs, dynamic graphics clocks and two GPU pairs; English WikiText prefixes only. Quality uses deterministic MoE reduction; performance uses the normal fast path. No BF16 draft quality baseline or broad downstream accuracy claim.",
+  "rejected_measurements": {
+    "serving/weights-mtp-native-scales-10/benchmark": "One transient queue sample; excluded by unchanged validity rule.",
+    "serving/weights-mtp-native-scales-7": "Requested native draft policy was not effective; actual CSF, excluded from native-draft comparisons."
+  }
+}

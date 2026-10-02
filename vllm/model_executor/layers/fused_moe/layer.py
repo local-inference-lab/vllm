@@ -348,6 +348,7 @@ def FusedMoEFactory(
         moe_parallel_config=moe_parallel_config,
         in_dtype=moe_in_dtype,
         moe_backend=vllm_config.kernel_config.moe_backend,
+        moe_scale_compression=vllm_config.kernel_config.moe_scale_compression,
         router_logits_dtype=router_logits_dtype,
         max_num_tokens=max_num_batched_tokens,
         elastic_ep_max_dp_size=vllm_config.parallel_config.elastic_ep_max_dp_size,

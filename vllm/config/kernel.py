@@ -252,6 +252,12 @@ class KernelConfig:
     enable_bf16x3_router_gemm: bool = False
     """If True, use the experimental SM100 BF16x3 CuteDSL router GEMM."""
 
+    moe_scale_compression: Literal["csf", "native"] | None = None
+    """B12X load-time FP4 MoE scale format. None uses VLLM_B12X_MOE_FP4_CSF;
+    'native' disables online compression and 'csf' enables it. This does not
+    change the interpretation of checkpoints already stored with CSF scales.
+    """
+
     moe_backend: MoEBackend = Field(
         default_factory=lambda: envs.VLLM_DEFAULT_MOE_BACKEND,
         validate_default=True,
@@ -382,6 +388,8 @@ class KernelConfig:
         }
         if self.linear_backend_per_quant is None:
             ignored_factors.add("linear_backend_per_quant")
+        if self.moe_scale_compression is None:
+            ignored_factors.add("moe_scale_compression")
         factors = get_hash_factors(self, ignored_factors)
         factors["ir_op_priority"] = self.ir_op_priority.compute_hash()
         return hash_factors(factors)

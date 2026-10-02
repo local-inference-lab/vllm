@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-glm-spark-online-weights",
+  "category": "feature",
+  "summary": "Quantize the GLM Spark projection set and BF16 MTP experts during loading",
+  "models": ["GLM-5.3-Flash"],
+  "compatibility": "Opt-in exact target configurations; existing online quantization defaults are unchanged. NVFP4 W4A16 requires a supported BF16-activation MoE backend. MXFP8 scale compression is not enabled.",
+  "details": [
+    "Strict targets reject missing projections, incomplete fused groups and independently enabled online quantizers outside the declared set.",
+    "The GLM example selects 531 MXFP8 projections and NVFP4 W4A16 MTP routed experts; main and draft scale-compression policies are independent.",
+    "Layerwise loading releases replaced full-precision parameters before packed-weight preparation, and NVFP4 encoding writes directly into bounded output storage."
+  ],
+  "authors": ["voipmonitor"],
+  "pull_requests": [],
+  "requires": ["vllm-online-fp4-csf"]
+}

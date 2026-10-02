@@ -15,7 +15,6 @@ from vllm.config.quantization import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoEMethodBase,
     RoutedExperts,
 )
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
@@ -45,6 +44,7 @@ from vllm.model_executor.layers.quantization.online.fp8 import (
 from vllm.model_executor.layers.quantization.online.int8 import (
     Int8OnlineMoEMethod,
 )
+from vllm.model_executor.layers.quantization.online.moe_base import OnlineMoEMethodBase
 from vllm.model_executor.layers.quantization.online.mxfp4 import (
     Mxfp4OnlineLinearMethod,
     Mxfp4OnlineMoEMethod,
@@ -54,6 +54,7 @@ from vllm.model_executor.layers.quantization.online.mxfp8 import (
     Mxfp8OnlineMoEMethod,
 )
 from vllm.model_executor.layers.quantization.online.nvfp4 import (
+    Nvfp4OnlineA16MoEMethod,
     Nvfp4OnlineMoEMethod,
 )
 from vllm.model_executor.layers.quantization.utils.config_utils import (
@@ -155,6 +156,40 @@ class OnlineQuantizationConfig(QuantizationConfig):
         self.args = args
         self.ignored_layers: list[str] = args.ignore
         self.quantized_layers: dict[str, tuple[str, str, str | None]] = {}
+        self.quantized_targets: dict[str, str] = {}
+
+    def validate_target_coverage(self, model: torch.nn.Module | None = None) -> None:
+        """Reject incomplete exact target sets before checkpoint loading."""
+        if not self.args.strict_targets:
+            return
+        missing = set(self.args.targets or ()) - self.quantized_targets.keys()
+        if missing:
+            raise ValueError(
+                "Online quantization did not resolve every strict target: "
+                + ", ".join(sorted(missing))
+            )
+        if model is not None:
+            present = set()
+            for name, layer in model.named_modules():
+                method = getattr(layer, "quant_method", None)
+                if isinstance(method, (OnlineLinearBase, OnlineMoEMethodBase)):
+                    prefix = getattr(method, "_online_target_prefix", None)
+                    if prefix not in self.quantized_layers:
+                        raise ValueError(
+                            f"Online quantizer at {name} is outside strict targets; "
+                            "disable independent head or model quantization flags"
+                        )
+                    present.add(prefix)
+            absent = {
+                target
+                for target, prefix in self.quantized_targets.items()
+                if prefix not in present
+            }
+            if absent:
+                raise ValueError(
+                    "Strict online targets are not present in the constructed model: "
+                    + ", ".join(sorted(absent))
+                )
 
     @property
     def quantized_layer_summaries(self) -> list[str]:
@@ -230,6 +265,17 @@ class OnlineQuantizationConfig(QuantizationConfig):
         """
         if spec is None or spec.weight is None:
             return None
+        if spec.activation_dtype is not None:
+            if (
+                table is not _ONLINE_MOE_METHODS
+                or spec.weight != kNvfp4Static
+                or spec.activation is not None
+            ):
+                raise ValueError(
+                    "activation_dtype is supported only for online NVFP4 MoE "
+                    "without an activation quantization override"
+                )
+            return Nvfp4OnlineA16MoEMethod
         cls = table.get(spec.weight)
         if cls is None:
             raise ValueError(
@@ -374,17 +420,38 @@ class OnlineQuantizationConfig(QuantizationConfig):
         resolved = self.resolve_quant_method_cls(layer, prefix)
         if resolved is not None:
             source, quant_key_str, target_pattern, _, quant_method_cls = resolved
+            if self.args.strict_targets:
+                assert self.args.targets is not None
+                matches = find_matching_patterns(
+                    prefix,
+                    self.args.targets,
+                    self.packed_modules_mapping,
+                    use_fnmatch=False,
+                )
+                for shard_matches in matches:
+                    for target in shard_matches:
+                        previous = self.quantized_targets.setdefault(target, prefix)
+                        if previous != prefix:
+                            raise ValueError(
+                                f"Strict target {target} resolved to both "
+                                f"{previous} and {prefix}"
+                            )
             self.quantized_layers[prefix] = (
                 source.value,
                 quant_key_str,
                 target_pattern,
             )
             if isinstance(layer, RoutedExperts):
-                assert issubclass(quant_method_cls, FusedMoEMethodBase)
-                return quant_method_cls(moe=layer.moe_config)
-
-            assert issubclass(quant_method_cls, OnlineLinearBase)
-            return quant_method_cls()
+                assert issubclass(quant_method_cls, OnlineMoEMethodBase)
+                method: OnlineMoEMethodBase | OnlineLinearBase = quant_method_cls(
+                    moe=layer.moe_config
+                )
+            else:
+                assert issubclass(quant_method_cls, OnlineLinearBase)
+                method = quant_method_cls()
+            if self.args.strict_targets:
+                method._online_target_prefix = prefix
+            return method
 
         if isinstance(layer, LinearBase):
             return UnquantizedLinearMethod()

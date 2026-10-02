@@ -416,6 +416,11 @@ class SpeculativeConfig:
     inherits the target model's `--moe-backend` setting. Useful when the
     drafter and generator require different MoE kernels (e.g. quantized
     generator with unquantized drafter)."""
+    moe_scale_compression: Literal["csf", "native"] | None = None
+    """Override B12X load-time FP4 scale compression for the draft model.
+    None inherits the target's kernel setting and environment default. A
+    single-layer draft can use 'native' to avoid a dedicated CSF scratch plane.
+    """
     attention_backend: AttentionBackendEnum | None = None
     """Attention backend to use for the draft model. When `None`, the backend is
     automatically selected. Useful when the drafter requires a different attention
@@ -634,6 +639,8 @@ class SpeculativeConfig:
         the final hidden states.
         """
         factors: list[Any] = [self.method, self.num_speculative_tokens]
+        if self.moe_scale_compression is not None:
+            factors.append(("moe_scale_compression", self.moe_scale_compression))
         # Eagle3 and extract_hidden_states affect the computation graph because
         # they return intermediate hidden states in addition to the final hidden state.
         uses_aux_hidden_states = self.method in (

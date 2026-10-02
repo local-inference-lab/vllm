@@ -383,6 +383,7 @@ def test_glm53_selector_lazily_caches_fp32_head_projection() -> None:
     indexer = Glm5NextPooledIndexer.__new__(Glm5NextPooledIndexer)
     nn.Module.__init__(indexer)
     indexer.weights_proj = nn.Linear(hidden_size, 32, bias=False, dtype=torch.bfloat16)
+    indexer.weights_proj.quant_method = None
     indexer._weights_proj_fp32 = None
     hidden = torch.randn(3, hidden_size, dtype=torch.bfloat16)
 
@@ -393,6 +394,32 @@ def test_glm53_selector_lazily_caches_fp32_head_projection() -> None:
 
     torch.testing.assert_close(actual, expected)
     assert indexer._weights_proj_fp32 is not None
+    pointer = indexer._weights_proj_fp32.data_ptr()
+    indexer._project_head_weights(hidden)
+    assert indexer._weights_proj_fp32.data_ptr() == pointer
+
+
+def test_glm53_selector_dequantizes_mxfp8_weights_before_fp32_projection() -> None:
+    """Packed weights must include block scales; the source parameter is empty."""
+    indexer = Glm5NextPooledIndexer.__new__(Glm5NextPooledIndexer)
+    nn.Module.__init__(indexer)
+    values = torch.arange(32 * 64).remainder(17).reshape(32, 64).float()
+    values = values.to(torch.float8_e4m3fn)
+    scales = torch.tensor([125, 130], dtype=torch.uint8).expand(32, 2).clone()
+    indexer.weights_proj = nn.Module()
+    indexer.weights_proj.weight = nn.Parameter(torch.empty(0), requires_grad=False)
+    indexer.weights_proj.b12x_mxfp8_packed_weight = SimpleNamespace(
+        out_features=32,
+        in_features=64,
+        weight=SimpleNamespace(values=values, scale_rows=scales.reshape(1, 32, 2)),
+    )
+    indexer._weights_proj_fp32 = None
+    hidden = torch.randn(3, 64, dtype=torch.bfloat16)
+    dequantized = values.float() * torch.tensor([0.25, 8.0]).repeat_interleave(32)
+    expected = torch.nn.functional.linear(hidden.float(), dequantized)
+    actual = indexer._project_head_weights(hidden)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.dtype == torch.float32
     pointer = indexer._weights_proj_fp32.data_ptr()
     indexer._project_head_weights(hidden)
     assert indexer._weights_proj_fp32.data_ptr() == pointer

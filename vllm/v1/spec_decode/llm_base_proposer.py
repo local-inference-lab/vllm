@@ -1325,8 +1325,9 @@ class SpecDecodeBaseProposer:
         need to customize model loading.
         """
         from vllm.compilation.backends import set_model_tag
+        from vllm.model_executor.models.utils import with_draft_quantization
 
-        draft_vllm_config = self._create_draft_vllm_config()
+        draft_vllm_config = with_draft_quantization(self._create_draft_vllm_config())
         with set_model_tag("eagle_head"):
             model = get_model(
                 vllm_config=draft_vllm_config,

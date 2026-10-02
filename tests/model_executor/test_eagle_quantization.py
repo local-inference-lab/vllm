@@ -1,13 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
-from vllm.config import LoadConfig, ModelConfig, SpeculativeConfig, VllmConfig
-from vllm.model_executor.models.utils import get_draft_quant_config
+from vllm.config import (
+    KernelConfig,
+    LoadConfig,
+    ModelConfig,
+    SpeculativeConfig,
+    VllmConfig,
+)
+from vllm.model_executor.models.utils import (
+    get_draft_quant_config,
+    with_draft_quantization,
+)
 from vllm.platforms import current_platform
 
 DEVICE_TYPE = current_platform.device_type
@@ -52,6 +62,38 @@ def test_get_draft_quant_config_without_draft_model():
     result = get_draft_quant_config(mock_vllm_config)
 
     assert result is None
+
+
+@pytest.mark.parametrize("quantized_draft", [False, True])
+@pytest.mark.parametrize("scale_compression", [None, "native", "csf"])
+def test_draft_quantization_preserves_target_runtime_and_unquantized_drafts(
+    quantized_draft,
+    scale_compression,
+):
+    """A draft must not inherit target quantization or rebuild target planning."""
+    target_quantization = object()
+    draft_quantization = object() if quantized_draft else None
+    target = SimpleNamespace(
+        model_config=object(),
+        compilation_config=object(),
+        quant_config=target_quantization,
+        use_replayssm=True,
+        kernel_config=KernelConfig(moe_scale_compression="csf"),
+        speculative_config=SimpleNamespace(moe_scale_compression=scale_compression),
+    )
+    with patch(
+        "vllm.model_executor.models.utils.get_draft_quant_config",
+        return_value=draft_quantization,
+    ):
+        draft = with_draft_quantization(target)
+    assert draft is not target
+    assert draft.quant_config is draft_quantization
+    assert target.quant_config is target_quantization
+    assert draft.model_config is target.model_config
+    assert draft.compilation_config is target.compilation_config
+    assert draft.use_replayssm
+    assert target.kernel_config.moe_scale_compression == "csf"
+    assert draft.kernel_config.moe_scale_compression == (scale_compression or "csf")
 
 
 @torch.inference_mode()

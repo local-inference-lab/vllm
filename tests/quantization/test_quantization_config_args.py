@@ -69,6 +69,24 @@ def test_args_moe_string_resolves_via_online_shorthand():
     assert args.moe == QuantSpec(weight=kFp8Static128BlockSym)
 
 
+def test_nvfp4_a16_spec_preserves_bfloat16_activation_selection():
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Static
+
+    args = QuantizationConfigArgs(targets={"model.layers.45.mlp.experts": "nvfp4_a16"})
+    expected = QuantSpec(weight=kNvfp4Static, activation_dtype="bfloat16")
+    config = OnlineQuantizationConfig(args)
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm.model_executor.layers.quantization.online.nvfp4 import (
+        Nvfp4OnlineA16MoEMethod,
+    )
+
+    result = config.resolve_quant_method_cls(
+        Mock(spec=RoutedExperts), "model.layers.45.mlp.experts"
+    )
+    assert result[-1] is Nvfp4OnlineA16MoEMethod
+    assert str(expected).endswith("/bfloat16")
+
+
 def test_args_string_shorthand_missing_slot_raises():
     # int8_per_channel_weight_only sets only `moe`; using it on `linear`
     # has no defined spec and should raise rather than silently no-op.

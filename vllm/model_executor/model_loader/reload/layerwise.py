@@ -309,6 +309,9 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
 
         # Process and copy when all weights are loaded
         if info.load_numel >= info.load_numel_total:  # type: ignore[operator]
+            # Quantizers replace BF16 parameters before packing kernels. Do not
+            # retain the final direct-load destination through that conversion.
+            del bound_args
             _layerwise_process(layer, info)
             LOADING_LAYERS.discard(layer)
 
@@ -456,6 +459,9 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
         # formerly held by checkpoint sources for its temporary workspace.
         info.loaded_weights.clear()
         loaded_args = None
+    # Loop locals must not keep a replaced full-precision parameter resident
+    # while its quantized replacement is prepared for the execution backend.
+    param = None
     _zero_online_processing_unloaded(layer)
     # Process weights (quantization, repacking, etc.)
     quant_method = getattr(layer, "quant_method", None)

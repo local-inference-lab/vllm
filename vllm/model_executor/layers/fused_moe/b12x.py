@@ -438,7 +438,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         }[quant_mode]
         import vllm.envs as envs
 
-        compress = envs.VLLM_B12X_MOE_FP4_CSF and self._source_format in (
+        policy = self.moe_config.moe_scale_compression
+        compress = (
+            envs.VLLM_B12X_MOE_FP4_CSF if policy is None else policy == "csf"
+        ) and self._source_format in (
             "fp4_e8m0_k32",
             "modelopt_nvfp4",
         )
