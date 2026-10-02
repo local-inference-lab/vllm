@@ -1,0 +1,17 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-glm-qad-scale-validation",
+  "category": "internal",
+  "summary": "Document GLM QAD TP2 serving and the optional shared gate/up activation scale",
+  "models": ["GLM-5.3-Flash"],
+  "compatibility": "No user action required.",
+  "details": [
+    "The online-quantization example keeps source calibration by default and specifies a 3072-token prefill budget, 4 GiB FP8 KV per rank and one loading CPU thread per worker.",
+    "The activation-scale report records public-image serving, the small measured prefill benefit, unchanged down-input scales, and bounded quality evidence. Sharing remains opt-in."
+  ],
+  "authors": ["voipmonitor"],
+  "requires": ["vllm-glm-spark-online-weights", "b12x-464"],
+  "evidence": [
+    "https://github.com/local-inference-lab/vllm/blob/integration/karmic-kraken-beta/docs/features/quantization/glm53_qad_activation_scales.md"
+  ]
+}

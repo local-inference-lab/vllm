@@ -4397,5 +4397,68 @@
         "sha256": "bfadad67412355aa90831cb72669512d7ad1da97564355d60cdb9136a65459f7"
       }
     ]
+  },
+  "published_image_qualification": {
+    "status": "qualified under the recorded conditions",
+    "image": "ghcr.io/local-inference-lab/vllm@sha256:ef547bdcf146e2c9b183e2fa0b82a3a01ada680765720d01a25c258b45a801a7",
+    "vllm": "58d05bc7626dd87ee401155e9b52e6c6fd92bd5d",
+    "b12x": "a77b3f85e5e2a81315ff4a90088912f187708005",
+    "python_source_overlays": false,
+    "hardware": "Frank1 GPUs12/13, RTX PRO6000 Blackwell Workstation96GB,600W,16365MHz memory,dynamic graphics clocks",
+    "configuration": "TP2/DCP1,MTP3,3072-token prefill budget,3GiB FP8KV/rank,maxseq8,maxlen65536,main/draftNVFP4-CSF",
+    "decode_median_tok_s": {
+      "1": 220.59282059287332,
+      "8": 765.27136050526
+    },
+    "fixed_prefill": {
+      "2048": {
+        "median_server_tok_s": 11061.818142860906,
+        "samples": 4,
+        "values": [
+          10988.793120158789,
+          11054.480232235233,
+          11069.156053486578,
+          11077.467451627574
+        ]
+      },
+      "8192": {
+        "median_server_tok_s": 11905.201723334958,
+        "samples": 4,
+        "values": [
+          11916.404664196909,
+          11827.57629855202,
+          11906.760224532023,
+          11903.643222137893
+        ]
+      },
+      "32768": {
+        "median_server_tok_s": 12120.093676181705,
+        "samples": 10,
+        "values": [
+          12149.747880743496,
+          12139.893603162653,
+          12122.93673026378,
+          12123.18588797047,
+          12121.881610089278,
+          12118.305742274131,
+          12108.100736248784,
+          12101.255314072401,
+          12105.216896186146,
+          12102.267463243132
+        ]
+      }
+    },
+    "limits": "Short performance sample. No accuracy or million-token capacity conclusion. Other services on GPUs0-9 preserved. The 4GiB scale-policy comparison uses different capacity settings.",
+    "evidence_sha256": {
+      "serving/beta-pr965-guide-tp2/benchmark/decode-1.json": "f6d78a0d9a385eb27bb32d62040933d9ed3a4612cc98a517b20140d0a58635d9",
+      "serving/beta-pr965-guide-tp2/benchmark/decode-2.json": "ff8205b68cab70ea463b59209331215d082f7fa8336a98e240809daf42aa3c53",
+      "serving/beta-pr965-guide-tp2/benchmark/decode-3.json": "18a8113f010857e85fea11d760e29b229ab14aad0ad152cf26e37db975cf22b5",
+      "serving/beta-pr965-guide-tp2/launch.json": "c026793013e9dc7cea6ccf24f794659e62b9df890719d0c31eacea52ab939d2b",
+      "serving/beta-pr965-guide-tp2/completed.json": "622bc5d64ab2012c5a8951066743c313fed794fa4b21f324b0fe82a9db222c3e",
+      "serving/beta-pr965-guide-tp2/controlled-prefill/results.json": "518b634ea1082a737526f17de0857ad7ec71e0ee5e4c66a00b3f3bf350ed6208",
+      "beta-merge-965/container-publication/manifest.json": "97da7abe55f9f0b7824087d180011978e5cbaf0058cf64fed15ddd598be4ae88",
+      "beta-merge-965/container-publication/container-release.json": "8e515c7fb64ce332ac55eb42ecb3efefb309c70ac321e0d0f6b3e49495db73d2",
+      "beta-merge-965/container-publication/community-assembly.json": "4314f6891aad186b2b7f903d81274aa583f6ccb5f7b88ab570d1dc2d4d478765"
+    }
   }
 }
