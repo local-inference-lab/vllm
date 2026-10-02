@@ -1,0 +1,730 @@
+{
+  "status": "research-only bounded quality and performance comparison",
+  "image": "ghcr.io/local-inference-lab/vllm@sha256:ef547bdcf146e2c9b183e2fa0b82a3a01ada680765720d01a25c258b45a801a7",
+  "source_revision": "cfd47bd7680e68408924df09b179d5bed25b2ae9",
+  "performance": [
+    {
+      "label": "beta-qad-scale-expert-kv4-tp2",
+      "decode": {
+        "1": {
+          "repetitions": 3,
+          "median_tok_s": 221.4771746882605,
+          "tok_s": [
+            218.02332943362967,
+            221.4771746882605,
+            221.66573016612452
+          ],
+          "median_steps_s": 83.69964638302837,
+          "median_acceptance_length": 2.63441712926249
+        },
+        "8": {
+          "repetitions": 3,
+          "median_tok_s": 768.1022533064705,
+          "tok_s": [
+            774.6882260562072,
+            768.0792970482026,
+            768.1022533064705
+          ],
+          "median_steps_s": 291.9975490258733,
+          "median_acceptance_length": 2.6416060054595087
+        }
+      },
+      "fixed_prefill": {
+        "2048": {
+          "median_server_tok_s": 11066.708060076511,
+          "samples": 4,
+          "values": [
+            11039.923549724492,
+            11055.370499894756,
+            11078.045620258268,
+            11085.195494339756
+          ]
+        },
+        "8192": {
+          "median_server_tok_s": 11916.979492702547,
+          "samples": 4,
+          "values": [
+            11923.61191625253,
+            11918.35551710502,
+            11915.603468300073,
+            11910.1336912364
+          ]
+        },
+        "32768": {
+          "median_server_tok_s": 12114.032894262891,
+          "samples": 10,
+          "values": [
+            12148.364994952219,
+            12145.583069971352,
+            12124.8080495932,
+            12125.705803846682,
+            12111.255235499719,
+            12116.810553026064,
+            12105.928247957045,
+            12100.436218980136,
+            12108.317996113037,
+            12100.324031875592
+          ]
+        }
+      },
+      "generated_prefill": {
+        "2048": {
+          "ttft_seconds": 0.205,
+          "prefill_seconds": 0.205,
+          "tok_per_sec": 10530.0,
+          "client_ttft_seconds": 0.205,
+          "client_tok_per_sec": 10530.0,
+          "prompt_tokens": 2160,
+          "samples": 4,
+          "method": "client",
+          "server_validation": {
+            "method": "prometheus",
+            "tok_per_sec": 11054.0,
+            "prefill_seconds": 0.195,
+            "prompt_tokens": 2160,
+            "request_prompt_tokens": 2160,
+            "cached_tokens": 0,
+            "token_source": "kv_computed",
+            "samples": 4,
+            "invalid_reason": ""
+          },
+          "hardware_summary": {}
+        },
+        "32768": {
+          "ttft_seconds": 2.645,
+          "prefill_seconds": 2.645,
+          "tok_per_sec": 12223.0,
+          "client_ttft_seconds": 2.645,
+          "client_tok_per_sec": 12223.0,
+          "prompt_tokens": 32328,
+          "samples": 2,
+          "method": "client",
+          "server_validation": {
+            "method": "prometheus",
+            "tok_per_sec": 12444.0,
+            "prefill_seconds": 2.598,
+            "prompt_tokens": 32328,
+            "request_prompt_tokens": 32328,
+            "cached_tokens": 0,
+            "token_source": "kv_computed",
+            "samples": 2,
+            "invalid_reason": ""
+          },
+          "hardware_summary": {}
+        }
+      }
+    },
+    {
+      "label": "beta-qad-scale-w13-kv4-tp2",
+      "decode": {
+        "1": {
+          "repetitions": 3,
+          "median_tok_s": 219.16086157745497,
+          "tok_s": [
+            218.1809343343083,
+            219.9208502123887,
+            219.16086157745497
+          ],
+          "median_steps_s": 84.18231846317094,
+          "median_acceptance_length": 2.603407290015848
+        },
+        "8": {
+          "repetitions": 3,
+          "median_tok_s": 768.6728042155796,
+          "tok_s": [
+            768.6728042155796,
+            765.9191191715657,
+            784.6212395318562
+          ],
+          "median_steps_s": 294.38391026919163,
+          "median_acceptance_length": 2.6174794895168643
+        }
+      },
+      "fixed_prefill": {
+        "2048": {
+          "median_server_tok_s": 11212.734548155679,
+          "samples": 4,
+          "values": [
+            11135.13568518337,
+            11219.513879590719,
+            11212.62435376682,
+            11212.844742544537
+          ]
+        },
+        "8192": {
+          "median_server_tok_s": 12067.969746508214,
+          "samples": 4,
+          "values": [
+            12071.568367382875,
+            12058.052824436763,
+            12064.371125633552,
+            12074.033402965986
+          ]
+        },
+        "32768": {
+          "median_server_tok_s": 12308.330403240814,
+          "samples": 10,
+          "values": [
+            12329.860673712114,
+            12321.687465847745,
+            12318.921969196506,
+            12315.153179414172,
+            12313.143875290822,
+            12303.516931190807,
+            12303.269692648373,
+            12300.576684806578,
+            12294.397194532234,
+            12298.077778090386
+          ]
+        }
+      },
+      "generated_prefill": {
+        "2048": {
+          "ttft_seconds": 0.206,
+          "prefill_seconds": 0.206,
+          "tok_per_sec": 10514.0,
+          "client_ttft_seconds": 0.206,
+          "client_tok_per_sec": 10514.0,
+          "prompt_tokens": 2162,
+          "samples": 4,
+          "method": "client",
+          "server_validation": {
+            "method": "prometheus",
+            "tok_per_sec": 11021.0,
+            "prefill_seconds": 0.196,
+            "prompt_tokens": 2162,
+            "request_prompt_tokens": 2162,
+            "cached_tokens": 0,
+            "token_source": "kv_computed",
+            "samples": 4,
+            "invalid_reason": ""
+          },
+          "hardware_summary": {}
+        },
+        "32768": {
+          "ttft_seconds": 2.59,
+          "prefill_seconds": 2.59,
+          "tok_per_sec": 12478.0,
+          "client_ttft_seconds": 2.59,
+          "client_tok_per_sec": 12478.0,
+          "prompt_tokens": 32316,
+          "samples": 2,
+          "method": "client",
+          "server_validation": {
+            "method": "prometheus",
+            "tok_per_sec": 12710.0,
+            "prefill_seconds": 2.543,
+            "prompt_tokens": 32316,
+            "request_prompt_tokens": 32316,
+            "cached_tokens": 0,
+            "token_source": "kv_computed",
+            "samples": 2,
+            "invalid_reason": ""
+          },
+          "hardware_summary": {}
+        }
+      }
+    },
+    {
+      "label": "beta-qad-scale-expert-prefill-control-kv4-tp2",
+      "decode": {},
+      "fixed_prefill": {
+        "2048": {
+          "median_server_tok_s": 11148.633654521618,
+          "samples": 4,
+          "values": [
+            11122.274840823196,
+            11136.586839149386,
+            11161.380013729235,
+            11160.680469893849
+          ]
+        },
+        "8192": {
+          "median_server_tok_s": 12015.935393929154,
+          "samples": 4,
+          "values": [
+            12025.354915453148,
+            12013.646874632053,
+            12014.86335426399,
+            12017.007433594317
+          ]
+        },
+        "32768": {
+          "median_server_tok_s": 12228.618226696435,
+          "samples": 10,
+          "values": [
+            12268.249723531488,
+            12259.093231316836,
+            12243.548690025871,
+            12241.590591982693,
+            12229.997002564722,
+            12227.239450828147,
+            12211.903965994985,
+            12201.998844948528,
+            12206.706323383463,
+            12196.718972919667
+          ]
+        }
+      },
+      "generated_prefill": {
+        "2048": {
+          "ttft_seconds": 0.202,
+          "prefill_seconds": 0.202,
+          "tok_per_sec": 10692.0,
+          "client_ttft_seconds": 0.202,
+          "client_tok_per_sec": 10692.0,
+          "prompt_tokens": 2161,
+          "samples": 4,
+          "method": "client",
+          "server_validation": {
+            "method": "prometheus",
+            "tok_per_sec": 11220.0,
+            "prefill_seconds": 0.193,
+            "prompt_tokens": 2161,
+            "request_prompt_tokens": 2161,
+            "cached_tokens": 0,
+            "token_source": "kv_computed",
+            "samples": 4,
+            "invalid_reason": ""
+          },
+          "hardware_summary": {}
+        },
+        "32768": {
+          "ttft_seconds": 2.615,
+          "prefill_seconds": 2.615,
+          "tok_per_sec": 12360.0,
+          "client_ttft_seconds": 2.615,
+          "client_tok_per_sec": 12360.0,
+          "prompt_tokens": 32321,
+          "samples": 2,
+          "method": "client",
+          "server_validation": {
+            "method": "prometheus",
+            "tok_per_sec": 12587.0,
+            "prefill_seconds": 2.568,
+            "prompt_tokens": 32321,
+            "request_prompt_tokens": 32321,
+            "cached_tokens": 0,
+            "token_source": "kv_computed",
+            "samples": 2,
+            "invalid_reason": ""
+          },
+          "hardware_summary": {}
+        }
+      }
+    }
+  ],
+  "paired_prefill": {
+    "2048": {
+      "candidate_change_percent": {
+        "mean": 0.8118738405858583,
+        "bootstrap_95ci": [
+          0.5753207207356059,
+          1.0377279323706412
+        ]
+      },
+      "baseline_reload_drift_percent": {
+        "mean": 0.7284436037244213,
+        "bootstrap_95ci": [
+          0.6971999722796662,
+          0.7490944627177809
+        ]
+      },
+      "paired_prompts": 4
+    },
+    "8192": {
+      "candidate_change_percent": {
+        "mean": 0.8338748010364883,
+        "bootstrap_95ci": [
+          0.7849103211061137,
+          0.8961688452165884
+        ]
+      },
+      "baseline_reload_drift_percent": {
+        "mean": 0.8457958706188318,
+        "bootstrap_95ci": [
+          0.8129733562913022,
+          0.8812570021112631
+        ]
+      },
+      "paired_prompts": 4
+    },
+    "32768": {
+      "candidate_change_percent": {
+        "mean": 1.1194026133184587,
+        "bootstrap_95ci": [
+          1.0662892061199551,
+          1.1696816523895603
+        ]
+      },
+      "baseline_reload_drift_percent": {
+        "mean": 0.9072160317732901,
+        "bootstrap_95ci": [
+          0.8637917578754812,
+          0.9476244260383052
+        ]
+      },
+      "paired_prompts": 10
+    }
+  },
+  "preparation_records": {
+    "baseline": 115,
+    "with_shared_input": 115,
+    "repeat": 115,
+    "previous_choices_preserved": true
+  },
+  "quality": {
+    "reference": "Source expert-specific NVFP4 activation calibration with identical QAD weights and online MXFP8 projections. Ground-truth next tokens provide the independent NLL comparison. BF16 reference probes failed repeated-forward invariance and are excluded.",
+    "tokens": 16384,
+    "documents": 16,
+    "source_to_shared_kl": 0.10045818150584182,
+    "source_to_shared_kl_95ci": [
+      0.0868175300355543,
+      0.11402704336352616
+    ],
+    "top1_agreement": 0.90570068359375,
+    "next_token_nll": {
+      "expert": 1.0844808511546482,
+      "w13": 1.0856278539566904,
+      "w13_minus_expert": {
+        "mean": 0.0011470028020421318,
+        "bootstrap_95ci": [
+          -0.004440642579484463,
+          0.005915980395769584
+        ]
+      },
+      "perplexity_change_percent": 0.11476608613306666
+    },
+    "repeat_checks": {
+      "expert": 0.0,
+      "w13": 0.0
+    }
+  },
+  "scale_contract": [
+    {
+      "rank": 0,
+      "layers": 42,
+      "shared_a1_equals_reciprocal_of_layer_max": true,
+      "a2_and_weight_global_scales_unchanged": true
+    },
+    {
+      "rank": 1,
+      "layers": 42,
+      "shared_a1_equals_reciprocal_of_layer_max": true,
+      "a2_and_weight_global_scales_unchanged": true
+    }
+  ],
+  "quality_runtime_correction": {
+    "base_b12x_revision": "a77b3f85e5e2a81315ff4a90088912f187708005",
+    "path": "b12x/moe/fused_moe/_preparation.py",
+    "sha256": "f4a8c6a895eda7a9f876a215d55c056ffa0d35395a3c8d7262f6f2ded2f8349f",
+    "behavior": "Resolve environment-selected MoE output determinism before candidate eligibility, keeping explicit RoutingSpec overrides. No kernel arithmetic or weight changes.",
+    "unit_tests": "128 passed, 4 skipped (no CUDA in unit-test container), 1 GPU test deselected; before fix 2 minimal reproducer cases fail and 4 explicit-override cases pass."
+  },
+  "excluded_b12x_a16_reference": {
+    "status": "excluded reference",
+    "reference": "beta-qad-input-prepared-a16",
+    "reason": "BF16 W4A16 reference failed repeated-forward invariance. Comparisons involving this reference cannot isolate activation quantization error.",
+    "repeat_kl": 0.02625725630649753,
+    "repeat_top1_agreement": 0.95654296875,
+    "affected_files": [
+      "a16-to-expert.json",
+      "a16-to-w13.json"
+    ],
+    "evidence_sha256": {
+      "a16-repeat.json": "6b926b527ee8a0a14b09c603e9958beb460f710459c74ef95081271eba776896",
+      "a16-to-expert.json": "0fca0225ba83ca1d89a27e201153293bcc943ab3c7e98aacc4ef86c9ddb7ed3e",
+      "a16-to-w13.json": "04f8a3958580b987aa61ba00b10898f95668e06d9b2bf6ed676bced9f280505b"
+    },
+    "valid_independent_comparison": "expert-to-w13.json; both NVFP4 policies repeat with exactly zero KLD, and their held-out NLL uses observed next tokens rather than the rejected reference."
+  },
+  "excluded_marlin_a16_reference": {
+    "status": "excluded reference",
+    "reference": "beta-qad-input-marlin-a16",
+    "reason": "The independently selected Marlin BF16-expert reference also fails repeated-forward invariance; no reference-to-candidate KLD is used. Accepted quality evidence consists of the repeatable direct NVFP4 policy comparison and ground-truth next-token NLL.",
+    "repeat_kl": 0.02148968739816654,
+    "repeat_top1_agreement": 0.95751953125,
+    "evidence_sha256": {
+      "marlin-a16-repeat.json": "8c8cc7ac24cdf0b30649b8f5ce8e453132923aafc741a7ba4fedc289c2e2ecd3"
+    }
+  },
+  "excluded_decode_loads": {
+    "status": "retained exclusions",
+    "loads": [
+      {
+        "label": "beta-qad-scale-w13-tp2",
+        "status": "excluded from headline decode comparison",
+        "reason": "A decode repetition flagged capacity_limited after a transient sampled request queue. The entire load is excluded from headline decode statistics, including its unflagged repetitions.",
+        "samples": [
+          {
+            "file": "serving/beta-qad-scale-w13-tp2/benchmark/decode-1.json",
+            "concurrency": 1,
+            "aggregate_tps": 228.78964715254384,
+            "num_errors": 0,
+            "loop_detected": false,
+            "underfilled": false,
+            "capacity_limited": false,
+            "avg_running_reqs": 1,
+            "max_queue_reqs": 0,
+            "queue_fraction": 0.0
+          },
+          {
+            "file": "serving/beta-qad-scale-w13-tp2/benchmark/decode-1.json",
+            "concurrency": 8,
+            "aggregate_tps": 776.8203570676363,
+            "num_errors": 0,
+            "loop_detected": false,
+            "underfilled": false,
+            "capacity_limited": true,
+            "avg_running_reqs": 7.9,
+            "max_queue_reqs": 1,
+            "queue_fraction": 0.067
+          }
+        ],
+        "evidence_sha256": {
+          "serving/beta-qad-scale-w13-tp2/benchmark/decode-1.json": "a155456e0c57039bab397f0c137e8ed8250c2fa95ed4872079a67d8c0828fb13"
+        }
+      },
+      {
+        "label": "beta-qad-scale-w13-retry-tp2",
+        "status": "excluded from headline decode comparison",
+        "reason": "A decode repetition flagged capacity_limited after a transient sampled request queue. The entire load is excluded from headline decode statistics, including its unflagged repetitions.",
+        "samples": [
+          {
+            "file": "serving/beta-qad-scale-w13-retry-tp2/benchmark/decode-1.json",
+            "concurrency": 1,
+            "aggregate_tps": 215.99848031255578,
+            "num_errors": 0,
+            "loop_detected": false,
+            "underfilled": false,
+            "capacity_limited": false,
+            "avg_running_reqs": 1.0,
+            "max_queue_reqs": 0,
+            "queue_fraction": 0.0
+          },
+          {
+            "file": "serving/beta-qad-scale-w13-retry-tp2/benchmark/decode-1.json",
+            "concurrency": 8,
+            "aggregate_tps": 768.5374432749344,
+            "num_errors": 0,
+            "loop_detected": false,
+            "underfilled": false,
+            "capacity_limited": false,
+            "avg_running_reqs": 8.0,
+            "max_queue_reqs": 0,
+            "queue_fraction": 0.0
+          },
+          {
+            "file": "serving/beta-qad-scale-w13-retry-tp2/benchmark/decode-2.json",
+            "concurrency": 1,
+            "aggregate_tps": 224.6984314727463,
+            "num_errors": 0,
+            "loop_detected": false,
+            "underfilled": false,
+            "capacity_limited": false,
+            "avg_running_reqs": 1,
+            "max_queue_reqs": 0,
+            "queue_fraction": 0.0
+          },
+          {
+            "file": "serving/beta-qad-scale-w13-retry-tp2/benchmark/decode-2.json",
+            "concurrency": 8,
+            "aggregate_tps": 779.0345332427296,
+            "num_errors": 0,
+            "loop_detected": false,
+            "underfilled": false,
+            "capacity_limited": true,
+            "avg_running_reqs": 7.9,
+            "max_queue_reqs": 1,
+            "queue_fraction": 0.033
+          }
+        ],
+        "evidence_sha256": {
+          "serving/beta-qad-scale-w13-retry-tp2/benchmark/decode-1.json": "2d971c99fc444d62e32d260ff881925b4f01a8973bb22f606a4e23d5d4acec18",
+          "serving/beta-qad-scale-w13-retry-tp2/benchmark/decode-2.json": "f914049ae8b1e5cc0fec6bcbff8153d8404658ca696e43e2fb7538fa06a02e43"
+        }
+      },
+      {
+        "label": "beta-qad-scale-expert-repeat-kv4-tp2",
+        "status": "excluded from headline decode comparison",
+        "reason": "A decode repetition flagged capacity_limited after a transient sampled request queue. The entire load is excluded from headline decode statistics, including its unflagged repetitions.",
+        "samples": [
+          {
+            "file": "serving/beta-qad-scale-expert-repeat-kv4-tp2/benchmark/decode-1.json",
+            "concurrency": 1,
+            "aggregate_tps": 227.20512297279814,
+            "num_errors": 0,
+            "loop_detected": false,
+            "underfilled": false,
+            "capacity_limited": false,
+            "avg_running_reqs": 1,
+            "max_queue_reqs": 0,
+            "queue_fraction": 0.0
+          },
+          {
+            "file": "serving/beta-qad-scale-expert-repeat-kv4-tp2/benchmark/decode-1.json",
+            "concurrency": 8,
+            "aggregate_tps": 765.6860868791812,
+            "num_errors": 0,
+            "loop_detected": false,
+            "underfilled": false,
+            "capacity_limited": true,
+            "avg_running_reqs": 8.0,
+            "max_queue_reqs": 1,
+            "queue_fraction": 0.033
+          }
+        ],
+        "evidence_sha256": {
+          "serving/beta-qad-scale-expert-repeat-kv4-tp2/benchmark/decode-1.json": "400607833d9ed5d86f29f8339423c3d411aa6ee59bc83dc6ba7e2f94e13cd545"
+        }
+      }
+    ],
+    "conclusion": "Transient queues also occur with 4GiB KV and the original scales. The evidence does not establish that increasing KV allocation eliminates the queue condition or that shared activation scales cause it."
+  },
+  "limits": "16 English WikiText test prefixes (16K positions); no broad capability or long-context quality qualification. Short MTP throughput runs with dynamic graphics clocks; fixed prompt bootstrap conditions on these loads, not independent system reloads. The third load controls prefill drift only: its separate preceding decode attempt was excluded after a transient C8 queue. The initial three-repetition decode batches for both policies completed all validity checks. BF16 expert-activation reference is not an original all-BF16 model. Performance image is unmodified; quality capture adds two observational hooks and resolves output determinism before B12X candidate eligibility.",
+  "evidence_sha256": {
+    "glm-kld-suite.json": "dece045c0b507d3288d667e281a76b12cbe75c2e4afc16e91f26657e234e821a",
+    "qad-layer-input-scale/a16-repeat.json": "6b926b527ee8a0a14b09c603e9958beb460f710459c74ef95081271eba776896",
+    "qad-layer-input-scale/a16-to-expert.json": "0fca0225ba83ca1d89a27e201153293bcc943ab3c7e98aacc4ef86c9ddb7ed3e",
+    "qad-layer-input-scale/a16-to-w13.json": "04f8a3958580b987aa61ba00b10898f95668e06d9b2bf6ed676bced9f280505b",
+    "qad-layer-input-scale/excluded-b12x-a16-reference.json": "c82943dbd57cef848761c2283e0d514f368e01d4ecb6819b8d969290df88fd7c",
+    "qad-layer-input-scale/excluded-decode-loads.json": "cf9d4241494d917390b0576604f91053254718088785df56450b9b9ed3d44cc7",
+    "qad-layer-input-scale/excluded-marlin-a16-reference.json": "79c47efa62f8ca7ee46c09c4e1b1f27449020f341428899961b0194455f0d98d",
+    "qad-layer-input-scale/excluded-performance-sample.json": "5308731c9aeb3a7341523b0f9902f92c5c0027104f189c9766d3db9bd3c53258",
+    "qad-layer-input-scale/expert-repeat.json": "78b752d22c5b5dc44237b430ab8b739ca599ce3649f34c926c68f3a15a81cb8a",
+    "qad-layer-input-scale/expert-to-w13.json": "d340dcbd1347bffbcd5d7df8f7aab9abe5be2cabca00bf4d438e3a7e2fd8857b",
+    "qad-layer-input-scale/marlin-a16-repeat.json": "8c8cc7ac24cdf0b30649b8f5ce8e453132923aafc741a7ba4fedc289c2e2ecd3",
+    "qad-layer-input-scale/performance-cache-baseline.json": "ac61726882374478d3f422d279950ef28cac9eb872fd5bcadd2380bd55079f2c",
+    "qad-layer-input-scale/performance-cache-beta-qad-scale-expert-kv4-tp2.json": "4dfbcc0230ec0cfa4af96cbfb5b21abf8cc13c3428a1806f7acf626cf37fff21",
+    "qad-layer-input-scale/performance-cache-beta-qad-scale-expert-prefill-control-kv4-tp2.json": "4dfbcc0230ec0cfa4af96cbfb5b21abf8cc13c3428a1806f7acf626cf37fff21",
+    "qad-layer-input-scale/performance-cache-beta-qad-scale-w13-kv4-tp2.json": "4dfbcc0230ec0cfa4af96cbfb5b21abf8cc13c3428a1806f7acf626cf37fff21",
+    "qad-layer-input-scale/quality-completed.json": "382b76f3299f9542fa1233445f2b8629a120045abfe0043c49d54f1bcf782234",
+    "qad-layer-input-scale/quality-qualified.json": "155c3bbf9a19298e5a7d66dc6ed20a1ad9f95798df9e4f8d2a1bee55193d5b9e",
+    "qad-layer-input-scale/scale-contract-check.json": "200edd0b20e1987f61ba7f9ac052781a90f3eedae25f13fe4cdabbe8e43e425c",
+    "qad-layer-input-scale/w13-repeat.json": "f46bdd5e367c5598b589fbca3f81d2ebf59bb1f62e5a055a5cfa0e5938825215",
+    "runtime/beta-58d05-deterministic-preparation/manifest.json": "096e07e0851aacf7764e244ffef967b6afad4e0476955a79b8922d940664562c",
+    "runtime/beta-58d05-scale-audit-2/source-manifest.json": "b92796128c50a569162b452b5e12c0f42b6b0794369f513fe508f4818d3f51e3",
+    "serving/beta-qad-input-marlin-a16/capture-receipt-repeat.json": "ff06bf5adf0b6364035439c761b59e2c786eaf6478831d23eebd6a0bc955fb24",
+    "serving/beta-qad-input-marlin-a16/capture-receipt.json": "87a4c1b8b8bdc64ea34f115f47198585ee6c087accbd95bf5176358ac73ba3eb",
+    "serving/beta-qad-input-marlin-a16/completed.json": "fbd2bee7596d8469de8adc1ea3206daee8d851af282f4deb5590de61746fa42b",
+    "serving/beta-qad-input-marlin-a16/launch.json": "b58be5c0ee6f85f5fe6cd18279d862176e7d6c14f6d1a11574d5000d0cd5e736",
+    "serving/beta-qad-input-marlin-a16/logits/wikitext-00/manifest.json": "c6de65b425665c8753b4244f37f6944a15e1bdd469c59a72042e129364641e7f",
+    "serving/beta-qad-input-marlin-a16/logits/wikitext-00-repeat/manifest.json": "fbac56b23c2caf4529aa5d92b28d04c8ac1bbd239075fe18c8024ebfbf6b3236",
+    "serving/beta-qad-input-marlin-a16/logits/wikitext-01/manifest.json": "262ab3c050a0b1a33f8d08a19fd4938917d2b4f054c9d54cff47128e524c24a9",
+    "serving/beta-qad-input-marlin-a16/logits/wikitext-01-repeat/manifest.json": "6bafb48f0e82d3c3da4ef3aa75072cb95de408c661619e8b8f455179d1391af1",
+    "serving/beta-qad-input-marlin-a16/logits/wikitext-02/manifest.json": "07da25029cdadf7137b53eda0fae137dd142533142e8b68101fd589c36979f32",
+    "serving/beta-qad-input-marlin-a16/logits/wikitext-03/manifest.json": "0723c554f4ab0081327ad24c35b38cfcc2c5ba55080c0daa864d4b969b71e22a",
+    "serving/beta-qad-input-marlin-a16/logits/wikitext-04/manifest.json": "370f63ed38e3c2a3690b85700c6c505b9e9cd3df62d95550a9986da11442e6eb",
+    "serving/beta-qad-input-marlin-a16/logits/wikitext-05/manifest.json": "c9f9e889fc55b406989336292e1796069520982fa5eaa1fbd573f0433c495f58",
+    "serving/beta-qad-input-marlin-a16/logits/wikitext-06/manifest.json": "0401aba4e0acf0510c5dbb61ae6851f7aba714f88119173801a70a8f3e551395",
+    "serving/beta-qad-input-marlin-a16/logits/wikitext-07/manifest.json": "f6d86471d13708f823c0d49cce92ca447c2450dc7f98a93f8ff8660ae470ac73",
+    "serving/beta-qad-input-marlin-a16/logits/wikitext-08/manifest.json": "a33bd9da33f9e1a92157360892f0c751848f7bd2a75a2298031b70c12ac1aa8f",
+    "serving/beta-qad-input-marlin-a16/logits/wikitext-09/manifest.json": "17b97f712bab8c99bde8d971e1266c6a3b476d0c6e3a6add54b318a70c571f69",
+    "serving/beta-qad-input-marlin-a16/logits/wikitext-10/manifest.json": "041f0d3baff5a2c2591660efe519d2378acb9332a00458f62d27452e755dae9a",
+    "serving/beta-qad-input-marlin-a16/logits/wikitext-11/manifest.json": "7670f1e21d9227805f83c1d83bb9952dc2b5a70a1462be264ed51bbc4fa98679",
+    "serving/beta-qad-input-marlin-a16/logits/wikitext-12/manifest.json": "6753bc6c2e905114128fd17ba61731ee294b4e377893bba2f16fc597a9f775df",
+    "serving/beta-qad-input-marlin-a16/logits/wikitext-13/manifest.json": "9b34b154a0eb0c5867b14ff7cef1fd9fbce808fe16f4f7b1fdcf544c0a00505c",
+    "serving/beta-qad-input-marlin-a16/logits/wikitext-14/manifest.json": "3ab4cb2daf815cf5be4e532c4e40dbd4c678fd8f44fc49e3e2843cc49bb0dcc3",
+    "serving/beta-qad-input-marlin-a16/logits/wikitext-15/manifest.json": "df26e3eb61d9b2eab2fb20cb063a92aae024390ef9dbe1bc7e5447a66874c296",
+    "serving/beta-qad-input-marlin-a16/weights/Glm5NextForConditionalGeneration-rank0.json": "40ee3b8440d2e0495d2af92e3444d6db492d6fef10a3b41e27dbd9a0a1dfc248",
+    "serving/beta-qad-input-marlin-a16/weights/Glm5NextForConditionalGeneration-rank1.json": "442ca38645ddb724fd4a4789e27e4a1573c310372582ecf1dd75ec495188ded3",
+    "serving/beta-qad-input-marlin-a16/weights/scale-contract-rank0.json": "bcc45bd8bb1f285ee404b43ee0c3c74b3a5f26c1dead3ff0a5b2c7ef9db8942a",
+    "serving/beta-qad-input-marlin-a16/weights/scale-contract-rank1.json": "50d9b0011f09466b84905a8aceb006aab2d82a8b9c3ade876cc3dbd81490d98e",
+    "serving/beta-qad-input-prepared-a16/capture-receipt-repeat.json": "8f0c0aec9a47a8f084487f2c6aeb827f80c25d275f9c31ac90a01f25712c14cb",
+    "serving/beta-qad-input-prepared-a16/capture-receipt.json": "83edf606cee732d624cf0af51351799eaae2d210b8d1f13b8ee8096e074d71a3",
+    "serving/beta-qad-input-prepared-a16/completed.json": "cd683c0d1b7541c51f3205cea5b62168ea0795408902e6acff544bbcb244b120",
+    "serving/beta-qad-input-prepared-a16/launch.json": "9f5025127543a90fe036f8f89dd0946c374d19a8e39b37ce8fb0b03649fb05cd",
+    "serving/beta-qad-input-prepared-a16/logits/wikitext-00/manifest.json": "93dacc9fa1d89071823dfc7d61337b6c801f88932f174addc7e43f57f41b4e9b",
+    "serving/beta-qad-input-prepared-a16/logits/wikitext-00-repeat/manifest.json": "6941f5a4558e4c10149825c2082cbd59ccfdc67579dce9d17c23a9dca0415cf2",
+    "serving/beta-qad-input-prepared-a16/logits/wikitext-01/manifest.json": "863165d414cb38df7c0cbb00eb299567c6d4b22baaad476abee622edca804f04",
+    "serving/beta-qad-input-prepared-a16/logits/wikitext-01-repeat/manifest.json": "3057269af6226d9c2fa64ae6272788fc445ad882bbfd8305388c1d58a833e24b",
+    "serving/beta-qad-input-prepared-a16/logits/wikitext-02/manifest.json": "281bc48952b8306e83e5e003484a491d38d36481189291aeb4365346a6faa91f",
+    "serving/beta-qad-input-prepared-a16/logits/wikitext-03/manifest.json": "6cf46ddb6284cb8e11dbd751592863ab43278331a0aca7e361914e29d42497c3",
+    "serving/beta-qad-input-prepared-a16/logits/wikitext-04/manifest.json": "e6edcb741ac04f908ef5a0164c5baff113487fea1a131f8ce734251676953be6",
+    "serving/beta-qad-input-prepared-a16/logits/wikitext-05/manifest.json": "d7e03ba534e1d6f349782ac05357977c7d0bf034b5b328884a812bab0424ea81",
+    "serving/beta-qad-input-prepared-a16/logits/wikitext-06/manifest.json": "027feeffd161ee98b605ebc24a0019fd69a86b4e2c2de5f060bbd1429d72e2bf",
+    "serving/beta-qad-input-prepared-a16/logits/wikitext-07/manifest.json": "a7b4087bfb720477d7726e63f584b9c34aad88f5f56dcc244b00e6a6ab43788b",
+    "serving/beta-qad-input-prepared-a16/logits/wikitext-08/manifest.json": "407e01a311e0ca61449088cec1d01578a79f091652424f78dbf4f473af099997",
+    "serving/beta-qad-input-prepared-a16/logits/wikitext-09/manifest.json": "7083fcd31662f778ef1a1f196443f774ce60ac9b92a5c4437d9a2cc18e5a19da",
+    "serving/beta-qad-input-prepared-a16/logits/wikitext-10/manifest.json": "eef1f5ab894df74cfd1f748cb0a9a26bf50eb7bd56d87fee9487b884869b0b13",
+    "serving/beta-qad-input-prepared-a16/logits/wikitext-11/manifest.json": "cbefda99f138d1695ae6d15b0852940938a29a1c37a63655e597c3a176fe8114",
+    "serving/beta-qad-input-prepared-a16/logits/wikitext-12/manifest.json": "dfc2f135ded73953098411c183864fb6565a012eeb587b50e55a2d7531a39e69",
+    "serving/beta-qad-input-prepared-a16/logits/wikitext-13/manifest.json": "96bdb42c752036d27b4705ddae8e411371cfd48f99e6e649172a16d31b651256",
+    "serving/beta-qad-input-prepared-a16/logits/wikitext-14/manifest.json": "31dc7a2e0502b6ae2be22f752b53b78715660cd34fa71ad7432e025e53e0b5d0",
+    "serving/beta-qad-input-prepared-a16/logits/wikitext-15/manifest.json": "cdab21c9dfd4f8c44c18b756cc645ac1347768896e69c1a12ec1c0a0966a9745",
+    "serving/beta-qad-input-prepared-a16/weights/Glm5NextForConditionalGeneration-rank0.json": "738b9bb0f80013684078ef8d1d02bec1d714e962f01a840eba2f6b6bcbc2c069",
+    "serving/beta-qad-input-prepared-a16/weights/Glm5NextForConditionalGeneration-rank1.json": "a767f2c727df22a30a1c6f4947f11542050329090ec6cee3676b9ca955b6b667",
+    "serving/beta-qad-input-prepared-a16/weights/scale-contract-rank0.json": "794e51ccae8da7a9a4defab42291a21dd5dc073c05f2dcc6b49df8e32e38598b",
+    "serving/beta-qad-input-prepared-a16/weights/scale-contract-rank1.json": "67301c52cb4d085a8b33de00d34fc0ffbbda5ebeee245f1cab2d41b603730ee8",
+    "serving/beta-qad-input-prepared-expert/capture-receipt-repeat.json": "78bfe590f135b3351fd72b076b2c0d03c1ba220f9355c7a3b49444aae029939d",
+    "serving/beta-qad-input-prepared-expert/capture-receipt.json": "109b1dbe8f960a01cae06f957a63371c0eb8f8fd1ca5345b3f377608b51716e2",
+    "serving/beta-qad-input-prepared-expert/completed.json": "06a0aecadff820476e590d58a1088706bbe125388db68d49dc6ab90d23edee9e",
+    "serving/beta-qad-input-prepared-expert/launch.json": "d4e76cc978572ec7b72f1eb28b1ac0b9fcdc751732b37ad73f420d5f0f2eafed",
+    "serving/beta-qad-input-prepared-expert/logits/wikitext-00/manifest.json": "16f4badecbd0baf7036aaeaa54f6eecd3aac938b1210db687856039576675fdc",
+    "serving/beta-qad-input-prepared-expert/logits/wikitext-00-repeat/manifest.json": "a2ed6e7a385b73383d2c2a73a791d1e69de402658f8bd0ad7a5f62e4af4c28af",
+    "serving/beta-qad-input-prepared-expert/logits/wikitext-01/manifest.json": "af1dc99b0130bc86a851d2a29e2ac7df3683905b2d1cefbeabff6903d4324d00",
+    "serving/beta-qad-input-prepared-expert/logits/wikitext-01-repeat/manifest.json": "d7d5880511975cdfe2f1a97e4180782a71cb830981e2668267dc42aeee72dbca",
+    "serving/beta-qad-input-prepared-expert/logits/wikitext-02/manifest.json": "494838e98d8eda1bf88888aba486390cc0f0068150b7cf4aa5122591fb966d18",
+    "serving/beta-qad-input-prepared-expert/logits/wikitext-03/manifest.json": "17db6c5eadf5309fcc13252938db10bfbf5b73c3f6f646a276fd339e14c26120",
+    "serving/beta-qad-input-prepared-expert/logits/wikitext-04/manifest.json": "c5ecd6a4ea8ab7e018f8df0e86a85f9d51498a6149241be591dea0a19ae139c5",
+    "serving/beta-qad-input-prepared-expert/logits/wikitext-05/manifest.json": "6532ce7709ae4e9c8179c6efc51af9a45609b7a152ea468ed276c02a7d2f0ab5",
+    "serving/beta-qad-input-prepared-expert/logits/wikitext-06/manifest.json": "37af6420071c0eb6204634cfd610e41a43eeb7df04c2e6444c1ea1d9649ca435",
+    "serving/beta-qad-input-prepared-expert/logits/wikitext-07/manifest.json": "e991b2b8193c75cb446a8aa82995bac2d5209a529a77e8d2b304d18d92030dff",
+    "serving/beta-qad-input-prepared-expert/logits/wikitext-08/manifest.json": "37df7071fcab1ca81f976fd03f0a02a31ff6543e9e538603aa37a0cba7225141",
+    "serving/beta-qad-input-prepared-expert/logits/wikitext-09/manifest.json": "da7a7f06682ce4020a4ea0dc5ed326fadb40eada778d7387b8324bfdac239e62",
+    "serving/beta-qad-input-prepared-expert/logits/wikitext-10/manifest.json": "053a0adcb30d3cca0b004d5fcac7bf07fe9d44880c37efd47e9c833de422e2ed",
+    "serving/beta-qad-input-prepared-expert/logits/wikitext-11/manifest.json": "bb3ca92a70bc00fef3a8fa97c63ff7a35da3dd12eed0cc7e889fc4ec4b4d1e4e",
+    "serving/beta-qad-input-prepared-expert/logits/wikitext-12/manifest.json": "9f758c3563d2e6a248c5e34cc59ac3054380973ae52b2c2be76791eb3fe1b47d",
+    "serving/beta-qad-input-prepared-expert/logits/wikitext-13/manifest.json": "fb6a6d127df992c5b2337291528efc1444a729c7f91c88389d50483989452fee",
+    "serving/beta-qad-input-prepared-expert/logits/wikitext-14/manifest.json": "d23a899d8bda1da6e1c8d17c5bee01c9c19c85a2edfda85ac45592a9cf4eeec4",
+    "serving/beta-qad-input-prepared-expert/logits/wikitext-15/manifest.json": "4e51e49c6a357d006cea590f05f1db7409593049b6e053ab3c245467c2cd9f1c",
+    "serving/beta-qad-input-prepared-expert/weights/Glm5NextForConditionalGeneration-rank0.json": "f210a39af17d8648241ac3736c4939266aaaaacac530723770806bda19359891",
+    "serving/beta-qad-input-prepared-expert/weights/Glm5NextForConditionalGeneration-rank1.json": "af93ebdefe82a89f261cad010e2af301e75dad1a810c931a5e69db992796bb42",
+    "serving/beta-qad-input-prepared-expert/weights/scale-contract-rank0.json": "d588b4f8ec96d2a75ea263051134330ea8ededdb6075711a7a780e21996ba73c",
+    "serving/beta-qad-input-prepared-expert/weights/scale-contract-rank1.json": "1a21f884317a1899c91ea949edb62a352c59a753c7f22db4fba51a8390cdcc14",
+    "serving/beta-qad-input-prepared-w13/capture-receipt-repeat.json": "fbe0ea4e769311f8738a70bc8cee714895db7ba2055e8aa5a2d6b37ac8267799",
+    "serving/beta-qad-input-prepared-w13/capture-receipt.json": "f86bcb2e823e4cc955fa2e04fbecaf33d8f623452a7f6e76600326de47a87095",
+    "serving/beta-qad-input-prepared-w13/completed.json": "a19b4938cb16e7a4549e6898d6b00fb65794f9d253de30888535c84e1cae50f7",
+    "serving/beta-qad-input-prepared-w13/launch.json": "b10346b25e2cc04c14b5342d95e288fdc903d3aa1027bca354fd3155eaa2625c",
+    "serving/beta-qad-input-prepared-w13/logits/wikitext-00/manifest.json": "a8454d46ed1ce9bee806c3d6a79e46d1000accc59db4e687d4700bc2dc65278b",
+    "serving/beta-qad-input-prepared-w13/logits/wikitext-00-repeat/manifest.json": "c96c434081d84b2805d44a5a9b022371ac4a300f215a367958560a16d0332ae2",
+    "serving/beta-qad-input-prepared-w13/logits/wikitext-01/manifest.json": "768a438a970e434e651f676fd5d264d8de33908a8ba49058f78ae15ef7238cf3",
+    "serving/beta-qad-input-prepared-w13/logits/wikitext-01-repeat/manifest.json": "168f1e092fc1be626296bb134790d93cfb8ae77f2931496c1ca2dd36f32be618",
+    "serving/beta-qad-input-prepared-w13/logits/wikitext-02/manifest.json": "c740069afe271c82b665d38c9fd45749d256d014f98b2ffd5daf13ee2427a2af",
+    "serving/beta-qad-input-prepared-w13/logits/wikitext-03/manifest.json": "d544d76474c869270eac28f5214c627e6fbd260160b09d43d4b8953973c37591",
+    "serving/beta-qad-input-prepared-w13/logits/wikitext-04/manifest.json": "39a4af35ea85f0d1eac66dd8c9046eb8c9d2a748d095220b4cb7af1669fad5be",
+    "serving/beta-qad-input-prepared-w13/logits/wikitext-05/manifest.json": "3f12ee7d94fb9f0c5d5ebd4858b5bad175e79b4b4a640c9e2d13fe89e3fc2100",
+    "serving/beta-qad-input-prepared-w13/logits/wikitext-06/manifest.json": "e72c46b7df2452c543806e7ece1d1112d007dfa859b6ddc8bc367f127a7eed7c",
+    "serving/beta-qad-input-prepared-w13/logits/wikitext-07/manifest.json": "ac57ea032f96491c9d90abb7c877303c85ebe5d56961435a4a93ddac77da9ae5",
+    "serving/beta-qad-input-prepared-w13/logits/wikitext-08/manifest.json": "7fbf7014a99a986f1b565788ef274dc122b1606bb993dc340c7773052d5a851c",
+    "serving/beta-qad-input-prepared-w13/logits/wikitext-09/manifest.json": "fddc6bf10649cc359254ee80a6fce66b7322bde5a71eb7629a180e2360baec9c",
+    "serving/beta-qad-input-prepared-w13/logits/wikitext-10/manifest.json": "62884c97bbd7dcc08df79700e5a2352e85b5d2d1779521e33eb2d743a39bc10d",
+    "serving/beta-qad-input-prepared-w13/logits/wikitext-11/manifest.json": "df8df31e22a0447806dc59496b67e636ee8a0c47366722d584b0393dbac6634b",
+    "serving/beta-qad-input-prepared-w13/logits/wikitext-12/manifest.json": "0c4cfec83aa911ea27c23e5f6d4c58ee8f611e6775b595c30208d4d4aff8ee14",
+    "serving/beta-qad-input-prepared-w13/logits/wikitext-13/manifest.json": "df2dd60d273ce0c0f1345c0b02d22cab203c833494b87d08fcd5d53ace63bcaa",
+    "serving/beta-qad-input-prepared-w13/logits/wikitext-14/manifest.json": "662a02cea5f6447f6db80a3e6f8eeb02bf133b9facc798d528f649e54519df8f",
+    "serving/beta-qad-input-prepared-w13/logits/wikitext-15/manifest.json": "e21ca1491e0928768104e8756c63c41612f6a0a64b60ddd3006d8182be3128ce",
+    "serving/beta-qad-input-prepared-w13/weights/Glm5NextForConditionalGeneration-rank0.json": "c480514afa8929860439cd72b526fdf5a712ad46c799901d1355f9517e3ab3d7",
+    "serving/beta-qad-input-prepared-w13/weights/Glm5NextForConditionalGeneration-rank1.json": "fef19ea2fe90ffccdaf1c1c4888317da95491b9fe8b51fa8d3d844c5204d18ff",
+    "serving/beta-qad-input-prepared-w13/weights/scale-contract-rank0.json": "94414fb0fd0e2cd748a8f23a5ab2dc9736c7587e3e2ac04e1740ad6b270d109b",
+    "serving/beta-qad-input-prepared-w13/weights/scale-contract-rank1.json": "b2e0d3d95acd25c7065422c09486cc727bebf10eb988d7bf88edd8a06e779c11",
+    "serving/beta-qad-scale-expert-kv4-tp2/benchmark/completed.json": "7a0dd54b57c2f4295da3fc8cc7de35160594d24958b8af530907422429becf4f",
+    "serving/beta-qad-scale-expert-kv4-tp2/benchmark/decode-1.json": "bc214b6933f88554d7944611635de7a7fef34f969ef72158254da778ae992232",
+    "serving/beta-qad-scale-expert-kv4-tp2/benchmark/decode-2.json": "d3f83999ead9830538e6d7074e98b4998e3cfed0c2f0f732f99fdbdd237f102b",
+    "serving/beta-qad-scale-expert-kv4-tp2/benchmark/decode-3.json": "0aed54e783a05803e771df3482c2d68c42aadc639680799f3d0800620b437b7e",
+    "serving/beta-qad-scale-expert-kv4-tp2/benchmark/prefill.json": "79771a88738c5003bac6f311c6853d07aaecd53cd43331c12ade17d7af3946c6",
+    "serving/beta-qad-scale-expert-kv4-tp2/completed.json": "69a9c38a14121f6018f9a08780c837de092fb9119eade43ad4f99c16ad06bde5",
+    "serving/beta-qad-scale-expert-kv4-tp2/launch.json": "a8b9b7ed3406086dcbeea3c61d2c679fb0f907911d1d2984f3d1d5f1478e84bf",
+    "serving/beta-qad-scale-expert-prefill-control-kv4-tp2/benchmark/completed.json": "57b98963147eca90fdceeef1ade698a225b2a72f31ce0cce8878c050c9ca6c97",
+    "serving/beta-qad-scale-expert-prefill-control-kv4-tp2/benchmark/prefill.json": "a6da35ab623dbc7e721da1a7e489a8190349467dbab726351a7afbf724dc87eb",
+    "serving/beta-qad-scale-expert-prefill-control-kv4-tp2/completed.json": "15220505e8fb239dbe06796729aded2950b014e5444df6074fe8eb53e733c507",
+    "serving/beta-qad-scale-expert-prefill-control-kv4-tp2/launch.json": "27164acfee8d5ba420b3c515e18e5f469579928ecce88107ae58f769b265f5c9",
+    "serving/beta-qad-scale-w13-kv4-tp2/benchmark/completed.json": "98d99bbfdac191a362f02429c2cf61e1c8ccfa66c4102eecb73cc388f0340466",
+    "serving/beta-qad-scale-w13-kv4-tp2/benchmark/decode-1.json": "0c09a404cb403d27904d216b0bd27a9e45f9cb11df1f0a83ae0063015faa5264",
+    "serving/beta-qad-scale-w13-kv4-tp2/benchmark/decode-2.json": "bfda3f6f6f19a34024df8dbc90e43dbf1ba0f1ef3f02e0e6091d4989996826a6",
+    "serving/beta-qad-scale-w13-kv4-tp2/benchmark/decode-3.json": "0c19e7494afa878d8f9f09c59aad976b9ccb179525d0cf020b8b6065ff4fd4a2",
+    "serving/beta-qad-scale-w13-kv4-tp2/benchmark/prefill.json": "30204032584fca3aafa9f297d0d099c046e72486bcd20a44787e32c6a53c873f",
+    "serving/beta-qad-scale-w13-kv4-tp2/completed.json": "15edbb704502263782ef5c0f75408aa6d6bd3db3ce32e1e99fa5356374e33c36",
+    "serving/beta-qad-scale-w13-kv4-tp2/launch.json": "04fa424dc8535df3dc38ffff5dafa68a88159bfc1be2b9f0e4ecb402bb100cbe"
+  }
+}

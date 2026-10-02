@@ -34,9 +34,11 @@ docker run -d --name glm-qad-spark-tp2 --restart no --init \
   --ulimit memlock=-1 --ulimit stack=67108864:67108864 \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
   -v "$GLM_QAD_DIR/config:/recipe:ro" \
+  -e OMP_NUM_THREADS=1 \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e VLLM_USE_V2_MODEL_RUNNER=1 \
   -e VLLM_B12X_MOE_FP4_CSF=1 -e VLLM_B12X_MOE_FP4_FORCE_A16=0 \
+  -e VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE=0 \
   -e VLLM_ENABLE_PCIE_ALLREDUCE=1 -e VLLM_PCIE_ALLREDUCE_BACKEND=b12x \
   -e VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE=2048 \
   -e VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE=auto \
@@ -59,7 +61,7 @@ exec /opt/venv/bin/python -m vllm.entrypoints.cli.main \
   --additional-config "{\"glm53_kda_decode_backend\":\"auto\",\"kda_prefill_backend\":\"b12x\"}" \
   --quantization-config "$(cat /recipe/main.json)" \
   --speculative-config "$(cat /recipe/mtp.json)" \
-  --kv-cache-dtype fp8 --kv-cache-memory-bytes 3221225472 \
+  --kv-cache-dtype fp8 --kv-cache-memory-bytes 4294967296 \
   --gpu-memory-utilization 0.93 \
   --block-size 256 --mamba-cache-mode align \
   --max-model-len 65536 --max-num-batched-tokens 3072 --max-num-seqs 8 \
@@ -110,9 +112,36 @@ dense quantization flags shown above disabled when reproducing this selection.
 
 The recipe matches the Spark **layer selection** while preserving QAD's weights
 and per-expert activation calibration. It does not produce byte parity with
-Spark's serialized weights. QAD calibration prevents an expert-input sharing
-optimization available to the measured Spark checkpoint; the validation report
-records the resulting workload-dependent prefill difference.
+Spark's serialized weights. Expert-specific QAD activation scales prevent reuse
+of one quantized input across experts. The optional shared-scale setting below
+enables that optimization with a change to activation quantization.
+
+## Optional shared gate/up activation scale
+
+`VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE` defaults to `0`, which preserves the
+checkpoint's expert-specific activation calibration. Keep `0` for routine use.
+To share one gate/up input scale per main routed layer while retaining each
+expert's down-input scale, replace its environment line in the Docker command
+with:
+
+```bash
+  -e VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE=w13 \
+```
+
+This takes the layer maximum of the existing gate/up scales during loading.
+The trained NVFP4 weight codes and weight scales remain unchanged; the loader
+recomputes the runtime coefficients for the selected activation scale. The MTP
+experts in this recipe use BF16 activations and need no shared FP4 input range.
+Use `w13` to retain per-expert down scales; `1` or `all` would share them too.
+This setting is separate from lossless CSF compression of **weight** scales.
+
+On two RTX PRO 6000 Blackwell GPUs at 600 W and 16365 MHz memory clocks, the
+shared setting improved fixed 32K prefill by about 1.1% after the reload control,
+with no decode improvement. The output distributions changed; a small English
+sample showed NLL 1.08448 to 1.08563 and did not establish equivalent quality.
+The [activation-scale report](glm53_qad_activation_scales.md) records exact
+image/configuration identities, repetitions and uncertainty. A maximum of
+expert-specific ranges is a heuristic, not a new calibration pass.
 
 ## MTP, cache and prefill settings
 
@@ -121,10 +150,15 @@ with `--num-speculative-tokens 1` when generating a separate configuration
 directory, or omit `--speculative-config` from the serve command to disable MTP.
 Without MTP, only the 520 main-model MXFP8 targets are loaded.
 
-The 3 GiB cache allocation is per GPU; the example sets a 65536-token model
+The 4 GiB cache allocation is per GPU; the example sets a 65536-token model
 limit. It does not provide eight simultaneous 64K contexts or establish
 million-token capacity. Set a lower limit with `--max-model-len 32768` if needed;
 increase `--kv-cache-memory-bytes` only when the available VRAM permits it.
+
+Set `OMP_NUM_THREADS=1` before startup, as in the example. This avoids excessive
+CPU thread creation while loading two tensor-parallel workers, especially when
+starting several servers on the same host. The container otherwise selected 64
+threads per worker during loading before reducing that count for inference.
 
 Set `--max-num-batched-tokens 3072` explicitly, as in the example, for prefill
 throughput. With TP2/DCP1, no MTP and a 32K prompt, the same GPU pair measured

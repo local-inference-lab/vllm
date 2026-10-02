@@ -12,7 +12,7 @@ representation.
   online NVFP4 MoE with BF16 activations, independent draft quantization, and
   separate main/draft FP4 scale-compression policies.
 - **Qualified:** target-set coverage on both TP2 ranks, GPU encoder tests,
-  bounded loader ownership, startup, C1/C8 generation and 4K prefill under the
+  bounded loader ownership, startup, C1/C8 generation and prefill through 32K under the
   configurations recorded below. Qualification is limited to these conditions.
 - **Research-only:** short throughput measurements and the English corpus
   quality sample. These do not establish downstream model quality or long-context
@@ -48,14 +48,52 @@ changes code selection; original-input GPU parity tests cover the intended
 quantizer contract. Its SM100 restriction remains. `nvfp4_a16` explicitly rejects
 FP16 activations and requires BF16 with a supported W4A16 backend.
 
-## Artifacts and conditions
+## Published container qualification
+
+The GLM QAD online recipe completed startup, three C1/C8 decode repetitions,
+and fixed 2K/8K/32K prefill on the published image below. This qualification uses
+installed packages with no Python source mounts, 3 GiB KV per rank and the
+container's loading-thread default. The source checkpoint and generated
+quantization maps match the [usage guide](glm53_spark_online.md), which recommends
+4 GiB KV and `OMP_NUM_THREADS=1`. GPU indices, the API port and container names
+are isolated for the benchmark; an additional mount stores evidence.
+
+| Artifact or condition | Identity or value |
+| --- | --- |
+| Image digest | `ghcr.io/local-inference-lab/vllm@sha256:ef547bdcf146e2c9b183e2fa0b82a3a01ada680765720d01a25c258b45a801a7` |
+| Image tag | `karmic-kraken-beta-20261002-764596cbb1634f24` |
+| vLLM | `58d05bc7626dd87ee401155e9b52e6c6fd92bd5d`, PR #965 merged into `integration/karmic-kraken-beta` |
+| B12X | `a77b3f85e5e2a81315ff4a90088912f187708005` |
+| Hardware | Frank1 GPUs 12/13, RTX PRO 6000 Blackwell Workstation 96 GB, 600 W, 16365 MHz memory, dynamic graphics clocks |
+| Model execution | TP2/DCP1, MTP with three speculative tokens, FP8 KV, main/draft NVFP4-CSF |
+| Capacity | 3 GiB KV/rank, 3072-token prefill budget, eight sequences, 65536-token limit |
+| Evidence | `serving/beta-pr965-guide-tp2` under the data root below |
+
+| Measurement | Result |
+| --- | ---: |
+| C1 decode, median of three 30-second runs | 220.593 output tok/s |
+| C8 decode, aggregate median of three 30-second runs | 765.271 output tok/s |
+| Fixed 2K prefill | 11061.818 prompt tok/s |
+| Fixed 8K prefill | 11905.202 prompt tok/s |
+| Fixed 32K prefill, ten prompts | 12120.094 prompt tok/s |
+
+All decode samples passed the benchmark's error, looping, underfill and capacity
+checks. Fixed prefill uses server prefill duration and verifies zero cached
+tokens. These are bounded performance measurements, not million-token capacity
+or downstream quality qualification. Other services on GPUs 0–9 remained active.
+The adjacent results JSON records the raw artifact hashes and publication
+manifest. The [activation-scale comparison](glm53_qad_activation_scales.md)
+qualifies the guide's 4 GiB KV and one CPU thread per worker; its numbers must
+not be substituted into the 3 GiB table.
+
+## Component evaluation artifacts and conditions
 
 | Artifact | Immutable identity |
 | --- | --- |
 | Source checkpoint | `local-inference-lab/GLM-5.3-Flash-NVFP4`, revision `cfd47bd7680e68408924df09b179d5bed25b2ae9` (`mtp-bf16`) |
 | Projection-selection reference | `local-inference-lab/GLM-5.3-Flash-NVFP4-Spark`, revision `a608241037e4c2565356bff7ca293f2133888f88` |
 | Container | `ghcr.io/local-inference-lab/vllm@sha256:2230db60afb4fd06dc2ef2b7f7f27dc7f78d7a50be70a08461b4df9fa5e90732` |
-| vLLM base | `93dabce32fd4d5355662608296e64d720711cdcc` plus the source changes in this PR |
+| vLLM base | `93dabce32fd4d5355662608296e64d720711cdcc` with implementation `6cfd54433be58facc00c10f491d72853667d7d10` |
 | B12X | Unmodified installed `a77b3f85e5e2a81315ff4a90088912f187708005` |
 | Hardware | Frank1, RTX PRO 6000 Blackwell 96 GB, TP2, 600 W limits |
 | Runtime limits | FP8 KV, 3 GiB KV allocation per rank, 8192 model length, 1024 batched tokens, eight sequences |
