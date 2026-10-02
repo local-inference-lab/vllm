@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import regex as re
 from pydantic import (
@@ -83,6 +83,11 @@ class QuantSpec:
     activation: QuantKeyField = None
     """Activation quantization key, or a name from QUANT_KEY_NAMES."""
 
+    activation_dtype: Literal["bfloat16"] | None = None
+    """Keep activations in this dtype instead of the method's quantized format.
+    Supported by online NVFP4 MoE with BF16 activations.
+    """
+
     def __str__(self) -> str:
         def quant_key_str(quant_key: QuantKey | None) -> str:
             if quant_key is None:
@@ -96,7 +101,10 @@ class QuantSpec:
                 str(quant_key),
             )
 
-        return quant_key_str(self.weight)
+        name = quant_key_str(self.weight)
+        return (
+            name if self.activation_dtype is None else f"{name}/{self.activation_dtype}"
+        )
 
 
 @config
@@ -123,6 +131,12 @@ class QuantizationConfigArgs:
     quantization, mapping to an online shorthand name (see
     `_ONLINE_SHORTHANDS`). A layer that matches no pattern is left unquantized.
     Mutually exclusive with `linear` and `moe`.
+    """
+
+    strict_targets: bool = False
+    """Require exact target names and complete coverage at model construction.
+    Use separate target sets for the main and draft models. A missing target,
+    including a target outside the local pipeline partition, is an error.
     """
 
     @field_validator("linear", "moe", mode="before")
@@ -170,6 +184,14 @@ class QuantizationConfigArgs:
 
     @model_validator(mode="after")
     def _validate_targets_exclusivity(self) -> "QuantizationConfigArgs":
+        if self.strict_targets:
+            if not self.targets:
+                raise ValueError("strict_targets requires a nonempty targets mapping")
+            if any(
+                name.startswith("re:") or any(char in name for char in "*?[")
+                for name in self.targets
+            ):
+                raise ValueError("strict_targets requires exact names without patterns")
         if self.targets is None:
             return self
         if self.linear is not None or self.moe is not None:
@@ -215,6 +237,9 @@ _ONLINE_SHORTHANDS: dict[str, QuantizationConfigArgs] = {
     # FlashInfer TRTLLM only); linear stays unquantized (no `linear` field).
     "nvfp4_per_token": QuantizationConfigArgs(
         moe=QuantSpec(weight=kNvfp4Static),
+    ),
+    "nvfp4_a16": QuantizationConfigArgs(
+        moe=QuantSpec(weight=kNvfp4Static, activation_dtype="bfloat16"),
     ),
 }
 
@@ -275,4 +300,5 @@ def resolve_quantization_config(
         moe=quantization_config.moe or base.moe,
         ignore=quantization_config.ignore or base.ignore,
         targets=quantization_config.targets or base.targets,
+        strict_targets=quantization_config.strict_targets,
     )

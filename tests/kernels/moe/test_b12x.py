@@ -1128,11 +1128,21 @@ def test_online_csf_scratch_rejects_concurrent_microbatches():
 @pytest.mark.parametrize(
     "weight_dtype,activation_dtype", [("nvfp4", "nvfp4"), ("mxfp4", "mxfp8")]
 )
+@pytest.mark.parametrize(
+    "scale_policy,environment",
+    [(None, "1"), (None, "0"), ("native", "1"), ("csf", "0")],
+)
 def test_online_csf_releases_original_scale_tensors(
-    monkeypatch, weight_dtype, activation_dtype
+    monkeypatch, weight_dtype, activation_dtype, scale_policy, environment
 ):
-    monkeypatch.setenv("VLLM_B12X_MOE_FP4_CSF", "1")
-    with set_current_vllm_config(VllmConfig()):
+    monkeypatch.setenv("VLLM_B12X_MOE_FP4_CSF", environment)
+    config = VllmConfig()
+    # Deferred draft preparation can run in the target model's context.
+    # The expert's own policy must survive that context switch.
+    config.kernel_config.moe_scale_compression = (
+        "csf" if scale_policy == "native" else "native"
+    )
+    with set_current_vllm_config(config):
         case = _make_b12x_moe_case(weight_dtype, activation_dtype)
         scales = [
             weakref.ref(case.quant_config.w1_scale),
@@ -1141,6 +1151,7 @@ def test_online_csf_releases_original_scale_tensors(
         config = make_dummy_moe_config(
             num_experts=4, hidden_dim=512, intermediate_size=128
         )
+        config.moe_scale_compression = scale_policy
         experts = B12xExperts(config, case.quant_config)
         layer = SimpleNamespace(
             activation=MoEActivation.SILU,
@@ -1158,6 +1169,9 @@ def test_online_csf_releases_original_scale_tensors(
             layer.w2_input_scale = 1.0 / case.quant_config.a2_gscale
         experts.process_weights_after_loading(layer)
         gc.collect()
+        if scale_policy == "native" or (scale_policy is None and environment == "0"):
+            assert experts._prepared_experts.plan.scale_compression is None
+            return
         assert all(reference() is None for reference in scales)
         assert layer.w13_weight_scale.numel() == layer.w2_weight_scale.numel() == 0
         assert experts._prepared_experts.plan.scale_compression == "csf"

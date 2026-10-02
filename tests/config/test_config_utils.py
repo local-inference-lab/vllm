@@ -7,8 +7,9 @@ from enum import Enum
 import pytest
 
 from vllm.config.cache import CacheConfig
+from vllm.config.kernel import KernelConfig
 from vllm.config.scheduler import SchedulerConfig
-from vllm.config.speculative import SpeculativeConfig
+from vllm.config.speculative import SpeculativeConfig, SpeculativeMethod
 from vllm.config.utils import get_hash_factors, hash_factors, normalize_value
 
 # Helpers
@@ -237,7 +238,9 @@ def test_scheduler_config_hash_includes_max_num_seqs():
 
 
 def test_speculative_config_hash_includes_graph_shape():
-    def config(method: str, num_speculative_tokens: int) -> SpeculativeConfig:
+    def config(
+        method: SpeculativeMethod, num_speculative_tokens: int
+    ) -> SpeculativeConfig:
         return SpeculativeConfig(
             method=method,
             num_speculative_tokens=num_speculative_tokens,
@@ -246,6 +249,19 @@ def test_speculative_config_hash_includes_graph_shape():
 
     assert config("ngram", 1).compute_hash() != config("ngram", 3).compute_hash()
     assert config("ngram", 3).compute_hash() != config("ngram_gpu", 3).compute_hash()
+
+
+def test_scale_compression_policy_has_distinct_compilation_keys():
+    """Native and CSF plans cannot share a compiled execution configuration."""
+    kernel_hashes, draft_hashes = set(), set()
+    for policy in (None, "native", "csf"):
+        kernel_hashes.add(KernelConfig(moe_scale_compression=policy).compute_hash())
+        draft_hashes.add(
+            SpeculativeConfig(
+                method="ngram", num_speculative_tokens=1, moe_scale_compression=policy
+            ).compute_hash()
+        )
+    assert len(kernel_hashes) == len(draft_hashes) == 3
 
 
 def test_cache_config_hash_ignores_prefix_cache_retention_interval():

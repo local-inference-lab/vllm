@@ -971,6 +971,26 @@ def get_draft_quant_config(vllm_config: VllmConfig) -> "QuantizationConfig | Non
     )
 
 
+def with_draft_quantization(vllm_config: VllmConfig) -> VllmConfig:
+    """Select draft weights without revalidating target execution planning.
+
+    Runtime options such as ReplaySSM belong to the target architecture. A
+    shallow copy preserves that planning and shared compilation state. Assigning
+    quant_config after construction also preserves an unquantized draft's None
+    instead of reinitializing it from the target checkpoint in __post_init__.
+    """
+    import copy
+
+    draft_config = copy.copy(vllm_config)
+    draft_config.quant_config = get_draft_quant_config(vllm_config)
+    scale_compression = vllm_config.speculative_config.moe_scale_compression
+    if scale_compression is not None:
+        draft_config.kernel_config = replace(
+            vllm_config.kernel_config, moe_scale_compression=scale_compression
+        )
+    return draft_config
+
+
 def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
     """
     Extract the layer index from the module name.
