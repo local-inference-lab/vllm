@@ -11,6 +11,6 @@
     "Layerwise loading releases replaced full-precision parameters before packed-weight preparation, and NVFP4 encoding writes directly into bounded output storage."
   ],
   "authors": ["voipmonitor"],
-  "pull_requests": [],
+  "pull_requests": [965],
   "requires": ["vllm-online-fp4-csf"]
 }
