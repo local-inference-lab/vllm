@@ -10,6 +10,7 @@
     "The activation-scale report records public-image serving, the small measured prefill benefit, unchanged down-input scales, and bounded quality evidence. Sharing remains opt-in."
   ],
   "authors": ["voipmonitor"],
+  "pull_requests": [966],
   "requires": ["vllm-glm-spark-online-weights", "b12x-464"],
   "evidence": [
     "https://github.com/local-inference-lab/vllm/blob/integration/karmic-kraken-beta/docs/features/quantization/glm53_qad_activation_scales.md"
