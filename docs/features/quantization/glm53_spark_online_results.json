@@ -994,5 +994,761 @@
   "rejected_measurements": {
     "serving/weights-mtp-native-scales-10/benchmark": "One transient queue sample; excluded by unchanged validity rule.",
     "serving/weights-mtp-native-scales-7": "Requested native draft policy was not effective; actual CSF, excluded from native-draft comparisons."
+  },
+  "prefill_budget_comparison": {
+    "status": "qualified startup/serving; research-only throughput and profiles",
+    "runtime_manifest": "runtime/online-weights-12/source-manifest.json",
+    "kernel_source_changed": false,
+    "host": "Frank1",
+    "gpu": "RTX PRO 6000 Blackwell Workstation Edition 96 GB",
+    "power_limit_w": 600,
+    "memory_clock_mhz": 16365,
+    "graphics_clocks": "dynamic",
+    "metric": "server prefill throughput; client TTFT retained separately",
+    "shared_settings": {
+      "tp": 2,
+      "dcp": 1,
+      "kv_dtype": "fp8",
+      "kv_bytes_per_rank": 3221225472,
+      "max_model_len": 65536,
+      "max_num_seqs": 8,
+      "main_fp4_csf": true,
+      "mxfp8_scale_compression": false
+    },
+    "limits": [
+      "Short repeated measurements; no narrow confidence interval.",
+      "Both sources have different weight values; Spark/online differences do not isolate encoding cost.",
+      "Profiling requests are excluded from throughput measurements.",
+      "The quality sample in this report uses the separately recorded 1024-token configuration."
+    ],
+    "runs": {
+      "prefill-bf16-c3072": {
+        "description": "Source BF16 selected projections, no MTP",
+        "gpus": [
+          14,
+          15
+        ],
+        "source_revision": "cfd47bd7680e68408924df09b179d5bed25b2ae9",
+        "max_num_batched_tokens": 3072,
+        "prefill": {
+          "2048": {
+            "ttft_seconds": 0.197,
+            "prefill_seconds": 0.197,
+            "tok_per_sec": 11000.0,
+            "client_ttft_seconds": 0.197,
+            "client_tok_per_sec": 11000.0,
+            "prompt_tokens": 2162,
+            "samples": 4,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 11605.0,
+              "prefill_seconds": 0.186,
+              "prompt_tokens": 2162,
+              "request_prompt_tokens": 2162,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 4,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          },
+          "8192": {
+            "ttft_seconds": 0.699,
+            "prefill_seconds": 0.699,
+            "tok_per_sec": 11729.0,
+            "client_ttft_seconds": 0.699,
+            "client_tok_per_sec": 11729.0,
+            "prompt_tokens": 8200,
+            "samples": 4,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 12016.0,
+              "prefill_seconds": 0.682,
+              "prompt_tokens": 8200,
+              "request_prompt_tokens": 8200,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 4,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          },
+          "32768": {
+            "ttft_seconds": 2.724,
+            "prefill_seconds": 2.724,
+            "tok_per_sec": 11867.0,
+            "client_ttft_seconds": 2.724,
+            "client_tok_per_sec": 11867.0,
+            "prompt_tokens": 32316,
+            "samples": 2,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 12075.0,
+              "prefill_seconds": 2.677,
+              "prompt_tokens": 32316,
+              "request_prompt_tokens": 32316,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 2,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          }
+        },
+        "decode": {},
+        "sha256": {
+          "serving/prefill-bf16-c3072/launch.json": "8a23c87ae507e3714f4a418e1ca5212efba27184c0528075fbfe33091e419c86",
+          "serving/prefill-bf16-c3072/server.log": "f80881ecd8a28fedee8e28f8945a91e5cc3badedddc211fcaaba429f0e42d748",
+          "serving/prefill-bf16-c3072/benchmark/prefill.json": "aa158708180d52df843011832f26004e63ac372143b7b71e6a2bcc392ae50d34",
+          "serving/prefill-bf16-c3072/benchmark/metrics-before.txt": "48af2c3411cab2a54dca8d34c4299c070022f1219e3cda13c9000d4b4607a4dd",
+          "serving/prefill-bf16-c3072/benchmark/metrics-after.txt": "9d3073e7e3477fd6a05d438e35ca8e184fc7928956a98defe20654c75eb8225e",
+          "serving/prefill-bf16-c3072/benchmark/telemetry.csv": "a2b42943b0308162a0df2011b1581e7bec3b689367eb0b4ddcb9e5fc867e390a"
+        }
+      },
+      "prefill-bf16-c3072-g12": {
+        "description": "Source BF16 selected projections, no MTP; GPU-pair control",
+        "gpus": [
+          12,
+          13
+        ],
+        "source_revision": "cfd47bd7680e68408924df09b179d5bed25b2ae9",
+        "max_num_batched_tokens": 3072,
+        "prefill": {
+          "2048": {
+            "ttft_seconds": 0.196,
+            "prefill_seconds": 0.196,
+            "tok_per_sec": 11018.0,
+            "client_ttft_seconds": 0.196,
+            "client_tok_per_sec": 11018.0,
+            "prompt_tokens": 2161,
+            "samples": 4,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 11612.0,
+              "prefill_seconds": 0.186,
+              "prompt_tokens": 2161,
+              "request_prompt_tokens": 2161,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 4,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          },
+          "8192": {
+            "ttft_seconds": 0.7,
+            "prefill_seconds": 0.7,
+            "tok_per_sec": 11708.0,
+            "client_ttft_seconds": 0.7,
+            "client_tok_per_sec": 11708.0,
+            "prompt_tokens": 8200,
+            "samples": 4,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 12000.0,
+              "prefill_seconds": 0.683,
+              "prompt_tokens": 8200,
+              "request_prompt_tokens": 8200,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 4,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          },
+          "32768": {
+            "ttft_seconds": 2.715,
+            "prefill_seconds": 2.715,
+            "tok_per_sec": 11905.0,
+            "client_ttft_seconds": 2.715,
+            "client_tok_per_sec": 11905.0,
+            "prompt_tokens": 32321,
+            "samples": 2,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 12119.0,
+              "prefill_seconds": 2.667,
+              "prompt_tokens": 32321,
+              "request_prompt_tokens": 32321,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 2,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          }
+        },
+        "decode": {},
+        "sha256": {
+          "serving/prefill-bf16-c3072-g12/launch.json": "5bc05516795aeb89092f04bde7584513c92d98c0133b62653bb65deed9d3b28d",
+          "serving/prefill-bf16-c3072-g12/server.log": "5d18fb0cd36b0ed7bfd9e39272befb9a302b13a17f0fb207c47e25e2558a50a6",
+          "serving/prefill-bf16-c3072-g12/benchmark/prefill.json": "155984f2ce9a16bd0b41bb03dccb1fd9eb43038cf728cc51dc02d0184081523d",
+          "serving/prefill-bf16-c3072-g12/benchmark/metrics-before.txt": "d0f1ffd66b0a4dfad4dbfdec51967c8145fba176f7c4cb474f3e7e48b4a4d80b",
+          "serving/prefill-bf16-c3072-g12/benchmark/metrics-after.txt": "5395edcf13bf4d23595189f7b5b85d750dc040cbdc510d9a3bfb6b53b76bb2f7",
+          "serving/prefill-bf16-c3072-g12/benchmark/telemetry.csv": "7276f92db807c1a5cf0705f09b755a35250c3c779cdd19c88054c90b5110bd9e"
+        }
+      },
+      "prefill-mxfp8-c3072": {
+        "description": "Online MXFP8 selected projections, no MTP",
+        "gpus": [
+          12,
+          13
+        ],
+        "source_revision": "cfd47bd7680e68408924df09b179d5bed25b2ae9",
+        "max_num_batched_tokens": 3072,
+        "prefill": {
+          "2048": {
+            "ttft_seconds": 0.188,
+            "prefill_seconds": 0.188,
+            "tok_per_sec": 11503.0,
+            "client_ttft_seconds": 0.188,
+            "client_tok_per_sec": 11503.0,
+            "prompt_tokens": 2161,
+            "samples": 4,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 12156.0,
+              "prefill_seconds": 0.178,
+              "prompt_tokens": 2161,
+              "request_prompt_tokens": 2161,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 4,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          },
+          "8192": {
+            "ttft_seconds": 0.669,
+            "prefill_seconds": 0.669,
+            "tok_per_sec": 12250.0,
+            "client_ttft_seconds": 0.669,
+            "client_tok_per_sec": 12250.0,
+            "prompt_tokens": 8200,
+            "samples": 4,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 12568.0,
+              "prefill_seconds": 0.652,
+              "prompt_tokens": 8200,
+              "request_prompt_tokens": 8200,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 4,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          },
+          "32768": {
+            "ttft_seconds": 2.595,
+            "prefill_seconds": 2.595,
+            "tok_per_sec": 12454.0,
+            "client_ttft_seconds": 2.595,
+            "client_tok_per_sec": 12454.0,
+            "prompt_tokens": 32321,
+            "samples": 2,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 12681.0,
+              "prefill_seconds": 2.549,
+              "prompt_tokens": 32321,
+              "request_prompt_tokens": 32321,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 2,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          }
+        },
+        "decode": {},
+        "sha256": {
+          "serving/prefill-mxfp8-c3072/launch.json": "8dd23766ef14b6c7f7beb8a48afd7a8b67e1362b11ec2afd53978657de89e144",
+          "serving/prefill-mxfp8-c3072/server.log": "668351cfc5b9ccc8a0f9448599d478fa0214f616be2603125b7aa4912cd22c10",
+          "serving/prefill-mxfp8-c3072/benchmark/prefill.json": "a316c2e3d339cab8d6453704130c33e3d0097dbde50b2db474cb1f03a1c07342",
+          "serving/prefill-mxfp8-c3072/benchmark/metrics-before.txt": "4950506ed1dc1b6bab3f722ec0180244e11e81208e73661875f188f7d11e4a19",
+          "serving/prefill-mxfp8-c3072/benchmark/metrics-after.txt": "1029d46693866c8cf81a333c6ee8c61806c6fe7f35377443863c9ea61b26d812",
+          "serving/prefill-mxfp8-c3072/benchmark/telemetry.csv": "492b50cade3698f49d264b3e67a344e509aa960785c52c6f4c3e57b628f48bfb"
+        }
+      },
+      "prefill-mxfp8-c3072-repeat": {
+        "description": "Online MXFP8 selected projections, no MTP; independent reload",
+        "gpus": [
+          12,
+          13
+        ],
+        "source_revision": "cfd47bd7680e68408924df09b179d5bed25b2ae9",
+        "max_num_batched_tokens": 3072,
+        "prefill": {
+          "2048": {
+            "ttft_seconds": 0.186,
+            "prefill_seconds": 0.186,
+            "tok_per_sec": 11602.0,
+            "client_ttft_seconds": 0.186,
+            "client_tok_per_sec": 11602.0,
+            "prompt_tokens": 2161,
+            "samples": 4,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 12257.0,
+              "prefill_seconds": 0.176,
+              "prompt_tokens": 2161,
+              "request_prompt_tokens": 2161,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 4,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          },
+          "8192": {
+            "ttft_seconds": 0.668,
+            "prefill_seconds": 0.668,
+            "tok_per_sec": 12271.0,
+            "client_ttft_seconds": 0.668,
+            "client_tok_per_sec": 12271.0,
+            "prompt_tokens": 8200,
+            "samples": 4,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 12593.0,
+              "prefill_seconds": 0.651,
+              "prompt_tokens": 8200,
+              "request_prompt_tokens": 8200,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 4,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          },
+          "32768": {
+            "ttft_seconds": 2.58,
+            "prefill_seconds": 2.58,
+            "tok_per_sec": 12526.0,
+            "client_ttft_seconds": 2.58,
+            "client_tok_per_sec": 12526.0,
+            "prompt_tokens": 32321,
+            "samples": 2,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 12760.0,
+              "prefill_seconds": 2.533,
+              "prompt_tokens": 32321,
+              "request_prompt_tokens": 32321,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 2,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          }
+        },
+        "decode": {},
+        "sha256": {
+          "serving/prefill-mxfp8-c3072-repeat/launch.json": "80a91cc7d47c37686e5826c24c0e105b6b14df4de51d1f1feb67f476b28c90cb",
+          "serving/prefill-mxfp8-c3072-repeat/server.log": "f4282f3ead2f10ebebd5eeef4a44b775bf6d0bdc4f4940d7c893b288f04910ed",
+          "serving/prefill-mxfp8-c3072-repeat/benchmark/prefill.json": "61feb1ce65b0a939eacf90d7448032c5331c07aabdcf6b7c19a2ae93f85dde33",
+          "serving/prefill-mxfp8-c3072-repeat/benchmark/metrics-before.txt": "3367113cce72ba75fc7132e8775ee7ac20ccf756eba88da917c0d5c58407aae0",
+          "serving/prefill-mxfp8-c3072-repeat/benchmark/metrics-after.txt": "ce147549d8a25c11ac2498b125bcb202cea147adaa1e3a797310d5c4759e85fa",
+          "serving/prefill-mxfp8-c3072-repeat/benchmark/telemetry.csv": "f58080c07d23f80e025fdbb59c32cfad5dcd5577bae8830787bebe977d5cc3b7"
+        }
+      },
+      "prefill-spark-c3072": {
+        "description": "Serialized Spark MXFP8, no MTP",
+        "gpus": [
+          14,
+          15
+        ],
+        "source_revision": "a608241037e4c2565356bff7ca293f2133888f88",
+        "max_num_batched_tokens": 3072,
+        "prefill": {
+          "2048": {
+            "ttft_seconds": 0.191,
+            "prefill_seconds": 0.191,
+            "tok_per_sec": 11323.0,
+            "client_ttft_seconds": 0.191,
+            "client_tok_per_sec": 11323.0,
+            "prompt_tokens": 2162,
+            "samples": 4,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 11965.0,
+              "prefill_seconds": 0.181,
+              "prompt_tokens": 2162,
+              "request_prompt_tokens": 2162,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 4,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          },
+          "8192": {
+            "ttft_seconds": 0.653,
+            "prefill_seconds": 0.653,
+            "tok_per_sec": 12566.0,
+            "client_ttft_seconds": 0.653,
+            "client_tok_per_sec": 12566.0,
+            "prompt_tokens": 8200,
+            "samples": 4,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 12899.0,
+              "prefill_seconds": 0.636,
+              "prompt_tokens": 8200,
+              "request_prompt_tokens": 8200,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 4,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          },
+          "32768": {
+            "ttft_seconds": 2.463,
+            "prefill_seconds": 2.463,
+            "tok_per_sec": 13121.0,
+            "client_ttft_seconds": 2.463,
+            "client_tok_per_sec": 13121.0,
+            "prompt_tokens": 32316,
+            "samples": 3,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 13360.0,
+              "prefill_seconds": 2.419,
+              "prompt_tokens": 32316,
+              "request_prompt_tokens": 32316,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 3,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          }
+        },
+        "decode": {},
+        "sha256": {
+          "serving/prefill-spark-c3072/launch.json": "07071ac26b687f1896c78a09a16ec39a9313dc1ff072dd42b350a745faedf2d0",
+          "serving/prefill-spark-c3072/server.log": "01278423c836b8ae3755ed10a0ed25aaef1648b3c39f9670f0d5f34d97eeb5f8",
+          "serving/prefill-spark-c3072/benchmark/prefill.json": "8dc49b40580ddaf6f1b311a124b3a045538c782976273a35f06a26ca66ed2cf3",
+          "serving/prefill-spark-c3072/benchmark/metrics-before.txt": "aa1067d1e62049bb88a615e1ee9be33c3b5996b45c111579c9e554c64eb31d9c",
+          "serving/prefill-spark-c3072/benchmark/metrics-after.txt": "406304da5917b951ad068cafc4ff037f14a9e686cc7feeadc2bc10b7aae16549",
+          "serving/prefill-spark-c3072/benchmark/telemetry.csv": "33530621d3929857c0674fc9801b804c971dfd2eeb3ba09371246fbbb9bd1035"
+        }
+      },
+      "prefill-spark-c1024": {
+        "description": "Serialized Spark MXFP8, no MTP",
+        "gpus": [
+          12,
+          13
+        ],
+        "source_revision": "a608241037e4c2565356bff7ca293f2133888f88",
+        "max_num_batched_tokens": 1024,
+        "prefill": {
+          "2048": {
+            "ttft_seconds": 0.503,
+            "prefill_seconds": 0.503,
+            "tok_per_sec": 4295.0,
+            "client_ttft_seconds": 0.503,
+            "client_tok_per_sec": 4295.0,
+            "prompt_tokens": 2161,
+            "samples": 4,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 4383.0,
+              "prefill_seconds": 0.493,
+              "prompt_tokens": 2161,
+              "request_prompt_tokens": 2161,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 4,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          },
+          "8192": {
+            "ttft_seconds": 1.42,
+            "prefill_seconds": 1.42,
+            "tok_per_sec": 5776.0,
+            "client_ttft_seconds": 1.42,
+            "client_tok_per_sec": 5776.0,
+            "prompt_tokens": 8200,
+            "samples": 3,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 5844.0,
+              "prefill_seconds": 1.403,
+              "prompt_tokens": 8200,
+              "request_prompt_tokens": 8200,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 3,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          },
+          "32768": {
+            "ttft_seconds": 5.426,
+            "prefill_seconds": 5.426,
+            "tok_per_sec": 5957.0,
+            "client_ttft_seconds": 5.426,
+            "client_tok_per_sec": 5957.0,
+            "prompt_tokens": 32321,
+            "samples": 2,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 6009.0,
+              "prefill_seconds": 5.379,
+              "prompt_tokens": 32321,
+              "request_prompt_tokens": 32321,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 2,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          }
+        },
+        "decode": {},
+        "sha256": {
+          "serving/prefill-spark-c1024/launch.json": "3ea6675c21b3d9d581475e3f6dfeea0740f403da6bd5b536874bcab2f8c65b25",
+          "serving/prefill-spark-c1024/server.log": "668a1ab24ec08dfb12a2fa1c215df61862b896288c15ba388e84f99845fae26c",
+          "serving/prefill-spark-c1024/benchmark/prefill.json": "909b30e9ad5e94ba5a4aef16c665d817c457b17346273540da4e333d6340820b",
+          "serving/prefill-spark-c1024/benchmark/metrics-before.txt": "2dfe99ca0157788b767057f65f72e5d76b52d9a4d718062829218c1f163f5f4e",
+          "serving/prefill-spark-c1024/benchmark/metrics-after.txt": "d73b087e6f36f2443b9e288f65aeb67133effc87a89a496721f94ccb9e9162f4",
+          "serving/prefill-spark-c1024/benchmark/telemetry.csv": "ccc33e5c22390c5852275fcab2a0ffa9e156b4c6260ae8df1401d79400ff9f6c"
+        }
+      },
+      "prefill-mxfp8-c1024-profile": {
+        "description": "Online MXFP8 selected projections, no MTP; 1024-token repeat",
+        "gpus": [
+          14,
+          15
+        ],
+        "source_revision": "cfd47bd7680e68408924df09b179d5bed25b2ae9",
+        "max_num_batched_tokens": 1024,
+        "prefill": {
+          "2048": {
+            "ttft_seconds": 0.511,
+            "prefill_seconds": 0.511,
+            "tok_per_sec": 4231.0,
+            "client_ttft_seconds": 0.511,
+            "client_tok_per_sec": 4231.0,
+            "prompt_tokens": 2162,
+            "samples": 4,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 4317.0,
+              "prefill_seconds": 0.501,
+              "prompt_tokens": 2162,
+              "request_prompt_tokens": 2162,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 4,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          },
+          "8192": {
+            "ttft_seconds": 1.405,
+            "prefill_seconds": 1.405,
+            "tok_per_sec": 5835.0,
+            "client_ttft_seconds": 1.405,
+            "client_tok_per_sec": 5835.0,
+            "prompt_tokens": 8200,
+            "samples": 3,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 5908.0,
+              "prefill_seconds": 1.388,
+              "prompt_tokens": 8200,
+              "request_prompt_tokens": 8200,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 3,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          },
+          "32768": {
+            "ttft_seconds": 5.406,
+            "prefill_seconds": 5.406,
+            "tok_per_sec": 5977.0,
+            "client_ttft_seconds": 5.406,
+            "client_tok_per_sec": 5977.0,
+            "prompt_tokens": 32316,
+            "samples": 2,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 6031.0,
+              "prefill_seconds": 5.358,
+              "prompt_tokens": 32316,
+              "request_prompt_tokens": 32316,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 2,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          }
+        },
+        "decode": {},
+        "sha256": {
+          "serving/prefill-mxfp8-c1024-profile/launch.json": "7461d2dc27b525ed32fb2ff00305ff309a209e676453e043f671236f5e0bf04e",
+          "serving/prefill-mxfp8-c1024-profile/server.log": "999dcab6cee34fd5c4763e352c751157392262d51e488d57e900b112919d51f0",
+          "serving/prefill-mxfp8-c1024-profile/benchmark/prefill.json": "0b22d3cf0cb67773a4fc9ee06cc11b0ca8d69b89918ffda64135ea85f4b7894b",
+          "serving/prefill-mxfp8-c1024-profile/benchmark/metrics-before.txt": "0b87ca2340acaa4ec8fead95cf09f956e12189a10f54e9848f582e2e597e8b45",
+          "serving/prefill-mxfp8-c1024-profile/benchmark/metrics-after.txt": "641c720d25b2c605ee5cec682354003cd60adbd58193b4a2111dbd0e4014a74c",
+          "serving/prefill-mxfp8-c1024-profile/benchmark/telemetry.csv": "9ad1ad9b6ddcf2a8b8169093b2b30143a35a7b6ab64ba2b719b70bfbef58516c"
+        }
+      },
+      "prefill-mtp-c3072": {
+        "description": "Online MXFP8 projections and NVFP4 W4A16 MTP; main/draft CSF",
+        "gpus": [
+          14,
+          15
+        ],
+        "source_revision": "cfd47bd7680e68408924df09b179d5bed25b2ae9",
+        "max_num_batched_tokens": 3072,
+        "prefill": {
+          "2048": {
+            "ttft_seconds": 0.192,
+            "prefill_seconds": 0.192,
+            "tok_per_sec": 11239.0,
+            "client_ttft_seconds": 0.192,
+            "client_tok_per_sec": 11239.0,
+            "prompt_tokens": 2161,
+            "samples": 4,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 11831.0,
+              "prefill_seconds": 0.183,
+              "prompt_tokens": 2161,
+              "request_prompt_tokens": 2161,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 4,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          },
+          "8192": {
+            "ttft_seconds": 0.692,
+            "prefill_seconds": 0.692,
+            "tok_per_sec": 11849.0,
+            "client_ttft_seconds": 0.692,
+            "client_tok_per_sec": 11849.0,
+            "prompt_tokens": 8200,
+            "samples": 4,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 12148.0,
+              "prefill_seconds": 0.675,
+              "prompt_tokens": 8200,
+              "request_prompt_tokens": 8200,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 4,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          },
+          "32768": {
+            "ttft_seconds": 2.677,
+            "prefill_seconds": 2.677,
+            "tok_per_sec": 12076.0,
+            "client_ttft_seconds": 2.677,
+            "client_tok_per_sec": 12076.0,
+            "prompt_tokens": 32322,
+            "samples": 2,
+            "method": "client",
+            "server_validation": {
+              "method": "prometheus",
+              "tok_per_sec": 12295.0,
+              "prefill_seconds": 2.629,
+              "prompt_tokens": 32322,
+              "request_prompt_tokens": 32322,
+              "cached_tokens": 0,
+              "token_source": "kv_computed",
+              "samples": 2,
+              "invalid_reason": ""
+            },
+            "hardware_summary": {}
+          }
+        },
+        "decode": {
+          "1": {
+            "samples_tok_s": [
+              214.43253925372156,
+              212.87405995151516,
+              209.17031866844914
+            ],
+            "median_tok_s": 212.87405995151516
+          },
+          "8": {
+            "samples_tok_s": [
+              704.5621092973325,
+              717.9092501067655,
+              699.2804120748567
+            ],
+            "median_tok_s": 704.5621092973325
+          }
+        },
+        "sha256": {
+          "serving/prefill-mtp-c3072/launch.json": "7a6628df991fdf701633e85bd7f82a1bb42ab2b6b53aa2a33c231cd6f4f33947",
+          "serving/prefill-mtp-c3072/server.log": "b05b46a21da51f070dab98d1a3b614ee6e3d416dcaf18ad5b197596390e33664",
+          "serving/prefill-mtp-c3072/benchmark/prefill.json": "65ce73ad4b068ac789c4764f7d03c8b9ab1d6fb13bcae53b977aa0c59b4a5354",
+          "serving/prefill-mtp-c3072/benchmark/metrics-before.txt": "d85e2d22dba40fb3687746e9c998f4d40225db2df3fcdd3538e0f1969b77a3fc",
+          "serving/prefill-mtp-c3072/benchmark/metrics-after.txt": "b31264c26d7087b5374ba81660f90676cc808f7fe0c6793f0974c29dbcada4af",
+          "serving/prefill-mtp-c3072/benchmark/telemetry.csv": "d570780a87825df21e1a5ed955ac00d99b7de18c202e79c17a0b7d159abffce0",
+          "serving/prefill-mtp-c3072/benchmark/decode-1.json": "30024dcd148228be1646eb98f085b19f5af4c04d03c84c371bbf9fc9a3b3149d",
+          "serving/prefill-mtp-c3072/benchmark/decode-2.json": "658ee44a0521fc37a4bc7e396aa948ea73b8bea25578a7d02e5fa014f8782076",
+          "serving/prefill-mtp-c3072/benchmark/decode-3.json": "b9f75892c1d3cd399d34b3631dbf8afd0f0343ec5c113d6118f50b19ad1d5e70"
+        }
+      }
+    },
+    "profile_call_counts": {
+      "1024": {
+        "prompt_tokens": 4491,
+        "packed_linear_calls": 1545,
+        "routed_moe_calls": 210,
+        "packed_linear_inclusive_cpu_ms": 200.639489
+      },
+      "3072": {
+        "prompt_tokens": 4489,
+        "packed_linear_calls": 618,
+        "routed_moe_calls": 84,
+        "packed_linear_inclusive_cpu_ms": 84.933574
+      },
+      "warning": "Instrumented CPU times are not a decomposition of unprofiled critical-path latency."
+    },
+    "diagnostic_artifact": {
+      "path": "/data/trellis-quant/glm53-online-mxfp8-csf-20261002/prefill-budget-diagnosis.json",
+      "sha256": "46e88144f7f3ccbf1e881ef14c92cf6268e10c4ab351bcc066bba1c8deda04c7"
+    }
   }
 }

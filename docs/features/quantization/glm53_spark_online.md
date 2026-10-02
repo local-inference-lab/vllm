@@ -33,7 +33,7 @@ vllm serve local-inference-lab/GLM-5.3-Flash-NVFP4 \
   --kv-cache-dtype fp8 --kv-cache-memory-bytes 3221225472 \
   --gpu-memory-utilization 0.93 \
   --block-size 256 --mamba-cache-mode align \
-  --max-model-len 8192 --max-num-batched-tokens 1024 --max-num-seqs 8 \
+  --max-model-len 8192 --max-num-batched-tokens 3072 --max-num-seqs 8 \
   --max-parallel-prefills 1 --enable-chunked-prefill --enable-prefix-caching \
   --recurrent-checkpoint-policy request_boundaries \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}' \
@@ -90,9 +90,18 @@ with `--num-speculative-tokens 1`, or omit `--speculative-config` from the serve
 command to disable MTP. The 3 GiB cache allocation is per GPU; it is a bounded
 8K-context example, not a million-token capacity configuration.
 
-The measured TP2 configuration trades lower weight memory and faster decode for
-slower prefill. Keep the selected projections in BF16 if prefill throughput is
-the priority; see the paired 4K and 32K measurements below before choosing.
+Use `--max-num-batched-tokens 3072`, as in the example, for prefill throughput.
+With TP2/DCP1, no MTP and a 32K prompt, the same GPU pair measured about
+12.1K tok/s with BF16 selected projections and 12.7K tok/s with online MXFP8.
+Those measurements use RTX PRO 6000 Blackwell GPUs at 600 W and 16365 MHz
+memory clocks; exact image and configuration identities are in the report.
+
+Reducing the budget with `--max-num-batched-tokens 1024` produces more model
+executions per prompt and prevents the MXFP8 backend from entering its large
+prefill regime. At that setting, both online MXFP8 and the serialized Spark
+checkpoint measured about 6K tok/s, while BF16 projections measured 7.8K.
+Choose the budget explicitly when comparing checkpoints; loading-time online
+encoding does not run again during prefill.
 
 Quality, memory, throughput and exact validation identities are recorded in
 the [GLM online-weight validation report](glm53_spark_online_validation.md).
