@@ -51,6 +51,7 @@ vllm serve Qwen/Qwen3.5-35B-A3B --quantization mxfp4 \
 | `fp8_per_tensor` | fp8_e4m3 data, fp32 per-tensor scale | fp8_e4m3 data, fp32 per-tensor scale | On some GPUs (Ada, Hopper) linear activations use per-token scaling for better performance |
 | `fp8_per_block` | fp8_e4m3 data, fp32 per-128x128-block scale | fp8_e4m3 data, fp32 per-1x128-block scale | |
 | `mxfp8` | fp8_e4m3 data, e8m0 per-1x32-block scale | fp8_e4m3 data, e8m0 per-1x32-block scale | Requires SM 100+ (Blackwell or newer) for w8a8, other GPUs use a w8a16 fallback |
+| `nvfp4_a16` | fp4_e2m1 data, fp8_e4m3 per-1x16-block scale, FP32 global scale per expert | BF16 | MoE only; select a compatible W4A16 backend. B12X supports SM120. |
 | `mxfp4` | fp4_e2m1 data, e8m0 per-1x32-block scale ([OCP MX specs](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf)) | - linear: fp4_e2m1 data, e8m0 per-1x32-block scale in some backends, or BF16. <br> - MOE: fp4_e2m1 data, e8m0 per-1x32-block scale. | Linear MXFP4 backend is auto-selected per platform, not enforcing activation dtype. Some use BF16 activation. Use `--linear-backend` to pin one (e.g. `--linear-backend flashinfer`). |
 
 ## Advanced Configuration
@@ -176,6 +177,16 @@ llm = LLM(
     For fused layers (e.g., `qkv_proj` which fuses `q_proj`, `k_proj`, `v_proj`), patterns may match the fused name directly or all of its unfused shard names.
 
 ### Fine-Grained Per-Layer Quantization Schemes
+
+For a fixed model recipe, set `"strict_targets": true` alongside `targets`.
+The default is `false`. Strict mode accepts exact names, requires every target
+to resolve before loading weights, and rejects independently enabled online
+quantizers outside that set. Fused linears can be named by all their source
+projections. Keep separate target maps for the main model and the draft;
+targets outside a local pipeline partition also cause an error.
+
+The [GLM Spark online-quantization guide](glm53_spark_online.md) includes an
+exact projection manifest and a complete TP2 launch example.
 
 Use the `targets` parameter to apply different online shorthands to different layers, instead of one scheme applied everywhere via `linear`/`moe`. Keys are exact layer names, regex patterns (prefixed with `re:`), or patterns understood by [`fnmatch.fnmatch`](https://docs.python.org/3/library/fnmatch.html#fnmatch.fnmatch); values are shorthand names (`fp8_per_tensor`, `fp8_per_block`, `fp8_per_channel`, `mxfp8`, `int8_per_channel_weight_only`, `nvfp4_per_token`).
 

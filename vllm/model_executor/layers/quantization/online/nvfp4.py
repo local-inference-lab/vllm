@@ -4,7 +4,7 @@
 import torch
 from torch.nn import Module
 
-from vllm._custom_ops import scaled_fp4_quant
+from vllm._custom_ops import create_fp4_output_tensors, scaled_fp4_quant
 from vllm.model_executor.kernels.linear.nvfp4.b12x import (
     B12xNvFp4LinearKernel,
     run_b12x_nvfp4_serialized_linear,
@@ -127,56 +127,61 @@ def _quantize_moe_weight_to_nvfp4(
     # Keep the original BF16/FP16 values as the quantizer input. Folding each
     # expert's FP32 global scale into the weight would add a BF16/FP16 rounding
     # before the group-16 scale and E2M1 values are selected.
-    weight = weight.contiguous()
-    quantized_experts = [
-        scaled_fp4_quant(
-            expert_weight,
-            expert_scale,
-            is_sf_swizzled_layout=False,
+    num_experts, rows, _ = weight.shape
+    qweight, block_scale = create_fp4_output_tensors(
+        num_experts * rows, k, weight.device, is_sf_swizzled_layout=False
+    )
+    qweight = qweight.view(num_experts, rows, k // 2)
+    block_scale = block_scale.view(num_experts, rows, k // 16)
+    # Write directly into the destination to avoid a second full packed tensor
+    # while the BF16 expert weights are still resident during loading.
+    for index in range(num_experts):
+        torch.ops._C.scaled_fp4_quant.out(
+            weight[index].contiguous(),
+            global_scale[index],
+            False,
+            output=qweight[index],
+            output_scale=block_scale[index],
         )
-        for expert_weight, expert_scale in zip(
-            weight,
-            global_scale,
-            strict=True,
-        )
-    ]
-    qweight = torch.stack([quantized for quantized, _ in quantized_experts])
-    block_scale = torch.stack([block_scale for _, block_scale in quantized_experts])
     return (
         qweight,
-        block_scale,
+        block_scale.view(torch.float8_e4m3fn),
         weight_scale_2,
     )
 
 
 class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
-    """Online NVFP4 MoE quantization with per-token activation scales.
+    """Online NVFP4 MoE with per-token FP4 or unquantized BF16 activations.
 
-    Quantizes fp16/bf16 expert weights to NVFP4 at load time; the FlashInfer
-    TRTLLM kernel computes per-token activation scales at runtime. Blackwell
-    (SM100) only.
+    Per-token FP4 activations require Blackwell SM100. The BF16 variant selects
+    a W4A16 backend through the MoE configuration.
     """
 
     def __init__(
         self,
         *,
         moe: FusedMoEConfig,
+        use_a16: bool = False,
     ):
-        if not current_platform.is_device_capability_family(100):
+        if use_a16 and moe.in_dtype != torch.bfloat16:
+            raise ValueError("nvfp4_a16 online MoE requires BF16 activations")
+        if not use_a16 and not current_platform.is_device_capability_family(100):
             raise ValueError(
                 "nvfp4_per_token online quantization requires a Blackwell (SM100) GPU."
             )
         super().__init__(moe)
+        self.use_a16 = use_a16
         self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
             config=self.moe,
             weight_key=kNvfp4Static,
-            activation_key=kNvfp4Dynamic,
+            activation_key=None if use_a16 else kNvfp4Dynamic,
         )
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
+        self._zero_padding(layer)
         self._quantize_weights(layer)
         self._setup_kernel(layer)
 
@@ -187,19 +192,18 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
         w13, w13_scale, w13_scale_2 = _quantize_moe_weight_to_nvfp4(
             layer.w13_weight, moe_tp_size
         )
-        w2, w2_scale, w2_scale_2 = _quantize_moe_weight_to_nvfp4(
-            layer.w2_weight, moe_tp_size
-        )
-
         replace_parameter(layer, "w13_weight", w13)
         replace_parameter(layer, "w13_weight_scale", w13_scale)
         replace_parameter(layer, "w13_weight_scale_2", w13_scale_2)
+        w2, w2_scale, w2_scale_2 = _quantize_moe_weight_to_nvfp4(
+            layer.w2_weight, moe_tp_size
+        )
         replace_parameter(layer, "w2_weight", w2)
         replace_parameter(layer, "w2_weight_scale", w2_scale)
         replace_parameter(layer, "w2_weight_scale_2", w2_scale_2)
 
-        # Neutral (1.0) activation global scales: the kernel derives per-token
-        # scales at runtime, so the output scalars reduce to the weight scales.
+        # Neutral activation scales: the FP4 path derives per-token scales at
+        # runtime, while W4A16 consumes BF16 values without activation scaling.
         ones = torch.ones(layer.num_experts, device=w13.device, dtype=torch.float32)
         replace_parameter(layer, "w13_input_scale", ones)
         replace_parameter(layer, "w2_input_scale", ones.clone())
@@ -226,6 +230,7 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
             w2_scale_2=layer.w2_weight_scale_2,
             a2_scale=layer.w2_input_scale,
             is_act_and_mul=self.moe.is_act_and_mul,
+            use_a16=self.use_a16,
         )
 
         replace_parameter(layer, "w13_weight", w13)
@@ -246,7 +251,7 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
                 experts_cls=self.experts_cls,
                 backend=self.nvfp4_backend,
                 routing_tables=layer._expert_routing_tables(),
-                per_token_activation=True,
+                per_token_activation=not self.use_a16,
             )
 
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
@@ -262,4 +267,12 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
             a2_scale=layer.w2_input_scale,
             swiglu_limit=getattr(layer, "swiglu_limit", None),
             layer=layer,
+            use_a16=self.use_a16,
         )
+
+
+class Nvfp4OnlineA16MoEMethod(Nvfp4OnlineMoEMethod):
+    """Quantize BF16 expert weights at load time and retain BF16 activations."""
+
+    def __init__(self, *, moe: FusedMoEConfig):
+        super().__init__(moe=moe, use_a16=True)

@@ -23,6 +23,7 @@ class OnlineMoEMethodBase(FusedMoEMethodBase):
     """
 
     uses_meta_device: bool = True
+    _online_target_prefix: str | None = None
 
     def create_weights(
         self,
@@ -166,6 +167,7 @@ class OnlineMoEMethodBase(FusedMoEMethodBase):
         topk_ids: torch.Tensor,
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
@@ -181,4 +183,5 @@ class OnlineMoEMethodBase(FusedMoEMethodBase):
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            workspace=workspace,
         )
