@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-glm-spark-precision-prefill-docs",
+  "category": "internal",
+  "summary": "Document the GLM Spark MTP precision contract and the paired Spark/QAD prefill comparison",
+  "models": ["GLM-5.3-Flash"],
+  "compatibility": "No user action required.",
+  "details": [
+    "The GLM online-loading guide states that Spark stores eleven MTP projections in MXFP8 and the MTP routed experts in NVFP4 W4A16, and that the example manifest selects exactly those projections.",
+    "The prefill report keeps the raw paired TP2 timings of Spark and the online QAD recipe with shared gate/up activation scales. No serving code changes."
+  ],
+  "authors": ["voipmonitor"],
+  "pull_requests": [967],
+  "requires": ["vllm-glm-qad-scale-validation"],
+  "evidence": [
+    "https://github.com/local-inference-lab/vllm/blob/integration/karmic-kraken-beta/docs/features/quantization/glm53_spark_qad_prefill.md"
+  ]
+}
