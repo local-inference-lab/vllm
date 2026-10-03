@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     VLLM_USE_MODELSCOPE: bool = False
     VLLM_USE_FASTOKENS: bool = False
     VLLM_RINGBUFFER_WARNING_INTERVAL: int = 60
+    VLLM_GPU_STALL_DUMP_SECONDS: float = 0.0
     VLLM_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
     VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE: int = 256
@@ -797,6 +798,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Interval in seconds to log a warning message when the ring buffer is full
     "VLLM_RINGBUFFER_WARNING_INTERVAL": lambda: int(
         os.environ.get("VLLM_RINGBUFFER_WARNING_INTERVAL", "60")
+    ),
+    # Seconds a worker's enqueued step may stay unfinished on its GPU before the
+    # worker writes a stall dump (RoCEnante state, Python stacks, and the running
+    # kernels via cuda-gdb) under $VLLM_CACHE_ROOT/gpu_stall. The same watchdog
+    # dumps once when a RoCEnante wait on that rank times out. 0 disables it.
+    "VLLM_GPU_STALL_DUMP_SECONDS": lambda: float(
+        os.environ.get("VLLM_GPU_STALL_DUMP_SECONDS", "0")
     ),
     # path to cudatoolkit home directory, under which should be bin, include,
     # and lib directories.
@@ -2618,6 +2626,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
+        "VLLM_GPU_STALL_DUMP_SECONDS",
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
