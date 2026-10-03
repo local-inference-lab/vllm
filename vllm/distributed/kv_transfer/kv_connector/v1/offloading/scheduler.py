@@ -1562,7 +1562,10 @@ class OffloadingConnectorScheduler:
             use_eagle=group_config.is_eagle_group,
             retention_interval=self.config.retention_interval,
             reachable_boundaries=reachable_boundaries,
-            dcp_world_size=self.config.dcp_world_size,
+            # The offload plan already resolves each group's logical span.
+            # Replicated draft pages retain their physical token width even
+            # when target attention pages are sharded across DCP ranks.
+            dcp_world_size=(group_config.tokens_per_block // kv_cache_spec.block_size),
             final_segment_end_block=(
                 final_segment_end_chunk_idx * blocks_per_chunk
                 if final_segment_end_chunk_idx is not None
@@ -1684,6 +1687,8 @@ class OffloadingConnectorScheduler:
                         partial_segment_start_block // blocks_per_chunk
                     )
                     start_chunk_idx = min(start_chunk_idx, partial_segment_start_chunk)
+                # Transfer descriptors retain one slot per cache group, even
+                # when recurrent state is stored only by boundary handoffs.
                 group_store_ranges.append((start_chunk_idx, num_chunks))
 
                 if num_chunks <= start_chunk_idx:

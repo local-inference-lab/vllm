@@ -180,6 +180,7 @@ if TYPE_CHECKING:
     VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS: bool = False
     VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S: float = 60.0
     VLLM_MLA_DISABLE: bool = False
+    VLLM_K3_DENSE_MLA_PARTIAL_DTYPE: Literal["bf16", "fp32"] = "bf16"
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1556,6 +1557,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
+    # Keep dense MLA split partials in FP32 until the merge when requested.
+    "VLLM_K3_DENSE_MLA_PARTIAL_DTYPE": env_with_choices(
+        "VLLM_K3_DENSE_MLA_PARTIAL_DTYPE", "bf16", ["bf16", "fp32"]
+    ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
     # it allows ray to schedule multiple actors on a single GPU,
@@ -1776,7 +1781,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH_COMPACT_ROPE": lambda: bool(
         int(os.getenv("VLLM_DFLASH_COMPACT_ROPE", "0"))
     ),
-    # Partition DFlash auxiliary FC output rows and gather complete activations.
+    # Partition DFlash auxiliary FC output rows and gather complete activations,
+    # padding widths that do not divide by TP. Divisible widths always shard.
     "VLLM_DFLASH_SHARD_AUX_PROJECTION": lambda: bool(
         int(os.getenv("VLLM_DFLASH_SHARD_AUX_PROJECTION", "0"))
     ),

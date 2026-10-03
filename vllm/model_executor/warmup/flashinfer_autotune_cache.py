@@ -14,10 +14,41 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
+    from flashinfer.autotuner import AutoTuner
+
     from vllm.distributed.parallel_state import GroupCoordinator
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
+
+
+def read_flashinfer_autotune_cache(cache_path: Path) -> bytes | None:
+    """Treat interrupted JSON writes as cache misses, not model-load failures."""
+    try:
+        contents = cache_path.read_bytes()
+    except FileNotFoundError:
+        return None
+    try:
+        json.loads(contents)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        logger.warning(
+            "Ignoring invalid FlashInfer autotune JSON at %s; "
+            "autotuning will regenerate it.",
+            cache_path,
+        )
+        return None
+    return contents
+
+
+def save_flashinfer_autotune_cache(cache_path: Path, tuner: "AutoTuner") -> None:
+    """Publish only complete serialized tuner state to the shared cache."""
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=cache_path.parent) as directory:
+        temporary_path = Path(directory) / cache_path.name
+        tuner.save_configs(str(temporary_path))
+        contents = temporary_path.read_bytes()
+        json.loads(contents)
+        write_flashinfer_autotune_cache(cache_path, contents)
 
 
 def flashinfer_autotune_cache_hash(runner: "GPUModelRunner") -> str:
@@ -91,7 +122,14 @@ def write_flashinfer_autotune_cache(cache_path: Path, contents: bytes) -> None:
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(contents)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_path, cache_path)
+        directory_fd = os.open(cache_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except BaseException:
         with suppress(OSError):
             os.unlink(tmp_path)
@@ -218,9 +256,9 @@ def load_autotune_cache_on_all_ranks(
     """
     world_size = group.world_size
     contents: bytes | None = None
-    if group.rank_in_group == 0 and cache_path.exists():
-        contents = cache_path.read_bytes()
-        if world_size > 1:
+    if group.rank_in_group == 0:
+        contents = read_flashinfer_autotune_cache(cache_path)
+        if contents is not None and world_size > 1:
             validated = read_rank_union_cache(contents, world_size)
             if validated is None:
                 logger.warning(

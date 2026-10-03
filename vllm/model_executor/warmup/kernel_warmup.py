@@ -20,6 +20,7 @@ from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     load_autotune_cache_on_all_ranks,
     rank_union_cache_path,
     resolve_flashinfer_autotune_file,
+    save_flashinfer_autotune_cache,
     save_rank_union_autotune_cache,
 )
 from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
@@ -438,4 +439,4 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         world.barrier()
         save_rank_union_autotune_cache(cache_path, tuner, world)
     else:
-        tuner.save_configs(str(cache_path))
+        save_flashinfer_autotune_cache(cache_path, tuner)

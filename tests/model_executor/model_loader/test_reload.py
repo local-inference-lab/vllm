@@ -21,6 +21,7 @@ from vllm.model_executor.layers.linear import QKVParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.reload.layerwise import (
     finalize_layerwise_reload,
+    get_layerwise_info,
     initialize_layerwise_reload,
     initialize_online_processing,
     record_metadata_for_reloading,
@@ -140,6 +141,154 @@ class _ReloadableAttentionLayer(
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
         self.post_load_called = True
+
+
+class _SourceLifetimeQuantMethod(QuantizeMethodBase):
+    """Observes checkpoint-source ownership when online processing starts."""
+
+    uses_meta_device = True
+
+    def __init__(self, source_refs):
+        self.source_refs = source_refs
+        self.sources_alive_at_process = None
+
+    def create_weights(self, layer, *weight_args, **extra_weight_attrs):
+        pass
+
+    def apply(self, layer, *args, **kwargs):
+        raise NotImplementedError
+
+    def process_weights_after_loading(self, layer):
+        gc.collect()
+        self.sources_alive_at_process = [
+            source_ref() is not None for source_ref in self.source_refs
+        ]
+
+
+class _DeferredOnlineQuantAttention(_ReloadableAttentionLayer):
+    """Attention layer whose checkpoint tensor is processed after loading."""
+
+    def __init__(self):
+        torch.nn.Module.__init__(self)
+        self.source_refs = []
+        self.quant_method = _SourceLifetimeQuantMethod(self.source_refs)
+
+        def tracking_weight_loader(param, loaded_weight):
+            self.source_refs.append(ref(loaded_weight))
+            default_weight_loader(param, loaded_weight)
+
+        weight = torch.nn.Parameter(torch.empty(2, 2, device="meta"))
+        weight.weight_loader = tracking_weight_loader
+        self.register_parameter("weight", weight)
+        self.post_load_called = False
+        initialize_online_processing(self)
+
+
+def test_attention_first_load_releases_sources_before_online_quantization():
+    model_config = types.SimpleNamespace(dtype=torch.float32)
+    layer = _DeferredOnlineQuantAttention()
+    model = torch.nn.Sequential(layer)
+
+    layer.weight.weight_loader(layer.weight, torch.full((2, 2), 7.0))
+
+    assert layer.source_refs[0]() is not None
+    finalize_layerwise_reload(model, model_config)
+
+    assert layer.quant_method.sources_alive_at_process
+    assert not any(layer.quant_method.sources_alive_at_process)
+    assert layer.post_load_called
+    assert torch.equal(layer.weight, torch.full((2, 2), 7.0))
+
+
+def test_initial_online_processing_loads_into_materialized_parameters():
+    quant_method = _RecordingQuantMethod()
+    layer = _LateBiasLayer(quant_method)
+    loaded_weight = torch.full((4, 2), 2.0)
+    loaded_bias = torch.full((4,), 3.0)
+
+    layer.weight.weight_loader(layer.weight, loaded_weight)
+
+    assert not layer.weight.is_meta
+    assert torch.equal(layer.weight, loaded_weight)
+    assert not get_layerwise_info(layer).loaded_weights
+    assert quant_method.bias_at_process is None
+
+    layer.bias.weight_loader(layer.bias, loaded_bias)
+
+    assert torch.equal(quant_method.bias_at_process, loaded_bias)
+    assert not get_layerwise_info(layer).loaded_weights
+
+
+def test_initial_online_processing_preserves_deferred_writer_accounting():
+    from vllm.model_executor.weight_transfer import weight_transfer
+
+    class DeferredWriter:
+        def __init__(self):
+            self.pending = []
+
+        def __call__(self, destination, source):
+            self.pending.append((destination, source))
+            return True
+
+        def flush(self):
+            for destination, source in self.pending:
+                destination.copy_(source)
+            self.pending.clear()
+
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(torch.empty(4, 2, device="meta"))
+    layer.weight.weight_loader = default_weight_loader
+    initialize_online_processing(layer)
+    expected = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    writer = DeferredWriter()
+
+    with weight_transfer(writer):
+        layer.weight.weight_loader(layer.weight, expected)
+
+    assert not layer.weight.is_meta
+    assert not get_layerwise_info(layer).can_load()
+    assert not writer.pending
+    torch.testing.assert_close(layer.weight, expected)
+
+
+def test_online_processing_finalizes_checkpoint_omitted_padding():
+    class RecordingWeightQuantMethod(QuantizeMethodBase):
+        uses_meta_device = True
+
+        def __init__(self):
+            self.weight_at_process = None
+
+        def create_weights(self, layer, *args, **kwargs):
+            raise NotImplementedError
+
+        def apply(self, layer, *args, **kwargs):
+            raise NotImplementedError
+
+        def process_weights_after_loading(self, layer):
+            self.weight_at_process = layer.weight.detach().clone()
+
+    def shard_loader(param, loaded_weight, shard_id):
+        start = shard_id * loaded_weight.shape[0]
+        param.data[start : start + loaded_weight.shape[0]].copy_(loaded_weight)
+
+    quant_method = RecordingWeightQuantMethod()
+    layer = torch.nn.Module()
+    layer.quant_method = quant_method
+    weight = torch.nn.Parameter(torch.empty(6, 2, device="meta"))
+    weight.weight_loader = shard_loader
+    layer.register_parameter("weight", weight)
+    initialize_online_processing(layer)
+    layer._vllm_online_processing_unloaded = {"weight": 4}
+
+    first = torch.full((2, 2), 3.0)
+    second = torch.full((2, 2), 7.0)
+    layer.weight.weight_loader(layer.weight, first, 0)
+    assert quant_method.weight_at_process is None
+    layer.weight.weight_loader(layer.weight, second, 1)
+
+    expected = torch.cat((first, second, torch.zeros(2, 2)))
+    assert torch.equal(quant_method.weight_at_process, expected)
+    assert not get_layerwise_info(layer).can_load()
 
 
 def test_move_metatensors():

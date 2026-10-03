@@ -380,7 +380,7 @@ class Glm5NextDecoderLayer(nn.Module):
             mla_quant_config = (
                 quant_config
                 if quant_config is not None
-                and quant_config.get_name() == "modelopt_mixed"
+                and quant_config.get_name() in ("modelopt_mixed", "nvfp4_csf")
                 else None
             )
             self.self_attn = Glm5NextMLAAttention(
