@@ -95,7 +95,11 @@ or alter the Hugging Face source files.
 | Routers, norms, first three dense FFNs, vision, embeddings and head | Source representation |
 
 The adjacent projection manifest selects exactly 531 BF16 matrices: 520 in the
-main model and 11 in MTP. The configuration generator creates `main.json` for
+main model and 11 in MTP. The MTP selection is eight attention/indexer
+projections and three shared-expert projections. The serialized Spark uses
+these same MXFP8 projections and NVFP4 W4A16 routed experts; the
+[checkpoint precision audit](glm53_spark_mtp_precision.md) lists each matrix.
+The configuration generator creates `main.json` for
 `--quantization-config` and `mtp.json` for `--speculative-config`. MXFP8 scale
 compression is not enabled.
 
@@ -135,13 +139,21 @@ experts in this recipe use BF16 activations and need no shared FP4 input range.
 Use `w13` to retain per-expert down scales; `1` or `all` would share them too.
 This setting is separate from lossless CSF compression of **weight** scales.
 
-On two RTX PRO 6000 Blackwell GPUs at 600 W and 16365 MHz memory clocks, the
-shared setting improved fixed 32K prefill by about 1.1% after the reload control,
-with no decode improvement. The output distributions changed; a small English
-sample showed NLL 1.08448 to 1.08563 and did not establish equivalent quality.
-The [activation-scale report](glm53_qad_activation_scales.md) records exact
-image/configuration identities, repetitions and uncertainty. A maximum of
-expert-specific ranges is a heuristic, not a new calibration pass.
+With TP2/DCP1, no MTP, a 3072-token prefill budget and identical frozen token
+inputs, QAD with `w13` matched serialized Spark within the measured variation:
++0.175% on generated 32K prompts and -0.054% on WikiText 32K prompts. Sharing
+improved QAD against its own source-scale policy by 4.122% and 1.601%,
+respectively. These RTX PRO 6000 Blackwell measurements use 600 W limits,
+16365 MHz memory and dynamic graphics clocks; the
+[paired prefill report](glm53_spark_qad_prefill.md) provides image identities,
+raw samples and limits. Short prompts did not show the same gain.
+
+The separate MTP3 measurement improved fixed 32K WikiText prefill by about 1.1%
+after the reload control, with no decode improvement. Changing the scale policy
+changes output distributions: a small English sample showed NLL 1.08448 to
+1.08563 and did not establish equivalent quality. The
+[activation-scale report](glm53_qad_activation_scales.md) records that test.
+A maximum of expert-specific ranges is a heuristic, not a calibration pass.
 
 ## MTP, cache and prefill settings
 
