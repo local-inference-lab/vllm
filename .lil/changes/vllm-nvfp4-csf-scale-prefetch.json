@@ -1,0 +1,22 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-nvfp4-csf-scale-prefetch",
+  "category": "performance",
+  "summary": "GLM-5.3-Flash prefill on FP4-CSF checkpoints is 2-3% faster with A4 and 1-2% with A16: the next layer's scales expand during its attention",
+  "models": [
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "On by default for NVFP4-CSF W4A16 layers; VLLM_B12X_CSF_SCALE_PREFETCH=0 turns it off. Decode is unchanged.",
+  "details": [
+    "Layers share one scale scratch and each eager prefill call expanded its experts' scales serially before its MoE. After a layer's MoE, the next layer's scales now expand on a side stream, overlapping that layer's attention. glm53-tp2 on two RTX PRO 6000 Max-Q: 8K/32K prefill 10,254/10,620 instead of 10,032/10,312 tok/s with A4 and 7,763/8,058 instead of 7,672/7,925 with A16; needle-checksum A4 495/490/492, A16 498/495/497."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    978
+  ],
+  "requires": [
+    "b12x-nvfp4-csf-expand-scales"
+  ]
+}

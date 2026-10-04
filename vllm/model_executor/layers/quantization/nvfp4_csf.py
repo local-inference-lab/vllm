@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Lossless NVFP4 expert scale storage with native ModelOpt arithmetic."""
 
+import itertools
 from dataclasses import replace
 
 import regex as re
@@ -16,7 +17,12 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
+from vllm.model_executor.layers.fused_moe.b12x import (
+    B12xExperts,
+    _is_current_stream_capturing,
+    _num_leading_decode_tokens,
+    _w4a16_a4_prefill_enabled,
+)
 from vllm.model_executor.layers.fused_moe.config import (
     nvfp4_moe_quant_config,
     nvfp4_w4a16_moe_quant_config,
@@ -34,12 +40,40 @@ from .modelopt import ModelOptMixedPrecisionConfig
 
 logger = init_logger(__name__)
 
+_FORWARD_TOKENS = itertools.count()
+
+
+def _forward_token() -> int | None:
+    """An id of the current forward pass, or None outside of one."""
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    if not is_forward_context_available():
+        return None
+    context = get_forward_context()
+    token = getattr(context, "_b12x_csf_token", None)
+    if token is None:
+        token = next(_FORWARD_TOKENS)
+        context._b12x_csf_token = token
+    return token
+
+
+def _stage_max_tokens() -> int:
+    """Calls up to this size read compressed scales per stage, without expansion."""
+    try:
+        from b12x.moe.fused_moe._impl import W4A16_CSF_STAGE_MAX_TOKENS
+    except ImportError:
+        return 1536
+    return W4A16_CSF_STAGE_MAX_TOKENS
+
 
 class Nvfp4CsfConfig(ModelOptMixedPrecisionConfig):
     """Compressed main experts; retained ModelOpt formats for all other tensors."""
 
     checkpoint_root: str
     scale_scratch: tuple[torch.Tensor, ...] | None
+    scale_layers: dict[int, "Nvfp4CsfMoEMethod"]
+    scale_stream: torch.cuda.Stream | None
+    scale_prefetch: tuple[int, int, torch.cuda.Event] | None
 
     @classmethod
     def get_name(cls):
@@ -66,6 +100,11 @@ class Nvfp4CsfConfig(ModelOptMixedPrecisionConfig):
         assert isinstance(result, cls)
         result.checkpoint_root = config["checkpoint_root"]
         result.scale_scratch = None
+        # Layers sharing scale_scratch by index, the side stream that expands
+        # the next layer's scales ahead of its MoE, and the pending expansion.
+        result.scale_layers = {}
+        result.scale_stream = None
+        result.scale_prefetch = None
         return result
 
     def get_quant_method(self, layer, prefix):
@@ -240,6 +279,14 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
         self.moe_kernel = mk.FusedMoEKernel(
             MoEPrepareAndFinalizeNoDPEPModular(), backend
         )
+        self.backend, self.prepared = backend, prepared
+        self.a4_prefill = bool(getattr(prepared._impl, "a4_prefill_scales", False))
+        self.moe_done = torch.cuda.Event()
+        self.scales_ready = torch.cuda.Event()
+        if self.use_a16 and envs.VLLM_B12X_CSF_SCALE_PREFETCH:
+            self.owner.scale_layers[self.layer_index] = self
+            if self.owner.scale_stream is None:
+                self.owner.scale_stream = torch.cuda.Stream(device)
         logger.info(
             "NVFP4-CSF layer %d rank %d/%d: native NVFP4 %s, "
             "shared scale scratch %d bytes",
@@ -261,17 +308,64 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
         workspace=None,
     ):
         assert self.moe_kernel is not None
-        return self.moe_kernel.apply(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            activation=layer.activation,
-            global_num_experts=layer.global_num_experts,
-            expert_map=layer.expert_map,
-            apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            shared_experts=shared_experts,
-            shared_experts_input=shared_experts_input,
-            workspace=workspace,
+
+        def run():
+            return self.moe_kernel.apply(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=layer.activation,
+                global_num_experts=layer.global_num_experts,
+                expert_map=layer.expert_map,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                shared_experts=shared_experts,
+                shared_experts_input=shared_experts_input,
+                workspace=workspace,
+            )
+
+        owner = self.owner
+        if self.layer_index not in owner.scale_layers or _is_current_stream_capturing():
+            return run()
+        token = _forward_token()
+        pending, owner.scale_prefetch = owner.scale_prefetch, None
+        stream = torch.cuda.current_stream()
+        if pending is not None:
+            # The shared scratch must never race an expansion still in flight.
+            stream.wait_event(pending[2])
+        self.backend.scales_expanded = (
+            token is not None
+            and pending is not None
+            and (pending[:2] == (self.layer_index, token))
         )
+        try:
+            result = run()
+        finally:
+            self.backend.scales_expanded = False
+        following = owner.scale_layers.get(self.layer_index + 1)
+        if token is not None and following is not None and self._expands(x):
+            # The next layer's MoE would expand its scales into the same scratch:
+            # do it now on a side stream, overlapping that layer's attention.
+            from b12x.moe import fused_moe
+
+            self.moe_done.record(stream)
+            side = owner.scale_stream
+            side.wait_event(self.moe_done)
+            with torch.cuda.stream(side):
+                fused_moe.expand_scales(following.prepared)
+                following.scales_ready.record(side)
+            owner.scale_prefetch = (
+                following.layer_index,
+                token,
+                following.scales_ready,
+            )
+        return result
+
+    def _expands(self, x: torch.Tensor) -> bool:
+        """Whether this step's calls expand scales: A4 prefill rows or a large
+        A16 call (smaller A16 calls read compressed scales per stage)."""
+        tokens = int(x.shape[0])
+        if self.a4_prefill and _w4a16_a4_prefill_enabled():
+            return _num_leading_decode_tokens(tokens) < tokens
+        return tokens > _stage_max_tokens()
