@@ -164,6 +164,35 @@ def test_startup_plan_apply_gate(plan_env):
     assert explicit.cache_config.kv_cache_memory_bytes == 7 * GiB_bytes
 
 
+@pytest.mark.parametrize(
+    "conf,limited",
+    [
+        ("expandable_segments:True", False),
+        ("expandable_segments:True,large_segment_size_mb:12", False),
+        ("", True),
+        ("expandable_segments:False", True),
+    ],
+)
+def test_weight_loading_split_limit_skips_expandable_segments(
+    monkeypatch, conf, limited
+):
+    """Expandable segments load weights without the temporary split limit.
+
+    With them, the limit strands pages that weights share with freed loading
+    temporaries; the classic allocator keeps it against cached-block
+    fragmentation.
+    """
+    settings: list[str] = []
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", conf)
+    monkeypatch.setattr(gpu_worker.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        gpu_worker.torch._C, "_accelerator_setAllocatorSettings", settings.append
+    )
+    with gpu_worker.Worker._scoped_allocator_max_split(None, max_split_size_mb=20):
+        assert settings == (["max_split_size_mb:20"] if limited else [])
+    assert len(settings) == (2 if limited else 0)
+
+
 # Memory accounting of the profiling run (Worker.determine_available_memory).
 
 
