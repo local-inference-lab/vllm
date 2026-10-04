@@ -3,14 +3,20 @@
   "id": "vllm-b12x-w4a16-a4-prefill",
   "category": "feature",
   "summary": "Opt-in faster prefill for W4A16 MoE: NVFP4 activations for large prefill steps, decode stays BF16",
-  "models": ["GLM-5.3-Flash"],
+  "models": [
+    "GLM-5.3-Flash"
+  ],
   "compatibility": "Opt-in through B12X_W4A16_A4_PREFILL_MIN_TOKENS; without it nothing changes.",
   "details": [
     "With B12X_W4A16_A4_PREFILL_MIN_TOKENS set, the b12x MoE in W4A16 mode receives the checkpoint's activation global scales, and b12x runs MoE calls of at least that many tokens with NVFP4 activations over the same packed W4A16 weights (B12X_W4A16_A4_PREFILL_TERMS=2 uses a two-term NVFP4 activation format with about 8-bit precision).",
     "Decode rows always stay on the exact W4A16 path: a mixed step runs its leading decode rows through W4A16 and only its prefill rows through the faster path.",
     "Layers without valid activation scales (for example a draft layer without calibration) stay W4A16."
   ],
-  "authors": ["voipmonitor"],
+  "authors": [
+    "voipmonitor"
+  ],
   "pull_requests": [],
-  "requires": []
+  "requires": [
+    "b12x-w4a16-a4-prefill"
+  ]
 }
