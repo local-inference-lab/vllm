@@ -31,9 +31,11 @@ from vllm.model_executor.model_loader.weight_utils import (
 
 SCHEMA = "lil-mxfp4-csf-checkpoint/1"
 CODEC = "row-base-offset1-u24-exceptions/1"
+# Routed experts, hidden size, MoE intermediate size and compressed layers.
 FAMILIES = {
-    "deepseek_v41": (384, 5120, 2304),
-    "kimi_k3": (896, 3584, 3072),
+    "deepseek_v41": (384, 5120, 2304, range(40)),
+    "deepseek_v4_flash": (256, 4096, 2048, range(43)),
+    "kimi_k3": (896, 3584, 3072, range(1, 93)),
 }
 
 
@@ -41,6 +43,24 @@ FAMILIES = {
 def checkpoint_contract(root: str) -> dict:
     """Validate the MXFP4-CSF container before loading model tensors."""
     return read_csf_contract(root, schema=SCHEMA, codec=CODEC, families=FAMILIES)
+
+
+def expert_tensor_names(family, layer_index, expert):
+    """Source weight and scale names of an expert's gate, up and down matrices."""
+    if family == "kimi_k3":
+        prefix = (
+            f"language_model.model.layers.{layer_index}."
+            f"block_sparse_moe.experts.{expert}"
+        )
+        weight, scale = "weight_packed", "weight_scale"
+    else:
+        # DeepSeek-V4.1-Flash and DeepSeek-V4-Flash, including its vision
+        # variant, keep DeepSeek's native routed-expert names.
+        prefix = f"layers.{layer_index}.ffn.experts.{expert}"
+        weight, scale = "weight", "scale"
+    return tuple(
+        (f"{prefix}.{p}.{weight}", f"{prefix}.{p}.{scale}") for p in ("w1", "w3", "w2")
+    )
 
 
 def read_mxfp4_csf_layer(
@@ -59,9 +79,12 @@ def read_mxfp4_csf_layer(
     """Read rank-local gate/up/down tensors and unprepared compressed scales."""
     contract = checkpoint_contract(str(Path(root).resolve()))
     family = contract["family"]
-    if (num_experts, hidden_size, intermediate_size) != FAMILIES[family]:
+    e, h, n, layers = FAMILIES[family]
+    if (num_experts, hidden_size, intermediate_size) != (e, h, n):
         raise ValueError("MXFP4-CSF expert geometry differs from the checkpoint family")
-    supported_tp = (1, 2, 4, 8) if family == "deepseek_v41" else (1, 2, 4, 8, 12, 16)
+    if layer_index not in layers:
+        raise ValueError("MXFP4-CSF layer is outside the compressed expert inventory")
+    supported_tp = (1, 2, 4, 8, 12, 16) if family == "kimi_k3" else (1, 2, 4, 8)
     if tp_size not in supported_tp or not 0 <= tp_rank < tp_size:
         raise ValueError(
             f"MXFP4-CSF {family} supports TP {supported_tp} with a valid rank"
@@ -70,18 +93,11 @@ def read_mxfp4_csf_layer(
 
         def experts():
             for expert in range(num_experts):
-                if family == "kimi_k3":
-                    prefix = (
-                        f"language_model.model.layers.{layer_index}."
-                        f"block_sparse_moe.experts.{expert}"
-                    )
-                    weight, scale = "weight_packed", "weight_scale"
-                else:
-                    prefix = f"layers.{layer_index}.ffn.experts.{expert}"
-                    weight, scale = "weight", "scale"
                 yield tuple(
-                    reader.matrix(f"{prefix}.{p}.{weight}", f"{prefix}.{p}.{scale}")
-                    for p in ("w1", "w3", "w2")
+                    reader.matrix(weight, scale)
+                    for weight, scale in expert_tensor_names(
+                        family, layer_index, expert
+                    )
                 )
 
         return _load_mxfp4_csf_weights(
