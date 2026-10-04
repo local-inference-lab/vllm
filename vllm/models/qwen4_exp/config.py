@@ -38,7 +38,19 @@ def resolve_ple_embedding_dtype(
 
     from vllm.transformers_utils.config import get_safetensors_params_metadata
 
-    metadata = get_safetensors_params_metadata(str(model), revision=revision)
+    source = str(model)
+    quant_config = (
+        config_dict.get("quantization_config")
+        or text_config_dict.get("quantization_config")
+        or {}
+    )
+    if quant_config.get("quant_method") in ("nvfp4_csf", "mxfp4_csf") and (
+        root := quant_config.get("checkpoint_root")
+    ):
+        # An FP4-CSF serving directory holds metadata only; the checkpoint's
+        # tensors, PLE shards included, live under its root.
+        source = str(Path(root) / "tensors")
+    metadata = get_safetensors_params_metadata(source, revision=revision)
     dtypes = {
         info["dtype"]
         for name, info in metadata.items()
