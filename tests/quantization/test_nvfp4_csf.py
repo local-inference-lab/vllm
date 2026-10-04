@@ -400,3 +400,75 @@ def test_missing_or_invalid_calibration_is_rejected(bad):
             w13_scale_scratch=None,
             w2_scale_scratch=None,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA streams")
+def test_scale_prefetch_expands_the_next_layer_for_this_forward_only(monkeypatch):
+    """Layer N expands layer N+1's scales on the side stream after its own MoE;
+    layer N+1 skips its expansion in the same forward pass only."""
+    pytest.importorskip("b12x")
+    import b12x.moe.fused_moe as fused_moe
+
+    import vllm.forward_context as forward_context
+
+    expanded = []
+    monkeypatch.setattr(
+        fused_moe,
+        "expand_scales",
+        lambda prepared: expanded.append((prepared, torch.cuda.current_stream())),
+    )
+
+    def step(tokens):
+        context = SimpleNamespace(attn_metadata={})
+        monkeypatch.setattr(
+            forward_context, "is_forward_context_available", lambda: True
+        )
+        monkeypatch.setattr(forward_context, "get_forward_context", lambda: context)
+        return torch.zeros(tokens, 8)
+
+    owner = SimpleNamespace(
+        scale_layers={}, scale_stream=torch.cuda.Stream(), scale_prefetch=None
+    )
+    calls = []
+
+    def method(index):
+        m = object.__new__(Nvfp4CsfMoEMethod)
+        m.owner, m.layer_index = owner, index
+        m.backend = SimpleNamespace(scales_expanded=False)
+        m.prepared = f"layer-{index}"
+        m.moe_done, m.scales_ready = torch.cuda.Event(), torch.cuda.Event()
+        m.moe_kernel = SimpleNamespace(
+            apply=lambda **_: calls.append((index, m.backend.scales_expanded))
+        )
+        owner.scale_layers[index] = m
+        return m
+
+    first, second = method(3), method(4)
+    layer = SimpleNamespace(
+        w13_weight=None,
+        w2_weight=None,
+        activation=MoEActivation.SILU,
+        global_num_experts=8,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+    )
+
+    def forward(x):
+        for m in (first, second):
+            m.apply(layer, x, None, None, None, None)
+
+    forward(step(2000))  # above the stage-read limit: the calls expand
+    assert calls == [(3, False), (4, True)]
+    assert [p for p, _ in expanded] == ["layer-4"]
+    assert expanded[0][1] == owner.scale_stream
+    assert owner.scale_prefetch is None
+    # A prefetch left from another forward pass is waited for, never reused.
+    owner.scale_prefetch = (4, -1, second.scales_ready)
+    calls.clear()
+    second.apply(layer, step(2000), None, None, None, None)
+    assert calls == [(4, False)]
+    # Decode-sized calls read compressed scales per stage: nothing to expand.
+    expanded.clear()
+    calls.clear()
+    forward(step(8))
+    assert calls == [(3, False), (4, False)] and expanded == []
