@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-qwen-ple-dtype-csf",
+  "category": "fix",
+  "summary": "Qwen3.8-Flash-Next QAD FP4-CSF checkpoints start: the PLE storage dtype is read from the checkpoint the serving directory points at",
+  "models": [
+    "Qwen3.8-Flash-Next"
+  ],
+  "compatibility": "Only FP4-CSF serving directories change; other checkpoints resolve the PLE dtype as before.",
+  "details": [
+    "When the checkpoint config omits the PLE storage dtype, vLLM reads it from the safetensors headers of the model directory. An FP4-CSF serving directory holds metadata only, so the QAD checkpoint's NVFP4 PLE table was taken for BF16 and loading stopped with a PLE shard shape mismatch. The dtype is now read from the tensors under the CSF checkpoint root."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [],
+  "requires": []
+}
