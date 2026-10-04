@@ -8,7 +8,7 @@
   ],
   "compatibility": "Opt-in through B12X_W4A16_A4_PREFILL_MIN_TOKENS; without it nothing changes.",
   "details": [
-    "With B12X_W4A16_A4_PREFILL_MIN_TOKENS set, the b12x MoE in W4A16 mode receives the checkpoint's activation global scales, and b12x runs MoE calls of at least that many tokens with NVFP4 activations over the same packed W4A16 weights (B12X_W4A16_A4_PREFILL_TERMS=2 uses a two-term NVFP4 activation format with about 8-bit precision).",
+    "With B12X_W4A16_A4_PREFILL_MIN_TOKENS set, the b12x MoE in W4A16 mode receives the checkpoint's activation global scales, and b12x runs MoE calls of at least that many tokens with NVFP4 activations over the same packed W4A16 weights. GLM-5.3-Flash TP2/DCP2 MTP3 on two RTX PRO 6000 Max-Q with a 1536-token threshold: prefill 9,528 and 9,784 tok/s at 8K and 32K tokens versus 7,490 and 7,728 with W4A16, decode unchanged.",
     "Decode rows always stay on the exact W4A16 path: a mixed step runs its leading decode rows through W4A16 and only its prefill rows through the faster path.",
     "Layers without valid activation scales (for example a draft layer without calibration) stay W4A16."
   ],
