@@ -113,7 +113,7 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
             or parallel.use_all2all_kernels
             or parallel.enable_eplb
         ):
-            raise NotImplementedError("MXFP4-CSF DS4.1 supports TP without EP/DP")
+            raise NotImplementedError("MXFP4-CSF experts support TP without EP/DP")
         if (
             moe.activation not in (MoEActivation.SILU, MoEActivation.SITU)
             or moe.in_dtype != torch.bfloat16
