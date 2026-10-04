@@ -8,7 +8,7 @@ from .kimi_mxfp4_csf import KimiMxfp4CsfConfig
 
 
 class Mxfp4CsfConfig(KimiMxfp4CsfConfig):
-    """Select Kimi or DeepSeek dense precision from the checkpoint contract."""
+    """Select Kimi, DeepSeek-V4.1 or DeepSeek-V4 dense precision by family."""
 
     @classmethod
     def get_name(cls):
@@ -32,6 +32,11 @@ class Mxfp4CsfConfig(KimiMxfp4CsfConfig):
         family = checkpoint_contract(config["checkpoint_root"])["family"]
         if family == "deepseek_v41":
             return DeepseekV41Mxfp4CsfConfig.from_config(config)
+        if family == "deepseek_v4_flash":
+            # Deferred: the DeepSeek-V4 package imports its platform model.
+            from vllm.models.deepseek_v4.mxfp4_csf import DeepseekV4Mxfp4CsfConfig
+
+            return DeepseekV4Mxfp4CsfConfig.from_config(config)
         if family == "kimi_k3":
             return super().from_config(config)
         raise ValueError(f"Unsupported MXFP4-CSF model family: {family}")
