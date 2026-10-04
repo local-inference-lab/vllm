@@ -961,8 +961,11 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         global_sf_num_experts = (
             global_num_experts if self.use_global_sf else num_experts
         )
+        # Zero, not uninitialized: W4A16_NVFP4 layers (such as GLM-5.3 MTP
+        # experts) store no input scales, and the b12x W4A16 A4 prefill takes
+        # any positive finite value here for a calibrated scale.
         w13_input_scale = PerTensorScaleParameter(
-            data=torch.empty(
+            data=torch.zeros(
                 global_sf_num_experts,
                 w13_num_shards,
                 dtype=torch.float32,
@@ -972,7 +975,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         layer.register_parameter("w13_input_scale", w13_input_scale)
 
         w2_input_scale = PerTensorScaleParameter(
-            data=torch.empty(global_sf_num_experts, dtype=torch.float32),
+            data=torch.zeros(global_sf_num_experts, dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_input_scale", w2_input_scale)
