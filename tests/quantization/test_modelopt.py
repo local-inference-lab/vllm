@@ -1035,6 +1035,60 @@ def test_modelopt_nvfp4_moe_dispatches_to_marlin_when_w4a16(
         assert kwargs["activation_key"] is kNvfp4Dynamic
 
 
+@pytest.mark.parametrize("quant_method", ["NVFP4", "W4A16_NVFP4"])
+def test_modelopt_nvfp4_moe_input_scales_start_at_zero(dist_init, quant_method):
+    """Input scales the checkpoint does not store must read as absent.
+
+    W4A16_NVFP4 experts (GLM-5.3's MTP layer) have no input scales on disk, so
+    the registered parameters keep their initial value. The b12x W4A16 A4
+    prefill treats positive finite scales as calibrated; uninitialized memory
+    could enable it with a garbage global scale.
+    """
+    from vllm.model_executor.layers.quantization import modelopt
+
+    config = modelopt.ModelOptNvFp4Config(
+        quant_method=quant_method,
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=[],
+        group_size=16,
+    )
+    with (
+        patch.object(
+            modelopt,
+            "select_nvfp4_moe_backend",
+            return_value=(MagicMock(), MagicMock()),
+        ),
+        patch.object(
+            modelopt, "is_global_sf_supported_for_nvfp4_backend", return_value=False
+        ),
+    ):
+        moe = modelopt.ModelOptNvFp4FusedMoE(config, MagicMock())
+
+    empty = torch.empty
+
+    def garbage_empty(*args, **kwargs):
+        # Stand-in for uninitialized memory: positive and finite.
+        tensor = empty(*args, **kwargs)
+        if tensor.dtype == torch.float32:
+            tensor.fill_(5.2e-32)
+        return tensor
+
+    layer = torch.nn.Module()
+    with patch.object(modelopt.torch, "empty", garbage_empty):
+        moe.create_weights(
+            layer,
+            num_experts=4,
+            hidden_size=64,
+            intermediate_size_per_partition=32,
+            params_dtype=torch.bfloat16,
+            weight_loader=lambda *args, **kwargs: None,
+        )
+
+    assert torch.equal(layer.w13_input_scale, torch.zeros(4, 2))
+    assert torch.equal(layer.w2_input_scale, torch.zeros(4))
+
+
 @pytest.mark.parametrize(
     "per_layer_algo, expected_weight, expected_activation",
     [
