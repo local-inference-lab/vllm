@@ -5,16 +5,19 @@ original scale bytes, calibration values and other tensors are preserved.
 The B12X backend keeps scales compressed between layers and reconstructs
 the needed scales into shared GPU scratch before expert computation.
 
-Use `--quantization mxfp4_csf --load-format mxfp4_csf` for supported Kimi-K3
-or DeepSeek-V4.1-Flash MXFP4 containers. Use
-`--quantization nvfp4_csf --load-format nvfp4_csf` for GLM-5.3-Flash or
-Qwen3.8-Flash-Next NVFP4 containers. Automatic loading does not select these readers;
-set the load format explicitly.
+Use `--quantization mxfp4_csf --load-format mxfp4_csf` for supported Kimi-K3,
+DeepSeek-V4.1-Flash, DeepSeek-V4-Flash or DeepSeek-V4-Flash-Vision-Exp MXFP4
+containers. Use `--quantization nvfp4_csf --load-format nvfp4_csf` for
+GLM-5.3-Flash or Qwen3.8-Flash-Next NVFP4 containers. Automatic loading does
+not select these readers; set the load format explicitly.
 
 MXFP4 uses a one-bit unsigned offset from a row's base byte. NVFP4 uses a
 four-bit offset. Both preserve out-of-interval scale bytes as exceptions.
-They retain their source arithmetic: MXFP4-CSF uses BF16 expert activations;
-NVFP4-CSF uses native calibrated FP4 expert activations.
+Expert activations follow each model's native B12X policy. DeepSeek-V4.1-Flash
+and DeepSeek-V4-Flash MXFP4-CSF quantize expert activations to MXFP8 (W4A8)
+unless `VLLM_B12X_MOE_FP4_FORCE_A16=1` requests BF16 activations. Kimi-K3
+MXFP4-CSF uses BF16 expert activations. NVFP4-CSF uses native calibrated FP4
+expert activations.
 
 ## GLM-5.3-Flash on two 96 GiB Blackwell GPUs
 
@@ -75,6 +78,33 @@ performance depends on storage and is not represented by the RAM example.
 The example reserves 2 GiB/GPU for KV cache. Qwen's intermediate dimension
 supports TP1 and TP2 in this reader; TP4 does not satisfy the 64-channel
 local alignment requirement.
+
+## DeepSeek-V4-Flash on two 96 GiB Blackwell GPUs
+
+This also applies to DeepSeek-V4-Flash-Vision-Exp. The serving directory
+contains the source tokenizer metadata and a `config.json` whose
+`quantization_config` keeps the source block-FP8 fields, including
+`weight_block_size` equal to `[128, 128]`, and sets `quant_method` to
+`mxfp4_csf`, `format_version` to 1 and an absolute `checkpoint_root`.
+
+The `deepseek_v4_flash` container compresses the routed-expert scales of the
+43 target layers. Attention, dense and shared-expert weights retain block
+FP8. MTP/DSpark draft layers (`mtp.*`), the vision tower, the aligner and the
+image embeddings retain their source tensors and precision. A `config.json`
+with a vision tower selects the multimodal model.
+
+```bash
+vllm serve /models/DeepSeek-V4-Flash-MXFP4-CSF/serve \
+  --quantization mxfp4_csf --load-format mxfp4_csf \
+  --tensor-parallel-size 2 --moe-backend b12x --attention-backend B12X \
+  --block-size 256 --max-num-seqs 8 --max-num-batched-tokens 4096 \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":5}' \
+  --tokenizer-mode deepseek_v4 --reasoning-parser deepseek_v4 \
+  --tool-call-parser deepseek_v4 --host 0.0.0.0 --port 8000
+```
+
+The reader supports TP1, TP2, TP4 and TP8 with pipeline parallel size 1,
+without expert/data parallelism or ubatching.
 
 ## Compatibility
 

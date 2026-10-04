@@ -618,3 +618,315 @@ def test_expert_inventory_must_match_declared_count(count):
             w13_scale_scratch=None,
             w2_scale_scratch=None,
         )
+
+
+# DeepSeek-V4-Flash (0731 and Vision-Exp) serving config: the source block-FP8
+# fields plus the MXFP4-CSF method and container location.
+DS4_FLASH_SERVING = {
+    "activation_scheme": "dynamic",
+    "fmt": "e4m3",
+    "quant_method": "mxfp4_csf",
+    "scale_fmt": "ue8m0",
+    "weight_block_size": [128, 128],
+    "format_version": 1,
+    "checkpoint_root": "/csf",
+}
+
+
+@pytest.fixture
+def ds4_flash_moe():
+    return FusedMoEConfig(
+        num_experts=256,
+        num_local_experts=256,
+        num_logical_experts=256,
+        experts_per_token=6,
+        hidden_dim=4096,
+        intermediate_size=1024,
+        in_dtype=torch.bfloat16,
+        device="cpu",
+        activation=MoEActivation.SILU,
+        swiglu_limit=10.0,
+        routing_method=RoutingMethodType.TopK,
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+    )
+
+
+def ds4_flash_vllm_config(
+    *, pp=1, ubatching=False, load_format="mxfp4_csf", ep=False, expert_dtype="fp4"
+):
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(num_hidden_layers=43, expert_dtype=expert_dtype)
+        ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=pp,
+            use_ubatching=ubatching,
+            enable_expert_parallel=ep,
+        ),
+        load_config=SimpleNamespace(load_format=load_format),
+    )
+
+
+def test_ds4_flash_reader_requests_native_target_expert_names(monkeypatch):
+    from vllm.model_executor.model_loader import mxfp4_csf_loader as checkpoint
+
+    requested = []
+
+    class Reader:
+        def __init__(self, root, source_names, codec):
+            assert codec == "mxfp4"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def matrix(self, weight, scale):
+            requested.append((weight, scale))
+            return weight
+
+    monkeypatch.setattr(
+        checkpoint,
+        "checkpoint_contract",
+        lambda _: {"family": "deepseek_v4_flash", "source_names": {}},
+    )
+    monkeypatch.setattr(checkpoint, "CsfTensorReader", Reader)
+    monkeypatch.setattr(
+        checkpoint, "_load_mxfp4_csf_weights", lambda experts, **_: list(experts)
+    )
+    experts = checkpoint.read_mxfp4_csf_layer(
+        "/csf",
+        42,
+        num_experts=256,
+        hidden_size=4096,
+        intermediate_size=2048,
+        tp_rank=1,
+        tp_size=2,
+        device="cpu",
+        w13_scale_scratch=None,
+        w2_scale_scratch=None,
+    )
+    assert len(experts) == len(requested) // 3 == 256
+    prefix = "layers.42.ffn.experts.255"
+    assert requested[-3:] == [
+        (f"{prefix}.{p}.weight", f"{prefix}.{p}.scale") for p in ("w1", "w3", "w2")
+    ]
+    assert experts[-1] == tuple(weight for weight, _ in requested[-3:])
+
+
+@pytest.mark.parametrize(
+    "layer,geometry,tp_size,error",
+    [
+        (43, (256, 4096, 2048), 2, "outside the compressed expert inventory"),
+        (0, (384, 5120, 2304), 2, "geometry"),
+        (0, (256, 4096, 2048), 16, "supports TP"),
+    ],
+)
+def test_ds4_flash_reader_rejects_draft_layers_geometry_and_tp(
+    monkeypatch, layer, geometry, tp_size, error
+):
+    from vllm.model_executor.model_loader import mxfp4_csf_loader as checkpoint
+
+    monkeypatch.setattr(
+        checkpoint,
+        "checkpoint_contract",
+        lambda _: {"family": "deepseek_v4_flash", "source_names": {}},
+    )
+    num_experts, hidden_size, intermediate_size = geometry
+    with pytest.raises(ValueError, match=error):
+        checkpoint.read_mxfp4_csf_layer(
+            "/csf",
+            layer,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            tp_rank=0,
+            tp_size=tp_size,
+            device="cpu",
+            w13_scale_scratch=None,
+            w2_scale_scratch=None,
+        )
+
+
+def test_mxfp4_csf_dispatches_ds4_flash_with_source_dense_config(monkeypatch):
+    from vllm.model_executor.layers.quantization import get_quantization_config
+    from vllm.model_executor.layers.quantization.mxfp4_csf import Mxfp4CsfConfig
+    from vllm.model_executor.model_loader import mxfp4_csf_loader as checkpoint
+    from vllm.models.deepseek_v4.mxfp4_csf import DeepseekV4Mxfp4CsfConfig
+    from vllm.models.deepseek_v41.quant_config import DeepseekV4FP8Config
+
+    monkeypatch.setattr(
+        checkpoint, "checkpoint_contract", lambda _: {"family": "deepseek_v4_flash"}
+    )
+    owner = get_quantization_config("mxfp4_csf").from_config(DS4_FLASH_SERVING)
+    source = {
+        key: value
+        for key, value in DS4_FLASH_SERVING.items()
+        if key not in ("format_version", "checkpoint_root")
+    }
+    native = DeepseekV4FP8Config.from_config({**source, "quant_method": "fp8"})
+    assert isinstance(owner, DeepseekV4Mxfp4CsfConfig)
+    assert owner.get_name() == "mxfp4_csf" and owner.get_min_capability() == 120
+    assert owner.checkpoint_root == "/csf" and owner.scale_scratch is None
+    for field in (
+        "is_checkpoint_fp8_serialized",
+        "activation_scheme",
+        "ignored_layers",
+        "weight_block_size",
+        "is_scale_e8m0",
+    ):
+        assert getattr(owner, field) == getattr(native, field)
+    # The serving config must select the CSF reader, not the native FP8 path.
+    hf_config = SimpleNamespace(model_type="deepseek_v4")
+    assert (
+        DeepseekV4FP8Config.override_quantization_method(
+            DS4_FLASH_SERVING, "mxfp4_csf", hf_config=hf_config
+        )
+        is None
+    )
+    for method in (Mxfp4CsfConfig, DeepseekV4Mxfp4CsfConfig):
+        assert (
+            method.override_quantization_method(
+                DS4_FLASH_SERVING, "mxfp4_csf", hf_config=hf_config
+            )
+            == "mxfp4_csf"
+        )
+    with pytest.raises(ValueError, match=r"\[128, 128\]"):
+        DeepseekV4Mxfp4CsfConfig.from_config(
+            {**DS4_FLASH_SERVING, "weight_block_size": [32, 32]}
+        )
+    with pytest.raises(ValueError, match="format_version"):
+        DeepseekV4Mxfp4CsfConfig.from_config({**DS4_FLASH_SERVING, "format_version": 2})
+
+
+@pytest.mark.parametrize("force_a16", [False, True])
+def test_ds4_flash_target_experts_use_csf_while_dense_and_drafts_stay_native(
+    monkeypatch, ds4_flash_moe, force_a16
+):
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.models.deepseek_v4 import mxfp4_csf
+
+    owner = mxfp4_csf.DeepseekV4Mxfp4CsfConfig.from_config(DS4_FLASH_SERVING)
+    config = ds4_flash_vllm_config()
+    monkeypatch.setattr(mxfp4_csf.envs, "VLLM_B12X_MOE_FP4_FORCE_A16", force_a16)
+    monkeypatch.setattr(mxfp4_csf, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(mxfp4_csf, "get_current_vllm_config_or_none", lambda: config)
+    native = object()
+    monkeypatch.setattr(
+        mxfp4_csf.DeepseekV4FP8Config, "get_quant_method", lambda *a, **k: native
+    )
+    layer = Mock(spec=RoutedExperts)
+    layer.moe_config = ds4_flash_moe
+    for prefix in (
+        "model.layers.0.ffn.experts",
+        "model.layers.42.ffn.experts",
+        "language_model.model.layers.42.ffn.experts",
+    ):
+        method = owner.get_quant_method(layer, prefix)
+        assert isinstance(method, Mxfp4CsfMoEMethod) and method.owner is owner
+        assert method.activation_mode == ("a16" if force_a16 else "a8")
+        assert method.get_fused_moe_quant_config(layer).quant_dtype == (
+            None if force_a16 else "mxfp8"
+        )
+    # MTP and DSpark draft layers are numbered after the 43 target layers.
+    for prefix in ("model.layers.43.ffn.experts", "model.layers.45.ffn.experts"):
+        assert owner.get_quant_method(layer, prefix) is native
+    assert owner.get_quant_method(torch.nn.Module(), "model.layers.0.attn.wq_a") is (
+        native
+    )
+
+
+@pytest.mark.parametrize(
+    "mode,error,match",
+    [
+        ("pipeline", NotImplementedError, "PP1 without ubatching"),
+        ("ubatching", NotImplementedError, "PP1 without ubatching"),
+        ("wrong_loader", ValueError, "load-format"),
+        ("fp8_experts", ValueError, "MXFP4 routed experts"),
+        ("expert_parallel", NotImplementedError, "expert parallelism"),
+    ],
+)
+def test_ds4_flash_csf_rejects_unsupported_execution(
+    monkeypatch, ds4_flash_moe, mode, error, match
+):
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.models import deepseek_v41
+    from vllm.models.deepseek_v4 import mxfp4_csf
+
+    owner = mxfp4_csf.DeepseekV4Mxfp4CsfConfig.from_config(DS4_FLASH_SERVING)
+    config = ds4_flash_vllm_config(
+        pp=2 if mode == "pipeline" else 1,
+        ubatching=mode == "ubatching",
+        load_format="safetensors" if mode == "wrong_loader" else "mxfp4_csf",
+        ep=mode == "expert_parallel",
+        expert_dtype="fp8" if mode == "fp8_experts" else "fp4",
+    )
+    for module in (mxfp4_csf, deepseek_v41.quant_config):
+        monkeypatch.setattr(module, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(mxfp4_csf, "get_current_vllm_config_or_none", lambda: config)
+    layer = Mock(spec=RoutedExperts)
+    layer.moe_config = ds4_flash_moe
+    with pytest.raises(error, match=match):
+        owner.get_quant_method(layer, "model.layers.42.ffn.experts")
+    if mode == "expert_parallel":
+        # MegaMoE experts never reach a quantization method.
+        with pytest.raises(error, match=match):
+            owner.get_quant_method(torch.nn.Module(), "model.layers.0.attn.wq_a")
+
+
+def test_ds4_flash_loader_keeps_vision_draft_and_dense_tensors(tmp_path):
+    from vllm.model_executor.model_loader.mxfp4_csf_loader import CODEC, SCHEMA
+
+    tensor_dir = tmp_path / "tensors"
+    tensor_dir.mkdir()
+    name = "model-00001-of-00001.safetensors"
+
+    def byte():
+        return torch.ones(8, dtype=torch.uint8)
+
+    compressed = {
+        "layers.0.ffn.experts.0.w1.weight": byte(),
+        "layers.0.ffn.experts.0.w1.scale.mxfp4_csf_fixed": byte(),
+        "layers.0.ffn.experts.0.w1.scale.mxfp4_csf_exceptions": torch.zeros(
+            1, dtype=torch.uint32
+        ),
+        "layers.42.ffn.experts.255.w2.weight": byte(),
+    }
+    draft = {
+        "mtp.0.ffn.experts.0.w1.weight": torch.full((8,), 42, dtype=torch.uint8),
+        "mtp.0.ffn.experts.0.w1.scale": byte(),
+        "mtp.2.markov_head.markov_w1.weight": torch.ones(8, dtype=torch.bfloat16),
+    }
+    retained = {
+        **draft,
+        "layers.0.attn.wq_a.scale": byte(),
+        "layers.0.ffn.gate.bias_vl": torch.ones(8),
+        "layers.0.ffn.gate.tid2eid": torch.ones(8, dtype=torch.int32),
+        "layers.0.hc_attn_fn": torch.ones(8),
+        "vision.blocks.0.attn.wqkv.weight": torch.ones(8, dtype=torch.bfloat16),
+        "aligner.w1.weight": torch.ones(8, dtype=torch.bfloat16),
+        "image_start": torch.ones(8),
+    }
+    tensors = {**compressed, **retained}
+    save_file(tensors, tensor_dir / name)
+    common = {"schema": SCHEMA, "codec": CODEC, "family": "deepseek_v4_flash"}
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({**common, "shards": [{"file": name}]})
+    )
+    (tmp_path / "build-contract.json").write_text(
+        json.dumps({**common, "source_names": {k: name for k in tensors}})
+    )
+    config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            num_hidden_layers=43,
+            quantization_config={**DS4_FLASH_SERVING, "checkpoint_root": str(tmp_path)},
+        )
+    )
+    loader = Mxfp4CsfModelLoader(LoadConfig(load_format="mxfp4_csf"))
+    result = dict(loader.get_all_weights(config, SimpleNamespace()))
+    assert sorted(result) == sorted(retained)
+    for key, value in retained.items():
+        assert torch.equal(result[key], value)
+    dspark = SimpleNamespace(checkpoint_weight_name_prefixes=("mtp.",))
+    assert sorted(dict(loader.get_all_weights(config, dspark))) == sorted(draft)
