@@ -32,7 +32,8 @@ def test_min_tokens_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _fake_context(monkeypatch, starts):
     metadata = SimpleNamespace(
-        query_start_loc=torch.tensor(starts, dtype=torch.int32), num_actual_tokens=starts[-1]
+        query_start_loc=torch.tensor(starts, dtype=torch.int32),
+        num_actual_tokens=starts[-1],
     )
     context = SimpleNamespace(attn_metadata={"layer.0": metadata})
     monkeypatch.setattr(forward_context, "is_forward_context_available", lambda: True)
@@ -67,9 +68,13 @@ class _Recorder:
     def __init__(self) -> None:
         self.calls: list[tuple[int, int]] = []
 
-    def bind(self, plan, *, scratch, a, experts, topk_weights, topk_ids, output, **kwargs):
+    def bind(
+        self, plan, *, scratch, a, experts, topk_weights, topk_ids, output, **kwargs
+    ):
         del plan, scratch, experts, kwargs
-        assert a.shape[0] == topk_weights.shape[0] == topk_ids.shape[0] == output.shape[0]
+        assert (
+            a.shape[0] == topk_weights.shape[0] == topk_ids.shape[0] == output.shape[0]
+        )
         return SimpleNamespace(rows=int(a.shape[0]), first=int(a.data_ptr()))
 
     def run(self, *, binding) -> None:
@@ -90,11 +95,21 @@ def _experts(monkeypatch, quant_mode: str):
 def _apply(experts, tokens):
     hidden = torch.zeros(tokens, 8, dtype=torch.bfloat16)
     experts.apply(
-        output=torch.zeros_like(hidden), hidden_states=hidden, w1=None, w2=None,
-        topk_weights=torch.ones(tokens, 2), topk_ids=torch.zeros(tokens, 2, dtype=torch.int32),
-        activation=MoEActivation.SILU, global_num_experts=4, expert_map=None, a1q_scale=None,
-        a2_scale=None, workspace13=None, workspace2=torch.zeros(64, dtype=torch.uint8),
-        expert_tokens_meta=None, apply_router_weight_on_input=False,
+        output=torch.zeros_like(hidden),
+        hidden_states=hidden,
+        w1=None,
+        w2=None,
+        topk_weights=torch.ones(tokens, 2),
+        topk_ids=torch.zeros(tokens, 2, dtype=torch.int32),
+        activation=MoEActivation.SILU,
+        global_num_experts=4,
+        expert_map=None,
+        a1q_scale=None,
+        a2_scale=None,
+        workspace13=None,
+        workspace2=torch.zeros(64, dtype=torch.uint8),
+        expert_tokens_meta=None,
+        apply_router_weight_on_input=False,
     )
     return hidden
 
@@ -105,7 +120,10 @@ def test_mixed_step_splits_decode_rows(monkeypatch: pytest.MonkeyPatch) -> None:
     experts, recorder = _experts(monkeypatch, "w4a16")
     hidden = _apply(experts, 2312)
     row = hidden.element_size() * hidden.shape[1]
-    assert recorder.calls == [(8, hidden.data_ptr()), (2304, hidden.data_ptr() + 8 * row)]
+    assert recorder.calls == [
+        (8, hidden.data_ptr()),
+        (2304, hidden.data_ptr() + 8 * row),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -116,7 +134,9 @@ def test_mixed_step_splits_decode_rows(monkeypatch: pytest.MonkeyPatch) -> None:
         ("nvfp4", "1536", 2312),  # not a W4A16 plan
     ],
 )
-def test_no_split(monkeypatch: pytest.MonkeyPatch, quant_mode, threshold, tokens) -> None:
+def test_no_split(
+    monkeypatch: pytest.MonkeyPatch, quant_mode, threshold, tokens
+) -> None:
     monkeypatch.setenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", threshold)
     _fake_context(monkeypatch, [0, 4, tokens])
     experts, recorder = _experts(monkeypatch, quant_mode)
