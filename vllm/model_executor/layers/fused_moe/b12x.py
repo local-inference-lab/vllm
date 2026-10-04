@@ -237,21 +237,23 @@ def _w4a16_a4_prefill_min_tokens() -> int:
 
 
 def _w4a16_a4_prefill_enabled() -> bool:
-    """b12x reads B12X_W4A16_A4_PREFILL_MIN_TOKENS at plan time; it needs the
-    activation global scales the A16 path otherwise ignores."""
+    """b12x compiles the A4 prefill path when B12X_W4A16_A4_PREFILL_MIN_TOKENS
+    is set; it needs the activation global scales the A16 path otherwise
+    ignores."""
     return _w4a16_a4_prefill_min_tokens() > 0
 
 
 _A4_SPLIT_LOGGED = False
 
 
-def _num_leading_decode_tokens() -> int:
-    """Leading decode-row count of the current decodes-first batch (0 if unknown).
+def _num_leading_decode_tokens(tokens: int) -> int:
+    """Leading decode-row count of the current decodes-first batch.
 
-    Only called for steps at or above the A4 threshold, which never run inside a
-    captured CUDA graph: one host read of query_start_loc per step, cached on the
-    forward context. Requests with query length <= 4 (1 + 3 MTP tokens) count as
-    decode rows; KDA's reorder keeps them first.
+    Requests with query length <= 4 (1 + 3 MTP tokens) count as decode rows;
+    KDA's reorder keeps them first. A GDN/KDA layer counts prefills on the
+    host, so a decode-only step needs no device read. Otherwise one host read
+    of query_start_loc per step, cached on the forward context. Never called
+    inside a captured CUDA graph. 0 without a forward context.
     """
     from vllm.forward_context import get_forward_context, is_forward_context_available
 
@@ -264,15 +266,25 @@ def _num_leading_decode_tokens() -> int:
     rows = 0
     metadata = context.attn_metadata
     if isinstance(metadata, dict):
-        for value in metadata.values():
-            starts = getattr(value, "query_start_loc", None)
-            if isinstance(starts, torch.Tensor) and hasattr(value, "num_actual_tokens"):
-                bounds = starts.tolist()
-                for lo, hi in zip(bounds, bounds[1:]):
-                    if not 0 < hi - lo <= 4:
-                        break
-                    rows = hi
-                break
+        prefills = [
+            value.num_prefills
+            for value in metadata.values()
+            if hasattr(value, "num_spec_decode_tokens")
+        ]
+        if prefills and not any(prefills):
+            rows = tokens
+        else:
+            for value in metadata.values():
+                starts = getattr(value, "query_start_loc", None)
+                if isinstance(starts, torch.Tensor) and hasattr(
+                    value, "num_actual_tokens"
+                ):
+                    bounds = starts.tolist()
+                    for lo, hi in zip(bounds, bounds[1:]):
+                        if not 0 < hi - lo <= 4:
+                            break
+                        rows = hi
+                    break
     with contextlib.suppress(AttributeError):
         context._b12x_a4_decode_rows = rows
     return rows
@@ -1057,35 +1069,47 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         scratch = workspace2.view(-1).view(torch.uint8)
         expanded = {"scales_expanded": True} if self.scales_expanded else {}
         tokens = int(hidden_states.shape[0])
-        a4_min = _w4a16_a4_prefill_min_tokens()
-        if a4_min and tokens >= a4_min and self._quant_mode == "w4a16":
-            # Decode always stays A16: a mixed step runs its leading decode rows
-            # through W4A16 and only the prefill rows through the A4 path.
-            decode_rows = _num_leading_decode_tokens()
-            if 0 < decode_rows < tokens:
+        if (
+            self._quant_mode == "w4a16"
+            and _w4a16_a4_prefill_enabled()
+            and getattr(getattr(prepared, "_impl", None), "a4_prefill_scales", False)
+        ):
+            # The row type decides the A4 prefill: decode rows always run
+            # W4A16 and prefill rows always A4, whatever the call size. A
+            # captured CUDA graph (decode steps and the smallest mixed steps)
+            # keeps W4A16 for all its rows. Layers without activation scales
+            # (the MTP draft layer) have no A4 path to choose.
+            if _is_current_stream_capturing():
+                parts = ((0, tokens, False),)
+            else:
+                decode_rows = min(_num_leading_decode_tokens(tokens), tokens)
+                parts = ((0, decode_rows, False), (decode_rows, tokens, True))
                 global _A4_SPLIT_LOGGED
-                if not _A4_SPLIT_LOGGED:
+                if not _A4_SPLIT_LOGGED and 0 < decode_rows < tokens:
                     _A4_SPLIT_LOGGED = True
                     logger.info(
-                        "b12x W4A16 A4 prefill split: %d decode rows stay A16, "
-                        "%d prefill rows",
+                        "b12x W4A16 A4 prefill by row type: %d decode rows stay "
+                        "W4A16, %d prefill rows run A4",
                         decode_rows,
                         tokens - decode_rows,
                     )
-                for lo, hi in ((0, decode_rows), (decode_rows, tokens)):
-                    binding = _require_b12x_fused_moe().bind(
-                        plan,
-                        scratch=scratch,
-                        a=hidden_states[lo:hi],
-                        experts=prepared,
-                        topk_weights=topk_weights[lo:hi],
-                        topk_ids=topk_ids[lo:hi],
-                        output=output[lo:hi],
-                        input_scales_static=True,
-                        **expanded,
-                    )
-                    _require_b12x_fused_moe().run(binding=binding)
-                return
+            for lo, hi, a4_prefill in parts:
+                if hi == lo:
+                    continue
+                binding = _require_b12x_fused_moe().bind(
+                    plan,
+                    scratch=scratch,
+                    a=hidden_states[lo:hi],
+                    experts=prepared,
+                    topk_weights=topk_weights[lo:hi],
+                    topk_ids=topk_ids[lo:hi],
+                    output=output[lo:hi],
+                    input_scales_static=True,
+                    a4_prefill=a4_prefill,
+                    **expanded,
+                )
+                _require_b12x_fused_moe().run(binding=binding)
+            return
         binding = _require_b12x_fused_moe().bind(
             plan,
             scratch=scratch,
