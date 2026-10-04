@@ -375,6 +375,12 @@ class Worker(WorkerBase):
             return
 
         conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+        if re.search(r"expandable_segments:\s*True", conf):
+            # Expandable segments release free pages, not whole cached blocks.
+            # A split limit there strands the pages that weights share with
+            # freed loading temporaries (1 GiB per GPU on DeepSeek-V4.1 TP4).
+            yield
+            return
         match = re.search(r"max_split_size_mb:(\d+)", conf)
         original_value = match.group(1) if match else None
 
