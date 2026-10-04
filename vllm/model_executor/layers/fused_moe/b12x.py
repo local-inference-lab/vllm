@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """b12x modular tensor-parallel fused MoE backend."""
 
+import contextlib
 import functools
 import os
 import weakref
@@ -271,10 +272,8 @@ def _num_leading_decode_tokens() -> int:
                         break
                     rows = hi
                 break
-    try:
+    with contextlib.suppress(AttributeError):
         context._b12x_a4_decode_rows = rows
-    except Exception:
-        pass
     return rows
 
 
@@ -483,9 +482,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             # experts; the intermediate requant keeps per-expert scales.
             a1 = _normalize_expert_scale(self.a1_gscale).to(w1.device)
             a2 = _normalize_expert_scale(self.a2_gscale).to(w2.device)
-            if all(
-                bool((torch.isfinite(t) & (t > 0)).all()) for t in (a1, a2)
-            ):
+            if all(bool((torch.isfinite(t) & (t > 0)).all()) for t in (a1, a2)):
                 a1_gscale = a1.amin().reshape(1)
                 a2_gscale = a2
                 logger.info(
@@ -1059,7 +1056,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 if not _A4_SPLIT_LOGGED:
                     _A4_SPLIT_LOGGED = True
                     logger.info(
-                        "b12x W4A16 A4 prefill split: %d decode rows A16, %d prefill rows",
+                        "b12x W4A16 A4 prefill split: %d decode rows stay A16, "
+                        "%d prefill rows",
                         decode_rows,
                         tokens - decode_rows,
                     )
