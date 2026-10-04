@@ -1,0 +1,21 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-load-split-expandable-segments",
+  "category": "performance",
+  "summary": "Weight loading no longer strands GPU memory when expandable segments are on: 0.5 GiB more free per GPU on glm53-tp2",
+  "models": [
+    "GLM-5.3-Flash",
+    "DeepSeek-V4.1-Flash"
+  ],
+  "compatibility": "No user action required. Applies when PYTORCH_CUDA_ALLOC_CONF enables expandable_segments, as the shipped profiles do; the classic allocator still loads with max_split_size_mb:20.",
+  "details": [
+    "vLLM loaded weights with max_split_size_mb:20 (upstream #41268). With expandable segments that limit left pages shared by weights and freed loading temporaries mapped, which empty_cache cannot release and the memory profile counts against the KV cache. Measured after loading, per GPU: glm53-tp2 0.59 -> 0.08 GiB (per-layer scale expansion 0.42 -> 0.12 GiB); DeepSeek-V4.1-Flash TP4 with inline CSF scales before b12x's own fix 1.01 -> 0.04 GiB, KV cache 11.96M -> 12.86M tokens. glm53-tp2 keeps its fixed 8 GiB KV cache, so the memory is headroom."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    980
+  ],
+  "requires": []
+}
