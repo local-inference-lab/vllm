@@ -313,6 +313,10 @@ def _b12x_has_mxfp8_moe() -> bool:
 class B12xExperts(mk.FusedMoEExpertsModular):
     """Packed MoE experts backed by the b12x SM12x planned API."""
 
+    # Set by the NVFP4-CSF method while the shared scale scratch holds this
+    # layer's scales, expanded ahead of the call (b12x expand_scales()).
+    scales_expanded = False
+
     def __init__(
         self,
         moe_config: mk.FusedMoEConfig,
@@ -1058,6 +1062,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             raise ValueError("b12x MoE requires contiguous caller-owned workspace2")
         scratch = workspace2.view(-1).view(torch.uint8)
         tokens = int(hidden_states.shape[0])
+        expanded = {"scales_expanded": True} if self.scales_expanded else {}
         if (
             self._quant_mode == "w4a16"
             and _w4a16_a4_prefill_enabled()
@@ -1095,6 +1100,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                     output=output[lo:hi],
                     input_scales_static=True,
                     a4_prefill=a4_prefill,
+                    **expanded,
                 )
                 _require_b12x_fused_moe().run(binding=binding)
             return
@@ -1107,6 +1113,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             topk_ids=topk_ids,
             output=output,
             input_scales_static=True,
+            **expanded,
         )
         _require_b12x_fused_moe().run(binding=binding)
 

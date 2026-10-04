@@ -206,6 +206,7 @@ if TYPE_CHECKING:
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
     VLLM_B12X_BF16_GEMV: bool = False
     VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE: Literal["0", "1", "all", "w13", "w2"] = "0"
+    VLLM_B12X_CSF_SCALE_PREFETCH: bool = True
     VLLM_DEFAULT_MOE_BACKEND: str = "auto"
     VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
     VLLM_B12X_NVFP4_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
@@ -1821,6 +1822,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE",
         "0",
         ["0", "1", "all", "w13", "w2"],
+    ),
+    # Expand the next NVFP4-CSF layer's expert scales on a side stream while its
+    # attention runs, instead of before its MoE (eager prefill calls only).
+    "VLLM_B12X_CSF_SCALE_PREFETCH": lambda: bool(
+        int(os.getenv("VLLM_B12X_CSF_SCALE_PREFETCH", "1"))
     ),
     # Dense activation precision; recipe overrides take precedence.
     "VLLM_B12X_DENSE_ACTIVATION_MODE": env_with_choices(
