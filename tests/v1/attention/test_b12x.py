@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import weakref
+from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
 
@@ -463,10 +464,12 @@ def test_b12x_dsa_indexer_reuses_capacity_and_declares_overflow(
 ) -> None:
     import b12x.preparation as preparation
 
+    @dataclass
     class _Plan:
-        def __init__(self, caps, invocation):
-            self.caps, self.invocation = caps, invocation
-            self.request_kwargs = None
+        caps: object
+        invocation: object
+        shared: bool = False
+        request_kwargs: object = None
 
         def request(self, **kwargs):
             self.request_kwargs = kwargs
@@ -524,6 +527,8 @@ def test_b12x_dsa_indexer_reuses_capacity_and_declares_overflow(
 
     plan = indexer._plan("prefill", 11)
     assert isinstance(plan, _Plan)
+    # Layers declare identical plans; sharing keeps one prepared payload.
+    assert plan.shared
     assert (plan.caps.mode, plan.caps.max_q_rows, plan.caps.max_batch) == (
         "prefill",
         11,

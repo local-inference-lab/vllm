@@ -3,7 +3,7 @@
 """B12x DSA indexer for non-compressed sparse MLA models."""
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 import torch
@@ -444,8 +444,15 @@ class B12xSparseIndexer(nn.Module):
         )
 
     def _declare_plan(self, caps):
-        return self._module.plan(
-            caps, invocation=self._invocation(caps, self.dcp_world_size > 1)
+        # Every layer declares an identical plan for the same capacity. Shared
+        # declarations alias one prepared payload, so preparation keeps one
+        # set of trial buffers instead of one per layer (GLM-5.3 has 78 DSA
+        # layers; per-layer trial scratch alone exhausted the GPU).
+        return replace(
+            self._module.plan(
+                caps, invocation=self._invocation(caps, self.dcp_world_size > 1)
+            ),
+            shared=True,
         )
 
     def _prepare_call(self, mode: str, caps):
