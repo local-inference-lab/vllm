@@ -555,6 +555,73 @@ def test_b12x_dsa_indexer_reuses_capacity_and_declares_overflow(
     assert prepared == []
 
 
+def test_b12x_dsa_indexer_prepares_the_batched_token_prefill_plan(
+    monkeypatch,
+) -> None:
+    """Prefill chunks reach the batched-token limit, beyond the logits budget."""
+    from vllm.utils.b12x import B12xWorkload
+
+    @dataclass
+    class _Plan:
+        caps: object
+        invocation: object
+        shared: bool = False
+
+        def request(self, **kwargs):
+            return SimpleNamespace(name=kwargs["name"])
+
+    module = SimpleNamespace(
+        Caps=lambda **kwargs: SimpleNamespace(**kwargs),
+        plan=lambda caps, *, invocation: _Plan(caps, invocation),
+        invocation_from_descriptors=lambda caps, *, operands: (caps.max_q_rows,),
+    )
+    monkeypatch.setattr(b12x_indexer, "_require_b12x_indexer", lambda: module)
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192, max_num_seqs=8),
+        compilation_config=SimpleNamespace(cudagraph_capture_sizes=[1, 2, 4, 8]),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        ),
+    )
+    k_cache = SimpleNamespace(
+        prefix="layer", kv_cache=torch.empty((2, 64, 132), dtype=torch.uint8)
+    )
+    with set_current_vllm_config(config):
+        indexer = b12x_indexer.B12xSparseIndexer(
+            k_cache=k_cache,
+            quant_block_size=128,
+            scale_fmt="ue8m0",
+            topk_tokens=4,
+            head_dim=128,
+            max_model_len=4096,
+            max_total_seq_len=4096,
+            topk_indices_buffer=torch.empty((8192, 4), dtype=torch.int32),
+            skip_k_cache_insert=True,
+            num_q_heads=16,
+            output_physical_slots=True,
+        )
+    workload = B12xWorkload(
+        stage="state",
+        token_counts=(1, 4, 8192),
+        fixed_token_counts=(1, 4),
+        output_dtype=torch.bfloat16,
+        max_tokens=8192,
+        max_seqs=8,
+        max_model_len=4096,
+    )
+    logits_rows = b12x_indexer._prefill_profile_q_rows(8192)
+    assert logits_rows < 8192
+
+    (unit,) = indexer.get_b12x_preparation_units(indexer, workload)
+
+    names = {request.name for request in unit.requests}
+    assert {f"layer.dsa_indexer.prefill.m{rows}" for rows in (logits_rows, 8192)} <= (
+        names
+    )
+    assert indexer._plan("prefill", 8192) is indexer._prepared_plans[("prefill", 8192)]
+
+
 def test_glm_dsa_b12x_attention_forwards_index_group_builder(monkeypatch) -> None:
     from vllm.models.deepseek_v32.nvidia import b12x as dsa_b12x
 
