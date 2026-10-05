@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-983",
+  "category": "fix",
+  "summary": "Startup logs show which GLM-5.3-Flash MoE layers prefill with A4; the MTP draft layer no longer warns as if A4 prefill were off",
+  "models": ["GLM-5.3-Flash", "Qwen3.8-Flash-Next"],
+  "compatibility": "Log messages only; serving is unchanged.",
+  "details": [
+    "With PREFILL_ACTIVATIONS=a4 every FP4-CSF MoE layer used to log 'native NVFP4 A16', and the one layer without calibrated input scales (the MTP draft layer) logged the WARNING 'layer has no valid activation scales; A4 prefill disabled for it (A16 only)'. That read as if hybrid A4/A16 had fallen back to full A16, but the target layers did prefill with A4.",
+    "FP4-CSF layers now log 'W4A16 decode, A4 prefill' when the A4 path is prepared. The draft layer's message names the layer, explains that it stays A16 because it has no calibrated scales, and is logged at INFO."
+  ],
+  "pull_requests": [983],
+  "requires": []
+}
