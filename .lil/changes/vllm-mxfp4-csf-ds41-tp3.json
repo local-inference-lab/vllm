@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-mxfp4-csf-ds41-tp3",
+  "category": "feature",
+  "summary": "Load DeepSeek-V4.1-Flash MXFP4-CSF checkpoints at TP3",
+  "models": ["DeepSeek-V4.1-Flash"],
+  "compatibility": "No user action required. TP1, TP2, TP4 and TP8 are unchanged; DeepSeek-V4-Flash and Kimi-K3 keep their existing TP sizes.",
+  "details": [
+    "The deepseek_v41 MXFP4-CSF reader admits --tensor-parallel-size 3. Each rank owns 768 of the 2304 routed-expert channels, which keeps the 32-channel and 16-row scale-slab alignment the slicer requires.",
+    "The checkpoint keeps its source config; the existing TP3 attention head padding applies at runtime."
+  ],
+  "authors": ["Defilan"],
+  "pull_requests": [982],
+  "requires": []
+}

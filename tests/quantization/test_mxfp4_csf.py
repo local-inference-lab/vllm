@@ -530,15 +530,16 @@ def test_rejects_unaligned_rows_and_bad_padding():
         slice_scale_plane(fixed, exceptions, 64, 9, (0, 64), (0, 9))
 
 
-@pytest.mark.parametrize("rank", [0, 1])
-def test_tensor_sources_preserve_projection_order_and_tp_bytes(rank):
+@pytest.mark.parametrize("tp_size,rank", [(2, 0), (2, 1), (3, 0), (3, 1), (3, 2)])
+def test_tensor_sources_preserve_projection_order_and_tp_bytes(tp_size, rank):
     """An arbitrary geometry loads without any model identity or checkpoint path."""
     from vllm.model_executor.model_loader.mxfp4_csf_loader import (
         _load_mxfp4_csf_weights as load_mxfp4_csf_weights,
     )
 
     device = "cpu"
-    experts, hidden, intermediate, local = 3, 256, 192, 96
+    experts, hidden, local = 3, 256, 96
+    intermediate = local * tp_size
     sources, scales = [], []
     for expert in range(experts):
         pairs = [
@@ -561,7 +562,7 @@ def test_tensor_sources_preserve_projection_order_and_tp_bytes(rank):
         hidden_size=hidden,
         intermediate_size=intermediate,
         tp_rank=rank,
-        tp_size=2,
+        tp_size=tp_size,
         device=device,
         w13_scale_scratch=scratch13,
         w2_scale_scratch=scratch2,
@@ -742,6 +743,53 @@ def test_ds4_flash_reader_rejects_draft_layers_geometry_and_tp(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             tp_rank=0,
+            tp_size=tp_size,
+            device="cpu",
+            w13_scale_scratch=None,
+            w2_scale_scratch=None,
+        )
+
+
+@pytest.mark.parametrize(
+    "family,geometry,tp_size,admitted",
+    [
+        ("deepseek_v41", (384, 5120, 2304), 3, True),
+        ("deepseek_v41", (384, 5120, 2304), 6, False),
+        ("deepseek_v4_flash", (256, 4096, 2048), 3, False),
+        ("kimi_k3", (896, 3584, 3072), 3, False),
+    ],
+)
+def test_reader_admits_tp3_for_deepseek_v41_only(
+    monkeypatch, family, geometry, tp_size, admitted
+):
+    from vllm.model_executor.model_loader import mxfp4_csf_loader as checkpoint
+
+    class PastTpGuard(Exception):
+        pass
+
+    def reader(*args, **kwargs):
+        raise PastTpGuard
+
+    monkeypatch.setattr(
+        checkpoint,
+        "checkpoint_contract",
+        lambda _: {"family": family, "source_names": {}},
+    )
+    monkeypatch.setattr(checkpoint, "CsfTensorReader", reader)
+    num_experts, hidden_size, intermediate_size = geometry
+    expected = (
+        pytest.raises(PastTpGuard)
+        if admitted
+        else pytest.raises(ValueError, match="supports TP")
+    )
+    with expected:
+        checkpoint.read_mxfp4_csf_layer(
+            "/csf",
+            1,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            tp_rank=tp_size - 1,
             tp_size=tp_size,
             device="cpu",
             w13_scale_scratch=None,
