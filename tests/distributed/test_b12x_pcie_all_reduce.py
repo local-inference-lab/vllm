@@ -55,6 +55,7 @@ def _make_communicator(
     communicator._capture_stream = None
     communicator.allreduce_max_bytes = allreduce_max_bytes
     communicator.fused_max_bytes = fused_max_bytes
+    communicator.fused_max_rows = 0
     communicator._twoshot = None
     communicator.twoshot_max_bytes = 0
     plan = object()
@@ -1307,6 +1308,29 @@ def test_twoshot_respects_runtime_acceptance() -> None:
     assert not communicator.should_custom_ar(inp)
     assert communicator.custom_all_reduce(inp) is None
     twoshot.all_reduce.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("rows", "max_rows", "expected"),
+    [(16, 0, "oneshot_fused"), (64, 64, "oneshot_fused"), (65, 64, None)],
+)
+def test_fused_rows_above_the_runtime_capacity_route_elsewhere(
+    rows, max_rows, expected
+):
+    """A byte limit above the fused kernel's row capacity must not declare
+    fused plans the kernel would reject; runtimes without a published
+    capacity keep the byte limit alone."""
+    communicator, _ = _make_communicator(fused_max_bytes=1 << 20)
+    communicator.fused_max_rows = max_rows
+    invocation = b12x_pcie_all_reduce.B12xPcieInvocation(
+        name="layers.1.input_layernorm.fused_ar_norm",
+        operation="all_reduce_fused_add_rms_norm",
+        shape=(rows, 64),
+        dtype=torch.bfloat16,
+        norm_weight=torch.ones(64, dtype=torch.bfloat16),
+        epsilon=1e-6,
+    )
+    assert communicator._route_invocation(invocation) == expected
 
 
 @pytest.mark.parametrize(("tokens", "expected"), [(12, None), (16, "twoshot")])
