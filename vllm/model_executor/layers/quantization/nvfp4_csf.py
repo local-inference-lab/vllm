@@ -287,13 +287,19 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
             self.owner.scale_layers[self.layer_index] = self
             if self.owner.scale_stream is None:
                 self.owner.scale_stream = torch.cuda.Stream(device)
+        if not self.use_a16:
+            activations = "A4"
+        elif self.a4_prefill:
+            activations = "W4A16 decode, A4 prefill"
+        else:
+            activations = "A16"
         logger.info(
             "NVFP4-CSF layer %d rank %d/%d: native NVFP4 %s, "
             "shared scale scratch %d bytes",
             self.layer_index,
             rank,
             tp,
-            "A16" if self.use_a16 else "A4",
+            activations,
             sum(t.numel() for t in scratch),
         )
 
