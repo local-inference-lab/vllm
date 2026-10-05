@@ -550,6 +550,35 @@ def test_b12x_dsa_indexer_reuses_capacity_and_declares_overflow(
     assert prepared == []
 
 
+def test_glm_dsa_b12x_attention_forwards_index_group_builder(monkeypatch) -> None:
+    from vllm.models.deepseek_v32.nvidia import b12x as dsa_b12x
+
+    captured = {}
+
+    def base_init(
+        self,
+        vllm_config,
+        config,
+        prefix,
+        topk_indices_buffer=None,
+        attn_backend=None,
+        index_group_builder=None,
+    ):
+        captured.update(
+            attn_backend=attn_backend, index_group_builder=index_group_builder
+        )
+
+    monkeypatch.setattr(dsa_b12x.DeepseekV32Attention, "__init__", base_init)
+    monkeypatch.setattr(dsa_b12x, "_get_sparse_mla_backend", lambda config: "B12X")
+    builder = object()
+
+    dsa_b12x.DeepseekV32B12xAttention(
+        None, None, "model.layers.0.self_attn", index_group_builder=builder
+    )
+
+    assert captured == {"attn_backend": "B12X", "index_group_builder": builder}
+
+
 def test_b12x_sparse_mla_prefill_binds_request_sequence_lengths(
     monkeypatch,
 ) -> None:
