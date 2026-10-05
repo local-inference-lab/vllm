@@ -562,9 +562,13 @@ class B12xSparseIndexer(nn.Module):
         width = self._page_table_width(workload.max_model_len)
         requests = []
         prepared_plans: dict[tuple[str, int], object] = {}
+        # The chunk builder emits prefill chunks of up to the batched-token
+        # limit, so prepare that row count beside the logits-budget one.
         capacities = {
             "decode": sorted({self._max_num_seqs, *workload.fixed_token_counts}),
-            "prefill": (_prefill_profile_q_rows(workload.max_tokens),),
+            "prefill": sorted(
+                {_prefill_profile_q_rows(workload.max_tokens), workload.max_tokens}
+            ),
         }
         for mode, counts in capacities.items():
             for rows in counts:
