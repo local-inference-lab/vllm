@@ -70,6 +70,11 @@ class B12xIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
         super().__init__(*args, block_table_width=block_table_width, **kwargs)
         self.use_flattening = False
         self.supports_varlen = False
+        # Draft steps rebuild this metadata instead of refreshing it in place:
+        # the decode metadata carries the scan width in ``active_width`` and
+        # no DeepGEMM schedule table, so the inherited in-place refresh would
+        # neither advance the width nor find the table it rewrites.
+        self.supports_draft_decode_metadata_update = False
         self.active_width_buffer = torch.zeros(
             (1,), dtype=torch.int32, device=self.device
         )
