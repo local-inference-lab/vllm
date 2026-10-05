@@ -84,7 +84,11 @@ def read_mxfp4_csf_layer(
         raise ValueError("MXFP4-CSF expert geometry differs from the checkpoint family")
     if layer_index not in layers:
         raise ValueError("MXFP4-CSF layer is outside the compressed expert inventory")
-    supported_tp = (1, 2, 4, 8, 12, 16) if family == "kimi_k3" else (1, 2, 4, 8)
+    supported_tp = {
+        "kimi_k3": (1, 2, 4, 8, 12, 16),
+        # 2304 / 3 = 768 local channels: 32-aligned, whole 16-row scale slabs.
+        "deepseek_v41": (1, 2, 3, 4, 8),
+    }.get(family, (1, 2, 4, 8))
     if tp_size not in supported_tp or not 0 <= tp_rank < tp_size:
         raise ValueError(
             f"MXFP4-CSF {family} supports TP {supported_tp} with a valid rank"
