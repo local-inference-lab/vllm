@@ -4,7 +4,16 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 tool_dir="${repo_root}/tools/jovian_wheel_release"
-lock_path="${tool_dir}/runtime.lock"
+# linux/amd64 uses the locks next to this script; another platform keeps its
+# own runtime and build-tool locks in a directory named after the platform.
+platform=${LIL_WHEEL_PLATFORM:-linux/amd64}
+case "${platform}" in
+  linux/amd64) lock_dir="${tool_dir}" ;;
+  linux/arm64) lock_dir="${tool_dir}/linux-arm64" ;;
+  *) printf 'Unsupported wheel platform: %s\n' "${platform}" >&2; exit 1 ;;
+esac
+lock_path="${lock_dir}/runtime.lock"
+build_requirements="${lock_dir#"${repo_root}/"}/build-requirements.lock"
 output_dir=${1:-"${repo_root}/dist/jovian-wheel-release"}
 build_jobs=${BUILD_JOBS:-64}
 
@@ -29,6 +38,14 @@ source_date_epoch=$(git -C "${repo_root}" show -s --format=%ct HEAD)
 repository=${GITHUB_REPOSITORY:-local-inference-lab/vllm}
 release_tag=${VLLM_RELEASE_TAG:-"vllm-jovian-cu134-beta-${source_commit}"}
 builder=$(lock_value buildx.builder)
+# Locks without a platform key predate arm64 and describe linux/amd64.
+test "$(lock_value platform 2>/dev/null || echo linux/amd64)" = "${platform}"
+cuda_arch_list=$(lock_value cuda.arch-list)
+# Separate platforms must never share native objects in BuildKit caches.
+cache_platform=
+if [[ ${platform} != linux/amd64 ]]; then
+  cache_platform="-${platform#linux/}-${cuda_arch_list//./}"
+fi
 test -z "$(git -C "${repo_root}" status --porcelain)"
 build_target='export'
 native_args=()
@@ -60,8 +77,8 @@ if [[ -n ${VLLM_PRECOMPILED_BUNDLE:-} ]]; then
   git -C "${repo_root}" diff --exit-code "${native_source_commit}" HEAD -- \
     csrc cmake rust requirements CMakeLists.txt setup.py pyproject.toml \
     vllm/vllm_flash_attn vllm/third_party \
-    tools/jovian_wheel_release/runtime.lock \
-    tools/jovian_wheel_release/build-requirements.lock \
+    "${lock_path#"${repo_root}/"}" \
+    "${build_requirements}" \
     tools/jovian_wheel_release/normalize_wheel.py
   build_target=export-precompiled
   native_args=(--build-context "native-bundle=${native_bundle}")
@@ -76,7 +93,12 @@ mkdir -p "${output_dir}/raw" "${output_dir}/bundle/wheels"
 
 docker buildx build \
   --builder "${builder}" \
+  --platform "${platform}" \
   --file "${tool_dir}/Dockerfile" \
+  --build-arg "BUILD_REQUIREMENTS=${build_requirements}" \
+  --build-arg "TORCH_CUDA_ARCH_LIST=${cuda_arch_list}" \
+  --build-arg "CMAKE_CUDA_ARCHITECTURES=${cuda_arch_list//./}" \
+  --build-arg "CACHE_PLATFORM=${cache_platform}" \
   --build-arg "BUILDER_IMAGE=$(lock_value builder.image)" \
   --build-arg "RUST_IMAGE=$(lock_value rust.image)" \
   --build-arg "UV_IMAGE=$(lock_value uv.image)" \
@@ -148,9 +170,10 @@ jq -n \
   --arg cuda "$(lock_value cuda.version)" \
   --arg pytorch "$(lock_value pytorch.version)" \
   --arg pytorch_commit "$(lock_value pytorch.commit)" \
-  --arg cuda_arch_list "$(lock_value cuda.arch-list)" \
+  --arg cuda_arch_list "${cuda_arch_list}" \
   --arg cutlass_scaled_mm_c2x "$(lock_value build.cutlass-scaled-mm-c2x)" \
   --arg cutlass_dsl "$(lock_value cutlass-dsl.version)" \
+  --arg platform "${platform}" \
   --arg native_source_commit "${native_source_commit}" \
   --arg native_wheel_sha256 "${native_wheel_sha256}" \
   '{schema: "local-inference-vllm-wheel-release/v2", status: $status,
@@ -161,7 +184,7 @@ jq -n \
        contract: "identical native source, dependency recipe and runtime ABI"} end),
     package_version: $package_version, release_tag: $release_tag,
     runtime: {builder_image: $builder_image, rust_image: $rust_image,
-      uv_image: $uv_image, python: $python, cuda: $cuda, pytorch: $pytorch,
+      uv_image: $uv_image, platform: $platform, python: $python, cuda: $cuda, pytorch: $pytorch,
       pytorch_commit: $pytorch_commit, cuda_arch_list: $cuda_arch_list,
       cutlass_scaled_mm_c2x: $cutlass_scaled_mm_c2x,
       cutlass_dsl: $cutlass_dsl,
@@ -190,7 +213,7 @@ Status: **research-only**
 
 This release contains vLLM ${package_version} from source commit
 \`${source_commit}\` for Python 3.12, CUDA 13.4.1, NVIDIA PyTorch 26.08, the
-C++11 ABI, and SM120a. Foundation and third-party dependency wheels are not
+C++11 ABI, ${platform}, and CUDA architecture ${cuda_arch_list}. Foundation and third-party dependency wheels are not
 included. The wheel metadata installs the Qwen3.8 SM120 execution profile;
 TileLang, Tokenspeed, Humming, and QuACK remain separate backend packages.
 Audio and video serving are unsupported because the foundation does not ship
