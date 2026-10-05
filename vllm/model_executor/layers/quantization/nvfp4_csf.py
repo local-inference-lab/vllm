@@ -16,6 +16,8 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.b12x import (
     B12xExperts,
     _is_current_stream_capturing,
+    _num_leading_decode_tokens,
+    _w4a16_a4_prefill_enabled,
 )
 from vllm.model_executor.layers.fused_moe.config import (
     nvfp4_moe_quant_config,
@@ -353,19 +355,26 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
             MoEPrepareAndFinalizeNoDPEPModular(), backend
         )
         self.backend, self.prepared = backend, prepared
+        self.a4_prefill = bool(getattr(prepared._impl, "a4_prefill_scales", False))
         self.moe_done = torch.cuda.Event()
         self.scales_ready = torch.cuda.Event()
         if self.use_a16 and envs.VLLM_B12X_CSF_SCALE_PREFETCH:
             self.owner.scale_layers[self.layer_index] = self
             if self.owner.scale_stream is None:
                 self.owner.scale_stream = torch.cuda.Stream(device)
+        if not self.use_a16:
+            activations = "A4"
+        elif self.a4_prefill:
+            activations = "W4A16 decode, A4 prefill"
+        else:
+            activations = "A16"
         logger.info(
             "NVFP4-CSF layer %d rank %d/%d: native NVFP4 %s, "
             "shared scale scratch %d bytes",
             self.layer_index,
             self.moe.tp_rank,
             self.moe.tp_size,
-            "A16" if self.use_a16 else "A4",
+            activations,
             sum(t.numel() for t in scratch),
         )
 
@@ -436,6 +445,9 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
         return result
 
     def _expands(self, x: torch.Tensor) -> bool:
-        """Whether this step's call expands scales: smaller A16 calls read
-        compressed scales per stage."""
-        return int(x.shape[0]) > _stage_max_tokens()
+        """Whether this step's calls expand scales: A4 prefill rows or a large
+        A16 call (smaller A16 calls read compressed scales per stage)."""
+        tokens = int(x.shape[0])
+        if self.a4_prefill and _w4a16_a4_prefill_enabled():
+            return _num_leading_decode_tokens(tokens) < tokens
+        return tokens > _stage_max_tokens()

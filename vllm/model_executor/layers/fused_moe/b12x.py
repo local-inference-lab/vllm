@@ -425,6 +425,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         w2: torch.Tensor,
         activation: MoEActivation,
         params_dtype: torch.dtype,
+        layer_name: str | None = None,
     ) -> Any:
         """Build the b12x prepared-experts representation for these weights.
 
@@ -506,18 +507,21 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 a1_gscale = a1.amin().reshape(1)
                 a2_gscale = a2
                 logger.info(
-                    "b12x W4A16: A4 prefill for calls >= %s tokens (shared input "
-                    "global scale %.4g, %d intermediate scales)",
-                    os.environ.get("B12X_W4A16_A4_PREFILL_MIN_TOKENS"),
+                    "b12x W4A16 %s: prefill rows run A4, decode rows W4A16 "
+                    "(shared input global scale %.4g, %d intermediate scales)",
+                    layer_name or "MoE layer",
                     float(a1_gscale[0]),
                     int(a2_gscale.numel()),
                 )
             else:
-                # No calibrated activation scales (e.g. a draft layer): stay A16.
+                # No calibrated activation scales (an MTP draft layer): its
+                # prefill stays A16; layers with scales keep A4 prefill.
                 a1_gscale = a2_gscale = None
-                logger.warning(
-                    "b12x W4A16: layer has no valid activation scales; A4 prefill "
-                    "disabled for it (A16 only)"
+                logger.info(
+                    "b12x W4A16 %s: no calibrated activation scales (expected "
+                    "for an MTP draft layer), so its prefill stays A16; every "
+                    "layer with scales still prefills with A4",
+                    layer_name or "MoE layer",
                 )
         else:
             a1_gscale = unit_scale
@@ -625,6 +629,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             w2=layer.w2_weight,
             activation=layer.activation,
             params_dtype=self.moe_config.in_dtype,
+            layer_name=getattr(layer, "layer_name", None),
         )
         prepared = self._reuse_prepared_storage(layer, prepared)
         if prepared.plan._impl.discards_source_parameters:
