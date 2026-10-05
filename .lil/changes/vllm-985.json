@@ -1,0 +1,24 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-985",
+  "category": "fix",
+  "summary": "GLM-5.3 (744B, NVFP4) starts and serves on B12X: index-group builder, KV layout for mixed MLA/indexer pages, shared indexer plans, MTP draft metadata and full-row prefill plans",
+  "models": [
+    "GLM-5.3"
+  ],
+  "compatibility": "No change for other models. GLM-5.3 needs a checkpoint whose quantization ignore list includes the BF16 MTP layer (local-inference-lab/GLM-5.3-NVFP4 refs/pr/2), --gpu-memory-utilization 0.93 or lower with 8,192 batched tokens, and --no-enable-flashinfer-autotune.",
+  "details": [
+    "Startup failed with a TypeError (index_group_builder), then with 'Mixed KV page sizes need a block-outermost layout'; layouts with mixed page sizes now prefer block-outermost and otherwise keep block-compact ones, which one KV cache group packs.",
+    "b12x preparation ran out of memory because each of the 78 DSA layers kept its own indexer trial buffers; identical declarations are now shared.",
+    "MTP draft steps rebuild the B12X indexer metadata (from joninco's 00ecc2dc46), and the indexer prepares its prefill plan for the batched-token limit as well as the logits budget.",
+    "TP8 DCP1 MTP3 on 8x RTX PRO 6000: 534,464 KV tokens at 524,288 context, decode 166 tok/s at C1, prefill 6.6-7.5K tok/s."
+  ],
+  "authors": [
+    "voipmonitor",
+    "joninco"
+  ],
+  "pull_requests": [
+    985
+  ],
+  "requires": []
+}

@@ -68,13 +68,21 @@ class B12xDSAIndexer(DeepseekV32Indexer):
 class DeepseekV32B12xAttention(DeepseekV32Attention):
     indexer_cls = B12xDSAIndexer
 
-    def __init__(self, vllm_config, config, prefix, topk_indices_buffer=None):
+    def __init__(
+        self,
+        vllm_config,
+        config,
+        prefix,
+        topk_indices_buffer=None,
+        index_group_builder=None,
+    ):
         super().__init__(
             vllm_config,
             config,
             prefix,
             topk_indices_buffer,
             attn_backend=_get_sparse_mla_backend(vllm_config),
+            index_group_builder=index_group_builder,
         )
 
 
