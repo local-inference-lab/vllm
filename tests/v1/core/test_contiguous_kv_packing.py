@@ -696,6 +696,27 @@ def test_layout_resolution_handles_target_and_draft_page_sizes(
     assert (views["draft"][1] == 2).all()
 
 
+def test_layout_resolution_keeps_block_compact_layout_for_one_mixed_group(
+    monkeypatch,
+):
+    """B12X DSA declares only LBNHC; its MLA and indexer pages share one group."""
+    from vllm import envs
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
+    monkeypatch.setattr(envs, "VLLM_KV_CACHE_LAYOUT", None)
+    config = _mock_vllm_config(None)
+    config.kv_transfer_config = None
+    specs = {"mla.0": _mla(512), "mla.1": _mla(512), "idx.0": _mla(128)}
+    layout = resolve_kv_cache_layout(config, [["LBNHC"]], list(specs.values()))
+    assert layout == KVCacheLayout.LBNHC
+    cache = get_kv_cache_config_from_groups(config, [_uniform_group(specs)], MEMORY)
+    views = _bind(cache, layout.name)
+    views["mla.0"][0].fill_(1)
+    views["idx.0"][0].fill_(2)
+    assert (views["mla.0"][0] == 1).all()
+    assert (views["idx.0"][0] == 2).all()
+
+
 def test_v41_mixed_cache_pages_preserve_request_partial_states(monkeypatch):
     from vllm import envs
     from vllm.models.deepseek_v4_1.compressor import (
