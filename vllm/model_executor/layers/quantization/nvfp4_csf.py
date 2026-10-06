@@ -66,6 +66,28 @@ def _stage_max_tokens() -> int:
     return W4A16_CSF_STAGE_MAX_TOKENS
 
 
+def _nvfp4_layer_recipes(source: dict, root: str) -> dict:
+    """Per-layer recipes for a single-algorithm NVFP4 source.
+
+    The checkpoint decides which modules are NVFP4: those that store weight
+    scales. Layers the source stores in BF16 without excluding them, such as
+    the GLM-5.3 MTP layer, stay unquantized.
+    """
+    from vllm.model_executor.model_loader.nvfp4_csf_loader import (
+        nvfp4_scaled_modules,
+    )
+
+    recipe = {"quant_algo": "NVFP4", "group_size": 16}
+    layers = {
+        re.sub(r"(\.experts)\.\d+\.\w+$", r"\1", module): recipe
+        for module in nvfp4_scaled_modules(root)
+    }
+    per_layer = {"quant_algo": "MIXED_PRECISION", "quantized_layers": layers}
+    if "quantization" in source:
+        return {**source, "quantization": {**source["quantization"], **per_layer}}
+    return {**source, **per_layer}
+
+
 class Nvfp4CsfConfig(ModelOptMixedPrecisionConfig):
     """Compressed main experts; retained ModelOpt formats for all other tensors."""
 
@@ -96,6 +118,8 @@ class Nvfp4CsfConfig(ModelOptMixedPrecisionConfig):
         original = config.get("source_quantization_config")
         if not isinstance(original, dict):
             raise ValueError("NVFP4-CSF requires source_quantization_config")
+        if cls._extract_modelopt_quant_algo(original) == "NVFP4":
+            original = _nvfp4_layer_recipes(original, config["checkpoint_root"])
         result = super().from_config(original)
         assert isinstance(result, cls)
         result.checkpoint_root = config["checkpoint_root"]
@@ -118,12 +142,14 @@ class Nvfp4CsfConfig(ModelOptMixedPrecisionConfig):
                 < config.model_config.hf_text_config.num_hidden_layers
             ):
                 if config.model_config.hf_text_config.model_type not in (
+                    "glm_moe_dsa",
                     "glm5_next_text",
                     "qwen3_8_flash_next_text",
                     "qwen4_exp_text",
                 ):
                     raise ValueError(
-                        "NVFP4-CSF supports GLM-5.3-Flash and Qwen3.8-Flash-Next"
+                        "NVFP4-CSF supports GLM-5.3, GLM-5.3-Flash and "
+                        "Qwen3.8-Flash-Next"
                     )
                 if (
                     config.parallel_config.pipeline_parallel_size != 1

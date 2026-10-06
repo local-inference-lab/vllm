@@ -26,16 +26,39 @@ from vllm.model_executor.model_loader.weight_utils import (
 
 SCHEMA = "lil-nvfp4-csf-checkpoint/1"
 CODEC = "byte-window4-fixed-stream-u24-exceptions/1"
+# Experts, hidden size, expert intermediate size, compressed layers and the
+# checkpoint name of the decoder layer list.
 FAMILIES = {
-    "glm53_nvfp4": (288, 4096, 2048, range(3, 45)),
-    "qwen38_flash_next_nvfp4": (512, 2560, 640, range(48)),
+    "glm53_nvfp4": (288, 4096, 2048, range(3, 45), "model.language_model.layers"),
+    "glm53_744b_nvfp4": (256, 6144, 2048, range(3, 78), "model.layers"),
+    "qwen38_flash_next_nvfp4": (
+        512,
+        2560,
+        640,
+        range(48),
+        "model.language_model.layers",
+    ),
 }
+_COMPRESSED_EXPERT = re.compile(
+    r"^model\.(?:language_model\.)?layers\.(\d+)\.mlp\.experts\."
+)
 
 
 @lru_cache(maxsize=4)
 def checkpoint_contract(root: str) -> dict:
     """Validate the NVFP4-CSF container before loading model tensors."""
     return read_csf_contract(root, schema=SCHEMA, codec=CODEC, families=FAMILIES)
+
+
+def nvfp4_scaled_modules(root) -> list[str]:
+    """Source modules that store NVFP4 weights, by their weight scales."""
+    contract = checkpoint_contract(str(Path(root).resolve()))
+    suffix = ".weight_scale"
+    return sorted(
+        name.removesuffix(suffix)
+        for name in contract["source_names"]
+        if name.endswith(suffix)
+    )
 
 
 def read_nvfp4_csf_layer(
@@ -53,7 +76,7 @@ def read_nvfp4_csf_layer(
 ):
     """Read rank-local up/gate/down tensors and unprepared compressed scales."""
     contract = checkpoint_contract(str(Path(root).resolve()))
-    e, h, n, layers = FAMILIES[contract["family"]]
+    e, h, n, layers, layer_list = FAMILIES[contract["family"]]
     if (num_experts, hidden_size, intermediate_size) != (e, h, n):
         raise ValueError("NVFP4-CSF expert geometry differs from the checkpoint family")
     if layer_index not in layers:
@@ -62,9 +85,7 @@ def read_nvfp4_csf_layer(
 
         def experts():
             for expert in range(num_experts):
-                prefix = (
-                    f"model.language_model.layers.{layer_index}.mlp.experts.{expert}"
-                )
+                prefix = f"{layer_list}.{layer_index}.mlp.experts.{expert}"
                 yield tuple(
                     reader.matrix(
                         f"{prefix}.{p}.weight",
@@ -279,9 +300,7 @@ class Nvfp4CsfModelLoader(DefaultModelLoader):
                 for name in sorted(handle.keys()):
                     if prefixes is not None and not name.startswith(prefixes):
                         continue
-                    match = re.search(
-                        r"^model\.language_model\.layers\.(\d+)\.mlp\.experts\.", name
-                    )
+                    match = _COMPRESSED_EXPERT.search(name)
                     if match and int(match.group(1)) < layers:
                         continue
                     if callable(file_filter) and file_filter(name):
