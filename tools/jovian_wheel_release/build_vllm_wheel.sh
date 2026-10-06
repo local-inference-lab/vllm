@@ -43,8 +43,10 @@ fi
 # packages everything staged there, so a module that exists only on another
 # branch would ship in this wheel. Compiled objects stay cached in build/temp.*;
 # CMake installs them into the staging directory again.
-find "${source_root}/build" -mindepth 1 -maxdepth 1 \
-  \( -name 'lib.*' -o -name 'bdist.*' \) -exec rm -rf -- {} +
+if test -d "${source_root}/build"; then
+  find "${source_root}/build" -mindepth 1 -maxdepth 1 \
+    \( -name 'lib.*' -o -name 'bdist.*' \) -exec rm -rf -- {} +
+fi
 
 env -u PYTHONPATH \
   VLLM_TARGET_DEVICE=cuda \

@@ -8,6 +8,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 def test_deepgemm_build_output_can_populate_source_checkout(tmp_path):
     source = Path(__file__).resolve().parents[2] / "vllm/third_party/deep_gemm"
@@ -63,27 +65,34 @@ def test_dependency_recipe_keys_mutable_fetch_and_native_caches(tmp_path):
     assert git("rev-parse", "HEAD:cmake/external_projects") != identity
 
 
-def test_wheel_build_drops_python_staged_by_other_branches(tmp_path):
-    """The shared native cache keeps compiled objects, not staged modules."""
+@pytest.mark.parametrize("existing_build", [False, True])
+def test_wheel_build_drops_python_staged_by_other_branches(tmp_path, existing_build):
+    """Cleanup accepts cold builds and preserves cached native objects."""
     script = (
         Path(__file__).resolve().parents[2]
         / "tools/jovian_wheel_release/build_vllm_wheel.sh"
     ).read_text()
-    start = script.index('find "${source_root}/build" -mindepth 1 -maxdepth 1')
-    cleanup = script[start : script.index("\n\n", start)]
+    start = script.index("# Every branch with the same dependency recipe")
+    cleanup = script[start : script.index("\nenv -u PYTHONPATH", start)]
     assert script.index(cleanup) < script.index("uv build")
     build = tmp_path / "build"
-    for staged in (
-        "lib.linux-x86_64-cpython-312/vllm/other_branch.py",
-        "bdist.linux-x86_64/wheel/vllm/other_branch.py",
-        "temp.linux-x86_64-cpython-312/_C.o",
-    ):
-        (build / staged).parent.mkdir(parents=True, exist_ok=True)
-        (build / staged).write_text("staged by an earlier build\n")
+    if existing_build:
+        for staged in (
+            "lib.linux-x86_64-cpython-312/vllm/other_branch.py",
+            "bdist.linux-x86_64/wheel/vllm/other_branch.py",
+            "temp.linux-x86_64-cpython-312/_C.o",
+        ):
+            (build / staged).parent.mkdir(parents=True, exist_ok=True)
+            (build / staged).write_text("staged by an earlier build\n")
     subprocess.run(
         ["bash", "-euo", "pipefail", "-c", cleanup],
         env={**os.environ, "source_root": str(tmp_path)},
         check=True,
     )
-    assert [path.name for path in build.iterdir()] == ["temp.linux-x86_64-cpython-312"]
-    assert (build / "temp.linux-x86_64-cpython-312/_C.o").is_file()
+    if existing_build:
+        assert [path.name for path in build.iterdir()] == [
+            "temp.linux-x86_64-cpython-312"
+        ]
+        assert (build / "temp.linux-x86_64-cpython-312/_C.o").is_file()
+    else:
+        assert not build.exists()
