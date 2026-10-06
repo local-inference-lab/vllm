@@ -1,6 +1,6 @@
 {
   "schema": "local-inference-release-change/v1",
-  "id": "vllm-glm53-dsa-dcp-prefill",
+  "id": "vllm-998",
   "category": "performance",
   "summary": "GLM-5.3 (744B) prefill with decode context parallelism runs 1.4x faster at DCP2, 1.7x at DCP3 and 2.5x at DCP6",
   "models": ["GLM-5.3"],
@@ -13,5 +13,6 @@
     "A 1,015K-token prompt at DCP6 prefills in 360 s (CKV gather up to 524K context); VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS=1048576 lowers that to 329 s at 11,902 fewer KV tokens (0.9%). Needle retrieval 3/3 at 421,762 (DCP2), 662,630 (DCP3) and 1,010,918 (DCP6) tokens."
   ],
   "authors": ["joninco", "voipmonitor"],
+  "pull_requests": [998],
   "requires": ["vllm-994"]
 }
