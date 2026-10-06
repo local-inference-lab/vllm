@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-b12x-checkpoint-loader-imports",
+  "category": "fix",
+  "summary": "Load native B12X checkpoint readers from their defining modules",
+  "models": [
+    "Models using load_format=b12x"
+  ],
+  "compatibility": "Uses the checkpoint reader modules provided by B12X master revision 64836b0e4dfc and the integrated B12X kernel revision.",
+  "details": [
+    "The native checkpoint adapter retains indexed source selection, direct destination ownership, and explicit bounce or GDS modes."
+  ],
+  "authors": [
+    "lukealonso"
+  ],
+  "pull_requests": [],
+  "requires": []
+}

@@ -1575,7 +1575,13 @@ def test_b12x_moe_tuning_times_native_candidate_without_capture(
 @pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
 @pytest.mark.parametrize(
     "weight_dtype,activation_dtype",
-    [("nvfp4", "nvfp4"), ("mxfp4", "mxfp8"), ("mxfp8", "mxfp8"), ("nvfp4", None), ("nvfp4", "mxfp8")],
+    [
+        ("nvfp4", "nvfp4"),
+        ("mxfp4", "mxfp8"),
+        ("mxfp8", "mxfp8"),
+        ("nvfp4", None),
+        ("nvfp4", "mxfp8"),
+    ],
     ids=["nvfp4", "w4a8", "w8a8-mx", "w4a16", "nvfp4-a8"],
 )
 @torch.inference_mode()

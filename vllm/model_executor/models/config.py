@@ -614,7 +614,6 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
                 quant_config["quant_method"] = "mxfp4"
 
 
-
 class Qwen3DSparkConfig(VerifyAndUpdateConfig):
     @staticmethod
     def update_model_config_for_parallelism(
