@@ -160,11 +160,11 @@ class _DraftBackend:
 class _CachingMetadataBuilder:
     supports_update_block_table = True
 
-    def __init__(self):
+    def __init__(self, device):
         self.num_builds = 0
         self.num_updates = 0
         self.state = torch.zeros(1, dtype=torch.int32)
-        self.token_mapping = torch.full((2,), -1, dtype=torch.int32)
+        self.token_mapping = torch.full((2,), -1, dtype=torch.int32, device=device)
 
     def build(self, common_prefix_len, common_attn_metadata, **_kwargs):
         self.num_builds += 1
@@ -580,12 +580,14 @@ def test_init_hisparse_rolls_back_shared_region(monkeypatch, failure_phase):
     assert region.cleanup_calls == 1
 
 
+@pytest.mark.skipif(not torch.accelerator.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("for_capture", [False, True])
 @pytest.mark.parametrize("same_spec", [False, True])
 def test_build_attn_metadata_reuses_equivalent_cache_group_builds(
     for_capture, same_spec
 ):
-    builders = [_CachingMetadataBuilder(), _CachingMetadataBuilder()]
+    device = torch.device("cuda")
+    builders = [_CachingMetadataBuilder(device), _CachingMetadataBuilder(device)]
     groups = []
     cache_groups = []
     for group_id, builder in enumerate(builders):
@@ -612,10 +614,11 @@ def test_build_attn_metadata_reuses_equivalent_cache_group_builds(
         kv_cache_groups=cache_groups,
     )
     block_tables = [
-        torch.full((2, 1), group_id, dtype=torch.int32) for group_id in range(2)
+        torch.full((2, 1), group_id, dtype=torch.int32, device=device)
+        for group_id in range(2)
     ]
-    slot_mappings = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64)
-    is_prefilling = torch.ones(2, dtype=torch.bool)
+    slot_mappings = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64, device=device)
+    is_prefilling = torch.ones(2, dtype=torch.bool, device=device)
     model_metadata = SimpleNamespace(
         get_extra_common_attn_kwargs=Mock(
             side_effect=lambda *_: {"is_prefilling": is_prefilling}
@@ -627,10 +630,10 @@ def test_build_attn_metadata_reuses_equivalent_cache_group_builds(
         attn_groups=groups,
         num_reqs=2,
         num_tokens=2,
-        query_start_loc_gpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+        query_start_loc_gpu=torch.tensor([0, 1, 2], dtype=torch.int32, device=device),
         query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.int32),
         max_query_len=1,
-        seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([1, 1], dtype=torch.int32, device=device),
         max_seq_len=1,
         block_tables=block_tables,
         slot_mappings=slot_mappings,
