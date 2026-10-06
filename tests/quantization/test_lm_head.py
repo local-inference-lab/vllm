@@ -131,7 +131,10 @@ def test_runtime_mxfp8_only_selects_lm_head(
 @pytest.mark.cpu_test
 def test_runtime_mxfp8_rejects_quantized_checkpoint(monkeypatch, mxfp8_head_config):
     monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", "1")
-    quant_config = SimpleNamespace(get_quant_method=lambda *args, **kwargs: object())
+    quant_config = SimpleNamespace(
+        get_quant_method=lambda *args, **kwargs: object(),
+        online_quantization_config=None,
+    )
     with pytest.raises(ValueError, match="requires an unquantized LM head"):
         ParallelLMHead(256, 128, quant_config=quant_config, disable_tp=True)
 
@@ -163,7 +166,10 @@ def test_runtime_lm_head_defaults_preserve_ineligible_heads(
         monkeypatch.setattr(vocab.current_platform, "is_cuda", lambda: False)
     existing = SimpleNamespace(create_weights=lambda *args, **kwargs: None)
     quant_config = (
-        SimpleNamespace(get_quant_method=lambda *a, **kw: existing)
+        SimpleNamespace(
+            get_quant_method=lambda *a, **kw: existing,
+            online_quantization_config=None,
+        )
         if fallback == "quantized"
         else None
     )

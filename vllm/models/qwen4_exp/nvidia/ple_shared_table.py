@@ -574,7 +574,7 @@ class SharedTableMapping:
             )
             if device.type == "cuda":
                 cudart = _cudart()
-                with torch.accelerator.device_index(device):
+                with torch.accelerator.device_index(device.index):
                     error, device_pointer = cudart.cudaHostGetDevicePointer(
                         self._pointer, 0
                     )
@@ -616,7 +616,7 @@ class SharedTableMapping:
                     "cudaHostRegisterReadOnly is not supported on this device"
                 )
             flags |= cudart.cudaHostRegisterReadOnly
-        with torch.accelerator.device_index(self.device):
+        with torch.accelerator.device_index(self.device.index):
             (error,) = cudart.cudaHostRegister(self._pointer, self.nbytes, flags)
         if error != cudart.cudaError_t.cudaSuccess:
             raise RuntimeError(

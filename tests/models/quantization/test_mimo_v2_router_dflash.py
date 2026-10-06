@@ -3,12 +3,14 @@
 """Router dtype and DFlash value scaling, with independent CPU expectations."""
 
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
 
 import vllm.model_executor.models.mimo_v2 as mimo
 import vllm.model_executor.models.qwen3_dflash as dflash
+from vllm.config import VllmConfig
 
 pytestmark = pytest.mark.cpu_test
 
@@ -70,7 +72,7 @@ def test_bf16_router_emits_fp32_logits(monkeypatch):
             return hidden_states
 
     monkeypatch.setattr(mimo, "FusedMoEFactory", Experts)
-    module = mimo.MiMoV2MoE(vconfig)
+    module = mimo.MiMoV2MoE(cast(VllmConfig, vconfig))
     with torch.no_grad():
         module.gate.weight.copy_(torch.arange(256).view(8, 32) / 256)
     hidden = torch.linspace(-1, 1, 96).view(3, 32).bfloat16()
@@ -107,7 +109,7 @@ def test_dflash_query_values_scaled_once(value_scale):
         v_scale=value_scale,
     )
     output = dflash.DFlashQwen3Attention.forward(
-        module, torch.arange(2), torch.empty(2, 4)
+        cast(dflash.DFlashQwen3Attention, module), torch.arange(2), torch.empty(2, 4)
     )
     expected = qkv[:, 8:] * (1 if value_scale is None else value_scale)
     torch.testing.assert_close(captured["v"], expected)
@@ -145,14 +147,19 @@ def test_dflash_context_values_scaled_once(monkeypatch, value_scale, per_layer):
         _rope_is_neox=True,
         _attn_layers=inner,
         layers=[
-            SimpleNamespace(self_attn=SimpleNamespace(v_scale=value_scale))
+            SimpleNamespace(
+                self_attn=SimpleNamespace(v_scale=value_scale, rotary_emb=object())
+            )
             for _ in range(2)
         ],
     )
     slots = [torch.tensor([0, 1, -1]), torch.tensor([7, -1, -1])]
     mapping = slots if per_layer else slots[0]
     dflash.DFlashQwen3Model.precompute_and_store_context_kv(
-        module, torch.empty(3, 8), torch.arange(3), mapping
+        cast(dflash.DFlashQwen3Model, module),
+        torch.empty(3, 8),
+        torch.arange(3),
+        mapping,
     )
     assert len(captures) == 2
     for index, (values, actual_slots) in enumerate(captures):
