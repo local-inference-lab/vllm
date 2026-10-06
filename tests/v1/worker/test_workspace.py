@@ -157,8 +157,73 @@ def test_workspace_reservation_covers_every_execution_slot(monkeypatch) -> None:
             assert view.data_ptr() == reserved.data_ptr()
 
     manager.lock()
-    with pytest.raises(AssertionError, match="reserve_all"):
+    with pytest.raises(AssertionError, match="Workspace is locked"):
         manager.reserve_all(((1024,), torch.uint8))
+
+
+def test_workspace_reservation_preserves_independent_lane_capacities(monkeypatch):
+    active_ubatch = [0]
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: active_ubatch[0])
+    manager = workspace.WorkspaceManager(
+        torch.device("cpu"), num_ubatches=2, num_lanes=2
+    )
+    manager.get_simultaneous(((1024,), torch.uint8))
+    active_ubatch[0] = 1
+    with workspace.use_workspace_lane(1):
+        manager.get_simultaneous(((256,), torch.uint8))
+    manager.reserve_by_lane()
+    assert [buffer.numel() for buffer in manager._current_workspaces] == [
+        1024,
+        256,
+        1024,
+        256,
+    ]
+    pointers = [buffer.data_ptr() for buffer in manager._current_workspaces]
+    assert len(set(pointers)) == 4
+    manager.lock()
+    manager.reserve_by_lane()
+    with workspace.use_workspace_lane(1):
+        manager.get_simultaneous(((256,), torch.uint8))
+        with pytest.raises(AssertionError, match="Workspace is locked"):
+            manager.get_simultaneous(((512,), torch.uint8))
+    assert pointers == [buffer.data_ptr() for buffer in manager._current_workspaces]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_lane_reservation_replays_graphs_with_independent_changed_inputs(monkeypatch):
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    manager = workspace.WorkspaceManager(torch.device("cuda"), num_lanes=2)
+    manager.get_simultaneous(((1024,), torch.float32))
+    with workspace.use_workspace_lane(1):
+        manager.get_simultaneous(((64,), torch.float32))
+    manager.reserve_by_lane()
+    manager.lock()
+    assert [buffer.numel() for buffer in manager._current_workspaces] == [4096, 256]
+    source = torch.ones(64, device="cuda")
+    output = torch.empty_like(source)
+
+    def run():
+        (target,) = manager.get_simultaneous(((1024,), torch.float32))
+        target[:64].copy_(source)
+        with workspace.use_workspace_lane(1):
+            (draft,) = manager.get_simultaneous(((64,), torch.float32))
+            torch.mul(source, 3, out=draft)
+        torch.add(target[:64], draft, out=output)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    pointers = [buffer.data_ptr() for buffer in manager._current_workspaces]
+    for _ in range(3):
+        source.normal_()
+        graph.replay()
+        torch.testing.assert_close(output, source + source * 3, rtol=0, atol=0)
+    assert pointers == [buffer.data_ptr() for buffer in manager._current_workspaces]
 
 
 def test_workspace_lane_validation(monkeypatch) -> None:

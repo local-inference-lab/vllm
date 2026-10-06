@@ -99,6 +99,7 @@ from vllm.model_executor.models.utils import (
     extract_layer_index,
     sequence_parallel_chunk,
 )
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.weight_transfer import materialize_weight
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -371,6 +372,18 @@ class DeepseekV2MoE(nn.Module):
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
+            # TP padding (GLM-5.3 at TP6) appends zero channels after the
+            # checkpoint's: silu(0) * 0 feeds zero down_proj columns.
+            if (
+                getattr(
+                    config,
+                    "original_moe_intermediate_size",
+                    config.moe_intermediate_size,
+                )
+                != config.moe_intermediate_size
+            ):
+                for param in self.shared_experts.parameters():
+                    set_weight_attrs(param, {"allow_tp_padding": True})
 
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,

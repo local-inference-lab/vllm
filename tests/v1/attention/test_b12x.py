@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import weakref
+from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -41,12 +43,14 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheLayout
 )
 @pytest.mark.parametrize("parallel_drafting", [False, True])
 @pytest.mark.parametrize("page_padding", [0, 192])
+@pytest.mark.parametrize("partial_dtype", ["bf16", "fp32"])
 @torch.inference_mode()
 def test_b12x_dense_mla_prepared_capacity_replay_and_high_pages(
-    dtype, dcp_size, parallel_drafting, page_padding, monkeypatch
+    dtype, dcp_size, parallel_drafting, page_padding, partial_dtype, monkeypatch
 ):
     """Real prepared kernels consume high page IDs and mutable graph inputs."""
     _require_b12x_paged_attention()
+    monkeypatch.setenv("VLLM_K3_DENSE_MLA_PARTIAL_DTYPE", partial_dtype)
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.attention import dense_mla
     from b12x.preparation import PreparationSession
@@ -461,10 +465,12 @@ def test_b12x_dsa_indexer_reuses_capacity_and_declares_overflow(
 ) -> None:
     import b12x.preparation as preparation
 
+    @dataclass
     class _Plan:
-        def __init__(self, caps, invocation):
-            self.caps, self.invocation = caps, invocation
-            self.request_kwargs = None
+        caps: SimpleNamespace
+        invocation: tuple[Any, ...]
+        shared: bool = False
+        request_kwargs: object = None
 
         def request(self, **kwargs):
             self.request_kwargs = kwargs
@@ -522,6 +528,8 @@ def test_b12x_dsa_indexer_reuses_capacity_and_declares_overflow(
 
     plan = indexer._plan("prefill", 11)
     assert isinstance(plan, _Plan)
+    # Layers declare identical plans; sharing keeps one prepared payload.
+    assert plan.shared
     assert (plan.caps.mode, plan.caps.max_q_rows, plan.caps.max_batch) == (
         "prefill",
         11,
@@ -546,6 +554,102 @@ def test_b12x_dsa_indexer_reuses_capacity_and_declares_overflow(
     assert indexer._plan("decode", 11) is decode
     # Serving never prepares: the plans materialize their defaults on first use.
     assert prepared == []
+
+
+def test_b12x_dsa_indexer_prepares_the_batched_token_prefill_plan(
+    monkeypatch,
+) -> None:
+    """Prefill chunks reach the batched-token limit, beyond the logits budget."""
+    from vllm.utils.b12x import B12xWorkload
+
+    @dataclass
+    class _Plan:
+        caps: SimpleNamespace
+        invocation: tuple[Any, ...]
+        shared: bool = False
+
+        def request(self, **kwargs):
+            return SimpleNamespace(name=kwargs["name"])
+
+    module = SimpleNamespace(
+        Caps=lambda **kwargs: SimpleNamespace(**kwargs),
+        plan=lambda caps, *, invocation: _Plan(caps, invocation),
+        invocation_from_descriptors=lambda caps, *, operands: (caps.max_q_rows,),
+    )
+    monkeypatch.setattr(b12x_indexer, "_require_b12x_indexer", lambda: module)
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192, max_num_seqs=8),
+        compilation_config=SimpleNamespace(cudagraph_capture_sizes=[1, 2, 4, 8]),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        ),
+    )
+    k_cache = SimpleNamespace(
+        prefix="layer", kv_cache=torch.empty((2, 64, 132), dtype=torch.uint8)
+    )
+    with set_current_vllm_config(config):
+        indexer = b12x_indexer.B12xSparseIndexer(
+            k_cache=k_cache,
+            quant_block_size=128,
+            scale_fmt="ue8m0",
+            topk_tokens=4,
+            head_dim=128,
+            max_model_len=4096,
+            max_total_seq_len=4096,
+            topk_indices_buffer=torch.empty((8192, 4), dtype=torch.int32),
+            skip_k_cache_insert=True,
+            num_q_heads=16,
+            output_physical_slots=True,
+        )
+    workload = B12xWorkload(
+        stage="state",
+        token_counts=(1, 4, 8192),
+        fixed_token_counts=(1, 4),
+        output_dtype=torch.bfloat16,
+        max_tokens=8192,
+        max_seqs=8,
+        max_model_len=4096,
+    )
+    logits_rows = b12x_indexer._prefill_profile_q_rows(8192)
+    assert logits_rows < 8192
+
+    (unit,) = indexer.get_b12x_preparation_units(indexer, workload)
+
+    names = {request.name for request in unit.requests}
+    assert {f"layer.dsa_indexer.prefill.m{rows}" for rows in (logits_rows, 8192)} <= (
+        names
+    )
+    assert indexer._plan("prefill", 8192) is indexer._prepared_plans[("prefill", 8192)]
+
+
+def test_glm_dsa_b12x_attention_forwards_index_group_builder(monkeypatch) -> None:
+    from vllm.models.deepseek_v32.nvidia import b12x as dsa_b12x
+
+    captured: dict[str, Any] = {}
+
+    def base_init(
+        self,
+        vllm_config,
+        config,
+        prefix,
+        topk_indices_buffer=None,
+        attn_backend=None,
+        index_group_builder=None,
+    ):
+        captured.update(
+            attn_backend=attn_backend, index_group_builder=index_group_builder
+        )
+
+    monkeypatch.setattr(dsa_b12x.DeepseekV32Attention, "__init__", base_init)
+    monkeypatch.setattr(dsa_b12x, "_get_sparse_mla_backend", lambda config: "B12X")
+    builder = object()
+
+    dsa_b12x.DeepseekV32B12xAttention(
+        None, None, "model.layers.0.self_attn", index_group_builder=builder
+    )
+
+    assert captured == {"attn_backend": "B12X", "index_group_builder": builder}
 
 
 def test_b12x_sparse_mla_prefill_binds_request_sequence_lengths(
@@ -931,7 +1035,7 @@ def test_b12x_cache_update_and_graph_replay(
                 value.mul_(factor)
                 output.fill_(torch.nan)
                 graph.replay()
-                references = []
+                references: list[torch.Tensor] = []
                 for i, (context, length) in enumerate(zip(context_lens, q_lens)):
                     start, end = sum(seq_lens[:i]), sum(seq_lens[: i + 1])
                     k, v = key[start:end].float(), value[start:end].float()
@@ -1072,6 +1176,64 @@ def test_b12x_attention_runtime_page_size_comes_from_cache() -> None:
     assert _kv_page_size(key_cache, value_cache) == 64
     with pytest.raises(ValueError, match="matching K/V page sizes"):
         _kv_page_size(key_cache, torch.empty((3, 128, 4, 128), device="meta"))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_b12x_dense_mla_preparation_releases_temporary_buffers(
+    dtype, monkeypatch
+) -> None:
+    from vllm.v1.attention.backends.mla import b12x_mla
+    from vllm.v1.worker import workspace
+
+    impl = object.__new__(b12x_mla.B12xMLAImpl)
+    impl.num_heads, impl.dcp_world_size = 6, 16
+    impl.head_size, impl.kv_lora_rank = 576, 512
+    impl.kv_cache_dtype = "fp8" if dtype == torch.float8_e4m3fn else "bfloat16"
+    impl.scale = 192**-0.5
+    impl._plans = {
+        8: SimpleNamespace(scratch_specs=lambda: [SimpleNamespace(nbytes=64)])
+    }
+    monkeypatch.setattr(
+        workspace,
+        "_manager",
+        SimpleNamespace(
+            get_simultaneous=lambda *args: None, reserve_by_lane=lambda: None
+        ),
+    )
+    monkeypatch.setattr(
+        b12x_mla,
+        "get_b12x_scratch_buffers",
+        lambda state: (torch.empty(64, dtype=torch.uint8),),
+    )
+    references: list[torch.Tensor] = []
+
+    def bind(**kwargs):
+        references.extend(
+            weakref.ref(kwargs[name])
+            for name in (
+                "scratch",
+                "q",
+                "output",
+                "cache_seqlens",
+                "cu_seqlens_q",
+                "page_table",
+            )
+        )
+        return kwargs
+
+    state = SimpleNamespace(
+        bind=bind,
+        prime=lambda binding: None,
+        run=lambda binding: binding["output"].zero_(),
+    )
+    layer = SimpleNamespace(kv_cache=torch.empty(2, 64, 576, dtype=dtype))
+    call = impl._prepared_call(layer, state, 8)
+    call.invoke()
+    assert all(reference() is not None for reference in references)
+    published = SimpleNamespace(state=state, owners=call.owners)
+    del call
+    assert all(reference() is None for reference in references)
+    assert published.state is state
 
 
 def test_b12x_attention_preparation_releases_temporary_buffers() -> None:
@@ -1575,7 +1737,7 @@ def test_b12x_noncausal_dflash_cache_and_graph(default_vllm_config, page_size, b
             query.neg_()
             output.fill_(torch.nan)
             graph.replay()
-            references = []
+            references: list[torch.Tensor] = []
             for request, length in enumerate(lengths):
                 if length == 0:
                     references.append(torch.zeros(8, 16, 128, device=device))

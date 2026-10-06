@@ -54,7 +54,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
 
 if TYPE_CHECKING:
-    from vllm.config import VllmConfig
+    from vllm.config import KVTransferConfig, VllmConfig
     from vllm.distributed.kv_events import KVCacheEvent, KVConnectorKVEvents
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
         KVConnectorPromMetrics,
@@ -135,6 +135,32 @@ def supports_hma(connector: Any) -> bool:
         return issubclass(connector, SupportsHMA)
     else:
         return isinstance(connector, SupportsHMA)
+
+
+class SupportsVmmSafeTransfers(ABC):
+    """Declare configurations that do not retain GPU physical-page registrations.
+
+    A qualifying transport accesses GPU buffers through virtual addresses at
+    transfer time, without RDMA, GPUDirect or GDS page registrations.
+    """
+
+    @classmethod
+    @abstractmethod
+    def supports_vmm_safe_transfer_config(
+        cls, kv_transfer_config: "KVTransferConfig"
+    ) -> bool:
+        """Return whether this exact connector configuration is VMM-safe."""
+        raise NotImplementedError
+
+
+def supports_vmm_safe_transfers(
+    connector: Any, kv_transfer_config: "KVTransferConfig"
+) -> bool:
+    """Evaluate a connector's explicit CUDA VMM transfer contract."""
+    connector_cls = connector if isinstance(connector, type) else type(connector)
+    return issubclass(
+        connector_cls, SupportsVmmSafeTransfers
+    ) and connector_cls.supports_vmm_safe_transfer_config(kv_transfer_config)
 
 
 class KVConnectorRole(enum.Enum):

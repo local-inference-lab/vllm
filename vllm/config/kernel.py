@@ -273,7 +273,7 @@ class KernelConfig:
     - "flashinfer_cutedsl": Use FlashInfer with CuteDSL kernels (FP4 only)
     - "flashinfer_b12x": Use FlashInfer CuteDSL fused MoE for SM12x
       (RTX Pro 6000 / DGX Spark)
-    - "b12x": Use b12x FP4 MoE kernels on SM12x
+    - "b12x": Use b12x FP4 and MXFP8 MoE kernels on SM12x
     - "flashinfer_moe_ep_mega_deep_gemm": Use the FlashInfer moe_ep
       expert-parallel mega-MoE with the DeepGEMM megakernel, which consumes an
       MXFP4 checkpoint verbatim (Blackwell, requires expert parallel;

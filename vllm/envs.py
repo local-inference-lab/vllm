@@ -175,6 +175,7 @@ if TYPE_CHECKING:
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S: float = 60.0
     VLLM_MLA_DISABLE: bool = False
+    VLLM_K3_DENSE_MLA_PARTIAL_DTYPE: Literal["bf16", "fp32"] = "bf16"
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -200,6 +201,7 @@ if TYPE_CHECKING:
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
     VLLM_B12X_ACTIVATION_MODE_A16_M: int = 0
     VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE: Literal["0", "1", "all", "w13", "w2"] = "0"
+    VLLM_B12X_CSF_SCALE_PREFETCH: bool = True
     VLLM_DEFAULT_MOE_BACKEND: str = "auto"
     VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
     VLLM_B12X_NVFP4_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
@@ -1521,6 +1523,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
+    # Keep dense MLA split partials in FP32 until the merge when requested.
+    "VLLM_K3_DENSE_MLA_PARTIAL_DTYPE": env_with_choices(
+        "VLLM_K3_DENSE_MLA_PARTIAL_DTYPE", "bf16", ["bf16", "fp32"]
+    ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
     # it allows ray to schedule multiple actors on a single GPU,
@@ -1782,6 +1788,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE",
         "0",
         ["0", "1", "all", "w13", "w2"],
+    ),
+    # Expand the next NVFP4-CSF layer's expert scales on a side stream while its
+    # attention runs, instead of before its MoE (eager prefill calls only).
+    "VLLM_B12X_CSF_SCALE_PREFETCH": lambda: bool(
+        int(os.getenv("VLLM_B12X_CSF_SCALE_PREFETCH", "1"))
     ),
     # Dense activation precision; recipe overrides take precedence.
     "VLLM_B12X_DENSE_ACTIVATION_MODE": env_with_choices(

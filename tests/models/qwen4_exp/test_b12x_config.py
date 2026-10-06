@@ -116,6 +116,37 @@ def test_omitted_ple_dtype_is_resolved_from_checkpoint_headers(
     assert config.get_text_config().ple_embedding_dtype == expected
 
 
+@pytest.mark.parametrize("method", ["nvfp4_csf", "mxfp4_csf"])
+def test_omitted_ple_dtype_is_resolved_from_the_csf_checkpoint_root(
+    tmp_path, method
+) -> None:
+    """An FP4-CSF serving directory has no tensors; the PLE dtype comes from the
+    checkpoint root it points at."""
+    root = tmp_path / "checkpoint"
+    (root / "tensors").mkdir(parents=True)
+    save_file(
+        {
+            "model.language_model.layers.1.ple.ple_embedding."
+            "ngram_embedding.shard_0.weight": torch.zeros((2, 8), dtype=torch.uint8),
+        },
+        root / "tensors" / "hybrid-main-00001.safetensors",
+    )
+    serving = tmp_path / "serving"
+    serving.mkdir()
+    config_dict = Qwen3_8FlashNextConfig(**_TEXT_CONFIG, ple_layer_ids=[2]).to_dict()
+    config_dict.get("text_config", config_dict).pop("ple_embedding_dtype")
+    config_dict["quantization_config"] = {
+        "quant_method": method,
+        "format_version": 1,
+        "checkpoint_root": str(root),
+    }
+    (serving / "config.json").write_text(json.dumps(config_dict))
+
+    config = get_config(str(serving), trust_remote_code=False)
+
+    assert config.get_text_config().ple_embedding_dtype == "nvfp4"
+
+
 def test_explicit_ple_dtype_does_not_probe_checkpoint(tmp_path, monkeypatch) -> None:
     config = Qwen4ExpConfig(
         **_TEXT_CONFIG, ple_layer_ids=[2], ple_embedding_dtype="bfloat16"

@@ -3,7 +3,7 @@
 """B12x DSA indexer for non-compressed sparse MLA models."""
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 import torch
@@ -70,6 +70,11 @@ class B12xIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
         super().__init__(*args, block_table_width=block_table_width, **kwargs)
         self.use_flattening = False
         self.supports_varlen = False
+        # Draft steps rebuild this metadata instead of refreshing it in place:
+        # the decode metadata carries the scan width in ``active_width`` and
+        # no DeepGEMM schedule table, so the inherited in-place refresh would
+        # neither advance the width nor find the table it rewrites.
+        self.supports_draft_decode_metadata_update = False
         self.active_width_buffer = torch.zeros(
             (1,), dtype=torch.int32, device=self.device
         )
@@ -439,8 +444,15 @@ class B12xSparseIndexer(nn.Module):
         )
 
     def _declare_plan(self, caps):
-        return self._module.plan(
-            caps, invocation=self._invocation(caps, self.dcp_world_size > 1)
+        # Every layer declares an identical plan for the same capacity. Shared
+        # declarations alias one prepared payload, so preparation keeps one
+        # set of trial buffers instead of one per layer (GLM-5.3 has 78 DSA
+        # layers; per-layer trial scratch alone exhausted the GPU).
+        return replace(
+            self._module.plan(
+                caps, invocation=self._invocation(caps, self.dcp_world_size > 1)
+            ),
+            shared=True,
         )
 
     def _prepare_call(self, mode: str, caps):
@@ -550,9 +562,13 @@ class B12xSparseIndexer(nn.Module):
         width = self._page_table_width(workload.max_model_len)
         requests = []
         prepared_plans: dict[tuple[str, int], object] = {}
+        # The chunk builder emits prefill chunks of up to the batched-token
+        # limit, so prepare that row count beside the logits-budget one.
         capacities = {
             "decode": sorted({self._max_num_seqs, *workload.fixed_token_counts}),
-            "prefill": (_prefill_profile_q_rows(workload.max_tokens),),
+            "prefill": sorted(
+                {_prefill_profile_q_rows(workload.max_tokens), workload.max_tokens}
+            ),
         }
         for mode, counts in capacities.items():
             for rows in counts:

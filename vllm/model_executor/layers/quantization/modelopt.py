@@ -961,8 +961,11 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         global_sf_num_experts = (
             global_num_experts if self.use_global_sf else num_experts
         )
+        # Zero, not uninitialized: W4A16_NVFP4 layers (such as GLM-5.3 MTP
+        # experts) store no input scales, and the b12x W4A16 A4 prefill takes
+        # any positive finite value here for a calibrated scale.
         w13_input_scale = PerTensorScaleParameter(
-            data=torch.empty(
+            data=torch.zeros(
                 global_sf_num_experts,
                 w13_num_shards,
                 dtype=torch.float32,
@@ -972,7 +975,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         layer.register_parameter("w13_input_scale", w13_input_scale)
 
         w2_input_scale = PerTensorScaleParameter(
-            data=torch.empty(global_sf_num_experts, dtype=torch.float32),
+            data=torch.zeros(global_sf_num_experts, dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_input_scale", w2_input_scale)
@@ -1225,7 +1228,13 @@ class ModelOptMxFp8Config(ModelOptQuantConfigBase):
 
 
 class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
-    """FlashInfer TRTLLM MXFP8 block-scale MoE for ModelOpt checkpoints."""
+    """MXFP8 block-scale MoE for ModelOpt checkpoints.
+
+    The oracle (``select_mxfp8_moe_backend``) picks the expert backend:
+    FlashInfer TRTLLM, Triton, Marlin, emulation, or the b12x planned
+    ``w8a8_mx`` path on SM12x, which prepares directly from the serialized
+    E4M3 weights and UE8M0 K/32 scale grids.
+    """
 
     def __init__(
         self,
@@ -1237,7 +1246,9 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         self.quant_config = quant_config
         assert self.quant_config.is_checkpoint_mxfp8_serialized
 
-        self.mxfp8_backend, self.experts_cls = select_mxfp8_moe_backend(config=self.moe)
+        self.mxfp8_backend, self.experts_cls = select_mxfp8_moe_backend(
+            config=self.moe, prepares_b12x=True
+        )
 
     def create_weights(
         self,
@@ -1387,6 +1398,13 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        """Convert the loaded MXFP8 weights and build the MoE kernel once.
+
+        Runs the selected backend's weight converter, refreshes the quant
+        config and kernel, lets the experts class prepare its own
+        representation, and dequantizes to BF16 at load time on the emulation
+        backend. A second call for the same layer is a no-op.
+        """
         # TODO(bnell): why is this required only for mxfp8?
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
@@ -1422,6 +1440,10 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
         )
+        # The b12x experts prepare their planned representation here, before
+        # memory profiling and CUDA graph capture; every other MXFP8 expert
+        # class inherits the no-op default.
+        self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
         # No native MXFP8 MoE kernel on this device (e.g. gfx942): the emulation
         # experts would dequant MXFP8->BF16 every forward step. Convert the

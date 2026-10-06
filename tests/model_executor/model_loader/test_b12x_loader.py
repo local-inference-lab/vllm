@@ -12,7 +12,8 @@ from safetensors.torch import save_file
 
 pytest.importorskip("b12x")
 
-from b12x.loader import CheckpointDisplay, DirectWeightSession
+from b12x.loader._checkpoint import DirectWeightSession
+from b12x.loader._progress import CheckpointDisplay
 
 from vllm.config.load import LoadConfig
 from vllm.model_executor.model_loader.b12x_loader import B12xModelLoader

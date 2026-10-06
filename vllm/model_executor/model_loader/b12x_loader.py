@@ -15,12 +15,10 @@ from contextlib import ExitStack
 from pathlib import Path
 
 import torch
-from b12x.loader import (
-    CheckpointDisplay,
-    DirectWeightSession,
-    SharedReadGroup,
-    capabilities,
-)
+from b12x.loader import capabilities
+from b12x.loader._checkpoint import DirectWeightSession
+from b12x.loader._progress import CheckpointDisplay
+from b12x.loader._shared_checkpoint import SharedReadGroup
 
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import weight_utils
