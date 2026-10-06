@@ -2,6 +2,7 @@
   "schema": "local-inference-release-change/v1",
   "id": "vllm-glm53-launcher-system-nvrtc",
   "category": "fix",
+  "authors": ["lukealonso"],
   "summary": "Resolve GLM launcher NVRTC libraries from the selected CUDA toolkit",
   "models": ["GLM-5.3-Flash"],
   "compatibility": "The Humming MTP backend uses its CUDA toolkit resolver for pip and system installations; model and backend settings are unchanged.",
