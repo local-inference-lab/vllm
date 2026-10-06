@@ -342,6 +342,99 @@ def test_deepseek_v32_dispatches_selected_mha(
     )
 
 
+@pytest.mark.parametrize("full_ckv", [False, True])
+def test_deepseek_v32_full_ckv_dcp_skips_query_exchange(
+    monkeypatch: pytest.MonkeyPatch,
+    full_ckv: bool,
+) -> None:
+    """A full-CKV prefill attends local heads over the gathered cache.
+
+    It must neither gather the DCP group's queries nor merge partial outputs;
+    every other DCP batch keeps both exchanges.
+    """
+    tokens, heads, latent, value = 3, 2, 4, 3
+    dcp = 2
+    attn_metadata = SimpleNamespace(num_actual_tokens=tokens)
+    kv_cache = torch.empty(1)
+    monkeypatch.setattr(
+        deepseek_v32_attention,
+        "get_attention_context",
+        lambda _: (attn_metadata, None, kv_cache, None),
+    )
+    observed: dict[str, object] = {"gathered": 0, "combined": 0}
+    local_out = torch.randn(tokens, heads, latent)
+
+    def query_gather(query: torch.Tensor) -> torch.Tensor:
+        observed["gathered"] += 1
+        return torch.cat([query] * dcp, dim=1)
+
+    def combine(attn_out, lse, *, seq_lens, query_start_loc):
+        observed["combined"] += 1
+        assert seq_lens is None and query_start_loc is None
+        return attn_out[:, :heads]
+
+    def forward_mqa(q, cache, metadata, layer):
+        assert cache is kv_cache and metadata is attn_metadata
+        observed["q"] = q
+        if full_ckv:
+            return local_out, torch.zeros(tokens, heads)
+        return torch.cat([local_out] * dcp, dim=1), torch.zeros(tokens, dcp * heads)
+
+    layer = SimpleNamespace(
+        indexer=None,
+        skip_topk=False,
+        layer_name=MLA_LAYER,
+        use_pcp=False,
+        _fp8_query=False,
+        _fp8_kv_needs_view=False,
+        _native_packed_kv_update=False,
+        _use_sparse_mha=lambda _: False,
+        num_local_heads=heads,
+        kv_lora_rank=latent,
+        v_head_dim=value,
+        W_UV=torch.randn(heads, latent, value),
+        impl=SimpleNamespace(
+            dcp_world_size=dcp,
+            pcp_world_size=1,
+            record_logical_topk_ready=lambda: None,
+            prepare_for_batch=lambda _: None,
+            uses_full_ckv_dcp=lambda metadata, num_tokens: (
+                full_ckv and metadata is attn_metadata and num_tokens == tokens
+            ),
+            forward_mqa=forward_mqa,
+        ),
+        dcp_manager=SimpleNamespace(query_gather=query_gather, combine=combine),
+    )
+    ql_nope = torch.randn(tokens, heads, latent)
+    mqa_q = torch.randn(tokens, heads, 2)
+    output = torch.empty(tokens, heads * value)
+
+    DeepseekV32Attention._sparse_indexer_and_attn(
+        layer,
+        torch.arange(tokens),
+        torch.empty(tokens, 2),
+        torch.empty(tokens, heads, 2),
+        torch.empty(tokens, heads, 2),
+        None,
+        None,
+        None,
+        None,
+        None,
+        ql_nope,
+        mqa_q,
+        output,
+    )
+
+    assert observed["gathered"] == observed["combined"] == int(not full_ckv)
+    if full_ckv:
+        q_nope, q_pe = observed["q"]
+        assert torch.equal(q_nope, ql_nope) and torch.equal(q_pe, mqa_q)
+    else:
+        assert observed["q"].shape == (tokens, dcp * heads, latent + 2)
+    expected = torch.bmm(local_out.transpose(0, 1), layer.W_UV).transpose(0, 1)
+    torch.testing.assert_close(output.view(tokens, heads, value), expected)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_select_candidate_blocks_tolerates_empty_rows():
     """Full-cudagraph decode pads the batch with seq_len-0 rows. The newest

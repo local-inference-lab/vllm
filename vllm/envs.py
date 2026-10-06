@@ -1899,9 +1899,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MiMo-V2: prefetch upcoming decode weights into L2 on a side stream
     # during FULL CUDA-graph decode (cache hints only; numerics unchanged).
     "VLLM_MIMO_L2_PREFETCH": lambda: os.getenv("VLLM_MIMO_L2_PREFETCH", "0") == "1",
-    # Gather DCP-sharded C4 records before B12X sparse-MLA prefill. This avoids
-    # query replication plus the per-rank LSE combine and is opt-in while the
-    # path is being qualified on GLM5Next.
+    # Gather DCP-sharded native cache records (GLM5Next C4, GLM-5.2/5.3 DSA)
+    # before B12X sparse-MLA prefill. This avoids query replication plus the
+    # per-rank LSE combine and is opt-in.
     "VLLM_B12X_MLA_CKV_GATHER": lambda: (
         os.getenv("VLLM_B12X_MLA_CKV_GATHER", "0").lower() in ("1", "true", "yes", "on")
     ),

@@ -343,6 +343,12 @@ class DeepseekV32Attention(MLAAttention):
             is_neox_style=not getattr(config, "indexer_rope_interleave", False),
         )
 
+    def reserve_profile_scratch(self) -> None:
+        """Reserve backend prefill workspace before KV-cache memory profiling."""
+        reserve = getattr(self.impl, "reserve_full_ckv_workspace", None)
+        if reserve is not None:
+            reserve()
+
     def forward(  # type: ignore[override]
         self,
         positions: torch.Tensor,
@@ -611,11 +617,18 @@ class DeepseekV32Attention(MLAAttention):
         else:
             mqa_q_arg = (ql_nope[:num_actual], mqa_q[:num_actual])
 
+        # A full-CKV prefill gathers the DCP-sharded cache instead, so its
+        # local query heads attend every token and need no LSE combine.
+        full_ckv_dcp = (
+            not self.use_pcp
+            and self.impl.dcp_world_size > 1
+            and self.impl.uses_full_ckv_dcp(attn_metadata, num_actual)
+        )
         if self.use_pcp and self.impl.dcp_world_size > self.impl.pcp_world_size:
             if isinstance(mqa_q_arg, tuple):
                 mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
             mqa_q_arg = get_tp_group().all_gather(mqa_q_arg, dim=1)
-        elif not self.use_pcp and self.impl.dcp_world_size > 1:
+        elif not self.use_pcp and self.impl.dcp_world_size > 1 and not full_ckv_dcp:
             assert self.dcp_manager is not None
             if isinstance(mqa_q_arg, tuple):
                 mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
@@ -625,7 +638,7 @@ class DeepseekV32Attention(MLAAttention):
             mqa_q_arg, kv_cache, attn_metadata, self
         )
 
-        if self.impl.dcp_world_size > 1:
+        if self.impl.dcp_world_size > 1 and not full_ckv_dcp:
             assert lse is not None and self.dcp_manager is not None
             seq_lens: torch.Tensor | None
             query_start_loc: torch.Tensor | None
