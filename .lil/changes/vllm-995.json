@@ -1,0 +1,21 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-995",
+  "category": "fix",
+  "summary": "GLM-5.3-Flash starts on GB10 (DGX Spark) with the NVFP4 MTP draft head",
+  "models": [
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "No change on RTX PRO 6000. On GB10, VLLM_GLM53_MTP_DRAFT_HEAD=nvfp4 no longer stops startup.",
+  "details": [
+    "The quantized draft vocabulary head required compute capability exactly 12.0; it now accepts the SM120 family, which includes GB10 (12.1). FlashInfer builds its W4A16 kernels for 12.0f.",
+    "The draft-head tests pass on GB10."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    995
+  ],
+  "requires": []
+}

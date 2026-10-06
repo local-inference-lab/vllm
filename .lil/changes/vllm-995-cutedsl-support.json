@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-995-cutedsl-support",
+  "category": "fix",
+  "summary": "Clarify SM121 support and validation of the NVFP4 MTP draft head",
+  "models": ["GLM-5.3-Flash"],
+  "compatibility": "The opt-in NVFP4 draft head accepts SM120-family GPUs. The default BF16 head is unchanged.",
+  "details": [
+    "Corrects vllm-995: the draft head selects FlashInfer's CuTe-DSL W4A16 backend, which explicitly supports SM120 and SM121 through architecture-specific CuTe compilation; this path does not depend on a 12.0f CUDA build target.",
+    "The reported GB10 test covers weight quantization and packing. GB10 draft logits, CUDA graph replay, and model serving remain unverified.",
+    "On SM120, the draft-head forward tests pass for single-row and multi-row inputs against independently dequantized NVFP4 weights, including CUDA graph replay with changed inputs and stable allocated memory. Validation used FlashInfer 0.6.18+lil.cu134.sm120.g34426e96c02c and CUTLASS DSL 4.7.1."
+  ],
+  "authors": ["voipmonitor", "Luke Alonso"],
+  "pull_requests": [995],
+  "requires": ["vllm-995"]
+}

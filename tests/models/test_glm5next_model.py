@@ -356,7 +356,8 @@ def test_glm5next_mtp_head_scale_bounds_conversion_memory(record_property) -> No
 
 
 @pytest.mark.skipif(
-    not current_platform.is_device_capability(120), reason="requires SM120"
+    not current_platform.is_device_capability_family(120),
+    reason="requires an SM120-family GPU",
 )
 def test_glm5next_mtp_head_quantization_preserves_packed_weights() -> None:
     import flashinfer
@@ -384,6 +385,65 @@ def test_glm5next_mtp_head_quantization_preserves_packed_weights() -> None:
     for observed, reference in zip(actual.buffers(), expected, strict=True):
         torch.testing.assert_close(observed, reference, rtol=0, atol=0)
     torch.testing.assert_close(source.weight, original, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120),
+    reason="requires an SM120-family GPU",
+)
+@pytest.mark.parametrize(
+    ("shape", "out_features"), [((1, 2048), 8192), ((2, 3, 256), 256)]
+)
+@torch.inference_mode()
+def test_glm5next_mtp_head_forward_matches_dequantized_weights(
+    shape, out_features
+) -> None:
+    import flashinfer
+
+    from tests.kernels.quantization.nvfp4_utils import dequantize_nvfp4_to_dtype
+
+    torch.manual_seed(0)
+    source = torch.nn.Linear(
+        shape[-1], out_features, bias=False, dtype=torch.bfloat16
+    ).cuda()
+    source.shard_indices = SimpleNamespace()
+    scale = 2688.0 / source.weight.float().abs().max()
+    weight, scales = flashinfer.nvfp4_quantize(
+        source.weight,
+        scale,
+        sfLayout=flashinfer.SfLayout.layout_128x4,
+        do_shuffle=False,
+        backend="cuda",
+    )
+    decoded = dequantize_nvfp4_to_dtype(
+        weight.view(torch.uint8), scales, scale, torch.float32, source.weight.device
+    )
+    head = mtp_draft_head.QuantizedDraftHead(source, "nvfp4")
+    hidden = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+
+    def expected_logits():
+        return (hidden.float() @ decoded.T).to(hidden.dtype)
+
+    for _ in range(3):
+        eager = head(hidden)
+    assert eager.shape == (*shape[:-1], source.weight.shape[0])
+    torch.testing.assert_close(eager, expected_logits(), rtol=2e-2, atol=1e-2)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        logits = head(hidden)
+    output_address = logits.data_ptr()
+
+    for _ in range(2):
+        hidden.copy_(torch.randn_like(hidden))
+        expected = expected_logits()
+        torch.accelerator.synchronize()
+        allocated = torch.accelerator.memory_allocated()
+        graph.replay()
+        torch.accelerator.synchronize()
+        assert torch.accelerator.memory_allocated() == allocated
+        assert logits.data_ptr() == output_address
+        torch.testing.assert_close(logits, expected, rtol=2e-2, atol=1e-2)
 
 
 def test_glm5next_mtp_prepares_configured_draft_head(monkeypatch) -> None:
