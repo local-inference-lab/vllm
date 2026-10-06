@@ -44,9 +44,12 @@ fi
 # setuptools stages Python modules under build/lib.* and bdist.*, and the wheel
 # packages everything staged there, so a module that exists only on another
 # branch would ship in this wheel. Compiled objects stay cached in build/temp.*;
-# CMake installs them into the staging directory again.
-find "${source_root}/build" -mindepth 1 -maxdepth 1 \
-  \( -name 'lib.*' -o -name 'bdist.*' \) -exec rm -rf -- {} +
+# CMake installs them into the staging directory again. A precompiled build
+# has no native cache mount and starts without build/.
+if [[ -d "${source_root}/build" ]]; then
+  find "${source_root}/build" -mindepth 1 -maxdepth 1 \
+    \( -name 'lib.*' -o -name 'bdist.*' \) -exec rm -rf -- {} +
+fi
 
 env -u PYTHONPATH \
   VLLM_TARGET_DEVICE=cuda \
