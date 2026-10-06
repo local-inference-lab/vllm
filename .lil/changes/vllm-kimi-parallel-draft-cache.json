@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-kimi-parallel-draft-cache",
+  "category": "feature",
+  "summary": "Preserve parallel Kimi draft projections and independent target and draft cache geometry",
+  "models": ["Kimi-K3"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Supports DSpark and DFlash projection staging, compact rotary tables and draft-specific cache policies.",
+    "Retains explicit Markov-head quantization while permitting TP sharding. Target DCP partitions do not change replicated draft-cache addressing.",
+    "Validates noncausal decode and DCP replication when merging MLA cache specifications."
+  ],
+  "pull_requests": [858],
+  "requires": []
+}
