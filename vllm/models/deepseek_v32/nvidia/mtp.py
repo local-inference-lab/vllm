@@ -200,7 +200,16 @@ class DeepseekV32MultiTokenPredictor(nn.Module):
 
     def prepare_draft_lm_head(self, source_head: nn.Module) -> None:
         """Build the draft-only copy of the shared target head that
-        ``VLLM_GLM53_MTP_DRAFT_HEAD`` selects; the verifier keeps BF16."""
+        ``VLLM_GLM53_MTP_DRAFT_HEAD`` selects; the verifier keeps its head.
+
+        A runtime-quantized target head is already packed and drafts as is.
+        """
+        if getattr(source_head, "runtime_lm_head_quantization", None) in (
+            "nvfp4",
+            "mxfp8",
+        ):
+            self.quantized_draft_head = None
+            return
         self.quantized_draft_head = make_quantized_draft_head(source_head)
 
     def set_skip_topk(self, skip: bool):
