@@ -386,6 +386,27 @@ def test_glm5next_mtp_head_quantization_preserves_packed_weights() -> None:
     torch.testing.assert_close(source.weight, original, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120),
+    reason="requires an SM120-family GPU",
+)
+def test_glm5next_mtp_head_pads_vocab_shard_to_gemm_tile() -> None:
+    # GLM-5.3 at TP8 shards its 154,880-row head into 19,360 rows per rank,
+    # which is not a multiple of the 64-row CuTe-DSL tile.
+    source = torch.nn.Linear(256, 19360, bias=False, dtype=torch.bfloat16).cuda()
+    source.shard_indices = SimpleNamespace()
+    hidden_states = torch.randn(3, 256, dtype=torch.bfloat16, device="cuda")
+
+    logits = mtp_draft_head.QuantizedDraftHead(source, "nvfp4")(hidden_states)
+
+    expected = source(hidden_states)
+    assert logits.shape == expected.shape
+    similarity = torch.nn.functional.cosine_similarity(
+        logits.float().flatten(), expected.float().flatten(), dim=0
+    )
+    assert similarity > 0.98
+
+
 def test_glm5next_mtp_prepares_configured_draft_head(monkeypatch) -> None:
     source_head = torch.nn.Linear(4, 8, bias=False)
     quantized_head = torch.nn.Linear(4, 8, bias=False)
