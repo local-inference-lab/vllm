@@ -21,7 +21,10 @@ from vllm.model_executor.model_loader.b12x_loader import B12xModelLoader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
 
-def test_load_format_selects_b12x_without_plugin_registration(monkeypatch):
+@pytest.mark.parametrize("register_plugin", [False, True])
+def test_load_format_selects_native_b12x_with_or_without_plugin(
+    monkeypatch, register_plugin
+):
     from vllm.model_executor import model_loader
 
     monkeypatch.delenv("VLLM_PLUGINS", raising=False)
@@ -31,6 +34,10 @@ def test_load_format_selects_b12x_without_plugin_registration(monkeypatch):
         dict(model_loader._LOAD_FORMAT_TO_MODEL_LOADER),
     )
     model_loader._LOAD_FORMAT_TO_MODEL_LOADER.pop("b12x", None)
+    if register_plugin:
+        from b12x.integration.vllm.loader import register_b12x_loader
+
+        register_b12x_loader()
     config = LoadConfig(
         load_format="b12x", model_loader_extra_config={"read_mode": "bounce"}
     )
