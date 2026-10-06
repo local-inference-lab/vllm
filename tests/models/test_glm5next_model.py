@@ -13,6 +13,7 @@ import pytest
 import torch
 from transformers import AutoTokenizer
 
+from vllm.config import CacheConfig
 from vllm.model_executor.layers import logits_processor as logits_processor_module
 from vllm.model_executor.layers import mla as mla_layer
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -1145,14 +1146,19 @@ def test_glm5next_explicit_b12x_rejects_unsupported_layer(monkeypatch) -> None:
         resolve_kda_prefill_backend("b12x", 128, torch.bfloat16, -5.0, torch.float32)
 
 
-def test_kimi_k3_kda_prefill_rejects_b12x() -> None:
-    """Only the GLM linear-attention layer offers the b12x prefill backend."""
+@pytest.mark.parametrize("supported", [False, True])
+def test_kimi_k3_kda_prefill_validates_b12x_support(monkeypatch, supported) -> None:
     from vllm.models.kimi_k3.nvidia import kda as kimi_k3_kda
 
-    with pytest.raises(ValueError, match="Unsupported KDA prefill backend"):
-        kimi_k3_kda.resolve_kda_prefill_backend(
-            "b12x", 128, torch.bfloat16, torch.float32, -5.0
-        )
+    monkeypatch.setattr(
+        kimi_k3_kda, "is_b12x_kda_prefill_supported", lambda *args: supported
+    )
+    args = ("b12x", 128, torch.bfloat16, torch.float32, -5.0)
+    if supported:
+        assert kimi_k3_kda.resolve_kda_prefill_backend(*args) == "b12x"
+    else:
+        with pytest.raises(RuntimeError, match="b12x KDA prefill backend requires"):
+            kimi_k3_kda.resolve_kda_prefill_backend(*args)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
@@ -1693,7 +1699,7 @@ def test_glm_adaptive_kda_backend_is_scoped_to_aligned_state_cache(
     layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
     torch.nn.Module.__init__(layer)
     layer.speculative_config = SimpleNamespace(enable_adaptive_verification=adaptive)
-    layer.cache_config = SimpleNamespace(mamba_cache_mode=cache_mode)
+    layer.cache_config = CacheConfig(mamba_cache_mode=cache_mode)
     expected = (
         Glm5NextKDAAttentionBackend
         if adaptive and cache_mode == "align"
@@ -1726,6 +1732,7 @@ def test_glm5next_b12x_kda_plan_reserves_null_state_zero(monkeypatch) -> None:
 
     layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
     torch.nn.Module.__init__(layer)
+    layer.cache_config = CacheConfig()
     layer._b12x_kda_api = FakeApi()
     layer._b12x_kda_max_tokens = 16
     layer._b12x_kda_max_seqs = 4
@@ -1782,6 +1789,7 @@ def test_b12x_kda_decode_buffers_match_live_gate_layout(
 
     layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
     torch.nn.Module.__init__(layer)
+    layer.cache_config = CacheConfig()
     layer.enable_b12x_kda_decode = True
     layer.gate_lower_bound = -5.0
     layer.head_dim = 128
@@ -1873,6 +1881,7 @@ def test_b12x_kda_trial_buffers_preserve_declared_layout(
 
     layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
     torch.nn.Module.__init__(layer)
+    layer.cache_config = CacheConfig()
     layer.head_dim = 4
     layer.local_num_heads = 3
     layer.model_config = SimpleNamespace(dtype=torch.float32)
@@ -1972,6 +1981,7 @@ def test_b12x_kda_decode_preparation_releases_synthetic_activations(
 ):
     layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
     torch.nn.Module.__init__(layer)
+    layer.cache_config = CacheConfig()
     layer.enable_b12x_kda_decode = True
     layer.head_dim, layer.local_num_heads = 128, 2
     layer.local_projection_size = 256
@@ -2100,7 +2110,7 @@ def test_b12x_kda_prefill_live_inputs_after_preparation():
     layer.kda_prefill_backend = "b12x"
     layer.head_dim, layer.local_num_heads = 128, 2
     layer.model_config = SimpleNamespace(dtype=torch.bfloat16)
-    layer.cache_config = SimpleNamespace(mamba_cache_dtype="auto")
+    layer.cache_config = CacheConfig()
     layer.A_log = torch.zeros(2, device=device)
     layer.dt_bias = torch.zeros(2, 128, device=device)
     layer.gate_lower_bound = -5.0
@@ -2220,6 +2230,7 @@ def test_glm_adaptive_kda_graph_matches_independent_request_states(
 
     layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
     torch.nn.Module.__init__(layer)
+    layer.cache_config = CacheConfig()
     layer.prefix = "model.layers.0.self_attn"
     layer.head_dim, layer.local_num_heads = dim, heads
     layer.local_projection_size = heads * dim
