@@ -215,13 +215,17 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
   exit 1
 fi
 HUMMING_NVRTC_LIB_DIR="$(
-  "${PYTHON_BIN}" -c \
-    'import sysconfig; print(sysconfig.get_path("purelib") + "/nvidia/cu13/lib")'
+  "${PYTHON_BIN}" - <<'PY'
+from pathlib import Path
+
+from humming.utils.nvrtc import get_nvrtc_library_path
+
+library_dir = Path(get_nvrtc_library_path()).parent
+if not any(library_dir.glob("libnvrtc-builtins.so*")):
+    raise FileNotFoundError(f"Humming NVRTC builtins not found: {library_dir}")
+print(library_dir)
+PY
 )"
-if [[ ! -f "${HUMMING_NVRTC_LIB_DIR}/libnvrtc-builtins.so.13.0" ]]; then
-  echo "Humming CUDA 13 NVRTC builtins not found: ${HUMMING_NVRTC_LIB_DIR}" >&2
-  exit 1
-fi
 if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
   echo "Model config not found: ${MODEL_PATH}/config.json" >&2
   exit 1
