@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Split-KV paged decode attention for the GLM-5.3 DFlash draft on SM120.
+"""Split-KV paged decode attention for GLM-5.3 DFlash on SM120-family GPUs.
 
 The DFlash2 draft's five layers attend over a 2048-token sliding window with
 eight query tokens per request and GQA 4 (8 heads over 2 KV heads, head size
@@ -155,7 +155,8 @@ def _load(device: torch.device) -> ctypes.CDLL:
 def is_available(device: torch.device) -> bool:
     if not torch.cuda.is_available() or device.type != "cuda":
         return False
-    if torch.cuda.get_device_capability(device) != (12, 0):
+    # Compile for the device's native architecture, including GB10 (SM121).
+    if torch.cuda.get_device_capability(device)[0] != 12:
         return False
     try:
         _load(device)
