@@ -803,7 +803,7 @@ def test_profile_cudagraph_memory_frees_throwaway_pool(monkeypatch, native_bytes
     def _fake_set_current_vllm_config(_cfg):
         yield
 
-    runner = _make_profiling_runner(CUDAGraphMode.FULL_AND_PIECEWISE)
+    runner = _make_profiling_runner(CUDAGraphMode.FULL_AND_PIECEWISE, num_full_descs=0)
     runner.compilation_config.static_forward_context = {}
     runner.model_state = SimpleNamespace(supports_mm_inputs=False)
     runner.cache_config = SimpleNamespace(num_gpu_blocks=1)

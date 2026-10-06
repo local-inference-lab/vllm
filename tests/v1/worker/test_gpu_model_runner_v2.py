@@ -661,6 +661,9 @@ def test_profile_run_releases_generic_outputs_before_deepseek_profile(
     runner.supports_mm_inputs = False
     runner.max_num_tokens = 4096
     runner.is_last_pp_rank = False
+    runner.model = torch.nn.Module()
+    runner.speculator = None
+    runner._draft_workspace_lane = 1
     runner.compilation_config = SimpleNamespace(static_forward_context={})
     events: list[object] = []
     output_refs: list[ref] = []
