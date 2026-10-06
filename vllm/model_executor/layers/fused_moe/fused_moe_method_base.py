@@ -163,6 +163,13 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 "This MoE backend cannot coordinate arena-backed shared-expert scratch"
             )
         rows = hidden_states.shape[0]
+        hidden_dim = self.moe.hidden_dim
+        # Workspace geometry follows the prepared activation storage width.
+        if (
+            impl.fused_experts.quant_dtype == "nvfp4"
+            and not impl.fused_experts.expects_unquantized_inputs
+        ):
+            hidden_dim //= 2
         workspace, shared_workspace = impl._allocate_buffers(
             hidden_states.dtype,
             impl.fused_experts.output_dtype,
@@ -170,7 +177,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             rows,
             rows,
             self.moe.intermediate_size_per_partition,
-            self.moe.hidden_dim,
+            hidden_dim,
             self.moe.experts_per_token,
             self.moe.num_experts,
             self.moe.num_local_experts,
@@ -209,6 +216,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         topk_ids: torch.Tensor,
         shared_experts: "SharedExperts | None",
         shared_experts_input: torch.Tensor | None,
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """
         Apply the MoE operation using modular kernels.

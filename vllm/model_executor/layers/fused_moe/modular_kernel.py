@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from math import prod
@@ -856,7 +856,7 @@ class FusedMoEExpertsModular(FusedMoEExperts):
         Inputs:
         - M: number of tokens.
         - N: Row (or column) dimension of expert weights.
-        - K: hidden dimension
+        - K: prepared activation storage width (packed for NVFP4).
         - topk: The number of top-k experts to select.
         - global_num_experts: global number of experts.
         - local_num_experts: local number of experts due to DP/EP.
@@ -1173,6 +1173,7 @@ class FusedMoEKernelModularImpl:
         )
 
         shared_output_storage = out_dtype is in_dtype or out_dtype is workspace_dtype
+        specs: tuple[tuple[tuple[int, ...], torch.dtype], ...]
         if shared_output_storage:
             max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
             specs = (
@@ -1190,6 +1191,7 @@ class FusedMoEKernelModularImpl:
 
         # All arena-backed buffers live across shared/routed overlap are leased
         # together. Neither consumer may request another overlapping arena view.
+        buffers: Sequence[torch.Tensor]
         if current_platform.is_cpu():
             # CPU kernels own their scratch and bypass the context-local arena.
             buffers = tuple(
