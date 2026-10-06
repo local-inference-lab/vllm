@@ -1,0 +1,21 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-b12x-kda-packed-beta-stride",
+  "category": "fix",
+  "summary": "Prepare KDA decode with the packed projection output stride",
+  "models": [
+    "GLM-5.3-Flash",
+    "Kimi-Linear"
+  ],
+  "compatibility": "B12X KDA decode accepts MXFP8 projections whose packed output has alignment padding; logical gate widths and head offsets remain unchanged.",
+  "details": [
+    "Decode preparation derives the beta row stride from finalized packed MXFP8 weights after loading.",
+    "The 8598-column GLM TP3 projection retains its logical slices while its beta view advances by 8600 storage columns."
+  ],
+  "requires": [
+    "vllm-b12x-mxfp8-logical-output-tail"
+  ],
+  "pull_requests": [
+    889
+  ]
+}

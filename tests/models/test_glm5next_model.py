@@ -1775,10 +1775,11 @@ def test_glm5next_b12x_kda_plan_reserves_null_state_zero(monkeypatch) -> None:
     assert all(probe() is None for probe in probes)
 
 
+@pytest.mark.parametrize("packed_padding", [0, 2])
 @pytest.mark.parametrize("extra_padding", [0, 16])
 @pytest.mark.parametrize("use_full_rank_gate", [False, True])
 def test_b12x_kda_decode_buffers_match_live_gate_layout(
-    monkeypatch, use_full_rank_gate: bool, extra_padding: int
+    monkeypatch, use_full_rank_gate: bool, extra_padding: int, packed_padding: int
 ) -> None:
     class FakeApi:
         bind_kda = run_kda = object()
@@ -1793,8 +1794,8 @@ def test_b12x_kda_decode_buffers_match_live_gate_layout(
     layer.enable_b12x_kda_decode = True
     layer.gate_lower_bound = -5.0
     layer.head_dim = 128
-    layer.local_num_heads = 16
-    layer.local_projection_size = 16 * 128
+    layer.local_num_heads = 22
+    layer.local_projection_size = 22 * 128
     layer.use_full_rank_gate = use_full_rank_gate
     layer.in_proj_padding = 0
     live_width = (
@@ -1823,15 +1824,19 @@ def test_b12x_kda_decode_buffers_match_live_gate_layout(
 
     layer._initialize_b12x_kda_decode(vllm_config)
 
+    # Weight packing completes after decoder capacity buffers are initialized.
+    layer.in_proj_qkvgfab.b12x_mxfp8_packed_weight = SimpleNamespace(
+        out_features=live_width + packed_padding
+    )
     _, raw_g, raw_beta, _, _ = layer._b12x_kda_decode_probes()
-    assert raw_g.shape == (16, 16, 128)
+    assert raw_g.shape == (16, 22, 128)
     assert sum(t.numel() * t.element_size() for t in layer.buffers()) < 1024
     beta_offset = (
         4 * layer.local_projection_size + layer.head_dim
         if use_full_rank_gate
         else 3 * layer.local_projection_size
     )
-    live_beta = torch.empty(16, live_width).narrow(
+    live_beta = torch.empty(16, live_width + packed_padding).narrow(
         1, beta_offset, layer.local_num_heads
     )
     assert raw_beta.shape == live_beta.shape
@@ -2189,8 +2194,9 @@ def test_b12x_kda_prefill_live_inputs_after_preparation():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("tokens", [3, 12])
+@pytest.mark.parametrize("packed_padding", [False, True])
 def test_glm_adaptive_kda_graph_matches_independent_request_states(
-    monkeypatch, tokens, request
+    monkeypatch, tokens, request, packed_padding
 ):
     from dataclasses import replace
 
@@ -2275,6 +2281,15 @@ def test_glm_adaptive_kda_graph_matches_independent_request_states(
     layer._b12x_kda_state_indices = torch.zeros(
         (requests, columns), dtype=torch.int32, device=device
     )
+    if packed_padding:
+        logical_width = 3 * heads * dim + heads + dim
+        physical_width = (logical_width + 7) // 8 * 8
+        layer._b12x_kda_beta_row_width = logical_width
+        layer._b12x_kda_beta_offset = 3 * heads * dim
+        layer.in_proj_qkvgfab = SimpleNamespace(
+            output_size_per_partition=logical_width,
+            b12x_mxfp8_packed_weight=SimpleNamespace(out_features=physical_width),
+        )
     plan = layer._b12x_kda_decode_declaration(33)
     layer._b12x_kda_plan = plan
     session = PreparationSession(device=device, autotune=False)
@@ -2304,6 +2319,13 @@ def test_glm_adaptive_kda_graph_matches_independent_request_states(
         g2=torch.randn(tokens, heads, dim, dtype=torch.bfloat16, device=device),
         beta=torch.randn(1, tokens, heads, dtype=torch.bfloat16, device=device),
     )
+    if packed_padding:
+        beta_storage = torch.randn(
+            tokens, physical_width, dtype=torch.bfloat16, device=device
+        )
+        inputs["beta"] = beta_storage.narrow(
+            1, layer._b12x_kda_beta_offset, heads
+        ).unsqueeze(0)
     output = torch.empty(1, tokens, heads, dim, dtype=torch.bfloat16, device=device)
 
     def run():
@@ -2360,14 +2382,17 @@ def test_glm_adaptive_kda_graph_matches_independent_request_states(
             )
             context.attn_metadata[layer.prefix] = single
             context.additional_kwargs.clear()
-            # Per-request views of the four-head beta and of the accepted
-            # counts start below the declared 16-byte pointer alignment, so
-            # the reference binds copies; served batches bind prefixes.
+            # Reference requests retain the prepared row stride and alignment.
+            beta = inputs["beta"][:, start:stop]
+            reference_beta = torch.empty_strided(
+                beta.shape, beta.stride(), dtype=beta.dtype, device=beta.device
+            )
+            reference_beta.copy_(beta)
             layer._forward(
                 mixed_qkv=inputs["mixed_qkv"][start:stop],
                 g1=inputs["g1"][:, start:stop],
                 g2=inputs["g2"][start:stop],
-                beta=inputs["beta"][:, start:stop].clone(),
+                beta=reference_beta,
                 core_attn_out=expected[:, start:stop],
             )
         torch.testing.assert_close(graph_output, expected, atol=0, rtol=0)

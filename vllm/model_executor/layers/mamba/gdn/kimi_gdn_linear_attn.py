@@ -745,9 +745,13 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         dtype, device = self.model_config.dtype, self._b12x_kda_num_tokens.device
         mixed_qkv = torch.empty((rows, 3 * heads * dim), dtype=dtype, device=device)
-        beta_storage = torch.empty(
-            (rows, self._b12x_kda_beta_row_width), dtype=dtype, device=device
+        projection = getattr(self, "in_proj_qkvgfab", None)
+        packed = getattr(projection, "b12x_mxfp8_packed_weight", None)
+        # Packing can append physical rows after capacity buffers initialize.
+        beta_row_width = (
+            packed.out_features if packed is not None else self._b12x_kda_beta_row_width
         )
+        beta_storage = torch.empty((rows, beta_row_width), dtype=dtype, device=device)
         raw_beta = beta_storage.narrow(1, self._b12x_kda_beta_offset, heads)
         raw_g, z, output = (
             torch.empty((rows, heads, dim), dtype=dtype, device=device)
