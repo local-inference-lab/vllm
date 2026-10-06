@@ -7,6 +7,7 @@ from vllm.config import SchedulerConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.core.boundary_checkpoint import BoundaryCheckpointCache
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
@@ -928,6 +929,38 @@ def test_round_robin_prioritizes_never_scheduled_prefills(opt_model_path):
 
     assert "long" not in output.num_scheduled_tokens
     assert output.num_scheduled_tokens == {"short": 8, "medium": 8}
+
+
+@pytest.mark.parametrize("admission_closed_by", ["full-running-set", "paused-new"])
+def test_queued_prefills_leave_lanes_to_running_prefills(
+    opt_model_path, admission_closed_by
+):
+    """Requests that cannot be admitted must not hold prefill lanes.
+
+    Never-scheduled requests rank first for lanes. While no queued request can
+    be admitted, lanes given to them left the running chunked prefills
+    unscheduled, so every step scheduled nothing and the engine stalled.
+    """
+    scheduler = _create_interleaving_scheduler(
+        opt_model_path,
+        max_parallel_prefills=2,
+        max_num_seqs=2 if admission_closed_by == "full-running-set" else 4,
+    )
+    for request in create_requests(
+        num_requests=2, num_tokens=64, req_ids=["running0", "running1"]
+    ):
+        scheduler.add_request(request)
+    _update(scheduler, scheduler.schedule())
+    for request in create_requests(
+        num_requests=2, num_tokens=64, req_ids=["queued0", "queued1"]
+    ):
+        scheduler.add_request(request)
+    if admission_closed_by == "paused-new":
+        scheduler.set_pause_state(PauseState.PAUSED_NEW)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"running0": 8, "running1": 8}
 
 
 def test_decode_aware_reserves_one_lane_for_nearest_decode(opt_model_path):
