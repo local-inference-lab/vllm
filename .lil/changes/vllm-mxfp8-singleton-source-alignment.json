@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-mxfp8-singleton-source-alignment",
+  "category": "fix",
+  "summary": "Stage unaligned singleton MXFP8 inputs in reserved scratch",
+  "models": ["GLM-5.3-Flash"],
+  "authors": ["lukealonso"],
+  "compatibility": "Prepared B12X kernels retain their aligned-input contract. The adapter reserves one BF16 input row alongside GEMM scratch and copies only an unaligned singleton view.",
+  "details": [
+    "GLM TP3 KDA gate projections accept a contiguous single-row view whose source offset is not sixteen-byte aligned.",
+    "Caller-provided workspaces include the aligned staging region, including kernels with no GEMM scratch. CUDA graph execution allocates no staging storage."
+  ],
+  "pull_requests": [889]
+}

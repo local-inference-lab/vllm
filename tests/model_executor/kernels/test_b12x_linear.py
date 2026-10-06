@@ -1822,8 +1822,11 @@ def test_b12x_dense_precision_gpu_graph_replay(
 
 @pytest.mark.parametrize("mode", ["a16", "quantized"])
 @pytest.mark.parametrize("with_bias", [False, True])
-def test_b12x_mxfp8_tp3_kda_width_graph_replay(monkeypatch, tmp_path, mode, with_bias):
-    """The TP3 KDA projection keeps 8598 logical columns through N8 packing."""
+@pytest.mark.parametrize("projection", ["in_proj", "f_b_proj"])
+def test_b12x_mxfp8_tp3_kda_width_graph_replay(
+    monkeypatch, tmp_path, mode, with_bias, projection
+):
+    """TP3 KDA projections preserve logical columns and sliced-input alignment."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("SM120 required")
     blockscaled = pytest.importorskip("b12x.gemm.blockscaled")
@@ -1832,11 +1835,16 @@ def test_b12x_mxfp8_tp3_kda_width_graph_replay(monkeypatch, tmp_path, mode, with
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
         _mxfp8_e4m3_quantize_torch,
     )
-    from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        init_workspace_manager,
+        reset_workspace_manager,
+        use_preallocated_workspace,
+    )
 
     monkeypatch.setenv("VLLM_B12X_MXFP8_ACTIVATION_MODE", mode)
     torch.manual_seed(75)
-    n, k = 8598, 4096
+    n, k = (8598, 4096) if projection == "in_proj" else (2816, 128)
     weight = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
     scales = torch.full((n, k // 32), 127, device="cuda", dtype=torch.uint8)
     layer = torch.nn.Module()
@@ -1849,7 +1857,7 @@ def test_b12x_mxfp8_tp3_kda_width_graph_replay(monkeypatch, tmp_path, mode, with
     try:
         kernel.process_weights_after_loading(layer)
         packed = layer.b12x_mxfp8_packed_weight
-        assert packed.out_features == 8600
+        assert packed.out_features == (8600 if projection == "in_proj" else n)
         session, _ = _prepare(
             layer,
             device=torch.device("cuda"),
@@ -1861,12 +1869,26 @@ def test_b12x_mxfp8_tp3_kda_width_graph_replay(monkeypatch, tmp_path, mode, with
             torch.randn(n, device="cuda", dtype=torch.bfloat16) if with_bias else None
         )
         for rows in (1, 8, 32):
-            source = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
+            if projection == "f_b_proj":
+                carrier = torch.randn(rows, 8600, device="cuda", dtype=torch.bfloat16)
+                source = carrier[:, 8470:8598]
+                assert source.stride() == (8600, 1)
+                assert source.data_ptr() % 16 == 12
+                assert source.is_contiguous() == (rows == 1)
+            else:
+                source = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
             kernel.apply_weights(layer, source, bias)
+            reserved = torch.empty(
+                layer.b12x_linear.get_workspace_size(rows),
+                dtype=torch.uint8,
+                device="cuda",
+            )
+            current_workspace_manager().lock()
             graph = torch.cuda.CUDAGraph()
             with (
                 kernel_resolution_guard("MXFP8 logical output tail"),
                 session.capture(),
+                use_preallocated_workspace(reserved),
             ):
                 with torch.cuda.graph(graph):
                     output = kernel.apply_weights(layer, source, bias)
@@ -2775,6 +2797,7 @@ def _holder_with_prepared_state(monkeypatch, *, required_workspace: int):
     )
 
     holder = B12xBlockscaledLinear.__new__(B12xBlockscaledLinear)
+    holder.recipe = "nvfp4"
     holder.layer_name = "layer.linear"
     holder.packed = types.SimpleNamespace(out_features=8, in_features=16)
     holder.activation_scale = None
@@ -2786,7 +2809,7 @@ def _holder_with_prepared_state(monkeypatch, *, required_workspace: int):
     calls = []
 
     def mm(*args, **kwargs):
-        calls.append(kwargs)
+        calls.append(dict(kwargs, source=args[0]))
         return "out"
 
     monkeypatch.setattr(
@@ -2876,6 +2899,56 @@ def test_b12x_holder_preserves_arena_backed_projection_input(monkeypatch, offset
         calls[-1]["workspace"].fill_(255)
         torch.testing.assert_close(source[:rows], expected[:rows], rtol=0, atol=0)
         assert manager.available_bytes() == 1024
+
+
+@pytest.mark.parametrize("required_workspace", [0, 65])
+@pytest.mark.parametrize("preallocated", [False, True])
+def test_b12x_mxfp8_holder_stages_unaligned_singleton_in_reserved_workspace(
+    monkeypatch, required_workspace, preallocated
+):
+    import contextlib
+
+    import vllm.v1.worker.workspace as workspace
+
+    holder, calls = _holder_with_prepared_state(
+        monkeypatch, required_workspace=required_workspace
+    )
+    holder.recipe = "mxfp8"
+    needed = (required_workspace + 15) // 16 * 16 + 32
+    assert holder.get_workspace_size(1) == needed
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    manager = workspace.WorkspaceManager(torch.device("cpu"))
+    monkeypatch.setattr(workspace, "current_workspace_manager", lambda: manager)
+    (arena,) = manager.get_simultaneous(((1024,), torch.uint8))
+    manager.lock()
+    source = arena[2:34].view(torch.bfloat16).view(1, 16)
+    expected = torch.arange(16, dtype=torch.bfloat16).view(1, 16)
+    reserved = arena[256 : 256 + needed]
+    context = (
+        workspace.use_preallocated_workspace(reserved)
+        if preallocated
+        else contextlib.nullcontext()
+    )
+    with context:
+        for value in (1, 2):
+            source.copy_(expected * value)
+            holder.run(source, None)
+            staged = calls[-1]["source"]
+            assert staged.data_ptr() % 16 == 0
+            assert staged.data_ptr() != source.data_ptr()
+            torch.testing.assert_close(staged, source, rtol=0, atol=0)
+            if required_workspace:
+                scratch = calls[-1]["workspace"]
+                assert scratch.numel() == required_workspace
+                assert scratch.data_ptr() + scratch.numel() <= staged.data_ptr()
+                scratch.fill_(255)
+            else:
+                assert calls[-1]["workspace"] is None
+            torch.testing.assert_close(source, expected * value, rtol=0, atol=0)
+            if preallocated:
+                assert reserved.data_ptr() <= staged.data_ptr()
+                assert staged.data_ptr() + 32 <= reserved.data_ptr() + needed
+            assert manager.available_bytes() == 1024
 
 
 def test_b12x_linear_methods_report_their_kernel_scratch_requirement() -> None:

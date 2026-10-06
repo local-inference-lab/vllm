@@ -235,10 +235,19 @@ class B12xBlockscaledLinear:
                 f"{self.layer_name}: block-scaled linear has no declared plan"
             )
         if plan.prepared is None:
-            return sum(spec.nbytes for spec in plan.scratch_specs())
+            return self._workspace_size(
+                sum(spec.nbytes for spec in plan.scratch_specs())
+            )
         from b12x.preparation import require_prepared
 
-        return int(require_prepared(plan, COMPONENT).required_workspace)
+        return self._workspace_size(
+            int(require_prepared(plan, COMPONENT).required_workspace)
+        )
+
+    def _workspace_size(self, kernel_bytes: int) -> int:
+        if self.recipe == "mxfp8":
+            return (kernel_bytes + 15) // 16 * 16 + self.in_features * 2
+        return kernel_bytes
 
     def run(self, source: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
         """Execute the prepared regime for ``source``; op-body only."""
@@ -250,8 +259,9 @@ class B12xBlockscaledLinear:
         from b12x.preparation import require_prepared
 
         state = require_prepared(plan, COMPONENT, source.device)
+        required_workspace = self._workspace_size(state.required_workspace)
         workspace = None
-        if state.required_workspace:
+        if required_workspace:
             from vllm.v1.worker.workspace import (
                 current_preallocated_workspace,
                 current_workspace_manager,
@@ -260,16 +270,16 @@ class B12xBlockscaledLinear:
             reserved = current_preallocated_workspace()
             if reserved is not None:
                 reserved = reserved.view(torch.uint8)
-                if reserved.numel() < state.required_workspace:
+                if reserved.numel() < required_workspace:
                     raise ValueError(
                         f"{self.layer_name}: reserved scratch holds {reserved.numel()} "
-                        f"bytes, the prepared regime needs {state.required_workspace}"
+                        f"bytes, the prepared regime needs {required_workspace}"
                     )
-                workspace = reserved[: state.required_workspace]
+                workspace = reserved[:required_workspace]
             else:
                 manager = current_workspace_manager()
                 (workspace,) = manager.get_simultaneous(
-                    ((state.required_workspace,), torch.uint8)
+                    ((required_workspace,), torch.uint8)
                 )
                 source_end = source.data_ptr() + source.numel() * source.element_size()
                 if (
@@ -281,8 +291,24 @@ class B12xBlockscaledLinear:
                     live_bytes = source_end - workspace.data_ptr()
                     _, workspace = manager.get_simultaneous(
                         ((live_bytes,), torch.uint8),
-                        ((state.required_workspace,), torch.uint8),
+                        ((required_workspace,), torch.uint8),
                     )
+            if (
+                self.recipe == "mxfp8"
+                and source.numel() == self.in_features
+                and source.data_ptr() % 16
+            ):
+                # A singleton slice is contiguous even when its offset is unaligned.
+                offset = (state.required_workspace + 15) // 16 * 16
+                aligned_source = workspace[offset:].view(torch.bfloat16).view_as(source)
+                aligned_source.copy_(source)
+                source = aligned_source
+            if self.recipe == "mxfp8":
+                workspace = (
+                    workspace[: state.required_workspace]
+                    if state.required_workspace
+                    else None
+                )
         api = get_b12x_blockscaled()
         assert api is not None
         return api.mm(
