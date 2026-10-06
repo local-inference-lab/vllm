@@ -1491,6 +1491,12 @@ class MLADCPManager:
         parallel_config = vllm_config.parallel_config
         self.group = get_dcp_group()
         self.device = torch.device(device)
+        if self.device.type == "meta":
+            # Online quantization builds the weights on the meta device; the
+            # exchange buffers belong on this rank's GPU.
+            self.device = torch.device(
+                current_platform.device_type, torch.accelerator.current_device_index()
+            )
         self.num_ubatches = max(parallel_config.num_ubatches, 1)
         self.max_num_tokens = get_dcp_workspace_max_num_tokens(vllm_config)
         self.use_a2a = parallel_config.dcp_comm_backend == "a2a"
