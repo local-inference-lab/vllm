@@ -62,8 +62,12 @@ def test_mla_dflash2_maps_context_and_norm_checkpoint_names(monkeypatch):
 
 
 def test_mla_dflash2_uses_distributed_topk_without_full_logit_gather():
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+
     processor = Mock()
-    head = object()
+    head = Mock(spec=VocabParallelEmbedding)
     states = torch.zeros(3, 8)
     model = SimpleNamespace(
         lm_head=head,
