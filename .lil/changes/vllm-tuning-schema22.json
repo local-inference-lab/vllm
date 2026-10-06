@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-tuning-schema22",
+  "category": "fix",
+  "summary": "Invalidate FlashInfer tuning decisions and startup memory plans with revision 22",
+  "models": ["all"],
+  "compatibility": "The first startup retunes FlashInfer operations and reprofiles startup memory plans. Existing cache files and configured cache directories are preserved.",
+  "details": [
+    "Include tuning revision 22 in the shared FlashInfer cache key, covering single-rank, rank-union, sparse-MLA, and PCIe all-reduce caches.",
+    "Require rank-union marker revision 22 before loading cached decisions on distributed ranks.",
+    "Store startup memory plans with schema revision 22 and reject earlier plan schemas."
+  ],
+  "authors": ["Luke Alonso"]
+}

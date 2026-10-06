@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
+    FLASHINFER_TUNING_CACHE_VERSION,
     RANK_UNION_CACHE_NAME,
     RANK_UNION_MARKER_KEY,
     load_autotune_cache_on_all_ranks,
@@ -149,7 +150,10 @@ def test_merge_unions_rank_specific_keys() -> None:
         "moe_ep2",
     }
     assert merged["_records"] == {"ns": {"x": 1}}
-    assert merged[RANK_UNION_MARKER_KEY] == {"version": 1, "world_size": WORLD}
+    assert merged[RANK_UNION_MARKER_KEY] == {
+        "version": FLASHINFER_TUNING_CACHE_VERSION,
+        "world_size": WORLD,
+    }
     assert merged["_generation"] != "a"
     # Deterministic output for identical inputs.
     assert merge_rank_autotune_configs(configs, WORLD)[0] == contents
@@ -194,6 +198,18 @@ def test_warm_start_hits_on_every_rank(tmp_path) -> None:
     # Fresh processes: every rank finds its own EP key, so none profiles.
     warm = _autotune_pass(cache_path, [_FakeTuner() for _ in range(WORLD)])
     assert warm == [[] for _ in range(WORLD)]
+
+
+@pytest.mark.parametrize("version", [None, 1, 21, 23])
+def test_other_union_revision_is_ignored_by_all_ranks(tmp_path, version) -> None:
+    cache_path = tmp_path / RANK_UNION_CACHE_NAME
+    contents, _ = merge_rank_autotune_configs([{"gemm_m128": ["R", 1]}], WORLD)
+    config = json.loads(contents)
+    config[RANK_UNION_MARKER_KEY]["version"] = version
+    cache_path.write_text(json.dumps(config))
+
+    misses = _autotune_pass(cache_path, [_FakeTuner() for _ in range(WORLD)])
+    assert misses == [_rank_keys(rank) for rank in range(WORLD)]
 
 
 def test_leader_only_cache_is_ignored_by_all_ranks(tmp_path) -> None:

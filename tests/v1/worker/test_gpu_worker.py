@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from weakref import ref
@@ -178,6 +180,24 @@ def test_startup_plan_apply_gate(plan_env):
     explicit = _plan_worker(kv_bytes=7 * GiB_bytes)
     maybe_apply_startup_plan(explicit)
     assert explicit.cache_config.kv_cache_memory_bytes == 7 * GiB_bytes
+
+
+def test_startup_plan_revision_rejects_existing_plan(plan_env):
+    worker = _plan_worker()
+    with patch.object(startup_plan, "PLAN_SCHEMA_VERSION", 1):
+        previous = startup_plan.compute_plan_fingerprint(worker.vllm_config, 0, 1)
+        maybe_save_startup_plan(worker, 50 * GiB_bytes)
+
+    fingerprint = startup_plan.compute_plan_fingerprint(worker.vllm_config, 0, 1)
+    assert fingerprint != previous
+    maybe_apply_startup_plan(worker)
+    assert worker.cache_config.kv_cache_memory_bytes is None
+
+    payload = json.loads(Path(startup_plan._plan_path(previous)).read_text())
+    payload["fingerprint"] = fingerprint
+    Path(startup_plan._plan_path(fingerprint)).write_text(json.dumps(payload))
+    maybe_apply_startup_plan(worker)
+    assert worker.cache_config.kv_cache_memory_bytes is None
 
 
 def test_startup_plan_survives_profiling_config_rewrites(plan_env):

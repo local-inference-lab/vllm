@@ -21,6 +21,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+FLASHINFER_TUNING_CACHE_VERSION = 22
+
 
 def read_flashinfer_autotune_cache(cache_path: Path) -> bytes | None:
     """Treat interrupted JSON writes as cache misses, not model-load failures."""
@@ -53,7 +55,8 @@ def save_flashinfer_autotune_cache(cache_path: Path, tuner: "AutoTuner") -> None
 
 def flashinfer_autotune_cache_hash(runner: "GPUModelRunner") -> str:
     config_hash = runner.vllm_config.compute_hash(include_version=False)
-    return hashlib.sha256(config_hash.encode()).hexdigest()
+    identity = f"{FLASHINFER_TUNING_CACHE_VERSION}:{config_hash}"
+    return hashlib.sha256(identity.encode()).hexdigest()
 
 
 def resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
@@ -142,7 +145,9 @@ def write_flashinfer_autotune_cache(cache_path: Path, contents: bytes) -> None:
 # profiling while its peers miss and enter synchronized (all-reduced)
 # profiling, which deadlocks. Older leader-only files use the base name and
 # are never read for a multi-rank world.
-RANK_UNION_CACHE_NAME = "autotune_configs.allranks-v1.json"
+RANK_UNION_CACHE_NAME = (
+    f"autotune_configs.allranks-v{FLASHINFER_TUNING_CACHE_VERSION}.json"
+)
 RANK_UNION_MARKER_KEY = "_vllm_rank_union"
 _METADATA_KEY = "_metadata"
 _GENERATION_KEY = "_generation"
@@ -200,7 +205,10 @@ def merge_rank_autotune_configs(
     ordered[_GENERATION_KEY] = hashlib.sha256(
         json.dumps(ordered, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    ordered[RANK_UNION_MARKER_KEY] = {"version": 1, "world_size": world_size}
+    ordered[RANK_UNION_MARKER_KEY] = {
+        "version": FLASHINFER_TUNING_CACHE_VERSION,
+        "world_size": world_size,
+    }
     return json.dumps(ordered, indent=2).encode(), sorted(set(conflicts))
 
 
@@ -217,7 +225,11 @@ def read_rank_union_cache(contents: bytes, world_size: int) -> bytes | None:
     if not isinstance(config, dict):
         return None
     marker = config.pop(RANK_UNION_MARKER_KEY, None)
-    if not isinstance(marker, dict) or marker.get("world_size") != world_size:
+    if (
+        not isinstance(marker, dict)
+        or marker.get("version") != FLASHINFER_TUNING_CACHE_VERSION
+        or marker.get("world_size") != world_size
+    ):
         return None
     return json.dumps(config, indent=2).encode()
 
