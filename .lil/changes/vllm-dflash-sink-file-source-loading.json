@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-dflash-sink-file-source-loading",
+  "category": "fix",
+  "summary": "Load DFlash attention sink shards directly into their parameters",
+  "models": [
+    "MiMo DFlash",
+    "Qwen DFlash"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "Preserve checkpoint file-source views while loading per-head sink biases with the native B12X loader.",
+    "Shard directly into each rank parameter and zero-fill padded attention heads without allocating an intermediate meta tensor."
+  ],
+  "authors": [
+    "Luke Alonso"
+  ]
+}

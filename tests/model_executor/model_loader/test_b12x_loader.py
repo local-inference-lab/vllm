@@ -279,6 +279,58 @@ def test_hyperconnection_weights_load_without_allocator_hooks(tmp_path, monkeypa
     torch.testing.assert_close(norm.weight.cpu(), expected)
 
 
+@pytest.mark.skipif(not torch.accelerator.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "tp_size,rank", [(1, 0), (2, 0), (2, 1), (3, 0), (3, 1), (3, 2)]
+)
+def test_dflash_sink_shards_preserve_file_sources(tmp_path, monkeypatch, tp_size, rank):
+    """Route per-head sinks into final parameters, including padded TP tails."""
+    from vllm.model_executor.models import qwen3_dflash as dflash
+    from vllm.model_executor.weight_transfer import weight_transfer
+
+    monkeypatch.setattr(dflash, "get_tensor_model_parallel_world_size", lambda: tp_size)
+    monkeypatch.setattr(dflash, "get_tensor_model_parallel_rank", lambda: rank)
+    monkeypatch.setenv("VLLM_DFLASH_COMPACT_ROPE", "0")
+    for name in (
+        "QKVParallelLinear",
+        "RowParallelLinear",
+        "DFlashAttention",
+        "RMSNorm",
+        "get_rope",
+    ):
+        monkeypatch.setattr(dflash, name, lambda *args, **kwargs: torch.nn.Identity())
+    heads = 8
+    padded_heads = ((heads + tp_size - 1) // tp_size) * tp_size
+    expected = torch.arange(heads, dtype=torch.float32) / 4
+    name = "layers.0.self_attn.attention_sink_bias"
+    path = tmp_path / "dflash-sinks.safetensors"
+    save_file({name: expected}, path)
+    model = dflash.DFlashQwen3Model.__new__(dflash.DFlashQwen3Model)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(num_attention_heads=padded_heads)
+    model.layers = torch.nn.ModuleList([torch.nn.Module()])
+    with (
+        DirectWeightSession() as session,
+        weight_transfer(session),
+        torch.device("cuda"),
+    ):
+        model.layers[0].self_attn = dflash.DFlashQwen3Attention(
+            hidden_size=padded_heads * 16,
+            num_heads=padded_heads,
+            num_kv_heads=1,
+            head_dim=16,
+            rope_parameters={},
+            add_swa_attention_sink_bias=True,
+        )
+        assert model.load_weights(session.weights([path])) == {name}
+    width = padded_heads // tp_size
+    padded = torch.nn.functional.pad(expected, (0, padded_heads - heads))
+    torch.testing.assert_close(
+        model.layers[0].self_attn.attention_sink_bias.cpu(),
+        padded[rank * width : (rank + 1) * width],
+    )
+
+
 @pytest.mark.parametrize("scale_first", [False, True])
 @pytest.mark.parametrize("quantization", ["mxfp8", "block_fp8"])
 def test_glm_attention_dequantization_reads_owned_checkpoint_inputs(

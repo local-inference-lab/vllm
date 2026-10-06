@@ -44,6 +44,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.parameter import copy_tensor_parallel_shard
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.weight_transfer import flush_weight_transfers
 from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
@@ -323,6 +324,12 @@ class DFlashQwen3Attention(nn.Module):
             else None
         )
 
+        if self.attention_sink_bias is not None:
+            set_weight_attrs(
+                self.attention_sink_bias,
+                {"weight_loader": self._load_attention_sink_bias},
+            )
+
         self.sliding_window = sliding_window
         self.attn = DFlashAttention(
             self.num_heads,
@@ -339,6 +346,18 @@ class DFlashQwen3Attention(nn.Module):
         self.causal = causal
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+
+    def _load_attention_sink_bias(
+        self, param: nn.Parameter, loaded_weight: torch.Tensor
+    ) -> None:
+        copy_tensor_parallel_shard(
+            param.data,
+            loaded_weight,
+            0,
+            get_tensor_model_parallel_rank() * self.num_heads,
+            self.num_heads,
+            allow_padding=True,
+        )
 
     def forward(
         self,
@@ -1126,33 +1145,9 @@ class DFlashQwen3Model(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-    def _preprocess(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> Iterable[tuple[str, torch.Tensor]]:
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
-        for name, loaded_weight in weights:
-            if "attention_sink_bias" in name:
-                # Sink bias is per-head; shard it across TP ranks like the
-                # attention heads themselves.
-                heads_per_rank = self.config.num_attention_heads // tp_size
-                shard = loaded_weight.new_empty(heads_per_rank)
-                copy_tensor_parallel_shard(
-                    shard,
-                    loaded_weight,
-                    0,
-                    tp_rank * heads_per_rank,
-                    heads_per_rank,
-                    allow_padding=True,
-                )
-                loaded_weight = shard
-            yield name, loaded_weight
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(
-            self._preprocess(weights), mapper=self.hf_to_vllm_mapper
-        )
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
