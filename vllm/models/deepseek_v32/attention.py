@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 
 class DeepseekV32Indexer(nn.Module):
     indexer_cache_cls = DeepseekV32IndexerCache
-    indexer_op_cls = SparseAttnIndexer
+    indexer_op_cls: ClassVar[type[nn.Module]] = SparseAttnIndexer
 
     @staticmethod
     def get_indexer_op_kwargs(vllm_config: VllmConfig) -> dict[str, Any]:
