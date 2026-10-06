@@ -9,7 +9,7 @@ import regex as re
 import torch
 
 import vllm.envs as envs
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -34,6 +34,7 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
     MoEPrepareAndFinalizeNoDPEPModular,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import set_default_torch_num_threads
 
 from .modelopt import ModelOptMixedPrecisionConfig
@@ -209,6 +210,14 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
         self.layer_index = int(match.group(1))
         self.num_experts, self.hidden_size = num_experts, hidden_size
         self.local_intermediate = intermediate_size_per_partition
+        # A TP-padded expert (GLM-5.3 at TP6) keeps its checkpoint width.
+        vllm_config = get_current_vllm_config_or_none()
+        model_config = getattr(vllm_config, "model_config", None)
+        self.checkpoint_width = getattr(
+            getattr(model_config, "hf_text_config", None),
+            "original_moe_intermediate_size",
+            None,
+        )
         for name in ("w13_weight", "w2_weight"):
             layer.register_buffer(
                 name, torch.empty(0, dtype=torch.uint8), persistent=False
@@ -230,7 +239,12 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
         )
         device = layer.w13_weight.device
         e, h, n = self.num_experts, self.hidden_size, self.local_intermediate
-        shapes = ((e, 2 * n, h // 16), (e, h, n // 16))
+        # Native E4M3 scale storage: the F8_128x4 grid (rows in 128s, k-groups
+        # in 4s), which TP-padded shards (GLM-5.3 TP6: 352 channels) fill.
+        shapes = (
+            (e, round_up(2 * n, 128), h // 16),
+            (e, h, round_up(n // 16, 4)),
+        )
         if self.owner.scale_scratch is None:
             self.owner.scale_scratch = tuple(
                 torch.empty(s, dtype=torch.float8_e4m3fn, device=device) for s in shapes
@@ -240,18 +254,20 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
             tuple(t.shape) != s or t.device != device for t, s in zip(scratch, shapes)
         ):
             raise ValueError("NVFP4-CSF shared scratch geometry/device mismatch")
+        width = self.checkpoint_width or n * tp
         with set_default_torch_num_threads(1):
             weights = read_nvfp4_csf_layer(
                 self.owner.checkpoint_root,
                 self.layer_index,
                 num_experts=e,
                 hidden_size=h,
-                intermediate_size=n * tp,
+                intermediate_size=width,
                 tp_rank=rank,
                 tp_size=tp,
                 device=device,
                 w13_scale_scratch=scratch[0],
                 w2_scale_scratch=scratch[1],
+                local_size=None if width == n * tp else n,
             )
         packed = weights.packed
         layer_max = envs.VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE
