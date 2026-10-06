@@ -952,6 +952,68 @@ def test_restore_past_its_bounded_wait_is_admitted_to_recompute(monkeypatch):
     assert not cache.external_boundary_wait_expired(waiter.request_id)
 
 
+def run_contended_steps(scheduler, steps):
+    """Schedule steps, charging each contended one to its compute class."""
+    outputs = []
+    for _ in range(steps):
+        output = scheduler.schedule()
+        if output.compute_service_class is not None:
+            scheduler.record_compute_time(
+                output.compute_service_class, 0.01, contended=True
+            )
+        outputs.append(output)
+    return outputs
+
+
+@pytest.mark.parametrize("slots", ["full", "free"])
+def test_decodes_on_a_full_pool_preempt_while_restores_wait(slots):
+    """A prefill turn that schedules nothing still lets decodes preempt.
+
+    Waiting restores keep compute sharing contended, so every step after the
+    first decode quantum is a prefill turn, whether the restores wait behind
+    full running slots or for GPU capacity. When a decode then needs a block
+    from a full pool, that turn must preempt like a decode turn; otherwise
+    every later step is empty and nothing changes.
+    """
+    from tests.v1.core.utils import create_requests
+
+    scheduler, cache, connector = import_scheduler(
+        max_num_seqs=2 if slots == "full" else 3,
+        num_blocks=17,
+        **compute_share_fixture_options(0.4),
+    )
+    first, second = create_requests(
+        num_requests=2, num_tokens=60, max_tokens=64, req_ids=["first", "second"]
+    )
+    for req in (first, second):
+        scheduler.add_request(req)
+    assert scheduler.schedule().num_scheduled_tokens == {"first": 60, "second": 60}
+    assert cache.block_pool.get_num_free_blocks() == 0
+    restores = [request(name, name) for name in ("restore-a", "restore-b")]
+    polled = []
+
+    def poll(req):
+        polled.append(req.request_id)
+        if req not in restores:
+            return True
+        assert reserve_import(cache, req, prefix=128) is None
+        return False
+
+    connector.poll_boundary_checkpoint.side_effect = poll
+    scheduler.connector = connector
+    for req in restores:
+        scheduler.add_request(req)
+    # Four decode steps fill the last block; the fifth needs a new one.
+    outputs = run_contended_steps(scheduler, 8)
+    assert all(output.num_scheduled_tokens for output in outputs)
+    assert second.num_preemptions == 1
+    assert first.status == RequestStatus.RUNNING
+    assert first.num_computed_tokens == 68
+    # With a slot free the restores compete, and their wait is bounded, again.
+    assert {"restore-a", "restore-b"} <= set(polled)
+    assert cache._boundary_import_waiters.keys() == {"restore-a", "restore-b"}
+
+
 def test_reset_with_running_requests_releases_ready_unadmitted_import():
     """A cache reset drops a finished restore; its request then recomputes."""
     scheduler, cache, connector = import_scheduler()
@@ -1101,56 +1163,3 @@ def test_future_working_reserve_blocks_beyond_immediate_allocation(can_defer):
     drain(cache)
     cache.free(active)
     assert cache.block_pool.get_num_free_blocks() == 127
-
-
-def run_contended_steps(scheduler, steps):
-    """Schedule steps, charging each contended one to its compute class."""
-    outputs = []
-    for _ in range(steps):
-        output = scheduler.schedule()
-        if output.compute_service_class is not None:
-            scheduler.record_compute_time(
-                output.compute_service_class, 0.01, contended=True
-            )
-        outputs.append(output)
-    return outputs
-
-
-def test_decodes_on_a_full_pool_preempt_in_an_empty_prefill_turn():
-    """A prefill turn that schedules nothing still lets decodes preempt.
-
-    Requests waiting behind full running slots keep compute sharing contended,
-    so every step after the first decode quantum is a prefill turn. When a
-    decode then needs a block from a full pool, that turn must preempt like a
-    decode turn; otherwise every later step is empty and nothing changes.
-    """
-    from tests.v1.core.utils import create_requests
-
-    scheduler = make_scheduler(
-        enable_prefix_caching=True,
-        use_v2_model_runner=True,
-        async_scheduling=True,
-        max_num_seqs=2,
-        num_blocks=17,
-        **compute_share_fixture_options(0.4),
-    )
-    scheduler.kv_cache_manager.boundary_checkpoints = BoundaryCheckpointCache(
-        scheduler.kv_cache_manager.block_pool
-    )
-    first, second = create_requests(
-        num_requests=2, num_tokens=60, max_tokens=64, req_ids=["first", "second"]
-    )
-    for req in (first, second):
-        scheduler.add_request(req)
-    assert scheduler.schedule().num_scheduled_tokens == {"first": 60, "second": 60}
-    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 0
-    for req in create_requests(
-        num_requests=2, num_tokens=40, req_ids=["waiting-a", "waiting-b"]
-    ):
-        scheduler.add_request(req)
-    # Four decode steps fill the last block; the fifth needs a new one.
-    outputs = run_contended_steps(scheduler, 8)
-    assert all(output.num_scheduled_tokens for output in outputs)
-    assert second.num_preemptions == 1
-    assert first.status == RequestStatus.RUNNING
-    assert first.num_computed_tokens == 68
