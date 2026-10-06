@@ -182,10 +182,12 @@ class TestGlm47ExtractToolCalls:
         r = glm47_tool_parser.extract_tool_calls(out, request=mock_request)
         assert r.content is None
 
-    def test_whitespace_content_none(self, glm47_tool_parser, mock_request):
+    def test_whitespace_content_preserved(self, glm47_tool_parser, mock_request):
+        # GLM templates render content verbatim before the first call, so
+        # whitespace the model generated there is kept for the next turn.
         out = "  \n  <tool_call>get_current_date</tool_call>"
         r = glm47_tool_parser.extract_tool_calls(out, request=mock_request)
-        assert r.content is None
+        assert r.content == "  \n  "
 
 
 def _reset(parser):

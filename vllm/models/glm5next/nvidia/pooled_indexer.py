@@ -18,6 +18,9 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import LayerNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    get_and_maybe_dequant_weights,
+)
 from vllm.models.deepseek_v4.nvidia.b12x_indexer import (
     B12xC4SparseIndexer,
 )
@@ -236,7 +239,7 @@ class Glm5NextPooledIndexer(nn.Module):
             hidden_size,
             _INDEX_HEADS,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.weights_proj",
         )
         self.k_norm = LayerNorm(_INDEX_HEAD_DIM, eps=1e-6)
@@ -490,7 +493,11 @@ class Glm5NextPooledIndexer(nn.Module):
 
     def _project_head_weights(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._weights_proj_fp32 is None:
-            self._weights_proj_fp32 = self.weights_proj.weight.detach().float()
+            # Honor quantized checkpoint and online weights while retaining the
+            # selector's FP32 projection arithmetic.
+            self._weights_proj_fp32 = get_and_maybe_dequant_weights(
+                self.weights_proj, out_dtype=torch.float32
+            ).detach()
         return F.linear(hidden_states.float(), self._weights_proj_fp32)
 
     @staticmethod

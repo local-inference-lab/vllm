@@ -1,0 +1,23 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-ds41-bf16-attention-fp32-heads",
+  "category": "change",
+  "summary": "DeepSeek-V4.1 computes attention in BF16 and logits in FP32 like the reference",
+  "models": [
+    "DeepSeek-V4.1-Flash"
+  ],
+  "compatibility": "VLLM_DS41_ATTENTION_COMPUTE=auto restores the previous tuner choice (FP8 or BF16 per plan); --hf-overrides '{\"head_dtype\": \"model\"}' restores BF16 logits. Output token streams change within numerical noise.",
+  "details": [
+    "b12x V4.1 sparse attention is pinned to BF16 arithmetic (BF16 Q, KV dequantized to BF16, BF16 P, FP32 accumulation) instead of the tuner's FP8 internals, which carried about 3% relative error against DeepSeek's reference sparse_attn. Measured throughput on 4x RTX PRO 6000 is unchanged.",
+    "VLLM_DS41_ATTENTION_COMPUTE=reference also runs decode rows single-pass, reproducing the reference kernel bit for bit at up to 17% lower low-concurrency decode speed.",
+    "On RTX PRO / SM120, DeepSeek-V4.1 (target and DSpark draft) defaults to head_dtype=float32: the LM head accumulates into FP32 logits instead of rounding them to BF16 steps of up to 1/8, matching the reference head. Measured decode speed is unchanged.",
+    "head_dtype=float32 no longer rejects runtime-quantized LM heads (for example the optional NVFP4 DSpark drafter and Markov heads): their logits are widened to FP32."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    911
+  ],
+  "requires": []
+}

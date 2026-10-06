@@ -9,7 +9,9 @@ import torch
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.distributed.parallel_state import declare_b12x_fused_allreduce_rms_norm_sites
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.model_executor.layers import l2_prefetch
 from vllm.model_executor.layers.fused_embed_norm import (
     fused_embed_norm,
     has_full_vocab_on_rank,
@@ -149,12 +151,24 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
         else:
             # The previous layer's MLP/MoE output is left un-reduced; fuse its
             # all-reduce into this input_layernorm.
+            l2_prefetch.issue(
+                hidden_states,
+                getattr(self, "_l2_prefetch_weights", None),
+                l2_prefetch.MOE_WINDOW,
+            )
             hidden_states, residual = fused_allreduce_rms_norm(
                 hidden_states, residual, self.input_layernorm
             )
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
+        # Load this layer's attention output projection into L2 beside the
+        # attention kernels; ordered on the normalised block input.
+        l2_prefetch.issue(
+            hidden_states,
+            getattr(self, "_l2_prefetch_attn_weights", None),
+            l2_prefetch.ATTN_WINDOW,
+        )
         # self_attn's o_proj runs reduce_results=False; reduce before RMSNorm.
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
         if self.use_sequence_parallel:
@@ -231,17 +245,41 @@ class DeepseekV32Model(torch.nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        if getattr(config, "model_type", None) == "glm_moe_dsa":
+            l2_prefetch.register_attention_layers(
+                self.layers, self.start_layer, self.end_layer
+            )
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+        if not self.use_sequence_parallel:
+            self._declare_fused_allreduce_rms_norm_sites()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
 
         self.aux_hidden_state_layers = tuple[int, ...]()
         self.num_redundant_experts = parallel_config.eplb_config.num_redundant_experts
+
+    def _declare_fused_allreduce_rms_norm_sites(self) -> None:
+        # The model is not torch.compiled, so fused_allreduce_rms_norm calls
+        # the B12X fused operation directly; it runs only for declared sites.
+        # Each post-attention norm follows the o_proj all-reduce, each later
+        # layer's input norm the previous layer's MLP/MoE all-reduce.
+        norms = []
+        for idx in range(self.start_layer, self.end_layer):
+            layer = self.layers[idx]
+            if idx > self.start_layer:
+                norms.append((f"layers.{idx}.input_layernorm", layer.input_layernorm))
+            post = layer.post_attention_layernorm
+            norms.append((f"layers.{idx}.post_attention_layernorm", post))
+        if isinstance(self.norm, RMSNorm):
+            norms.append(("norm", self.norm))
+        declare_b12x_fused_allreduce_rms_norm_sites(
+            self, norms, self.config.hidden_size, "deepseek_v32"
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -300,6 +338,7 @@ class DeepseekV32Model(torch.nn.Module):
                 )
             hidden_states, residual = layer(positions, hidden_states, residual, attn_in)
             attn_in = None
+        l2_prefetch.join(hidden_states)
 
         if not get_pp_group().is_last_rank:
             assert not self.use_sequence_parallel, (

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 import os
 import weakref
 from collections.abc import Callable, Sequence
@@ -235,6 +236,7 @@ class B12xPcieAllReduce:
         self._dma: Any | None = None
         self._is_capturing = False
         self._capture_stream: torch.cuda.Stream | None = None
+        self.fused_max_rows = 0
         self.global_ranks = tuple(
             int(rank)
             for rank in (
@@ -306,6 +308,11 @@ class B12xPcieAllReduce:
 
         assert runtime is not None
         self._runtime = runtime
+        # Rows one fused all-reduce + RMSNorm launch may carry (one CTA per
+        # row), when the runtime publishes it; larger inputs go elsewhere.
+        max_rows = getattr(runtime, "fused_max_rows", None)
+        if isinstance(max_rows, int) and max_rows > 0:
+            self.fused_max_rows = max_rows
         self._initialize_dma(dma_cls)
         self._twoshot: Any | None = None
         self.twoshot_max_bytes = 0
@@ -501,8 +508,10 @@ class B12xPcieAllReduce:
             ):
                 return "dma"
         elif invocation.operation == "all_reduce_fused_add_rms_norm":
+            rows = math.prod(invocation.shape[:-1])
             if (
                 nbytes <= self.fused_max_bytes
+                and (not self.fused_max_rows or rows <= self.fused_max_rows)
                 and getattr(self._runtime, "algorithm", "oneshot") == "oneshot"
             ):
                 return "oneshot_fused"
@@ -777,9 +786,13 @@ class B12xPcieAllReduce:
 
     @staticmethod
     def _plan_key(operation, shape, dtype, strides, weight=None, epsilon=None):
-        norm = None if operation == "all_reduce" else (id(weight), epsilon)
-        # Singleton strides do not affect addresses. Trimmed TP projections
-        # can retain a padded row stride when only one logical row is live.
+        # Parameter aliases retain the same storage identity.
+        norm = (
+            None
+            if operation == "all_reduce"
+            else (weight.data_ptr() if weight is not None else None, epsilon)
+        )
+        # Singleton strides do not affect padded TP projection addresses.
         address_strides = tuple(
             0 if size == 1 else stride for size, stride in zip(shape, strides)
         )

@@ -26,6 +26,8 @@ from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from .glm53_fp8_dense import enable_glm53_fp8_dense
+from .glm53_low_latency_gemm import enable_glm53_low_latency_gemm
 from .model import (
     GLM5NEXT_PACKED_MODULES_MAPPING,
     Glm5NextDecoderLayer,
@@ -33,6 +35,7 @@ from .model import (
     _try_load_fp8_attn_proj,
     _try_load_mxfp8_bf16_attn_proj,
     get_spec_layer_idx_from_weight_name,
+    host_embedding_if_requested,
 )
 from .mtp_draft_head import QuantizedDraftHead, make_quantized_draft_head
 from .pooled_indexer import Glm5NextPooledIndexer
@@ -135,6 +138,7 @@ class Glm5NextMultiTokenPredictor(nn.Module):
             config.hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
+        host_embedding_if_requested(self.embed_tokens)
         # Plain list for the per-propose lookup: ModuleDict[str(...)] builds a
         # string and hashes it on every draft step.
         self._mtp_layers = list(self.layers.values())
@@ -279,6 +283,9 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         self.model = Glm5NextMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        # TP3-only decode GEMM selection; both are no-ops at other TP sizes.
+        enable_glm53_low_latency_gemm(self.model, vllm_config.model_config.dtype)
+        enable_glm53_fp8_dense(self.model, draft=True)
         head = self.model._mtp_layers[0].shared_head.head
         self.has_own_lm_head = head.runtime_lm_head_quantization == "nvfp4"
         self.checkpoint_weight_name_prefixes = self._checkpoint_weight_name_prefixes()

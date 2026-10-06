@@ -526,7 +526,11 @@ class DelegatingParser(Parser):
                     for tc in tool_call_info.tool_calls
                 )
                 content = tool_call_info.content
-                if content and content.strip() == "":
+                if (
+                    content
+                    and content.strip() == ""
+                    and tool_parser.drops_whitespace_only_content
+                ):
                     content = None
             else:
                 # No tool calls.

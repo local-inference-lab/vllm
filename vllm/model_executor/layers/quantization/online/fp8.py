@@ -117,6 +117,7 @@ class OnlineLinearBase(LinearMethodBase):
     weights onto meta device and materializes them just-in-time."""
 
     uses_meta_device: bool = True
+    _online_target_prefix: str | None = None
 
     def __init__(self):
         self.out_dtype = torch.get_default_dtype()

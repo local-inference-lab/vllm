@@ -76,6 +76,33 @@ def mxfp8_head_config(monkeypatch, default_vllm_config):
 
 
 @pytest.mark.cpu_test
+def test_fp32_head_dtype_widens_quantized_head_logits(mxfp8_head_config):
+    """A runtime-quantized head (e.g. the NVFP4 DSpark drafter head) keeps its
+    own kernel under an FP32 head_dtype; its logits are widened, not rejected."""
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
+    mxfp8_head_config.model_config.head_dtype = torch.float32
+    processor = LogitsProcessor(8)
+    calls = []
+
+    class QuantizedHeadMethod:
+        def apply(self, layer, x, bias=None):
+            calls.append(x.dtype)
+            return x @ layer.weight.t()
+
+    head = SimpleNamespace(
+        quant_method=QuantizedHeadMethod(),
+        weight=torch.randn(8, 4).bfloat16(),
+        tp_size=1,
+    )
+    hidden = torch.randn(3, 4, dtype=torch.bfloat16)
+    logits = processor(head, hidden, skip_gather=True)
+    assert calls == [torch.bfloat16]
+    assert logits.dtype == torch.float32
+    torch.testing.assert_close(logits, (hidden @ head.weight.t()).float())
+
+
+@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     ("env_value", "enabled"), [(None, False), ("0", False), ("1", True)]
 )
@@ -104,7 +131,10 @@ def test_runtime_mxfp8_only_selects_lm_head(
 @pytest.mark.cpu_test
 def test_runtime_mxfp8_rejects_quantized_checkpoint(monkeypatch, mxfp8_head_config):
     monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", "1")
-    quant_config = SimpleNamespace(get_quant_method=lambda *args, **kwargs: object())
+    quant_config = SimpleNamespace(
+        get_quant_method=lambda *args, **kwargs: object(),
+        online_quantization_config=None,
+    )
     with pytest.raises(ValueError, match="requires an unquantized LM head"):
         ParallelLMHead(256, 128, quant_config=quant_config, disable_tp=True)
 
@@ -136,7 +166,10 @@ def test_runtime_lm_head_defaults_preserve_ineligible_heads(
         monkeypatch.setattr(vocab.current_platform, "is_cuda", lambda: False)
     existing = SimpleNamespace(create_weights=lambda *args, **kwargs: None)
     quant_config = (
-        SimpleNamespace(get_quant_method=lambda *a, **kw: existing)
+        SimpleNamespace(
+            get_quant_method=lambda *a, **kw: existing,
+            online_quantization_config=None,
+        )
         if fallback == "quantized"
         else None
     )

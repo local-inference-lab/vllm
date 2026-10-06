@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-932",
+  "category": "fix",
+  "summary": "GLM responses keep the whitespace the model generated in reasoning and before tool calls, so the next turn can reuse the cached response",
+  "models": ["GLM-5.3-Flash"],
+  "compatibility": "With the glm45/glm47 parsers, reasoning can now end in the newline the model generated, content before tool calls keeps its surrounding whitespace, and whitespace-only content before a tool call is returned instead of null. Nothing changes when the model generates no whitespace there. Other parsers are unchanged.",
+  "details": [
+    "A follow-up request reuses a hybrid model's response checkpoint only when the returned assistant message re-renders to the tokens the model generated. The parser trimmed reasoning, stripped content before tool calls and dropped whitespace-only content, which no chat template can restore, so the whole previous response was prefilled again.",
+    "Together with the runtime's GLM chat template (docker-110), a CPU reproduction with the deployed GLM-5.3 tokenizer reuses about 99.7% of the next prompt instead of 79% when the previous answer or reasoning ended in a newline or content preceded a tool call on its own line."
+  ],
+  "pull_requests": [932],
+  "requires": []
+}

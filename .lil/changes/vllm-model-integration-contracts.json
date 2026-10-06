@@ -1,0 +1,20 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-model-integration-contracts",
+  "category": "fix",
+  "summary": "Preserve model optimization opt-ins and atomic distributed autotune caches",
+  "models": [
+    "MiMo-V2.6-Flash-RL",
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "Experimental MiMo router weighting, GEMV, L2 prefetch, vocabulary sampling, and uncapped prefill switches default to off; explicit environment values still win.",
+  "details": [
+    "Rank-union FlashInfer cache loading treats malformed JSON as a collective miss and all writes publish complete serialized state atomically.",
+    "Sparse attention plans retain storage-keyed weight identity and existing singleton-stride normalization."
+  ],
+  "pull_requests": [
+    889,
+    881,
+    990
+  ]
+}

@@ -11,6 +11,8 @@ ROCm's fused ``torch.mm`` branch and SM120's router branches are both guarded on
 ``not bias`` so a biased gate cannot silently drop its bias term.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -62,7 +64,15 @@ def _make_gate(
             lambda: True,
         )
     if is_rocm:
-        import vllm.platforms.rocm as rocm_platform
+        # The module resolves its architecture at import time. Mock that
+        # hardware probe too, so eligibility tests remain device-free.
+        with monkeypatch.context() as probe:
+            probe.setattr(
+                torch.cuda,
+                "get_device_properties",
+                lambda *args, **kwargs: SimpleNamespace(gcnArchName=""),
+            )
+            import vllm.platforms.rocm as rocm_platform
 
         monkeypatch.setattr(rocm_platform, "on_gfx950", lambda: on_gfx950)
 
@@ -192,7 +202,7 @@ def test_sm120_enables_bf16_fp32_paths_without_datacenter_kernels(monkeypatch):
 
     assert gate.allow_ll_bf16_gemm
     assert not gate.allow_specialized_router_gemm
-    assert not gate.allow_dsv3_router_gemm
+    assert not gate.allow_fp32_router_gemm
     assert gate.allow_cublas_router_gemm
 
 
@@ -276,6 +286,11 @@ def test_sm120_capture_preserves_router_graph_pool_layout(monkeypatch):
         lambda: object(),
     )
     monkeypatch.setattr(torch, "mm", lambda *args, **kwargs: expected)
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "sm120_cublas_router_gemm",
+        gate_linear_mod.sm120_cublas_router_gemm_impl,
+    )
 
     output, output_bias = gate(x)
 
