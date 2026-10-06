@@ -61,6 +61,18 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
         assert scales.dtype == MXFP8_SCALE_DTYPE and scales.ndim == 2
         out_features, in_features = map(int, weight.shape)
         assert in_features % MXFP8_BLOCK_SIZE == 0
+        layer.b12x_mxfp8_output_size = out_features
+        padded_out_features = (out_features + 7) // 8 * 8
+        if padded_out_features != out_features:
+            padded_weight = weight.new_zeros((padded_out_features, in_features))
+            padded_weight[:out_features].copy_(weight)
+            weight = padded_weight
+            # E8M0 byte 127 is a unit scale for the artificial zero rows.
+            padded_scales = scales.new_full(
+                (max(padded_out_features, scales.shape[0]), scales.shape[1]), 127
+            )
+            padded_scales[:out_features].copy_(scales[:out_features])
+            scales = padded_scales
         api = _import_b12x_blockscaled()
         assert api is not None
         packed = api.pack_weight(
@@ -76,7 +88,7 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
             layer, "b12x_activation_mode", None
         ) or get_b12x_dense_activation_mode("mxfp8")
         layer.b12x_bf16_input_supported = (
-            in_features % 128 == 0 and out_features % 8 == 0
+            in_features % 128 == 0 and padded_out_features % 8 == 0
         )
         name = b12x_layer_prefix(layer)
         # A reload into the same packed storage keeps the holder and its
@@ -119,10 +131,16 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
         if source.dtype != torch.bfloat16:
             raise ValueError("prepared vLLM MXFP8 path requires BF16 activations")
         out_features = int(layer.b12x_mxfp8_packed_weight.out_features)
+        logical_out_features = layer.b12x_mxfp8_output_size
+        padded = logical_out_features != out_features
         output = run_b12x_blockscaled_linear(
-            source, bias, out_features, layer.b12x_layer_name
+            source, None if padded else bias, out_features, layer.b12x_layer_name
         )
-        return output.view(*x.shape[:-1], out_features)
+        if padded:
+            output = output[:, :logical_out_features]
+            if bias is not None:
+                output.add_(bias)
+        return output.view(*x.shape[:-1], logical_out_features)
 
 
 __all__ = ["B12xMxfp8LinearKernel"]

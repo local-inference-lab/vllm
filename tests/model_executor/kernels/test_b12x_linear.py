@@ -456,11 +456,15 @@ def test_b12x_mxfp8_support_respects_runtime_probe(monkeypatch) -> None:
     assert reason == "b12x.gemm.blockscaled is not supported"
 
 
-def test_b12x_mxfp8_process_weights_packs_modelopt_layout(monkeypatch) -> None:
+@pytest.mark.parametrize("out_features", [48, 50])
+def test_b12x_mxfp8_process_weights_packs_modelopt_layout(
+    monkeypatch, out_features
+) -> None:
     import vllm.model_executor.kernels.linear.mxfp8.b12x as b12x_mod
 
     calls = []
-    packed = types.SimpleNamespace(out_features=48)
+    padded_features = (out_features + 7) // 8 * 8
+    packed = types.SimpleNamespace(out_features=padded_features)
 
     def pack(weight: torch.Tensor, weight_scale: torch.Tensor):
         calls.append((weight, weight_scale))
@@ -475,7 +479,7 @@ def test_b12x_mxfp8_process_weights_packs_modelopt_layout(monkeypatch) -> None:
     layer = torch.nn.Module()
     layer.prefix = "model.layers.0.self_attn.qkv_proj"
     layer.weight = torch.nn.Parameter(
-        torch.empty((48, 128), dtype=torch.float8_e4m3fn),
+        torch.empty((out_features, 128), dtype=torch.float8_e4m3fn),
         requires_grad=False,
     )
     layer.weight_scale = torch.nn.Parameter(
@@ -493,7 +497,11 @@ def test_b12x_mxfp8_process_weights_packs_modelopt_layout(monkeypatch) -> None:
     assert layer.b12x_mxfp8_packed_weight is packed
     assert len(calls) == 1
     weight, weight_scale = calls[0]
-    assert weight.shape == (48, 128)
+    assert weight.shape == (padded_features, 128)
+    assert layer.b12x_mxfp8_output_size == out_features
+    if padded_features != out_features:
+        assert torch.count_nonzero(weight[out_features:].float()) == 0
+        assert torch.all(weight_scale[out_features:] == 127)
     # Preserve the checkpoint's padded row layout for native packed scales.
     assert weight_scale.shape == (64, 4)
     assert weight.dtype == torch.float8_e4m3fn
@@ -506,16 +514,19 @@ def test_b12x_mxfp8_process_weights_packs_modelopt_layout(monkeypatch) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
-def test_b12x_mxfp8_dequantizes_before_serving_plan_preparation(out_dtype) -> None:
+@pytest.mark.parametrize("rows", [8, 11])
+def test_b12x_mxfp8_dequantizes_before_serving_plan_preparation(
+    out_dtype, rows
+) -> None:
     from vllm.model_executor.layers.quantization.utils.quant_utils import (
         get_and_maybe_dequant_weights,
     )
 
     layer = torch.nn.Module()
     layer.prefix = "test.dequant.kv_b_proj"
-    values = torch.arange(8 * 96, device="cuda").reshape(8, 96).remainder(31)
+    values = torch.arange(rows * 96, device="cuda").reshape(rows, 96).remainder(31)
     values = (values - 15).to(torch.float8_e4m3fn)
-    scales = torch.arange(24, device="cuda").reshape(8, 3).remainder(5)
+    scales = torch.arange(rows * 3, device="cuda").reshape(rows, 3).remainder(5)
     scales = (scales + 124).to(torch.uint8)
     layer.weight = torch.nn.Parameter(values, requires_grad=False)
     layer.weight_scale = torch.nn.Parameter(scales, requires_grad=False)
@@ -931,6 +942,7 @@ def test_b12x_mxfp8_apply_delegates_to_layer_held_linear_holder(monkeypatch) -> 
 
     layer = torch.nn.Module()
     layer.b12x_mxfp8_packed_weight = types.SimpleNamespace(out_features=48)
+    layer.b12x_mxfp8_output_size = 48
     layer.b12x_linear = types.SimpleNamespace(run=fake_run)
     name = "mxfp8-apply-delegates-probe"
     layer.b12x_layer_name = _encode_layer_name(name)
@@ -1805,6 +1817,90 @@ def test_b12x_dense_precision_gpu_graph_replay(
             assert relative < 0.005
     finally:
         session.close()
+        reset_workspace_manager()
+
+
+@pytest.mark.parametrize("mode", ["a16", "quantized"])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_b12x_mxfp8_tp3_kda_width_graph_replay(monkeypatch, tmp_path, mode, with_bias):
+    """The TP3 KDA projection keeps 8598 logical columns through N8 packing."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("SM120 required")
+    blockscaled = pytest.importorskip("b12x.gemm.blockscaled")
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        _mxfp8_e4m3_quantize_torch,
+    )
+    from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
+
+    monkeypatch.setenv("VLLM_B12X_MXFP8_ACTIVATION_MODE", mode)
+    torch.manual_seed(75)
+    n, k = 8598, 4096
+    weight = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
+    scales = torch.full((n, k // 32), 127, device="cuda", dtype=torch.uint8)
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(scales, requires_grad=False)
+    kernel = object.__new__(B12xMxfp8LinearKernel)
+    reset_workspace_manager()
+    init_workspace_manager(torch.device("cuda"))
+    session = None
+    try:
+        kernel.process_weights_after_loading(layer)
+        packed = layer.b12x_mxfp8_packed_weight
+        assert packed.out_features == 8600
+        session, _ = _prepare(
+            layer,
+            device=torch.device("cuda"),
+            counts=(1, 8, 32),
+            fixed=(1, 8),
+            cache_dir=tmp_path,
+        )
+        bias = (
+            torch.randn(n, device="cuda", dtype=torch.bfloat16) if with_bias else None
+        )
+        for rows in (1, 8, 32):
+            source = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
+            kernel.apply_weights(layer, source, bias)
+            graph = torch.cuda.CUDAGraph()
+            with (
+                kernel_resolution_guard("MXFP8 logical output tail"),
+                session.capture(),
+            ):
+                with torch.cuda.graph(graph):
+                    output = kernel.apply_weights(layer, source, bias)
+                source.normal_()
+                allocated = torch.accelerator.memory_allocated()
+                pointer = output.data_ptr()
+                graph.replay()
+                torch.accelerator.synchronize()
+                assert torch.accelerator.memory_allocated() == allocated
+                assert output.data_ptr() == pointer
+            if mode == "a16":
+                expected = (source.float() @ weight.float().T).bfloat16()
+            else:
+                quantized = _mxfp8_e4m3_quantize_torch(source)
+                query = blockscaled.query_from_call(
+                    quantized, packed, out_dtype=source.dtype
+                )
+                expected = blockscaled.mm(
+                    quantized,
+                    packed,
+                    out_dtype=source.dtype,
+                    plan=blockscaled.plan(query),
+                )[:, :n]
+            if bias is not None:
+                expected = expected + bias
+            assert output.shape == (rows, n)
+            assert torch.isfinite(output).all()
+            relative = (
+                output.float() - expected.float()
+            ).norm() / expected.float().norm()
+            assert relative < 0.005
+    finally:
+        if session is not None:
+            session.close()
         reset_workspace_manager()
 
 

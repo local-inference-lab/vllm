@@ -524,9 +524,10 @@ def get_and_maybe_dequant_weights(
         # Weight preparation can run before serving GEMM plans are declared.
         scales = packed.weight.scale_rows.reshape(packed.out_features, -1)
         scales = scales[:, : packed.in_features // 32]
+        output_size = getattr(layer, "b12x_mxfp8_output_size", packed.out_features)
         return scaled_dequantize(
-            packed.weight.values[:, : packed.in_features],
-            scales.view(torch.float8_e8m0fnu).to(torch.float32),
+            packed.weight.values[:output_size, : packed.in_features],
+            scales[:output_size].view(torch.float8_e8m0fnu).to(torch.float32),
             group_shape=GroupShape(1, 32),
             out_dtype=out_dtype,
         )
