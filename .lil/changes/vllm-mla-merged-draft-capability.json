@@ -1,0 +1,12 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-mla-merged-draft-capability",
+  "category": "fix",
+  "summary": "Preserve non-causal decode capability when merging MLA cache specs",
+  "models": ["all"],
+  "compatibility": "Full-attention MLA cache groups retain the non-causal multi-token decode capability required by draft layers. Sliding-window MLA groups continue to require a uniform causal mode.",
+  "details": [
+    "Merged full-attention MLA specs enable the group capability when any member requires non-causal multi-token decode."
+  ],
+  "pull_requests": [858]
+}

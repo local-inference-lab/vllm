@@ -750,6 +750,9 @@ class MLAAttentionSpec(FullAttentionSpec):
             storage_block_size=storage_block_size_set.pop(),
             block_stride_alignment=block_stride_alignment_set.pop(),
             page_tail_bytes_per_token=page_tail_bytes_per_token_set.pop(),
+            non_causal_multi_token_decode=any(
+                spec.non_causal_multi_token_decode for spec in specs
+            ),
             dcp_replicated=dcp_replicated_set.pop(),
         )
         for spec in specs:

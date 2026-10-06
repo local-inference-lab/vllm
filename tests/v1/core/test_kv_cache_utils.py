@@ -4268,6 +4268,30 @@ def test_get_kv_cache_spec_sliding_window_unwraps_uniform_type_specs():
     assert get_kv_cache_spec_sliding_window(mixed_window_spec) is None
 
 
+@pytest.mark.parametrize("non_causal", [(False,), (True,), (False, True), (True, True)])
+def test_merge_mla_spec_preserves_non_causal_decode_capability(non_causal):
+    specs = [
+        replace(new_mla_spec(), non_causal_multi_token_decode=enabled)
+        for enabled in non_causal
+    ]
+    merged = MLAAttentionSpec.merge(specs)
+    assert merged.non_causal_multi_token_decode is any(non_causal)
+
+
+@pytest.mark.parametrize("non_causal", [(False, False), (True, True), (False, True)])
+def test_merge_sliding_mla_spec_requires_uniform_non_causal_decode(non_causal):
+    specs = [
+        replace(new_swa_mla_spec(), non_causal_multi_token_decode=enabled)
+        for enabled in non_causal
+    ]
+    if len(set(non_causal)) > 1:
+        with pytest.raises(AssertionError, match="non-causal mode"):
+            SlidingWindowMLASpec.merge(specs)
+    else:
+        merged = SlidingWindowMLASpec.merge(specs)
+        assert merged.non_causal_multi_token_decode is non_causal[0]
+
+
 def test_merge_mla_spec():
     kv_cache_specs = [
         new_mla_spec(),
