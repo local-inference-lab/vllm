@@ -3,7 +3,9 @@
   "id": "vllm-allocator-config-alias",
   "category": "fix",
   "summary": "Honor allocator configuration aliases during weight loading",
-  "models": [],
+  "models": [
+    "all"
+  ],
   "compatibility": "No user action required.",
   "details": [
     "Use PYTORCH_ALLOC_CONF when PYTORCH_CUDA_ALLOC_CONF is unset, preserving the CUDA allocator alias precedence.",

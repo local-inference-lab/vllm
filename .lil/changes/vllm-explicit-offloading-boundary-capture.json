@@ -3,7 +3,9 @@
   "id": "vllm-explicit-offloading-boundary-capture",
   "category": "fix",
   "summary": "Capture recurrent boundary state for explicitly configured offloading connectors",
-  "models": [],
+  "models": [
+    "hybrid attention and recurrent state models"
+  ],
   "compatibility": "No user action required.",
   "details": [
     "Frozen recurrent capture follows the effective OffloadingConnector, including MultiConnector children and configurations without kv_offloading_size.",

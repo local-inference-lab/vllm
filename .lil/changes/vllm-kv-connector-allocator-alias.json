@@ -3,10 +3,15 @@
   "id": "vllm-kv-connector-allocator-alias",
   "category": "fix",
   "summary": "Validate KV connector compatibility with both allocator configuration aliases",
-  "models": [],
+  "models": [
+    "all"
+  ],
   "compatibility": "Unsafe KV transports are rejected when expandable segments are enabled through either PyTorch allocator environment variable. CUDA-specific settings retain precedence.",
   "details": [
     "Recognize whitespace around expandable_segments settings and apply the same effective configuration used by CUDA weight loading."
   ],
-  "pull_requests": []
+  "pull_requests": [],
+  "authors": [
+    "Luke Alonso"
+  ]
 }
