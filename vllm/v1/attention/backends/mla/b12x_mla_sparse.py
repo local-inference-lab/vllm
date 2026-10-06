@@ -1356,6 +1356,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         cp_kv_cache_interleave_size = int(
             vllm_config.parallel_config.cp_kv_cache_interleave_size
         )
+        self._cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
         self._ckv_capacity_tokens = (
             max_ckv_tokens + self.dcp_world_size - 1
         ) // self.dcp_world_size + max_seqs * cp_kv_cache_interleave_size
@@ -1676,7 +1677,8 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
 
         The memory profile skips attention. Without this reservation, the
         first eligible prefill would grow the locked workspace by the gathered
-        cache receive buffer.
+        cache receive buffer. The selection remap kernels are compiled here
+        too, so that prefill does not compile them either.
         """
         if not (self._ckv_gather_enabled and self._kernel_page_size_finalized):
             return
@@ -1686,6 +1688,33 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 include_ckv=True,
             )
         )
+        assert self.topk_indices_buffer is not None
+        # Serving binds row slices of persistent buffers with these widths and
+        # strides; matching them selects the same compiled specializations.
+        device = self.topk_indices_buffer.device
+        rank_req = torch.zeros(
+            (self.dcp_world_size, self._max_seqs), dtype=torch.int32, device=device
+        )[:, :1]
+        selected = torch.empty((1, self._topk_tokens), dtype=torch.int32, device=device)
+        counts = torch.empty(1, dtype=torch.int32, device=device)
+        alignment = _ckv_rank_token_alignment(
+            self._kernel_page_size, self.dcp_world_size
+        )
+        # Rank spans are multiples of the alignment, with or without a factor
+        # of 16; the integer specialization differs between the two.
+        for padded_rank_tokens in (alignment, 2 * alignment):
+            _map_global_topk_to_gathered_ckv(
+                torch.zeros(1, dtype=torch.int32, device=device),
+                self.topk_indices_buffer[:1],
+                rank_req,
+                rank_req,
+                selected,
+                counts,
+                dcp_size=self.dcp_world_size,
+                cp_kv_cache_interleave_size=self._cp_kv_cache_interleave_size,
+                padded_rank_tokens=padded_rank_tokens,
+            )
+        _mask_page_table_after_nsa_len(selected, counts)
 
     def _borrow_workspaces(
         self,
