@@ -1,0 +1,22 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-989",
+  "category": "fix",
+  "summary": "The DFlash split-KV draft attention kernel runs on GB10 (DGX Spark) instead of being silently skipped",
+  "models": [
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "No change on RTX PRO 6000. On GB10, VLLM_GLM53_DFLASH_ATTN=1 now takes effect.",
+  "details": [
+    "The availability check required compute capability exactly 12.0; it now accepts the SM120 family, which includes GB10 (12.1). The kernel is compiled for the device's own architecture.",
+    "From #673 by original-el8: 40 kernel tests passed on GB10."
+  ],
+  "authors": [
+    "original-el8",
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    989
+  ],
+  "requires": []
+}
