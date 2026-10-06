@@ -114,39 +114,51 @@ def test_prepared_nvfp4_accepts_kernel_order_and_rejects_activation_change(monke
         backend.install_prepared_experts(layer, prepared)
 
 
+def _write_checkpoint(root, family, tensors):
+    from vllm.model_executor.model_loader.nvfp4_csf_loader import CODEC, SCHEMA
+
+    directory = root / "tensors"
+    directory.mkdir()
+    filename = "weights.safetensors"
+    save_file(tensors, directory / filename)
+    common = {"schema": SCHEMA, "codec": CODEC, "family": family}
+    (root / "manifest.json").write_text(
+        json.dumps({**common, "shards": [{"file": filename}]})
+    )
+    (root / "build-contract.json").write_text(
+        json.dumps({**common, "source_names": {k: filename for k in tensors}})
+    )
+
+
 @pytest.mark.parametrize("quant_method", ["nvfp4_csf"])
 @pytest.mark.parametrize("load_format", ["nvfp4_csf"])
+@pytest.mark.parametrize(
+    "family,layer_list,num_layers",
+    [
+        ("glm53_nvfp4", "model.language_model.layers", 45),
+        # GLM-5.3 (744B): the MTP layer 78 stores BF16 experts.
+        ("glm53_744b_nvfp4", "model.layers", 78),
+    ],
+)
 def test_loader_excludes_compressed_main_experts_and_retains_native_tensors(
-    tmp_path, quant_method, load_format
+    tmp_path, quant_method, load_format, family, layer_list, num_layers
 ):
     from vllm.model_executor.layers.quantization import get_quantization_config
     from vllm.model_executor.model_loader import get_model_loader
-    from vllm.model_executor.model_loader.nvfp4_csf_loader import CODEC, SCHEMA
 
-    directory = tmp_path / "tensors"
-    directory.mkdir()
-    filename = "weights.safetensors"
     tensors = {
-        "model.language_model.layers.3.mlp.experts.0.gate_proj.weight": torch.ones(
+        f"{layer_list}.3.mlp.experts.0.gate_proj.weight": torch.ones(
             8, dtype=torch.uint8
         ),
         (
-            "model.language_model.layers.3.mlp.experts.0.gate_proj."
-            "weight_scale.nvfp4_csf_fixed"
+            f"{layer_list}.3.mlp.experts.0.gate_proj.weight_scale.nvfp4_csf_fixed"
         ): torch.ones(8, dtype=torch.uint8),
-        "model.language_model.layers.45.mlp.experts.0.gate_proj.weight": torch.full(
+        f"{layer_list}.{num_layers}.mlp.experts.0.gate_proj.weight": torch.full(
             (8,), 42, dtype=torch.uint8
         ),
         "model.language_model.norm.weight": torch.ones(8, dtype=torch.bfloat16),
     }
-    save_file(tensors, directory / filename)
-    common = {"schema": SCHEMA, "codec": CODEC, "family": "glm53_nvfp4"}
-    (tmp_path / "manifest.json").write_text(
-        json.dumps({**common, "shards": [{"file": filename}]})
-    )
-    (tmp_path / "build-contract.json").write_text(
-        json.dumps({**common, "source_names": {k: filename for k in tensors}})
-    )
+    _write_checkpoint(tmp_path, family, tensors)
     config = SimpleNamespace(
         hf_config=SimpleNamespace(
             quantization_config={
@@ -154,7 +166,7 @@ def test_loader_excludes_compressed_main_experts_and_retains_native_tensors(
                 "checkpoint_root": str(tmp_path),
             }
         ),
-        hf_text_config=SimpleNamespace(num_hidden_layers=45),
+        hf_text_config=SimpleNamespace(num_hidden_layers=num_layers),
     )
     loader = get_model_loader(LoadConfig(load_format=load_format))
     assert isinstance(loader, Nvfp4CsfModelLoader)
@@ -163,6 +175,42 @@ def test_loader_excludes_compressed_main_experts_and_retains_native_tensors(
     assert set(actual) == {name for name in tensors if ".layers.3." not in name}
     for name, tensor in actual.items():
         assert torch.equal(tensor, tensors[name])
+
+
+def test_single_nvfp4_source_quantizes_the_modules_that_store_scales(tmp_path):
+    """GLM-5.3 (744B) declares one NVFP4 recipe whose ignore list misses its
+    BF16 MTP layer; the checkpoint's weight scales decide instead."""
+    names = (
+        "model.layers.3.mlp.experts.0.up_proj.weight",
+        "model.layers.3.mlp.experts.0.up_proj.weight_scale",
+        "model.layers.3.mlp.experts.1.down_proj.weight_scale",
+        "model.layers.3.self_attn.o_proj.weight",
+        "model.layers.78.mlp.experts.0.up_proj.weight",
+        "model.layers.78.self_attn.o_proj.weight",
+    )
+    _write_checkpoint(
+        tmp_path,
+        "glm53_744b_nvfp4",
+        {name: torch.ones(1, dtype=torch.uint8) for name in names},
+    )
+    owner = Nvfp4CsfConfig.from_config(
+        {
+            "format_version": 1,
+            "checkpoint_root": str(tmp_path),
+            "source_quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "NVFP4",
+                "ignore": ["lm_head", "model.layers.3.self_attn*"],
+            },
+        }
+    )
+    assert owner.quantized_layers == {
+        "model.layers.3.mlp.experts": {"quant_algo": "NVFP4", "group_size": 16}
+    }
+    assert owner._resolve_quant_algo("model.layers.3.mlp.experts") == "NVFP4"
+    assert owner._resolve_quant_algo("model.layers.78.mlp.experts") is None
+    assert owner._resolve_quant_algo("model.layers.78.self_attn.o_proj") is None
+    assert owner.is_layer_excluded("model.layers.3.self_attn.o_proj")
 
 
 @pytest.mark.parametrize("rank", [0, 1])
