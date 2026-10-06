@@ -183,6 +183,7 @@ class TestDirectDCPGating:
     def test_p2p_probe_checks_both_directions(self, monkeypatch, p2p_available):
         group = MagicMock(world_size=2, local_rank=2, cpu_group=object())
         cp_common._cuda_p2p_spans_group.cache_clear()
+        monkeypatch.setenv("VLLM_SKIP_P2P_CHECK", "0")
         monkeypatch.setattr(cp_common.current_platform, "is_cuda", lambda: True)
 
         def gather_local_ranks(output, value, *, group):
@@ -200,6 +201,34 @@ class TestDirectDCPGating:
             assert peer_checks.call_count == 2
         else:
             assert peer_checks.call_args.args == (3, 2)
+
+    def test_p2p_probe_trusts_the_driver_by_default(self, monkeypatch):
+        """VLLM_SKIP_P2P_CHECK (default on) skips the IPC probe, which can
+        hang on PCIe hosts, as it does for the custom all-reduce."""
+        group = MagicMock(world_size=2, local_rank=0, cpu_group=object())
+        cp_common._cuda_p2p_spans_group.cache_clear()
+        monkeypatch.delenv("VLLM_SKIP_P2P_CHECK", raising=False)
+        monkeypatch.setattr(cp_common.current_platform, "is_cuda", lambda: True)
+        monkeypatch.setattr(
+            cp_common.current_platform,
+            "logical_device_id_to_visible_device_id",
+            lambda device: device + 4,
+        )
+
+        def gather_local_ranks(output, value, *, group):
+            output[:] = [0, 1]
+
+        monkeypatch.setattr(torch.distributed, "all_gather_object", gather_local_ranks)
+        monkeypatch.setattr(
+            cp_common,
+            "gpu_p2p_access_check",
+            lambda *args: pytest.fail("the driver report should replace the probe"),
+        )
+        peers = MagicMock(return_value=True)
+        monkeypatch.setattr(torch.cuda, "can_device_access_peer", peers)
+
+        assert cp_common._cuda_p2p_spans_group(group)
+        assert sorted(call.args for call in peers.call_args_list) == [(4, 5), (5, 4)]
 
     def test_env_disabled_returns_none(self, monkeypatch):
         monkeypatch.setenv("VLLM_USE_DIRECT_DCP_A2A", "0")
