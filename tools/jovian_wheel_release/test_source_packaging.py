@@ -97,3 +97,57 @@ def test_wheel_build_drops_python_staged_by_other_branches(tmp_path, existing_bu
         assert (build / "temp.linux-x86_64-cpython-312/_C.o").is_file()
     else:
         assert not build.exists()
+
+
+@pytest.mark.parametrize(
+    "changed_path,can_reuse",
+    [
+        ("tools/jovian_wheel_release/Dockerfile", False),
+        ("tools/jovian_wheel_release/build_vllm_wheel.sh", False),
+        ("tools/jovian_wheel_release/build_bundle.sh", False),
+        ("vllm/model.py", True),
+    ],
+)
+def test_precompiled_reuse_requires_identical_build_recipes(
+    tmp_path, changed_path, can_reuse
+):
+    """Execute the reuse guard on real Git revisions of native build inputs."""
+    root = Path(__file__).resolve().parents[2]
+    builder = (root / "tools/jovian_wheel_release/build_bundle.sh").read_text()
+    start = builder.index("  # Python-only releases may reuse binaries")
+    guard = builder[start : builder.index("\n  build_target=", start)]
+
+    def git(*args):
+        return subprocess.check_output(
+            ["git", "-C", str(tmp_path), *args], text=True
+        ).strip()
+
+    git("init", "--quiet")
+    git("config", "user.name", "Native reuse contract test")
+    git("config", "user.email", "native-reuse@example.invalid")
+    git("config", "commit.gpgsign", "false")
+    changed = tmp_path / changed_path
+    changed.parent.mkdir(parents=True)
+    changed.write_text("# Input used to compile the native wheel.\n")
+    git("add", ".")
+    git("commit", "--quiet", "-m", "Native input fixture")
+    native_source_commit = git("rev-parse", "HEAD")
+    changed.write_text("# Modified input for the candidate wheel.\n")
+    git("add", ".")
+    git("commit", "--quiet", "-m", "Candidate input fixture")
+
+    result = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", guard],
+        env={
+            **os.environ,
+            "repo_root": str(tmp_path),
+            "native_source_commit": native_source_commit,
+            "lock_path": str(tmp_path / "tools/jovian_wheel_release/runtime.lock"),
+            "build_requirements": "tools/jovian_wheel_release/build-requirements.lock",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert (result.returncode == 0) is can_reuse, result.stdout + result.stderr
+    if not can_reuse:
+        assert changed_path in result.stdout

@@ -79,7 +79,10 @@ if [[ -n ${VLLM_PRECOMPILED_BUNDLE:-} ]]; then
     vllm/vllm_flash_attn vllm/third_party \
     "${lock_path#"${repo_root}/"}" \
     "${build_requirements}" \
-    tools/jovian_wheel_release/normalize_wheel.py
+    tools/jovian_wheel_release/normalize_wheel.py \
+    tools/jovian_wheel_release/Dockerfile \
+    tools/jovian_wheel_release/build_vllm_wheel.sh \
+    tools/jovian_wheel_release/build_bundle.sh
   build_target=export-precompiled
   native_args=(--build-context "native-bundle=${native_bundle}")
 fi

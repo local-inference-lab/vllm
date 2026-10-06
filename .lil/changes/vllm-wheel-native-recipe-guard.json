@@ -1,0 +1,12 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-wheel-native-recipe-guard",
+  "category": "fix",
+  "summary": "Require identical build recipes when reusing native wheel binaries",
+  "models": [],
+  "compatibility": "Changes to the wheel Dockerfile or build scripts require a native rebuild. Python-only source updates remain eligible for native reuse.",
+  "details": [
+    "Compare the Dockerfile, wheel build script, and bundle build script against the native bundle source revision before accepting its binaries."
+  ],
+  "pull_requests": []
+}
