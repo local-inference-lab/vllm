@@ -1,0 +1,27 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-glm-prepared-attention",
+  "category": "fix",
+  "summary": "Prepare GLM sparse attention for draft verification and fused normalization",
+  "models": [
+    "GLM-5.3-Flash",
+    "DeepSeek-V3.2"
+  ],
+  "compatibility": "L2 prefetch remains opt-in; prepared fused reductions honor the declared maximum row count.",
+  "details": [
+    "Forward index-group metadata builders, share identical indexer plans, and prepare the actual prefill token capacity.",
+    "Rebuild draft metadata after speculative verification and preserve mixed-page cache layout requirements.",
+    "Declare fused all-reduce RMSNorm sites and key normalization plans by weight storage."
+  ],
+  "pull_requests": [
+    985,
+    986,
+    987,
+    990,
+    991,
+    992
+  ],
+  "requires": [
+    "vllm-872"
+  ]
+}

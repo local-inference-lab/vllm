@@ -6,6 +6,7 @@ import gc
 import weakref
 from functools import partial
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -322,9 +323,9 @@ def test_index_preparation_reuses_reserved_workspace(native_workspace):
     plan = layer._declare_index_plan("prefill", 256)
     attention._scratch(plan)
     manager.lock()
-    torch.cuda.synchronize()
-    before = torch.cuda.memory_allocated(device)
-    torch.cuda.reset_peak_memory_stats(device)
+    torch.accelerator.synchronize()
+    before = torch.accelerator.memory_allocated(device)
+    torch.accelerator.reset_peak_memory_stats(device)
     with PreparationSession(device=device, autotune=False) as session:
         session.prepare(
             [
@@ -334,8 +335,8 @@ def test_index_preparation_reuses_reserved_workspace(native_workspace):
                 )
             ]
         )
-        torch.cuda.synchronize()
-        peak = torch.cuda.max_memory_allocated(device) - before
+        torch.accelerator.synchronize()
+        peak = torch.accelerator.max_memory_allocated(device) - before
         assert peak < 64 * 1024**2
         torch.testing.assert_close(cache, torch.zeros_like(cache), rtol=0, atol=0)
 
@@ -1096,7 +1097,7 @@ def test_output_projection_prepares_uncaptured_decode_sizes(native_workspace):
                     output = layer._o_proj(source[:15], positions[:15])
                 source.neg_()
                 graph.replay()
-                torch.cuda.synchronize(device)
+                torch.accelerator.synchronize(device)
                 torch.testing.assert_close(
                     output, torch.full_like(output, -128), rtol=0, atol=0
                 )
@@ -1216,7 +1217,7 @@ def test_output_projection_uses_fused_block32_path(native_workspace, monkeypatch
     import b12x.preparation as preparation
 
     attention, _, _ = native_workspace
-    calls = {}
+    calls: dict[str, Any] = {}
     plan = SimpleNamespace(scratch_specs=lambda: (), prepared=object())
 
     @dataclass

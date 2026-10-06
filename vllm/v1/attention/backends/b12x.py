@@ -313,7 +313,7 @@ class B12xPagedMetadataBuilder(AttentionMetadataBuilder[B12xPagedMetadata]):
         # Ragged decode/verify batches (adaptive verification trims drafts on
         # device) are graph-safe when every layer of the group runs them
         # through paged_decode, which derives its schedule on device.
-        self.supports_varlen_decode_cudagraph = _group_uses_paged_decode(
+        self.supports_varlen_decode_cudagraph = _group_uses_paged_decode(  # type: ignore[misc]
             vllm_config, layer_names
         )
 

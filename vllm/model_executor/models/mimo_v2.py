@@ -707,7 +707,7 @@ def _install_l2_prefetch_windows(
     """
     from vllm.models.glm5next.nvidia import l2_prefetch
 
-    plans: dict[str, object] = {}
+    plans: dict[str, l2_prefetch.L2PrefetchPlan | None] = {}
 
     def build() -> None:
         device = layer.post_attention_layernorm.weight.device

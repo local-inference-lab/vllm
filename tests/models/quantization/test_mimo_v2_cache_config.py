@@ -3,12 +3,14 @@
 """MiMo target and native draft constructors retain the requested cache policy."""
 
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
 
 import vllm.model_executor.models.mimo_v2 as mimo
 import vllm.model_executor.models.mimo_v2_mtp as mtp
+from vllm.config import VllmConfig
 
 pytestmark = pytest.mark.cpu_test
 
@@ -60,9 +62,13 @@ def test_mimo_attention_receives_cache_policy(monkeypatch, kind, dtype):
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
     )
     if kind == "mtp":
-        mtp.MiMoV2MultiTokenPredictor(vllm_config=vconfig, prefix="model")
+        mtp.MiMoV2MultiTokenPredictor(
+            vllm_config=cast(VllmConfig, vconfig), prefix="model"
+        )
     else:
-        mimo.MiMoV2FlashDecoderLayer(vllm_config=vconfig, prefix="model.layers.0")
+        mimo.MiMoV2FlashDecoderLayer(
+            vllm_config=cast(VllmConfig, vconfig), prefix="model.layers.0"
+        )
     assert len(observed) == 1
     # The whole policy must reach Attention, including scale calibration and
     # intentional skip layers, not just a copied dtype string.
@@ -95,7 +101,7 @@ def test_mimo_preserves_per_layer_window_and_cache_spec(
         ),
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
-    with set_current_vllm_config(vconfig):
+    with set_current_vllm_config(cast(VllmConfig, vconfig)):
         layer = mimo.MiMoV2Attention(
             hidden_size=4096,
             num_heads=64,
@@ -106,10 +112,11 @@ def test_mimo_preserves_per_layer_window_and_cache_spec(
             cache_config=cache_config,
             prefix="model.layers.0.self_attn",
         )
-        spec = layer.attn.get_kv_cache_spec(vconfig)
+        spec = layer.attn.get_kv_cache_spec(cast(VllmConfig, vconfig))
     assert cache_config.sliding_window == 128
     assert layer.attn.kv_cache_dtype == ("auto" if skip_layer else "bfloat16")
     assert layer.attn.query_quant is None
+    assert isinstance(spec, (FullAttentionSpec, SlidingWindowSpec))
     assert spec.dtype == torch.bfloat16
     if window == -1:
         assert layer.attn.sliding_window is None

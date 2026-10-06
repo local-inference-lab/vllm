@@ -8,6 +8,7 @@ fused operation directly, and the communicator runs it only for declared
 """
 
 from types import SimpleNamespace
+from typing import Any
 
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.models.deepseek_v32.nvidia import model as deepseek_v32_model
@@ -22,7 +23,7 @@ def _layer():
 def test_every_all_reduce_followed_by_a_norm_is_declared(
     monkeypatch, default_vllm_config
 ):
-    declared = {}
+    declared: dict[str, Any] = {}
 
     def declare(owner, norms, hidden_size, name_prefix):
         declared.update(
