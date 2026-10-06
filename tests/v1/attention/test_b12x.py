@@ -5,6 +5,7 @@ import weakref
 from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -466,8 +467,8 @@ def test_b12x_dsa_indexer_reuses_capacity_and_declares_overflow(
 
     @dataclass
     class _Plan:
-        caps: object
-        invocation: object
+        caps: SimpleNamespace
+        invocation: tuple[Any, ...]
         shared: bool = False
         request_kwargs: object = None
 
@@ -563,8 +564,8 @@ def test_b12x_dsa_indexer_prepares_the_batched_token_prefill_plan(
 
     @dataclass
     class _Plan:
-        caps: object
-        invocation: object
+        caps: SimpleNamespace
+        invocation: tuple[Any, ...]
         shared: bool = False
 
         def request(self, **kwargs):
@@ -625,7 +626,7 @@ def test_b12x_dsa_indexer_prepares_the_batched_token_prefill_plan(
 def test_glm_dsa_b12x_attention_forwards_index_group_builder(monkeypatch) -> None:
     from vllm.models.deepseek_v32.nvidia import b12x as dsa_b12x
 
-    captured = {}
+    captured: dict[str, Any] = {}
 
     def base_init(
         self,
@@ -1054,7 +1055,7 @@ def test_b12x_cache_update_and_graph_replay(
                 value.mul_(factor)
                 output.fill_(torch.nan)
                 graph.replay()
-                references = []
+                references: list[torch.Tensor] = []
                 for i, (context, length) in enumerate(zip(context_lens, q_lens)):
                     start, end = sum(seq_lens[:i]), sum(seq_lens[: i + 1])
                     k, v = key[start:end].float(), value[start:end].float()
@@ -1194,7 +1195,7 @@ def test_b12x_noncausal_fp8_drafter_uses_paged_decode(
                 query.mul_(factor)
                 output.fill_(torch.nan)
                 graph.replay()
-                references = []
+                references: list[torch.Tensor] = []
                 for i, length in enumerate(q_lens):
                     start, end = sum(seq_lens[:i]), sum(seq_lens[: i + 1])
                     fp8 = torch.float8_e4m3fn
@@ -1362,7 +1363,7 @@ def test_b12x_dense_mla_preparation_releases_temporary_buffers(
         "get_b12x_scratch_buffers",
         lambda state: (torch.empty(64, dtype=torch.uint8),),
     )
-    references = []
+    references: list[torch.Tensor] = []
 
     def bind(**kwargs):
         references.extend(
@@ -1894,7 +1895,7 @@ def test_b12x_noncausal_dflash_cache_and_graph(default_vllm_config, page_size, b
             query.neg_()
             output.fill_(torch.nan)
             graph.replay()
-            references = []
+            references: list[torch.Tensor] = []
             for request, length in enumerate(lengths):
                 if length == 0:
                     references.append(torch.zeros(8, 16, 128, device=device))
