@@ -1163,3 +1163,43 @@ def test_future_working_reserve_blocks_beyond_immediate_allocation(can_defer):
     drain(cache)
     cache.free(active)
     assert cache.block_pool.get_num_free_blocks() == 127
+
+
+def test_decodes_on_a_full_pool_preempt_in_an_empty_prefill_turn():
+    """A prefill turn that schedules nothing still lets decodes preempt.
+
+    Requests waiting behind full running slots keep compute sharing contended,
+    so every step after the first decode quantum is a prefill turn. When a
+    decode then needs a block from a full pool, that turn must preempt like a
+    decode turn; otherwise every later step is empty and nothing changes.
+    """
+    from tests.v1.core.utils import create_requests
+
+    scheduler = make_scheduler(
+        enable_prefix_caching=True,
+        use_v2_model_runner=True,
+        async_scheduling=True,
+        max_num_seqs=2,
+        num_blocks=17,
+        **compute_share_fixture_options(0.4),
+    )
+    scheduler.kv_cache_manager.boundary_checkpoints = BoundaryCheckpointCache(
+        scheduler.kv_cache_manager.block_pool
+    )
+    first, second = create_requests(
+        num_requests=2, num_tokens=60, max_tokens=64, req_ids=["first", "second"]
+    )
+    for req in (first, second):
+        scheduler.add_request(req)
+    assert scheduler.schedule().num_scheduled_tokens == {"first": 60, "second": 60}
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 0
+    for req in create_requests(
+        num_requests=2, num_tokens=40, req_ids=["waiting-a", "waiting-b"]
+    ):
+        scheduler.add_request(req)
+    # Four decode steps fill the last block; the fifth needs a new one.
+    outputs = run_contended_steps(scheduler, 8)
+    assert all(output.num_scheduled_tokens for output in outputs)
+    assert second.num_preemptions == 1
+    assert first.status == RequestStatus.RUNNING
+    assert first.num_computed_tokens == 68
