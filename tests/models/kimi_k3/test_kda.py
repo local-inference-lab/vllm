@@ -29,6 +29,7 @@ from vllm.models.kimi_k3.nvidia.kda import (
     _flashinfer_kda_prefill,
     _flashkda_prefill,
     _store_cache_checkpoints_kernel,
+    is_b12x_kda_prefill_supported,
     is_flashinfer_fused_kda_decode_supported,
     is_flashinfer_recurrent_kda_prefill_supported,
     is_flashkda_supported,
@@ -50,6 +51,7 @@ from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
 )
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
+from vllm.utils.b12x import get_b12x_kda_prefill
 from vllm.utils.flashinfer import flashinfer_fused_kda_decode
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
@@ -1366,6 +1368,10 @@ def _require_kda_prefill_backend(
         supported = is_flashinfer_recurrent_kda_prefill_supported(
             128, torch.bfloat16, state_dtype, lower_bound
         )
+    elif backend == "b12x":
+        supported = is_b12x_kda_prefill_supported(
+            128, torch.bfloat16, state_dtype, lower_bound
+        )
     else:
         assert backend == "flashkda"
         supported = is_flashkda_supported(128, torch.bfloat16, state_dtype, lower_bound)
@@ -1411,6 +1417,23 @@ def _run_kda_prefill_backend(
             seq_order=seq_order,
         )
 
+    if backend == "b12x":
+        return _b12x_kda_prefill(
+            q=q,
+            k=k,
+            v=v,
+            raw_g=raw_g,
+            raw_beta=raw_beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            initial_state=initial_state,
+            has_initial_state=torch.ones(
+                initial_state.shape[0], dtype=torch.bool, device=q.device
+            ),
+            cu_seqlens=cu_seqlens,
+            lower_bound=lower_bound,
+        )
+
     assert backend == "flashkda"
     import vllm._flashkda_C  # noqa: F401
 
@@ -1437,6 +1460,110 @@ def _run_kda_prefill_backend(
         final_state=final_state,
         workspace=workspace,
     )
+
+
+def _b12x_kda_prefill(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    initial_state: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    lower_bound: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run b12x prefill with the layer's slot conventions.
+
+    Slot ``NULL_BLOCK_ID`` is the null slot. Request ``r`` owns slot ``r + 1``
+    of a state pool, reads it only when ``has_initial_state[r]`` is set, and
+    receives its final state there; no checkpoint slot is written.
+    """
+    from b12x.preparation import PreparationSession, PreparedCall, require_prepared
+
+    api = get_b12x_kda_prefill()
+    assert api is not None
+    assert NULL_BLOCK_ID == 0
+    num_seqs = cu_seqlens.numel() - 1
+    tokens, heads = q.shape[1], q.shape[2]
+    pool = torch.zeros(
+        (num_seqs + 1, *initial_state.shape[1:]),
+        dtype=initial_state.dtype,
+        device=q.device,
+    )
+    pool[1:] = initial_state
+    final_indices = torch.arange(1, num_seqs + 1, dtype=torch.int32, device=q.device)
+    initial_indices = final_indices.masked_fill(~has_initial_state, NULL_BLOCK_ID)
+    tensors = {
+        "q": q[0],
+        "k": k[0],
+        "v": v[0],
+        "raw_g": raw_g[0],
+        "raw_beta": raw_beta[0],
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+        "recurrent_state": pool,
+        "cu_seqlens": cu_seqlens,
+        "initial_state_indices": initial_indices,
+        "final_state_indices": final_indices,
+        "checkpoint_state_indices": torch.full_like(final_indices, NULL_BLOCK_ID),
+        "checkpoint_offsets": torch.zeros_like(final_indices),
+        "num_seqs": torch.tensor([num_seqs], dtype=torch.int32, device=q.device),
+        "num_tokens": torch.tensor([tokens], dtype=torch.int32, device=q.device),
+        "output": torch.empty_like(v[0]),
+    }
+    plan = api.plan(
+        api.Caps(
+            device=q.device,
+            max_tokens=tokens,
+            max_seqs=num_seqs,
+            max_state_slots=num_seqs + 1,
+            heads=heads,
+            null_state_index=NULL_BLOCK_ID,
+        ),
+        invocation=api.invocation_from_tensors(
+            A_log=A_log, dt_bias=dt_bias, initial_state_indices=initial_indices
+        ),
+    )
+    original_pool = pool.clone()
+
+    def prepare_call(state):
+        (spec,) = state.layout.scratch_specs()
+        binding = state.bind(
+            scratch=torch.empty(spec.shape, dtype=spec.dtype, device=q.device),
+            **tensors,
+        )
+
+        def reset():
+            pool.copy_(original_pool)
+
+        return PreparedCall(
+            run=lambda: state.run(binding, lower_bound=lower_bound),
+            reset=reset,
+            restore=reset,
+        )
+
+    session = PreparationSession(device=q.device, autotune=False)
+    result = session.prepare(
+        (plan.request(name="kimi-k3-kda-prefill", prepare_call=prepare_call),)
+    )
+    try:
+        (spec,) = require_prepared(plan, "sequence.kda_prefill").layout.scratch_specs()
+        pool.copy_(original_pool)
+        binding = api.bind(
+            plan,
+            scratch=torch.empty(spec.shape, dtype=spec.dtype, device=q.device),
+            **tensors,
+        )
+        api.run(binding, lower_bound=lower_bound)
+        torch.accelerator.synchronize()
+    finally:
+        result.close()
+        session.close()
+    return tensors["output"].unsqueeze(0), pool[1:].clone()
 
 
 def _kda_prefill_reference(
@@ -1477,6 +1604,7 @@ def _kda_prefill_reference(
     [
         pytest.param("flashkda", torch.float32, id="flashkda"),
         pytest.param("flashinfer", torch.bfloat16, id="flashinfer"),
+        pytest.param("b12x", torch.float32, id="b12x"),
     ],
 )
 @torch.inference_mode()
@@ -1524,6 +1652,7 @@ def test_kda_prefill_near_collinear_keys_remain_finite(
         pytest.param("flashinfer", torch.bfloat16, 0.03, id="flashinfer-bf16"),
         pytest.param("flashkda", torch.bfloat16, 0.03, id="flashkda-bf16"),
         pytest.param("flashkda", torch.float32, 0.01, id="flashkda-fp32"),
+        pytest.param("b12x", torch.float32, 0.01, id="b12x-fp32"),
     ],
 )
 @torch.inference_mode()
@@ -1543,6 +1672,69 @@ def test_kda_prefill_correctness(
 
     assert_close("o", expected_out, actual_out, tolerance)
     assert_close("ht", expected_state, actual_state, tolerance)
+
+
+@torch.inference_mode()
+def test_b12x_kda_prefill_matches_triton_serving_batch():
+    """Compare b12x with Triton on a TP9-shaped 4,096-token prefill batch.
+
+    Eleven local heads, ragged requests including a one-token row, and one
+    request without a computed prefix; b12x reads and writes state slots in
+    place while Triton consumes gathered initial states.
+    """
+    lower_bound = -5.0
+    _require_kda_prefill_backend("b12x", torch.float32, lower_bound)
+    torch.manual_seed(7)
+    H, D = 11, 128
+    lengths = [1, 700, 1531, 1864]
+    T = sum(lengths)
+    q, k, v, raw_g = [
+        torch.randn(1, T, H, D, dtype=torch.bfloat16, device=DEVICE) for _ in range(4)
+    ]
+    raw_beta = torch.randn(1, T, H, dtype=torch.bfloat16, device=DEVICE)
+    A_log = torch.randn(H, dtype=torch.float32, device=DEVICE) * 0.5
+    dt_bias = torch.randn(H, D, dtype=torch.float32, device=DEVICE) * 0.1
+    initial_state = (
+        torch.randn(len(lengths), H, D, D, dtype=torch.float32, device=DEVICE) * 0.1
+    )
+    has_initial_state = torch.tensor(
+        [True, False, True, True], dtype=torch.bool, device=DEVICE
+    )
+    cu_seqlens = torch.zeros(len(lengths) + 1, dtype=torch.int32, device=DEVICE)
+    cu_seqlens[1:] = torch.tensor(lengths, device=DEVICE).cumsum(0)
+
+    b12x_out, b12x_state = _b12x_kda_prefill(
+        q=q,
+        k=k,
+        v=v,
+        raw_g=raw_g,
+        raw_beta=raw_beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state=initial_state,
+        has_initial_state=has_initial_state,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+    )
+    triton_out, triton_state = chunk_kda_with_fused_gate(
+        q=q,
+        k=k,
+        v=v,
+        raw_g=raw_g,
+        raw_beta=raw_beta,
+        A_log=A_log,
+        g_bias=dt_bias.reshape(-1),
+        lower_bound=lower_bound,
+        initial_state=initial_state * has_initial_state[:, None, None, None],
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens,
+    )
+
+    assert torch.isfinite(b12x_out).all()
+    assert torch.isfinite(b12x_state).all()
+    assert_close("o", triton_out, b12x_out, 0.01)
+    assert_close("ht", triton_state, b12x_state, 0.01)
 
 
 @torch.inference_mode()

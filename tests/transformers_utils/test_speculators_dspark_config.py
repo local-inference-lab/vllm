@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+
 import pytest
 
+from vllm.config import ModelConfig, ParallelConfig
 from vllm.transformers_utils.configs.speculators.base import SpeculatorsConfig
 
 pytestmark = pytest.mark.skip_global_cleanup
@@ -56,3 +59,48 @@ def test_dspark_updater_maps_bonus_anchor_semantics() -> None:
 
     assert config["sample_from_anchor"] is False
     assert config["dspark_bonus_anchor"] is True
+
+
+@pytest.mark.parametrize(
+    "tp,heads,kv_heads",
+    [
+        (1, 96, 16),
+        (8, 96, 16),
+        (10, 120, 20),
+        (12, 144, 24),
+        (16, 96, 16),
+        (32, 96, 16),
+    ],
+)
+def test_dspark_parallel_config_preserves_complete_gqa_groups(
+    tmp_path, tp, heads, kv_heads
+):
+    """Padding must not change which learned KV head serves a query head."""
+    config = {
+        "architectures": ["Qwen3DSparkModel"],
+        "model_type": "qwen3",
+        "hidden_size": 7168,
+        "intermediate_size": 14336,
+        "num_hidden_layers": 5,
+        "num_attention_heads": 96,
+        "num_key_value_heads": 16,
+        "head_dim": 64,
+        "vocab_size": 163840,
+        "max_position_embeddings": 4096,
+        "torch_dtype": "bfloat16",
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    model = ModelConfig(model=str(tmp_path), tokenizer_mode="skip", runner="draft")
+    parallel = ParallelConfig(
+        tensor_parallel_size=tp, distributed_executor_backend="external_launcher"
+    )
+    for _ in range(2):
+        model.verify_with_parallel_config(parallel)
+        assert model.hf_text_config.num_attention_heads == heads
+        assert model.hf_text_config.num_key_value_heads == kv_heads
+        assert model.get_num_attention_heads(parallel) == heads // tp
+        assert model.get_num_kv_heads(parallel) == max(1, kv_heads // tp)
+        assert model.get_head_size() == 64
+    model.verify_with_parallel_config(ParallelConfig())
+    assert model.hf_text_config.num_attention_heads == 96
+    assert model.hf_text_config.num_key_value_heads == 16
