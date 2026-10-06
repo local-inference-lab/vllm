@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 
@@ -23,6 +23,20 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
 
 logger = init_logger(__name__)
+
+
+class _WorkspaceMoEApply(Protocol):
+    def __call__(
+        self,
+        layer: "RoutedExperts",
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts: "SharedExperts | None",
+        shared_experts_input: torch.Tensor | None,
+        *,
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor: ...
 
 
 class FusedMoEMethodBase(QuantizeMethodBase):
@@ -198,7 +212,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         shared_experts_input: torch.Tensor | None,
         workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        return self.apply(
+        apply = cast(_WorkspaceMoEApply, self.apply)
+        return apply(
             layer,
             x,
             topk_weights,
@@ -216,7 +231,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         topk_ids: torch.Tensor,
         shared_experts: "SharedExperts | None",
         shared_experts_input: torch.Tensor | None,
-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """
         Apply the MoE operation using modular kernels.
