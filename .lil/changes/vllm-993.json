@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-993",
+  "category": "feature",
+  "summary": "GLM-5.3 (744B) serves the losslessly compressed NVFP4-CSF checkpoint: 7.8% more KV cache at TP8",
+  "models": ["GLM-5.3"],
+  "compatibility": "Opt-in: --quantization nvfp4_csf --load-format nvfp4_csf with local-inference-lab/GLM-5.3-NVFP4-CSF. Other checkpoints are unchanged.",
+  "details": [
+    "The NVFP4-CSF reader knows the 744B expert family (layers 3-77 under model.layers) and accepts the glm_moe_dsa model type.",
+    "A single-recipe NVFP4 source quantizes exactly the modules that store weight scales, so the BF16 MTP layer 78 loads unquantized from the same checkpoint.",
+    "TP8 MTP3 on 8x RTX PRO 6000: KV cache 576,896 tokens vs 535,040 with the original checkpoint; decode steps/s -5.5% at C1, -2% at C2, -4% at C4 while B12X rebuilds the compressed scales in every pipeline stage; prefill within 3%."
+  ],
+  "authors": ["voipmonitor"],
+  "pull_requests": [993],
+  "requires": []
+}
