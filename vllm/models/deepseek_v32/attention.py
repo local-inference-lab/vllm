@@ -43,6 +43,7 @@ from vllm.v1.attention.ops.pcp import (
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
+    from vllm.v1.attention.backend import MLAAttentionImpl
     from vllm.v1.attention.backends.mla.index_group import (
         SparseMLAIndexGroupBuilder,
     )
@@ -622,7 +623,9 @@ class DeepseekV32Attention(MLAAttention):
         full_ckv_dcp = (
             not self.use_pcp
             and self.impl.dcp_world_size > 1
-            and self.impl.uses_full_ckv_dcp(attn_metadata, num_actual)
+            and cast("MLAAttentionImpl[Any]", self.impl).uses_full_ckv_dcp(
+                attn_metadata, num_actual
+            )
         )
         if self.use_pcp and self.impl.dcp_world_size > self.impl.pcp_world_size:
             if isinstance(mqa_q_arg, tuple):

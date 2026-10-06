@@ -55,6 +55,9 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
+    from b12x.attention.sparse_mla import Caps as B12xMLACaps
+    from b12x.preparation import Plan as B12xPlan
+
     from vllm.model_executor.models.deepseek_v2 import Indexer
     from vllm.v1.attention.backend import CommonAttentionMetadata
 
@@ -926,11 +929,9 @@ class B12xMLASparseMetadataBuilder(
         else:
             starts = np.asarray(common.query_start_loc_cpu, dtype=np.int32)
             query_lens = np.diff(starts)
-            seq_lens_cpu_source = (
-                common.seq_lens_cpu_upper_bound
-                if common.seq_lens_cpu_upper_bound is not None
-                else common.seq_lens_cpu
-            )
+            seq_lens_cpu_source = common.seq_lens_cpu_upper_bound
+            if seq_lens_cpu_source is None:
+                raise ValueError("B12X sparse MLA requires host sequence length bounds")
             seq_lens_cpu = seq_lens_cpu_source.numpy().astype(np.int32, copy=False)
             host_lens = np.zeros((num_tokens,), dtype=np.int32)
             for req_id, query_len in enumerate(query_lens):
@@ -969,11 +970,9 @@ class B12xMLASparseMetadataBuilder(
             metadata.prefill_query_lens_cpu = torch.diff(
                 common.query_start_loc_cpu[prefill_start:prefill_end]
             )
-            seq_lens_cpu_source = (
-                common.seq_lens_cpu_upper_bound
-                if common.seq_lens_cpu_upper_bound is not None
-                else common.seq_lens_cpu
-            )
+            seq_lens_cpu_source = common.seq_lens_cpu_upper_bound
+            if seq_lens_cpu_source is None:
+                raise ValueError("B12X sparse MLA requires host sequence length bounds")
             metadata.prefill_seq_lens_cpu = seq_lens_cpu_source[
                 prefill_start : prefill_start + metadata.num_prefills
             ].clone()
@@ -1364,8 +1363,8 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         self._module = module
         self._kernel_page_size = 0
         self._kernel_page_size_finalized = not self._is_glm_next
-        self._plans: dict[tuple[str, int], object] = {}
-        self._plan_caps: dict[tuple[str, int], object] = {}
+        self._plans: dict[tuple[str, int], B12xPlan] = {}
+        self._plan_caps: dict[tuple[str, int], B12xMLACaps] = {}
         self._cache_writer_plan: object | None = None
         self._bound_kv_cache: torch.Tensor | None = None
         self._set_kernel_page_size(kernel_page_size)
@@ -2193,6 +2192,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 assert cache_seq_lens is not None
                 cache_seq_lens = cache_seq_lens[:num_tokens].contiguous()
             else:
+                assert attn_metadata.seq_lens is not None
                 cache_seq_lens = attn_metadata.seq_lens[
                     : attn_metadata.num_reqs
                 ].contiguous()

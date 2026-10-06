@@ -39,6 +39,7 @@ from vllm.models.deepseek_v32.nvidia.b12x import (
 )
 from vllm.models.deepseek_v32.nvidia.model import _get_attention_cls
 from vllm.platforms.interface import DeviceCapability, Platform
+from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.b12x import B12xPagedAttentionBackend
 from vllm.v1.attention.backends.mla import b12x_indexer as generic_b12x_indexer
 from vllm.v1.attention.backends.mla import b12x_mla_sparse
@@ -881,10 +882,12 @@ def _bare_glm_dsa_ckv_metadata_builder(
 
 @pytest.mark.parametrize("dcp_rank", [0, 1])
 @pytest.mark.parametrize("batch", ["prefill", "capture", "spec_decode"])
+@pytest.mark.parametrize("host_seq_lens", [False, True])
 def test_glm_dsa_builder_gathers_full_ckv_only_for_eager_prefill(
     monkeypatch: pytest.MonkeyPatch,
     dcp_rank: int,
     batch: str,
+    host_seq_lens: bool,
 ) -> None:
     query_lens = [3, 4] if batch == "spec_decode" else [24, 9]
     seq_lens = [27, 20] if batch == "spec_decode" else [40, 9]
@@ -903,19 +906,26 @@ def test_glm_dsa_builder_gathers_full_ckv_only_for_eager_prefill(
     builder = _bare_glm_dsa_ckv_metadata_builder(dcp_rank=dcp_rank)
     query_start_loc = torch.tensor([0, query_lens[0], rows], dtype=torch.int32)
     global_seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
-    common = SimpleNamespace(
+    common = CommonAttentionMetadata(
         num_reqs=2,
         num_actual_tokens=rows,
         max_query_len=max(query_lens),
+        max_seq_len=max(seq_lens),
+        block_table_tensor=torch.zeros((2, 1), dtype=torch.int32),
+        slot_mapping=torch.zeros(rows, dtype=torch.int64),
         seq_lens=global_seq_lens,
         dcp_local_seq_lens=(global_seq_lens + 1 - dcp_rank) // 2,
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc,
-        seq_lens_cpu=global_seq_lens,
-        seq_lens_cpu_upper_bound=None,
+        seq_lens_cpu_upper_bound=global_seq_lens if host_seq_lens else None,
         positions=None,
         is_prefilling=torch.tensor([batch != "spec_decode"] * 2),
     )
+
+    if not host_seq_lens:
+        with pytest.raises(ValueError, match="B12X sparse MLA requires host sequence"):
+            builder.build(common_prefix_len=0, common_attn_metadata=common)
+        return
 
     if batch == "capture":
         metadata = builder.build_for_cudagraph_capture(common)

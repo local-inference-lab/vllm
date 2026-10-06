@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -361,7 +362,7 @@ def test_deepseek_v32_full_ckv_dcp_skips_query_exchange(
         "get_attention_context",
         lambda _: (attn_metadata, None, kv_cache, None),
     )
-    observed: dict[str, object] = {"gathered": 0, "combined": 0}
+    observed: dict[str, Any] = {"gathered": 0, "combined": 0}
     local_out = torch.randn(tokens, heads, latent)
 
     def query_gather(query: torch.Tensor) -> torch.Tensor:
