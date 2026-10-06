@@ -219,6 +219,37 @@ def test_kv_connector_rejects_expandable_segments(monkeypatch, kv_connector):
         _build_config(kv_connector=kv_connector)
 
 
+@pytest.mark.parametrize(
+    "cuda_conf,alloc_conf,rejected",
+    [
+        (None, "expandable_segments:True", True),
+        (None, "max_split_size_mb:64, expandable_segments : True", True),
+        ("expandable_segments : True", None, True),
+        ("expandable_segments:True", "expandable_segments:False", True),
+        ("expandable_segments:False", "expandable_segments:True", False),
+        ("", "expandable_segments:True", False),
+        (None, "expandable_segments:False", False),
+    ],
+)
+def test_kv_connector_allocator_aliases_follow_cuda_precedence(
+    monkeypatch, cuda_conf, alloc_conf, rejected
+):
+    """Unsafe connectors reject the allocator configuration CUDA actually uses."""
+    for name, value in (
+        ("PYTORCH_CUDA_ALLOC_CONF", cuda_conf),
+        ("PYTORCH_ALLOC_CONF", alloc_conf),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    if rejected:
+        with pytest.raises(ValueError, match="expandable_segments"):
+            _build_config(kv_connector="SomeOOTConnector")
+    else:
+        _build_config(kv_connector="SomeOOTConnector")
+
+
 def test_lmcache_mp_engine_driven_allows_expandable_segments(monkeypatch):
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     _build_config(

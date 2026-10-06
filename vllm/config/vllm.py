@@ -17,6 +17,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, get_args
 
+import regex as re
 import torch
 from pydantic import ConfigDict, Field, model_validator
 
@@ -1294,8 +1295,11 @@ class VllmConfig:
         # expandable_segments off around its pool (see #40812), so the KV
         # cache allocated within that context lands on stable physical pages
         # even when the env var is set.
-        if "expandable_segments:True" not in os.environ.get(
-            "PYTORCH_CUDA_ALLOC_CONF", ""
+        allocator_config = os.environ.get(
+            "PYTORCH_CUDA_ALLOC_CONF", os.environ.get("PYTORCH_ALLOC_CONF", "")
+        )
+        if not re.search(
+            r"(?:^|,)\s*expandable_segments\s*:\s*True\s*(?:,|$)", allocator_config
         ):
             return
         if self.model_config is not None and (self.model_config.enable_cumem_allocator):
@@ -1315,7 +1319,8 @@ class VllmConfig:
 
         raise ValueError(
             f"KV connector {self.kv_transfer_config.kv_connector} is "
-            "incompatible with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
+            "incompatible with expandable_segments:True in PYTORCH_CUDA_ALLOC_CONF "
+            "or PYTORCH_ALLOC_CONF "
             "unless enable_cumem_allocator is also enabled. PyTorch's CUDA VMM "
             "allocator can remap KV cache virtual addresses to different "
             "physical pages, invalidating any pinned/registered KV memory "
