@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-explicit-offloading-boundary-capture",
+  "category": "fix",
+  "summary": "Capture recurrent boundary state for explicitly configured offloading connectors",
+  "models": [],
+  "compatibility": "No user action required.",
+  "details": [
+    "Frozen recurrent capture follows the effective OffloadingConnector, including MultiConnector children and configurations without kv_offloading_size.",
+    "Atomic request-boundary checkpoints retain their separate capture path."
+  ],
+  "pull_requests": [
+    870,
+    883
+  ]
+}

@@ -84,12 +84,10 @@ class MambaBase(AttentionLayerBase):
         # (post-forward D2D of the whole page), so no scan rework is needed.
         boundary_capture = (
             cache_config.mamba_cache_mode == "align"
-            and cache_config.kv_offloading_size is not None
             and kv_transfer_config is not None
             and kv_transfer_config.has_connector("OffloadingConnector")
             # Atomic request-boundary checkpoints own the same columns with
-            # their own capture path; the two features are mutually exclusive
-            # (kv_offloading_size already asserts it) -- never double-capture.
+            # their own capture path; never double-capture.
             and not vllm_config.use_request_boundary_checkpoints
         )
         return MambaSpec(

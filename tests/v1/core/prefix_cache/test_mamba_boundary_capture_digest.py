@@ -74,8 +74,7 @@ def _make_capture_manager(boundary_capture: bool):
     )
     # Two fake "layers" of per-block state: row index == pool block id.
     kv_caches = [
-        torch.zeros(NUM_BLOCKS, PAGE_BYTES, dtype=torch.uint8)
-        for _ in range(2)
+        torch.zeros(NUM_BLOCKS, PAGE_BYTES, dtype=torch.uint8) for _ in range(2)
     ]
     return manager, kv_caches
 
@@ -189,7 +188,7 @@ def test_all_recurrent_groups_of_align_config_carry_capture():
     """
     from types import SimpleNamespace
 
-    from vllm.config.cache import CacheConfig
+    from vllm.config.kv_transfer import KVTransferConfig
     from vllm.model_executor.layers.mamba.abstract import MambaBase
 
     class _Layer(MambaBase):
@@ -216,22 +215,36 @@ def test_all_recurrent_groups_of_align_config_carry_capture():
         )
         return _Layer().get_kv_cache_spec(vllm_config)
 
-    connector = SimpleNamespace(
-        has_connector=lambda name: name == "OffloadingConnector"
+    connector = KVTransferConfig(
+        kv_connector="OffloadingConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={"cpu_bytes_to_use": 1 << 30},
     )
-    # Align + complex offloading connector: capture on.
-    for mode in ("align",):
-        spec = _spec_for(connector, 1.0, mode)
-        assert spec.boundary_capture is True, f"{mode} group missed capture"
-    # Any gate missing -> capture off: boundary stores keep the live-column
-    # behavior and external hits stop at the last checkpoint.
-    assert _spec_for(connector, None, "align").boundary_capture is False
+    multi_connector = KVTransferConfig(
+        kv_connector="MultiConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "connectors": [
+                {
+                    "kv_connector": "OffloadingConnector",
+                    "kv_role": "kv_both",
+                    "kv_connector_extra_config": {"cpu_bytes_to_use": 1 << 30},
+                }
+            ]
+        },
+    )
+    for configured_connector in (connector, multi_connector):
+        for offload_size in (None, 1.0):
+            spec = _spec_for(configured_connector, offload_size, "align")
+            assert spec.boundary_capture is True
     assert _spec_for(None, 1.0, "align").boundary_capture is False
-    assert _spec_for(
-        SimpleNamespace(has_connector=lambda name: False), 1.0, "align"
-    ).boundary_capture is False
+    assert (
+        _spec_for(
+            SimpleNamespace(has_connector=lambda name: False), 1.0, "align"
+        ).boundary_capture
+        is False
+    )
     assert _spec_for(connector, 1.0, "all").boundary_capture is False
     assert (
-        _spec_for(connector, 1.0, "align", boundary_ckpt=True).boundary_capture
-        is False
+        _spec_for(connector, 1.0, "align", boundary_ckpt=True).boundary_capture is False
     )
