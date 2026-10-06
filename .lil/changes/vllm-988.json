@@ -1,0 +1,22 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-988",
+  "category": "performance",
+  "summary": "The first request after startup no longer recompiles torch.compile'd helpers: the serving thread count is set before warmup",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No configuration change. Startup warmup now runs with the serving torch thread count.",
+  "details": [
+    "Dynamo guards compiled functions on torch.get_num_threads(); the count dropped only after warmup and graph capture, so the first real request recompiled every helper compiled during warmup.",
+    "GLM-5.3-Flash NVFP4 TP4 on four DGX Spark (from #681): cold first prefill +1.03 s -> +0.22 s."
+  ],
+  "authors": [
+    "original-el8",
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    988
+  ],
+  "requires": []
+}
