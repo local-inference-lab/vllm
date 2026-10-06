@@ -353,8 +353,7 @@ class SchedulerConfig:
             )
         if self.max_num_prefill_tokens_per_step > self.max_num_batched_tokens:
             raise ValueError(
-                "max_num_prefill_tokens_per_step cannot exceed "
-                "max_num_batched_tokens"
+                "max_num_prefill_tokens_per_step cannot exceed max_num_batched_tokens"
             )
         if (
             isinstance(self.max_parallel_prefills, int)

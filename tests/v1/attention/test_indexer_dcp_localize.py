@@ -764,9 +764,9 @@ def test_cutedsl_dcp_select_packs_valid_ids_before_deterministic_padding():
     gathered[:, :valid, 0] = scores
     gathered[:, :valid, 1] = token_ids
 
-    expected_valid = torch.arange(
-        valid, dtype=torch.int32, device="cuda"
-    ).expand(rows, -1)
+    expected_valid = torch.arange(valid, dtype=torch.int32, device="cuda").expand(
+        rows, -1
+    )
     expected_padding = torch.full(
         (rows, topk - valid), -1, dtype=torch.int32, device="cuda"
     )

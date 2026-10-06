@@ -4853,7 +4853,7 @@ def test_capture_pin_released_on_store_ack_and_on_drop():
     )
 
     # Boundary beyond the save window is filtered -> pin dropped immediately.
-    jobs = scheduler._build_aligned_boundary_store_jobs({"req": [(1, 77, 10 ** 6)]})
+    jobs = scheduler._build_aligned_boundary_store_jobs({"req": [(1, 77, 10**6)]})
     assert jobs == {}
     assert released == [77]
 

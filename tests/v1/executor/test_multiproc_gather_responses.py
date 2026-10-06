@@ -209,14 +209,14 @@ def test_a_watched_failure_on_real_queues_wakes_the_parked_gather():
             time.sleep(0.2)
             pairs[1][0].enqueue((FAILURE, "CUDA out of memory"))
 
-        failer = threading.Thread(target=fail)
+        failure_thread = threading.Thread(target=fail)
         started = time.monotonic()
-        failer.start()
+        failure_thread.start()
         with pytest.raises(RuntimeError, match="Worker 1 failed"):
             _gather_responses(
                 [pairs[0][1]], (0,), time.monotonic() + 30, "m", [(1, pairs[1][1])]
             )
-        failer.join()
+        failure_thread.join()
         assert time.monotonic() - started < 2.0
     finally:
         for writer, reader in pairs:

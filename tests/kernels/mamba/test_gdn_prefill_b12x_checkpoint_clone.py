@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # The b12x GDN prefill kernel must clone state at
 # checkpoint_offset == query_len (a step-end boundary crossing) into the
 # designated checkpoint slot, matching the reference oracle. The
@@ -13,9 +14,7 @@ def _setup(lengths, offsets, ckpt_slots, max_seqs):
     device = torch.device("cuda")
     case = PrefillCase("gdn", 2, 6, lengths)
     max_tokens = sum(lengths)
-    tensors = make_inputs(
-        case, device=device, max_tokens=max_tokens, max_seqs=max_seqs
-    )
+    tensors = make_inputs(case, device=device, max_tokens=max_tokens, max_seqs=max_seqs)
     # Distinct non-final, non-initial checkpoint slots (pool has 3*max_seqs+1).
     tensors["checkpoint_state_indices"][: len(lengths)] = torch.tensor(
         ckpt_slots, dtype=torch.int32, device=device
@@ -44,7 +43,7 @@ def _run_case(lengths, offsets, ckpt_slots, max_seqs=2):
         null_state_index=0,
     ) as binding:
         run_binding("gdn", binding)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         expected_output, expected_pool = oracle(case, tensors, null_state_index=0)
         assert_close(
             "output",
@@ -97,7 +96,5 @@ def test_v1_checkpoint_clone_offset_exceeds_query_len_no_write():
     ) as binding:
         saved = binding.recurrent_state[4].clone()
         run_binding("gdn", binding)
-        torch.cuda.synchronize()
-        torch.testing.assert_close(
-            binding.recurrent_state[4], saved, rtol=0, atol=0
-        )
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(binding.recurrent_state[4], saved, rtol=0, atol=0)

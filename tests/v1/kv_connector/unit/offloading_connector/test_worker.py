@@ -697,12 +697,8 @@ def test_register_kv_caches_padded_attention_ref_carries_full_row(backend):
             ),
         ],
         kv_cache_groups=[
-            KVCacheGroupSpec(
-                layer_names=[plain_layer], kv_cache_spec=plain_spec
-            ),
-            KVCacheGroupSpec(
-                layer_names=[padded_layer], kv_cache_spec=padded_spec
-            ),
+            KVCacheGroupSpec(layer_names=[plain_layer], kv_cache_spec=plain_spec),
+            KVCacheGroupSpec(layer_names=[padded_layer], kv_cache_spec=padded_spec),
         ],
     )
     attn_groups = [
@@ -770,9 +766,9 @@ def test_padded_attention_tail_survives_store_load_roundtrip():
     padded GPU row with distinct bytes, store, wipe the GPU row, load
     back, and require the FULL row -- [unpadded, padded) tail included
     -- to match."""
-    from vllm.v1.worker.utils import AttentionGroup
     from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
     from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+    from vllm.v1.worker.utils import AttentionGroup
 
     backend_cls = AttentionBackendEnum["FLASH_ATTN"].get_class()
 
@@ -802,9 +798,7 @@ def test_padded_attention_tail_survives_store_load_roundtrip():
                 block_stride=padded,
             ),
         ],
-        kv_cache_groups=[
-            KVCacheGroupSpec(layer_names=[layer], kv_cache_spec=spec)
-        ],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=[layer], kv_cache_spec=spec)],
     )
     attn_groups = [
         [
@@ -834,9 +828,7 @@ def test_padded_attention_tail_survives_store_load_roundtrip():
     try:
         gpu_row = canonical.tensors[0].tensor[3]  # GPU block 3
         # Distinct, position-dependent bytes so a zero tail is detectable.
-        pattern = (
-            torch.arange(padded, dtype=torch.int64) % 251
-        ).to(torch.int8)
+        pattern = (torch.arange(padded, dtype=torch.int64) % 251).to(torch.int8)
         gpu_row.copy_(pattern.to(gpu_row.device))
 
         assert offload_worker.submit_store(
@@ -848,7 +840,7 @@ def test_padded_attention_tail_survives_store_load_roundtrip():
 
         # Wipe the GPU row; only the CPU tier can bring the tail back.
         gpu_row.zero_()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         assert offload_worker.submit_load(
             2,

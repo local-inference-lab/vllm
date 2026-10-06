@@ -2612,9 +2612,7 @@ class EngineArgs:
             prefill_schedule_interval=self.prefill_schedule_interval,
             prefill_compute_share=self.prefill_compute_share,
             prefill_compute_half_life=self.prefill_compute_half_life,
-            max_num_prefill_tokens_per_step=(
-                self.max_num_prefill_tokens_per_step
-            ),
+            max_num_prefill_tokens_per_step=(self.max_num_prefill_tokens_per_step),
             max_parallel_prefills=self.max_parallel_prefills,
             prefill_policy=self.prefill_policy,
             decode_refill_target=self.decode_refill_target,

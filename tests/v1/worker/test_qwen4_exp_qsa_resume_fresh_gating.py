@@ -90,9 +90,7 @@ def test_cold_add_keeps_fresh_true(monkeypatch: pytest.MonkeyPatch) -> None:
     """Control: a cold add (no restored prefix) owns a recycled slot."""
     state = _bare_qsa_state()
     layers = _attach_fake_layers(state)
-    monkeypatch.setattr(
-        MambaHybridModelState, "add_request", lambda self, i, r: None
-    )
+    monkeypatch.setattr(MambaHybridModelState, "add_request", lambda self, i, r: None)
 
     state.add_request(3, _new_req(0))
 
@@ -112,9 +110,7 @@ def test_external_resume_add_keeps_fresh_true(
     state = _bare_qsa_state()
     state.qsa_state_is_fresh_gpu[5].fill_(False)  # prior owner cleared
     layers = _attach_fake_layers(state)
-    monkeypatch.setattr(
-        MambaHybridModelState, "add_request", lambda self, i, r: None
-    )
+    monkeypatch.setattr(MambaHybridModelState, "add_request", lambda self, i, r: None)
 
     state.add_request(5, _new_req(9024))
 
@@ -133,9 +129,7 @@ def test_local_hit_add_keeps_fresh_true(
     pages, so the resumed slot stays fresh."""
     state = _bare_qsa_state()
     _attach_fake_layers(state)
-    monkeypatch.setattr(
-        MambaHybridModelState, "add_request", lambda self, i, r: None
-    )
+    monkeypatch.setattr(MambaHybridModelState, "add_request", lambda self, i, r: None)
 
     state.add_request(0, _new_req(6016))
 
@@ -153,9 +147,7 @@ def test_boundary_checkpoint_add_clears_fresh_and_seeds_anchor(
     state = _bare_qsa_state()
     state.qsa_state_is_fresh_gpu[5].fill_(True)
     layers = _attach_fake_layers(state)
-    monkeypatch.setattr(
-        MambaHybridModelState, "add_request", lambda self, i, r: None
-    )
+    monkeypatch.setattr(MambaHybridModelState, "add_request", lambda self, i, r: None)
 
     checkpoint = SimpleNamespace(num_tokens=9024)
     state.add_request(
@@ -182,9 +174,7 @@ def test_checkpoint_without_allocation_keeps_fresh_true(
     state = _bare_qsa_state()
     state.qsa_state_is_fresh_gpu[5].fill_(False)
     _attach_fake_layers(state)
-    monkeypatch.setattr(
-        MambaHybridModelState, "add_request", lambda self, i, r: None
-    )
+    monkeypatch.setattr(MambaHybridModelState, "add_request", lambda self, i, r: None)
 
     state.add_request(
         5,

@@ -511,6 +511,8 @@ class ExecuteModelState(NamedTuple):
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
+    jit_warmup_registry: JitWarmupRegistry
+
     @JitWarmupRegistry.capture
     def __init__(
         self,

@@ -194,6 +194,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
             self.qsa_state_is_fresh_gpu[req_index].fill_(not restored_selector_state)
             self.qsa_committed_num_accepted_tokens_gpu[req_index].fill_(1)
             if restored_selector_state:
+                assert checkpoint is not None
                 # The fresh-reset's anchor formula (first_position -
                 # accepted, in the QSA reset kernel) is skipped with the
                 # flag down, so seed the value it would have produced:

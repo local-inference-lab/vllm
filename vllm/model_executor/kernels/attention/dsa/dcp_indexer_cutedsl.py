@@ -536,9 +536,9 @@ class StableTopKFromGatheredCandidatesKernel(
             cute.arch.sync_threads()
             for key_idx in cutlass.range_constexpr(keys_per_thread):
                 col = tid + Int32(key_idx * tb_size)
-                is_selected = selected_smem[col] * (
-                    keys[key_idx] != Uint64(0)
-                ).to(Int32)
+                is_selected = selected_smem[col] * (keys[key_idx] != Uint64(0)).to(
+                    Int32
+                )
                 prefix = block_scan_inclusive_i32(
                     is_selected,
                     cute.arch.lane_idx(),
