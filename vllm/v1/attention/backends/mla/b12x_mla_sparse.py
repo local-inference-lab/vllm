@@ -205,7 +205,7 @@ def _is_speculative_decode_batch(
     )
 
 
-def _is_glm_next_ckv_source_layout(
+def _is_native_ckv_source_layout(
     kv_cache: torch.Tensor,
     *,
     page_size: int,
@@ -230,10 +230,12 @@ def _use_b12x_full_ckv_gather(
     num_decode_tokens: int,
     min_tokens: int,
     max_tokens: int,
+    is_glm_dsa: bool = False,
+    is_spec_decode: bool = False,
 ) -> bool:
     return (
         enabled
-        and is_glm_next
+        and (is_glm_next or (is_glm_dsa and not is_spec_decode))
         and dcp_world_size > 1
         and max_query_len > 1
         and num_decode_tokens == 0
@@ -706,6 +708,7 @@ class B12xMLASparseMetadataBuilder(
     metadata_cls = B12xMLASparseMetadata
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     requires_glm_next_selector_metadata: bool
+    _is_glm_dsa: bool = False
 
     def __init__(
         self,
@@ -716,6 +719,7 @@ class B12xMLASparseMetadataBuilder(
     ) -> None:
         hf_config = vllm_config.model_config.hf_text_config
         self.requires_glm_next_selector_metadata = _is_glm_next_config(hf_config)
+        self._is_glm_dsa = _is_glm_dsa_config(hf_config)
         if self.requires_glm_next_selector_metadata and (
             dcp_error := _glm_next_dcp_error(vllm_config)
         ):
@@ -749,13 +753,16 @@ class B12xMLASparseMetadataBuilder(
                 max_reqs, dtype=torch.bool, device=device
             )
         self._ckv_gather_requested = (
-            self.requires_glm_next_selector_metadata
+            (self.requires_glm_next_selector_metadata or self._is_glm_dsa)
             and self.dcp_world_size > 1
             and envs.VLLM_B12X_MLA_CKV_GATHER
         )
         if self._ckv_gather_requested:
-            hf_config = vllm_config.model_config.hf_text_config
-            ckv_topk_tokens = int(hf_config.index_topk) + int(hf_config.index_kpool) - 1
+            # GLM DSA selects index_topk tokens; GLM5Next appends its
+            # incomplete-pool tail to the selection.
+            ckv_topk_tokens = int(hf_config.index_topk)
+            if self.requires_glm_next_selector_metadata:
+                ckv_topk_tokens += int(hf_config.index_kpool) - 1
             self.ckv_selected_indices_buffer = torch.empty(
                 (max_tokens, ckv_topk_tokens), dtype=torch.int32, device=device
             )
@@ -973,6 +980,10 @@ class B12xMLASparseMetadataBuilder(
         if _use_b12x_full_ckv_gather(
             enabled=self._ckv_gather_requested,
             is_glm_next=self.requires_glm_next_selector_metadata,
+            # GLM DSA gathers only in eager prefill: captured graphs and
+            # speculative verification keep the query exchange.
+            is_glm_dsa=self._is_glm_dsa and not for_cudagraph_capture,
+            is_spec_decode=metadata.is_spec_decode,
             dcp_world_size=self.dcp_world_size,
             max_query_len=common.max_query_len,
             num_tokens=num_tokens,
@@ -1337,7 +1348,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             int(vllm_config.cache_config.block_size) if self._is_glm_next else 64
         )
         self._ckv_gather_enabled = (
-            self._is_glm_next
+            (self._is_glm_next or self._is_glm_dsa)
             and self.dcp_world_size > 1
             and envs.VLLM_B12X_MLA_CKV_GATHER
         )
@@ -1345,6 +1356,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         cp_kv_cache_interleave_size = int(
             vllm_config.parallel_config.cp_kv_cache_interleave_size
         )
+        self._cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
         self._ckv_capacity_tokens = (
             max_ckv_tokens + self.dcp_world_size - 1
         ) // self.dcp_world_size + max_seqs * cp_kv_cache_interleave_size
@@ -1660,6 +1672,50 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             *(ckv_specs if include_ckv else ()),
         )
 
+    def reserve_full_ckv_workspace(self) -> None:
+        """Reserve the full-CKV prefill workspace before KV-cache sizing.
+
+        The memory profile skips attention. Without this reservation, the
+        first eligible prefill would grow the locked workspace by the gathered
+        cache receive buffer. The selection remap kernels are compiled here
+        too, so that prefill does not compile them either.
+        """
+        if not (self._ckv_gather_enabled and self._kernel_page_size_finalized):
+            return
+        current_workspace_manager().get_simultaneous(
+            *self._workspace_specs(
+                input_num_heads=_round_up_heads(self.num_heads),
+                include_ckv=True,
+            )
+        )
+        assert self.topk_indices_buffer is not None
+        # Serving binds row slices of persistent buffers with these widths and
+        # strides; matching them selects the same compiled specializations.
+        device = self.topk_indices_buffer.device
+        rank_req = torch.zeros(
+            (self.dcp_world_size, self._max_seqs), dtype=torch.int32, device=device
+        )[:, :1]
+        selected = torch.empty((1, self._topk_tokens), dtype=torch.int32, device=device)
+        counts = torch.empty(1, dtype=torch.int32, device=device)
+        alignment = _ckv_rank_token_alignment(
+            self._kernel_page_size, self.dcp_world_size
+        )
+        # Rank spans are multiples of the alignment, with or without a factor
+        # of 16; the integer specialization differs between the two.
+        for padded_rank_tokens in (alignment, 2 * alignment):
+            _map_global_topk_to_gathered_ckv(
+                torch.zeros(1, dtype=torch.int32, device=device),
+                self.topk_indices_buffer[:1],
+                rank_req,
+                rank_req,
+                selected,
+                counts,
+                dcp_size=self.dcp_world_size,
+                cp_kv_cache_interleave_size=self._cp_kv_cache_interleave_size,
+                padded_rank_tokens=padded_rank_tokens,
+            )
+        _mask_page_table_after_nsa_len(selected, counts)
+
     def _borrow_workspaces(
         self,
         *,
@@ -1891,12 +1947,13 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
     def uses_full_ckv_dcp(
         self, attn_metadata: B12xMLASparseMetadata, num_tokens: int
     ) -> bool:
+        # Decode layers ask once per step; reject them before the CUDA query.
+        if not (self._ckv_gather_enabled and attn_metadata.dcp_ckv_gather_eligible):
+            return False
         if torch.cuda.is_current_stream_capturing():
             return False
         return (
-            self._ckv_gather_enabled
-            and self._kernel_page_size_finalized
-            and attn_metadata.dcp_ckv_gather_eligible
+            self._kernel_page_size_finalized
             and attn_metadata.num_decode_tokens == 0
             and num_tokens == attn_metadata.num_actual_tokens
             and 0 < attn_metadata.dcp_padded_total_tokens <= self._ckv_local_capacity
@@ -1923,13 +1980,17 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
     ) -> torch.Tensor:
         if not self.uses_full_ckv_dcp(attn_metadata, attn_metadata.num_actual_tokens):
             raise RuntimeError("full CKV gather called for an ineligible batch")
-        if not _is_glm_next_ckv_source_layout(
+        # A packed FP8 cache may arrive through an E4M3 view. The gather copies
+        # whole native records, including scales and the RoPE tail.
+        if kv_cache.dtype == torch.float8_e4m3fn:
+            kv_cache = kv_cache.view(torch.uint8)
+        if not _is_native_ckv_source_layout(
             kv_cache,
             page_size=self._kernel_page_size,
             record_bytes=self._cache_record_bytes,
         ):
             raise ValueError(
-                "GLM5Next CKV gather requires native "
+                "CKV gather requires native "
                 f"{self._cache_record_bytes}-byte records; "
                 f"got shape={tuple(kv_cache.shape)}, stride={kv_cache.stride()}"
             )
@@ -1992,7 +2053,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         plan = self._plan(plan_key)
         use_ckv_gather = plan_key[0] == "ckv_extend"
         if use_ckv_gather:
-            logger.info_once("Using full-CKV gather for GLM5Next B12X DCP prefill")
+            logger.info_once("Using full-CKV gather for B12X DCP prefill")
         input_num_heads = self.num_heads if use_ckv_gather else self._input_num_heads
         kernel_num_heads = _round_up_heads(input_num_heads)
         workspace_specs = self._workspace_specs(

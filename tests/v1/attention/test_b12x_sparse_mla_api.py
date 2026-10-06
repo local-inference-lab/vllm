@@ -53,7 +53,7 @@ from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xMLASparseMetadataBuilder,
     _ckv_rank_token_alignment,
     _global_causal_lens_for_ckv_gather,
-    _is_glm_next_ckv_source_layout,
+    _is_native_ckv_source_layout,
     _is_speculative_decode_batch,
     _max_speculative_decode_query_len,
     _round_up_ckv_rank_tokens,
@@ -822,6 +822,126 @@ def test_b12x_full_ckv_gather_excludes_decode_and_mtp_batches(
     )
 
 
+@pytest.mark.parametrize(
+    ("is_glm_next", "is_glm_dsa", "is_spec_decode", "expected"),
+    [
+        (False, True, False, True),
+        (False, True, True, False),
+        (True, False, True, True),
+        (False, False, False, False),
+    ],
+)
+def test_b12x_full_ckv_gather_admits_glm_dsa_eager_prefill(
+    is_glm_next: bool,
+    is_glm_dsa: bool,
+    is_spec_decode: bool,
+    expected: bool,
+) -> None:
+    """GLM DSA verification keeps the query exchange; GLM5Next is unchanged."""
+    assert (
+        _use_b12x_full_ckv_gather(
+            enabled=True,
+            is_glm_next=is_glm_next,
+            is_glm_dsa=is_glm_dsa,
+            is_spec_decode=is_spec_decode,
+            dcp_world_size=2,
+            max_query_len=4,
+            num_tokens=64,
+            num_decode_tokens=0,
+            min_tokens=16,
+            max_tokens=524288,
+        )
+        is expected
+    )
+
+
+def _bare_glm_dsa_ckv_metadata_builder(
+    *, dcp_rank: int, max_tokens: int = 64, max_reqs: int = 4
+) -> B12xMLASparseMetadataBuilder:
+    builder = B12xMLASparseMetadataBuilder.__new__(B12xMLASparseMetadataBuilder)
+    builder.requires_glm_next_selector_metadata = False
+    builder._is_glm_dsa = True
+    builder._ckv_gather_requested = True
+    builder.dcp_world_size = 2
+    builder.dcp_rank = dcp_rank
+    builder.cp_kv_cache_interleave_size = 1
+    builder.kv_cache_spec = SimpleNamespace(block_size=64)
+    builder._ckv_max_reqs = max_reqs
+    builder._max_speculative_decode_query_len = 4
+    builder.cache_seq_lens_per_token_buffer = torch.zeros(max_tokens, dtype=torch.int32)
+    builder.ckv_selected_indices_buffer = torch.empty(
+        (max_tokens, 2048), dtype=torch.int32
+    )
+    builder.ckv_active_counts_buffer = torch.empty(max_tokens, dtype=torch.int32)
+    builder.dcp_rank_req_lens_buffer = torch.empty((2, max_reqs), dtype=torch.int32)
+    builder.dcp_rank_req_starts_buffer = torch.empty((2, max_reqs), dtype=torch.int32)
+    builder.dcp_local_cu_seq_lens_buffer = torch.empty(max_reqs + 1, dtype=torch.int32)
+    return builder
+
+
+@pytest.mark.parametrize("dcp_rank", [0, 1])
+@pytest.mark.parametrize("batch", ["prefill", "capture", "spec_decode"])
+def test_glm_dsa_builder_gathers_full_ckv_only_for_eager_prefill(
+    monkeypatch: pytest.MonkeyPatch,
+    dcp_rank: int,
+    batch: str,
+) -> None:
+    query_lens = [3, 4] if batch == "spec_decode" else [24, 9]
+    seq_lens = [27, 20] if batch == "spec_decode" else [40, 9]
+    rows = sum(query_lens)
+    monkeypatch.setattr(
+        SparseMLACommonMetadataBuilder,
+        "build",
+        lambda *args, **kwargs: SimpleNamespace(
+            num_prefills=0 if batch == "spec_decode" else 2,
+            num_decodes=2 if batch == "spec_decode" else 0,
+            num_decode_tokens=0,
+            dcp_ckv_gather_eligible=False,
+        ),
+    )
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
+    builder = _bare_glm_dsa_ckv_metadata_builder(dcp_rank=dcp_rank)
+    query_start_loc = torch.tensor([0, query_lens[0], rows], dtype=torch.int32)
+    global_seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+    common = SimpleNamespace(
+        num_reqs=2,
+        num_actual_tokens=rows,
+        max_query_len=max(query_lens),
+        seq_lens=global_seq_lens,
+        dcp_local_seq_lens=(global_seq_lens + 1 - dcp_rank) // 2,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc,
+        seq_lens_cpu=global_seq_lens,
+        seq_lens_cpu_upper_bound=None,
+        positions=None,
+        is_prefilling=torch.tensor([batch != "spec_decode"] * 2),
+    )
+
+    if batch == "capture":
+        metadata = builder.build_for_cudagraph_capture(common)
+    else:
+        metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+    assert metadata.is_spec_decode is (batch == "spec_decode")
+    assert metadata.dcp_ckv_gather_eligible is (batch == "prefill")
+    if batch != "prefill":
+        return
+    # Interleave one: rank zero owns even and rank one odd global positions.
+    assert metadata.dcp_rank_req_lens.tolist() == [[20, 5], [20, 4]]
+    assert metadata.dcp_rank_req_starts.tolist() == [[0, 20], [0, 20]]
+    local_lens = [[20, 5], [20, 4]][dcp_rank]
+    assert metadata.dcp_local_cu_seq_lens.tolist() == [
+        0,
+        local_lens[0],
+        sum(local_lens),
+    ]
+    assert metadata.dcp_local_total_tokens == sum(local_lens)
+    # Two 32-token rank spans form one 64-token page of the gathered cache.
+    assert metadata.dcp_padded_total_tokens == 32
+    assert metadata.ckv_selected_indices.shape == (rows, 2048)
+    assert torch.equal(metadata.global_cache_seq_lens_per_req, global_seq_lens)
+
+
 def test_b12x_full_ckv_gather_uses_global_causal_lengths() -> None:
     global_seq_lens = torch.tensor([5, 12], dtype=torch.int32)
     query_start_loc = torch.tensor([0, 2, 5], dtype=torch.int32)
@@ -912,8 +1032,8 @@ def test_b12x_glm5_next_ckv_source_layout() -> None:
         size=(2, 64, 528),
         stride=(37888, 528, 1),
     )
-    assert _is_glm_next_ckv_source_layout(cache, page_size=64, record_bytes=528)
-    assert not _is_glm_next_ckv_source_layout(
+    assert _is_native_ckv_source_layout(cache, page_size=64, record_bytes=528)
+    assert not _is_native_ckv_source_layout(
         cache[:, :, ::2], page_size=64, record_bytes=528
     )
 
@@ -939,6 +1059,79 @@ def test_b12x_glm5_next_full_ckv_workspaces_follow_cache_format(
     assert len(specs) == 3
     assert specs[1] == ((8,), torch.uint8)
     assert specs[-1] == ((512, record_bytes), torch.uint8)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_b12x_full_ckv_workspace_is_reserved_before_kv_profiling(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    """The profile skips attention, so the gathered cache is reserved upfront.
+
+    The selection remap kernels are compiled for serving buffer layouts there
+    as well, instead of during the first eligible prefill.
+    """
+    from vllm.v1.worker.workspace import WorkspaceManager
+
+    manager = WorkspaceManager(torch.device("cpu"))
+    monkeypatch.setattr(b12x_mla_sparse, "current_workspace_manager", lambda: manager)
+    remaps: list[dict[str, Any]] = []
+    masks: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def remap(req_ids, token_indices, starts, lens, out, counts, **kwargs):
+        remaps.append(
+            dict(
+                kwargs,
+                token_indices=token_indices,
+                starts_stride=starts.stride(),
+                out_shape=tuple(out.shape),
+            )
+        )
+
+    monkeypatch.setattr(b12x_mla_sparse, "_map_global_topk_to_gathered_ckv", remap)
+    monkeypatch.setattr(
+        b12x_mla_sparse,
+        "_mask_page_table_after_nsa_len",
+        lambda selected, counts: masks.append((selected, counts)),
+    )
+    impl = object.__new__(B12xMLASparseImpl)
+    impl.num_heads = 11
+    impl._ckv_gather_enabled = enabled
+    impl._kernel_page_size_finalized = True
+    impl._kernel_page_size = 64
+    impl._max_tokens = 32
+    impl._max_seqs = 16
+    impl._q_head_dim = 576
+    impl._scratch_nbytes = 16
+    impl._ckv_local_capacity = 128
+    impl.dcp_world_size = 2
+    impl._cp_kv_cache_interleave_size = 1
+    impl._cache_record_bytes = 656
+    impl._topk_tokens = 2048
+    impl.topk_indices_buffer = torch.zeros((32, 2048), dtype=torch.int32)
+    impl._plans = {
+        ("ckv_extend", 32): SimpleNamespace(
+            scratch_specs=lambda: (SimpleNamespace(nbytes=8),)
+        )
+    }
+
+    impl.reserve_full_ckv_workspace()
+
+    # Eleven TP-padded local heads run as two whole groups of eight.
+    query_bytes = 32 * 16 * 576 * torch.bfloat16.itemsize
+    gathered_bytes = 2 * 128 * 656
+    expected = query_bytes + 256 + gathered_bytes
+    assert manager.available_bytes() == (expected if enabled else 0)
+    if not enabled:
+        assert remaps == [] and masks == []
+        return
+    assert [call["padded_rank_tokens"] for call in remaps] == [32, 64]
+    for call in remaps:
+        assert call["dcp_size"] == 2
+        assert call["cp_kv_cache_interleave_size"] == 1
+        assert call["starts_stride"] == (16, 1)
+        assert call["out_shape"] == (1, 2048)
+        assert call["token_indices"].data_ptr() == impl.topk_indices_buffer.data_ptr()
+    assert len(masks) == 1 and masks[0][0].shape == (1, 2048)
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
@@ -1090,12 +1283,16 @@ def test_glm_dcp_output_preserves_decode_and_special_transport_paths(
     assert impl.reduce_scatter_dcp_output(torch.empty(rows, 8, 8)) is None
 
 
-@pytest.mark.parametrize("record_bytes", [528, 304])
+@pytest.mark.parametrize(
+    ("record_bytes", "fp8_view"),
+    [(528, False), (304, False), (656, False), (656, True)],
+)
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("padded_tokens", [2, 4])
-def test_b12x_glm5_next_full_ckv_gather_preserves_native_records(
+def test_b12x_full_ckv_gather_preserves_native_records(
     monkeypatch: pytest.MonkeyPatch,
     record_bytes: int,
+    fp8_view: bool,
     rank: int,
     padded_tokens: int,
 ) -> None:
@@ -1139,7 +1336,8 @@ def test_b12x_glm5_next_full_ckv_gather_preserves_native_records(
         lambda: SimpleNamespace(rank_in_group=rank, world_size=2),
     )
 
-    gathered = impl._gather_full_ckv(kv_cache, metadata, gathered_buffer)
+    source = kv_cache.view(torch.float8_e4m3fn) if fp8_view else kv_cache
+    gathered = impl._gather_full_ckv(source, metadata, gathered_buffer)
 
     expected_rank = torch.cat(
         (
@@ -2309,6 +2507,212 @@ def test_b12x_non_compressed_indexer_exposes_scores_for_dcp(monkeypatch) -> None
     assert calls["run"].scores is scores
     assert torch.count_nonzero(output != 7) == 0
     assert torch.count_nonzero(scores != 0.5) == 0
+
+
+@pytest.mark.parametrize(
+    ("dcp_world_size", "interleave"), [(2, 1), (3, 1), (6, 1), (2, 4), (3, 64)]
+)
+def test_dcp_index_key_shards_match_cache_sharding(
+    dcp_world_size: int, interleave: int
+) -> None:
+    from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+
+    seq_lens = torch.tensor([1, 63, 64, 65, 300, 4099], dtype=torch.int32)
+    expected = get_dcp_local_seq_lens(seq_lens, dcp_world_size, None, interleave)
+    for row, seq_len in enumerate(seq_lens.tolist()):
+        assert (
+            generic_b12x_indexer._dcp_local_seq_lens(
+                seq_len, dcp_world_size, interleave
+            )
+            == expected[row].tolist()
+        )
+
+
+def test_dcp_index_key_gather_groups_logits_budget_subchunks() -> None:
+    first_table = torch.zeros((2, 4), dtype=torch.int32)
+
+    def chunk(start: int, end: int, seq_len: int, table: torch.Tensor):
+        return SimpleNamespace(
+            num_reqs=1,
+            token_start=start,
+            token_end=end,
+            total_seq_lens=seq_len,
+            block_table=table,
+        )
+
+    chunks = [
+        chunk(0, 3, 40, first_table[:1]),
+        chunk(3, 5, 40, first_table[:1]),
+        chunk(5, 9, 40, first_table[1:]),
+    ]
+
+    requests = generic_b12x_indexer._prefill_requests(chunks)
+
+    assert [[c.token_start for c in request] for request in requests] == [[0, 3], [5]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton page kernel")
+@pytest.mark.parametrize(
+    ("dcp_world_size", "interleave", "seq_len"),
+    [(2, 1, 200), (3, 1, 129), (6, 1, 1000), (2, 4, 77), (3, 64, 700)],
+)
+def test_dcp_index_key_gather_restores_global_token_pages(
+    monkeypatch: pytest.MonkeyPatch,
+    dcp_world_size: int,
+    interleave: int,
+    seq_len: int,
+) -> None:
+    """Rank-major shards must interleave back into the single-rank layout."""
+    torch.manual_seed(0)
+    keys = torch.randint(0, 256, (seq_len, 128), dtype=torch.uint8)
+    scales = torch.randint(0, 256, (seq_len, 4), dtype=torch.uint8)
+    num_pages = (seq_len + 63) // 64
+    reference = torch.zeros((num_pages, 64 * 132), dtype=torch.uint8)
+    for token in range(seq_len):
+        page, slot = divmod(token, 64)
+        reference[page, slot * 128 : slot * 128 + 128] = keys[token]
+        reference[page, 8192 + slot * 4 : 8192 + slot * 4 + 4] = scales[token]
+
+    # Every rank stores its owned tokens in local order across scattered
+    # physical blocks of its own cache.
+    num_blocks = 4 * num_pages + 4
+    caches, tables = [], []
+    for rank in range(dcp_world_size):
+        cache = torch.zeros((num_blocks, 64 * 132), dtype=torch.uint8)
+        table = torch.randperm(num_blocks, dtype=torch.int32)
+        local = 0
+        for token in range(seq_len):
+            if (token // interleave) % dcp_world_size != rank:
+                continue
+            block, slot = int(table[local // 64]), local % 64
+            cache[block, slot * 128 : slot * 128 + 128] = keys[token]
+            cache[block, 8192 + slot * 4 : 8192 + slot * 4 + 4] = scales[token]
+            local += 1
+        caches.append(cache.cuda().view(num_blocks, 64, 132))
+        tables.append(table.cuda())
+
+    for rank in range(dcp_world_size):
+
+        def all_gather(group, local, gathered, rank=rank):
+            assert group == "dcp"
+            rank_pages = gathered.numel() // (dcp_world_size * 64 * 132)
+            shards = gathered.view(dcp_world_size, rank_pages, 64 * 132)
+            assert local.data_ptr() == shards[rank].data_ptr()
+            for peer in range(dcp_world_size):
+                if peer == rank:
+                    continue
+                pages = (
+                    generic_b12x_indexer._dcp_local_seq_lens(
+                        seq_len, dcp_world_size, interleave
+                    )[peer]
+                    + 63
+                ) // 64
+                flat = caches[peer].view(num_blocks, 64 * 132)
+                shards[peer, :pages] = flat[tables[peer][:pages].long()]
+
+        monkeypatch.setattr(
+            b12x_mla_sparse, "_dcp_all_gather_current_stream", all_gather
+        )
+        gathered = generic_b12x_indexer._gather_dcp_index_keys(
+            caches[rank],
+            tables[rank],
+            seq_len,
+            group="dcp",
+            dcp_rank=rank,
+            dcp_world_size=dcp_world_size,
+            interleave=interleave,
+        )
+
+        assert gathered.shape == (num_pages, 64, 132)
+        actual = gathered.view(num_pages, 64 * 132).cpu()
+        for token in range(seq_len):
+            page, slot = divmod(token, 64)
+            for lo, hi in (
+                (slot * 128, slot * 128 + 128),
+                (8192 + slot * 4, 8196 + slot * 4),
+            ):
+                assert torch.equal(actual[page, lo:hi], reference[page, lo:hi])
+
+
+@pytest.mark.parametrize(("tp_rank", "tp_size"), [(0, 3), (1, 3), (2, 3), (1, 7)])
+def test_dcp_index_key_gather_splits_rows_and_restores_selection(
+    monkeypatch: pytest.MonkeyPatch, tp_rank: int, tp_size: int
+) -> None:
+    """Each TP rank selects a disjoint row slice at its global causal length."""
+    from vllm.distributed import parallel_state
+
+    topk, rows, history = 4, 7, 13
+    indexer = object.__new__(generic_b12x_indexer.B12xSparseIndexer)
+    indexer.k_cache = SimpleNamespace(kv_cache=torch.empty((1, 64, 132)))
+    indexer.dcp_rank, indexer.dcp_world_size = 1, 2
+    indexer.cp_kv_cache_interleave_size = 1
+    indexer.topk_tokens = topk
+    indexer.topk_indices_buffer = torch.full((12, topk), -7, dtype=torch.int32)
+    indexer.active_width_cap = torch.full((1,), 1 << 20, dtype=torch.int32)
+    indexer._module = object()
+    indexer._plan = lambda mode, count: (mode, count)
+    keys = torch.zeros((1, 64, 132), dtype=torch.uint8)
+    calls: dict[str, Any] = {}
+
+    def gather_keys(cache, table_row, seq_len, **kwargs):
+        calls["gather"] = (seq_len, kwargs)
+        return keys
+
+    def select(**kwargs):
+        calls["select"] = kwargs
+        kwargs["output"].copy_(kwargs["seq_lens"][:, None].expand(-1, topk))
+
+    def restore(group, local, restored):
+        per = local.shape[0]
+        assert restored.shape[0] == per * tp_size
+        assert local.data_ptr() == restored[tp_rank * per].data_ptr()
+        for peer in range(tp_size):
+            if peer != tp_rank:
+                lengths = history + torch.arange(peer * per, (peer + 1) * per) + 1
+                restored[peer * per : (peer + 1) * per] = lengths[:, None]
+
+    monkeypatch.setattr(generic_b12x_indexer, "_gather_dcp_index_keys", gather_keys)
+    monkeypatch.setattr(generic_b12x_indexer, "_run_paged_topk", select)
+    monkeypatch.setattr(generic_b12x_indexer, "get_dcp_group", lambda: "dcp")
+    monkeypatch.setattr(
+        parallel_state,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=tp_size, rank_in_group=tp_rank),
+    )
+    monkeypatch.setattr(b12x_mla_sparse, "_dcp_all_gather_current_stream", restore)
+    q_quant = torch.arange(12, dtype=torch.float32)[:, None, None].expand(12, 2, 128)
+    weights = torch.arange(12, dtype=torch.float32)[:, None].expand(12, 2)
+    table = torch.zeros((1, 4), dtype=torch.int32)
+    chunks = [
+        SimpleNamespace(
+            token_start=2, token_end=5, total_seq_lens=20, block_table=table
+        ),
+        SimpleNamespace(
+            token_start=5, token_end=9, total_seq_lens=20, block_table=table
+        ),
+    ]
+
+    indexer._run_gathered_prefill(chunks, q_quant, weights)
+
+    assert calls["gather"][0] == history + rows
+    assert calls["gather"][1]["dcp_rank"] == 1
+    per = (rows + tp_size - 1) // tp_size
+    first = min(tp_rank * per, rows)
+    count = min(per, rows - first)
+    if count:
+        selected = calls["select"]
+        assert selected["plan"] == ("prefill", count)
+        assert selected["kv_cache"] is keys
+        assert selected["q"][:, 0, 0].tolist() == list(
+            range(2 + first, 2 + first + count)
+        )
+        assert selected["block_table"].shape == (count, 1)
+    expected = history + torch.arange(rows, dtype=torch.int32) + 1
+    assert torch.equal(
+        indexer.topk_indices_buffer[2:9], expected[:, None].expand(rows, topk)
+    )
+    assert torch.all(indexer.topk_indices_buffer[:2] == -7)
+    assert torch.all(indexer.topk_indices_buffer[9:] == -7)
 
 
 def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
