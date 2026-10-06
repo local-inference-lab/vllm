@@ -419,7 +419,7 @@ def test_scale_prefetch_expands_the_next_layer_for_this_forward_only(monkeypatch
     )
 
     def step(tokens):
-        context = SimpleNamespace(attn_metadata={})
+        context = SimpleNamespace(attn_metadata={}, additional_kwargs={})
         monkeypatch.setattr(
             forward_context, "is_forward_context_available", lambda: True
         )

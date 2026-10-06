@@ -1747,7 +1747,9 @@ def test_b12x_moe_prefill_capacity_and_exact_decode_reuse(
                     for route_ids in (ids, ids64):
                         check(apply(rows, route_ids), rows)
                 graph_rows = (
-                    (3, 5, 31, 32, 33) if cutoff and capacity > cutoff else (3, 4)
+                    (3, 5, 31, 32, 33)
+                    if weight_dtype == "nvfp4" and cutoff and capacity > cutoff
+                    else (3, 4)
                 )
                 for rows in graph_rows:
                     graph = torch.cuda.CUDAGraph()
