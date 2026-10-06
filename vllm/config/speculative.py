@@ -692,6 +692,9 @@ class SpeculativeConfig:
             "deepseek_v32",
             "glm_moe_dsa",
         ):
+            # Parallelism hooks of the target (GLM-5.3 TP padding) apply to
+            # its draft too.
+            hf_config.update({"mtp_target_model_type": hf_config.model_type})
             hf_config.model_type = "deepseek_mtp"
         if hf_config.model_type == "deepseek_mtp":
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
