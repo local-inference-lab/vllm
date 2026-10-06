@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -16,6 +18,59 @@ from vllm.utils.mem_constants import GiB_bytes
 from ..utils import create_new_process_for_each_test, requires_fp8
 
 DEVICE_TYPE = current_platform.device_type
+
+
+@pytest.mark.parametrize("failure", [False, True])
+@pytest.mark.parametrize(
+    "cuda_conf,alloc_conf,expandable",
+    [
+        (None, "expandable_segments:True", True),
+        (None, "max_split_size_mb:64, expandable_segments : True", True),
+        ("expandable_segments : True", None, True),
+        ("expandable_segments:True", "expandable_segments:False", True),
+        ("expandable_segments:False", "expandable_segments:True", False),
+        ("", "expandable_segments:True", False),
+        (None, None, False),
+    ],
+)
+def test_cumem_pool_restores_effective_allocator_config(
+    monkeypatch, cuda_conf, alloc_conf, expandable, failure
+):
+    """Disable VMM before pool entry and restore it even when the body raises."""
+    for name, value in (
+        ("PYTORCH_CUDA_ALLOC_CONF", cuda_conf),
+        ("PYTORCH_ALLOC_CONF", alloc_conf),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    settings: list[str] = []
+    monkeypatch.setattr(
+        "vllm.device_allocator.cumem.torch.cuda.memory._set_allocator_settings",
+        settings.append,
+    )
+    pool = SimpleNamespace(snapshot=lambda: [])
+
+    @contextmanager
+    def fake_pool(*_args):
+        assert settings == (["expandable_segments:False"] if expandable else [])
+        yield pool, None
+
+    monkeypatch.setattr(cumem, "use_memory_pool_with_allocator", fake_pool)
+    allocator = cumem.CuMemAllocator()
+    outcome = (
+        pytest.raises(RuntimeError, match="pool body") if failure else nullcontext()
+    )
+    with outcome, allocator.use_memory_pool("weights"):
+        assert allocator.current_tag == "weights"
+        if failure:
+            raise RuntimeError("pool body")
+    assert allocator.current_tag == allocator.default_tag
+    assert allocator.allocator_and_pools["weights"][0] is pool
+    assert settings == (
+        ["expandable_segments:False", "expandable_segments:True"] if expandable else []
+    )
 
 
 def mapped_usage(allocator) -> int:

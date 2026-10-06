@@ -15,6 +15,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
 
+import regex as re
 import torch
 
 from vllm.device_allocator import AllocationData, HandleType
@@ -373,11 +374,14 @@ class CuMemAllocator:
 
         # Expandable segments are incompatible with the memory pool used for
         # sleep mode (see https://github.com/pytorch/pytorch/issues/147851).
-        # If the user has enabled expandable segments via
-        # PYTORCH_CUDA_ALLOC_CONF, temporarily disable them for the duration
-        # of the memory pool context and restore on exit.
-        conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-        expandable_was_enabled = "expandable_segments:True" in conf
+        # Temporarily disable the effective allocator setting while the pool
+        # is active and restore it on exit.
+        conf = os.environ.get(
+            "PYTORCH_CUDA_ALLOC_CONF", os.environ.get("PYTORCH_ALLOC_CONF", "")
+        )
+        expandable_was_enabled = bool(
+            re.search(r"(?:^|,)\s*expandable_segments\s*:\s*True\s*(?:,|$)", conf)
+        )
         if expandable_was_enabled:
             torch.cuda.memory._set_allocator_settings("expandable_segments:False")
 
