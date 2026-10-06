@@ -32,6 +32,7 @@ logger = init_logger(__name__)
 # if a new load format is added here
 LoadFormats = Literal[
     "auto",
+    "b12x",
     "hf",
     "dummy",
     "fastsafetensors",
@@ -122,6 +123,10 @@ def register_model_loader(load_format: str):
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     """Get a model loader based on the load format."""
     load_format = load_config.load_format
+    if load_format == "b12x" and load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
+        from vllm.model_executor.model_loader.b12x_loader import B12xModelLoader
+
+        _LOAD_FORMAT_TO_MODEL_LOADER[load_format] = B12xModelLoader
     if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
         raise ValueError(f"Load format `{load_format}` is not supported")
     return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)

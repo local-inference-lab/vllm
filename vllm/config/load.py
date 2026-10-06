@@ -35,6 +35,8 @@ class LoadConfig:
       back to the pytorch bin format if safetensors format is not available.
     - "pt" will load the weights in the pytorch bin format.
     - "safetensors" will load the weights in the safetensors format.
+    - "b12x" will load safetensors weights directly into CUDA tensors using
+      the b12x checkpoint loader provided by `flashinfer-python[b12x]`.
     - "instanttensor" will load the Safetensors weights on CUDA devices using
       InstantTensor, which enables distributed loading with pipelined prefetching
       and fast direct I/O.
