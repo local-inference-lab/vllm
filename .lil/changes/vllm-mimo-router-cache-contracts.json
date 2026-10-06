@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-mimo-router-cache-contracts",
+  "category": "fix",
+  "summary": "Preserve MiMo router precision and DFlash cache configuration",
+  "models": [
+    "MiMo-V2.6-Flash-RL"
+  ],
+  "compatibility": "MiMo router projections retain FP32 values; DFlash inherits the configured cache contract.",
+  "details": [
+    "Guard kernel graph dispatch with tensor inputs and retain target-normalization semantics for DFlash."
+  ],
+  "pull_requests": [
+    829,
+    831,
+    832
+  ]
+}

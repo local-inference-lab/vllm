@@ -231,3 +231,17 @@ def test_single_rank_loads_plain_cache(tmp_path) -> None:
 
     assert _run_ranks(run, world_size=1) == [True]
     assert tuner.file_configs == {"gemm": ["R", 1]}
+
+
+@pytest.mark.parametrize("world_size", [1, WORLD])
+@pytest.mark.parametrize("contents", [b"{", b"\xff"])
+def test_malformed_cache_misses_consistently(tmp_path, world_size, contents) -> None:
+    cache_path = tmp_path / "autotune_configs.json"
+    cache_path.write_bytes(contents)
+    tuners = [_FakeTuner() for _ in range(world_size)]
+
+    def run(group: _FakeGroup, rank: int) -> bool:
+        return load_autotune_cache_on_all_ranks(cache_path, tuners[rank], group)
+
+    assert _run_ranks(run, world_size=world_size) == [False] * world_size
+    assert all(not tuner.file_configs for tuner in tuners)
