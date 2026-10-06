@@ -32,6 +32,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     yarn_get_mscale,
 )
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v32.common.kernels import fused_norm_rope, fused_q
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_quantized_kv_cache
@@ -319,6 +320,14 @@ class DeepseekV32Attention(MLAAttention):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+
+        # TP padding (GlmMoeDsaForCausalLM config) appends zero heads after the
+        # checkpoint heads: zero Q and KV-up rows and zero o_proj input
+        # columns, so padded heads contribute nothing to the output.
+        if getattr(config, "original_num_attention_heads", num_heads) != num_heads:
+            for linear in (self.q_b_proj, kv_b_proj, self.o_proj):
+                for param in linear.parameters():
+                    set_weight_attrs(param, {"allow_tp_padding": True})
 
         self.rotary_emb = get_rope(
             qk_rope_head_dim,

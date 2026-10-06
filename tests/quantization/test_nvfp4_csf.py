@@ -301,6 +301,77 @@ def test_tensor_sources_preserve_tp_bytes_and_fp32_with_bf16_default(rank):
         assert torch.equal(actual, expected)
 
 
+@pytest.mark.parametrize("rank", [0, 1, 2])
+def test_padded_shards_hold_whole_tiles_and_zero_the_tail(rank):
+    """TP-padded experts (GLM-5.3 at TP6): rank r holds checkpoint channels
+    [r * local, (r + 1) * local) and zero weights past the checkpoint width,
+    here 320 channels over three 128-channel shards."""
+    from vllm.model_executor.model_loader.nvfp4_csf_loader import (
+        _load_nvfp4_csf_weights as load_nvfp4_csf_weights,
+    )
+
+    experts, hidden, intermediate, local = 2, 256, 320, 128
+    one = torch.tensor(1.0)
+    sources, scales = [], []
+    for expert in range(experts):
+        pairs = [
+            matrix(r, c, group_size=16, seed=expert * 17 + projection)
+            for projection, (r, c) in enumerate(
+                ((intermediate, hidden), (intermediate, hidden), (hidden, intermediate))
+            )
+        ]
+        sources.append(
+            tuple(replace(p[0], global_scale=one, input_scale=one) for p in pairs)
+        )
+        scales.append(tuple(pair[1] for pair in pairs))
+    weights = load_nvfp4_csf_weights(
+        iter(sources),
+        num_experts=experts,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        tp_rank=rank,
+        tp_size=3,
+        device="cpu",
+        w13_scale_scratch=torch.empty(
+            (experts, 2 * local, hidden // 16), dtype=torch.float8_e4m3fn
+        ),
+        w2_scale_scratch=torch.empty(
+            (experts, hidden, local // 16), dtype=torch.float8_e4m3fn
+        ),
+        local_size=local,
+    )
+    first = rank * local
+    real = min(intermediate - first, local)
+    w13, w2 = weights.packed.w13, weights.packed.w2
+    assert w13.shape == (experts, 2 * local, hidden // 2)
+    assert w2.shape == (experts, hidden, local // 2)
+    for expert, (up, gate, down) in enumerate(sources):
+        assert torch.equal(w13[expert, :real], up.weight[first : first + real, :])
+        assert torch.equal(
+            w13[expert, local : local + real], gate.weight[first : first + real, :]
+        )
+        assert torch.equal(
+            w2[expert, :, : real // 2], down.weight[:, first // 2 : (first + real) // 2]
+        )
+    assert not w13[:, real:local].any() and not w13[:, local + real :].any()
+    assert not w2[:, :, real // 2 :].any()
+    decoded13 = decode_planes(weights.w13_scales, 2 * local, hidden // 16, 16)
+    decoded2 = decode_planes(weights.w2_scales, hidden, local // 16, 16)
+    for expert, (up, gate, down) in enumerate(scales):
+        assert torch.equal(decoded13[expert, :real], up[first : first + real])
+        assert torch.equal(
+            decoded13[expert, local : local + real], gate[first : first + real]
+        )
+        assert torch.equal(
+            decoded2[expert, :, : real // 16],
+            down[:, first // 16 : (first + real) // 16],
+        )
+    # Padded rows scale zero weights by 1.0 (E4M3 0x38), which packs without
+    # replacement words.
+    assert (decoded13[:, real:local] == 0x38).all()
+    assert (decoded13[:, local + real :] == 0x38).all()
+
+
 @pytest.mark.parametrize(
     "bad",
     [

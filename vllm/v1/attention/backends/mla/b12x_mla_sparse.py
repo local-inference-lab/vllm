@@ -81,6 +81,18 @@ class B12xPhysicalSelectionProvider(Protocol):
     ) -> tuple[torch.Tensor, torch.Tensor] | None: ...
 
 
+def _round_up_heads(num_heads: int) -> int:
+    """B12X sparse MLA query heads: whole groups of eight."""
+    return (num_heads + 7) // 8 * 8
+
+
+def _packed_heads(tensor: torch.Tensor, num_heads: int) -> torch.Tensor:
+    """The first ``num_heads`` heads of ``tensor`` as a new packed tensor."""
+    real = tensor.new_empty((tensor.shape[0], num_heads, *tensor.shape[2:]))
+    real.copy_(tensor[:, :num_heads])
+    return real
+
+
 def _is_glm_next_config(hf_config: object | None) -> bool:
     return getattr(hf_config, "model_type", None) in _GLM_NEXT_MODEL_TYPES
 
@@ -1298,6 +1310,10 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         max_tokens = int(scheduler_config.max_num_batched_tokens)
         max_seqs = int(scheduler_config.max_num_seqs)
         self._input_num_heads = self.num_heads * self.dcp_world_size
+        # B12X sparse MLA runs whole groups of eight heads. TP-padded models
+        # (GLM-5.3 at TP6: 11 heads per rank) get zero heads up to the next
+        # group, and their outputs are dropped again.
+        self._kernel_num_heads = _round_up_heads(self._input_num_heads)
         self._q_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         self._topk_tokens = int(self.topk_indices_buffer.shape[-1])
         if self._is_glm_next:
@@ -1396,7 +1412,9 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         caps_kwargs = dict(
             device=torch.device("cuda", torch.accelerator.current_device_index()),
             num_q_heads=(
-                self.num_heads if mode == "ckv_extend" else self._input_num_heads
+                _round_up_heads(self.num_heads)
+                if mode == "ckv_extend"
+                else self._kernel_num_heads
             ),
             max_q_rows=rows,
             max_width=self._topk_tokens,
@@ -1665,7 +1683,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         return bool(
             self.dcp_world_size == 1
             and output_dtype == torch.bfloat16
-            and num_heads == self._input_num_heads
+            and num_heads == self._input_num_heads == self._kernel_num_heads
             and self._q_head_dim == 576
         )
 
@@ -1976,38 +1994,44 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         if use_ckv_gather:
             logger.info_once("Using full-CKV gather for GLM5Next B12X DCP prefill")
         input_num_heads = self.num_heads if use_ckv_gather else self._input_num_heads
+        kernel_num_heads = _round_up_heads(input_num_heads)
         workspace_specs = self._workspace_specs(
-            input_num_heads=input_num_heads,
+            input_num_heads=kernel_num_heads,
             include_ckv=use_ckv_gather,
         )
         workspaces = current_workspace_manager().get_simultaneous(*workspace_specs)
         q_buffer = workspaces[0]
         scratch = workspaces[1]
 
+        q_all = q_buffer[:num_tokens]
+        q_real = q_all[:, :input_num_heads]
         if isinstance(q, tuple):
             q_nope, q_pe = q
-            q_all = q_buffer[:num_tokens]
             if int(q_pe.shape[-1]) == 0:
-                q_all.copy_(q_nope)
+                q_real.copy_(q_nope)
             else:
-                ops.concat_mla_q(q_nope, q_pe, q_all)
+                ops.concat_mla_q(q_nope, q_pe, q_real)
         else:
-            q_all = q_buffer[:num_tokens]
             exact_workspace_alias = (
-                tuple(q.shape) == tuple(q_all.shape)
-                and tuple(q.stride()) == tuple(q_all.stride())
-                and q.dtype == q_all.dtype
-                and q.device == q_all.device
-                and q.untyped_storage().data_ptr() == q_all.untyped_storage().data_ptr()
-                and q.storage_offset() == q_all.storage_offset()
+                tuple(q.shape) == tuple(q_real.shape)
+                and tuple(q.stride()) == tuple(q_real.stride())
+                and q.dtype == q_real.dtype
+                and q.device == q_real.device
+                and q.untyped_storage().data_ptr()
+                == q_real.untyped_storage().data_ptr()
+                and q.storage_offset() == q_real.storage_offset()
             )
             if not exact_workspace_alias:
-                q_all.copy_(q)
+                q_real.copy_(q)
+        if kernel_num_heads != input_num_heads:
+            q_all[:, input_num_heads:].zero_()
 
-        if int(q_all.shape[1]) != input_num_heads:
+        if int(q.shape[1] if not isinstance(q, tuple) else q[0].shape[1]) != (
+            input_num_heads
+        ):
             raise ValueError(
                 "B12X sparse MLA query heads do not match the planned head "
-                f"count: {q_all.shape[1]} != {input_num_heads}."
+                f"count: {q_real.shape[1]} != {input_num_heads}."
             )
 
         assert self.topk_indices_buffer is not None
@@ -2123,6 +2147,12 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         result = self._run(binding)
         # The extend kernel returns LSE even when decode does not request it.
         output, lse = result if isinstance(result, tuple) else (result, None)
+        if kernel_num_heads != input_num_heads:
+            # Fresh packed tensors: for one row, contiguous() would keep the
+            # padded row stride, which the DCP collectives reject.
+            output = _packed_heads(output, input_num_heads)
+            if lse is not None:
+                lse = _packed_heads(lse, input_num_heads)
         if self.need_to_return_lse_for_decode:
             assert lse is not None
             return output, lse

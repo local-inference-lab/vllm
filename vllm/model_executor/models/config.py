@@ -46,6 +46,86 @@ class DeepseekV32ForCausalLM(VerifyAndUpdateConfig):
             logger.info("Using bfloat16 kv-cache for DeepSeekV3.2")
 
 
+def _pad_glm_moe_dsa_for_parallelism(
+    model_config: "ModelConfig", parallel_config: "ParallelConfig"
+) -> None:
+    """Pad GLM-5.3 (744B) axes that the tensor-parallel size does not divide.
+
+    The 64 MLA heads and the 2048-channel experts (routed and shared) need
+    physical padding at TP6: heads 64 -> 66 and expert channels
+    2048 -> 2112 (352 per rank, whole 32-channel B12X W4A16 tiles).
+    The checkpoint sizes stay as ``original_*`` attributes; the loaders zero
+    the padded tails, so padded heads and channels contribute nothing.
+    Divisible TP sizes are exact no-ops.
+    """
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return
+    text_config: Any = model_config.hf_text_config
+    model_type = getattr(
+        text_config,
+        "mtp_target_model_type",
+        getattr(text_config, "model_type", None),
+    )
+    if model_type != "glm_moe_dsa":
+        return
+    tp_size = parallel_config.tensor_parallel_size
+
+    def logical(name: str) -> int:
+        return getattr(text_config, f"original_{name}", getattr(text_config, name))
+
+    heads = logical("num_attention_heads")
+    kv_heads = logical("num_key_value_heads")
+    expert_width = logical("moe_intermediate_size")
+    padded_heads = heads if heads % tp_size == 0 else round_up(heads, tp_size)
+    padded_width = (
+        expert_width
+        if expert_width % tp_size == 0
+        else round_up(expert_width, tp_size * _GLM_DSA_EXPERT_LOCAL_ALIGNMENT)
+    )
+    if (padded_heads, padded_width) == (
+        text_config.num_attention_heads,
+        text_config.moe_intermediate_size,
+    ):
+        return
+    if kv_heads != heads:
+        raise ValueError(
+            "GLM-5.3 TP padding expects num_key_value_heads == "
+            f"num_attention_heads for MLA, got {kv_heads} and {heads}."
+        )
+    if padded_width != expert_width and parallel_config.enable_expert_parallel:
+        raise ValueError(
+            f"GLM-5.3 at tensor_parallel_size={tp_size} pads the expert width "
+            f"({expert_width}) for tensor parallelism; expert parallelism is "
+            "not supported with that padding."
+        )
+    if text_config.intermediate_size % tp_size:
+        raise ValueError(
+            f"GLM-5.3 dense MLP width ({text_config.intermediate_size}) is not "
+            f"divisible by tensor_parallel_size={tp_size}."
+        )
+    text_config.original_num_attention_heads = heads
+    text_config.num_attention_heads = padded_heads
+    text_config.original_num_key_value_heads = kv_heads
+    text_config.num_key_value_heads = padded_heads
+    text_config.original_moe_intermediate_size = expert_width
+    text_config.moe_intermediate_size = padded_width
+    model_config.model_arch_config = model_config.get_model_arch_config()
+    logger.warning(
+        "Padded GLM-5.3 for TP%d: MLA heads %d -> %d, expert width %d -> %d.",
+        tp_size,
+        heads,
+        padded_heads,
+        expert_width,
+        padded_width,
+    )
+
+
+# B12X W4A16 expert kernels take whole 32-channel tiles per rank (FC2 K32).
+_GLM_DSA_EXPERT_LOCAL_ALIGNMENT = 32
+
+
 class GlmMoeDsaForCausalLM(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
@@ -54,6 +134,27 @@ class GlmMoeDsaForCausalLM(VerifyAndUpdateConfig):
         vllm_config.parallel_config.set_dcp_defaults(
             comm_backend="a2a", q_replicate=True
         )
+        if vllm_config.model_config is not None:
+            _pad_glm_moe_dsa_for_parallelism(
+                vllm_config.model_config, vllm_config.parallel_config
+            )
+
+    @staticmethod
+    def update_model_config_for_parallelism(
+        model_config: "ModelConfig", parallel_config: "ParallelConfig"
+    ) -> None:
+        _pad_glm_moe_dsa_for_parallelism(model_config, parallel_config)
+
+
+class GlmMoeDsaMTPConfig(VerifyAndUpdateConfig):
+    """The GLM-5.3 (744B) MTP draft pads like its target (DeepSeek-V3.2 MTP
+    drafts are unaffected)."""
+
+    @staticmethod
+    def update_model_config_for_parallelism(
+        model_config: "ModelConfig", parallel_config: "ParallelConfig"
+    ) -> None:
+        _pad_glm_moe_dsa_for_parallelism(model_config, parallel_config)
 
 
 class Ernie4_5_VLMoeForConditionalGenerationConfig(VerifyAndUpdateConfig):
@@ -1213,6 +1314,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Gemma4ForConditionalGeneration": Gemma4Config,
     "Gemma4UnifiedForConditionalGeneration": Gemma4Config,
     "GlmMoeDsaForCausalLM": GlmMoeDsaForCausalLM,
+    "DeepseekV32MTPModel": GlmMoeDsaMTPConfig,
     "GptOssForCausalLM": GptOssForCausalLMConfig,
     "LongcatFlashNgramForCausalLM": LongcatFlashNgramForCausalLMConfig,
     "GteModel": SnowflakeGteNewModelConfig,

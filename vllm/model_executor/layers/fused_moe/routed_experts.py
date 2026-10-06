@@ -480,10 +480,15 @@ class RoutedExperts(PluggableLayer):
             # size.  Compute the offset into the checkpoint weight using
             # the *unpadded* per-rank size so that every TP rank lands at
             # the correct slice.
-            tp_size = self.moe_config.moe_parallel_config.tp_size
-            loaded_per_rank = loaded_weight.shape[shard_dim] // tp_size
+            loaded_per_rank = self._loaded_per_rank(
+                loaded_weight, shard_dim, shard_size
+            )
             start_offset = loaded_per_rank * tp_rank
             available = loaded_weight.shape[shard_dim] - start_offset
+            if min(loaded_per_rank, available) < shard_size:
+                # The padded tail of this rank's half must be zero.
+                half = 0 if shard_id == "w1" else shard_size
+                expert_data.narrow(shard_dim, half, shard_size).zero_()
             if available <= 0:
                 # If there is no available weight to load for this TP rank
                 # (can happen on last TP rank with padding), we can skip
@@ -508,6 +513,23 @@ class RoutedExperts(PluggableLayer):
         )
         copy_weight(expert_data, loaded_weight)
 
+    def _loaded_per_rank(
+        self, loaded_weight: torch.Tensor, shard_dim: int, shard_size: int
+    ) -> int:
+        """Checkpoint channels per TP rank along ``shard_dim``.
+
+        A width the TP size divides is split evenly; each rank's share may be
+        padded in the parameter (MXFP4 tile rounding). A width it does not
+        divide was padded as a whole (GLM-5.3 at TP6): rank r holds channels
+        [r * shard_size, (r + 1) * shard_size) and the last rank's tail is
+        zero.
+        """
+        tp_size = self.moe_config.moe_parallel_config.tp_size
+        loaded_size = loaded_weight.shape[shard_dim]
+        if loaded_size % tp_size == 0:
+            return loaded_size // tp_size
+        return shard_size
+
     def _load_w2(
         self,
         expert_data: torch.Tensor,
@@ -520,10 +542,14 @@ class RoutedExperts(PluggableLayer):
         # Only narrow if the loaded_weight is not a scalar (0-dim tensor).
         if loaded_weight.ndim > 0:
             # Same padding fix as _load_w13: use unpadded per-rank size.
-            tp_size = self.moe_config.moe_parallel_config.tp_size
-            loaded_per_rank = loaded_weight.shape[shard_dim] // tp_size
+            loaded_per_rank = self._loaded_per_rank(
+                loaded_weight, shard_dim, expert_data.shape[shard_dim]
+            )
             start_offset = loaded_per_rank * tp_rank
             available = loaded_weight.shape[shard_dim] - start_offset
+            if min(loaded_per_rank, available) < expert_data.shape[shard_dim]:
+                # The padded tail of this rank's columns must be zero.
+                expert_data.zero_()
             if available <= 0:
                 # If there is no available weight to load for this TP rank
                 # (can happen on last TP rank with padding), we can skip
