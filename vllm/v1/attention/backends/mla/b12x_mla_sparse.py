@@ -1947,12 +1947,13 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
     def uses_full_ckv_dcp(
         self, attn_metadata: B12xMLASparseMetadata, num_tokens: int
     ) -> bool:
+        # Decode layers ask once per step; reject them before the CUDA query.
+        if not (self._ckv_gather_enabled and attn_metadata.dcp_ckv_gather_eligible):
+            return False
         if torch.cuda.is_current_stream_capturing():
             return False
         return (
-            self._ckv_gather_enabled
-            and self._kernel_page_size_finalized
-            and attn_metadata.dcp_ckv_gather_eligible
+            self._kernel_page_size_finalized
             and attn_metadata.num_decode_tokens == 0
             and num_tokens == attn_metadata.num_actual_tokens
             and 0 < attn_metadata.dcp_padded_total_tokens <= self._ckv_local_capacity
