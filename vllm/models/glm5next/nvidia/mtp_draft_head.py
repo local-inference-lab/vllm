@@ -94,11 +94,13 @@ class QuantizedDraftHead(nn.Module):
         if self.shard_indices is None:
             raise TypeError("the shared target vocabulary head has no shard metadata")
 
+        # FlashInfer builds the W4A16 kernels for the SM120 family (12.0f),
+        # which includes GB10 (DGX Spark, 12.1).
         major, minor = torch.cuda.get_device_capability(weight.device)
-        if (major, minor) != (12, 0):
+        if major != 12:
             raise ValueError(
-                "the NVFP4 W4A16 draft vocabulary head requires CUDA capability "
-                f"12.0; got {major}.{minor}"
+                "the NVFP4 W4A16 draft vocabulary head requires an SM120-family "
+                f"GPU (CUDA capability 12.x); got {major}.{minor}"
             )
         import flashinfer
 

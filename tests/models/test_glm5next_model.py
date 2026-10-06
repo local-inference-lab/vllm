@@ -355,7 +355,8 @@ def test_glm5next_mtp_head_scale_bounds_conversion_memory(record_property) -> No
 
 
 @pytest.mark.skipif(
-    not current_platform.is_device_capability(120), reason="requires SM120"
+    not current_platform.is_device_capability_family(120),
+    reason="requires an SM120-family GPU",
 )
 def test_glm5next_mtp_head_quantization_preserves_packed_weights() -> None:
     import flashinfer
