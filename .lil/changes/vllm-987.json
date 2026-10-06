@@ -1,0 +1,25 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-987",
+  "category": "performance",
+  "summary": "GLM-5.3 (744B) decodes up to 14% faster at TP8: the all-reduce before each RMSNorm runs as one fused B12X PCIe kernel",
+  "models": [
+    "GLM-5.3"
+  ],
+  "compatibility": "With the current b12x, keep VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE at 96KB (fused up to 8 rows at hidden size 6144); larger values send 16-row MTP steps through a slower fused path. Other models are unchanged: the fused path runs only at declared sites.",
+  "details": [
+    "fused_allreduce_rms_norm now offers the B12X PCIe communicator the fused all-reduce + residual add + RMSNorm first, and the GLM DSA model declares its 155 sites (post-attention norms, later input norms, final norm). Before, this eager model ran an all-reduce and a separate RMSNorm at each.",
+    "The communicator respects the fused kernel's published row capacity, so a byte limit above it degrades to the plain all-reduce instead of failing.",
+    "TP8, DCP1, MTP3 on 8x RTX PRO 6000 with L2 prefetch: MTP-normalized decode steps/s 73.5 -> 83.6 at C1, 127.5 -> 136.4 at C2, 189.0 -> 190.1 at C4 (context 0); 62.4 -> 70.1 at C1 with 128K context. Ported from joninco (1dd6f2b2f5, f8e10d49f6)."
+  ],
+  "authors": [
+    "voipmonitor",
+    "joninco"
+  ],
+  "pull_requests": [
+    987
+  ],
+  "requires": [
+    "vllm-986"
+  ]
+}
