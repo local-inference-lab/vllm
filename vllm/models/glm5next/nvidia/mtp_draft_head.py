@@ -27,6 +27,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _NVFP4_GLOBAL_MAX = 448.0 * 6.0
+_CUTE_DSL_N_TILE = 64
 _SUPPORTED_MODES = frozenset(("bf16", "nvfp4"))
 
 
@@ -103,6 +104,15 @@ class QuantizedDraftHead(nn.Module):
             )
         import flashinfer
 
+        # The CuTe-DSL W4A16 GEMM packs N in tiles of 64; a vocabulary shard
+        # that is not a multiple (GLM-5.3 at TP8: 154880 / 8 = 19360) is
+        # padded with zero rows whose logits forward() drops.
+        self.output_rows = int(weight.shape[0])
+        padded_rows = -(-self.output_rows // _CUTE_DSL_N_TILE) * _CUTE_DSL_N_TILE
+        if padded_rows != self.output_rows:
+            weight = torch.nn.functional.pad(
+                weight, (0, 0, 0, padded_rows - self.output_rows)
+            )
         weight_global_scale = _nvfp4_weight_global_scale(weight)
         weight_fp4, weight_sf = flashinfer.nvfp4_quantize(
             weight,
@@ -143,6 +153,8 @@ class QuantizedDraftHead(nn.Module):
             backend="cute-dsl",
             out_dtype=hidden.dtype,
         )
+        if logits.shape[-1] != self.output_rows:
+            logits = logits[:, : self.output_rows].contiguous()
         return logits.reshape(*shape[:-1], -1)
 
 

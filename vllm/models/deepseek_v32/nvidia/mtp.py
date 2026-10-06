@@ -46,6 +46,10 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 from vllm.models.deepseek_v32.common.kernels import fused_eh_norm
+from vllm.models.glm5next.nvidia.mtp_draft_head import (
+    QuantizedDraftHead,
+    make_quantized_draft_head,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.mla.index_group import (
@@ -192,6 +196,12 @@ class DeepseekV32MultiTokenPredictor(nn.Module):
         # A full on-rank table lets the eh_norm fusion fold in the embedding gather.
         self.replicated_embed = has_full_vocab_on_rank(self.embed_tokens)
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.quantized_draft_head: QuantizedDraftHead | None = None
+
+    def prepare_draft_lm_head(self, source_head: nn.Module) -> None:
+        """Build the draft-only copy of the shared target head that
+        ``VLLM_GLM53_MTP_DRAFT_HEAD`` selects; the verifier keeps BF16."""
+        self.quantized_draft_head = make_quantized_draft_head(source_head)
 
     def set_skip_topk(self, skip: bool):
         # index_share_for_mtp_iteration: step 0 computes top-k, steps 1+ reuse.
@@ -248,7 +258,8 @@ class DeepseekV32MultiTokenPredictor(nn.Module):
         # hidden_states is already post-final-norm (produced in the layer
         # forward and recycled as-is); apply the LM head only, without a
         # second RMSNorm.
-        return self.logits_processor(mtp_layer.shared_head.head, hidden_states)
+        head = self.quantized_draft_head or mtp_layer.shared_head.head
+        return self.logits_processor(head, hidden_states)
 
     def get_top_tokens(
         self,
@@ -263,9 +274,8 @@ class DeepseekV32MultiTokenPredictor(nn.Module):
         """
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
-        return self.logits_processor.get_top_tokens(
-            mtp_layer.shared_head.head, hidden_states
-        )
+        head = self.quantized_draft_head or mtp_layer.shared_head.head
+        return self.logits_processor.get_top_tokens(head, hidden_states)
 
 
 class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
@@ -327,6 +337,10 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
     ) -> torch.Tensor:
         """See ``DeepseekV32MultiTokenPredictor.get_top_tokens``."""
         return self.model.get_top_tokens(hidden_states, spec_step_idx)
+
+    def prepare_draft_lm_head(self, source_head: nn.Module) -> None:
+        """Create a draft-only quantized copy of the shared target head."""
+        self.model.prepare_draft_lm_head(source_head)
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
         spec_layer_weight_names = [
