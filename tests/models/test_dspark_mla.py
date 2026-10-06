@@ -708,7 +708,7 @@ def test_v41_context_graph_replay_matches_checkpoint_projection(
     """Real native projections, rotary and cache writes across shrinking batches."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("native V4.1 context preparation requires SM12x")
-    from contextlib import nullcontext
+    from contextlib import contextmanager
 
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.attention import compressed_sparse_mla
@@ -738,7 +738,15 @@ def test_v41_context_graph_replay_matches_checkpoint_projection(
         lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
     )
     monkeypatch.setattr(cudagraph_utils, "is_global_first_rank", lambda: False)
-    monkeypatch.setattr(cudagraph_utils, "graph_capture", lambda device: nullcontext())
+
+    @contextmanager
+    def local_graph_capture(device):
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream):
+            yield
+
+    monkeypatch.setattr(cudagraph_utils, "graph_capture", local_graph_capture)
     config = default_vllm_config
     config.scheduler_config.max_num_batched_tokens = 8
     config.scheduler_config.max_num_seqs = 8

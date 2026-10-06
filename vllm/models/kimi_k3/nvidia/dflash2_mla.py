@@ -9,6 +9,7 @@ import torch
 from vllm.compilation.backends import set_model_tag
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.models.qwen3_dflash import _resolve_layer_attention
 from vllm.model_executor.models.qwen3_dflash2 import (
     CandidateSelector,
@@ -134,6 +135,7 @@ class DFlash2KimiK3ForCausalLM(K3DSparkForCausalLM):
         )
 
     def compute_candidates(self, hidden_states):
+        assert isinstance(self.lm_head, VocabParallelEmbedding)
         return self.candidate_logits_processor.get_top_k_tokens(
             self.lm_head, hidden_states, self.model.candidate_selector.top_k
         )

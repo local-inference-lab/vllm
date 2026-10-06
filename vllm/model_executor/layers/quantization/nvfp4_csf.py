@@ -49,10 +49,10 @@ def _forward_token() -> int | None:
     if not is_forward_context_available():
         return None
     context = get_forward_context()
-    token = getattr(context, "_b12x_csf_token", None)
+    token = context.additional_kwargs.get("b12x_csf_token")
     if token is None:
         token = next(_FORWARD_TOKENS)
-        context._b12x_csf_token = token
+        context.additional_kwargs["b12x_csf_token"] = token
     return token
 
 
@@ -346,10 +346,11 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
         shared_experts_input,
         workspace=None,
     ):
-        assert self.moe_kernel is not None
+        moe_kernel = self.moe_kernel
+        assert moe_kernel is not None
 
         def run():
-            return self.moe_kernel.apply(
+            return moe_kernel.apply(
                 hidden_states=x,
                 w1=layer.w13_weight,
                 w2=layer.w2_weight,

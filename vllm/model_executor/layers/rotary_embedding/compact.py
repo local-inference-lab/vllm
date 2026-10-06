@@ -21,7 +21,10 @@ class CompactRotaryEmbedding(RotaryEmbedding):
     def __init__(self, *args, capacity: int, **kwargs):
         if capacity <= 0:
             raise ValueError("compact rotary capacity must be positive")
-        super().__init__(*args, **kwargs, init_cache=False)
+        if "init_cache" in kwargs:
+            raise TypeError("CompactRotaryEmbedding owns cache initialization")
+        kwargs["init_cache"] = False
+        super().__init__(*args, **kwargs)
         self.capacity = capacity
         inv_freq = self._compute_inv_freq(self.base)
         self.register_buffer("inv_freq", inv_freq, persistent=False)

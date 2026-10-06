@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 
 import torch.nn as nn
 
@@ -110,6 +110,7 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     # config is retained for DSpark's target-layer metadata, so we must override it.
     draft_vllm_config.quant_config = get_draft_quant_config(vllm_config)
 
+    rope_ownership: AbstractContextManager[None]
     if draft_model_config.hf_config.model_type == "k3_dspark":
         from vllm.models.kimi_k3.nvidia.dspark_mla import (
             protect_k3_compact_rope_sources,

@@ -233,7 +233,7 @@ def test_dflash_bf16_staging_keeps_local_projection_and_single_gather(monkeypatc
     wrapper = object.__new__(DFlashQwen3ForCausalLM)
     nn.Module.__init__(wrapper)
     wrapper.model = model
-    bound = []
+    bound: list[object] = []
     target = SimpleNamespace(set_aux_hidden_state_projector=bound.append)
     scratch = torch.empty(2048, 4, dtype=torch.bfloat16)
     wrapper.bind_target_auxiliary_stream(target, scratch)

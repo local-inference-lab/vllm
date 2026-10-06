@@ -311,14 +311,14 @@ def init_attn_backend(
                     # execution. Sequential cache groups can reuse it, but
                     # concurrent target/draft lanes and microbatches cannot.
                     workspace = builder.chunked_prefill_workspace
-                    key = (
+                    workspace_key = (
                         id(layer_config),
                         ubatch_id,
                         workspace.shape,
                         workspace.dtype,
                     )
                     builder.chunked_prefill_workspace = (
-                        mla_prefill_workspaces.setdefault(key, workspace)
+                        mla_prefill_workspaces.setdefault(workspace_key, workspace)
                     )
                 if attn_backend_workspace is None:
                     if hasattr(builder, "_get_workspace_buffer"):

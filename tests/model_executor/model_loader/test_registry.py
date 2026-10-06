@@ -173,7 +173,7 @@ def test_instanttensor_loader_retains_index_and_priority_for_selected_shard(
         json.dumps({"weight_map": {weight_name: shard.name}})
     )
     weight = torch.ones(2, 2)
-    observed = {}
+    observed: dict[str, object] = {}
 
     def iterator(files, use_tqdm, **kwargs):
         observed.update(files=files, **kwargs)

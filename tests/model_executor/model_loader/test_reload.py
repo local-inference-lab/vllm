@@ -170,7 +170,7 @@ class _DeferredOnlineQuantAttention(_ReloadableAttentionLayer):
 
     def __init__(self):
         torch.nn.Module.__init__(self)
-        self.source_refs = []
+        self.source_refs: list[ref[torch.Tensor]] = []
         self.quant_method = _SourceLifetimeQuantMethod(self.source_refs)
 
         def tracking_weight_loader(param, loaded_weight):

@@ -462,6 +462,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 else:
                     last_hidden_states = gather_rows(last_hidden_states, ced_indices)
             if context_states_are_streamed:
+                assert aux_hidden_states is not None
                 context_states = aux_hidden_states[0]
             elif aux_hidden_states:
                 hidden_states = self.model.combine_hidden_states(
@@ -567,6 +568,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             else:
                 context_slots = group_slots[0]
         if use_context_graph:
+            assert self._context_preparer is not None
             self._context_preparer.run(aux_hidden_states, num_target_tokens)
         elif not context_kv_is_restored:
             self.model.precompute_and_store_context_kv(

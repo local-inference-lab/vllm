@@ -1294,6 +1294,8 @@ class VllmConfig:
             supports_vmm_safe_transfers,
         )
 
+        if self.kv_transfer_config is None:
+            return False
         try:
             connector_cls = KVConnectorFactory.get_connector_class(
                 self.kv_transfer_config

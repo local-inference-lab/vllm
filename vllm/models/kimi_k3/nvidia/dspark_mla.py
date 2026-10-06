@@ -4,6 +4,11 @@
 
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from b12x.comm.pcie.pcie_vocab_argmax import PCIeVocabParallelArgmax
+    from b12x.preparation import Plan
 
 import torch
 import torch.nn as nn
@@ -587,9 +592,12 @@ class K3DSparkModel(nn.Module):
         if not self.context_proj_sharded or len(states) != 1:
             return False
         candidate = states[0]
+        completed = self._completed_stream_result
+        if completed is None:
+            return False
         expected = self._streamed_context_states[: self._streamed_aux_tokens]
         matches = (
-            candidate is self._completed_stream_result
+            candidate is completed
             and self._completed_stream_generation > self._consumed_stream_generation
             and candidate.shape == expected.shape
             and candidate.dtype == expected.dtype
@@ -938,9 +946,9 @@ class K3DSparkForCausalLM(nn.Module):
         )
         self._argmax_capacity = min(vllm_config.scheduler_config.max_num_seqs, 8)
         self._argmax_enabled = envs.VLLM_KIMI_K3_B12X_DSPARK_ARGMAX
-        self._argmax_runtime = None
-        self._argmax_plan = None
-        self._argmax_output = None
+        self._argmax_runtime: PCIeVocabParallelArgmax | None = None
+        self._argmax_plan: Plan | None = None
+        self._argmax_output: torch.Tensor | None = None
         set_b12x_preparation_provider(self, self)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -1051,6 +1059,7 @@ class K3DSparkForCausalLM(nn.Module):
 
     def compute_local_markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         """Project a Markov embedding into the matching vocabulary shard."""
+        assert self.model.markov_head is not None
         return self.model.markov_head.local_bias(markov_embed, self.logits_processor)
 
     def gather_local_draft_logits(
@@ -1067,6 +1076,7 @@ class K3DSparkForCausalLM(nn.Module):
             workload.stage != "weights"
             or not self._argmax_enabled
             or not self.supports_local_draft_argmax()
+            or not isinstance(self.lm_head, VocabParallelEmbedding)
             or self.lm_head.tp_size not in (8, 12, 16)
         ):
             return ()
@@ -1126,6 +1136,7 @@ class K3DSparkForCausalLM(nn.Module):
         self, base_logits: torch.Tensor, markov_bias: torch.Tensor
     ) -> torch.Tensor:
         """Sample exact greedy tokens without gathering full vocabulary shards."""
+        assert isinstance(self.lm_head, VocabParallelEmbedding)
         self._mask_local_draft_padding(base_logits)
         self._mask_local_draft_padding(markov_bias)
         batch = base_logits.shape[0]
@@ -1139,6 +1150,8 @@ class K3DSparkForCausalLM(nn.Module):
                 raise PreparationResourceUnavailableError(
                     "Kimi DSpark vocabulary argmax must be prepared before sampling"
                 )
+            assert self._argmax_runtime is not None
+            assert self._argmax_output is not None
             return self._argmax_runtime.fused_add_argmax(
                 base_logits,
                 markov_bias,
@@ -1151,9 +1164,11 @@ class K3DSparkForCausalLM(nn.Module):
         return draft_ids
 
     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+        assert self.model.markov_head is not None
         return self.model.markov_head.embed(token_ids)
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
+        assert self.model.markov_head is not None
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
