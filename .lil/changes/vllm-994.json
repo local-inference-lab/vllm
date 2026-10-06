@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-994",
+  "category": "feature",
+  "summary": "GLM-5.3 (744B) serves at TP6 on six GPUs, with DCP2 and DCP3 for longer contexts",
+  "models": ["GLM-5.3"],
+  "compatibility": "TP sizes that divide the model are unchanged. TP6 needs b12x with 352-channel W4A16 tiles (b12x-487).",
+  "details": [
+    "At TP6 the 64 MLA heads are padded to 66 and the 2048 expert channels to 2112 (352 per GPU) with zero weights, for the target and its MTP draft; routed experts that the TP size does not divide are now split at the tail instead of dropping channels.",
+    "B12X sparse MLA pads its query heads to whole groups of eight; the FP4-CSF reader writes padded per-rank shards.",
+    "GLM-5.3-NVFP4-CSF on 6x RTX PRO 6000 (MTP3, GPU memory 0.95): KV cache 219,904 / 436,095 / 651,264 tokens at DCP1 / DCP2 / DCP3; decode steps/s at C1 66.9 / 55.2 / 51.9; needle retrieval 3/3 at 196K / 392K / 589K tokens."
+  ],
+  "authors": ["voipmonitor"],
+  "pull_requests": [994],
+  "requires": ["vllm-993"]
+}
