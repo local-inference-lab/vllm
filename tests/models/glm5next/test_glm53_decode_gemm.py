@@ -19,6 +19,9 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
     UnquantizedLinearMethod,
 )
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptMixedPrecisionConfig,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     UnquantizedEmbeddingMethod,
@@ -217,6 +220,31 @@ def test_fp8_lm_head_only_at_tp3(monkeypatch, tp_size) -> None:
     head4 = _lm_head(monkeypatch, 4)
     assert not fp8.enable_glm53_fp8_lm_head(head4)
     assert type(head4.quant_method) is UnquantizedEmbeddingMethod
+
+
+def test_fp8_lm_head_accepts_modelopt_unquantized_method(monkeypatch, tp_size):
+    monkeypatch.setenv("VLLM_GLM53_FP8_DENSE", "1")
+    head = _lm_head(monkeypatch, 3)
+    config = ModelOptMixedPrecisionConfig.from_config(
+        {
+            "quantization": {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.layers.3.mlp.experts": {"quant_algo": "NVFP4"}
+                },
+            }
+        }
+    )
+    inner = config.get_quant_method(head, "lm_head")
+    assert type(inner) is UnquantizedLinearMethod
+    head.quant_method = inner
+    assert fp8.enable_glm53_fp8_lm_head(head)
+    assert head.quant_method._inner is inner
+    assert head.weight.dtype == torch.bfloat16
+
+    head.runtime_lm_head_quantization = "mxfp8"
+    head.quant_method = inner
+    assert not fp8.enable_glm53_fp8_lm_head(head)
 
 
 # ---------------------------------------------------------------------------

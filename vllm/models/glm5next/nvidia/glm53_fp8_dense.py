@@ -250,7 +250,9 @@ class GLM53Fp8DecodeLMHeadMethod(QuantizeMethodBase):
 
     supports_pre_processed_weights = False
 
-    def __init__(self, inner: UnquantizedEmbeddingMethod) -> None:
+    def __init__(
+        self, inner: UnquantizedEmbeddingMethod | UnquantizedLinearMethod
+    ) -> None:
         super().__init__()
         self._inner = inner
         self._max_m = max_m()
@@ -265,6 +267,7 @@ class GLM53Fp8DecodeLMHeadMethod(QuantizeMethodBase):
         return self._inner.create_weights(*args, **kwargs)
 
     def embedding(self, layer: nn.Module, *args, **kwargs) -> torch.Tensor:
+        assert isinstance(self._inner, UnquantizedEmbeddingMethod)
         return self._inner.embedding(layer, *args, **kwargs)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
@@ -360,7 +363,7 @@ def enable_glm53_fp8_lm_head(lm_head: nn.Module) -> bool:
     if (
         getattr(lm_head, "runtime_lm_head_quantization", None) is not None
         or type(getattr(lm_head, "quant_method", None))
-        is not UnquantizedEmbeddingMethod
+        not in (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
         or weight is None
         or tuple(weight.shape) != GLM53_TP3_LM_HEAD_SHAPE
         or weight.dtype != torch.bfloat16
