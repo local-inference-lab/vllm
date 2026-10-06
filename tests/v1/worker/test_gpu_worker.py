@@ -198,32 +198,44 @@ def test_startup_plan_survives_profiling_config_rewrites(plan_env):
 
 
 @pytest.mark.parametrize(
-    "conf,limited",
+    "cuda_conf,alloc_conf,restore",
     [
-        ("expandable_segments:True", False),
-        ("expandable_segments:True,large_segment_size_mb:12", False),
-        ("", True),
-        ("expandable_segments:False", True),
+        ("expandable_segments:True", None, None),
+        ("expandable_segments:True,large_segment_size_mb:12", None, None),
+        ("expandable_segments : True", None, None),
+        (None, "expandable_segments:True", None),
+        ("expandable_segments:True", "expandable_segments:False", None),
+        ("", "expandable_segments:True", str((2**64 - 1) // (1024 * 1024))),
+        (None, None, str((2**64 - 1) // (1024 * 1024))),
+        ("expandable_segments:False", None, str((2**64 - 1) // (1024 * 1024))),
+        (None, "expandable_segments:False,max_split_size_mb:64", "64"),
+        ("max_split_size_mb : 128", None, "128"),
+        ("max_split_size_mb:64", "expandable_segments:True", "64"),
+        ("max_split_size_mb:64", "max_split_size_mb:128", "64"),
     ],
 )
 def test_weight_loading_split_limit_skips_expandable_segments(
-    monkeypatch, conf, limited
+    monkeypatch, cuda_conf, alloc_conf, restore
 ):
-    """Expandable segments load weights without the temporary split limit.
-
-    With them, the limit strands pages that weights share with freed loading
-    temporaries; the classic allocator keeps it against cached-block
-    fragmentation.
-    """
+    """Respect allocator aliases and restore the effective classic split limit."""
     settings: list[str] = []
-    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", conf)
+    for key, value in (
+        ("PYTORCH_CUDA_ALLOC_CONF", cuda_conf),
+        ("PYTORCH_ALLOC_CONF", alloc_conf),
+    ):
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
     monkeypatch.setattr(gpu_worker.current_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(
         gpu_worker.torch._C, "_accelerator_setAllocatorSettings", settings.append
     )
     with gpu_worker.Worker._scoped_allocator_max_split(None, max_split_size_mb=20):
-        assert settings == (["max_split_size_mb:20"] if limited else [])
-    assert len(settings) == (2 if limited else 0)
+        assert settings == (["max_split_size_mb:20"] if restore else [])
+    assert settings == (
+        ["max_split_size_mb:20", f"max_split_size_mb:{restore}"] if restore else []
+    )
 
 
 # Memory accounting of the profiling run (Worker.determine_available_memory).

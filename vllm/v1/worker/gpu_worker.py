@@ -374,14 +374,16 @@ class Worker(WorkerBase):
             yield
             return
 
-        conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-        if re.search(r"expandable_segments:\s*True", conf):
+        conf = os.environ.get(
+            "PYTORCH_CUDA_ALLOC_CONF", os.environ.get("PYTORCH_ALLOC_CONF", "")
+        )
+        if re.search(r"(?:^|,)\s*expandable_segments\s*:\s*True\s*(?:,|$)", conf):
             # Expandable segments release free pages, not whole cached blocks.
             # A split limit there strands the pages that weights share with
             # freed loading temporaries (1 GiB per GPU on DeepSeek-V4.1 TP4).
             yield
             return
-        match = re.search(r"max_split_size_mb:(\d+)", conf)
+        match = re.search(r"(?:^|,)\s*max_split_size_mb\s*:\s*(\d+)\s*(?:,|$)", conf)
         original_value = match.group(1) if match else None
 
         torch._C._accelerator_setAllocatorSettings(
