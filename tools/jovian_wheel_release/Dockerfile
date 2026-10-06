@@ -7,7 +7,7 @@ ARG BUILDER_IMAGE
 FROM ${UV_IMAGE} AS uv
 FROM ${RUST_IMAGE} AS rust
 
-FROM ${BUILDER_IMAGE} AS wheels
+FROM ${BUILDER_IMAGE} AS wheel-source
 
 # DeepGEMM's DeepJIT exception formatter includes the elfutils DWARF API.
 RUN --mount=type=cache,id=lil-wheel-apt-packages,target=/var/cache/apt,sharing=locked \
@@ -21,11 +21,14 @@ ARG UV_SHA256
 ARG VLLM_BUILD_CUTLASS_SCALED_MM_C2X
 ARG DEPENDENCY_RECIPE
 ARG CUTLASS_DSL_VERSION
+ARG TORCH_CUDA_ARCH_LIST=12.0a
+ARG CMAKE_CUDA_ARCHITECTURES=120a
+ARG BUILD_REQUIREMENTS=tools/jovian_wheel_release/build-requirements.lock
 ENV PATH=/build-venv/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup \
-    TORCH_CUDA_ARCH_LIST=12.0a \
-    CMAKE_CUDA_ARCHITECTURES=120a \
+    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
+    CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES} \
     CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS} \
     MAX_JOBS=${BUILD_JOBS} \
     NVCC_THREADS=4 \
@@ -36,7 +39,7 @@ ENV PATH=/build-venv/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/us
 COPY --from=uv /uv /usr/local/bin/uv
 COPY --from=rust /usr/local/cargo /usr/local/cargo
 COPY --from=rust /usr/local/rustup /usr/local/rustup
-COPY tools/jovian_wheel_release/build-requirements.lock /tmp/build-requirements.lock
+COPY ${BUILD_REQUIREMENTS} /tmp/build-requirements.lock
 RUN test "$(sha256sum /usr/local/bin/uv | awk '{print $1}')" = "${UV_SHA256}" \
     && test "$(rustc --version | awk '{print $2}')" = 1.95.0 \
     && uv venv --python /usr/bin/python --system-site-packages /build-venv \
@@ -59,12 +62,15 @@ assert torch._C._GLIBCXX_USE_CXX11_ABI
 assert importlib.metadata.version("nvidia-cutlass-dsl") == os.environ["CUTLASS_DSL_VERSION"]
 PY
 
-RUN --mount=type=cache,id=lil-vllm-native-cu134-torch214-sm120-${DEPENDENCY_RECIPE},target=/src/vllm/build,sharing=locked \
+FROM wheel-source AS wheels
+# Empty for linux/amd64 so its existing caches stay valid.
+ARG CACHE_PLATFORM=
+RUN --mount=type=cache,id=lil-vllm-native-cu134-torch214-sm120${CACHE_PLATFORM}-${DEPENDENCY_RECIPE},target=/src/vllm/build,sharing=locked \
     --mount=type=cache,id=lil-vllm-fetchcontent-cu134-${DEPENDENCY_RECIPE},target=/tmp/vllm-fetchcontent,sharing=locked \
-    --mount=type=cache,id=lil-vllm-generated-cu134-torch214-sm120-${DEPENDENCY_RECIPE},target=/tmp/vllm-generated,sharing=locked \
+    --mount=type=cache,id=lil-vllm-generated-cu134-torch214-sm120${CACHE_PLATFORM}-${DEPENDENCY_RECIPE},target=/tmp/vllm-generated,sharing=locked \
     --mount=type=cache,id=lil-vllm-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=lil-vllm-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=lil-vllm-rust-target,target=/src/vllm/rust/target,sharing=locked \
+    --mount=type=cache,id=lil-vllm-rust-target${CACHE_PLATFORM},target=/src/vllm/rust/target,sharing=locked \
     --mount=type=cache,id=lil-wheel-uv,target=/root/.cache/uv,sharing=locked \
     test "${#DEPENDENCY_RECIPE}" -eq 40 && \
     SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" \
@@ -73,3 +79,19 @@ RUN --mount=type=cache,id=lil-vllm-native-cu134-torch214-sm120-${DEPENDENCY_RECI
 
 FROM scratch AS export
 COPY --from=wheels /wheelhouse/ /wheels/
+
+FROM wheel-source AS precompiled-wheels
+RUN --mount=type=bind,from=native-bundle,source=/,target=/native-bundle,ro \
+    --mount=type=cache,id=lil-wheel-uv,target=/root/.cache/uv,sharing=locked \
+    test "$(find /native-bundle/wheels -name 'vllm-*.whl' | wc -l)" -eq 1 && \
+    SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" \
+    BUILD_JOBS="${BUILD_JOBS}" \
+    VLLM_USE_PRECOMPILED=1 \
+    VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX=1 \
+    VLLM_PRECOMPILED_WHEEL_LOCATION="$(find /native-bundle/wheels -name 'vllm-*.whl')" \
+    tools/jovian_wheel_release/build_vllm_wheel.sh && \
+    /build-venv/bin/python tools/jovian_wheel_release/verify_native_payload.py \
+      /native-bundle/wheels/vllm-*.whl /wheelhouse/vllm-*.whl
+
+FROM scratch AS export-precompiled
+COPY --from=precompiled-wheels /wheelhouse/ /wheels/

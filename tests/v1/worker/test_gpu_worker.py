@@ -677,3 +677,65 @@ def test_post_capture_recommendation_counts_measured_graph_memory_once(
     gpu_worker.Worker.compile_or_warm_up_model(worker)
 
     assert saved == [(90 - 10 - 5 - measured_gib) * GiB_bytes - 150 * (1 << 20)]
+
+
+def test_serving_thread_count_is_set_before_warmup(monkeypatch):
+    """Dynamo guards compiled functions on torch.get_num_threads(); dropping to
+    the serving count after warmup made the first request recompile every
+    torch.compile'd function."""
+    events: list[str] = []
+
+    def capture_model():
+        events.append("capture_model")
+        return 0
+
+    compilation = SimpleNamespace(
+        mode=gpu_worker.CompilationMode.NONE,
+        compilation_time=0.0,
+        encoder_compilation_time=0.0,
+    )
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(compilation_config=compilation),
+        compilation_config=compilation,
+        model_runner=SimpleNamespace(
+            lora_config=None,
+            maybe_remove_all_loras=lambda config: None,
+            capture_model=capture_model,
+        ),
+        model_config=SimpleNamespace(enforce_eager=False, seed=0),
+        cache_config=SimpleNamespace(kv_cache_memory_bytes=1),
+        use_v2_model_runner=False,
+        observability_config=SimpleNamespace(
+            jit_monitor_mode="off", jit_monitor_verbose=False
+        ),
+    )
+    monkeypatch.setattr(
+        gpu_worker, "get_pp_group", lambda: SimpleNamespace(is_last_rank=False)
+    )
+    for name in (
+        "set_random_seed",
+        "freeze_gc_heap",
+        "maybe_attach_gc_debug_callback",
+        "enable_gpu_sync_check",
+    ):
+        monkeypatch.setattr(gpu_worker, name, lambda *args: None)
+    monkeypatch.setattr(
+        gpu_worker,
+        "set_torch_threads_for_runtime",
+        lambda: events.append("set_torch_threads_for_runtime"),
+    )
+    monkeypatch.setattr(
+        gpu_worker, "kernel_warmup", lambda *args: events.append("kernel_warmup")
+    )
+    monkeypatch.setattr("vllm.utils.jit_monitor.activate", lambda **kwargs: None)
+
+    worker._compile_or_warm_up_model_after_preparation = lambda: (
+        gpu_worker.Worker._compile_or_warm_up_model_after_preparation(worker)
+    )
+    worker._b12x_session = None
+    worker._get_cudagraph_capture_context = nullcontext
+    gpu_worker.Worker.compile_or_warm_up_model(worker)
+
+    assert events[0] == "set_torch_threads_for_runtime"
+    assert events.count("set_torch_threads_for_runtime") == 1
+    assert "kernel_warmup" in events and "capture_model" in events

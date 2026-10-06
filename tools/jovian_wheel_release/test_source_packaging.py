@@ -38,7 +38,8 @@ def test_dependency_recipe_keys_mutable_fetch_and_native_caches(tmp_path):
         "fetchcontent-cu134",
         "generated-cu134-torch214-sm120",
     ):
-        assert f"id=lil-vllm-{cache}-${{DEPENDENCY_RECIPE}}," in dockerfile
+        platform = "" if cache == "fetchcontent-cu134" else "${CACHE_PLATFORM}"
+        assert f"id=lil-vllm-{cache}{platform}-${{DEPENDENCY_RECIPE}}," in dockerfile
 
     def git(*args):
         return subprocess.check_output(

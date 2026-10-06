@@ -1,0 +1,33 @@
+# Wheel-build tools resolved for CPython 3.12 on Linux aarch64.
+cmake==3.31.6 \
+    --hash=sha256:42d9883b8958da285d53d5f69d40d9650c2d1bcf922d82b3ebdceb2b3a7d4521
+jinja2==3.1.6 \
+    --hash=sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67
+ninja==1.13.0 \
+    --hash=sha256:3d00c692fb717fd511abeb44b8c5d00340c36938c12d6538ba989fe764e79630
+nvidia-cutlass-dsl==4.7.1 \
+    --hash=sha256:765850c74868a0b5a02fefbfc1b380842b64e5f7a1c8b1655e322a3b14c01726
+nvidia-cutlass-dsl-libs-base==4.7.1 \
+    --hash=sha256:e86c55a5010a7edfc067648a75cb29d0c5bd67d75210168cf507b0d0e4d15ba7
+nvidia-cutlass-dsl-libs-core==4.7.1 \
+    --hash=sha256:c65662abc9ab18fd997c57547895736928e559f4624bbe2aa1aa91418ea014ca
+nvidia-cutlass-dsl-libs-cu12==4.7.1 \
+    --hash=sha256:f57a3955c17b7dcd5472aa47c46513e5f3914e1325fc308afca1b9063a8f897b
+nvidia-cutlass-dsl-libs-cu13==4.7.1 \
+    --hash=sha256:e675bf04dc6c91f7c4d5540699b7a031f2b8b44cd2687b32c20892f112f7e0d9
+packaging==26.2 \
+    --hash=sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e
+semantic-version==2.10.0 \
+    --hash=sha256:bdabb6d336998cbb378d4b9db3a4b56a1e3235701dc05ea2690d9a997ed5041c \
+    --hash=sha256:de78a3b8e0feda74cabc54aab2da702113e33ac9d9eb9d2389bcf1f58b7d9177
+setuptools==80.10.2 \
+    --hash=sha256:95b30ddfb717250edb492926c92b5221f7ef3fbcc2b07579bcd4a27da21d0173
+setuptools-rust==1.13.0 \
+    --hash=sha256:666439c4d90e968bb625bcf87ec0aa02b4f49e599d2f5dc255c633a04e8eca99
+setuptools-scm==10.2.1 \
+    --hash=sha256:b7c82f4102d389ee57dc66ccdb4f9b4bca3c40ba83b43f1f63d68ccd72db2580
+vcs-versioning==2.3.1 \
+    --hash=sha256:806635bd0ea653c96af98a70624be758d408a989f2cd0b390e63474d99f96b63 \
+    --hash=sha256:a11299394e101569a62ab061375260d08bc56cd33d685b7067d85312368f4457
+wheel==0.47.0 \
+    --hash=sha256:212281cab4dff978f6cedd499cd893e1f620791ca6ff7107cf270781e587eced

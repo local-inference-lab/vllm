@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-wheel-platform-cache-test",
+  "category": "internal",
+  "summary": "Validate platform-separated native wheel cache identities",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "The source-packaging regression checks platform and dependency-recipe components in native build cache identities."
+  ],
+  "pull_requests": [],
+  "authors": ["lukealonso"],
+  "requires": ["vllm-996"]
+}
