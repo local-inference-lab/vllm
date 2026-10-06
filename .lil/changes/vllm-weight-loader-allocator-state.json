@@ -1,0 +1,17 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-weight-loader-allocator-state",
+  "category": "fix",
+  "summary": "Preserve active allocator options around weight loading split limits",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "Read the applied allocator configuration before choosing whether classic split limits are appropriate.",
+    "Change only max_split_size_mb for weight loading, preserve unrelated options, and restore the exact configuration on normal and exceptional exit."
+  ],
+  "pull_requests": [
+    981
+  ]
+}

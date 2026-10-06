@@ -374,28 +374,26 @@ class Worker(WorkerBase):
             yield
             return
 
-        conf = os.environ.get(
-            "PYTORCH_CUDA_ALLOC_CONF", os.environ.get("PYTORCH_ALLOC_CONF", "")
-        )
+        conf = torch._C._accelerator_getAllocatorSettings()
         if re.search(r"(?:^|,)\s*expandable_segments\s*:\s*True\s*(?:,|$)", conf):
             # Expandable segments release free pages, not whole cached blocks.
             # A split limit there strands the pages that weights share with
             # freed loading temporaries (1 GiB per GPU on DeepSeek-V4.1 TP4).
             yield
             return
-        match = re.search(r"(?:^|,)\s*max_split_size_mb\s*:\s*(\d+)\s*(?:,|$)", conf)
-        original_value = match.group(1) if match else None
-
-        torch._C._accelerator_setAllocatorSettings(
-            f"max_split_size_mb:{max_split_size_mb}"
+        load_conf, replacements = re.subn(
+            r"(\bmax_split_size_mb\s*:\s*)\d+\b",
+            lambda match: f"{match.group(1)}{max_split_size_mb}",
+            conf,
         )
+        if not replacements:
+            load_conf = f"{conf}," if conf else ""
+            load_conf += f"max_split_size_mb:{max_split_size_mb}"
+        torch._C._accelerator_setAllocatorSettings(load_conf)
         try:
             yield
         finally:
-            # PyTorch defaults to SIZE_MAX (no limit).
-            _SIZE_MAX_MB = (2**64 - 1) // (1024 * 1024)
-            restore = original_value if original_value else str(_SIZE_MAX_MB)
-            torch._C._accelerator_setAllocatorSettings(f"max_split_size_mb:{restore}")
+            torch._C._accelerator_setAllocatorSettings(conf)
 
     @instrument(span_name="Init device")
     def init_device(self):

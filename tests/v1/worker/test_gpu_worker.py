@@ -197,45 +197,68 @@ def test_startup_plan_survives_profiling_config_rewrites(plan_env):
     assert second.cache_config.kv_cache_memory_bytes == 50 * GiB_bytes
 
 
+@pytest.mark.parametrize("failure", [False, True])
 @pytest.mark.parametrize(
-    "cuda_conf,alloc_conf,restore",
+    "active_conf,load_conf",
     [
-        ("expandable_segments:True", None, None),
-        ("expandable_segments:True,large_segment_size_mb:12", None, None),
-        ("expandable_segments : True", None, None),
-        (None, "expandable_segments:True", None),
-        ("expandable_segments:True", "expandable_segments:False", None),
-        ("", "expandable_segments:True", str((2**64 - 1) // (1024 * 1024))),
-        (None, None, str((2**64 - 1) // (1024 * 1024))),
-        ("expandable_segments:False", None, str((2**64 - 1) // (1024 * 1024))),
-        (None, "expandable_segments:False,max_split_size_mb:64", "64"),
-        ("max_split_size_mb : 128", None, "128"),
-        ("max_split_size_mb:64", "expandable_segments:True", "64"),
-        ("max_split_size_mb:64", "max_split_size_mb:128", "64"),
+        ("expandable_segments:True", None),
+        ("expandable_segments:True,large_segment_size_mb:12", None),
+        ("expandable_segments : True", None),
+        ("", "max_split_size_mb:20"),
+        ("expandable_segments:False", "expandable_segments:False,max_split_size_mb:20"),
+        ("max_split_size_mb : 128", "max_split_size_mb : 20"),
+        (
+            "garbage_collection_threshold:0.8",
+            "garbage_collection_threshold:0.8,max_split_size_mb:20",
+        ),
+        (
+            "expandable_segments:False,max_split_size_mb:64,garbage_collection_threshold:0.8",
+            "expandable_segments:False,max_split_size_mb:20,garbage_collection_threshold:0.8",
+        ),
     ],
 )
-def test_weight_loading_split_limit_skips_expandable_segments(
-    monkeypatch, cuda_conf, alloc_conf, restore
+def test_weight_loading_split_limit_preserves_runtime_settings(
+    monkeypatch, active_conf, load_conf, failure
 ):
-    """Respect allocator aliases and restore the effective classic split limit."""
+    """Respect active VMM policy and restore every allocator option after loading."""
     settings: list[str] = []
-    for key, value in (
-        ("PYTORCH_CUDA_ALLOC_CONF", cuda_conf),
-        ("PYTORCH_ALLOC_CONF", alloc_conf),
-    ):
-        if value is None:
-            monkeypatch.delenv(key, raising=False)
-        else:
-            monkeypatch.setenv(key, value)
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     monkeypatch.setattr(gpu_worker.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        gpu_worker.torch._C, "_accelerator_getAllocatorSettings", lambda: active_conf
+    )
     monkeypatch.setattr(
         gpu_worker.torch._C, "_accelerator_setAllocatorSettings", settings.append
     )
-    with gpu_worker.Worker._scoped_allocator_max_split(None, max_split_size_mb=20):
-        assert settings == (["max_split_size_mb:20"] if restore else [])
-    assert settings == (
-        ["max_split_size_mb:20", f"max_split_size_mb:{restore}"] if restore else []
+    outcome = pytest.raises(RuntimeError, match="loading") if failure else nullcontext()
+    with (
+        outcome,
+        gpu_worker.Worker._scoped_allocator_max_split(None, max_split_size_mb=20),
+    ):
+        assert settings == ([load_conf] if load_conf is not None else [])
+        if failure:
+            raise RuntimeError("loading")
+    assert settings == ([load_conf, active_conf] if load_conf is not None else [])
+
+
+def test_weight_loading_split_limit_keeps_non_cuda_defaults(monkeypatch):
+    monkeypatch.setattr(gpu_worker.current_platform, "is_cuda", lambda: False)
+
+    def unexpected_allocator_access(*args):
+        pytest.fail("non-CUDA workers must not access CUDA allocator settings")
+
+    monkeypatch.setattr(
+        gpu_worker.torch._C,
+        "_accelerator_getAllocatorSettings",
+        unexpected_allocator_access,
     )
+    monkeypatch.setattr(
+        gpu_worker.torch._C,
+        "_accelerator_setAllocatorSettings",
+        unexpected_allocator_access,
+    )
+    with gpu_worker.Worker._scoped_allocator_max_split(None, max_split_size_mb=20):
+        pass
 
 
 # Memory accounting of the profiling run (Worker.determine_available_memory).
