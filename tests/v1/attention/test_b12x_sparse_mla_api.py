@@ -53,7 +53,7 @@ from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xMLASparseMetadataBuilder,
     _ckv_rank_token_alignment,
     _global_causal_lens_for_ckv_gather,
-    _is_glm_next_ckv_source_layout,
+    _is_native_ckv_source_layout,
     _is_speculative_decode_batch,
     _max_speculative_decode_query_len,
     _round_up_ckv_rank_tokens,
@@ -822,6 +822,126 @@ def test_b12x_full_ckv_gather_excludes_decode_and_mtp_batches(
     )
 
 
+@pytest.mark.parametrize(
+    ("is_glm_next", "is_glm_dsa", "is_spec_decode", "expected"),
+    [
+        (False, True, False, True),
+        (False, True, True, False),
+        (True, False, True, True),
+        (False, False, False, False),
+    ],
+)
+def test_b12x_full_ckv_gather_admits_glm_dsa_eager_prefill(
+    is_glm_next: bool,
+    is_glm_dsa: bool,
+    is_spec_decode: bool,
+    expected: bool,
+) -> None:
+    """GLM DSA verification keeps the query exchange; GLM5Next is unchanged."""
+    assert (
+        _use_b12x_full_ckv_gather(
+            enabled=True,
+            is_glm_next=is_glm_next,
+            is_glm_dsa=is_glm_dsa,
+            is_spec_decode=is_spec_decode,
+            dcp_world_size=2,
+            max_query_len=4,
+            num_tokens=64,
+            num_decode_tokens=0,
+            min_tokens=16,
+            max_tokens=524288,
+        )
+        is expected
+    )
+
+
+def _bare_glm_dsa_ckv_metadata_builder(
+    *, dcp_rank: int, max_tokens: int = 64, max_reqs: int = 4
+) -> B12xMLASparseMetadataBuilder:
+    builder = B12xMLASparseMetadataBuilder.__new__(B12xMLASparseMetadataBuilder)
+    builder.requires_glm_next_selector_metadata = False
+    builder._is_glm_dsa = True
+    builder._ckv_gather_requested = True
+    builder.dcp_world_size = 2
+    builder.dcp_rank = dcp_rank
+    builder.cp_kv_cache_interleave_size = 1
+    builder.kv_cache_spec = SimpleNamespace(block_size=64)
+    builder._ckv_max_reqs = max_reqs
+    builder._max_speculative_decode_query_len = 4
+    builder.cache_seq_lens_per_token_buffer = torch.zeros(max_tokens, dtype=torch.int32)
+    builder.ckv_selected_indices_buffer = torch.empty(
+        (max_tokens, 2048), dtype=torch.int32
+    )
+    builder.ckv_active_counts_buffer = torch.empty(max_tokens, dtype=torch.int32)
+    builder.dcp_rank_req_lens_buffer = torch.empty((2, max_reqs), dtype=torch.int32)
+    builder.dcp_rank_req_starts_buffer = torch.empty((2, max_reqs), dtype=torch.int32)
+    builder.dcp_local_cu_seq_lens_buffer = torch.empty(max_reqs + 1, dtype=torch.int32)
+    return builder
+
+
+@pytest.mark.parametrize("dcp_rank", [0, 1])
+@pytest.mark.parametrize("batch", ["prefill", "capture", "spec_decode"])
+def test_glm_dsa_builder_gathers_full_ckv_only_for_eager_prefill(
+    monkeypatch: pytest.MonkeyPatch,
+    dcp_rank: int,
+    batch: str,
+) -> None:
+    query_lens = [3, 4] if batch == "spec_decode" else [24, 9]
+    seq_lens = [27, 20] if batch == "spec_decode" else [40, 9]
+    rows = sum(query_lens)
+    monkeypatch.setattr(
+        SparseMLACommonMetadataBuilder,
+        "build",
+        lambda *args, **kwargs: SimpleNamespace(
+            num_prefills=0 if batch == "spec_decode" else 2,
+            num_decodes=2 if batch == "spec_decode" else 0,
+            num_decode_tokens=0,
+            dcp_ckv_gather_eligible=False,
+        ),
+    )
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
+    builder = _bare_glm_dsa_ckv_metadata_builder(dcp_rank=dcp_rank)
+    query_start_loc = torch.tensor([0, query_lens[0], rows], dtype=torch.int32)
+    global_seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+    common = SimpleNamespace(
+        num_reqs=2,
+        num_actual_tokens=rows,
+        max_query_len=max(query_lens),
+        seq_lens=global_seq_lens,
+        dcp_local_seq_lens=(global_seq_lens + 1 - dcp_rank) // 2,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc,
+        seq_lens_cpu=global_seq_lens,
+        seq_lens_cpu_upper_bound=None,
+        positions=None,
+        is_prefilling=torch.tensor([batch != "spec_decode"] * 2),
+    )
+
+    if batch == "capture":
+        metadata = builder.build_for_cudagraph_capture(common)
+    else:
+        metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+    assert metadata.is_spec_decode is (batch == "spec_decode")
+    assert metadata.dcp_ckv_gather_eligible is (batch == "prefill")
+    if batch != "prefill":
+        return
+    # Interleave one: rank zero owns even and rank one odd global positions.
+    assert metadata.dcp_rank_req_lens.tolist() == [[20, 5], [20, 4]]
+    assert metadata.dcp_rank_req_starts.tolist() == [[0, 20], [0, 20]]
+    local_lens = [[20, 5], [20, 4]][dcp_rank]
+    assert metadata.dcp_local_cu_seq_lens.tolist() == [
+        0,
+        local_lens[0],
+        sum(local_lens),
+    ]
+    assert metadata.dcp_local_total_tokens == sum(local_lens)
+    # Two 32-token rank spans form one 64-token page of the gathered cache.
+    assert metadata.dcp_padded_total_tokens == 32
+    assert metadata.ckv_selected_indices.shape == (rows, 2048)
+    assert torch.equal(metadata.global_cache_seq_lens_per_req, global_seq_lens)
+
+
 def test_b12x_full_ckv_gather_uses_global_causal_lengths() -> None:
     global_seq_lens = torch.tensor([5, 12], dtype=torch.int32)
     query_start_loc = torch.tensor([0, 2, 5], dtype=torch.int32)
@@ -912,8 +1032,8 @@ def test_b12x_glm5_next_ckv_source_layout() -> None:
         size=(2, 64, 528),
         stride=(37888, 528, 1),
     )
-    assert _is_glm_next_ckv_source_layout(cache, page_size=64, record_bytes=528)
-    assert not _is_glm_next_ckv_source_layout(
+    assert _is_native_ckv_source_layout(cache, page_size=64, record_bytes=528)
+    assert not _is_native_ckv_source_layout(
         cache[:, :, ::2], page_size=64, record_bytes=528
     )
 
@@ -939,6 +1059,40 @@ def test_b12x_glm5_next_full_ckv_workspaces_follow_cache_format(
     assert len(specs) == 3
     assert specs[1] == ((8,), torch.uint8)
     assert specs[-1] == ((512, record_bytes), torch.uint8)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_b12x_full_ckv_workspace_is_reserved_before_kv_profiling(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    """The profile skips attention, so the gathered cache is reserved upfront."""
+    from vllm.v1.worker.workspace import WorkspaceManager
+
+    manager = WorkspaceManager(torch.device("cpu"))
+    monkeypatch.setattr(b12x_mla_sparse, "current_workspace_manager", lambda: manager)
+    impl = object.__new__(B12xMLASparseImpl)
+    impl.num_heads = 11
+    impl._ckv_gather_enabled = enabled
+    impl._kernel_page_size_finalized = True
+    impl._max_tokens = 32
+    impl._q_head_dim = 576
+    impl._scratch_nbytes = 16
+    impl._ckv_local_capacity = 128
+    impl.dcp_world_size = 2
+    impl._cache_record_bytes = 656
+    impl._plans = {
+        ("ckv_extend", 32): SimpleNamespace(
+            scratch_specs=lambda: (SimpleNamespace(nbytes=8),)
+        )
+    }
+
+    impl.reserve_full_ckv_workspace()
+
+    # Eleven TP-padded local heads run as two whole groups of eight.
+    query_bytes = 32 * 16 * 576 * torch.bfloat16.itemsize
+    gathered_bytes = 2 * 128 * 656
+    expected = query_bytes + 256 + gathered_bytes
+    assert manager.available_bytes() == (expected if enabled else 0)
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
@@ -1090,12 +1244,16 @@ def test_glm_dcp_output_preserves_decode_and_special_transport_paths(
     assert impl.reduce_scatter_dcp_output(torch.empty(rows, 8, 8)) is None
 
 
-@pytest.mark.parametrize("record_bytes", [528, 304])
+@pytest.mark.parametrize(
+    ("record_bytes", "fp8_view"),
+    [(528, False), (304, False), (656, False), (656, True)],
+)
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("padded_tokens", [2, 4])
-def test_b12x_glm5_next_full_ckv_gather_preserves_native_records(
+def test_b12x_full_ckv_gather_preserves_native_records(
     monkeypatch: pytest.MonkeyPatch,
     record_bytes: int,
+    fp8_view: bool,
     rank: int,
     padded_tokens: int,
 ) -> None:
@@ -1139,7 +1297,8 @@ def test_b12x_glm5_next_full_ckv_gather_preserves_native_records(
         lambda: SimpleNamespace(rank_in_group=rank, world_size=2),
     )
 
-    gathered = impl._gather_full_ckv(kv_cache, metadata, gathered_buffer)
+    source = kv_cache.view(torch.float8_e4m3fn) if fp8_view else kv_cache
+    gathered = impl._gather_full_ckv(source, metadata, gathered_buffer)
 
     expected_rank = torch.cat(
         (
