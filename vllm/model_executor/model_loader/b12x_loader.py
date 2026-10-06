@@ -11,9 +11,11 @@ import json
 import math
 import sys
 import time
-from contextlib import ExitStack
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 
+import regex as re
 import torch
 from b12x.loader import capabilities
 from b12x.loader._checkpoint import DirectWeightSession
@@ -26,6 +28,21 @@ from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.weight_utils import enable_tqdm
 
 logger = init_logger("vllm.model_executor.model_loader.b12x")
+
+
+@contextmanager
+def _ipc_weight_allocations() -> Iterator[None]:
+    """Use IPC-exportable weight storage and restore the runtime allocator policy."""
+    original = torch._C._accelerator_getAllocatorSettings()
+    configured = re.sub(r"(\bexpandable_segments\s*:\s*)True\b", r"\1False", original)
+    if configured == original:
+        yield
+        return
+    torch._C._accelerator_setAllocatorSettings(configured)
+    try:
+        yield
+    finally:
+        torch._C._accelerator_setAllocatorSettings(original)
 
 
 class B12xModelLoader(DefaultModelLoader):
@@ -81,10 +98,18 @@ class B12xModelLoader(DefaultModelLoader):
         if read_mode == "auto":
             read_mode = "bounce" if capabilities(index)["host_page_tables"] else "gds"
         if read_mode == "gds":
+            if model_config.enable_cumem_allocator:
+                raise ValueError(
+                    "b12x shared GDS loading requires CUDA IPC-exportable weight "
+                    "allocations and does not support the CuMem allocator or sleep mode"
+                )
             from vllm.distributed.parallel_state import get_tp_group
 
             shared_read_group = SharedReadGroup(get_tp_group().cpu_group, index)
         with (
+            _ipc_weight_allocations()
+            if shared_read_group is not None
+            else nullcontext(),
             DirectWeightSession(
                 index,
                 io_threads=self.io_threads,

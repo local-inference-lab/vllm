@@ -4,6 +4,7 @@
 """The adapter preserves vLLM's indexed source selection and owned inputs."""
 
 import json
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -47,6 +48,107 @@ def test_direct_loader_reports_missing_host_hooks_when_selected(monkeypatch):
         RuntimeError, match="requires vLLM file-source hooks.*file_source_tensor"
     ):
         B12xModelLoader(LoadConfig(load_format="b12x"))
+
+
+@pytest.mark.parametrize("read_mode", ["gds", "bounce"])
+@pytest.mark.parametrize("expandable", [False, True])
+@pytest.mark.parametrize("fail_loading", [False, True])
+def test_shared_loading_preserves_allocator_settings(
+    monkeypatch, read_mode, expandable, fail_loading
+):
+    import vllm.model_executor.model_loader.b12x_loader as adapter
+    from vllm.distributed import parallel_state
+
+    original = f"max_split_size_mb:64,expandable_segments:{expandable}"
+    settings = [original]
+    monkeypatch.setattr(
+        torch._C, "_accelerator_getAllocatorSettings", lambda: settings[0]
+    )
+    monkeypatch.setattr(
+        torch._C,
+        "_accelerator_setAllocatorSettings",
+        lambda value: settings.__setitem__(0, value),
+    )
+    monkeypatch.setattr(
+        parallel_state, "get_tp_group", lambda: SimpleNamespace(cpu_group=object())
+    )
+    monkeypatch.setattr(adapter, "SharedReadGroup", lambda *_: object())
+
+    @contextmanager
+    def session(*args, **kwargs):
+        yield SimpleNamespace(stats=lambda: {"payload_bytes": 0})
+
+    monkeypatch.setattr(adapter, "DirectWeightSession", session)
+
+    def load(loader, *args):
+        expected = original.replace("True", "False") if read_mode == "gds" else original
+        assert settings[0] == expected
+        if fail_loading:
+            raise RuntimeError("checkpoint read failed")
+        loader.counter_before_loading_weights = 1.0
+        loader.counter_after_loading_weights = 2.0
+        return torch.nn.Module()
+
+    monkeypatch.setattr(DefaultModelLoader, "load_model", load)
+    loader = B12xModelLoader(
+        LoadConfig(
+            load_format="b12x",
+            model_loader_extra_config={"read_mode": read_mode},
+        )
+    )
+    config = SimpleNamespace(device_config=SimpleNamespace(device="cuda:0"))
+    model_config = SimpleNamespace(enable_cumem_allocator=False)
+    try:
+        if fail_loading:
+            with pytest.raises(RuntimeError, match="checkpoint read failed"):
+                loader.load_model(config, model_config)
+        else:
+            loader.load_model(config, model_config)
+    finally:
+        assert settings[0] == original
+
+
+def test_shared_gds_rejects_cumem_before_allocating_weights():
+    loader = B12xModelLoader(
+        LoadConfig(load_format="b12x", model_loader_extra_config={"read_mode": "gds"})
+    )
+    config = SimpleNamespace(device_config=SimpleNamespace(device="cuda:0"))
+    with pytest.raises(ValueError, match="does not support the CuMem allocator"):
+        loader.load_model(config, SimpleNamespace(enable_cumem_allocator=True))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA IPC")
+def test_shared_weight_allocations_export_with_expandable_segments_enabled():
+    from vllm.model_executor.model_loader.b12x_loader import _ipc_weight_allocations
+
+    original = torch._C._accelerator_getAllocatorSettings()
+    configured = "max_split_size_mb:64,expandable_segments:True"
+    try:
+        torch._C._accelerator_setAllocatorSettings(configured)
+        with DirectWeightSession(read_mode="gds") as session:
+            native = session._gds
+            executor = native.owner_create(
+                session.device,
+                session.io_threads,
+                *(program.function for program in session._copy_programs),
+            )
+            try:
+                with _ipc_weight_allocations():
+                    assert torch._C._accelerator_getAllocatorSettings() == (
+                        "max_split_size_mb:64,expandable_segments:False"
+                    )
+                    weights = torch.empty(32 << 20, dtype=torch.uint8, device="cuda")
+                assert torch._C._accelerator_getAllocatorSettings() == configured
+                base, size, handle = native.owner_export(
+                    executor, weights.data_ptr(), weights.nbytes
+                )
+                assert base <= weights.data_ptr()
+                assert weights.data_ptr() + weights.nbytes <= base + size
+                assert len(handle) == 64
+            finally:
+                native.owner_close(executor)
+    finally:
+        torch._C._accelerator_setAllocatorSettings(original)
 
 
 @pytest.mark.parametrize("show_progress", [True, False])

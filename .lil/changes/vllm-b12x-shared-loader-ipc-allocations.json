@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-b12x-shared-loader-ipc-allocations",
+  "category": "fix",
+  "summary": "Keep shared checkpoint weight allocations compatible with CUDA IPC",
+  "models": [
+    "Models loaded through the native B12X shared GDS reader"
+  ],
+  "compatibility": "Shared GDS loading temporarily disables expandable segments for weight allocation and restores the complete runtime allocator configuration afterward. CuMem and sleep-mode allocations are rejected because their virtual-memory backing cannot use the reader's CUDA IPC export path.",
+  "details": [
+    "Checkpoint loading preserves unrelated allocator settings and restores the original configuration after successful loading or an exception. Bounce loading retains its allocator behavior."
+  ],
+  "authors": [
+    "lukealonso"
+  ]
+}
