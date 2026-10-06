@@ -1,0 +1,17 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-cumem-allocator-state",
+  "category": "fix",
+  "summary": "Preserve applied allocator options across CuMem pool contexts",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "Capture the applied allocator configuration, disable only expandable segments during CuMem allocation, and restore the complete configuration on normal and exceptional exit.",
+    "Retain caller split limits and respect an enclosing context that has already disabled expandable segments."
+  ],
+  "authors": [
+    "Luke Alonso"
+  ]
+}

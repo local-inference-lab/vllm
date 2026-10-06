@@ -22,29 +22,31 @@ DEVICE_TYPE = current_platform.device_type
 
 @pytest.mark.parametrize("failure", [False, True])
 @pytest.mark.parametrize(
-    "cuda_conf,alloc_conf,expandable",
+    "active_conf,pool_conf",
     [
-        (None, "expandable_segments:True", True),
-        (None, "max_split_size_mb:64, expandable_segments : True", True),
-        ("expandable_segments : True", None, True),
-        ("expandable_segments:True", "expandable_segments:False", True),
-        ("expandable_segments:False", "expandable_segments:True", False),
-        ("", "expandable_segments:True", False),
-        (None, None, False),
+        ("", None),
+        ("max_split_size_mb:64", None),
+        ("expandable_segments:False,max_split_size_mb:64", None),
+        ("expandable_segments:True", "expandable_segments:False"),
+        (
+            "max_split_size_mb:64, expandable_segments : True",
+            "max_split_size_mb:64, expandable_segments : False",
+        ),
+        (
+            "expandable_segments:True,max_split_size_mb:64",
+            "expandable_segments:False,max_split_size_mb:64",
+        ),
     ],
 )
 def test_cumem_pool_restores_effective_allocator_config(
-    monkeypatch, cuda_conf, alloc_conf, expandable, failure
+    monkeypatch, active_conf, pool_conf, failure
 ):
-    """Disable VMM before pool entry and restore it even when the body raises."""
-    for name, value in (
-        ("PYTORCH_CUDA_ALLOC_CONF", cuda_conf),
-        ("PYTORCH_ALLOC_CONF", alloc_conf),
-    ):
-        if value is None:
-            monkeypatch.delenv(name, raising=False)
-        else:
-            monkeypatch.setenv(name, value)
+    """Preserve the applied configuration across pool entry and exceptional exit."""
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.setattr(
+        cumem.torch._C, "_accelerator_getAllocatorSettings", lambda: active_conf
+    )
     settings: list[str] = []
     monkeypatch.setattr(
         "vllm.device_allocator.cumem.torch.cuda.memory._set_allocator_settings",
@@ -54,7 +56,7 @@ def test_cumem_pool_restores_effective_allocator_config(
 
     @contextmanager
     def fake_pool(*_args):
-        assert settings == (["expandable_segments:False"] if expandable else [])
+        assert settings == ([pool_conf] if pool_conf is not None else [])
         yield pool, None
 
     monkeypatch.setattr(cumem, "use_memory_pool_with_allocator", fake_pool)
@@ -68,9 +70,7 @@ def test_cumem_pool_restores_effective_allocator_config(
             raise RuntimeError("pool body")
     assert allocator.current_tag == allocator.default_tag
     assert allocator.allocator_and_pools["weights"][0] is pool
-    assert settings == (
-        ["expandable_segments:False", "expandable_segments:True"] if expandable else []
-    )
+    assert settings == ([pool_conf, active_conf] if pool_conf is not None else [])
 
 
 def mapped_usage(allocator) -> int:

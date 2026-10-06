@@ -10,7 +10,6 @@
 # the only successful approach is to call cuda driver API in C.
 import atexit
 import gc
-import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -376,14 +375,11 @@ class CuMemAllocator:
         # sleep mode (see https://github.com/pytorch/pytorch/issues/147851).
         # Temporarily disable the effective allocator setting while the pool
         # is active and restore it on exit.
-        conf = os.environ.get(
-            "PYTORCH_CUDA_ALLOC_CONF", os.environ.get("PYTORCH_ALLOC_CONF", "")
-        )
-        expandable_was_enabled = bool(
-            re.search(r"(?:^|,)\s*expandable_segments\s*:\s*True\s*(?:,|$)", conf)
-        )
+        conf = torch._C._accelerator_getAllocatorSettings()
+        pool_conf = re.sub(r"(\bexpandable_segments\s*:\s*)True\b", r"\1False", conf)
+        expandable_was_enabled = pool_conf != conf
         if expandable_was_enabled:
-            torch.cuda.memory._set_allocator_settings("expandable_segments:False")
+            torch.cuda.memory._set_allocator_settings(pool_conf)
 
         old_tag = self.current_tag
         self.current_tag = tag
@@ -417,7 +413,7 @@ class CuMemAllocator:
         finally:
             self.current_tag = old_tag
             if expandable_was_enabled:
-                torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+                torch.cuda.memory._set_allocator_settings(conf)
 
     def get_current_usage(self) -> int:
         """
