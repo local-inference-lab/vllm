@@ -1065,21 +1065,49 @@ def test_b12x_glm5_next_full_ckv_workspaces_follow_cache_format(
 def test_b12x_full_ckv_workspace_is_reserved_before_kv_profiling(
     monkeypatch: pytest.MonkeyPatch, enabled: bool
 ) -> None:
-    """The profile skips attention, so the gathered cache is reserved upfront."""
+    """The profile skips attention, so the gathered cache is reserved upfront.
+
+    The selection remap kernels are compiled for serving buffer layouts there
+    as well, instead of during the first eligible prefill.
+    """
     from vllm.v1.worker.workspace import WorkspaceManager
 
     manager = WorkspaceManager(torch.device("cpu"))
     monkeypatch.setattr(b12x_mla_sparse, "current_workspace_manager", lambda: manager)
+    remaps: list[dict[str, Any]] = []
+    masks: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def remap(req_ids, token_indices, starts, lens, out, counts, **kwargs):
+        remaps.append(
+            dict(
+                kwargs,
+                token_indices=token_indices,
+                starts_stride=starts.stride(),
+                out_shape=tuple(out.shape),
+            )
+        )
+
+    monkeypatch.setattr(b12x_mla_sparse, "_map_global_topk_to_gathered_ckv", remap)
+    monkeypatch.setattr(
+        b12x_mla_sparse,
+        "_mask_page_table_after_nsa_len",
+        lambda selected, counts: masks.append((selected, counts)),
+    )
     impl = object.__new__(B12xMLASparseImpl)
     impl.num_heads = 11
     impl._ckv_gather_enabled = enabled
     impl._kernel_page_size_finalized = True
+    impl._kernel_page_size = 64
     impl._max_tokens = 32
+    impl._max_seqs = 16
     impl._q_head_dim = 576
     impl._scratch_nbytes = 16
     impl._ckv_local_capacity = 128
     impl.dcp_world_size = 2
+    impl._cp_kv_cache_interleave_size = 1
     impl._cache_record_bytes = 656
+    impl._topk_tokens = 2048
+    impl.topk_indices_buffer = torch.zeros((32, 2048), dtype=torch.int32)
     impl._plans = {
         ("ckv_extend", 32): SimpleNamespace(
             scratch_specs=lambda: (SimpleNamespace(nbytes=8),)
@@ -1093,6 +1121,17 @@ def test_b12x_full_ckv_workspace_is_reserved_before_kv_profiling(
     gathered_bytes = 2 * 128 * 656
     expected = query_bytes + 256 + gathered_bytes
     assert manager.available_bytes() == (expected if enabled else 0)
+    if not enabled:
+        assert remaps == [] and masks == []
+        return
+    assert [call["padded_rank_tokens"] for call in remaps] == [32, 64]
+    for call in remaps:
+        assert call["dcp_size"] == 2
+        assert call["cp_kv_cache_interleave_size"] == 1
+        assert call["starts_stride"] == (16, 1)
+        assert call["out_shape"] == (1, 2048)
+        assert call["token_indices"].data_ptr() == impl.topk_indices_buffer.data_ptr()
+    assert len(masks) == 1 and masks[0][0].shape == (1, 2048)
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
