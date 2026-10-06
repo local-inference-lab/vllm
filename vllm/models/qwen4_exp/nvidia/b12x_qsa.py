@@ -248,6 +248,7 @@ class Qwen4ExpQSAMetadataBuilder(B12xPagedMetadataBuilder):
         qsa_state_is_fresh: torch.Tensor | None = None,
         qsa_num_accepted_tokens: torch.Tensor | None = None,
         qsa_is_prefilling: torch.Tensor | None = None,
+        qsa_max_seq_len: int | None = None,
     ) -> Qwen4ExpQSAMetadata:
         del common_prefix_len, fast_build
         cm = common_attn_metadata
@@ -281,7 +282,7 @@ class Qwen4ExpQSAMetadataBuilder(B12xPagedMetadataBuilder):
             num_actual_tokens=cm.num_actual_tokens,
             max_query_len=cm.max_query_len,
             query_start_loc=cm.query_start_loc,
-            max_seq_len=cm.max_seq_len,
+            max_seq_len=cm.max_seq_len if qsa_max_seq_len is None else qsa_max_seq_len,
             seq_lens=cm.seq_lens,
             block_table=cm.block_table_tensor,
             slot_mapping=cm.slot_mapping,
