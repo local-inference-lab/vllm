@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.distributed.device_communicators.all_reduce_utils import (
     gpu_p2p_access_check,
 )
@@ -60,6 +61,17 @@ def _symm_mem_spans_group(group: GroupCoordinator) -> bool:
     return spans
 
 
+def _can_access_peer(src: int, dst: int) -> bool:
+    if envs.VLLM_SKIP_P2P_CHECK:
+        # Trust the driver like the custom all-reduce does: the IPC probe
+        # spawns processes for every device pair and can hang on PCIe hosts.
+        return torch.cuda.can_device_access_peer(
+            current_platform.logical_device_id_to_visible_device_id(src),
+            current_platform.logical_device_id_to_visible_device_id(dst),
+        )
+    return gpu_p2p_access_check(src, dst)
+
+
 @functools.cache
 def _cuda_p2p_spans_group(group: GroupCoordinator) -> bool:
     """Check whether every rank can directly access every peer GPU.
@@ -85,7 +97,7 @@ def _cuda_p2p_spans_group(group: GroupCoordinator) -> bool:
         if any(rank is None for rank in local_ranks):
             return False
         spans = all(
-            src == dst or gpu_p2p_access_check(src, dst)
+            src == dst or _can_access_peer(src, dst)
             for src in local_ranks
             for dst in local_ranks
             if src is not None and dst is not None
