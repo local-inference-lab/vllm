@@ -42,6 +42,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
+from ..common.hyperconnection import load_grouped_norm_weight
 from .b12x_ple import (
     B12xNGramEmbedding,
     _b12x_module,
@@ -72,6 +73,7 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
         self.eps = eps
         self.group_size = group_size
         self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=dtype))
+        self.weight.weight_loader = load_grouped_norm_weight
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype

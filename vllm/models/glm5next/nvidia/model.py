@@ -43,6 +43,9 @@ from vllm.model_executor.layers.mhc import (
     hc_expand,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptMixedPrecisionConfig,
+)
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_SCALE_DTYPE,
     MXFP8_VALUE_DTYPE,
@@ -379,8 +382,7 @@ class Glm5NextDecoderLayer(nn.Module):
             # unlisted projections remain BF16.
             mla_quant_config = (
                 quant_config
-                if quant_config is not None
-                and quant_config.get_name() in ("modelopt_mixed", "nvfp4_csf")
+                if isinstance(quant_config, ModelOptMixedPrecisionConfig)
                 else None
             )
             self.self_attn = Glm5NextMLAAttention(
@@ -1543,9 +1545,7 @@ class Glm5NextForConditionalGeneration(
                 # the latter onto text_config (1e-5), silently ignoring the
                 # vision tower's own (1e-6) rms_norm_eps.
                 norm_eps=config.vision_config.rms_norm_eps,
-                # The vision tower ships BF16 weights; it is quantized only
-                # on request (VLLM_GLM53_VISION_MXFP8).
-                quant_config=_vision_quant_config(),
+                quant_config=_vision_quant_config(vllm_config.quant_config),
                 prefix=maybe_prefix(prefix, "visual"),
             )
 
@@ -1704,8 +1704,12 @@ def host_embedding_if_requested(embed: VocabParallelEmbedding) -> None:
     weight._vllm_is_uva_offloaded = True
 
 
-def _vision_quant_config() -> QuantizationConfig | None:
-    """Online MXFP8 for the vision tower's linear layers, when requested."""
+def _vision_quant_config(
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    """Use stored vision recipes or opt-in online MXFP8 for BF16 checkpoints."""
+    if isinstance(quant_config, ModelOptMixedPrecisionConfig):
+        return quant_config
     if not envs.VLLM_GLM53_VISION_MXFP8:
         return None
     from vllm.config.quantization import QuantizationConfigArgs, QuantSpec

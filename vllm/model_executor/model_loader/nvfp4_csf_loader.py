@@ -16,6 +16,7 @@ from vllm.model_executor.model_loader.csf_utils import (
     CsfMatrix,
     CsfTensorReader,
     read_csf_contract,
+    resolve_csf_checkpoint_root,
     tp_extent,
 )
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
@@ -324,9 +325,7 @@ class Nvfp4CsfModelLoader(DefaultModelLoader):
         quant = quant or model_config.hf_text_config.quantization_config
         if quant.get("quant_method") != "nvfp4_csf":
             raise ValueError("NVFP4-CSF loader requires quant_method=nvfp4_csf")
-        root = Path(quant["checkpoint_root"])
-        if not root.is_absolute():
-            raise ValueError("NVFP4-CSF checkpoint_root must be an absolute local path")
+        root = resolve_csf_checkpoint_root(model_config, quant)
         return root, checkpoint_contract(str(root.resolve()))
 
     def download_model(self, model_config):

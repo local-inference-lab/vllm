@@ -656,3 +656,32 @@ def test_lazy_package_exports_match_registry(architecture: str) -> None:
     assert registered_cls.__name__ == architecture
     assert registered_cls.__module__.startswith("vllm.models.qwen4_exp.")
     assert ModelRegistry.models[architecture].inspect_model_cls() is not None
+
+
+@pytest.mark.parametrize("kind", ["hyperconnection", "ple"])
+@pytest.mark.parametrize("source_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("runtime_dtype", [torch.bfloat16, torch.float32])
+def test_grouped_norm_loader_uses_runtime_precision_without_mutating_source(
+    kind, source_dtype, runtime_dtype
+):
+    from vllm.models.qwen4_exp.common.hyperconnection import GroupedGemmaRMSNorm
+    from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPLEGroupedNorm
+
+    cls = GroupedGemmaRMSNorm if kind == "hyperconnection" else Qwen4ExpPLEGroupedNorm
+    layer = cls(32, 1e-6, 8, runtime_dtype)
+    source = torch.linspace(-0.01739, 0.01917, 32).to(source_dtype)
+    original = source.clone()
+    expected = source.to(runtime_dtype)
+    loaded = AutoWeightsLoader(layer).load_weights([("weight", source)])
+    assert loaded == {"weight"}
+    assert layer.weight.dtype == runtime_dtype
+    assert source.dtype == source_dtype
+    torch.testing.assert_close(source, original, rtol=0, atol=0)
+    torch.testing.assert_close(layer.weight, expected, rtol=0, atol=0)
+    inputs = torch.arange(64, dtype=torch.bfloat16).reshape(2, 32) / 13
+    grouped = inputs.float().reshape(2, 4, 8)
+    normalized = (
+        grouped * torch.rsqrt(grouped.square().mean(-1, keepdim=True) + 1e-6)
+    ).reshape(2, 32)
+    reference = (normalized * (1 + expected.float())).to(inputs.dtype)
+    torch.testing.assert_close(layer(inputs), reference, rtol=0, atol=0)

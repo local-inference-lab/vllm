@@ -28,6 +28,23 @@ from vllm.model_executor.model_loader.nvfp4_csf_loader import Nvfp4CsfModelLoade
 from .csf_fixtures import decode_planes, matrix
 
 
+@pytest.mark.parametrize("selected", [None, "nvfp4_csf"])
+def test_model_config_detects_csf(selected):
+    from transformers import PretrainedConfig
+
+    from vllm.config import ModelConfig
+
+    config = SimpleNamespace(
+        quantization=selected,
+        model_arch_config=SimpleNamespace(
+            quantization_config={"quant_method": "nvfp4_csf"}
+        ),
+        hf_config=PretrainedConfig(),
+    )
+    ModelConfig._verify_quantization(config)
+    assert config.quantization == "nvfp4_csf"
+
+
 @pytest.mark.parametrize("config_cls", [Nvfp4CsfConfig])
 def test_csf_config_preserves_source_recipes_and_avoids_expert_allocations(config_cls):
     original = {
@@ -472,3 +489,48 @@ def test_scale_prefetch_expands_the_next_layer_for_this_forward_only(monkeypatch
     calls.clear()
     forward(step(8))
     assert calls == [(3, False), (4, False)] and expanded == []
+
+
+@pytest.mark.parametrize("checkpoint_root", [".", "absolute"])
+def test_portable_root_binds_loader_and_quantizer_to_model_directory(
+    tmp_path, monkeypatch, checkpoint_root
+):
+    from vllm.model_executor.model_loader.weight_utils import get_quant_config
+
+    root = tmp_path / "model"
+    root.mkdir()
+    _write_checkpoint(root, "qwen38_flash_next_nvfp4", {"norm.weight": torch.ones(8)})
+    quant = {
+        "quant_method": "nvfp4_csf",
+        "format_version": 1,
+        "checkpoint_root": str(root) if checkpoint_root == "absolute" else ".",
+        "source_quantization_config": {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {"model.layers.0.mlp.experts": {"quant_algo": "NVFP4"}},
+        },
+    }
+    config = SimpleNamespace(
+        model=str(root),
+        quantization="nvfp4_csf",
+        quantization_config=None,
+        hf_config=SimpleNamespace(quantization_config=quant),
+    )
+    monkeypatch.chdir(tmp_path)
+    load_config = LoadConfig(load_format="nvfp4_csf")
+    actual_root, _ = Nvfp4CsfModelLoader(load_config)._root(config)
+    owner = get_quant_config(config, load_config)
+    assert actual_root == root
+    assert owner.checkpoint_root == str(root)
+    assert quant["checkpoint_root"] == (
+        str(root) if checkpoint_root == "absolute" else "."
+    )
+
+
+def test_relative_csf_root_rejects_unresolved_hub_model():
+    from vllm.model_executor.model_loader.csf_utils import resolve_csf_checkpoint_root
+
+    with pytest.raises(ValueError, match="local model directory"):
+        resolve_csf_checkpoint_root(
+            SimpleNamespace(model="owner/model"), {"checkpoint_root": "."}
+        )

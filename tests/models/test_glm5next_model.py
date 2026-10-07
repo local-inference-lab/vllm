@@ -580,7 +580,10 @@ def test_glm5next_mtp_preserves_position_zero_embedding() -> None:
     torch.testing.assert_close(projection.inputs[:, :2], inputs_embeds)
 
 
-def test_glm5next_mixed_precision_reaches_mla_projections(monkeypatch) -> None:
+@pytest.mark.parametrize("csf", [False, True])
+def test_glm5next_mixed_precision_reaches_mla_projections(monkeypatch, csf) -> None:
+    from vllm.model_executor.layers.quantization.nvfp4_csf import Nvfp4CsfConfig
+
     captured = {}
 
     class FakeModule(torch.nn.Module):
@@ -596,7 +599,8 @@ def test_glm5next_mixed_precision_reaches_mla_projections(monkeypatch) -> None:
     monkeypatch.setattr(glm5next_model, "Glm5NextMLP", FakeModule)
     monkeypatch.setattr(glm5next_model, "RMSNorm", FakeModule)
 
-    quant_config = ModelOptMixedPrecisionConfig.__new__(ModelOptMixedPrecisionConfig)
+    quant_cls = Nvfp4CsfConfig if csf else ModelOptMixedPrecisionConfig
+    quant_config = quant_cls.__new__(quant_cls)
     config = SimpleNamespace(
         hidden_size=16,
         is_moe=False,
@@ -3260,3 +3264,121 @@ def test_glm5next_registers_mhc_preparation_after_broadcast_publication(
     causal_lm.process_weights_after_loading()
 
     assert calls == ["broadcast", "providers"]
+
+
+@pytest.mark.parametrize("implementation", ["common", "nvidia"])
+@pytest.mark.parametrize("quant_kind", ["fp8", "mixed", "csf"])
+@pytest.mark.parametrize("online", [False, True])
+def test_vision_constructor_preserves_explicit_mixed_recipes(
+    monkeypatch, implementation, quant_kind, online
+):
+    import importlib
+    from contextlib import nullcontext
+
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.model_executor.layers.quantization.nvfp4_csf import Nvfp4CsfConfig
+    from vllm.model_executor.layers.quantization.online.base import (
+        OnlineQuantizationConfig,
+    )
+
+    monkeypatch.setenv("VLLM_GLM53_VISION_MXFP8", str(int(online)))
+    module = importlib.import_module(f"vllm.models.glm5next.{implementation}.model")
+    cls = module.Glm5NextForConditionalGeneration
+    quant = (
+        ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.visual.blocks.0.attn.qkv": {"quant_algo": "MXFP8"}
+                },
+            }
+        )
+        if quant_kind != "fp8"
+        else Fp8Config(is_checkpoint_fp8_serialized=True)
+    )
+    if quant_kind == "csf":
+        quant = Nvfp4CsfConfig.from_config(
+            {
+                "format_version": 1,
+                "checkpoint_root": "/checkpoint",
+                "source_quantization_config": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": quant.quantized_layers,
+                },
+            }
+        )
+    seen = []
+
+    def tower(*args, **kwargs):
+        seen.append(kwargs["quant_config"])
+        return torch.nn.Identity()
+
+    monkeypatch.setattr(module, "Glm5NextVisionTransformer", tower)
+    monkeypatch.setattr(
+        module, "init_vllm_registered_model", lambda **kwargs: torch.nn.Identity()
+    )
+    monkeypatch.setattr(cls, "_mark_tower_model", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(
+        cls, "_mark_language_model", lambda *args, **kwargs: nullcontext()
+    )
+    config = SimpleNamespace(
+        quant_config=quant,
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                text_config=SimpleNamespace(),
+                vision_config=SimpleNamespace(rms_norm_eps=1e-6),
+            ),
+            multimodal_config=SimpleNamespace(
+                mm_encoder_tp_mode="data", is_multimodal_pruning_enabled=lambda: False
+            ),
+        ),
+    )
+    if implementation == "common":
+        monkeypatch.setattr(cls, "set_moe_parameters", lambda self: None)
+    cls(vllm_config=config)
+    if quant_kind != "fp8":
+        assert seen == [quant]
+    elif implementation == "nvidia" and online:
+        assert isinstance(seen[0], OnlineQuantizationConfig)
+    else:
+        assert seen == [None]
+
+
+def test_vision_qkv_prefix_resolves_the_stored_mxfp8_recipe(
+    monkeypatch, default_vllm_config
+):
+    from vllm.models.glm5next.common import multimodal
+
+    quant = ModelOptMixedPrecisionConfig.from_config(
+        {
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "visual.blocks.0.attn.qkv": {"quant_algo": "MXFP8"},
+                "visual.blocks.0.attn.proj": {"quant_algo": "MXFP8"},
+            },
+        }
+    )
+    recipes = {}
+
+    def projection(**kwargs):
+        recipes[kwargs["prefix"]] = kwargs["quant_config"]._resolve_quant_algo(
+            kwargs["prefix"]
+        )
+        result = torch.nn.Identity()
+        result.quant_method = object()
+        return result
+
+    monkeypatch.setattr(multimodal, "is_vit_use_data_parallel", lambda: True)
+    monkeypatch.setattr(multimodal, "QKVParallelLinear", projection)
+    monkeypatch.setattr(multimodal, "RowParallelLinear", projection)
+    monkeypatch.setattr(
+        multimodal, "MMEncoderAttention", lambda **kwargs: torch.nn.Identity()
+    )
+    monkeypatch.setattr(
+        multimodal, "ApplyRotaryEmb", lambda **kwargs: torch.nn.Identity()
+    )
+    multimodal.Glm5NextVisionAttention(128, 4, 128, quant, "visual.blocks.0.attn")
+    assert recipes == {
+        "visual.blocks.0.attn.qkv": "MXFP8",
+        "visual.blocks.0.attn.proj": "MXFP8",
+    }
