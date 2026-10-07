@@ -229,6 +229,7 @@ if TYPE_CHECKING:
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
     VLLM_B12X_MLA_CKV_GATHER_MIXED: bool = False
+    VLLM_DCP_INDEXER_KEY_GATHER: bool = False
     VLLM_B12X_PAGED_DECODE: Literal["auto", "0", "1"] = "auto"
     VLLM_PLE_TABLE_MEMORY: Literal["ram", "disk", "shared"] | None = None
     VLLM_PLE_SHARED_TABLE_DIR: str = "/dev/shm/vllm-ple"
@@ -1917,6 +1918,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_B12X_MLA_CKV_GATHER_MIXED": lambda: (
         os.getenv("VLLM_B12X_MLA_CKV_GATHER_MIXED", "0").lower()
         in ("1", "true", "yes", "on")
+    ),
+    # Eager B12X DSA prefill under DCP gathers each request's sharded index
+    # keys once into the reserved workspace and splits the query rows across
+    # tensor-parallel ranks, which then exchange only selected indices instead
+    # of per-shard candidates.
+    "VLLM_DCP_INDEXER_KEY_GATHER": lambda: bool(
+        int(os.getenv("VLLM_DCP_INDEXER_KEY_GATHER", "0"))
     ),
     # B12X attention decode/verify through b12x.attention.paged_decode:
     # "auto" for layers with unequal Q/K and V head dims and for non-causal
