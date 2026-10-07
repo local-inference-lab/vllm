@@ -1,7 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import pytest
+
+from vllm.config import DeviceConfig, VllmConfig
 from vllm.v1.core.sched.output import ScheduledEncoderInputStats, SchedulerOutput
 from vllm.v1.engine import EngineCoreOutputs, FinishReason
+from vllm.v1.engine.llm_engine import LLMEngine
+from vllm.v1.metrics.loggers import (
+    AggregatedLoggingStatLogger,
+    LoggingStatLogger,
+    PrometheusStatLogger,
+)
+from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import (
     IterationStats,
     PrefillStats,
@@ -55,6 +68,7 @@ def test_scheduler_iteration_details_serialization():
         scheduler_stats=SchedulerStats(
             kv_cache_usage=0.5,
             iteration_details=iteration_details,
+            num_computed_prefill_tokens=4096,
         )
     )
 
@@ -64,6 +78,111 @@ def test_scheduler_iteration_details_serialization():
     assert decoded.scheduler_stats is not None
     assert decoded.scheduler_stats.kv_cache_usage == 0.5
     assert decoded.scheduler_stats.iteration_details == iteration_details
+    assert decoded.scheduler_stats.num_computed_prefill_tokens == 4096
+
+
+@pytest.mark.parametrize("aggregated", [False, True])
+def test_prefill_counters_advance_before_first_output_without_double_count(aggregated):
+    """Chunk completion credits compute; first output credits only cache reuse."""
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    config.model_config = Mock(
+        served_model_name="test-model", max_model_len=16384, is_diffusion=False
+    )
+    with patch("vllm.v1.metrics.loggers.time.monotonic", return_value=0.0):
+        logs = (
+            AggregatedLoggingStatLogger(config, [0])
+            if aggregated
+            else LoggingStatLogger(config)
+        )
+    try:
+        metrics = PrometheusStatLogger(config)
+        sources = metrics.counter_prompt_tokens_by_source
+        for count in (4096, 2048):
+            step = SchedulerStats(num_computed_prefill_tokens=count)
+            metrics.record(step, None)
+            logs.record(step, None)
+        assert metrics.counter_prompt_tokens[0]._value.get() == 6144
+        assert sources["local_compute"][0]._value.get() == 6144
+        assert metrics.counter_prompt_tokens_cached[0]._value.get() == 0
+        with patch("vllm.v1.metrics.loggers.time.monotonic", return_value=10.0):
+            logs.log()
+        assert logs.last_prompt_throughput == 614.4
+
+        prefill = PrefillStats()
+        prefill.set(
+            num_prompt_tokens=10000,
+            num_local_cached_tokens=2000,
+            num_external_cached_tokens=1000,
+        )
+        first_output = IterationStats()
+        first_output.prompt_token_stats.update_from_output(prefill)
+        first_output.num_generation_tokens = 1
+        last_chunk = SchedulerStats(num_computed_prefill_tokens=856)
+        metrics.record(last_chunk, first_output)
+        logs.record(last_chunk, first_output)
+        assert metrics.counter_prompt_tokens[0]._value.get() == 10000
+        assert {
+            source: counters[0]._value.get() for source, counters in sources.items()
+        } == {
+            "local_compute": 7000,
+            "local_cache_hit": 2000,
+            "external_kv_transfer": 1000,
+        }
+        assert metrics.counter_prompt_tokens_cached[0]._value.get() == 3000
+        assert metrics.counter_generation_tokens[0]._value.get() == 1
+        assert first_output.num_prompt_tokens == 10000
+        assert first_output.prompt_token_stats.computed == 7000
+        with patch("vllm.v1.metrics.loggers.time.monotonic", return_value=20.0):
+            logs.log()
+        assert logs.last_prompt_throughput == 85.6
+    finally:
+        unregister_vllm_metrics()
+
+
+def test_saved_logits_cache_hit_has_no_computed_prefill_counter():
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    config.model_config = Mock(
+        served_model_name="test-model", max_model_len=16384, is_diffusion=False
+    )
+    try:
+        metrics = PrometheusStatLogger(config)
+        prefill = PrefillStats()
+        prefill.set(
+            num_prompt_tokens=10000,
+            num_local_cached_tokens=10000,
+            num_external_cached_tokens=0,
+        )
+        first_output = IterationStats()
+        first_output.prompt_token_stats.update_from_output(prefill)
+        metrics.record(SchedulerStats(), first_output)
+        assert metrics.counter_prompt_tokens[0]._value.get() == 10000
+        assert (
+            metrics.counter_prompt_tokens_by_source["local_compute"][0]._value.get()
+            == 0
+        )
+        assert metrics.counter_prompt_tokens_cached[0]._value.get() == 10000
+    finally:
+        unregister_vllm_metrics()
+
+
+def test_synchronous_engine_logs_partial_prefill_without_request_output():
+    engine = LLMEngine.__new__(LLMEngine)
+    engine.should_execute_dummy_batch = False
+    engine.log_stats = True
+    engine.engine_core = Mock()
+    engine.engine_core.get_output.return_value = EngineCoreOutputs(
+        scheduler_stats=SchedulerStats(num_computed_prefill_tokens=16)
+    )
+    engine.output_processor = Mock()
+    engine.output_processor.process_outputs.return_value = SimpleNamespace(
+        reqs_to_abort=[], request_outputs=[]
+    )
+    engine.renderer = Mock()
+    engine.logger_manager = Mock()
+    engine.do_log_stats_with_interval = Mock()
+    assert engine.step() == []
+    engine.logger_manager.record.assert_called_once()
+    engine.do_log_stats_with_interval.assert_called_once()
 
 
 def test_compute_iteration_details_includes_encoder_stats():
