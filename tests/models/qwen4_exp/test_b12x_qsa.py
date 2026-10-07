@@ -28,7 +28,11 @@ from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
 from vllm.platforms import current_platform
 from vllm.platforms.interface import Platform
 from vllm.v1.attention.backend import CommonAttentionMetadata
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVQuantMode,
+    get_kv_quant_mode,
+)
 from vllm.v1.worker.utils import select_common_block_size
 
 
@@ -524,6 +528,132 @@ def test_qsa_main_cache_views_reinterpret_fp8_storage() -> None:
     assert (
         key_cache.untyped_storage().data_ptr() == storage.untyped_storage().data_ptr()
     )
+
+
+def test_nvfp4_qsa_is_its_own_kv_quant_mode() -> None:
+    assert get_kv_quant_mode("nvfp4_qsa") == KVQuantMode.NVFP4_QSA
+    assert get_kv_quant_mode("nvfp4") == KVQuantMode.NVFP4
+    assert get_kv_quant_mode("nvfp4_ds_mla") == KVQuantMode.NVFP4_DS_MLA
+    assert not KVQuantMode.NVFP4_QSA.is_nvfp4
+
+
+def test_qsa_backend_sizes_nvfp4_record_slots_from_b12x(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+    record = 148
+
+    def cache_requirements(**kwargs):
+        calls.append(kwargs)
+        heads = int(kwargs["kv_heads"])
+        page = int(kwargs["main_page_size"])
+        return SimpleNamespace(
+            compressed_page_nbytes=page // 4 * 128 * 2,
+            main_k_page_nbytes=page * heads * record,
+        )
+
+    nvfp4_dtype = torch.float4_e2m1fn_x2
+    monkeypatch.setattr(
+        qsa_cache_module,
+        "get_b12x_qsa",
+        lambda: SimpleNamespace(
+            cache_requirements=cache_requirements, NVFP4_KV_DTYPE=nvfp4_dtype
+        ),
+    )
+    probe = FullAttentionSpec(
+        block_size=1,
+        num_kv_heads=2,
+        head_size=256,
+        head_size_v=256,
+        dtype=torch.uint8,
+        kv_quant_mode=KVQuantMode.NVFP4_QSA,
+    )
+
+    packed = Qwen4ExpQSABackend.customize_spec(probe)
+
+    # Two head slots (K and V) of 2 x 148-byte records per token, plus the
+    # unchanged 64-byte BF16 selector tail per token.
+    assert packed.num_head_slots == 2
+    assert packed.state_content_bytes == 2 * record
+    assert packed.unpadded_page_size_bytes == 2 * 2 * record
+    assert packed.page_size_bytes == 2 * 2 * record + 64
+    assert all(call["kv_dtype"] is nvfp4_dtype for call in calls)
+
+
+def test_qsa_backend_accepts_nvfp4_qsa_only_as_an_explicit_cache_dtype() -> None:
+    assert "nvfp4_qsa" in Qwen4ExpQSABackend.supported_kv_cache_dtypes
+    assert "nvfp4" not in Qwen4ExpQSABackend.supported_kv_cache_dtypes
+
+
+def test_qsa_main_cache_views_keep_nvfp4_records_as_bytes() -> None:
+    impl = Qwen4ExpQSAImpl.__new__(Qwen4ExpQSAImpl)
+    impl.num_kv_heads = 2
+    impl.head_size = 256
+    impl.kv_cache_dtype = "nvfp4_qsa"
+    storage = torch.zeros(3, 2, 16, 2 * 148, dtype=torch.uint8)
+
+    key_cache, value_cache = impl._kv_cache_views(storage)
+
+    assert key_cache.dtype == value_cache.dtype == torch.uint8
+    assert key_cache.shape == value_cache.shape == (3, 16, 2, 148)
+    assert key_cache.stride() == (2 * 16 * 296, 296, 148, 1)
+    value_cache[1, 2, 1, 5] = 9
+    assert storage[1, 1, 2, 148 + 5] == 9
+
+
+def test_qsa_nvfp4_cache_update_uses_the_layer_writer() -> None:
+    impl = Qwen4ExpQSAImpl.__new__(Qwen4ExpQSAImpl)
+    impl.num_kv_heads = 1
+    impl.head_size = 256
+    impl.kv_cache_dtype = "nvfp4_qsa"
+    calls = []
+    layer = SimpleNamespace(
+        write_nvfp4_kv=lambda *args: calls.append(args),
+    )
+    key = torch.zeros(3, 256, dtype=torch.bfloat16)
+    value = torch.ones(3, 256, dtype=torch.bfloat16)
+    storage = torch.zeros(2, 2, 16, 148, dtype=torch.uint8)
+    slots = torch.tensor([0, -1, 17], dtype=torch.int64)
+
+    impl.do_kv_cache_update(layer, key, value, storage, slots)
+
+    ((k, v, slot_mapping),) = calls
+    assert k.shape == v.shape == (3, 1, 256)
+    assert torch.equal(v, value.view(3, 1, 256))
+    assert slot_mapping is slots
+
+
+def test_qsa_nvfp4_writer_binds_once_to_the_layer_cache(monkeypatch) -> None:
+    impl = Qwen4ExpQSAImpl.__new__(Qwen4ExpQSAImpl)
+    impl.num_kv_heads = 1
+    impl.head_size = 256
+    impl.kv_cache_dtype = "nvfp4_qsa"
+    storage = torch.zeros(2, 2, 16, 148, dtype=torch.uint8)
+    binds, writes = [], []
+
+    class Writer:
+        def write(self, **kwargs):
+            writes.append(kwargs)
+
+    api = SimpleNamespace(
+        bind_kv_writer=lambda plan, **caches: binds.append((plan, caches)) or Writer()
+    )
+    layer = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
+    layer.impl = impl
+    layer.kv_cache = storage
+    layer._b12x_preparation_prefix = "layer"
+    layer._nvfp4_kv_writer = None
+    layer._qsa_decode_context = SimpleNamespace(prepared_plan="plan")
+    key = torch.zeros(3, 1, 256, dtype=torch.bfloat16)
+    slots = torch.tensor([0, -1, 17], dtype=torch.int64)
+
+    monkeypatch.setattr(qsa_module, "get_b12x_qsa", lambda: api)
+    layer.write_nvfp4_kv(key, key, slots)
+    layer.write_nvfp4_kv(key, key, slots)
+
+    ((plan, caches),) = binds
+    assert plan == "plan"
+    assert caches["main_k_cache"].shape == (2, 16, 1, 148)
+    assert caches["main_v_cache"].data_ptr() == storage[:, 1].data_ptr()
+    assert len(writes) == 2 and writes[1]["slot_mapping"] is slots
 
 
 def test_qsa_caps_without_dcp_accepts_the_base_b12x_contract() -> None:

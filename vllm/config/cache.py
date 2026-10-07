@@ -46,6 +46,7 @@ CacheDType = Literal[
     "fp8_inc",
     "fp8_ds_mla",
     "nvfp4_ds_mla",
+    "nvfp4_qsa",
     "turboquant_k8v4",
     "turboquant_4bit_nc",
     "turboquant_k3v4_nc",
@@ -128,6 +129,7 @@ class CacheConfig:
     "nvfp4_4over6" uses the NVFP4 layout and selects between max/6 and max/4
     scales per 16 values by minimizing squared reconstruction error.
     "nvfp4_ds_mla" uses the model-specific packed sparse-MLA record.
+    "nvfp4_qsa" stores Qwen3.8 QSA main K/V as self-scaled NVFP4 records.
     """
     is_attention_free: bool = False
     """Whether the model is attention-free. This is primarily set in
