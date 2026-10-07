@@ -2837,6 +2837,69 @@ def test_dcp_index_key_gather_splits_rows_and_restores_selection(
     assert torch.all(indexer.topk_indices_buffer[9:] == -7)
 
 
+def test_dcp_index_key_gather_selects_eager_prefill_per_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Eager prefill rows select over gathered keys once per request; only the
+    decode rows keep sharded selection and allocate shard scores."""
+    topk, decode_rows = 4, 2
+    indexer = object.__new__(generic_b12x_indexer.B12xSparseIndexer)
+    indexer.k_cache = SimpleNamespace(
+        prefix="layer.k_cache", kv_cache=torch.empty((1, 64, 132))
+    )
+    indexer.dcp_key_gather = True
+    indexer.dcp_rank, indexer.dcp_world_size = 0, 2
+    indexer.cp_kv_cache_interleave_size = 1
+    indexer.topk_tokens = topk
+    indexer.topk_indices_buffer = torch.zeros((8, topk), dtype=torch.int32)
+    indexer._module = object()
+    indexer._plan = lambda mode, rows: (mode, rows)
+    requests: list[list[int]] = []
+    indexer._run_gathered_prefill = lambda chunks, q, w: requests.append(
+        [chunk.token_start for chunk in chunks]
+    )
+    selections: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        generic_b12x_indexer, "_run_paged_topk", lambda **kw: selections.append(kw)
+    )
+    monkeypatch.setattr(generic_b12x_indexer, "_merge_dcp_topk", lambda *args: None)
+    table = torch.zeros((1, 4), dtype=torch.int32)
+    chunks = [
+        SimpleNamespace(
+            num_reqs=1,
+            token_start=start,
+            token_end=end,
+            total_seq_lens=40,
+            block_table=table,
+        )
+        for start, end in ((2, 5), (5, 8))
+    ]
+    metadata = SimpleNamespace(
+        prefill=SimpleNamespace(chunks=chunks),
+        decode=SimpleNamespace(
+            requires_padding=False,
+            seq_lens=torch.full((decode_rows,), 9, dtype=torch.int32),
+            block_table=torch.zeros((decode_rows, 1), dtype=torch.int32),
+            active_width=torch.full((1,), 9, dtype=torch.int32),
+        ),
+        num_decode_tokens=decode_rows,
+    )
+    monkeypatch.setattr(
+        generic_b12x_indexer,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"layer.k_cache": metadata}),
+    )
+
+    indexer.forward(None, torch.zeros((8, 2, 128)), None, torch.zeros((8, 2)))
+
+    assert requests == [[2, 5]]
+    assert len(selections) == 1
+    assert selections[0]["plan"] == ("decode", decode_rows)
+    scores = selections[0]["scores"]
+    assert scores.shape == (decode_rows, topk)
+    assert scores.untyped_storage().nbytes() == decode_rows * topk * 4
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_dcp_index_key_gather_workspace_is_reserved_before_kv_profiling(
     monkeypatch: pytest.MonkeyPatch, enabled: bool

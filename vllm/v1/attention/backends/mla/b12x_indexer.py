@@ -904,20 +904,28 @@ class B12xSparseIndexer(nn.Module):
         metadata = cast(
             DeepseekV32IndexerMetadata, context.attn_metadata[self.k_cache.prefix]
         )
+        gather_prefill = (
+            metadata.prefill is not None
+            and self.dcp_key_gather
+            and not _is_current_stream_capturing(q_quant)
+        )
+        # Gathered prefill rows score into their workspace borrow.
         scores = (
             torch.empty(
-                (q_quant.shape[0], self.topk_tokens),
+                (
+                    metadata.num_decode_tokens
+                    if gather_prefill
+                    else int(q_quant.shape[0]),
+                    self.topk_tokens,
+                ),
                 dtype=torch.float32,
                 device=q_quant.device,
             )
             if self.dcp_world_size > 1
             else None
         )
-        if (
-            metadata.prefill is not None
-            and self.dcp_key_gather
-            and not _is_current_stream_capturing(q_quant)
-        ):
+        if gather_prefill:
+            assert metadata.prefill is not None
             for request in _prefill_requests(metadata.prefill.chunks):
                 self._run_gathered_prefill(request, q_quant, weights)
         elif metadata.prefill is not None:
