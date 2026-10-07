@@ -3,6 +3,7 @@
 """Compressed expert storage must retain nonexpert precision and tensors."""
 
 import json
+from contextlib import ExitStack
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -452,14 +453,18 @@ def test_scale_prefetch_expands_the_next_layer_for_this_forward_only(monkeypatch
 
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("direct", [False, True])
 def test_normal_expert_hooks_preserve_tp_weights_scales_and_calibration(
-    tmp_path, rank, reverse
+    tmp_path, rank, reverse, direct
 ):
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
     from vllm.model_executor.layers.quantization.utils.nvfp4_csf_utils import (
         prepare_nvfp4_csf_weights,
     )
 
+    if direct and not torch.cuda.is_available():
+        pytest.skip("B12X direct checkpoint transfers require CUDA")
+    device = "cuda" if direct else "cpu"
     parallel = replace(
         FusedMoEParallelConfig.make_no_parallel(), tp_size=2, tp_rank=rank
     )
@@ -471,7 +476,7 @@ def test_normal_expert_hooks_preserve_tp_weights_scales_and_calibration(
         hidden_dim=128,
         intermediate_size=128,
         in_dtype=torch.bfloat16,
-        device="cpu",
+        device=device,
         activation=MoEActivation.SILU,
         routing_method=RoutingMethodType.TopK,
         moe_parallel_config=parallel,
@@ -501,7 +506,8 @@ def test_normal_expert_hooks_preserve_tp_weights_scales_and_calibration(
     )
     method = config.get_quant_method(layer, layer.layer_name)
     assert isinstance(method, Nvfp4CsfMoEMethod)
-    method.create_weights(layer, 2, 128, 64, torch.bfloat16)
+    with torch.device(device):
+        method.create_weights(layer, 2, 128, 64, torch.bfloat16)
     tensors, sources = {}, []
     for expert in range(2):
         projections = []
@@ -540,13 +546,19 @@ def test_normal_expert_hooks_preserve_tp_weights_scales_and_calibration(
         json.dumps({"weight_map": mapping})
     )
     loader = DefaultModelLoader(LoadConfig(load_format="safetensors"))
-    loaded = set(
-        layer.load_weights(
-            loader._get_weights_iterator(
-                DefaultModelLoader.Source(str(tmp_path), revision=None)
-            )
+    with ExitStack() as stack:
+        weights = loader._get_weights_iterator(
+            DefaultModelLoader.Source(str(tmp_path), revision=None)
         )
-    )
+        if direct:
+            from b12x.loader._checkpoint import DirectWeightSession
+
+            from vllm.model_executor.weight_transfer import weight_transfer
+
+            session = stack.enter_context(DirectWeightSession(read_mode="bounce"))
+            stack.enter_context(weight_transfer(session))
+            weights = session.weights([tmp_path / name for name in mapping.values()])
+        loaded = set(layer.load_weights(weights))
     assert loaded == set(dict(layer.named_parameters()))
     kwargs = dict(
         num_experts=2,

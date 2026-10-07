@@ -27,6 +27,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
     MoEPrepareAndFinalizeNoDPEPModular,
 )
+from vllm.model_executor.weight_transfer import copy_weight, materialize_weight
 from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import set_default_torch_num_threads
 
@@ -186,21 +187,22 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
             ):
                 raise ValueError(f"Invalid NVFP4 weight shape or dtype: {weight_name}")
             shape = (h, n // 2) if shard_id == "w2" else (n, h // 2)
-            local = torch.zeros(shape, dtype=torch.uint8, device="cpu")
+            local = torch.zeros(shape, dtype=torch.uint8, device=param.device)
             if shard_id == "w2":
-                local[:, : (last - first) // 2].copy_(
-                    loaded_weight[:, first // 2 : last // 2].cpu()
+                copy_weight(
+                    local[:, : (last - first) // 2],
+                    loaded_weight[:, first // 2 : last // 2],
                 )
             else:
-                local[: last - first].copy_(loaded_weight[first:last].cpu())
+                copy_weight(local[: last - first], loaded_weight[first:last])
             values[field_name] = local
         elif field_name in ("weight_scale_2", "input_scale"):
             if loaded_weight.numel() != 1 or loaded_weight.dtype != torch.float32:
                 raise ValueError(f"CSF {field_name} must contain one FP32 value")
-            values[field_name] = loaded_weight.detach().cpu().clone()
+            values[field_name] = materialize_weight(loaded_weight).cpu()
         else:
             parts = self._scale_parts.setdefault(key, {})
-            parts[field_name] = loaded_weight.detach().cpu()
+            parts[field_name] = materialize_weight(loaded_weight).cpu()
             if len(parts) == 2:
                 if shard_id == "w2":
                     rows, columns = h, width // 16
