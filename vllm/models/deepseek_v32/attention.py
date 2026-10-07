@@ -511,6 +511,54 @@ class DeepseekV32Attention(MLAAttention):
         )
         return self.o_proj(output)[0]
 
+    def _split_ckv_dcp_mqa(
+        self,
+        mqa_q_arg: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_cache: torch.Tensor,
+        attn_metadata,
+        num_actual: int,
+    ) -> torch.Tensor:
+        """Attend a mixed DCP batch in two parts.
+
+        Decode rows (ordered first) exchange their queries and merge LSE
+        across the DCP group; prefill rows attend with their local heads over
+        the gathered cache of their own requests, which moves far fewer bytes
+        than exchanging every head's queries and outputs.
+        """
+        assert self.dcp_manager is not None
+        assert self.dcp_manager.query_gather is not None
+        num_decode = int(attn_metadata.num_decode_tokens)
+        if isinstance(mqa_q_arg, tuple):
+            mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
+            prefill_q = mqa_q_arg[num_decode:num_actual]
+        else:
+            # The packed query may alias the kernel workspace both calls use.
+            prefill_q = mqa_q_arg[num_decode:num_actual].clone()
+        decode_q = self.dcp_manager.query_gather(mqa_q_arg[:num_decode])
+        decode_out, decode_lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
+            decode_q, kv_cache, attn_metadata, self, route="extend"
+        )
+        assert decode_lse is not None
+        decode_out = self.dcp_manager.combine(
+            decode_out, decode_lse, seq_lens=None, query_start_loc=None
+        )
+        attn_out = torch.empty(
+            (num_actual, *decode_out.shape[1:]),
+            dtype=decode_out.dtype,
+            device=decode_out.device,
+        )
+        attn_out[:num_decode].copy_(decode_out)
+        prefill_out, _ = self.impl.forward_mqa(  # type: ignore[attr-defined]
+            prefill_q,
+            kv_cache,
+            attn_metadata,
+            self,
+            row_start=num_decode,
+            route="ckv_extend",
+        )
+        attn_out[num_decode:].copy_(prefill_out)
+        return attn_out
+
     @eager_break_during_capture
     def _sparse_indexer_and_attn(
         self,
@@ -624,61 +672,73 @@ class DeepseekV32Attention(MLAAttention):
             and self.impl.dcp_world_size > 1
             and self.impl.uses_full_ckv_dcp(attn_metadata, num_actual)
         )
-        if self.use_pcp and self.impl.dcp_world_size > self.impl.pcp_world_size:
-            if isinstance(mqa_q_arg, tuple):
-                mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
-            mqa_q_arg = get_tp_group().all_gather(mqa_q_arg, dim=1)
-        elif not self.use_pcp and self.impl.dcp_world_size > 1 and not full_ckv_dcp:
-            assert self.dcp_manager is not None
-            if isinstance(mqa_q_arg, tuple):
-                mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
-            assert self.dcp_manager.query_gather is not None
-            mqa_q_arg = self.dcp_manager.query_gather(mqa_q_arg)
-        attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
-            mqa_q_arg, kv_cache, attn_metadata, self
+        split_ckv_dcp = (
+            not self.use_pcp
+            and not full_ckv_dcp
+            and self.impl.dcp_world_size > 1
+            and hasattr(self.impl, "uses_split_ckv_dcp")
+            and self.impl.uses_split_ckv_dcp(attn_metadata, num_actual)
         )
+        if split_ckv_dcp:
+            attn_out = self._split_ckv_dcp_mqa(
+                mqa_q_arg, kv_cache, attn_metadata, num_actual
+            )
+        else:
+            if self.use_pcp and self.impl.dcp_world_size > self.impl.pcp_world_size:
+                if isinstance(mqa_q_arg, tuple):
+                    mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
+                mqa_q_arg = get_tp_group().all_gather(mqa_q_arg, dim=1)
+            elif not self.use_pcp and self.impl.dcp_world_size > 1 and not full_ckv_dcp:
+                assert self.dcp_manager is not None
+                if isinstance(mqa_q_arg, tuple):
+                    mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
+                assert self.dcp_manager.query_gather is not None
+                mqa_q_arg = self.dcp_manager.query_gather(mqa_q_arg)
+            attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
+                mqa_q_arg, kv_cache, attn_metadata, self
+            )
 
-        if self.impl.dcp_world_size > 1 and not full_ckv_dcp:
-            assert lse is not None and self.dcp_manager is not None
-            seq_lens: torch.Tensor | None
-            query_start_loc: torch.Tensor | None
-            if self.use_pcp:
-                decode_metadata = getattr(attn_metadata, "decode", None)
-                if decode_metadata is not None:
-                    seq_lens = decode_metadata.seq_lens
+            if self.impl.dcp_world_size > 1 and not full_ckv_dcp:
+                assert lse is not None and self.dcp_manager is not None
+                seq_lens: torch.Tensor | None
+                query_start_loc: torch.Tensor | None
+                if self.use_pcp:
+                    decode_metadata = getattr(attn_metadata, "decode", None)
+                    if decode_metadata is not None:
+                        seq_lens = decode_metadata.seq_lens
+                    else:
+                        all_seq_lens = cast(
+                            torch.Tensor,
+                            attn_metadata.seq_lens,  # type: ignore[attr-defined]
+                        )
+                        seq_lens = all_seq_lens[: attn_metadata.num_decodes]
+                    query_start_loc = attn_metadata.query_start_loc[
+                        : attn_metadata.num_decodes + 1
+                    ]
                 else:
-                    all_seq_lens = cast(
-                        torch.Tensor,
-                        attn_metadata.seq_lens,  # type: ignore[attr-defined]
+                    # The backend emits (0, -inf) for empty local shards, so no
+                    # PCP-only empty-shard metadata is needed.
+                    seq_lens = None
+                    query_start_loc = None
+                # Under PCP+DCP the prefill rows attended over the gathered KV, so
+                # only the decode rows carry an LSE and take part in the merge.
+                num_merge_rows = lse.shape[0]
+                if num_merge_rows == attn_out.shape[0]:
+                    attn_out = self.dcp_manager.combine(
+                        attn_out,
+                        lse,
+                        seq_lens=seq_lens,  # type: ignore[arg-type]
+                        query_start_loc=query_start_loc,  # type: ignore[arg-type]
                     )
-                    seq_lens = all_seq_lens[: attn_metadata.num_decodes]
-                query_start_loc = attn_metadata.query_start_loc[
-                    : attn_metadata.num_decodes + 1
-                ]
-            else:
-                # The backend emits (0, -inf) for empty local shards, so no
-                # PCP-only empty-shard metadata is needed.
-                seq_lens = None
-                query_start_loc = None
-            # Under PCP+DCP the prefill rows attended over the gathered KV, so
-            # only the decode rows carry an LSE and take part in the merge.
-            num_merge_rows = lse.shape[0]
-            if num_merge_rows == attn_out.shape[0]:
-                attn_out = self.dcp_manager.combine(
-                    attn_out,
-                    lse,
-                    seq_lens=seq_lens,  # type: ignore[arg-type]
-                    query_start_loc=query_start_loc,  # type: ignore[arg-type]
-                )
-            elif num_merge_rows > 0:
-                attn_out[:num_merge_rows] = self.dcp_manager.combine(
-                    attn_out[:num_merge_rows],
-                    lse,
-                    seq_lens=seq_lens,  # type: ignore[arg-type]
-                    query_start_loc=query_start_loc,  # type: ignore[arg-type]
-                )
-            if self.use_pcp:
-                attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
+                elif num_merge_rows > 0:
+                    attn_out[:num_merge_rows] = self.dcp_manager.combine(
+                        attn_out[:num_merge_rows],
+                        lse,
+                        seq_lens=seq_lens,  # type: ignore[arg-type]
+                        query_start_loc=query_start_loc,  # type: ignore[arg-type]
+                    )
+                if self.use_pcp:
+                    attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
 
         # NOTE(woosuk): While the below does not need to be in the eager region,
         # we put it here to avoid copying the attention output. Move this back to the
