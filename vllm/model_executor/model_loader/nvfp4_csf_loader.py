@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Load retained tensors while the quantization method owns compressed experts."""
 
+import json
 import time
 from collections.abc import Iterable
 from functools import lru_cache
@@ -20,6 +21,7 @@ from vllm.model_executor.model_loader.csf_utils import (
 )
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.weight_utils import (
+    download_weights_from_hf,
     file_source_tensor,
     safetensors_file_sources,
 )
@@ -46,10 +48,80 @@ _COMPRESSED_EXPERT = re.compile(
 )
 
 
+_CSF_STREAMS = (".nvfp4_csf_fixed", ".nvfp4_csf_exceptions")
+
+
+def is_csf_modelopt_config(quant_config: dict | None) -> bool:
+    """A ModelOpt mixed-precision config whose layers store CSF expert scales."""
+    if not isinstance(quant_config, dict):
+        return False
+    layers = quant_config.get("quantized_layers")
+    if layers is None:
+        layers = (quant_config.get("quantization") or {}).get("quantized_layers")
+    return isinstance(layers, dict) and any(
+        isinstance(recipe, dict) and recipe.get("weight_scale_encoding") == "csf"
+        for recipe in layers.values()
+    )
+
+
+def _standard_family(compressed: set[str]) -> str:
+    """The family whose routed-expert scale inventory the checkpoint compresses."""
+    for family, (experts, _, _, layers, layer_list) in FAMILIES.items():
+        expected = {
+            f"{layer_list}.{layer}.mlp.experts.{expert}.{projection}.weight_scale"
+            for layer in layers
+            for expert in range(experts)
+            for projection in ("up_proj", "gate_proj", "down_proj")
+        }
+        if compressed == expected:
+            return family
+    raise ValueError(
+        "NVFP4-CSF checkpoint compresses an expert scale inventory of no "
+        "supported model family"
+    )
+
+
+def _standard_contract(root: Path) -> dict:
+    """The tensor inventory of a Hugging Face-layout NVFP4-CSF checkpoint.
+
+    The index maps each stored tensor to a shard, the routed-expert scales
+    as their ``.nvfp4_csf_fixed`` and ``.nvfp4_csf_exceptions`` streams.
+    """
+    index = json.loads((root / "model.safetensors.index.json").read_text())
+    names: dict[str, str] = {}
+    compressed: set[str] = set()
+    for name, filename in index["weight_map"].items():
+        path = Path(filename)
+        if path.is_absolute() or ".." in path.parts or path.suffix != ".safetensors":
+            raise ValueError(
+                "CSF shard names must be checkpoint-local safetensors files"
+            )
+        logical = name
+        for stream in _CSF_STREAMS:
+            if name.endswith(stream):
+                logical = name.removesuffix(stream)
+                compressed.add(logical)
+        if names.setdefault(logical, filename) != filename:
+            raise ValueError(f"CSF streams of {logical} span several shards")
+    return {
+        "family": _standard_family(compressed),
+        "source_names": names,
+        "tensor_dir": ".",
+    }
+
+
 @lru_cache(maxsize=4)
 def checkpoint_contract(root: str) -> dict:
-    """Validate the NVFP4-CSF container before loading model tensors."""
-    return read_csf_contract(root, schema=SCHEMA, codec=CODEC, families=FAMILIES)
+    """Validate the NVFP4-CSF checkpoint before loading model tensors.
+
+    Two layouts: the ``lil-nvfp4-csf-checkpoint/1`` container (manifest,
+    build contract and ``tensors/``), and a Hugging Face layout whose index
+    names the compressed scale streams next to every other tensor.
+    """
+    if not (Path(root) / "manifest.json").is_file():
+        return _standard_contract(Path(root))
+    contract = read_csf_contract(root, schema=SCHEMA, codec=CODEC, families=FAMILIES)
+    return {**contract, "tensor_dir": "tensors"}
 
 
 def nvfp4_scaled_modules(root) -> list[str]:
@@ -88,7 +160,9 @@ def read_nvfp4_csf_layer(
         raise ValueError("NVFP4-CSF expert geometry differs from the checkpoint family")
     if layer_index not in layers:
         raise ValueError("NVFP4-CSF layer is outside the compressed expert inventory")
-    with CsfTensorReader(root, contract["source_names"], "nvfp4") as reader:
+    with CsfTensorReader(
+        root, contract["source_names"], "nvfp4", contract["tensor_dir"]
+    ) as reader:
 
         def experts():
             for expert in range(num_experts):
@@ -322,12 +396,32 @@ class Nvfp4CsfModelLoader(DefaultModelLoader):
     def _root(self, model_config):
         quant = getattr(model_config.hf_config, "quantization_config", None)
         quant = quant or model_config.hf_text_config.quantization_config
-        if quant.get("quant_method") != "nvfp4_csf":
-            raise ValueError("NVFP4-CSF loader requires quant_method=nvfp4_csf")
-        root = Path(quant["checkpoint_root"])
-        if not root.is_absolute():
-            raise ValueError("NVFP4-CSF checkpoint_root must be an absolute local path")
-        return root, checkpoint_contract(str(root.resolve()))
+        if is_csf_modelopt_config(quant):
+            # Hugging Face layout: the model directory is the checkpoint.
+            root = Path(model_config.model)
+            if not root.is_dir():
+                root = Path(
+                    download_weights_from_hf(
+                        model_config.model,
+                        self.load_config.download_dir,
+                        ["*.json", "*.safetensors"],
+                        revision=model_config.revision,
+                        ignore_patterns=self.load_config.ignore_patterns,
+                    )
+                )
+        elif quant.get("quant_method") == "nvfp4_csf":
+            root = Path(quant["checkpoint_root"])
+            if not root.is_absolute():
+                raise ValueError(
+                    "NVFP4-CSF checkpoint_root must be an absolute local path"
+                )
+        else:
+            raise ValueError(
+                "NVFP4-CSF loader requires quant_method=nvfp4_csf or ModelOpt "
+                "layers with weight_scale_encoding=csf"
+            )
+        root = root.resolve()
+        return root, checkpoint_contract(str(root))
 
     def download_model(self, model_config):
         self._root(model_config)
@@ -338,15 +432,20 @@ class Nvfp4CsfModelLoader(DefaultModelLoader):
             raise NotImplementedError(
                 "NVFP4-CSF does not support secondary weight sources"
             )
+        # The routed experts read their compressed scales from the checkpoint
+        # after the retained tensors have loaded.
+        for module in model.modules() if isinstance(model, torch.nn.Module) else ():
+            owner = getattr(getattr(module, "quant_method", None), "owner", None)
+            if hasattr(owner, "checkpoint_root"):
+                owner.checkpoint_root = str(root)
+        tensors = root / contract["tensor_dir"]
         prefixes = getattr(model, "checkpoint_weight_name_prefixes", None)
         file_filter = getattr(model, "checkpoint_file_weight_filter", None)
         layers = model_config.hf_text_config.num_hidden_layers
         self.counter_before_loading_weights = time.perf_counter()
         for filename in sorted(set(contract["source_names"].values())):
-            descriptors = safetensors_file_sources(str(root / "tensors" / filename))
-            with safe_open(
-                root / "tensors" / filename, framework="pt", device="cpu"
-            ) as handle:
+            descriptors = safetensors_file_sources(str(tensors / filename))
+            with safe_open(tensors / filename, framework="pt", device="cpu") as handle:
                 for name in sorted(handle.keys()):
                     if prefixes is not None and not name.startswith(prefixes):
                         continue

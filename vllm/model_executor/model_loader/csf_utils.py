@@ -82,9 +82,9 @@ def read_csf_contract(root, *, schema, codec, families):
 class CsfTensorReader(ExitStack):
     """Keep a layer's lazily opened shards alive while slicing its tensors."""
 
-    def __init__(self, root, source_names, codec):
+    def __init__(self, root, source_names, codec, tensor_dir="tensors"):
         super().__init__()
-        self.root = Path(root)
+        self.root = Path(root) / tensor_dir
         self.source_names = source_names
         self.codec = codec
         self.handles = {}
@@ -93,9 +93,7 @@ class CsfTensorReader(ExitStack):
         filename = self.source_names[name]
         if filename not in self.handles:
             self.handles[filename] = self.enter_context(
-                safe_open(
-                    self.root / "tensors" / filename, framework="pt", device="cpu"
-                )
+                safe_open(self.root / filename, framework="pt", device="cpu")
             )
         return self.handles[filename]
 

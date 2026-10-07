@@ -92,7 +92,7 @@ def _nvfp4_layer_recipes(source: dict, root: str) -> dict:
 class Nvfp4CsfConfig(ModelOptMixedPrecisionConfig):
     """Compressed main experts; retained ModelOpt formats for all other tensors."""
 
-    checkpoint_root: str
+    checkpoint_root: str | None
     scale_scratch: tuple[torch.Tensor, ...] | None
     scale_layers: dict[int, "Nvfp4CsfMoEMethod"]
     scale_stream: torch.cuda.Stream | None
@@ -108,22 +108,40 @@ class Nvfp4CsfConfig(ModelOptMixedPrecisionConfig):
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant, hf_config=None):
-        if (hf_quant_cfg or {}).get("quant_method") == cls.get_name():
+        from vllm.model_executor.model_loader.nvfp4_csf_loader import (
+            is_csf_modelopt_config,
+        )
+
+        if (hf_quant_cfg or {}).get(
+            "quant_method"
+        ) == cls.get_name() or is_csf_modelopt_config(hf_quant_cfg):
             return cls.get_name()
         return None
 
     @classmethod
     def from_config(cls, config):
-        if config.get("format_version") != 1 or not config.get("checkpoint_root"):
-            raise ValueError("NVFP4-CSF requires format_version=1 and checkpoint_root")
-        original = config.get("source_quantization_config")
-        if not isinstance(original, dict):
-            raise ValueError("NVFP4-CSF requires source_quantization_config")
-        if cls._extract_modelopt_quant_algo(original) == "NVFP4":
-            original = _nvfp4_layer_recipes(original, config["checkpoint_root"])
+        from vllm.model_executor.model_loader.nvfp4_csf_loader import (
+            is_csf_modelopt_config,
+        )
+
+        if is_csf_modelopt_config(config):
+            # Hugging Face layout: ModelOpt recipes mark the CSF experts; the
+            # loader sets the checkpoint root once it has the model directory.
+            original, root = config, None
+        else:
+            if config.get("format_version") != 1 or not config.get("checkpoint_root"):
+                raise ValueError(
+                    "NVFP4-CSF requires format_version=1 and checkpoint_root"
+                )
+            original = config.get("source_quantization_config")
+            if not isinstance(original, dict):
+                raise ValueError("NVFP4-CSF requires source_quantization_config")
+            root = config["checkpoint_root"]
+            if cls._extract_modelopt_quant_algo(original) == "NVFP4":
+                original = _nvfp4_layer_recipes(original, root)
         result = super().from_config(original)
         assert isinstance(result, cls)
-        result.checkpoint_root = config["checkpoint_root"]
+        result.checkpoint_root = root
         result.scale_scratch = None
         # Layers sharing scale_scratch by index, the side stream that expands
         # the next layer's scales ahead of its MoE, and the pending expansion.
@@ -159,7 +177,7 @@ class Nvfp4CsfConfig(ModelOptMixedPrecisionConfig):
                     raise NotImplementedError(
                         "NVFP4-CSF shared scratch requires PP1 without ubatching"
                     )
-                if config.load_config.load_format != "nvfp4_csf":
+                if config.load_config.load_format not in ("nvfp4_csf", "auto"):
                     raise ValueError("NVFP4-CSF requires --load-format nvfp4_csf")
                 algo = self._resolve_quant_algo(prefix)
                 if algo not in ("NVFP4", "W4A16_NVFP4"):
