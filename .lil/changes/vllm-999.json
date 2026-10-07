@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-999",
+  "category": "fix",
+  "summary": "GLM-5.3 starts with decode context parallelism under online quantization",
+  "models": ["GLM-5.3"],
+  "compatibility": "No user action required. Launches at DCP1 or without --quantization-config are unchanged.",
+  "details": [
+    "Online quantization builds the attention weights on the meta device, and the MLA DCP exchange took its device from them, so DCP > 1 with --quantization-config failed at load with 'SymmetricMemory does not support device type meta'. The exchange buffers now go to the rank's GPU.",
+    "GLM-5.3-NVFP4-CSF at TP8 with online MXFP8 attention and shared experts starts at DCP2 (1,217,792 KV tokens, full 1M context) and DCP8 (4,858,368 KV tokens) over the B12X PCIe DCP exchange."
+  ],
+  "authors": ["voipmonitor"],
+  "pull_requests": [999],
+  "requires": []
+}
