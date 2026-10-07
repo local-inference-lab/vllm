@@ -1618,8 +1618,15 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
     def override_quantization_method(
         cls, hf_quant_cfg, user_quant, hf_config=None
     ) -> QuantizationMethods | None:
+        from vllm.model_executor.model_loader.nvfp4_csf_loader import (
+            is_csf_modelopt_config,
+        )
+
         algo = cls._extract_modelopt_quant_algo(hf_quant_cfg)
         if algo is not None and algo == "MIXED_PRECISION":
+            # CSF-encoded expert scales belong to the nvfp4_csf reader.
+            if is_csf_modelopt_config(hf_quant_cfg):
+                return None
             return "modelopt_mixed"
         return None
 
@@ -1795,6 +1802,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             candidates.append(
                 "language_model.model." + prefix[len("model.language_model.") :]
             )
+        elif prefix.startswith("visual."):
+            # Multimodal checkpoints name the vision tower model.visual.
+            candidates.append("model." + prefix)
 
         return tuple(dict.fromkeys(candidates))
 

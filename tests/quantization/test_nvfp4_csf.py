@@ -483,3 +483,116 @@ def test_scale_prefetch_expands_the_next_layer_for_this_forward_only(monkeypatch
     calls.clear()
     forward(step([0, 4, 8], gdn_prefills=0))
     assert calls == [(3, False), (4, False)] and expanded == []
+
+
+def _write_hf_layout_checkpoint(root, retained):
+    """A Hugging Face-layout GLM-5.3-Flash checkpoint: the index names every
+    routed-expert scale stream; one shard holds the tensors under test."""
+    layers = "model.language_model.layers"
+    shard = "tensors/model-00001-of-00001.safetensors"
+    (root / "tensors").mkdir()
+    save_file(retained, root / shard)
+    weight_map = dict.fromkeys(retained, shard)
+    for layer in range(3, 45):
+        for expert in range(288):
+            for projection in ("up_proj", "gate_proj", "down_proj"):
+                scale = f"{layers}.{layer}.mlp.experts.{expert}.{projection}"
+                for stream in ("fixed", "exceptions"):
+                    weight_map[f"{scale}.weight_scale.nvfp4_csf_{stream}"] = shard
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map})
+    )
+
+
+_CSF_RECIPES = {
+    "quant_method": "modelopt",
+    "quant_algo": "MIXED_PRECISION",
+    "quantized_layers": {
+        "model.language_model.layers.3.mlp.experts": {
+            "quant_algo": "NVFP4",
+            "group_size": 16,
+            "weight_scale_encoding": "csf",
+        },
+        "model.language_model.layers.3.self_attn.o_proj": {
+            "quant_algo": "MXFP8",
+            "group_size": 32,
+        },
+        "model.visual.blocks.0.attn.qkv": {"quant_algo": "MXFP8", "group_size": 32},
+        "model.visual.blocks.0.mlp.gate_proj": {
+            "quant_algo": "W4A16_NVFP4",
+            "group_size": 16,
+        },
+        "model.visual.blocks.0.mlp.up_proj": {
+            "quant_algo": "W4A16_NVFP4",
+            "group_size": 16,
+        },
+    },
+}
+
+
+def test_csf_recipes_in_a_modelopt_config_select_the_csf_reader():
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMixedPrecisionConfig,
+    )
+
+    plain = {
+        **_CSF_RECIPES,
+        "quantized_layers": {
+            name: {k: v for k, v in recipe.items() if k != "weight_scale_encoding"}
+            for name, recipe in _CSF_RECIPES["quantized_layers"].items()
+        },
+    }
+    assert Nvfp4CsfConfig.override_quantization_method(_CSF_RECIPES, None) == (
+        "nvfp4_csf"
+    )
+    assert (
+        ModelOptMixedPrecisionConfig.override_quantization_method(_CSF_RECIPES, None)
+        is None
+    )
+    assert Nvfp4CsfConfig.override_quantization_method(plain, None) is None
+    assert ModelOptMixedPrecisionConfig.override_quantization_method(plain, None) == (
+        "modelopt_mixed"
+    )
+
+
+def test_csf_modelopt_config_keeps_recipes_including_the_vision_tower():
+    owner = Nvfp4CsfConfig.from_config(_CSF_RECIPES)
+    assert owner.checkpoint_root is None
+    assert owner._resolve_quant_algo("language_model.model.layers.3.mlp.experts") == (
+        "NVFP4"
+    )
+    assert owner._resolve_quant_algo("visual.blocks.0.attn.qkv") == "MXFP8"
+    owner.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    assert owner._resolve_quant_algo("visual.blocks.0.mlp.gate_up_proj") == (
+        "W4A16_NVFP4"
+    )
+
+
+def test_hf_layout_loader_reads_retained_tensors_and_roots_the_experts(tmp_path):
+    from vllm.model_executor.model_loader import get_model_loader
+
+    layers = "model.language_model.layers"
+    retained = {
+        f"{layers}.3.mlp.experts.0.gate_proj.weight": torch.ones(8, dtype=torch.uint8),
+        f"{layers}.45.mlp.experts.0.gate_proj.weight": torch.full(
+            (8,), 42, dtype=torch.uint8
+        ),
+        "model.language_model.norm.weight": torch.ones(8, dtype=torch.bfloat16),
+    }
+    _write_hf_layout_checkpoint(tmp_path, retained)
+    config = SimpleNamespace(
+        model=str(tmp_path),
+        revision=None,
+        hf_config=SimpleNamespace(quantization_config=_CSF_RECIPES),
+        hf_text_config=SimpleNamespace(num_hidden_layers=45),
+    )
+    owner = SimpleNamespace(checkpoint_root=None)
+    model = torch.nn.Module()
+    model.experts = torch.nn.Module()
+    model.experts.quant_method = SimpleNamespace(owner=owner)
+
+    loader = get_model_loader(LoadConfig(load_format="nvfp4_csf"))
+    actual = dict(loader.get_all_weights(config, model))
+
+    assert set(actual) == {name for name in retained if ".layers.3." not in name}
+    assert owner.checkpoint_root == str(tmp_path.resolve())

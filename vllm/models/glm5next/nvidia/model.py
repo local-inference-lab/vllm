@@ -1543,9 +1543,10 @@ class Glm5NextForConditionalGeneration(
                 # the latter onto text_config (1e-5), silently ignoring the
                 # vision tower's own (1e-6) rms_norm_eps.
                 norm_eps=config.vision_config.rms_norm_eps,
-                # The vision tower ships BF16 weights; it is quantized only
-                # on request (VLLM_GLM53_VISION_MXFP8).
-                quant_config=_vision_quant_config(),
+                # Checkpoint recipes for the vision tower apply as stored;
+                # BF16 towers are quantized only on request
+                # (VLLM_GLM53_VISION_MXFP8).
+                quant_config=_vision_quant_config(vllm_config.quant_config),
                 prefix=maybe_prefix(prefix, "visual"),
             )
 
@@ -1704,8 +1705,13 @@ def host_embedding_if_requested(embed: VocabParallelEmbedding) -> None:
     weight._vllm_is_uva_offloaded = True
 
 
-def _vision_quant_config() -> QuantizationConfig | None:
-    """Online MXFP8 for the vision tower's linear layers, when requested."""
+def _vision_quant_config(
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    """The checkpoint's vision recipes, else online MXFP8 when requested."""
+    layers = getattr(quant_config, "quantized_layers", None) or {}
+    if any(name.startswith("model.visual.") for name in layers):
+        return quant_config
     if not envs.VLLM_GLM53_VISION_MXFP8:
         return None
     from vllm.config.quantization import QuantizationConfigArgs

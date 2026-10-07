@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import dataclasses
 from typing import Literal
 
 from torch import nn
@@ -140,9 +141,13 @@ def get_model(
     prefix: str = "",
     load_config: LoadConfig | None = None,
 ) -> nn.Module:
-    loader = get_model_loader(load_config or vllm_config.load_config)
     if model_config is None:
         model_config = vllm_config.model_config
+    load_config = load_config or vllm_config.load_config
+    if load_config.load_format == "auto" and model_config.quantization == "nvfp4_csf":
+        # NVFP4-CSF checkpoints in the Hugging Face layout need no load format.
+        load_config = dataclasses.replace(load_config, load_format="nvfp4_csf")
+    loader = get_model_loader(load_config)
     return loader.load_model(
         vllm_config=vllm_config, model_config=model_config, prefix=prefix
     )
