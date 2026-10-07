@@ -1709,8 +1709,10 @@ def _vision_quant_config(
     quant_config: QuantizationConfig | None,
 ) -> QuantizationConfig | None:
     """The checkpoint's vision recipes, else online MXFP8 when requested."""
+    # Recipe names are checkpoint names, or vLLM names once the model's
+    # weight mapper has been applied.
     layers = getattr(quant_config, "quantized_layers", None) or {}
-    if any(name.startswith("model.visual.") for name in layers):
+    if any(name.startswith(("model.visual.", "visual.")) for name in layers):
         return quant_config
     if not envs.VLLM_GLM53_VISION_MXFP8:
         return None

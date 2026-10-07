@@ -3186,3 +3186,16 @@ def test_glm5next_registers_mhc_preparation_after_broadcast_publication(
     causal_lm.process_weights_after_loading()
 
     assert calls == ["broadcast", "providers"]
+
+
+@pytest.mark.parametrize(
+    "name", ["model.visual.blocks.0.attn.qkv", "visual.blocks.0.attn.qkv"]
+)
+def test_glm5next_vision_uses_the_checkpoint_recipes(monkeypatch, name) -> None:
+    """Stored vision recipes win; their names may already be vLLM-mapped."""
+    monkeypatch.setattr(glm5next_model.envs, "VLLM_GLM53_VISION_MXFP8", True)
+    stored = SimpleNamespace(quantized_layers={name: {"quant_algo": "MXFP8"}})
+    assert glm5next_model._vision_quant_config(stored) is stored
+    text_only = SimpleNamespace(quantized_layers={"lm_head": {"quant_algo": "MXFP8"}})
+    monkeypatch.setattr(glm5next_model.envs, "VLLM_GLM53_VISION_MXFP8", False)
+    assert glm5next_model._vision_quant_config(text_only) is None
