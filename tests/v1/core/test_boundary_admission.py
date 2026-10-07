@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU ownership and scheduler-progress checks for the installed admission guard."""
+"""Cache ownership and scheduler-progress checks for recurrent cache restores."""
 
 import inspect
 from dataclasses import replace
@@ -459,14 +459,6 @@ def seed(cache, salt):
     return checkpoint
 
 
-def pending_kwargs(cache, requests=()):
-    """Keep baseline execution compatible with the queued-request API."""
-    parameters = inspect.signature(cache.allocate_slots).parameters
-    if "pending_boundary_requests" in parameters:
-        return {"pending_boundary_requests": tuple(requests)}
-    return {}
-
-
 def queue_matching(scheduler, producer):
     """Queue a future consumer of the checkpoint used by pressure fixtures."""
     queued = make_request(
@@ -479,7 +471,7 @@ def queue_matching(scheduler, producer):
     return queued
 
 
-def restore(cache, req, can_defer=False, pending=()):
+def restore(cache, req):
     cache.new_step_starts()
     blocks, hit, _ = cache.get_computed_blocks(req)
     result = cache.allocate_slots(
@@ -488,8 +480,6 @@ def restore(cache, req, can_defer=False, pending=()):
         num_new_computed_tokens=hit,
         new_computed_blocks=blocks,
         num_lookahead_tokens=3,
-        can_defer_boundary_restore=can_defer,
-        **pending_kwargs(cache, pending),
     )
     if result is not None:
         req.num_computed_tokens = hit
@@ -509,8 +499,8 @@ def victim_at_head(cache, checkpoint):
     return block
 
 
-@pytest.mark.parametrize("case", ["defer", "no_runnable", "idle", "cold"])
-def test_guard_only_defers_exact_restore_with_runnable_reader(case):
+@pytest.mark.parametrize("case", ["active", "idle", "cold"])
+def test_cached_reader_admits_even_when_allocation_evicts_an_unused_checkpoint(case):
     cache = manager()
     seed(cache, "a")
     other = seed(cache, "b")
@@ -520,29 +510,8 @@ def test_guard_only_defers_exact_restore_with_runnable_reader(case):
         drain(cache)
     victim_at_head(cache, other)
     waiting = request("waiting", "c" if case == "cold" else "a")
-    before = [b.ref_cnt for b in cache.block_pool.blocks]
-    free_before = [
-        b.block_id for b in cache.block_pool.free_block_queue.get_all_free_blocks()
-    ]
-    result = restore(
-        cache,
-        waiting,
-        can_defer=case != "no_runnable",
-        pending=[request("queued-b", "b")],
-    )
-    if case == "defer":
-        assert result is None
-        assert before == [b.ref_cnt for b in cache.block_pool.blocks]
-        assert free_before == [
-            b.block_id for b in cache.block_pool.free_block_queue.get_all_free_blocks()
-        ]
-        assert waiting.request_id not in cache._boundary_readers
-        assert waiting.request_id not in cache._boundary_allocations
-        cache.free(active)
-        assert restore(cache, waiting, can_defer=True) is not None
-    else:
-        assert result is not None
-        assert other.checkpoint_id not in cache.boundary_checkpoints._entries
+    assert restore(cache, waiting) is not None
+    assert other.checkpoint_id not in cache.boundary_checkpoints._entries
     drain(cache)
     cache.free(waiting)
     if active.request_id in cache._boundary_allocations:
@@ -575,7 +544,7 @@ def test_pending_copy_pins_survive_reader_release_and_id_reuse(action):
         cache.boundary_checkpoints.discard(new.checkpoint_id)
     assert cache.block_pool.get_num_free_blocks() == 127
     reused = request("reused-id")
-    assert restore(cache, reused, can_defer=True) is not None
+    assert restore(cache, reused) is not None
     assert len(cache._boundary_allocations[reused.request_id]) == 15
     drain(cache)
     cache.free(reused)
@@ -1033,66 +1002,20 @@ def test_reset_with_running_requests_releases_ready_unadmitted_import():
     assert output.num_scheduled_tokens["import"] == 32
 
 
-@pytest.mark.parametrize("release", ["move_victim", "finish_reader"])
 @pytest.mark.parametrize("fairness", [None, 0.4])
-def test_actual_scheduler_runs_decode_after_guard_defers_restore(fairness, release):
-    from tests.v1.core.utils import create_requests
+def test_scheduler_admits_cached_reader_before_existing_decode_finishes(fairness):
+    from tests.v1.core import test_boundary_admission_review as review
 
-    scheduler = make_scheduler(
-        enable_prefix_caching=True,
-        use_v2_model_runner=True,
-        async_scheduling=True,
-        num_speculative_tokens=3,
-        speculative_method="ngram_gpu",
-        **compute_share_fixture_options(fairness),
-    )
-    assert (scheduler.compute_share_controller is not None) == (fairness is not None)
-    cache = scheduler.kv_cache_manager
-    cache.boundary_checkpoints = BoundaryCheckpointCache(cache.block_pool)
-    producer, first, second = create_requests(
-        num_requests=3,
-        num_tokens=32,
-        same_prompt=True,
-        req_ids=["producer", "first", "second"],
-    )
-    (unrelated,) = create_requests(num_requests=1, num_tokens=48, req_ids=["unrelated"])
-    for req in (producer, unrelated):
-        cache.get_computed_blocks(req)
-        assert cache.allocate_slots(req, req.num_prompt_tokens) is not None
-        checkpoint = cache.publish_boundary_checkpoint(
-            req, req.num_prompt_tokens, kind="prompt"
-        )
-        cache.free(req)
-    scheduler.add_request(first)
-    assert scheduler.schedule().boundary_logits_only
-    scheduler.add_request(second)
-    assert scheduler.schedule().num_scheduled_tokens == {"first": 4}
-    future = queue_matching(scheduler, unrelated)
-    victim = victim_at_head(cache, checkpoint)
-    blocked = scheduler.schedule()
-    assert not blocked.boundary_logits_only
-    assert blocked.num_scheduled_tokens == {"first": 4}
-    assert second.status == RequestStatus.WAITING
-    assert checkpoint.checkpoint_id in cache.boundary_checkpoints._entries
-    if release == "move_victim":
-        queue = cache.block_pool.free_block_queue
-        queue.remove(victim)
-        queue.append(victim)
-    else:
-        # Reader completion must unblock admission without rearranging the victim.
-        scheduler.finish_requests([first.request_id], RequestStatus.FINISHED_STOPPED)
-    admitted = scheduler.schedule()
-    assert admitted.boundary_logits_only
-    assert admitted.num_scheduled_tokens == {"second": 1}
-    assert future.status == RequestStatus.WAITING
+    scheduler, first, second = review.scheduler_state(fairness=fairness)
+    output = scheduler.schedule()
+    assert output.boundary_logits_only
+    assert output.num_scheduled_tokens == {"second": 1}
+    assert first.status == second.status == RequestStatus.RUNNING
     scheduler.finish_requests(
-        [second.request_id] + ([first.request_id] if release == "move_victim" else []),
-        RequestStatus.FINISHED_ABORTED,
+        [first.request_id, second.request_id], RequestStatus.FINISHED_ABORTED
     )
-    final = scheduler.schedule()
-    assert final.boundary_logits_only
-    assert final.num_scheduled_tokens == {future.request_id: 1}
-    assert future.status == RequestStatus.RUNNING
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens["queued-unrelated"] > 0
     assert scheduler.max_num_running_reqs == 16
 
 
@@ -1122,8 +1045,7 @@ def test_response_checkpoint_remains_reusable_after_stop_or_length_cap(status):
     assert cache.block_pool.get_num_free_blocks() == 127
 
 
-@pytest.mark.parametrize("can_defer", [False, True])
-def test_future_working_reserve_blocks_beyond_immediate_allocation(can_defer):
+def test_future_growth_does_not_block_immediate_allocation():
     cache = manager()
     seed(cache, "a")
     checkpoint = seed(cache, "b")
@@ -1148,18 +1070,9 @@ def test_future_working_reserve_blocks_beyond_immediate_allocation(can_defer):
     for block in prefix:
         queue.remove(block)
     queue.prepend_n(prefix)
-    before = [b.block_id for b in queue.get_all_free_blocks()]
-    result = restore(
-        cache, waiting, can_defer=can_defer, pending=[request("queued-b", "b")]
-    )
-    if can_defer:
-        assert result is None
-        assert before == [b.block_id for b in queue.get_all_free_blocks()]
-        assert waiting.request_id not in cache._boundary_readers
-    else:
-        assert result is not None
-        assert checkpoint.checkpoint_id in cache.boundary_checkpoints._entries
-        cache.free(waiting)
+    assert restore(cache, waiting) is not None
+    assert checkpoint.checkpoint_id in cache.boundary_checkpoints._entries
+    cache.free(waiting)
     drain(cache)
     cache.free(active)
     assert cache.block_pool.get_num_free_blocks() == 127

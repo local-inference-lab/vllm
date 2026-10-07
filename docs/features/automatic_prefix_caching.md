@@ -88,6 +88,12 @@ These bundles consume the configured KV-cache budget and are evicted when any
 required page is reclaimed. A complete repeated-prompt hit samples its saved
 hidden state without a target-model forward pass.
 
+Admission checks the blocks needed for scheduled tokens, speculative lookahead,
+and checkpoint copies. A request's output-token limit does not reserve future
+cache capacity. Checkpoints held by active readers and in-flight copies remain
+pinned; unused checkpoints, including those reusable by queued requests, may be
+evicted to admit work.
+
 Prefix caching must be enabled, the Mamba cache mode must be `align`, and the
 KV layout must be block-outermost (the default `BLHNC` layout qualifies).
 The boundary policy currently excludes multimodal requests, resumable requests,

@@ -19,9 +19,9 @@ from vllm.v1.request import RequestStatus
 pytestmark = pytest.mark.cpu_test
 
 
-@pytest.mark.parametrize("case", ["defer", "idle", "no_runnable", "cold", "external"])
+@pytest.mark.parametrize("case", ["active", "idle", "cold", "external"])
 @pytest.mark.parametrize("length", [166, 272, 480])
-def test_continuation_guard_bypasses_only_without_local_reader_progress(case, length):
+def test_continuation_admits_with_existing_reader(case, length):
     cache = base.manager()
     base.seed(cache, "a")
     other = base.seed(cache, "b")
@@ -32,33 +32,19 @@ def test_continuation_guard_bypasses_only_without_local_reader_progress(case, le
     base.victim_at_head(cache, other)
     req = base.request("continuation", "c" if case == "cold" else "a", length)
     cached, hit, _ = cache.get_computed_blocks(req)
-    before = [
-        (b.block_id, b.ref_cnt)
-        for b in cache.block_pool.free_block_queue.get_all_free_blocks()
-    ]
-    blocks = cache.allocate_slots(
-        req,
-        min(32, length - hit),
-        hit,
-        cached,
-        num_external_computed_tokens=1 if case == "external" else 0,
-        num_lookahead_tokens=3,
-        can_defer_boundary_restore=case != "no_runnable",
-        **base.pending_kwargs(cache, [base.request("queued-b", "b")]),
+    assert (
+        cache.allocate_slots(
+            req,
+            min(32, length - hit),
+            hit,
+            cached,
+            num_external_computed_tokens=1 if case == "external" else 0,
+            num_lookahead_tokens=3,
+        )
+        is not None
     )
-    if case == "defer":
-        assert hit == 140
-        assert blocks is None
-        assert before == [
-            (b.block_id, b.ref_cnt)
-            for b in cache.block_pool.free_block_queue.get_all_free_blocks()
-        ]
-        assert req.request_id not in cache._boundary_readers
-        assert req.request_id not in cache._boundary_allocations
-    else:
-        assert blocks is not None
-        base.drain(cache)
-        cache.free(req)
+    base.drain(cache)
+    cache.free(req)
     if case != "idle":
         cache.free(active)
     assert cache.block_pool.get_num_free_blocks() == 127
@@ -66,7 +52,7 @@ def test_continuation_guard_bypasses_only_without_local_reader_progress(case, le
 
 @pytest.mark.parametrize("fairness", [None, 0.4])
 @pytest.mark.parametrize("length", [58, 256])
-def test_nonisolated_continuation_deferral_serves_existing_decoder(
+def test_continuation_prefill_progresses_with_existing_decoder(
     fairness, length, monkeypatch
 ):
     from tests.v1.core.utils import create_requests
@@ -105,7 +91,7 @@ def test_nonisolated_continuation_deferral_serves_existing_decoder(
     scheduler.add_request(continuation)
     first.is_prefill_chunk = False
     if scheduler.compute_share_controller is not None:
-        # Force the prefill turn whose empty admission must fall back to decode.
+        # Exercise admission during a prefill service turn.
         monkeypatch.setattr(
             scheduler.compute_share_controller, "select", lambda **kwargs: "prefill"
         )
@@ -114,10 +100,9 @@ def test_nonisolated_continuation_deferral_serves_existing_decoder(
     assert scheduler._waiting_boundary_logits_request() is None
     output = scheduler.schedule()
     assert not output.boundary_logits_only
-    assert output.num_scheduled_tokens == {"first": 4}
-    assert continuation.status == RequestStatus.WAITING
-    assert continuation.request_id not in cache._boundary_readers
-    assert checkpoint.checkpoint_id in cache.boundary_checkpoints._entries
+    assert output.num_scheduled_tokens["continuation"] > 0
+    assert continuation.status == RequestStatus.RUNNING
+    assert continuation.request_id in cache._boundary_readers
     assert scheduler.max_num_running_reqs == 16
 
 
@@ -192,7 +177,6 @@ def test_continuation_prefill_source_and_two_batch_state_bound(
             hit if not req.num_computed_tokens else 0,
             cached if not req.num_computed_tokens else None,
             num_lookahead_tokens=3,
-            can_defer_boundary_restore=True,
         )
         assert blocks is not None
         assert all(b.ref_cnt > 0 for b in protected)
@@ -226,10 +210,7 @@ def test_continuation_prefill_source_and_two_batch_state_bound(
 
 
 @pytest.mark.parametrize("length", [166, 480])
-@pytest.mark.parametrize("can_defer", [False, True])
-def test_continuation_reserve_includes_cached_source_and_future_growth(
-    length, can_defer
-):
+def test_continuation_admission_does_not_reserve_future_growth(length):
     cache = base.manager()
     base.seed(cache, "a")
     checkpoint = base.seed(cache, "b")
@@ -253,31 +234,25 @@ def test_continuation_reserve_includes_cached_source_and_future_growth(
     for block in prefix:
         queue.remove(block)
     queue.prepend_n(prefix)
-    before = [b.block_id for b in queue.get_all_free_blocks()]
-    result = cache.allocate_slots(
-        req,
-        length - hit,
-        hit,
-        cached,
-        num_lookahead_tokens=3,
-        can_defer_boundary_restore=can_defer,
-        **base.pending_kwargs(cache, [base.request("queued-b", "b")]),
+    assert (
+        cache.allocate_slots(
+            req,
+            length - hit,
+            hit,
+            cached,
+            num_lookahead_tokens=3,
+        )
+        is not None
     )
-    if can_defer:
-        assert result is None
-        assert before == [b.block_id for b in queue.get_all_free_blocks()]
-        assert req.request_id not in cache._boundary_readers
-    else:
-        assert result is not None
-        assert checkpoint.checkpoint_id in cache.boundary_checkpoints._entries
-        base.drain(cache)
-        cache.free(req)
+    assert checkpoint.checkpoint_id in cache.boundary_checkpoints._entries
+    base.drain(cache)
+    cache.free(req)
     cache.free(active)
     assert cache.block_pool.get_num_free_blocks() == 127
 
 
 @pytest.mark.parametrize("length", [58, 512])
-def test_same_pass_continuations_use_already_scheduled_prefill_progress(length):
+def test_same_pass_continuations_admit_with_large_output_caps(length):
     from tests.v1.core.utils import create_requests
 
     scheduler = base.make_scheduler(
@@ -325,9 +300,12 @@ def test_same_pass_continuations_use_already_scheduled_prefill_progress(length):
     assert not scheduler.running
     output = scheduler.schedule()
     assert not output.boundary_logits_only
-    assert output.num_scheduled_tokens == {"first": length - 32}
-    assert second.status == RequestStatus.WAITING
+    assert output.num_scheduled_tokens["first"] == length - 32
+    assert output.num_scheduled_tokens["second"] == length - 32
+    assert second.status == RequestStatus.RUNNING
     assert first.request_id in cache._boundary_readers
-    assert second.request_id not in cache._boundary_readers
-    assert checkpoint.checkpoint_id in cache.boundary_checkpoints._entries
+    assert second.request_id in cache._boundary_readers
+    assert (checkpoint.checkpoint_id in cache.boundary_checkpoints._entries) == (
+        length == 58
+    )
     assert scheduler.max_num_running_reqs == 16

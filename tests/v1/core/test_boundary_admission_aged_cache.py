@@ -2,9 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Old checkpoints must not serialize otherwise admissible cached readers."""
 
-import inspect
-import json
-
 import pytest
 
 from tests.v1.core import test_boundary_admission as base
@@ -15,7 +12,7 @@ from vllm.v1.request import RequestStatus
 pytestmark = pytest.mark.cpu_test
 
 
-def aged_probe(defer):
+def aged_probe():
     cache = horizon.manager()
     for i in range(300):
         horizon.seed(cache, str(i), lookahead=3)
@@ -25,20 +22,12 @@ def aged_probe(defer):
         cache.new_step_starts()
         blocks, hit, _ = cache.get_computed_blocks(req)
         assert hit == 8192
-        options = {}
-        if (
-            "pending_boundary_requests"
-            in inspect.signature(cache.allocate_slots).parameters
-        ):
-            options["pending_boundary_requests"] = waiting
         allocation = cache.allocate_slots(
             req,
             1,
             hit,
             blocks,
             num_lookahead_tokens=3,
-            can_defer_boundary_restore=defer,
-            **options,
         )
         if allocation is None:
             break
@@ -54,15 +43,7 @@ def aged_probe(defer):
 
 
 def test_aged_cache_admits_two_warm_readers():
-    guarded, unguarded = aged_probe(True), aged_probe(False)
-    print(
-        "PR721_PROBE "
-        + json.dumps(
-            dict(cold_requests=300, admitted=guarded, unguarded_admitted=unguarded)
-        )
-    )
-    assert unguarded == 2
-    assert guarded == 2, "Aged-cache guard serialized two warm readers"
+    assert aged_probe() == 2
 
 
 def test_real_scheduler_admits_past_unrelated_old_checkpoint():

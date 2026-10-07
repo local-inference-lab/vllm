@@ -96,7 +96,7 @@ def test_recurrent_reserve_across_acceptance_and_block_edges(
     assert not cache._boundary_readers
 
 
-def scheduler_state():
+def scheduler_state(fairness=None):
     from tests.v1.core.utils import create_requests
 
     scheduler = base.make_scheduler(
@@ -105,6 +105,7 @@ def scheduler_state():
         async_scheduling=True,
         num_speculative_tokens=3,
         speculative_method="ngram_gpu",
+        **base.compute_share_fixture_options(fairness),
     )
     cache = scheduler.kv_cache_manager
     cache.boundary_checkpoints = base.BoundaryCheckpointCache(cache.block_pool)
@@ -131,82 +132,28 @@ def scheduler_state():
     return scheduler, first, second
 
 
-@pytest.mark.parametrize(
-    "scope",
-    [
-        "supported",
-        "dcp2",
-        "pp2",
-        "three_batches",
-        "all_mode",
-        "two_checkpoints",
-        "wide_spec",
-    ],
-)
-def test_actual_caller_scope(scope, monkeypatch):
-    scheduler, first, second = scheduler_state()
-    cache = scheduler.kv_cache_manager
-    if scope == "dcp2":
-        monkeypatch.setattr(
-            scheduler.parallel_config, "decode_context_parallel_size", 2
-        )
-    if scope == "pp2":
-        monkeypatch.setattr(scheduler, "use_pp", True)
-    if scope == "three_batches":
-        monkeypatch.setattr(
-            type(scheduler.vllm_config), "max_concurrent_batches", property(lambda _: 3)
-        )
-    if scope in ("all_mode", "two_checkpoints", "wide_spec"):
-        manager = cache.coordinator.single_type_managers[0]
-        monkeypatch.setattr(
-            manager,
-            "kv_cache_spec",
-            MambaSpec(
-                block_size=256,
-                shapes=((1,),),
-                dtypes=(torch.uint8,),
-                mamba_cache_mode="all" if scope == "all_mode" else "align",
-                num_speculative_blocks=3,
-                num_prefill_checkpoint_blocks=2 if scope == "two_checkpoints" else 0,
-            ),
-        )
-        monkeypatch.setattr(manager, "block_size", 4 if scope == "wide_spec" else 256)
-    calls = []
-
-    class Captured(Exception):
-        pass
-
-    def capture(*args, **kwargs):
-        calls.append(kwargs["can_defer_boundary_restore"])
-        raise Captured
-
-    monkeypatch.setattr(cache, "allocate_slots", capture)
-    with pytest.raises(Captured):
-        scheduler.schedule()
-    assert calls == [scope == "supported"]
-
-
-def test_deferred_head_blocks_later_cold_request():
+def test_cached_head_admits_with_later_cold_request():
     from tests.v1.core.utils import create_requests
 
     scheduler, first, second = scheduler_state()
     (cold,) = create_requests(num_requests=1, num_tokens=24, req_ids=["later-cold"])
     scheduler.add_request(cold)
     output = scheduler.schedule()
-    assert output.num_scheduled_tokens == {"first": 4}
-    assert second.status == cold.status == RequestStatus.WAITING
-    assert scheduler.max_num_running_reqs == 16
+    assert output.boundary_logits_only
+    assert output.num_scheduled_tokens == {"second": 1}
+    assert first.status == second.status == RequestStatus.RUNNING
+    assert cold.status == RequestStatus.WAITING
 
 
-def test_coarse_runnable_can_return_empty_while_output_is_pending():
+def test_pending_decode_output_does_not_block_cached_admission():
     scheduler, first, second = scheduler_state()
     first.num_output_placeholders = 4
     first.num_computed_tokens = first.num_prompt_tokens + first.max_tokens + 2
     assert scheduler._request_is_runnable_decode(
         first, scheduling_step=scheduler.current_step + 1
     )
-    assert scheduler.schedule().num_scheduled_tokens == {}
-    assert second.status == RequestStatus.WAITING
+    assert scheduler.schedule().num_scheduled_tokens == {"second": 1}
+    assert second.status == RequestStatus.RUNNING
 
 
 def test_preemption_removes_reader_bookkeeping():
@@ -220,7 +167,9 @@ def test_preemption_removes_reader_bookkeeping():
 
 
 @pytest.mark.parametrize("case", ["supported", "connector", "idle", "no_progress"])
-def test_scheduler_deferral_requires_local_progress(case, monkeypatch):
+def test_cached_admission_does_not_require_existing_reader_completion(
+    case, monkeypatch
+):
     from unittest.mock import Mock
 
     scheduler, first, second = scheduler_state()
@@ -237,12 +186,7 @@ def test_scheduler_deferral_requires_local_progress(case, monkeypatch):
         first.next_decode_eligible_step = scheduler.current_step + 100
 
     output = scheduler.schedule()
-    if case == "supported":
-        assert output.num_scheduled_tokens == {"first": 4}
-        assert second.status == RequestStatus.WAITING
-        assert second.request_id not in cache._boundary_readers
-    else:
-        assert output.boundary_logits_only
-        assert output.num_scheduled_tokens == {"second": 1}
-        assert second.request_id in cache._boundary_readers
+    assert output.boundary_logits_only
+    assert output.num_scheduled_tokens == {"second": 1}
+    assert second.request_id in cache._boundary_readers
     assert scheduler.max_num_running_reqs == 16
