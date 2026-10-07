@@ -273,6 +273,9 @@ class SchedulerOutput:
     # This batch samples saved final hidden states without a target forward.
     boundary_logits_only: bool = False
 
+    # Snapshot before request positions advance; publish only after execution.
+    num_computed_prefill_tokens: int = 0
+
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.
     preempted_req_ids: set[str] | None = None

@@ -146,8 +146,6 @@ class LoggingStatLogger(StatLoggerBase):
 
     def _track_iteration_stats(self, iteration_stats: IterationStats):
         # Save tracked stats for token counters.
-        # Use computed tokens for prompt throughput (excludes cached/transferred)
-        self.num_prompt_tokens += iteration_stats.prompt_token_stats.computed
         self.num_generation_tokens += iteration_stats.num_generation_tokens
         self.num_corrupted_reqs += iteration_stats.num_corrupted_reqs
         self.num_preemptions += iteration_stats.num_preempted_reqs
@@ -212,6 +210,7 @@ class LoggingStatLogger(StatLoggerBase):
             self._track_iteration_stats(iteration_stats)
 
         if scheduler_stats is not None:
+            self.num_prompt_tokens += scheduler_stats.num_computed_prefill_tokens
             self._log_iteration_details(scheduler_stats, engine_idx)
             self.prefix_caching_metrics.observe(scheduler_stats.prefix_cache_stats)
 
@@ -1081,6 +1080,11 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
     ):
         """Log to prometheus."""
         if scheduler_stats is not None:
+            computed = scheduler_stats.num_computed_prefill_tokens
+            self.counter_prompt_tokens[engine_idx].inc(computed)
+            self.counter_prompt_tokens_by_source["local_compute"][engine_idx].inc(
+                computed
+            )
             self.gauge_scheduler_running[engine_idx].set(
                 scheduler_stats.num_running_reqs
             )
@@ -1183,10 +1187,13 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.counter_num_preempted_reqs[engine_idx].inc(
             iteration_stats.num_preempted_reqs
         )
-        self.counter_prompt_tokens[engine_idx].inc(iteration_stats.num_prompt_tokens)
-        # Labeled prompt token counters by source
         pts = iteration_stats.prompt_token_stats
+        # Cache reuse is credited once, at first output. Compute was credited
+        # at each engine completion, including steps without request output.
+        self.counter_prompt_tokens[engine_idx].inc(pts.cached_tokens)
         for source in PromptTokenStats.ALL_SOURCES:
+            if source == "local_compute":
+                continue
             self.counter_prompt_tokens_by_source[source][engine_idx].inc(
                 pts.get_by_source(source)
             )
