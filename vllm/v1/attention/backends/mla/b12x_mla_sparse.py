@@ -244,6 +244,34 @@ def _use_b12x_full_ckv_gather(
     )
 
 
+def _use_b12x_split_ckv_gather(
+    *,
+    enabled: bool,
+    is_glm_dsa: bool,
+    dcp_world_size: int,
+    num_decode_tokens: int,
+    num_prefills: int,
+    num_prefill_tokens: int,
+    min_tokens: int,
+    max_tokens: int,
+) -> bool:
+    """Whether a mixed batch gathers the full CKV cache for its prefill rows.
+
+    Decode rows attend a few query tokens over long contexts, so they keep
+    the query exchange; the prefill rows of the same batch gather the cache
+    of their own requests instead of exchanging every head's queries.
+    """
+    return (
+        enabled
+        and is_glm_dsa
+        and dcp_world_size > 1
+        and num_decode_tokens > 0
+        and num_prefills > 0
+        and num_prefill_tokens > min_tokens
+        and num_prefill_tokens <= max_tokens
+    )
+
+
 def _ckv_rank_token_alignment(page_size: int, dcp_world_size: int) -> int:
     """Per-rank padding that makes the gathered CKV page-addressable.
 
@@ -700,6 +728,7 @@ class B12xMLASparseMetadata(SparseMLACommonMetadata):
     dcp_local_total_tokens: int = 0
     dcp_padded_total_tokens: int = 0
     dcp_ckv_gather_eligible: bool = False
+    dcp_ckv_split_eligible: bool = False
 
 
 class B12xMLASparseMetadataBuilder(
@@ -709,6 +738,7 @@ class B12xMLASparseMetadataBuilder(
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     requires_glm_next_selector_metadata: bool
     _is_glm_dsa: bool = False
+    _ckv_split_requested: bool = False
 
     def __init__(
         self,
@@ -756,6 +786,11 @@ class B12xMLASparseMetadataBuilder(
             (self.requires_glm_next_selector_metadata or self._is_glm_dsa)
             and self.dcp_world_size > 1
             and envs.VLLM_B12X_MLA_CKV_GATHER
+        )
+        self._ckv_split_requested = (
+            self._ckv_gather_requested
+            and self._is_glm_dsa
+            and envs.VLLM_B12X_MLA_CKV_GATHER_MIXED
         )
         if self._ckv_gather_requested:
             # GLM DSA selects index_topk tokens; GLM5Next appends its
@@ -977,7 +1012,7 @@ class B12xMLASparseMetadataBuilder(
             metadata.prefill_seq_lens_cpu = seq_lens_cpu_source[
                 prefill_start : prefill_start + metadata.num_prefills
             ].clone()
-        if _use_b12x_full_ckv_gather(
+        full_ckv = _use_b12x_full_ckv_gather(
             enabled=self._ckv_gather_requested,
             is_glm_next=self.requires_glm_next_selector_metadata,
             # GLM DSA gathers only in eager prefill: captured graphs and
@@ -990,15 +1025,32 @@ class B12xMLASparseMetadataBuilder(
             num_decode_tokens=metadata.num_decode_tokens,
             min_tokens=envs.VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS,
             max_tokens=envs.VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS,
-        ):
+        )
+        split_ckv = not full_ckv and _use_b12x_split_ckv_gather(
+            enabled=self._ckv_split_requested,
+            is_glm_dsa=self._is_glm_dsa and not for_cudagraph_capture,
+            dcp_world_size=self.dcp_world_size,
+            num_decode_tokens=metadata.num_decode_tokens,
+            num_prefills=metadata.num_prefills,
+            num_prefill_tokens=num_tokens - metadata.num_decode_tokens,
+            min_tokens=envs.VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS,
+            max_tokens=envs.VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS,
+        )
+        if full_ckv or split_ckv:
             assert self.ckv_selected_indices_buffer is not None
             assert self.ckv_active_counts_buffer is not None
             assert self.dcp_rank_req_lens_buffer is not None
             assert self.dcp_rank_req_starts_buffer is not None
             assert self.dcp_local_cu_seq_lens_buffer is not None
             global_seq_lens = common.seq_lens[: common.num_reqs]
+            gather_seq_lens = global_seq_lens
+            if split_ckv:
+                # The decode requests (ordered first) keep the query exchange,
+                # so none of their cache is gathered.
+                gather_seq_lens = global_seq_lens.clone()
+                gather_seq_lens[: metadata.num_decodes] = 0
             all_rank_lens = get_dcp_local_seq_lens(
-                global_seq_lens,
+                gather_seq_lens,
                 self.dcp_world_size,
                 dcp_rank=None,
                 cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
@@ -1046,7 +1098,8 @@ class B12xMLASparseMetadataBuilder(
                 metadata.global_cache_seq_lens_per_req = global_seq_lens
                 metadata.dcp_local_total_tokens = local_total_tokens
                 metadata.dcp_padded_total_tokens = padded_total_tokens
-                metadata.dcp_ckv_gather_eligible = True
+                metadata.dcp_ckv_gather_eligible = full_ckv
+                metadata.dcp_ckv_split_eligible = split_ckv
         (
             metadata.selector_state_slot_ids,
             metadata.selector_state_is_fresh,
@@ -1944,18 +1997,10 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             kv_c_normed, kv_cache, slot_mapping.flatten(), plan=plan
         )
 
-    def uses_full_ckv_dcp(
-        self, attn_metadata: B12xMLASparseMetadata, num_tokens: int
-    ) -> bool:
-        # Decode layers ask once per step; reject them before the CUDA query.
-        if not (self._ckv_gather_enabled and attn_metadata.dcp_ckv_gather_eligible):
-            return False
-        if torch.cuda.is_current_stream_capturing():
-            return False
+    def _ckv_gather_ready(self, attn_metadata: B12xMLASparseMetadata) -> bool:
+        """Whether the builder staged a gather that fits the reserved cache."""
         return (
             self._kernel_page_size_finalized
-            and attn_metadata.num_decode_tokens == 0
-            and num_tokens == attn_metadata.num_actual_tokens
             and 0 < attn_metadata.dcp_padded_total_tokens <= self._ckv_local_capacity
             and attn_metadata.dcp_local_total_tokens
             <= attn_metadata.dcp_padded_total_tokens
@@ -1972,13 +2017,49 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             )
         )
 
+    def uses_full_ckv_dcp(
+        self, attn_metadata: B12xMLASparseMetadata, num_tokens: int
+    ) -> bool:
+        # Decode layers ask once per step; reject them before the CUDA query.
+        if not (self._ckv_gather_enabled and attn_metadata.dcp_ckv_gather_eligible):
+            return False
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        return (
+            attn_metadata.num_decode_tokens == 0
+            and num_tokens == attn_metadata.num_actual_tokens
+            and self._ckv_gather_ready(attn_metadata)
+        )
+
+    def uses_split_ckv_dcp(
+        self, attn_metadata: B12xMLASparseMetadata, num_tokens: int
+    ) -> bool:
+        """Whether a mixed batch runs its decode rows through the query
+        exchange and its prefill rows over their gathered full CKV cache."""
+        if not (
+            self._ckv_gather_enabled
+            and getattr(attn_metadata, "dcp_ckv_split_eligible", False)
+        ):
+            return False
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        return (
+            0 < int(attn_metadata.num_decode_tokens) < num_tokens
+            and num_tokens == attn_metadata.num_actual_tokens
+            and self._ckv_gather_ready(attn_metadata)
+        )
+
     def _gather_full_ckv(
         self,
         kv_cache: torch.Tensor,
         attn_metadata: B12xMLASparseMetadata,
         gathered_buffer: torch.Tensor,
     ) -> torch.Tensor:
-        if not self.uses_full_ckv_dcp(attn_metadata, attn_metadata.num_actual_tokens):
+        num_actual = attn_metadata.num_actual_tokens
+        if not (
+            self.uses_full_ckv_dcp(attn_metadata, num_actual)
+            or self.uses_split_ckv_dcp(attn_metadata, num_actual)
+        ):
             raise RuntimeError("full CKV gather called for an ineligible batch")
         # A packed FP8 cache may arrive through an E4M3 view. The gather copies
         # whole native records, including scales and the RoPE tail.
@@ -2035,7 +2116,15 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: B12xMLASparseMetadata,
         layer: AttentionLayer,
+        *,
+        row_start: int = 0,
+        route: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Attend the batch rows ``[row_start, row_start + len(q))``.
+
+        ``route`` forces the ``extend`` or ``ckv_extend`` plan for one part of
+        a split mixed batch; the whole-batch call chooses its own route.
+        """
         del layer
         cache_page_size = int(kv_c_and_k_pe_cache.shape[1])
         metadata_page_size = int(attn_metadata.block_size)
@@ -2049,7 +2138,13 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 f"plan={self._kernel_page_size}"
             )
         num_tokens = int(q[0].shape[0] if isinstance(q, tuple) else q.shape[0])
-        plan_key = self._plan_key(attn_metadata, num_tokens)
+        row_end = row_start + num_tokens
+        if route is None:
+            plan_key = self._plan_key(attn_metadata, num_tokens)
+        else:
+            if route not in ("extend", "ckv_extend"):
+                raise ValueError(f"unsupported forced sparse MLA route {route!r}")
+            plan_key = (route, self._max_tokens)
         plan = self._plan(plan_key)
         use_ckv_gather = plan_key[0] == "ckv_extend"
         if use_ckv_gather:
@@ -2096,7 +2191,8 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             )
 
         assert self.topk_indices_buffer is not None
-        topk_indices = self.topk_indices_buffer[:num_tokens]
+        topk_indices = self.topk_indices_buffer[row_start:row_end]
+        req_id_per_token = attn_metadata.req_id_per_token[row_start:row_end]
         kv_cache_for_run = kv_c_and_k_pe_cache
         if use_ckv_gather:
             gathered_buffer = workspaces[2]
@@ -2114,7 +2210,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             ]
             active_counts = attn_metadata.ckv_active_counts[:num_tokens]
             _map_global_topk_to_gathered_ckv(
-                attn_metadata.req_id_per_token[:num_tokens],
+                req_id_per_token,
                 topk_indices,
                 attn_metadata.dcp_rank_req_starts,
                 attn_metadata.dcp_rank_req_lens,
@@ -2129,8 +2225,8 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 attn_metadata.global_cache_seq_lens_per_req,
                 attn_metadata.query_start_loc,
                 attn_metadata.req_id_per_token,
-                num_tokens,
-            ).contiguous()
+                row_end,
+            )[row_start:].contiguous()
             torch.minimum(active_counts, cache_seq_lens, out=active_counts)
             _mask_page_table_after_nsa_len(selected_indices, active_counts)
         else:
@@ -2151,7 +2247,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     block_size=attn_metadata.block_size,
                 )
                 selected_indices, active_counts = triton_filter_and_convert_dcp_index(
-                    attn_metadata.req_id_per_token[:num_tokens],
+                    req_id_per_token,
                     attn_metadata.block_table,
                     topk_indices,
                     dcp_size=self.dcp_world_size,
@@ -2176,7 +2272,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 )
                 selected_indices, active_counts = (
                     triton_convert_req_index_to_global_index(
-                        attn_metadata.req_id_per_token[:num_tokens],
+                        req_id_per_token,
                         attn_metadata.block_table,
                         topk_indices,
                         BLOCK_SIZE=attn_metadata.block_size,
