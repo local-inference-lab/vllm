@@ -49,6 +49,11 @@ def _prefill_profile_q_rows(max_q_rows: int) -> int:
     return min(max(int(max_q_rows), 1), max(1, max_logits_elems // supertile_k))
 
 
+def _prefill_plan_rows(max_tokens: int) -> list[int]:
+    """Prefill row capacities prepared for a scheduler token budget."""
+    return sorted({_prefill_profile_q_rows(max_tokens), int(max_tokens)})
+
+
 def _is_current_stream_capturing(tensor: torch.Tensor) -> bool:
     return tensor.is_cuda and torch.cuda.is_current_stream_capturing()
 
@@ -200,15 +205,17 @@ def _run_paged_topk(
     active_width: torch.Tensor | None,
     output: torch.Tensor,
     scores: torch.Tensor | None,
+    scratch: list[torch.Tensor] | None = None,
 ) -> None:
     if active_width is None:
         raise RuntimeError("B12X DSA requires a device active-width scalar.")
-    scratch = current_workspace_manager().get_simultaneous(
-        *(
-            (spec.shape, spec.dtype)
-            for spec in module.scratch_specs(plan, device=q.device)
+    if scratch is None:
+        scratch = current_workspace_manager().get_simultaneous(
+            *(
+                (spec.shape, spec.dtype)
+                for spec in module.scratch_specs(plan, device=q.device)
+            )
         )
-    )
     binding = module.bind(
         plan,
         scratch=scratch,
@@ -352,11 +359,27 @@ def _dcp_local_seq_lens(
     ]
 
 
+def _dcp_index_key_shapes(
+    seq_len: int, dcp_world_size: int, interleave: int
+) -> tuple[tuple[int, int, int], tuple[int, int]]:
+    """Shapes of the rank-major exchange and of the gathered index pages."""
+    rank_pages = max(
+        triton.cdiv(tokens, _INDEX_PAGE_SIZE)
+        for tokens in _dcp_local_seq_lens(seq_len, dcp_world_size, interleave)
+    )
+    return (
+        (dcp_world_size, rank_pages, _INDEX_PAGE_WIDTH),
+        (triton.cdiv(seq_len, _INDEX_PAGE_SIZE), _INDEX_PAGE_WIDTH),
+    )
+
+
 def _gather_dcp_index_keys(
     kv_cache: torch.Tensor,
     block_table_row: torch.Tensor,
     seq_len: int,
     *,
+    gathered: torch.Tensor,
+    keys: torch.Tensor,
     group,
     dcp_rank: int,
     dcp_world_size: int,
@@ -368,24 +391,21 @@ def _gather_dcp_index_keys(
     interleaved back into ordinary paged-cache layout, so logical selections
     over the result are global token positions.
 
+    Args:
+        gathered: Exchange buffer shaped as ``_dcp_index_key_shapes`` gives.
+        keys: Destination pages shaped as ``_dcp_index_key_shapes`` gives.
+
     Returns:
-        Index pages of shape ``[ceil(seq_len / 64), 64, 132]``.
+        ``keys`` viewed as index pages ``[ceil(seq_len / 64), 64, 132]``.
     """
     from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
         _dcp_all_gather_current_stream,
     )
 
-    local_pages = [
-        triton.cdiv(tokens, _INDEX_PAGE_SIZE)
-        for tokens in _dcp_local_seq_lens(seq_len, dcp_world_size, interleave)
-    ]
-    rank_pages = max(local_pages)
-    gathered = torch.empty(
-        (dcp_world_size, rank_pages, _INDEX_PAGE_WIDTH),
-        dtype=torch.uint8,
-        device=kv_cache.device,
+    pages = triton.cdiv(
+        _dcp_local_seq_lens(seq_len, dcp_world_size, interleave)[dcp_rank],
+        _INDEX_PAGE_SIZE,
     )
-    pages = local_pages[dcp_rank]
     if pages:
         torch.index_select(
             _flatten_index_cache(kv_cache),
@@ -396,16 +416,12 @@ def _gather_dcp_index_keys(
     _dcp_all_gather_current_stream(
         group, gathered[dcp_rank].view(-1), gathered.view(-1)
     )
-    num_pages = triton.cdiv(seq_len, _INDEX_PAGE_SIZE)
-    keys = torch.empty(
-        (num_pages, _INDEX_PAGE_WIDTH), dtype=torch.uint8, device=kv_cache.device
-    )
     block = 128
     _interleave_dcp_index_pages_kernel[(triton.cdiv(seq_len, block),)](
         gathered.view(torch.int32),
         keys.view(torch.int32),
         seq_len,
-        rank_pages * _INDEX_PAGE_WORDS,
+        int(gathered.shape[1]) * _INDEX_PAGE_WORDS,
         DCP_SIZE=dcp_world_size,
         INTERLEAVE=interleave,
         PAGE_SIZE=_INDEX_PAGE_SIZE,
@@ -413,7 +429,9 @@ def _gather_dcp_index_keys(
         PAGE_WORDS=_INDEX_PAGE_WORDS,
         BLOCK=block,
     )
-    return keys.view(num_pages, _INDEX_PAGE_SIZE, _INDEX_HEAD_DIM + _INDEX_SCALE_BYTES)
+    return keys.view(
+        int(keys.shape[0]), _INDEX_PAGE_SIZE, _INDEX_HEAD_DIM + _INDEX_SCALE_BYTES
+    )
 
 
 def _prefill_requests(
@@ -708,9 +726,7 @@ class B12xSparseIndexer(nn.Module):
         # limit, so prepare that row count beside the logits-budget one.
         capacities = {
             "decode": sorted({self._max_num_seqs, *workload.fixed_token_counts}),
-            "prefill": sorted(
-                {_prefill_profile_q_rows(workload.max_tokens), workload.max_tokens}
-            ),
+            "prefill": _prefill_plan_rows(workload.max_tokens),
         }
         for mode, counts in capacities.items():
             for rows in counts:
@@ -737,6 +753,65 @@ class B12xSparseIndexer(nn.Module):
             ),
         )
 
+    def _key_gather_specs(
+        self,
+        seq_len: int,
+        rows: int,
+        split: int,
+        topk_scratch,
+        *,
+        restore: bool,
+    ) -> list[tuple[tuple[int, ...], torch.dtype]]:
+        """Workspace views that one gathered-key prefill request holds at once.
+
+        Selection scratch comes first, then the key exchange, the gathered
+        keys, this rank's scores, causal lengths and page ids, and the
+        all-gathered selection when it cannot land in the output directly.
+        """
+        rows_per_rank = triton.cdiv(rows, split)
+        exchange_shape, keys_shape = _dcp_index_key_shapes(
+            seq_len, self.dcp_world_size, self.cp_kv_cache_interleave_size
+        )
+        return [
+            *((tuple(spec.shape), spec.dtype) for spec in topk_scratch),
+            (exchange_shape, torch.uint8),
+            (keys_shape, torch.uint8),
+            ((rows_per_rank, self.topk_tokens), torch.float32),
+            ((rows_per_rank,), torch.int32),
+            ((keys_shape[0],), torch.int32),
+            *(
+                [((rows_per_rank * split, self.topk_tokens), torch.int32)]
+                if restore
+                else []
+            ),
+        ]
+
+    def reserve_key_gather_workspace(self) -> None:
+        """Reserve the gathered-key prefill workspace before KV-cache sizing.
+
+        The memory profile skips the indexer and the gathered keys grow with
+        the context, so the longest request and largest prefill step are
+        reserved upfront. Attention borrows the same workspace only after the
+        indexer is done with it, so this grows it only past the larger need.
+        """
+        if not self.dcp_key_gather:
+            return
+        from vllm.distributed.parallel_state import get_tp_group
+
+        rows = int(self.topk_indices_buffer.shape[0])
+        split = get_tp_group().world_size
+        rows_per_rank = triton.cdiv(rows, split)
+        capacity = next(c for c in _prefill_plan_rows(rows) if c >= rows_per_rank)
+        current_workspace_manager().get_simultaneous(
+            *self._key_gather_specs(
+                self.max_model_len,
+                rows,
+                split,
+                self._plan("prefill", capacity).scratch_specs(),
+                restore=True,
+            )
+        )
+
     def _run_gathered_prefill(
         self,
         chunks: list[DeepseekV32IndexerPrefillChunkMetadata],
@@ -748,7 +823,8 @@ class B12xSparseIndexer(nn.Module):
         Each DCP rank contributes its key shard once. The tensor-parallel ranks
         then score disjoint row slices against the whole context and exchange
         only the selected indices, instead of exchanging every shard's top-k
-        candidates and scores for every row.
+        candidates and scores for every row. All temporaries are views of the
+        workspace reserved by ``reserve_key_gather_workspace``.
         """
         from vllm.distributed.parallel_state import get_tp_group
         from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
@@ -758,29 +834,33 @@ class B12xSparseIndexer(nn.Module):
         start, end = chunks[0].token_start, chunks[-1].token_end
         rows = end - start
         seq_len = int(chunks[0].total_seq_lens)
+        tp_group = get_tp_group()
+        split, rank = tp_group.world_size, tp_group.rank_in_group
+        rows_per_rank = triton.cdiv(rows, split)
+        output = self.topk_indices_buffer[start:end, : self.topk_tokens]
+        restore = rows_per_rank * split != rows or not output.is_contiguous()
+        plan = self._plan("prefill", rows_per_rank)
+        topk_scratch = self._module.scratch_specs(plan, device=q_quant.device)
+        views = current_workspace_manager().get_simultaneous(
+            *self._key_gather_specs(seq_len, rows, split, topk_scratch, restore=restore)
+        )
+        scratch = views[: len(topk_scratch)]
+        gathered, keys, scores, seq_lens, page_ids, *restored = views[
+            len(topk_scratch) :
+        ]
         keys = _gather_dcp_index_keys(
             self.k_cache.kv_cache,
             chunks[0].block_table[0],
             seq_len,
+            gathered=gathered,
+            keys=keys,
             group=get_dcp_group(),
             dcp_rank=self.dcp_rank,
             dcp_world_size=self.dcp_world_size,
             interleave=self.cp_kv_cache_interleave_size,
         )
-        tp_group = get_tp_group()
-        split, rank = tp_group.world_size, tp_group.rank_in_group
-        rows_per_rank = triton.cdiv(rows, split)
-        output = self.topk_indices_buffer[start:end, : self.topk_tokens]
-        restored = (
-            output
-            if rows_per_rank * split == rows and output.is_contiguous()
-            else torch.empty(
-                (rows_per_rank * split, self.topk_tokens),
-                dtype=output.dtype,
-                device=output.device,
-            )
-        )
-        local = restored[rank * rows_per_rank : (rank + 1) * rows_per_rank]
+        selection = restored[0] if restore else output
+        local = selection[rank * rows_per_rank : (rank + 1) * rows_per_rank]
         first = min(rank * rows_per_rank, rows)
         count = min(rows_per_rank, rows - first)
         if count > 0:
@@ -789,30 +869,22 @@ class B12xSparseIndexer(nn.Module):
             pages = int(keys.shape[0])
             _run_paged_topk(
                 module=self._module,
-                plan=self._plan("prefill", count),
+                plan=plan,
                 q=q_quant[row_start : row_start + count].contiguous(),
                 weights=weights[row_start : row_start + count].contiguous(),
                 kv_cache=keys,
                 seq_lens=torch.arange(
-                    causal_start,
-                    causal_start + count,
-                    dtype=torch.int32,
-                    device=q_quant.device,
+                    causal_start, causal_start + count, out=seq_lens[:count]
                 ),
-                block_table=torch.arange(
-                    pages, dtype=torch.int32, device=q_quant.device
-                ).expand(count, pages),
+                block_table=torch.arange(pages, out=page_ids).expand(count, pages),
                 active_width=self.active_width_cap,
                 output=local[:count],
-                scores=torch.empty(
-                    (count, self.topk_tokens),
-                    dtype=torch.float32,
-                    device=q_quant.device,
-                ),
+                scores=scores[:count],
+                scratch=scratch,
             )
-        _dcp_all_gather_current_stream(tp_group, local, restored)
-        if restored is not output:
-            output.copy_(restored[:rows])
+        _dcp_all_gather_current_stream(tp_group, local, selection)
+        if selection is not output:
+            output.copy_(selection[:rows])
 
     def forward(
         self,
