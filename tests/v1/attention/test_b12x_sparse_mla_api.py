@@ -4,6 +4,7 @@
 
 import gc
 import weakref
+from math import prod
 from types import SimpleNamespace
 from typing import Any
 
@@ -2703,10 +2704,16 @@ def test_dcp_index_key_gather_restores_global_token_pages(
         monkeypatch.setattr(
             b12x_mla_sparse, "_dcp_all_gather_current_stream", all_gather
         )
+        exchange_shape, keys_shape = generic_b12x_indexer._dcp_index_key_shapes(
+            seq_len, dcp_world_size, interleave
+        )
+        keys_out = torch.empty(keys_shape, dtype=torch.uint8, device="cuda")
         gathered = generic_b12x_indexer._gather_dcp_index_keys(
             caches[rank],
             tables[rank],
             seq_len,
+            gathered=torch.empty(exchange_shape, dtype=torch.uint8, device="cuda"),
+            keys=keys_out,
             group="dcp",
             dcp_rank=rank,
             dcp_world_size=dcp_world_size,
@@ -2714,6 +2721,7 @@ def test_dcp_index_key_gather_restores_global_token_pages(
         )
 
         assert gathered.shape == (num_pages, 64, 132)
+        assert gathered.data_ptr() == keys_out.data_ptr()
         actual = gathered.view(num_pages, 64 * 132).cpu()
         for token in range(seq_len):
             page, slot = divmod(token, 64)
@@ -2730,6 +2738,7 @@ def test_dcp_index_key_gather_splits_rows_and_restores_selection(
 ) -> None:
     """Each TP rank selects a disjoint row slice at its global causal length."""
     from vllm.distributed import parallel_state
+    from vllm.v1.worker.workspace import WorkspaceManager
 
     topk, rows, history = 4, 7, 13
     indexer = object.__new__(generic_b12x_indexer.B12xSparseIndexer)
@@ -2739,8 +2748,15 @@ def test_dcp_index_key_gather_splits_rows_and_restores_selection(
     indexer.topk_tokens = topk
     indexer.topk_indices_buffer = torch.full((12, topk), -7, dtype=torch.int32)
     indexer.active_width_cap = torch.full((1,), 1 << 20, dtype=torch.int32)
-    indexer._module = object()
+    scratch_spec = SimpleNamespace(shape=(64,), dtype=torch.uint8)
+    indexer._module = SimpleNamespace(
+        scratch_specs=lambda plan, *, device: (scratch_spec,)
+    )
     indexer._plan = lambda mode, count: (mode, count)
+    manager = WorkspaceManager(torch.device("cpu"))
+    monkeypatch.setattr(
+        generic_b12x_indexer, "current_workspace_manager", lambda: manager
+    )
     keys = torch.zeros((1, 64, 132), dtype=torch.uint8)
     calls: dict[str, Any] = {}
 
@@ -2785,14 +2801,30 @@ def test_dcp_index_key_gather_splits_rows_and_restores_selection(
     indexer._run_gathered_prefill(chunks, q_quant, weights)
 
     assert calls["gather"][0] == history + rows
-    assert calls["gather"][1]["dcp_rank"] == 1
+    gather_kwargs = calls["gather"][1]
+    assert gather_kwargs["dcp_rank"] == 1
+    assert gather_kwargs["gathered"].shape == (2, 1, 64 * 132)
+    assert gather_kwargs["keys"].shape == (1, 64 * 132)
     per = (rows + tp_size - 1) // tp_size
     first = min(tp_rank * per, rows)
     count = min(per, rows - first)
     if count:
         selected = calls["select"]
-        assert selected["plan"] == ("prefill", count)
+        assert selected["plan"] == ("prefill", per)
         assert selected["kv_cache"] is keys
+        assert [tuple(view.shape) for view in selected["scratch"]] == [(64,)]
+        # Every temporary is a view of the one workspace allocation.
+        workspace = manager._current_workspaces[0]
+        base, limit = workspace.data_ptr(), workspace.data_ptr() + workspace.numel()
+        for view in (
+            *selected["scratch"],
+            gather_kwargs["gathered"],
+            gather_kwargs["keys"],
+            selected["scores"],
+            selected["seq_lens"],
+            selected["block_table"],
+        ):
+            assert base <= view.data_ptr() < limit
         assert selected["q"][:, 0, 0].tolist() == list(
             range(2 + first, 2 + first + count)
         )
@@ -2803,6 +2835,158 @@ def test_dcp_index_key_gather_splits_rows_and_restores_selection(
     )
     assert torch.all(indexer.topk_indices_buffer[:2] == -7)
     assert torch.all(indexer.topk_indices_buffer[9:] == -7)
+
+
+def test_dcp_index_key_gather_selects_eager_prefill_per_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Eager prefill rows select over gathered keys once per request; only the
+    decode rows keep sharded selection and allocate shard scores."""
+    topk, decode_rows = 4, 2
+    indexer = object.__new__(generic_b12x_indexer.B12xSparseIndexer)
+    indexer.k_cache = SimpleNamespace(
+        prefix="layer.k_cache", kv_cache=torch.empty((1, 64, 132))
+    )
+    indexer.dcp_key_gather = True
+    indexer.dcp_rank, indexer.dcp_world_size = 0, 2
+    indexer.cp_kv_cache_interleave_size = 1
+    indexer.topk_tokens = topk
+    indexer.topk_indices_buffer = torch.zeros((8, topk), dtype=torch.int32)
+    indexer._module = object()
+    indexer._plan = lambda mode, rows: (mode, rows)
+    requests: list[list[int]] = []
+    indexer._run_gathered_prefill = lambda chunks, q, w: requests.append(
+        [chunk.token_start for chunk in chunks]
+    )
+    selections: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        generic_b12x_indexer, "_run_paged_topk", lambda **kw: selections.append(kw)
+    )
+    monkeypatch.setattr(generic_b12x_indexer, "_merge_dcp_topk", lambda *args: None)
+    table = torch.zeros((1, 4), dtype=torch.int32)
+    chunks = [
+        SimpleNamespace(
+            num_reqs=1,
+            token_start=start,
+            token_end=end,
+            total_seq_lens=40,
+            block_table=table,
+        )
+        for start, end in ((2, 5), (5, 8))
+    ]
+    metadata = SimpleNamespace(
+        prefill=SimpleNamespace(chunks=chunks),
+        decode=SimpleNamespace(
+            requires_padding=False,
+            seq_lens=torch.full((decode_rows,), 9, dtype=torch.int32),
+            block_table=torch.zeros((decode_rows, 1), dtype=torch.int32),
+            active_width=torch.full((1,), 9, dtype=torch.int32),
+        ),
+        num_decode_tokens=decode_rows,
+    )
+    monkeypatch.setattr(
+        generic_b12x_indexer,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"layer.k_cache": metadata}),
+    )
+
+    indexer.forward(None, torch.zeros((8, 2, 128)), None, torch.zeros((8, 2)))
+
+    assert requests == [[2, 5]]
+    assert len(selections) == 1
+    assert selections[0]["plan"] == ("decode", decode_rows)
+    scores = selections[0]["scores"]
+    assert scores.shape == (decode_rows, topk)
+    assert scores.untyped_storage().nbytes() == decode_rows * topk * 4
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_dcp_index_key_gather_workspace_is_reserved_before_kv_profiling(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    """The profile skips the indexer, so its largest gathered prefill is
+    reserved upfront: a locked workspace then serves a full-length request
+    with a full prefill step without growing, and nothing more is reserved.
+    """
+    from vllm.distributed import parallel_state
+    from vllm.utils.math_utils import round_up
+    from vllm.v1.worker.workspace import WorkspaceManager
+
+    topk, max_rows, max_model_len, tp_size = 4, 12, 1000, 3
+    indexer = object.__new__(generic_b12x_indexer.B12xSparseIndexer)
+    indexer.dcp_key_gather = enabled
+    indexer.k_cache = SimpleNamespace(kv_cache=torch.empty((1, 64, 132)))
+    indexer.dcp_rank, indexer.dcp_world_size = 0, 2
+    indexer.cp_kv_cache_interleave_size = 1
+    indexer.topk_tokens = topk
+    indexer.max_model_len = max_model_len
+    indexer.topk_indices_buffer = torch.zeros((max_rows, topk), dtype=torch.int32)
+    indexer.active_width_cap = torch.full((1,), max_model_len, dtype=torch.int32)
+
+    capacities = generic_b12x_indexer._prefill_plan_rows(max_rows)
+
+    def plan(mode: str, rows: int):
+        # Rows run on the smallest prepared capacity, whose selection scratch
+        # grows with the capacity.
+        capacity = next(c for c in capacities if c >= rows)
+        specs = (SimpleNamespace(shape=(capacity * 64,), dtype=torch.uint8),)
+        return SimpleNamespace(scratch_specs=lambda: specs)
+
+    indexer._plan = plan
+    indexer._module = SimpleNamespace(
+        scratch_specs=lambda plan, *, device: plan.scratch_specs()
+    )
+    manager = WorkspaceManager(torch.device("cpu"))
+    borrowed: list[int] = []
+    get_simultaneous = manager.get_simultaneous
+
+    def record(*specs):
+        borrowed.append(
+            sum(round_up(prod(shape) * dtype.itemsize, 256) for shape, dtype in specs)
+        )
+        return get_simultaneous(*specs)
+
+    monkeypatch.setattr(manager, "get_simultaneous", record)
+    monkeypatch.setattr(
+        generic_b12x_indexer, "current_workspace_manager", lambda: manager
+    )
+    monkeypatch.setattr(
+        parallel_state,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=tp_size, rank_in_group=tp_size - 1),
+    )
+
+    indexer.reserve_key_gather_workspace()
+
+    if not enabled:
+        assert manager.available_bytes() == 0
+        return
+    reserved = manager.available_bytes()
+    manager.lock()
+    monkeypatch.setattr(generic_b12x_indexer, "get_dcp_group", lambda: "dcp")
+    monkeypatch.setattr(
+        generic_b12x_indexer,
+        "_gather_dcp_index_keys",
+        lambda cache, table_row, seq_len, *, keys, **kwargs: keys.view(-1, 64, 132),
+    )
+    monkeypatch.setattr(generic_b12x_indexer, "_run_paged_topk", lambda **kwargs: None)
+    monkeypatch.setattr(
+        b12x_mla_sparse, "_dcp_all_gather_current_stream", lambda *args: None
+    )
+    # Eleven rows over three ranks also need the separate all-gather target.
+    rows = max_rows - 1
+    chunk = SimpleNamespace(
+        token_start=0,
+        token_end=rows,
+        total_seq_lens=max_model_len,
+        block_table=torch.zeros((1, 16), dtype=torch.int32),
+    )
+    q_quant = torch.zeros((max_rows, 2, 128))
+    weights = torch.zeros((max_rows, 2))
+
+    indexer._run_gathered_prefill([chunk], q_quant, weights)
+
+    assert borrowed[-1] == reserved
 
 
 def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
