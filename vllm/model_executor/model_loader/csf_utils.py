@@ -12,18 +12,6 @@ import torch
 from safetensors import safe_open
 
 
-def resolve_csf_checkpoint_root(model_config, quant):
-    root = Path(quant["checkpoint_root"])
-    if not root.is_absolute():
-        model = Path(model_config.model)
-        if not model.is_dir():
-            raise ValueError(
-                "A relative CSF checkpoint_root requires a local model directory"
-            )
-        root = model / root
-    return root.resolve()
-
-
 class PackedTensorView(Protocol):
     """CPU tensor slicing interface provided by safetensors and tensor stores."""
 

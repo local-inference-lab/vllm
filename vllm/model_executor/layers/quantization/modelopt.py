@@ -1556,6 +1556,15 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
 
         for prefix, recipe in quantized_layers.items():
             codec = recipe.get("quant_algo", "").upper()
+            scale_encoding = recipe.get("weight_scale_encoding")
+            if scale_encoding is not None and (
+                scale_encoding != "csf"
+                or codec not in ("NVFP4", "W4A16_NVFP4")
+                or recipe.get("group_size", 16) != 16
+            ):
+                raise ValueError(
+                    f"Unsupported weight_scale_encoding for {prefix}: {recipe}"
+                )
             if codec in BLOCK_CODECS and any(
                 recipe.get(key) != value
                 for key, value in {
@@ -1571,6 +1580,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         self.nvfp4_config = nvfp4_config
         self.w4a16_nvfp4_config = w4a16_nvfp4_config
         self.mxfp8_config = mxfp8_config
+        self.csf_state = None
+        if any(
+            r.get("weight_scale_encoding") == "csf" for r in quantized_layers.values()
+        ):
+            from .nvfp4_csf import Nvfp4CsfState
+
+            self.csf_state = Nvfp4CsfState()
 
         block_sizes = {
             int(layer_info.get("group_size", 128))
@@ -1798,6 +1814,21 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
 
         return tuple(dict.fromkeys(candidates))
 
+    def _resolve_weight_scale_encoding(self, prefix: str) -> str | None:
+        for candidate in self._quantized_layer_prefix_candidates(prefix):
+            if candidate in self.quantized_layers:
+                return self.quantized_layers[candidate].get("weight_scale_encoding")
+            encodings = {
+                recipe.get("weight_scale_encoding")
+                for name, recipe in self.quantized_layers.items()
+                if name.startswith(candidate + ".")
+            }
+            if len(encodings) > 1:
+                raise ValueError(f"Mixed weight scale encodings within {prefix}")
+            if encodings:
+                return encodings.pop()
+        return None
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
@@ -1815,6 +1846,15 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             return None
 
         quant_algo = self._resolve_quant_algo(prefix)
+
+        if self._resolve_weight_scale_encoding(prefix) == "csf":
+            if not isinstance(layer, RoutedExperts):
+                raise ValueError("CSF scale encoding currently requires routed experts")
+            from .nvfp4_csf import Nvfp4CsfMoEMethod
+
+            return Nvfp4CsfMoEMethod(
+                layer.moe_config, self.csf_state, use_a16=quant_algo == "W4A16_NVFP4"
+            )
 
         if quant_algo in ("IQ2_XS", "IQ2_XXS", "Q8_0"):
             from vllm.model_executor.layers.quantization.modelopt_iq2_xs import (

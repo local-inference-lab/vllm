@@ -44,7 +44,7 @@ def resolve_ple_embedding_dtype(
         or text_config_dict.get("quantization_config")
         or {}
     )
-    if quant_config.get("quant_method") in ("nvfp4_csf", "mxfp4_csf") and (
+    if quant_config.get("quant_method") == "mxfp4_csf" and (
         root := quant_config.get("checkpoint_root")
     ):
         # An FP4-CSF serving directory holds metadata only; the checkpoint's

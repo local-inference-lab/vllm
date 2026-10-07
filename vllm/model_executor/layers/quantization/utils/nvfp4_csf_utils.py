@@ -1,121 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Load retained tensors while the quantization method owns compressed experts."""
+"""Tensor-only slicing and preparation of NVFP4 compressed scale planes."""
 
-import time
 from collections.abc import Iterable
-from functools import lru_cache
-from pathlib import Path
 
 import numpy as np
-import regex as re
 import torch
-from safetensors import safe_open
 
-from vllm.model_executor.model_loader.csf_utils import (
-    CsfMatrix,
-    CsfTensorReader,
-    read_csf_contract,
-    resolve_csf_checkpoint_root,
-    tp_extent,
-)
-from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
-from vllm.model_executor.model_loader.weight_utils import (
-    file_source_tensor,
-    safetensors_file_sources,
-)
+from vllm.model_executor.model_loader.csf_utils import CsfMatrix, tp_extent
 
-SCHEMA = "lil-nvfp4-csf-checkpoint/1"
-CODEC = "byte-window4-fixed-stream-u24-exceptions/1"
-# Experts, hidden size, expert intermediate size, compressed layers and the
-# checkpoint name of the decoder layer list.
-FAMILIES = {
-    "glm53_nvfp4": (288, 4096, 2048, range(3, 45), "model.language_model.layers"),
-    "glm53_744b_nvfp4": (256, 6144, 2048, range(3, 78), "model.layers"),
-    "qwen38_flash_next_nvfp4": (
-        512,
-        2560,
-        640,
-        range(48),
-        "model.language_model.layers",
-    ),
-}
-# E4M3 1.0: the scale of padded expert rows, which hold zero weights.
 _PADDED_SCALE = 0x38
-_COMPRESSED_EXPERT = re.compile(
-    r"^model\.(?:language_model\.)?layers\.(\d+)\.mlp\.experts\."
-)
 
 
-@lru_cache(maxsize=4)
-def checkpoint_contract(root: str) -> dict:
-    """Validate the NVFP4-CSF container before loading model tensors."""
-    return read_csf_contract(root, schema=SCHEMA, codec=CODEC, families=FAMILIES)
+class TensorView:
+    def __init__(self, tensor: torch.Tensor):
+        self.tensor = tensor
 
+    def get_shape(self):
+        return list(self.tensor.shape)
 
-def nvfp4_scaled_modules(root) -> list[str]:
-    """Source modules that store NVFP4 weights, by their weight scales."""
-    contract = checkpoint_contract(str(Path(root).resolve()))
-    suffix = ".weight_scale"
-    return sorted(
-        name.removesuffix(suffix)
-        for name in contract["source_names"]
-        if name.endswith(suffix)
-    )
+    def get_dtype(self):
+        return "U8" if self.tensor.dtype == torch.uint8 else str(self.tensor.dtype)
 
-
-def read_nvfp4_csf_layer(
-    root,
-    layer_index,
-    *,
-    num_experts,
-    hidden_size,
-    intermediate_size,
-    tp_rank,
-    tp_size,
-    device,
-    w13_scale_scratch,
-    w2_scale_scratch,
-    local_size=None,
-):
-    """Read rank-local up/gate/down tensors and unprepared compressed scales.
-
-    ``intermediate_size`` is the checkpoint's expert width; ``local_size``
-    the per-rank width of a TP-padded expert, if any.
-    """
-    contract = checkpoint_contract(str(Path(root).resolve()))
-    e, h, n, layers, layer_list = FAMILIES[contract["family"]]
-    if (num_experts, hidden_size, intermediate_size) != (e, h, n):
-        raise ValueError("NVFP4-CSF expert geometry differs from the checkpoint family")
-    if layer_index not in layers:
-        raise ValueError("NVFP4-CSF layer is outside the compressed expert inventory")
-    with CsfTensorReader(root, contract["source_names"], "nvfp4") as reader:
-
-        def experts():
-            for expert in range(num_experts):
-                prefix = f"{layer_list}.{layer_index}.mlp.experts.{expert}"
-                yield tuple(
-                    reader.matrix(
-                        f"{prefix}.{p}.weight",
-                        f"{prefix}.{p}.weight_scale",
-                        global_scale=f"{prefix}.{p}.weight_scale_2",
-                        input_scale=f"{prefix}.{p}.input_scale",
-                    )
-                    for p in ("up_proj", "gate_proj", "down_proj")
-                )
-
-        return _load_nvfp4_csf_weights(
-            experts(),
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            device=device,
-            w13_scale_scratch=w13_scale_scratch,
-            w2_scale_scratch=w2_scale_scratch,
-            local_size=local_size,
-        )
+    def __getitem__(self, extent):
+        return self.tensor[extent]
 
 
 def _slice_scale_plane(
@@ -170,7 +78,7 @@ def _slice_scale_plane(
     return result.copy(), selected_words.astype(np.uint32)
 
 
-def _load_nvfp4_csf_weights(
+def prepare_nvfp4_csf_weights(
     experts: Iterable[tuple[CsfMatrix, CsfMatrix, CsfMatrix]],
     *,
     num_experts,
@@ -317,42 +225,3 @@ def _load_nvfp4_csf_weights(
             tuple(torch.from_numpy(p) for p in exceptions2),
         ),
     )
-
-
-class Nvfp4CsfModelLoader(DefaultModelLoader):
-    def _root(self, model_config):
-        quant = getattr(model_config.hf_config, "quantization_config", None)
-        quant = quant or model_config.hf_text_config.quantization_config
-        if quant.get("quant_method") != "nvfp4_csf":
-            raise ValueError("NVFP4-CSF loader requires quant_method=nvfp4_csf")
-        root = resolve_csf_checkpoint_root(model_config, quant)
-        return root, checkpoint_contract(str(root.resolve()))
-
-    def download_model(self, model_config):
-        self._root(model_config)
-
-    def get_all_weights(self, model_config, model):
-        root, contract = self._root(model_config)
-        if getattr(model, "secondary_weights", ()):
-            raise NotImplementedError(
-                "NVFP4-CSF does not support secondary weight sources"
-            )
-        prefixes = getattr(model, "checkpoint_weight_name_prefixes", None)
-        file_filter = getattr(model, "checkpoint_file_weight_filter", None)
-        layers = model_config.hf_text_config.num_hidden_layers
-        self.counter_before_loading_weights = time.perf_counter()
-        for filename in sorted(set(contract["source_names"].values())):
-            descriptors = safetensors_file_sources(str(root / "tensors" / filename))
-            with safe_open(
-                root / "tensors" / filename, framework="pt", device="cpu"
-            ) as handle:
-                for name in sorted(handle.keys()):
-                    if prefixes is not None and not name.startswith(prefixes):
-                        continue
-                    match = _COMPRESSED_EXPERT.search(name)
-                    if match and int(match.group(1)) < layers:
-                        continue
-                    if callable(file_filter) and file_filter(name):
-                        yield name, file_source_tensor(descriptors[name])
-                    else:
-                        yield name, handle.get_tensor(name)

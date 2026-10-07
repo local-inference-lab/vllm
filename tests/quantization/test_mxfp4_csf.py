@@ -395,14 +395,10 @@ def test_mxfp4_csf_selects_retained_precision_and_rejects_other_configs(
         )
 
 
-@pytest.mark.parametrize("codec", ["mxfp4", "nvfp4"])
 @pytest.mark.parametrize("fault", ["schema", "codec", "family", "inventory", "path"])
-def test_csf_contract_rejects_mismatched_identity_and_shard_inventory(
-    tmp_path, codec, fault
-):
-    from vllm.model_executor.model_loader import mxfp4_csf_loader, nvfp4_csf_loader
+def test_csf_contract_rejects_mismatched_identity_and_shard_inventory(tmp_path, fault):
+    from vllm.model_executor.model_loader import mxfp4_csf_loader as reader
 
-    reader = mxfp4_csf_loader if codec == "mxfp4" else nvfp4_csf_loader
     identity = {
         "schema": reader.SCHEMA,
         "codec": reader.CODEC,

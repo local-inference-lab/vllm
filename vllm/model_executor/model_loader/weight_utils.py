@@ -303,17 +303,6 @@ def get_quant_config(
         )
 
     if hf_quant_config is not None:
-        if model_config.quantization == "nvfp4_csf":
-            from vllm.model_executor.model_loader.csf_utils import (
-                resolve_csf_checkpoint_root,
-            )
-
-            hf_quant_config = {
-                **hf_quant_config,
-                "checkpoint_root": str(
-                    resolve_csf_checkpoint_root(model_config, hf_quant_config)
-                ),
-            }
         # `model_config.quantization_config` may be set alongside a checkpoint
         # quant config: the checkpoint determines `quant_cls`, and the user's
         # QuantizationConfigArgs is consulted by individual quant methods

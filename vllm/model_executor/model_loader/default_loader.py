@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import fnmatch
 import glob
 import json
 import os
@@ -244,9 +245,32 @@ class DefaultModelLoader(BaseModelLoader):
         if subfolder is not None:
             hf_folder = os.path.join(hf_folder, subfolder)
 
+        indexed_files = None
+        if any(pattern.endswith(".safetensors") for pattern in allow_patterns):
+            if not is_local:
+                download_safetensors_index_file_from_hf(
+                    model_name_or_path,
+                    index_file,
+                    cache_dir=self.load_config.download_dir,
+                    subfolder=subfolder,
+                    revision=revision,
+                )
+            index_path = os.path.join(hf_folder, index_file)
+            if os.path.isfile(index_path):
+                with open(index_path) as handle:
+                    indexed_files = set(json.load(handle)["weight_map"].values())
+
         hf_weights_files: list[str] = []
         for pattern in allow_patterns:
-            hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
+            if indexed_files is not None and pattern.endswith(".safetensors"):
+                hf_weights_files += [
+                    os.path.join(hf_folder, filename)
+                    for filename in sorted(indexed_files)
+                    if fnmatch.fnmatch(filename, pattern)
+                    and os.path.isfile(os.path.join(hf_folder, filename))
+                ]
+            else:
+                hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
             if len(hf_weights_files) > 0:
                 if pattern.endswith(".safetensors"):
                     use_safetensors = True
@@ -256,16 +280,7 @@ class DefaultModelLoader(BaseModelLoader):
             # For models like Mistral-7B-Instruct-v0.3
             # there are both sharded safetensors files and a consolidated
             # safetensors file. Using both breaks.
-            # Here, we download the `model.safetensors.index.json` and filter
-            # any files not found in the index.
-            if not is_local and len(hf_weights_files) > 1:
-                download_safetensors_index_file_from_hf(
-                    model_name_or_path,
-                    index_file,
-                    cache_dir=self.load_config.download_dir,
-                    subfolder=subfolder,
-                    revision=revision,
-                )
+            # Filter files against the standard shard index.
             hf_weights_files = filter_duplicate_safetensors_files(
                 hf_weights_files, hf_folder, index_file
             )

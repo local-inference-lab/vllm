@@ -900,7 +900,14 @@ class RoutedExperts(PluggableLayer):
                 )
                 weight_name = qual_name.replace(weight_name, param_name)
                 param_name = weight_name.removeprefix(f"{self.layer_name}.")
-                param = getattr(self, param_name, None)
+                try:
+                    param = (
+                        self.get_parameter(param_name)
+                        if "." in param_name
+                        else getattr(self, param_name, None)
+                    )
+                except AttributeError:
+                    param = None
                 if param is None:
                     if param_name.endswith(("w13_bias", "w2_bias")):
                         continue

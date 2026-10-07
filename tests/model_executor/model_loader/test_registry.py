@@ -136,6 +136,36 @@ def test_default_loader_restricts_safetensors_shards_by_weight_prefix(
     assert files == [str(mtp_shard)]
 
 
+@pytest.mark.parametrize("remote", [False, True])
+def test_default_loader_uses_nested_index_paths(tmp_path, monkeypatch, remote):
+    import vllm.model_executor.model_loader.default_loader as module
+
+    (tmp_path / "tensors").mkdir()
+    shard = tmp_path / "tensors/model-00001-of-00001.safetensors"
+    shard.write_bytes(b"")
+    (tmp_path / "unused.safetensors").write_bytes(b"")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"weight": "tensors/" + shard.name}})
+    )
+    if remote:
+        monkeypatch.setattr(module, "maybe_download_from_modelscope", lambda *a: None)
+        monkeypatch.setattr(
+            module, "download_weights_from_hf", lambda *a, **kw: str(tmp_path)
+        )
+        monkeypatch.setattr(
+            module, "download_safetensors_index_file_from_hf", lambda *a, **kw: None
+        )
+    loader = DefaultModelLoader(LoadConfig(load_format="safetensors"))
+    _, files, use_safetensors = loader._prepare_weights(
+        "owner/model" if remote else str(tmp_path),
+        None,
+        None,
+        fall_back_to_pt=False,
+        allow_patterns_overrides=None,
+    )
+    assert use_safetensors and files == [str(shard)]
+
+
 @pytest.mark.parametrize("prefixes", ["vision.", [], [""], [1]])
 def test_default_loader_rejects_invalid_priority_prefixes(prefixes):
     with pytest.raises(ValueError, match="non-empty list of non-empty strings"):

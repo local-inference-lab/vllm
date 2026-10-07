@@ -184,6 +184,7 @@ class KVCacheManager:
         watermark: float = 0.0,
         enable_mamba_fine_grained_prefix_cache: bool = False,
         enable_boundary_checkpoints: bool = False,
+        num_lookahead_tokens: int = 0,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -282,6 +283,17 @@ class KVCacheManager:
         self._external_admission_has_scheduled_reqs = False
         self._boundary_allocations: dict[str, list[KVCacheBlock]] = {}
         self._boundary_readers: dict[str, BoundaryCheckpoint] = {}
+        self._boundary_restore_lookahead = max(
+            num_lookahead_tokens,
+            max(
+                (
+                    manager.kv_cache_spec.num_speculative_blocks + 1
+                    for manager in self.coordinator.single_type_managers
+                    if isinstance(manager.kv_cache_spec, MambaSpec)
+                ),
+                default=0,
+            ),
+        )
         if self.boundary_checkpoints is not None:
             logger.info(
                 "Request-boundary recurrent checkpoint caching is enabled. "
@@ -689,7 +701,7 @@ class KVCacheManager:
             assert self.boundary_checkpoints is not None
             admission = self._boundary_import_admissions.get(request.request_id)
             if admission is not None and admission.ready and not admission.admitted:
-                checkpoint = admission.checkpoint
+                checkpoint: BoundaryCheckpoint | None = admission.checkpoint
                 admission.admitted = True
             else:
                 checkpoint = self.boundary_checkpoints.acquire(

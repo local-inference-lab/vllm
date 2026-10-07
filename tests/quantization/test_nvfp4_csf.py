@@ -19,16 +19,18 @@ from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
     nvfp4_moe_quant_config,
 )
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptMixedPrecisionConfig,
+)
 from vllm.model_executor.layers.quantization.nvfp4_csf import (
-    Nvfp4CsfConfig,
     Nvfp4CsfMoEMethod,
 )
-from vllm.model_executor.model_loader.nvfp4_csf_loader import Nvfp4CsfModelLoader
+from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
 from .csf_fixtures import decode_planes, matrix
 
 
-@pytest.mark.parametrize("selected", [None, "nvfp4_csf"])
+@pytest.mark.parametrize("selected", [None, "modelopt_mixed"])
 def test_model_config_detects_csf(selected):
     from transformers import PretrainedConfig
 
@@ -37,31 +39,31 @@ def test_model_config_detects_csf(selected):
     config = SimpleNamespace(
         quantization=selected,
         model_arch_config=SimpleNamespace(
-            quantization_config={"quant_method": "nvfp4_csf"}
+            quantization_config={
+                "quant_method": "modelopt",
+                "quant_algo": "MIXED_PRECISION",
+            }
         ),
         hf_config=PretrainedConfig(),
     )
     ModelConfig._verify_quantization(config)
-    assert config.quantization == "nvfp4_csf"
+    assert config.quantization == "modelopt_mixed"
 
 
-@pytest.mark.parametrize("config_cls", [Nvfp4CsfConfig])
-def test_csf_config_preserves_source_recipes_and_avoids_expert_allocations(config_cls):
+def test_csf_config_preserves_recipes_and_avoids_expert_allocations():
     original = {
         "quant_method": "modelopt",
         "quant_algo": "MIXED_PRECISION",
         "quantized_layers": {
-            "model.layers.3.mlp.experts": {"quant_algo": "NVFP4", "group_size": 16},
+            "model.layers.3.mlp.experts": {
+                "quant_algo": "NVFP4",
+                "group_size": 16,
+                "weight_scale_encoding": "csf",
+            },
             "model.layers.45.mlp.experts": {"quant_algo": "MXFP8"},
         },
     }
-    owner = config_cls.from_config(
-        {
-            "format_version": 1,
-            "checkpoint_root": "/lsc",
-            "source_quantization_config": original,
-        }
-    )
+    owner = ModelOptMixedPrecisionConfig.from_config(original)
     assert owner._resolve_quant_algo("model.layers.3.mlp.experts") == "NVFP4"
     assert owner._resolve_quant_algo("model.layers.45.mlp.experts") == "MXFP8"
     moe = FusedMoEConfig(
@@ -78,14 +80,13 @@ def test_csf_config_preserves_source_recipes_and_avoids_expert_allocations(confi
         routing_method=RoutingMethodType.TopK,
         moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
     )
-    method = Nvfp4CsfMoEMethod(moe, owner)
+    method = Nvfp4CsfMoEMethod(moe, owner.csf_state)
     layer = torch.nn.Module()
     layer.layer_name = "model.layers.3.mlp.experts"
     method.create_weights(layer, 288, 4096, 1024, torch.bfloat16)
-    assert not list(layer.parameters()) and not layer.state_dict()
-    assert layer.w13_weight.numel() == layer.w2_weight.numel() == 0
-    with pytest.raises(ValueError, match="source_quantization_config"):
-        Nvfp4CsfConfig.from_config({"format_version": 1, "checkpoint_root": "/lsc"})
+    assert all(p.numel() == 0 for p in layer.parameters())
+    assert owner._resolve_weight_scale_encoding("model.layers.3.mlp.experts") == "csf"
+    assert owner._resolve_weight_scale_encoding("model.layers.45.mlp.experts") is None
 
 
 def test_prepared_nvfp4_accepts_kernel_order_and_rejects_activation_change(monkeypatch):
@@ -131,109 +132,67 @@ def test_prepared_nvfp4_accepts_kernel_order_and_rejects_activation_change(monke
         backend.install_prepared_experts(layer, prepared)
 
 
-def _write_checkpoint(root, family, tensors):
-    from vllm.model_executor.model_loader.nvfp4_csf_loader import CODEC, SCHEMA
-
-    directory = root / "tensors"
-    directory.mkdir()
-    filename = "weights.safetensors"
-    save_file(tensors, directory / filename)
-    common = {"schema": SCHEMA, "codec": CODEC, "family": family}
-    (root / "manifest.json").write_text(
-        json.dumps({**common, "shards": [{"file": filename}]})
-    )
-    (root / "build-contract.json").write_text(
-        json.dumps({**common, "source_names": {k: filename for k in tensors}})
-    )
-
-
-@pytest.mark.parametrize("quant_method", ["nvfp4_csf"])
-@pytest.mark.parametrize("load_format", ["nvfp4_csf"])
-@pytest.mark.parametrize(
-    "family,layer_list,num_layers",
-    [
-        ("glm53_nvfp4", "model.language_model.layers", 45),
-        # GLM-5.3 (744B): the MTP layer 78 stores BF16 experts.
-        ("glm53_744b_nvfp4", "model.layers", 78),
-    ],
-)
-def test_loader_excludes_compressed_main_experts_and_retains_native_tensors(
-    tmp_path, quant_method, load_format, family, layer_list, num_layers
+@pytest.mark.parametrize("load_format", ["auto", "safetensors"])
+def test_standard_loader_yields_all_csf_components_and_native_tensors(
+    tmp_path, load_format
 ):
-    from vllm.model_executor.layers.quantization import get_quantization_config
-    from vllm.model_executor.model_loader import get_model_loader
-
     tensors = {
-        f"{layer_list}.3.mlp.experts.0.gate_proj.weight": torch.ones(
+        "model.layers.3.mlp.experts.0.gate_proj.weight": torch.ones(
             8, dtype=torch.uint8
         ),
         (
-            f"{layer_list}.3.mlp.experts.0.gate_proj.weight_scale.nvfp4_csf_fixed"
+            "model.layers.3.mlp.experts.0.gate_proj.weight_scale.nvfp4_csf_fixed"
         ): torch.ones(8, dtype=torch.uint8),
-        f"{layer_list}.{num_layers}.mlp.experts.0.gate_proj.weight": torch.full(
+        (
+            "model.layers.3.mlp.experts.0.gate_proj.weight_scale.nvfp4_csf_exceptions"
+        ): torch.tensor([42], dtype=torch.uint32),
+        "model.layers.45.mlp.experts.0.gate_proj.weight": torch.full(
             (8,), 42, dtype=torch.uint8
         ),
-        "model.language_model.norm.weight": torch.ones(8, dtype=torch.bfloat16),
+        "model.norm.weight": torch.ones(8, dtype=torch.float32),
     }
-    _write_checkpoint(tmp_path, family, tensors)
-    config = SimpleNamespace(
-        hf_config=SimpleNamespace(
-            quantization_config={
-                "quant_method": quant_method,
-                "checkpoint_root": str(tmp_path),
-            }
-        ),
-        hf_text_config=SimpleNamespace(num_hidden_layers=num_layers),
+    directory = tmp_path / "tensors"
+    directory.mkdir()
+    mapping = {}
+    for i, (name, tensor) in enumerate(tensors.items()):
+        filename = f"tensors/model-{i:05}.safetensors"
+        save_file({name: tensor}, tmp_path / filename)
+        mapping[name] = filename
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": mapping})
     )
-    loader = get_model_loader(LoadConfig(load_format=load_format))
-    assert isinstance(loader, Nvfp4CsfModelLoader)
-    assert get_quantization_config("nvfp4_csf") is Nvfp4CsfConfig
-    actual = dict(loader.get_all_weights(config, SimpleNamespace()))
-    assert set(actual) == {name for name in tensors if ".layers.3." not in name}
+    loader = DefaultModelLoader(LoadConfig(load_format=load_format))
+    actual = dict(
+        loader._get_weights_iterator(
+            DefaultModelLoader.Source(str(tmp_path), revision=None)
+        )
+    )
+    assert actual.keys() == tensors.keys()
     for name, tensor in actual.items():
+        assert tensor.dtype == tensors[name].dtype
         assert torch.equal(tensor, tensors[name])
 
 
-def test_single_nvfp4_source_quantizes_the_modules_that_store_scales(tmp_path):
-    """GLM-5.3 (744B) declares one NVFP4 recipe whose ignore list misses its
-    BF16 MTP layer; the checkpoint's weight scales decide instead."""
-    names = (
-        "model.layers.3.mlp.experts.0.up_proj.weight",
-        "model.layers.3.mlp.experts.0.up_proj.weight_scale",
-        "model.layers.3.mlp.experts.1.down_proj.weight_scale",
-        "model.layers.3.self_attn.o_proj.weight",
-        "model.layers.78.mlp.experts.0.up_proj.weight",
-        "model.layers.78.self_attn.o_proj.weight",
-    )
-    _write_checkpoint(
-        tmp_path,
-        "glm53_744b_nvfp4",
-        {name: torch.ones(1, dtype=torch.uint8) for name in names},
-    )
-    owner = Nvfp4CsfConfig.from_config(
-        {
-            "format_version": 1,
-            "checkpoint_root": str(tmp_path),
-            "source_quantization_config": {
-                "quant_method": "modelopt",
-                "quant_algo": "NVFP4",
-                "ignore": ["lm_head", "model.layers.3.self_attn*"],
-            },
-        }
-    )
-    assert owner.quantized_layers == {
-        "model.layers.3.mlp.experts": {"quant_algo": "NVFP4", "group_size": 16}
-    }
-    assert owner._resolve_quant_algo("model.layers.3.mlp.experts") == "NVFP4"
-    assert owner._resolve_quant_algo("model.layers.78.mlp.experts") is None
-    assert owner._resolve_quant_algo("model.layers.78.self_attn.o_proj") is None
-    assert owner.is_layer_excluded("model.layers.3.self_attn.o_proj")
+@pytest.mark.parametrize("algo,encoding", [("MXFP8", "csf"), ("NVFP4", "unknown")])
+def test_unsupported_scale_encoding_is_rejected(algo, encoding):
+    with pytest.raises(ValueError, match="weight_scale_encoding"):
+        ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.layers.0.mlp.experts": {
+                        "quant_algo": algo,
+                        "weight_scale_encoding": encoding,
+                    }
+                },
+            }
+        )
 
 
 @pytest.mark.parametrize("rank", [0, 1])
 def test_tensor_sources_preserve_tp_bytes_and_fp32_with_bf16_default(rank):
-    from vllm.model_executor.model_loader.nvfp4_csf_loader import (
-        _load_nvfp4_csf_weights as load_nvfp4_csf_weights,
+    from vllm.model_executor.layers.quantization.utils.nvfp4_csf_utils import (
+        prepare_nvfp4_csf_weights as load_nvfp4_csf_weights,
     )
 
     device = "cpu"
@@ -323,8 +282,8 @@ def test_padded_shards_hold_whole_tiles_and_zero_the_tail(rank):
     """TP-padded experts (GLM-5.3 at TP6): rank r holds checkpoint channels
     [r * local, (r + 1) * local) and zero weights past the checkpoint width,
     here 320 channels over three 128-channel shards."""
-    from vllm.model_executor.model_loader.nvfp4_csf_loader import (
-        _load_nvfp4_csf_weights as load_nvfp4_csf_weights,
+    from vllm.model_executor.layers.quantization.utils.nvfp4_csf_utils import (
+        prepare_nvfp4_csf_weights as load_nvfp4_csf_weights,
     )
 
     experts, hidden, intermediate, local = 2, 256, 320, 128
@@ -399,8 +358,8 @@ def test_padded_shards_hold_whole_tiles_and_zero_the_tail(rank):
     ],
 )
 def test_missing_or_invalid_calibration_is_rejected(bad):
-    from vllm.model_executor.model_loader.nvfp4_csf_loader import (
-        _load_nvfp4_csf_weights as load_nvfp4_csf_weights,
+    from vllm.model_executor.layers.quantization.utils.nvfp4_csf_utils import (
+        prepare_nvfp4_csf_weights as load_nvfp4_csf_weights,
     )
 
     source, _ = matrix(128, 128, group_size=16, seed=0)
@@ -491,46 +450,134 @@ def test_scale_prefetch_expands_the_next_layer_for_this_forward_only(monkeypatch
     assert calls == [(3, False), (4, False)] and expanded == []
 
 
-@pytest.mark.parametrize("checkpoint_root", [".", "absolute"])
-def test_portable_root_binds_loader_and_quantizer_to_model_directory(
-    tmp_path, monkeypatch, checkpoint_root
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_normal_expert_hooks_preserve_tp_weights_scales_and_calibration(
+    tmp_path, rank, reverse
 ):
-    from vllm.model_executor.model_loader.weight_utils import get_quant_config
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.model_executor.layers.quantization.utils.nvfp4_csf_utils import (
+        prepare_nvfp4_csf_weights,
+    )
 
-    root = tmp_path / "model"
-    root.mkdir()
-    _write_checkpoint(root, "qwen38_flash_next_nvfp4", {"norm.weight": torch.ones(8)})
-    quant = {
-        "quant_method": "nvfp4_csf",
-        "format_version": 1,
-        "checkpoint_root": str(root) if checkpoint_root == "absolute" else ".",
-        "source_quantization_config": {
-            "quant_method": "modelopt",
+    parallel = replace(
+        FusedMoEParallelConfig.make_no_parallel(), tp_size=2, tp_rank=rank
+    )
+    moe = FusedMoEConfig(
+        num_experts=2,
+        num_local_experts=2,
+        num_logical_experts=2,
+        experts_per_token=1,
+        hidden_dim=128,
+        intermediate_size=128,
+        in_dtype=torch.bfloat16,
+        device="cpu",
+        activation=MoEActivation.SILU,
+        routing_method=RoutingMethodType.TopK,
+        moe_parallel_config=parallel,
+    )
+    layer = RoutedExperts.__new__(RoutedExperts)
+    torch.nn.Module.__init__(layer)
+    layer.layer_name = "model.layers.0.mlp.experts"
+    layer.moe_config = moe
+    layer.expert_map_manager = SimpleNamespace(num_fused_shared_experts=0)
+    layer.ckpt_gate_proj_name, layer.ckpt_up_proj_name, layer.ckpt_down_proj_name = (
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    )
+    layer.lora_base_layer_prefix = ""
+    config = ModelOptMixedPrecisionConfig.from_config(
+        {
             "quant_algo": "MIXED_PRECISION",
-            "quantized_layers": {"model.layers.0.mlp.experts": {"quant_algo": "NVFP4"}},
-        },
-    }
-    config = SimpleNamespace(
-        model=str(root),
-        quantization="nvfp4_csf",
-        quantization_config=None,
-        hf_config=SimpleNamespace(quantization_config=quant),
+            "quantized_layers": {
+                layer.layer_name: {
+                    "quant_algo": "NVFP4",
+                    "group_size": 16,
+                    "weight_scale_encoding": "csf",
+                }
+            },
+        }
     )
-    monkeypatch.chdir(tmp_path)
-    load_config = LoadConfig(load_format="nvfp4_csf")
-    actual_root, _ = Nvfp4CsfModelLoader(load_config)._root(config)
-    owner = get_quant_config(config, load_config)
-    assert actual_root == root
-    assert owner.checkpoint_root == str(root)
-    assert quant["checkpoint_root"] == (
-        str(root) if checkpoint_root == "absolute" else "."
+    method = config.get_quant_method(layer, layer.layer_name)
+    assert isinstance(method, Nvfp4CsfMoEMethod)
+    method.create_weights(layer, 2, 128, 64, torch.bfloat16)
+    tensors, sources = {}, []
+    for expert in range(2):
+        projections = []
+        for projection, proj_name in enumerate(("up_proj", "gate_proj", "down_proj")):
+            source, _ = matrix(128, 128, group_size=16, seed=expert * 3 + projection)
+            source = replace(
+                source,
+                global_scale=torch.tensor(0.031234 + expert),
+                input_scale=torch.tensor(0.234567 + projection),
+            )
+            projections.append(source)
+            prefix = f"{expert}.{proj_name}."
+            tensors.update(
+                {
+                    prefix + suffix: tensor
+                    for suffix, tensor in (
+                        ("weight", source.weight.tensor),
+                        ("weight_scale.nvfp4_csf_fixed", source.fixed),
+                        ("weight_scale.nvfp4_csf_exceptions", source.exceptions),
+                        ("weight_scale_2", source.global_scale),
+                        ("input_scale", source.input_scale),
+                    )
+                }
+            )
+        sources.append(tuple(projections))
+    items = list(tensors.items())
+    if reverse:
+        items.reverse()
+    # Each component in a separate shard exercises arrival-order independence.
+    mapping = {}
+    for i, (name, tensor) in enumerate(items):
+        filename = f"model-{i:03d}.safetensors"
+        save_file({name: tensor}, tmp_path / filename)
+        mapping[name] = filename
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": mapping})
     )
-
-
-def test_relative_csf_root_rejects_unresolved_hub_model():
-    from vllm.model_executor.model_loader.csf_utils import resolve_csf_checkpoint_root
-
-    with pytest.raises(ValueError, match="local model directory"):
-        resolve_csf_checkpoint_root(
-            SimpleNamespace(model="owner/model"), {"checkpoint_root": "."}
+    loader = DefaultModelLoader(LoadConfig(load_format="safetensors"))
+    loaded = set(
+        layer.load_weights(
+            loader._get_weights_iterator(
+                DefaultModelLoader.Source(str(tmp_path), revision=None)
+            )
         )
+    )
+    assert loaded == set(dict(layer.named_parameters()))
+    kwargs = dict(
+        num_experts=2,
+        hidden_size=128,
+        device="cpu",
+        w13_scale_scratch=torch.empty((2, 128, 8), dtype=torch.float8_e4m3fn),
+        w2_scale_scratch=torch.empty((2, 128, 4), dtype=torch.float8_e4m3fn),
+    )
+    actual = prepare_nvfp4_csf_weights(
+        method._expert_tensors(), intermediate_size=64, tp_rank=0, tp_size=1, **kwargs
+    )
+    expected = prepare_nvfp4_csf_weights(
+        sources, intermediate_size=128, tp_rank=rank, tp_size=2, **kwargs
+    )
+    for name in (
+        "w13",
+        "w2",
+        "w13_global_scales",
+        "w2_global_scales",
+        "input_scale",
+        "intermediate_scale",
+    ):
+        torch.testing.assert_close(
+            getattr(actual.packed, name), getattr(expected.packed, name), rtol=0, atol=0
+        )
+    for name, rows, columns in (("w13_scales", 128, 8), ("w2_scales", 128, 4)):
+        assert torch.equal(
+            decode_planes(getattr(actual, name), rows, columns, 16),
+            decode_planes(getattr(expected, name), rows, columns, 16),
+        )
+    missing = method._components[(0, "w1")].pop("fixed")
+    with pytest.raises(ValueError, match="Missing CSF tensors"):
+        list(method._expert_tensors())
+    method._components[(0, "w1")]["fixed"] = missing

@@ -361,6 +361,7 @@ class Scheduler(SchedulerInterface):
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
             enable_boundary_checkpoints=vllm_config.use_request_boundary_checkpoints,
+            num_lookahead_tokens=self.num_lookahead_tokens,
             enable_mamba_fine_grained_prefix_cache=(
                 self.cache_config.enable_mamba_fine_grained_prefix_cache
             ),

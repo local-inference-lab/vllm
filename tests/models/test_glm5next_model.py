@@ -580,10 +580,7 @@ def test_glm5next_mtp_preserves_position_zero_embedding() -> None:
     torch.testing.assert_close(projection.inputs[:, :2], inputs_embeds)
 
 
-@pytest.mark.parametrize("csf", [False, True])
-def test_glm5next_mixed_precision_reaches_mla_projections(monkeypatch, csf) -> None:
-    from vllm.model_executor.layers.quantization.nvfp4_csf import Nvfp4CsfConfig
-
+def test_glm5next_mixed_precision_reaches_mla_projections(monkeypatch) -> None:
     captured = {}
 
     class FakeModule(torch.nn.Module):
@@ -599,8 +596,7 @@ def test_glm5next_mixed_precision_reaches_mla_projections(monkeypatch, csf) -> N
     monkeypatch.setattr(glm5next_model, "Glm5NextMLP", FakeModule)
     monkeypatch.setattr(glm5next_model, "RMSNorm", FakeModule)
 
-    quant_cls = Nvfp4CsfConfig if csf else ModelOptMixedPrecisionConfig
-    quant_config = quant_cls.__new__(quant_cls)
+    quant_config = ModelOptMixedPrecisionConfig.__new__(ModelOptMixedPrecisionConfig)
     config = SimpleNamespace(
         hidden_size=16,
         is_moe=False,
@@ -3276,7 +3272,6 @@ def test_vision_constructor_preserves_explicit_mixed_recipes(
     from contextlib import nullcontext
 
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-    from vllm.model_executor.layers.quantization.nvfp4_csf import Nvfp4CsfConfig
     from vllm.model_executor.layers.quantization.online.base import (
         OnlineQuantizationConfig,
     )
@@ -3297,13 +3292,15 @@ def test_vision_constructor_preserves_explicit_mixed_recipes(
         else Fp8Config(is_checkpoint_fp8_serialized=True)
     )
     if quant_kind == "csf":
-        quant = Nvfp4CsfConfig.from_config(
+        quant = ModelOptMixedPrecisionConfig.from_config(
             {
-                "format_version": 1,
-                "checkpoint_root": "/checkpoint",
-                "source_quantization_config": {
-                    "quant_algo": "MIXED_PRECISION",
-                    "quantized_layers": quant.quantized_layers,
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    **quant.quantized_layers,
+                    "model.layers.0.mlp.experts": {
+                        "quant_algo": "NVFP4",
+                        "weight_scale_encoding": "csf",
+                    },
                 },
             }
         )
