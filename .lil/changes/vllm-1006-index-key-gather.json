@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-1006-index-key-gather",
+  "category": "performance",
+  "summary": "GLM DSA prefill with decode context parallelism gathers the index keys once per request inside the reserved workspace",
+  "models": ["GLM-5.2", "GLM-5.3"],
+  "compatibility": "Opt-in: set VLLM_DCP_INDEXER_KEY_GATHER=1 for GLM DSA launches with DCP > 1. Without it the DSA indexer keeps sharded scoring and candidate merging; captured execution and decode rows always do.",
+  "details": [
+    "This imports the index-key gather that vllm-998-ckv-selection excluded, with the buffers of vllm-1006: the exchanged key shards, the gathered keys, the selection scratch, the scores and the restored selection are views of one workspace borrow, reserved before KV-cache sizing for max_model_len and the largest prefill step and shared with the CKV gather receive buffer. A request beyond the reservation fails on the locked workspace instead of allocating.",
+    "Each DCP rank contributes its key shard once per indexer layer; the tensor-parallel ranks score disjoint row slices against the whole context and all-gather only the selected indices, instead of exchanging every shard's top-k candidates and scores for every row. Shard scores are allocated only for the decode rows that keep candidate merging.",
+    "GLM-5.3-NVFP4-CSF at TP8 DCP2 (MTP3) with the CKV gather, prefill tok/s at 8K / 32K / 128K: 7,397 / 7,068 / 6,704 with candidate merging -> 7,815 / 7,515 / 7,488. With the KV cache profiled at 92% GPU memory (1,217,792 tokens), candidate merging ran out of memory in its 256 MiB candidate all-gather on the first 8K prompt, while the key gather served a 1,048,448-token prompt, 64 concurrent 8K prompts and 4 minutes of 1K-96K prompts with at least 607 MiB free per GPU."
+  ],
+  "authors": ["voipmonitor"],
+  "pull_requests": [998, 1006],
+  "requires": ["vllm-998-ckv-selection", "vllm-1006"]
+}
