@@ -1,0 +1,20 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-997",
+  "category": "internal",
+  "summary": "A vLLM wheel that reuses the native objects of an earlier build no longer fails before packaging",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No change to wheels built from source.",
+  "details": [
+    "The precompiled build stage has no build/ directory; the cleanup of staged Python modules now skips it. This unblocks the DGX Spark image, whose vLLM reuses arm64 native objects."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    997
+  ],
+  "requires": []
+}

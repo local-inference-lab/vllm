@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-1002",
+  "category": "feature",
+  "summary": "Read NVFP4-CSF checkpoints in the Hugging Face layout, including their quantized vision towers",
+  "models": ["GLM-5.3-Flash", "Qwen3.8-Flash-Next"],
+  "compatibility": "No user action required. Checkpoints whose ModelOpt recipes declare weight_scale_encoding: csf load without a serving directory, checkpoint_root or --load-format; the lil-nvfp4-csf-checkpoint/1 container keeps working.",
+  "details": [
+    "The checkpoint contract comes from model.safetensors.index.json: compressed routed-expert scales are .nvfp4_csf_fixed / .nvfp4_csf_exceptions streams in any checkpoint-local shard, and the model family follows from the compressed inventory.",
+    "Stored vision recipes apply: model.visual.* recipes resolve for the tower's modules, and GLM-5.3-Flash uses them instead of online MXFP8 (which stays the fallback for BF16 towers).",
+    "GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD@dec48abd and Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD@dc5b8ab2 at TP2: KV 1,844,162 and 5,065,660 tokens, vision checks 11/11 and 10/11, no CJK leakage, decode steps/s C1 69.3 and 95.7 on RTX PRO 6000 Max-Q."
+  ],
+  "authors": ["voipmonitor"],
+  "pull_requests": [1002],
+  "requires": []
+}

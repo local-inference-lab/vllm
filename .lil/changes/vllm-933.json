@@ -1,0 +1,17 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-933",
+  "category": "fix",
+  "summary": "Correction: DeepSeek-V4.1 decode drift is not fixed; the compressor-ring change from beta 6e8298a1 had no effect and is removed",
+  "models": [
+    "DeepSeek-V4.1-Flash"
+  ],
+  "compatibility": "No user action required. Output is the same as with the previous betas.",
+  "details": [
+    "The note \"Keep DeepSeek-V4.1 compressor state across decode steps past the ring size\" (vllm #926/#927) was wrong: ring groups do not use the slot mapping that change edited, so it never ran. Measured decode-vs-prefill divergence over 2K tokens was the same with and without it. The drift remains under investigation."
+  ],
+  "pull_requests": [
+    933
+  ],
+  "requires": []
+}

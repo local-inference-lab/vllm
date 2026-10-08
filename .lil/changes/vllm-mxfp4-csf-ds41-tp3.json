@@ -10,6 +10,6 @@
     "The checkpoint keeps its source config; the existing TP3 attention head padding applies at runtime."
   ],
   "authors": ["Defilan"],
-  "pull_requests": [],
+  "pull_requests": [982],
   "requires": []
 }

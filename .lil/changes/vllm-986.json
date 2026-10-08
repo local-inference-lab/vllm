@@ -1,0 +1,25 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-986",
+  "category": "performance",
+  "summary": "GLM-5.3 (744B) decodes 5-9% faster at TP8: attention weights are prefetched into L2 while the MoE all-reduce and attention kernels run",
+  "models": [
+    "GLM-5.3"
+  ],
+  "compatibility": "No user action required. VLLM_L2_PREFETCH=0 disables it; VLLM_L2_PREFETCH_WINDOWS=moe or attn keeps one window.",
+  "details": [
+    "A side-stream Triton kernel loads the next layer's fused_qkv_a_proj, q_b_proj and indexer wq_b during the MoE all-reduce (up to 64 padded tokens) and the layer's o_proj at the start of attention (up to 8 padded tokens), only inside full CUDA graphs.",
+    "TP8, DCP1, MTP3 on 8x RTX PRO 6000: MTP-normalized decode steps/s 69.0 -> 73.3 at C1, 118.0 -> 128.3 at C2, 184.4 -> 187.5 at C4 (context 0); +5% to +9% through 128K context; prefill unchanged.",
+    "Ported from joninco's GLM-5.3 image (joninco/vllm 6b46727a23, e5b3afd147, 4b07d2370b, a9cab9e774)."
+  ],
+  "authors": [
+    "joninco",
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    986
+  ],
+  "requires": [
+    "vllm-985"
+  ]
+}
