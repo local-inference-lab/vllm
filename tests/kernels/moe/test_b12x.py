@@ -26,6 +26,11 @@ from tests.kernels.utils import torch_moe
 from tests.quantization.reference_mxfp4 import dq_mxfp4_torch
 from vllm import _custom_ops as ops
 from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
+from vllm.forward_context import (
+    ForwardContext,
+    MoEPrefillMetadata,
+    override_forward_context,
+)
 from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
@@ -953,6 +958,128 @@ def test_b12x_moe_uses_minimax_swiglu_parameters() -> None:
     experts = B12xExperts(config, _quant_config("mxfp4", None))
 
     assert experts._swiglu_params(config.activation) == (7.0, 1.702, 1.0)
+
+
+@pytest.mark.parametrize(
+    "prefill_ranges,capturing,enabled,calibrated,expected",
+    [
+        (
+            ((0, 1), (7, 17), (23, 25)),
+            False,
+            True,
+            True,
+            [
+                (0, 1, True),
+                (1, 7, False),
+                (7, 17, True),
+                (17, 23, False),
+                (23, 25, True),
+                (25, 32, False),
+            ],
+        ),
+        ((), False, True, True, [(0, 32, False)]),
+        (((0, 32),), False, True, True, [(0, 32, True)]),
+        (None, False, True, True, [(0, 32, False)]),
+        (((0, 32),), True, True, True, [(0, 32, False)]),
+        (((0, 32),), False, False, True, [(0, 32, False)]),
+        (((0, 32),), False, True, False, [(0, 32, None)]),
+    ],
+)
+def test_b12x_hybrid_prefill_preserves_decode_rows_and_shared_workspace(
+    monkeypatch, prefill_ranges, capturing, enabled, calibrated, expected
+):
+    """Semantic ranges choose precision without changing row or scratch ownership."""
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", "1536" if enabled else "0")
+    monkeypatch.setattr(b12x, "_is_current_stream_capturing", lambda: capturing)
+    experts = B12xExperts(
+        make_dummy_moe_config(hidden_dim=8, intermediate_size=32),
+        _quant_config("nvfp4", None),
+    )
+    experts._prepared_experts = SimpleNamespace(
+        _impl=SimpleNamespace(a4_prefill_scales=calibrated)
+    )
+    experts._plan = object()
+    experts._plan_key = ((32,),)
+    experts._plan_activation = MoEActivation.SILU
+    experts._plan_route_on_input = False
+    experts.scales_expanded = True
+    hidden = torch.arange(32 * 8, dtype=torch.float32).reshape(32, 8)
+    output = torch.empty_like(hidden)
+    workspace = torch.empty(64, dtype=torch.uint8)
+    ids = torch.zeros(32, 2, dtype=torch.int32)
+    weights = torch.ones(32, 2)
+    calls = []
+
+    def run(*, binding):
+        start = (binding["a"].data_ptr() - hidden.data_ptr()) // (8 * 4)
+        end = start + binding["a"].shape[0]
+        a4 = binding.get("a4_prefill")
+        calls.append((start, end, a4))
+        assert binding["scratch"].data_ptr() == workspace.data_ptr()
+        assert binding["topk_ids"].data_ptr() == ids[start:end].data_ptr()
+        assert binding["topk_weights"].data_ptr() == weights[start:end].data_ptr()
+        assert binding["scales_expanded"]
+        binding["output"].copy_(binding["a"] + (1000 if a4 else 0))
+
+    monkeypatch.setattr(
+        b12x,
+        "_require_b12x_fused_moe",
+        lambda: SimpleNamespace(bind=lambda plan, **kwargs: kwargs, run=run),
+    )
+    metadata = (
+        None if prefill_ranges is None else MoEPrefillMetadata(32, prefill_ranges)
+    )
+    context = ForwardContext({}, {}, {}, moe_prefill_metadata=metadata)
+    # Configuration is fixed when the expert owner is constructed.
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", "0" if enabled else "1536")
+    with override_forward_context(context):
+        experts.apply(
+            output=output,
+            hidden_states=hidden,
+            w1=None,
+            w2=None,
+            topk_weights=weights,
+            topk_ids=ids,
+            activation=MoEActivation.SILU,
+            global_num_experts=1,
+            expert_map=None,
+            a1q_scale=None,
+            a2_scale=None,
+            workspace13=None,
+            workspace2=workspace,
+            expert_tokens_meta=None,
+            apply_router_weight_on_input=False,
+        )
+    assert calls == expected
+    for start, end, a4 in expected:
+        torch.testing.assert_close(
+            output[start:end], hidden[start:end] + (1000 if a4 else 0)
+        )
+
+
+def test_b12x_hybrid_prefill_rejects_reshaped_inputs_and_ignores_capture_metadata(
+    monkeypatch,
+):
+    context = ForwardContext(
+        {}, {}, {}, moe_prefill_metadata=MoEPrefillMetadata(8, ((0, 8),))
+    )
+    monkeypatch.setattr(b12x, "_is_current_stream_capturing", lambda: False)
+    with override_forward_context(context):
+        with pytest.raises(ValueError, match="expected 8 rows, got 4"):
+            b12x._a4_prefill_parts(4)
+        monkeypatch.setattr(b12x, "_is_current_stream_capturing", lambda: True)
+        assert b12x._a4_prefill_parts(4) == ((0, 4, False),)
+
+
+@pytest.mark.parametrize(
+    "field,value", [("dp_size", 2), ("pcp_size", 2), ("sp_size", 2)]
+)
+def test_b12x_hybrid_prefill_rejects_token_redistribution(monkeypatch, field, value):
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", "1536")
+    config = make_dummy_moe_config(hidden_dim=128, intermediate_size=64)
+    setattr(config.moe_parallel_config, field, value)
+    with pytest.raises(NotImplementedError, match="supports TP/DCP"):
+        B12xExperts(config, _quant_config("nvfp4", None))
 
 
 @pytest.mark.parametrize(

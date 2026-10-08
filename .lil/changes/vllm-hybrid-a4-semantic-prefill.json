@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-hybrid-a4-semantic-prefill",
+  "category": "feature",
+  "summary": "Enable opt-in calibrated A4 prefill while preserving A16 decode and speculative verification",
+  "models": ["GLM-5.3-Flash"],
+  "compatibility": "Requires FlashInfer with B12X hybrid A4 prefill support. Set B12X_W4A16_A4_PREFILL_MIN_TOKENS to a positive value before worker startup to enable lossy activation quantization; the default remains disabled.",
+  "details": [
+    "Host request metadata distinguishes short and chunked prefills from speculative verification for arbitrary draft counts and interleaved DCP batches.",
+    "CUDA graph capture and replay, draft execution and layers without eligible calibrated scales retain A16.",
+    "Hybrid prefill supports TP and DCP; token redistribution through DP, EP, PCP, sequence parallelism, microbatching or GPU adaptive verification is rejected."
+  ],
+  "pull_requests": [970, 977],
+  "authors": ["voipmonitor", "lukealonso"]
+}

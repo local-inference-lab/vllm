@@ -38,7 +38,11 @@ from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
 )
-from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.forward_context import (
+    BatchDescriptor,
+    MoEPrefillMetadata,
+    set_forward_context,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
@@ -216,6 +220,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.speculative_config is not None and self.speculative_config.use_dspark()
         )
         self.observability_config = vllm_config.observability_config
+        from vllm.utils.b12x import is_b12x_a4_prefill_enabled
+
+        self._b12x_a4_prefill_enabled = is_b12x_a4_prefill_enabled()
         self.jit_warmup_registry = JitWarmupRegistry(vllm_config)
 
         self.device = device
@@ -1465,6 +1472,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_reqs, num_toks, max_query_len, batch_state.has_prefill
         )
 
+    def _build_moe_prefill_metadata(
+        self, input_batch: InputBatch
+    ) -> MoEPrefillMetadata | None:
+        if not self._b12x_a4_prefill_enabled:
+            return None
+        from vllm.utils.b12x import build_moe_prefill_metadata
+
+        return build_moe_prefill_metadata(
+            input_batch.num_tokens_after_padding,
+            input_batch.query_start_loc_np[: input_batch.num_reqs + 1],
+            input_batch.num_computed_tokens_np,
+            self.req_states.prompt_len.np[input_batch.idx_mapping_np],
+        )
+
     def prepare_inputs(
         self,
         scheduler_output: SchedulerOutput,
@@ -2227,6 +2248,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
+                moe_prefill_metadata=(
+                    self._build_moe_prefill_metadata(input_batch)
+                    if not dummy_run
+                    else None
+                ),
             ):
                 self.kv_connector.pre_forward(**connector_kwargs)
                 if ubatch_state is not None:

@@ -5,10 +5,12 @@ import contextlib
 from types import SimpleNamespace
 from weakref import ref
 
+import numpy as np
 import pytest
 import torch
 
 import vllm.v1.worker.gpu.model_runner as model_runner_module
+from vllm.forward_context import MoEPrefillMetadata
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
@@ -20,6 +22,30 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+
+@pytest.mark.parametrize("draft_tokens", [0, 1, 3, 5, 7])
+def test_moe_prefill_metadata_uses_original_prompt_in_request_state_order(draft_tokens):
+    """Recomputed completion tokens and speculative rows must retain A16."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner._b12x_a4_prefill_enabled = True
+    runner.req_states = SimpleNamespace(
+        prompt_len=SimpleNamespace(np=np.array([100, 2, 80])),
+    )
+    query = draft_tokens + 1
+    batch = SimpleNamespace(
+        num_reqs=3,
+        num_tokens_after_padding=query + 16,
+        idx_mapping_np=np.array([2, 1, 0]),
+        query_start_loc_np=np.array([0, query, query + 2, query + 10]),
+        num_computed_tokens_np=np.array([100, 0, 98]),
+        prefill_len_np=np.array([120, 2, 110]),
+    )
+    assert runner._build_moe_prefill_metadata(batch) == MoEPrefillMetadata(
+        query + 16, ((query, query + 4),)
+    )
+    runner._b12x_a4_prefill_enabled = False
+    assert runner._build_moe_prefill_metadata(batch) is None
 
 
 @pytest.mark.parametrize("recovery", [False, True])

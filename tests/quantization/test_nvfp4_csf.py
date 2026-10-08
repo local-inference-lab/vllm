@@ -133,6 +133,55 @@ def test_prepared_nvfp4_accepts_kernel_order_and_rejects_activation_change(monke
         backend.install_prepared_experts(layer, prepared)
 
 
+@pytest.mark.parametrize("use_a16", [False, True])
+def test_csf_preparation_preserves_explicit_a16_cutoff(monkeypatch, use_a16):
+    """CSF installation must retain the precision constraint in its weight plan."""
+    from b12x.moe import fused_moe
+
+    monkeypatch.setenv("VLLM_B12X_ACTIVATION_MODE_A16_M", "32")
+    moe = FusedMoEConfig(
+        num_experts=1,
+        num_local_experts=1,
+        num_logical_experts=1,
+        experts_per_token=1,
+        hidden_dim=256,
+        intermediate_size=128,
+        in_dtype=torch.bfloat16,
+        device="cpu",
+        activation=MoEActivation.SILU,
+        routing_method=RoutingMethodType.TopK,
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+    )
+    method = Nvfp4CsfMoEMethod(
+        moe, SimpleNamespace(scale_scratch=None), use_a16=use_a16
+    )
+    layer = torch.nn.Module()
+    layer.layer_name = "model.layers.3.mlp.experts"
+    method.create_weights(layer, 1, 256, 128, torch.bfloat16)
+    projections = []
+    for rows, channels in ((128, 256), (128, 256), (256, 128)):
+        source, _ = matrix(rows, channels, group_size=16, seed=7)
+        projections.append(
+            replace(
+                source,
+                global_scale=torch.tensor(1.0),
+                input_scale=torch.tensor(0.5),
+            )
+        )
+    monkeypatch.setattr(method, "_expert_tensors", lambda: iter([tuple(projections)]))
+    plans = []
+
+    def stop_before_cuda_preparation(*, plan, weights):
+        plans.append(plan)
+        raise StopIteration
+
+    monkeypatch.setattr(fused_moe, "prepare_weights", stop_before_cuda_preparation)
+    with pytest.raises(StopIteration):
+        method.process_weights_after_loading(layer)
+    assert plans[0].activation.a16_max_tokens == (32 if use_a16 else 0)
+    assert plans[0].activation.mode == ("a16" if use_a16 else "a4")
+
+
 @pytest.mark.parametrize("load_format", ["auto", "safetensors"])
 def test_standard_loader_yields_all_csf_components_and_native_tensors(
     tmp_path, load_format

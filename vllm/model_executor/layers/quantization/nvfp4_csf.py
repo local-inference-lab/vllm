@@ -28,6 +28,7 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
     MoEPrepareAndFinalizeNoDPEPModular,
 )
 from vllm.model_executor.weight_transfer import copy_weight, materialize_weight
+from vllm.utils.b12x import get_b12x_a16_max_tokens
 from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import set_default_torch_num_threads
 
@@ -323,6 +324,7 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
                 nonlinearity="silu",
                 io_dtype=torch.bfloat16,
                 swiglu_limit=self.moe.swiglu_limit,
+                a16_max_tokens=get_b12x_a16_max_tokens() if self.use_a16 else 0,
             ),
             geometry=fused_moe.MoEGeometry(
                 num_experts=e, hidden_size=h, intermediate_size=n
