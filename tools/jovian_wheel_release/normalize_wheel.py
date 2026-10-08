@@ -83,7 +83,12 @@ def rewrite_requirements(
         replacement = replacements.get(name)
         if replacement is not None:
             seen.add(name)
-            rewritten.append(replacement)
+            pinned = Requirement(replacement)
+            # An extra's requirement, such as flashinfer-python[b12x] for
+            # vllm[b12x], keeps its own extras and marker.
+            pinned.extras |= requirement.extras
+            pinned.marker = requirement.marker
+            rewritten.append(str(pinned))
         else:
             rewritten.append(value)
 
