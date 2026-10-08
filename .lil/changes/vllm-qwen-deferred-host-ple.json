@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-qwen-deferred-host-ple",
+  "category": "fix",
+  "summary": "Load deferred Qwen PLE checkpoint shards into host-memory tables",
+  "models": ["Qwen3.8-Flash-Next"],
+  "compatibility": "No configuration change is required. Host-memory PLE tables remain in their configured storage precision and placement.",
+  "details": [
+    "The b12x checkpoint transport accepts CUDA destinations. Loading a deferred PLE shard into a host-memory table first materializes only the tensor-parallel overlap through the transport, then copies the completed values into the host load view.",
+    "Eager checkpoint tensors and CUDA destinations retain their existing transfer paths. Temporary shard materialization occurs only during model loading."
+  ],
+  "pull_requests": [],
+  "requires": []
+}

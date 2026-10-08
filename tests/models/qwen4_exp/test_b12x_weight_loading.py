@@ -455,6 +455,49 @@ def test_nvfp4_ple_loader_keeps_local_table_packed() -> None:
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize("deferred", [False, True])
+def test_host_ple_shard_materializes_only_deferred_tp_overlap(dtype, deferred):
+    from vllm.model_executor.weight_transfer import weight_transfer
+    from vllm.models.qwen4_exp.nvidia.b12x_ple import _copy_embedding_shard
+
+    values = torch.arange(12).reshape(6, 2).to(dtype)
+    source = torch.empty_like(values, device="meta") if deferred else values
+    destination = torch.zeros((6, 2), dtype=dtype)
+    materialized = []
+
+    class CudaDestinationWriter:
+        def __call__(self, target, value):
+            assert not value.is_meta
+            return False
+
+        def materialize(self, value):
+            assert value.untyped_storage()._cdata == source.untyped_storage()._cdata
+            materialized.append((value.shape, value.storage_offset()))
+            return values.as_strided(
+                value.shape, value.stride(), value.storage_offset()
+            ).clone()
+
+    with weight_transfer(CudaDestinationWriter()):
+        assert (
+            _copy_embedding_shard(
+                destination, source, checkpoint_start=12, tp_start=4, tp_end=10
+            )
+            is None
+        )
+        assert materialized == []
+        target = _copy_embedding_shard(
+            destination, source, checkpoint_start=2, tp_start=4, tp_end=10
+        )
+    assert target is not None and target.shape == (4, 2)
+    assert target.data_ptr() == destination.data_ptr()
+    assert materialized == ([(torch.Size([4, 2]), 4)] if deferred else [])
+    torch.testing.assert_close(
+        destination[:4].float(), values[2:].float(), rtol=0, atol=0
+    )
+    assert torch.count_nonzero(destination[4:].float()) == 0
+
+
 def test_ple_embedding_uses_query_offsets_for_live_token_count() -> None:
     embedding = B12xNGramEmbedding.__new__(B12xNGramEmbedding)
     nn.Module.__init__(embedding)

@@ -24,6 +24,7 @@ from vllm.model_executor.weight_transfer import (
     copy_weight,
     flush_weight_transfers,
     get_file_tensor_source,
+    materialize_weight,
 )
 from vllm.platforms import current_platform
 from vllm.utils.b12x import (
@@ -159,6 +160,8 @@ def _copy_embedding_shard(
     source = loaded_weight.narrow(0, overlap_start - checkpoint_start, rows)
     target = destination.narrow(0, overlap_start - tp_start, rows)
     with torch.no_grad():
+        if target.device.type == "cpu" and source.is_meta:
+            source = materialize_weight(source)
         copy_weight(target, source)
     return target
 
