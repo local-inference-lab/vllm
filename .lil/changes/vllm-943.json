@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-943",
+  "category": "fix",
+  "summary": "DeepSeek-V4.1 on RTX PRO 6000, RTX 5090 and DGX Spark no longer drifts away from the model as a generation gets longer",
+  "models": ["DeepSeek-V4.1-Flash"],
+  "compatibility": "No user action required. Affected every earlier DeepSeek-V4.1 image, beta and canonical, on SM12x GPUs (RTX PRO 6000, RTX 5090, DGX Spark). DeepSeek-V4.1 on other GPUs runs a different implementation and was not affected, and no other model uses this path. Supersedes the vllm-933 note, which measured only the first half of vllm #926.",
+  "details": [
+    "What was wrong: DeepSeek-V4.1 packs groups of tokens into compressed KV entries that its sparse attention reads across the context. During decode, the compressor's partial state for newly generated tokens was never stored, because circular-buffer KV groups got no worker slot mapping. Compressed entries covering generated text were therefore built from stale state. Prompt processing (prefill) was correct.",
+    "Consequence: the longer the answer, the more generation diverged from what the model computes for the same text. Over 8 greedy 2,048-token generations, the divergence of the next-token distribution from a prefill of the same text (KL) grew from 0.038 over the first 256 tokens to 0.156 over tokens 1,536-2,048, where the top-1 token differed at 7.6% of positions. Longer outputs, such as long reasoning, were likely affected more; we did not measure beyond 2,048 tokens.",
+    "With the fix the divergence is 0.018-0.030 at every length, and the top-1 token differs at 3-5% of positions, the residual numeric difference between decode and prefill. Decode speed, DSpark acceptance and KV cache size are unchanged."
+  ],
+  "authors": ["MadeBy561"],
+  "pull_requests": [943, 926],
+  "requires": []
+}

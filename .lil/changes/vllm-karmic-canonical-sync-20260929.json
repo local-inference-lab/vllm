@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-karmic-canonical-sync-20260929",
+  "category": "compatibility",
+  "summary": "Carry the current canonical Karmic runtime into beta: Kimi-K3 EXL3 serving, MLA memory and DCP transport options, activation reuse and decode scheduling options",
+  "models": ["Kimi-K3"],
+  "compatibility": "No user action required. The new MLA workspace, DCP transport, projection sharding, prefetch and draft-cache controls are opt-in and default off.",
+  "details": [
+    "Kimi-K3 MLA gets configurable context workspaces, projection scratch reuse, optional PCIe query and LSE transport and context-gather overlap (#924).",
+    "Kimi-K3 bounds vision intermediates, gathers variable-length image embeddings without padding, reuses consumed activations and adds optional projection sharding, L2 prefetch and KDA projection overlap (#925).",
+    "The B12X attention backend selects B12X MLA for dense MLA layers; sparse MLA layers keep their existing backend."
+  ],
+  "authors": ["voipmonitor", "lukealonso"],
+  "pull_requests": [924, 925],
+  "requires": ["vllm-842", "b12x-master-sync-20260929"]
+}

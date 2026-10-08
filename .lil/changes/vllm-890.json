@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-890",
+  "category": "fix",
+  "summary": "Revert the dummy-draft block-table change (#885): startup crashed with FlashInfer autotune",
+  "models": ["all"],
+  "compatibility": "No user action required. Beta 3e670ca5 could fail at startup with a CUDA device-side assert when FlashInfer autotune is on (DS4 profiles by default, GLM TP3).",
+  "details": [
+    "#885 marked every row of a dummy draft batch as padding. Warmup dummy runs then passed -1 indices to the GLM-5.3 pooled indexer, which index_select rejects.",
+    "The data-parallel fix it carried will return once the consumers handle padded rows."
+  ],
+  "pull_requests": [890],
+  "requires": []
+}

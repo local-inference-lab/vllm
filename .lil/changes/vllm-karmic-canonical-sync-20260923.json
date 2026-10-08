@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-karmic-canonical-sync-20260923",
+  "category": "compatibility",
+  "summary": "Carry the current canonical Karmic runtime into beta",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Weights load into ordinary PyTorch allocations; the loader keeps only its scoped checkpoint-copy transport.",
+    "Block-FP8 linears and DeepSeek attention-output projections are prepared with a capacity plan, so intermediate live sizes reuse prepared kernels while serving.",
+    "Qwen QSA derives page alignment from the speculative ring and accepts more than four MTP draft tokens.",
+    "Adaptive speculative verification warms each captured shape before timing and alternates sample rounds on every worker."
+  ],
+  "authors": ["lukealonso"],
+  "requires": ["b12x-master-sync-20260923"]
+}

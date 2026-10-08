@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-941",
+  "category": "fix",
+  "summary": "Startup releases its B12X profiling plans in one batch, so program reclamation and garbage collection run once instead of once per plan",
+  "models": ["all"],
+  "compatibility": "No user action required. With a B12X release that has no batched release, plans are released one at a time as before.",
+  "details": [
+    "B12X now reclaims unused programs and runs a full garbage collection after every release call. vLLM released each profiling plan separately, so a start with thousands of plans spent that time once per plan: DeepSeek-V4.1 TP4 and MiMo-V2.6 TP2 did not finish starting within an hour, and GLM-5.3 and Qwen3.8 started minutes later.",
+    "The prepared batch now goes to B12X in one release_many call. DeepSeek-V4.1 TP4 starts in about 6 minutes again, with the same KV cache size and decode speed."
+  ],
+  "pull_requests": [941],
+  "requires": []
+}
