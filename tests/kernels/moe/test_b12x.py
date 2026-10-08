@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import gc
 import weakref
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, make_dataclass, replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -1055,6 +1055,29 @@ def test_b12x_hybrid_prefill_preserves_decode_rows_and_shared_workspace(
         torch.testing.assert_close(
             output[start:end], hidden[start:end] + (1000 if a4 else 0)
         )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("compatible", [False, True])
+def test_b12x_hybrid_prefill_requires_compatible_api(monkeypatch, enabled, compatible):
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", "1536" if enabled else "0")
+    binding_type = make_dataclass(
+        "Binding", [("a4_prefill_launches", object, None)] if compatible else []
+    )
+    monkeypatch.setattr(
+        b12x,
+        "_require_b12x_fused_moe",
+        lambda: SimpleNamespace(Binding=binding_type),
+    )
+    config = make_dummy_moe_config(hidden_dim=128, intermediate_size=64)
+    if enabled and not compatible:
+        with pytest.raises(
+            RuntimeError, match="requires a compatible FlashInfer build"
+        ):
+            B12xExperts(config, _quant_config("nvfp4", None))
+    else:
+        experts = B12xExperts(config, _quant_config("nvfp4", None))
+        assert experts._a4_prefill_enabled is enabled
 
 
 def test_b12x_hybrid_prefill_rejects_reshaped_inputs_and_ignores_capture_metadata(

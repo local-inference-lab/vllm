@@ -356,6 +356,14 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                     "B12X hybrid A4 prefill requires host-visible token ranges; "
                     "adaptive verification changes token ranges on the GPU"
                 )
+            binding_type = getattr(_require_b12x_fused_moe(), "Binding", None)
+            if "a4_prefill_launches" not in getattr(
+                binding_type, "__dataclass_fields__", {}
+            ):
+                raise RuntimeError(
+                    "B12X hybrid A4 prefill requires a compatible FlashInfer build "
+                    "with B12X hybrid kernels and the bind(a4_prefill=...) API"
+                )
         self._source_parameters_released = False
         self._unit_scales: dict[torch.device, torch.Tensor] = {}
         self._apply_router_weight_on_input = False
