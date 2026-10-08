@@ -9,6 +9,7 @@
     "The b12x checkpoint transport accepts CUDA destinations. Loading a deferred PLE shard into a host-memory table first materializes only the tensor-parallel overlap through the transport, then copies the completed values into the host load view.",
     "Eager checkpoint tensors and CUDA destinations retain their existing transfer paths. Temporary shard materialization occurs only during model loading."
   ],
+  "authors": ["lukealonso"],
   "pull_requests": [],
   "requires": []
 }
