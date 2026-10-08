@@ -269,9 +269,8 @@ def _loading_with_native_output():
     from types import SimpleNamespace
     from unittest.mock import patch
 
-    from b12x.integration.vllm.loader import B12xModelLoader
-
     from vllm.config.load import LoadConfig
+    from vllm.model_executor.model_loader.b12x_loader import B12xModelLoader
     from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
     from vllm.utils.system_utils import decorate_logs
 
