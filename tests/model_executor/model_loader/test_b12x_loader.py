@@ -35,9 +35,9 @@ def test_load_format_selects_native_b12x_with_or_without_plugin(
     )
     model_loader._LOAD_FORMAT_TO_MODEL_LOADER.pop("b12x", None)
     if register_plugin:
-        from b12x.integration.vllm.loader import register_b12x_loader
-
-        register_b12x_loader()
+        # FlashInfer's B12X ships without the standalone vLLM plugin package.
+        plugin = pytest.importorskip("b12x.integration.vllm.loader")
+        plugin.register_b12x_loader()
     config = LoadConfig(
         load_format="b12x", model_loader_extra_config={"read_mode": "bounce"}
     )

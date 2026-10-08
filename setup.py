@@ -1537,7 +1537,8 @@ setup(
         # only; also needs system GStreamer + libv4l (see docs).
         "deepstream": ["nvidia-deepstream-videodecode-cu13>=9.0.2"],
         "flashinfer": [],  # Kept for backwards compatibility
-        "b12x": ["b12x==1.3.0"],
+        # B12X is part of FlashInfer; its extra adds the pinned CuTe DSL.
+        "b12x": ["flashinfer-python[b12x]==0.7.1"],
         # Optional deps for Helion kernel development
         # NOTE: When updating helion version, also update CI files:
         #   - .buildkite/test_areas/kernels.yaml
