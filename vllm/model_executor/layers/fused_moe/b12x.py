@@ -3,6 +3,7 @@
 """b12x modular tensor-parallel fused MoE backend."""
 
 import functools
+import inspect
 import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -360,13 +361,17 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 )
             fused_moe = _require_b12x_fused_moe()
             binding_type = getattr(fused_moe, "Binding", None)
-            if not callable(getattr(fused_moe, "uses_expanded_nvfp4_scales", None)) or (
-                "a4_prefill_launches"
+            scale_query = getattr(fused_moe, "uses_expanded_nvfp4_scales", None)
+            if (
+                not callable(scale_query)
+                or "scales_expanded" not in inspect.signature(scale_query).parameters
+                or "a4_prefill_launches"
                 not in getattr(binding_type, "__dataclass_fields__", {})
             ):
                 raise RuntimeError(
                     "B12X hybrid A4 prefill requires a compatible FlashInfer build "
-                    "with semantic A4 selection and the uses_expanded_nvfp4_scales API"
+                    "with semantic A4 selection and the "
+                    "uses_expanded_nvfp4_scales(scales_expanded=...) API"
                 )
         self._source_parameters_released = False
         self._unit_scales: dict[torch.device, torch.Tensor] = {}
@@ -833,12 +838,13 @@ class B12xExperts(mk.FusedMoEExpertsModular):
     def uses_expanded_nvfp4_scales(
         self, tokens: int, route_ids_dtype: torch.dtype
     ) -> bool:
-        """Query the prepared consumers for this layer's semantic row ranges."""
+        """Query whether this layer's semantic spans can use prefetched scales."""
         return any(
             _require_b12x_fused_moe().uses_expanded_nvfp4_scales(
                 self._plan,
                 num_tokens=end - start,
                 a4_prefill=a4_prefill,
+                scales_expanded=True,
                 route_ids_dtype=route_ids_dtype,
             )
             for start, end, a4_prefill in self._execution_parts(tokens)

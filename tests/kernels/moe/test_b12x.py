@@ -1082,16 +1082,16 @@ def test_b12x_hybrid_prefill_rejects_invalid_boolean(monkeypatch, value):
 @pytest.mark.parametrize(
     "ranges,calibrated,expected_calls,expanded",
     [
-        (((0, 3072),), True, [(3072, True)], False),
+        (((0, 3072),), True, [(3072, True)], True),
         ((), True, [(3072, False)], True),
-        (((4, 3072),), True, [(4, False), (3068, True)], False),
+        (((4, 3072),), True, [(4, False), (3068, True)], True),
         (((0, 3072),), False, [(3072, False)], True),
     ],
 )
 def test_b12x_hybrid_prefill_queries_selected_scale_consumers(
     monkeypatch, ranges, calibrated, expected_calls, expanded
 ):
-    """Prefetch inspects this layer's prepared variants for each semantic span."""
+    """Prefetch queries prospective readiness for each following-layer span."""
     monkeypatch.setenv("B12X_W4A16_A4_PREFILL", "1")
     monkeypatch.setattr(b12x, "_is_current_stream_capturing", lambda: False)
     experts = B12xExperts(
@@ -1104,11 +1104,12 @@ def test_b12x_hybrid_prefill_queries_selected_scale_consumers(
     experts._plan = object()
     calls = []
 
-    def query(plan, *, num_tokens, a4_prefill, route_ids_dtype):
+    def query(plan, *, num_tokens, a4_prefill, scales_expanded, route_ids_dtype):
         assert plan is experts._plan
+        assert scales_expanded is True
         assert route_ids_dtype == torch.int64
         calls.append((num_tokens, a4_prefill))
-        return not a4_prefill and num_tokens > 4
+        return num_tokens > (1536 if a4_prefill else 4)
 
     monkeypatch.setattr(
         b12x,
@@ -1126,25 +1127,31 @@ def test_b12x_hybrid_prefill_queries_selected_scale_consumers(
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("binding_supported", [False, True])
 @pytest.mark.parametrize("semantic_supported", [False, True])
+@pytest.mark.parametrize("readiness_supported", [False, True])
 def test_b12x_hybrid_prefill_requires_compatible_api(
-    monkeypatch, enabled, binding_supported, semantic_supported
+    monkeypatch, enabled, binding_supported, semantic_supported, readiness_supported
 ):
     monkeypatch.setenv("B12X_W4A16_A4_PREFILL", "1" if enabled else "0")
     binding_type = make_dataclass(
         "Binding", [("a4_prefill_launches", object, None)] if binding_supported else []
+    )
+    query = (
+        (lambda *a, scales_expanded=False, **k: False)
+        if readiness_supported
+        else (lambda *a, **k: False)
     )
     monkeypatch.setattr(
         b12x,
         "_require_b12x_fused_moe",
         lambda: SimpleNamespace(
             Binding=binding_type,
-            uses_expanded_nvfp4_scales=(lambda *a, **k: False)
-            if semantic_supported
-            else None,
+            uses_expanded_nvfp4_scales=query if semantic_supported else None,
         ),
     )
     config = make_dummy_moe_config(hidden_dim=128, intermediate_size=64)
-    if enabled and not (binding_supported and semantic_supported):
+    if enabled and not (
+        binding_supported and semantic_supported and readiness_supported
+    ):
         with pytest.raises(
             RuntimeError, match="requires a compatible FlashInfer build"
         ):
