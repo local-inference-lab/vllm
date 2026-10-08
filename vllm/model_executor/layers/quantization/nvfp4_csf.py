@@ -76,6 +76,8 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
         super().__init__(moe)
         self.owner = owner
         self.use_a16 = use_a16 or bool(envs.VLLM_B12X_MOE_FP4_FORCE_A16)
+        # Set from the prepared experts in process_weights_after_loading.
+        self.a4_prefill = False
         config = get_current_vllm_config_or_none()
         if config is not None and (
             config.parallel_config.pipeline_parallel_size != 1
