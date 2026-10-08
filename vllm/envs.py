@@ -228,7 +228,6 @@ if TYPE_CHECKING:
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
-    VLLM_DCP_INDEXER_KEY_GATHER: bool = False
     VLLM_B12X_PAGED_DECODE: Literal["auto", "0", "1"] = "auto"
     VLLM_PLE_TABLE_MEMORY: Literal["ram", "disk", "shared"] | None = None
     VLLM_PLE_SHARED_TABLE_DIR: str = "/dev/shm/vllm-ple"
@@ -243,6 +242,7 @@ if TYPE_CHECKING:
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
     VLLM_DCP_Q_REPLICATE: bool = False
+    VLLM_DCP_INDEXER_KEY_GATHER: bool = False
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
@@ -1698,6 +1698,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Opt-in MLA DCP query replication: skip the decode query all-gather.
     "VLLM_DCP_Q_REPLICATE": lambda: bool(int(os.getenv("VLLM_DCP_Q_REPLICATE", "0"))),
+    # Eager B12X DSA prefill under DCP gathers each request's sharded index
+    # keys once into the reserved workspace and splits the query rows across
+    # tensor-parallel ranks, which then exchange only selected indices instead
+    # of per-shard candidates.
+    "VLLM_DCP_INDEXER_KEY_GATHER": lambda: bool(
+        int(os.getenv("VLLM_DCP_INDEXER_KEY_GATHER", "0"))
+    ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no
     # JIT'ing in the hot-path. However, this warmup increases the engine
@@ -1911,13 +1918,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS", "524288")
-    ),
-    # Eager B12X DSA prefill under DCP gathers each request's sharded index
-    # keys once into the reserved workspace and splits the query rows across
-    # tensor-parallel ranks, which then exchange only selected indices instead
-    # of per-shard candidates.
-    "VLLM_DCP_INDEXER_KEY_GATHER": lambda: bool(
-        int(os.getenv("VLLM_DCP_INDEXER_KEY_GATHER", "0"))
     ),
     # B12X attention decode/verify through b12x.attention.paged_decode:
     # "auto" for layers with unequal Q/K and V head dims and for non-causal
