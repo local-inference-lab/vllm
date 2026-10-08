@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-913",
+  "category": "fix",
+  "summary": "Shared-memory broadcast no longer drops a write notification",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "The writer's notify socket had a send high-water mark of 1, so a notification sent within about 1 ms (x86) or 3 ms (aarch64) of the previous one was dropped. A reader that had parked in between then slept until its 5 s recheck. With a short VLLM_SHM_BROADCAST_BUSY_LOOP_S this stalled requests for seconds; on 4x GB10 about a third of warm resends took 1.2-10.8 s instead of 0.1-0.4 s.",
+    "The socket now keeps the default high-water mark; the readers' conflating queue already collapses a burst of notifications into one."
+  ],
+  "pull_requests": [913],
+  "authors": ["tobymao"],
+  "requires": []
+}
