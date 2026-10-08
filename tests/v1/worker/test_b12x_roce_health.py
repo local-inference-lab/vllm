@@ -5,15 +5,15 @@
 The four-node adapter tests in b12x establish the GPU behaviour; this test
 pins where the worker runs the check relative to the step's device-to-host
 completion: immediately for a synchronous output (or ``None``), and only after
-``get_output()`` for an asynchronous output.
+``get_output()`` for an asynchronous output; and that it covers every live
+communicator of the process, not one looked up through the TP group.
 """
 
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
-import vllm.v1.worker.gpu_worker as gpu_worker_module
+import vllm.distributed.device_communicators.b12x_roce_all_reduce as roce_module
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.gpu_worker import Worker, _B12xRoceCheckedAsyncOutput
 
@@ -28,10 +28,9 @@ class _AsyncOutput(AsyncModelRunnerOutput):
         return self._result
 
 
-def _worker_with_communicator(monkeypatch, comm) -> Worker:
+def _worker_with_communicators(monkeypatch, *comms) -> Worker:
     worker = Worker.__new__(Worker)  # no GPU, no init: only the helpers are used
-    group = SimpleNamespace(device_communicator=SimpleNamespace(b12x_ar_comm=comm))
-    monkeypatch.setattr(gpu_worker_module, "get_tp_group", lambda: group)
+    monkeypatch.setattr(roce_module, "live_roce_communicators", lambda: list(comms))
     return worker
 
 
@@ -48,7 +47,7 @@ def _sync_output() -> ModelRunnerOutput:
 
 def test_sync_output_is_checked_immediately(monkeypatch):
     comm = Mock()
-    worker = _worker_with_communicator(monkeypatch, comm)
+    worker = _worker_with_communicators(monkeypatch, comm)
     output = _sync_output()
     assert worker._b12x_roce_guarded(output) is output
     comm.check_health.assert_called_once_with()
@@ -56,7 +55,7 @@ def test_sync_output_is_checked_immediately(monkeypatch):
 
 def test_none_output_is_checked_and_passed_through(monkeypatch):
     comm = Mock()
-    worker = _worker_with_communicator(monkeypatch, comm)
+    worker = _worker_with_communicators(monkeypatch, comm)
     assert worker._b12x_roce_guarded(None) is None
     comm.check_health.assert_called_once_with()
 
@@ -65,7 +64,7 @@ def test_async_output_is_checked_after_completion(monkeypatch):
     trace: list[str] = []
     comm = Mock()
     comm.check_health.side_effect = lambda: trace.append("check")
-    worker = _worker_with_communicator(monkeypatch, comm)
+    worker = _worker_with_communicators(monkeypatch, comm)
     result = _sync_output()
     wrapped = worker._b12x_roce_guarded(_AsyncOutput(result, trace))
     assert isinstance(wrapped, _B12xRoceCheckedAsyncOutput)
@@ -78,7 +77,7 @@ def test_async_output_is_checked_after_completion(monkeypatch):
 def test_failure_propagates_from_sync_and_async(monkeypatch):
     comm = Mock()
     comm.check_health.side_effect = RuntimeError("poisoned")
-    worker = _worker_with_communicator(monkeypatch, comm)
+    worker = _worker_with_communicators(monkeypatch, comm)
     with pytest.raises(RuntimeError, match="poisoned"):
         worker._b12x_roce_guarded(_sync_output())
     wrapped = worker._b12x_roce_guarded(_AsyncOutput(_sync_output(), []))
@@ -87,9 +86,18 @@ def test_failure_propagates_from_sync_and_async(monkeypatch):
 
 
 def test_no_roce_communicator_means_no_wrapping(monkeypatch):
-    for comm in (None, SimpleNamespace()):  # no adapter, or one without a check
-        worker = _worker_with_communicator(monkeypatch, comm)
-        output = _sync_output()
-        assert worker._b12x_roce_guarded(output) is output
-        async_output = _AsyncOutput(output, [])
-        assert worker._b12x_roce_guarded(async_output) is async_output
+    worker = _worker_with_communicators(monkeypatch)
+    output = _sync_output()
+    assert worker._b12x_roce_guarded(output) is output
+    async_output = _AsyncOutput(output, [])
+    assert worker._b12x_roce_guarded(async_output) is async_output
+
+
+def test_every_live_communicator_is_checked(monkeypatch):
+    first, second = Mock(), Mock()
+    second.check_health.side_effect = RuntimeError("poisoned")
+    worker = _worker_with_communicators(monkeypatch, first, second)
+    with pytest.raises(RuntimeError, match="poisoned"):
+        worker._b12x_roce_guarded(_sync_output())
+    first.check_health.assert_called_once_with()
+    second.check_health.assert_called_once_with()
