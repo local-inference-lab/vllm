@@ -1,0 +1,24 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-b12x-a4-prefill-row-type",
+  "category": "performance",
+  "summary": "The A4 prefill now covers every prefill row, not only steps of 1,536 tokens or more: short prompts prefill up to 11% faster",
+  "models": [
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "Only with B12X_W4A16_A4_PREFILL_MIN_TOKENS set (prefill-activations a4); decode stays W4A16.",
+  "details": [
+    "The b12x MoE now chooses the precision by row type: decode and MTP verification rows run W4A16 and prefill rows run A4, whatever the step size, so a prompt's precision no longer depends on how the scheduler batches it. Steps replayed from a CUDA graph keep W4A16.",
+    "GLM-5.3-Flash glm53-tp2 on two RTX PRO 6000 Max-Q: a 1,154-token prompt prefilled at 6,498 instead of 5,868 tok/s; 8K/32K prefill and decode unchanged; needle-checksum 492, 492, 490 of 500 against 490, 492, 497."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    977
+  ],
+  "requires": [
+    "vllm-b12x-w4a16-a4-prefill",
+    "b12x-w4a16-a4-prefill-per-call"
+  ]
+}
