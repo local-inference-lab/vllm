@@ -90,6 +90,7 @@ def prepare_nvfp4_csf_weights(
     w13_scale_scratch,
     w2_scale_scratch,
     local_size=None,
+    packed=None,
 ):
     """Slice and upload up/gate/down-ordered expert projections.
 
@@ -99,6 +100,9 @@ def prepare_nvfp4_csf_weights(
     ``local_size`` is the per-rank width of a TP-padded expert (GLM-5.3 at
     TP6: 2048 channels padded to 6 x 352): rank r holds checkpoint channels
     [r * local_size, (r + 1) * local_size) and zeros past the checkpoint.
+    ``packed`` is an optional (w13, w2) pair that already holds every sliced
+    projection in the packed layout; it is used as the weight storage, and
+    the projections then supply only scales and calibration.
     """
     from b12x.moe.fused_moe import CsfScalePlanes, Nvfp4CsfWeights, PackedWeights
 
@@ -118,12 +122,19 @@ def prepare_nvfp4_csf_weights(
     real = last - first
     if real <= 0:
         raise ValueError("NVFP4-CSF requires checkpoint channels on every TP rank")
-    w13 = torch.zeros(
-        (num_experts, 2 * local, hidden_size // 2), dtype=torch.uint8, device="cpu"
+    shapes = (
+        (num_experts, 2 * local, hidden_size // 2),
+        (num_experts, hidden_size, local // 2),
     )
-    w2 = torch.zeros(
-        (num_experts, hidden_size, local // 2), dtype=torch.uint8, device="cpu"
-    )
+    if packed is None:
+        w13, w2 = (torch.zeros(s, dtype=torch.uint8, device="cpu") for s in shapes)
+    else:
+        w13, w2 = packed
+        if any(
+            tuple(t.shape) != s or t.dtype != torch.uint8
+            for t, s in zip(packed, shapes, strict=True)
+        ):
+            raise ValueError("NVFP4-CSF packed weights do not match the geometry")
     # Model loaders may set BF16 as the default dtype. Calibration belongs to
     # the source FP32 contract and must not be rounded with the model weights.
     g13, g2 = (
@@ -164,7 +175,7 @@ def prepare_nvfp4_csf_weights(
                 scalar(projection.input_scale, "input_scale"),
             )
             if matrix < 2:
-                if real:
+                if real and packed is None:
                     w13[expert, matrix * local : matrix * local + real].copy_(
                         view[first:last, :]
                     )
@@ -174,7 +185,7 @@ def prepare_nvfp4_csf_weights(
                 global13.append(global_scale)
                 input13.append(input_scale)
             else:
-                if real:
+                if real and packed is None:
                     w2[expert, :, : real // 2].copy_(view[:, first // 2 : last // 2])
                 rows, columns = hidden_size, intermediate_size // 16
                 row_slice, column_slice = (0, rows), (first // 16, last // 16)
