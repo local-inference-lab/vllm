@@ -55,6 +55,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import (
     BatchDescriptor,
+    MoEPrefillMetadata,
     set_forward_context,
 )
 from vllm.logger import init_logger
@@ -530,6 +531,10 @@ class GPUModelRunner(
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+
+        from vllm.utils.b12x import is_b12x_a4_prefill_enabled
+
+        self._b12x_a4_prefill_enabled = is_b12x_a4_prefill_enabled()
 
         model_config = self.model_config
         cache_config = self.cache_config
@@ -1203,6 +1208,19 @@ class GPUModelRunner(
                 scheduler_output,
                 decode_threshold=self.reorder_batch_threshold,
             )
+
+    def _build_moe_prefill_metadata(self, num_tokens: int) -> MoEPrefillMetadata | None:
+        if not self._b12x_a4_prefill_enabled:
+            return None
+        from vllm.utils.b12x import build_moe_prefill_metadata
+
+        num_reqs = self.input_batch.num_reqs
+        return build_moe_prefill_metadata(
+            num_tokens,
+            self.query_start_loc.np[: num_reqs + 1],
+            self.input_batch.num_computed_tokens_cpu[:num_reqs],
+            self.input_batch.num_prompt_tokens[:num_reqs],
+        )
 
     def _init_kv_zero_meta(self) -> None:
         """One-time precomputation for _zero_block_ids.
@@ -4497,6 +4515,9 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
+                moe_prefill_metadata=self._build_moe_prefill_metadata(
+                    num_tokens_padded
+                ),
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(

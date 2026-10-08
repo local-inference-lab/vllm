@@ -1,0 +1,12 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-hybrid-a4-package-capability",
+  "category": "fix",
+  "summary": "Reject unavailable B12X hybrid prefill support during worker startup",
+  "models": ["GLM-5.3-Flash"],
+  "compatibility": "Hybrid prefill requires a FlashInfer build with B12X hybrid kernels and bind(a4_prefill=...) support. Disabled hybrid mode preserves compatibility with older packages.",
+  "details": [
+    "Enabling hybrid prefill with an incompatible package raises a clear error during expert construction instead of silently retaining A16 for every request."
+  ],
+  "pull_requests": [970, 977]
+}

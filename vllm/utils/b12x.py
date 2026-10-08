@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import os
 import weakref
 from collections.abc import Hashable, Iterable, Mapping
 from dataclasses import dataclass, fields, is_dataclass, replace
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Literal
 
+import numpy as np
 import torch
 
 import vllm.envs as envs
@@ -29,6 +31,8 @@ from vllm.utils.torch_utils import (
 
 if TYPE_CHECKING:
     from b12x.preparation import PreparationRequest
+
+    from vllm.forward_context import MoEPrefillMetadata
 
 
 class PreparationResourceUnavailableError(RuntimeError):
@@ -250,6 +254,41 @@ def get_b12x_a16_max_tokens() -> int:
     if cutoff < 0:
         raise ValueError("VLLM_B12X_ACTIVATION_MODE_A16_M must be nonnegative")
     return cutoff
+
+
+def is_b12x_a4_prefill_enabled() -> bool:
+    """Read the opt-in activation policy during model preparation."""
+    value = os.environ.get("B12X_W4A16_A4_PREFILL", "0")
+    if value not in ("0", "1"):
+        raise ValueError("B12X_W4A16_A4_PREFILL must be 0 or 1")
+    return value == "1"
+
+
+def build_moe_prefill_metadata(
+    num_tokens: int,
+    query_start_loc: np.ndarray,
+    num_computed_tokens: np.ndarray,
+    num_prompt_tokens: np.ndarray,
+) -> MoEPrefillMetadata:
+    """Describe prompt-token ranges from scheduler-owned CPU request state."""
+    from vllm.forward_context import MoEPrefillMetadata
+
+    if int(query_start_loc[-1]) > num_tokens:
+        raise ValueError("MoE prefill ranges exceed the padded forward size")
+    ranges: list[tuple[int, int]] = []
+    for request in np.flatnonzero(num_computed_tokens < num_prompt_tokens):
+        start = int(query_start_loc[request])
+        end = min(
+            int(query_start_loc[request + 1]),
+            start + int(num_prompt_tokens[request] - num_computed_tokens[request]),
+        )
+        if start == end:
+            continue
+        if ranges and ranges[-1][1] == start:
+            ranges[-1] = ranges[-1][0], end
+        else:
+            ranges.append((start, end))
+    return MoEPrefillMetadata(num_tokens, tuple(ranges))
 
 
 _HAS_B12X = importlib.util.find_spec("b12x") is not None

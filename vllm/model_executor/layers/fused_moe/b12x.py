@@ -3,6 +3,7 @@
 """b12x modular tensor-parallel fused MoE backend."""
 
 import functools
+import inspect
 import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -12,6 +13,8 @@ from typing import Any
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.config import get_current_vllm_config_or_none
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
@@ -37,6 +40,7 @@ from vllm.utils.b12x import (
     PreparationResourceUnavailableError,
     get_b12x_a16_max_tokens,
     get_b12x_fused_moe,
+    is_b12x_a4_prefill_enabled,
     reuse_packed_weight_storage,
     set_b12x_preparation_provider,
 )
@@ -218,6 +222,31 @@ def _normalize_topk_weights(topk_weights: torch.Tensor) -> torch.Tensor:
     return topk_weights.to(dtype=torch.float32).contiguous()
 
 
+def _a4_prefill_parts(tokens: int) -> tuple[tuple[int, int, bool], ...]:
+    if _is_current_stream_capturing() or not is_forward_context_available():
+        return ((0, tokens, False),)
+    metadata = get_forward_context().moe_prefill_metadata
+    if metadata is None:
+        return ((0, tokens, False),)
+    if metadata.num_tokens != tokens:
+        raise ValueError(
+            "B12X hybrid prefill requires the target forward's padded token ordering: "
+            f"expected {metadata.num_tokens} rows, got {tokens}"
+        )
+    parts = []
+    previous = 0
+    for start, end in metadata.prefill_ranges:
+        if not previous <= start < end <= tokens:
+            raise ValueError("B12X hybrid prefill ranges must be ordered and disjoint")
+        if previous < start:
+            parts.append((previous, start, False))
+        parts.append((start, end, True))
+        previous = end
+    if previous < tokens:
+        parts.append((previous, tokens, False))
+    return tuple(parts)
+
+
 def _replace_parameter_with_empty(
     layer: torch.nn.Module,
     name: str,
@@ -296,9 +325,54 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 f"unsupported b12x MoE quantization scheme {scheme}"
             ) from exc
         self._prepared_experts: Any | None = None
-        self._a16_max_tokens = (
-            get_b12x_a16_max_tokens() if self._source_format == "modelopt_nvfp4" else 0
+        self._a4_prefill_enabled = (
+            self._quant_mode == "w4a16"
+            and self._source_format == "modelopt_nvfp4"
+            and is_b12x_a4_prefill_enabled()
         )
+        self._a16_max_tokens = (
+            get_b12x_a16_max_tokens()
+            if self._source_format == "modelopt_nvfp4" and not self._a4_prefill_enabled
+            else 0
+        )
+        if self._a4_prefill_enabled:
+            parallel = moe_config.moe_parallel_config
+            config = get_current_vllm_config_or_none()
+            if (
+                parallel.dp_size != 1
+                or parallel.pcp_size != 1
+                or parallel.is_sequence_parallel
+                or parallel.use_ep
+                or parallel.ep_size != 1
+                or (config is not None and config.parallel_config.use_ubatching)
+            ):
+                raise NotImplementedError(
+                    "B12X hybrid A4 prefill supports TP/DCP without DP, PCP, "
+                    "EP, sequence parallelism or ubatching"
+                )
+            if (
+                config is not None
+                and config.speculative_config is not None
+                and config.speculative_config.enable_adaptive_verification
+            ):
+                raise NotImplementedError(
+                    "B12X hybrid A4 prefill requires host-visible token ranges; "
+                    "adaptive verification changes token ranges on the GPU"
+                )
+            fused_moe = _require_b12x_fused_moe()
+            binding_type = getattr(fused_moe, "Binding", None)
+            scale_query = getattr(fused_moe, "uses_expanded_nvfp4_scales", None)
+            if (
+                not callable(scale_query)
+                or "scales_expanded" not in inspect.signature(scale_query).parameters
+                or "a4_prefill_launches"
+                not in getattr(binding_type, "__dataclass_fields__", {})
+            ):
+                raise RuntimeError(
+                    "B12X hybrid A4 prefill requires a compatible FlashInfer build "
+                    "with semantic A4 selection and the "
+                    "uses_expanded_nvfp4_scales(scales_expanded=...) API"
+                )
         self._source_parameters_released = False
         self._unit_scales: dict[torch.device, torch.Tensor] = {}
         self._apply_router_weight_on_input = False
@@ -431,6 +505,14 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 raise ValueError("b12x NVFP4 MoE requires activation global scales")
             a1_gscale = _normalize_expert_scale(self.a1_gscale).to(w1.device)
             a2_gscale = _normalize_expert_scale(self.a2_gscale).to(w2.device)
+        elif self._a4_prefill_enabled:
+            a1_gscale = a2_gscale = None
+            if self.a1_gscale is not None and self.a2_gscale is not None:
+                a1 = _normalize_expert_scale(self.a1_gscale).to(w1.device)
+                a2 = _normalize_expert_scale(self.a2_gscale).to(w2.device)
+                if all(bool((torch.isfinite(t) & (t > 0)).all()) for t in (a1, a2)):
+                    a1_gscale = a1.amin().reshape(1)
+                    a2_gscale = a2
         else:
             a1_gscale = unit_scale
             a2_gscale = unit_scale
@@ -490,7 +572,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
 
         self.quant_config._w1.alpha_or_gscale = layer.w13_weight_scale_2
         self.quant_config._w2.alpha_or_gscale = layer.w2_weight_scale_2
-        if self._quant_mode in ("nvfp4", "w4a8_nvfp4"):
+        if self._quant_mode in ("nvfp4", "w4a8_nvfp4") or (
+            self._a4_prefill_enabled
+            and getattr(layer, "w13_input_scale", None) is not None
+            and getattr(layer, "w2_input_scale", None) is not None
+        ):
             self.quant_config._a1.alpha_or_gscale = 1.0 / layer.w13_input_scale
             self.quant_config._a2.alpha_or_gscale = 1.0 / layer.w2_input_scale
 
@@ -741,6 +827,29 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             )
         return self._prepared_experts
 
+    def _execution_parts(self, tokens: int) -> tuple[tuple[int, int, bool], ...]:
+        prepared = self._prepared()
+        if self._a4_prefill_enabled and getattr(
+            getattr(prepared, "_impl", None), "a4_prefill_scales", False
+        ):
+            return _a4_prefill_parts(tokens)
+        return ((0, tokens, False),)
+
+    def uses_expanded_nvfp4_scales(
+        self, tokens: int, route_ids_dtype: torch.dtype
+    ) -> bool:
+        """Query whether this layer's semantic spans can use prefetched scales."""
+        return any(
+            _require_b12x_fused_moe().uses_expanded_nvfp4_scales(
+                self._plan,
+                num_tokens=end - start,
+                a4_prefill=a4_prefill,
+                scales_expanded=True,
+                route_ids_dtype=route_ids_dtype,
+            )
+            for start, end, a4_prefill in self._execution_parts(tokens)
+        )
+
     def _prepared_plan(
         self, *, activation: MoEActivation, apply_router_weight_on_input: bool
     ) -> Any:
@@ -975,6 +1084,23 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             raise ValueError("b12x MoE requires contiguous caller-owned workspace2")
         scratch = workspace2.view(-1).view(torch.uint8)
         expanded = {"scales_expanded": True} if self.scales_expanded else {}
+        if getattr(getattr(prepared, "_impl", None), "a4_prefill_scales", False):
+            tokens = int(hidden_states.shape[0])
+            for start, end, a4_prefill in self._execution_parts(tokens):
+                binding = _require_b12x_fused_moe().bind(
+                    plan,
+                    scratch=scratch,
+                    a=hidden_states[start:end],
+                    experts=prepared,
+                    topk_weights=topk_weights[start:end],
+                    topk_ids=topk_ids[start:end],
+                    output=output[start:end],
+                    input_scales_static=True,
+                    a4_prefill=a4_prefill,
+                    **expanded,
+                )
+                _require_b12x_fused_moe().run(binding=binding)
+            return
         binding = _require_b12x_fused_moe().bind(
             plan,
             scratch=scratch,

@@ -26,6 +26,7 @@ from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm.forward_context import MoEPrefillMetadata
 from vllm.lora.layers import LoRAMappingType
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.attention import Attention
@@ -147,6 +148,85 @@ def get_vllm_config():
         parallel_config=parallel_config,
     )
     return vllm_config
+
+
+@pytest.mark.parametrize("draft_tokens", [0, 1, 3, 5, 7])
+@pytest.mark.parametrize("prefill_tokens", [1, 2, 4, 16])
+def test_moe_prefill_metadata_uses_request_phase_with_graph_padding(
+    draft_tokens: int, prefill_tokens: int
+) -> None:
+    runner = object.__new__(GPUModelRunner)
+    runner._b12x_a4_prefill_enabled = True
+    decode_tokens = draft_tokens + 1
+    runner.input_batch = SimpleNamespace(
+        num_reqs=3,
+        num_computed_tokens_cpu=np.array([100, 50, 75]),
+        num_prompt_tokens=np.array([100, 100, 75]),
+    )
+    runner.query_start_loc = SimpleNamespace(
+        np=np.array(
+            [
+                0,
+                decode_tokens,
+                decode_tokens + prefill_tokens,
+                2 * decode_tokens + prefill_tokens,
+            ]
+        )
+    )
+    padded_tokens = 2 * decode_tokens + prefill_tokens + 8
+    assert runner._build_moe_prefill_metadata(padded_tokens) == MoEPrefillMetadata(
+        padded_tokens, ((decode_tokens, decode_tokens + prefill_tokens),)
+    )
+    runner._b12x_a4_prefill_enabled = False
+    assert runner._build_moe_prefill_metadata(padded_tokens) is None
+
+
+def test_moe_prefill_metadata_preserves_dcp_interleaving() -> None:
+    from tests.v1.attention.test_batch_reordering import (
+        MockInputBatch,
+        MockSchedulerOutput,
+    )
+    from vllm.v1.attention.backends.utils import (
+        reorder_batch_to_split_decodes_and_prefills,
+    )
+
+    requests = [(1, 50, 100), (6, 100, 100), (10, 50, 100), (6, 100, 100), (2, 0, 2)]
+    batch = MockInputBatch(
+        list(range(5)),
+        np.array([r[1] for r in requests]),
+        np.array([r[2] for r in requests]),
+    )
+    schedule = MockSchedulerOutput({i: r[0] for i, r in enumerate(requests)})
+    reorder_batch_to_split_decodes_and_prefills(batch, schedule, decode_threshold=1)
+    batch.num_reqs = len(batch.req_ids)
+    runner = object.__new__(GPUModelRunner)
+    runner._b12x_a4_prefill_enabled = True
+    runner.input_batch = batch
+    runner.query_start_loc = SimpleNamespace(
+        np=np.concatenate(
+            (
+                [0],
+                np.cumsum([schedule.num_scheduled_tokens[i] for i in batch.req_ids]),
+            )
+        )
+    )
+    assert runner._build_moe_prefill_metadata(32) == MoEPrefillMetadata(
+        32, ((0, 1), (7, 17), (23, 25))
+    )
+
+
+def test_moe_prefill_metadata_keeps_completion_rows_a16_after_prompt_boundary():
+    runner = object.__new__(GPUModelRunner)
+    runner._b12x_a4_prefill_enabled = True
+    runner.input_batch = SimpleNamespace(
+        num_reqs=2,
+        num_computed_tokens_cpu=np.array([98, 0]),
+        num_prompt_tokens=np.array([100, 3]),
+    )
+    runner.query_start_loc = SimpleNamespace(np=np.array([0, 8, 11]))
+    assert runner._build_moe_prefill_metadata(16) == MoEPrefillMetadata(
+        16, ((0, 2), (8, 11))
+    )
 
 
 @pytest.mark.parametrize("gc_initially_enabled", [True, False])
