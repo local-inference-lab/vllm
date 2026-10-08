@@ -744,11 +744,6 @@ class B12xNGramEmbedding(nn.Module):
                         f"{self._table_layout.weight_scale_dtype}, "
                         f"got {loaded_weight.dtype}"
                     )
-                scale = loaded_weight.float()
-                if not bool(torch.isfinite(scale).all()) or not bool((scale > 0).all()):
-                    raise ValueError(
-                        "PLE embedding weight_scale must be finite and positive"
-                    )
                 with torch.no_grad():
                     target = getattr(
                         embedding, "weight_scale_load_view", embedding.weight_scale
@@ -781,13 +776,6 @@ class B12xNGramEmbedding(nn.Module):
                         "PLE embedding weight_scale_2 must have dtype "
                         f"{self._table_layout.weight_scale_2_dtype}, got "
                         f"{loaded_weight.dtype}"
-                    )
-                scale_2 = loaded_weight.float()
-                if not bool(torch.isfinite(scale_2).all()) or not bool(
-                    (scale_2 > 0).all()
-                ):
-                    raise ValueError(
-                        "PLE embedding weight_scale_2 must be finite and positive"
                     )
                 with torch.no_grad():
                     target = getattr(
@@ -876,23 +864,13 @@ class B12xNGramEmbedding(nn.Module):
                         embedding, f"{suffix}_load_view", parameter.data
                     )
                     assert destination is not None
-                    target = _copy_embedding_shard(
+                    _copy_embedding_shard(
                         destination,
                         loaded_weight,
                         checkpoint_start=checkpoint_start,
                         tp_start=tp_start,
                         tp_end=tp_end,
                     )
-                    if suffix == "weight_scale" and target is not None:
-                        flush_weight_transfers()
-                        scale = target.float()
-                        if not bool(torch.isfinite(scale).all()) or not bool(
-                            (scale > 0).all()
-                        ):
-                            raise ValueError(
-                                f"PLE shard {shard_index} weight_scale must be "
-                                "finite and positive"
-                            )
                 if overlap_start < overlap_end:
                     load_ranges = (
                         self._embedding_load_ranges
