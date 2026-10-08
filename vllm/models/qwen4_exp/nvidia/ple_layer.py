@@ -25,6 +25,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
@@ -42,7 +43,6 @@ from vllm.v1.attention.backends.short_conv_attn import (
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
-from ..common.hyperconnection import load_grouped_norm_weight
 from .b12x_ple import (
     B12xNGramEmbedding,
     _b12x_module,
@@ -73,7 +73,7 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
         self.eps = eps
         self.group_size = group_size
         self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=dtype))
-        self.weight.weight_loader = load_grouped_norm_weight
+        self.weight.weight_loader = default_weight_loader
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype

@@ -661,9 +661,11 @@ def test_lazy_package_exports_match_registry(architecture: str) -> None:
 @pytest.mark.parametrize("kind", ["hyperconnection", "ple"])
 @pytest.mark.parametrize("source_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("runtime_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("deferred", [False, True])
 def test_grouped_norm_loader_uses_runtime_precision_without_mutating_source(
-    kind, source_dtype, runtime_dtype
+    kind, source_dtype, runtime_dtype, deferred
 ):
+    from vllm.model_executor.weight_transfer import weight_transfer
     from vllm.models.qwen4_exp.common.hyperconnection import GroupedGemmaRMSNorm
     from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPLEGroupedNorm
 
@@ -672,7 +674,18 @@ def test_grouped_norm_loader_uses_runtime_precision_without_mutating_source(
     source = torch.linspace(-0.01739, 0.01917, 32).to(source_dtype)
     original = source.clone()
     expected = source.to(runtime_dtype)
-    loaded = AutoWeightsLoader(layer).load_weights([("weight", source)])
+    if deferred:
+        descriptor = torch.empty_like(source, device="meta")
+        sources = {descriptor.untyped_storage()._cdata: source}
+
+        def writer(destination, value):
+            destination.copy_(sources[value.untyped_storage()._cdata])
+            return True
+
+        with weight_transfer(writer):
+            loaded = AutoWeightsLoader(layer).load_weights([("weight", descriptor)])
+    else:
+        loaded = AutoWeightsLoader(layer).load_weights([("weight", source)])
     assert loaded == {"weight"}
     assert layer.weight.dtype == runtime_dtype
     assert source.dtype == source_dtype

@@ -4,8 +4,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-${SCRIPT_DIR}/.venv/bin/python}"
-MODEL_PATH="${MODEL_PATH:-/data/models/qwen3.8-flash-next-mixed/qwen3.8-flash-next-180b-nvfp4-ple-mxfp8-attn-shared_vv1}"
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8-flash-next-4p89bpw}"
+MODEL_PATH="${MODEL_PATH:-/data/models/Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}"

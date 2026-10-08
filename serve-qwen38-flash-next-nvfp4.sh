@@ -4,9 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-${SCRIPT_DIR}/.venv/bin/python}"
 
-MODEL_PATH="${MODEL_PATH:-/data/models/qwen3.8-flash-next-mixed/qwen3.8-flash-next-180b-nvfp4-ple-mxfp8-attn-shared_vv1}"
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8-flash-next-4p89bpw}"
-LOAD_FORMAT="${LOAD_FORMAT:-fastsafetensors}"
+MODEL_PATH="${MODEL_PATH:-/data/models/Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD}"
+LOAD_FORMAT="${LOAD_FORMAT:-b12x}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 TP_SIZE="${TP_SIZE:-2}"
@@ -255,7 +255,7 @@ command=(
   --enable-prefix-caching
   --enable-chunked-prefill
   --dtype bfloat16
-  --kv-cache-dtype bfloat16
+  --kv-cache-dtype fp8
   --quantization modelopt_mixed
   --block-size 16
   --load-format "${LOAD_FORMAT}"

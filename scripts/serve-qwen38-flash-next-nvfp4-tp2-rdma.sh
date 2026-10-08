@@ -18,22 +18,30 @@ WORKER_IB_IF="${WORKER_IB_IF:-${IB_IF}}"
 NCCL_IB_MERGE_NICS="${NCCL_IB_MERGE_NICS:-1}"
 MASTER_PORT="${MASTER_PORT:-29638}"
 TP_SIZE="${TP_SIZE:-2}"
+B12X_COMPILE_CACHE_DIR="${B12X_COMPILE_CACHE_DIR:-${HOME}/.cache/b12x/compile/qwen38-tp${TP_SIZE}}"
 CONTAINER_NAME="${CONTAINER_NAME:-vllm_qwen38_flash_next_tp${TP_SIZE}}"
-IMAGE_NAME="${IMAGE_NAME:-vllm-node-eugr-20260712:latest}"
+IMAGE_NAME="${IMAGE_NAME:-vllm-node-eugr-20260712-io-uring:latest}"
+SECCOMP_PROFILE="${SECCOMP_PROFILE:-${SCRIPT_DIR}/seccomp/spark-io-uring.json}"
 CONTAINER_MEMORY_GB="${CONTAINER_MEMORY_GB:-108}"
 CONTAINER_MEMORY_SWAP_GB="${CONTAINER_MEMORY_SWAP_GB:-112}"
 
 PYTHON_BIN="${PYTHON_BIN:-${VLLM_ROOT}/.venv/bin/python}"
 VLLM_BIN="${VLLM_BIN:-${VLLM_ROOT}/.venv/bin/vllm}"
-DEFAULT_MODEL_PATH=/data/models/qwen3.8-flash-next-mixed
-DEFAULT_MODEL_PATH+="/qwen3.8-flash-next-180b-nvfp4-ple-mxfp8-attn-shared_vv1"
+DEFAULT_MODEL_PATH=/data/models/Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD
 MODEL_PATH="${MODEL_PATH:-${DEFAULT_MODEL_PATH}}"
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8-flash-next-4p89bpw}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD}"
+LOAD_FORMAT="${LOAD_FORMAT:-b12x}"
 PORT="${PORT:-8000}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}"
+default_max_model_len=65536
+default_kv_cache_memory_bytes=1610612736
+if [[ "${TP_SIZE}" == 2 ]]; then
+  default_max_model_len=262144
+  default_kv_cache_memory_bytes=34359738368
+fi
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-${default_max_model_len}}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
-KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-1610612736}"
+KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-${default_kv_cache_memory_bytes}}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-3}"
 ALLREDUCE="${ALLREDUCE:-rocenante}"
@@ -63,16 +71,17 @@ ALLREDUCE=nccl keeps the existing NCCL path. TP=1 uses neither transport.
 
 Launcher options:
   --sync-code   For TP=2, mirror local vllm/ and b12x/ to the worker.
-  --sync-model  For TP=2, rsync the roughly 99 GiB MODEL_PATH to the worker.
+  --sync-model  For TP=2, rsync MODEL_PATH to the worker.
   --check       Validate the selected topology without launching.
   --detach      Run the head rank in the background; use docker logs to follow it.
   -h, --help    Show this help.
 
-Environment overrides include TP_SIZE (1 or 2), ALLREDUCE, MODEL_PATH,
-MAX_MODEL_LEN, KV_CACHE_MEMORY_BYTES, GPU_MEMORY_UTILIZATION, HEAD_IP,
+Environment overrides include TP_SIZE (1 or 2), ALLREDUCE, MODEL_PATH, LOAD_FORMAT,
+MAX_MODEL_LEN, KV_CACHE_MEMORY_BYTES, GPU_MEMORY_UTILIZATION, B12X_COMPILE_CACHE_DIR,
+HEAD_IP,
 WORKER_IP, ETH_IF,
 IB_IF, HEAD_IB_IF, WORKER_IB_IF, NCCL_IB_MERGE_NICS,
-ROCE_ALLREDUCE_MAX_SIZE, ROCE_ALLGATHER_MAX_SIZE, IMAGE_NAME, and
+ROCE_ALLREDUCE_MAX_SIZE, ROCE_ALLGATHER_MAX_SIZE, IMAGE_NAME, SECCOMP_PROFILE, and
 CONTAINER_MEMORY_GB.
 EOF
 }
@@ -140,13 +149,20 @@ esac
 for path in \
   "${VLLM_ROOT}" \
   "${B12X_ROOT}" \
+  "${B12X_COMPILE_CACHE_DIR}" \
   "${MODEL_PATH}" \
+  "${SECCOMP_PROFILE}" \
   "${CLUSTER_LAUNCHER}"; do
   if [[ "${path}" == *[[:space:]]* ]]; then
     echo "Spark bind-mount paths cannot contain whitespace: ${path}" >&2
     exit 2
   fi
 done
+
+if [[ "${LOAD_FORMAT}" == b12x && ! -f "${SECCOMP_PROFILE}" ]]; then
+  echo "b12x loader seccomp profile not found: ${SECCOMP_PROFILE}" >&2
+  exit 1
+fi
 
 if [[ ! -x "${CLUSTER_LAUNCHER}" ]]; then
   echo "Spark cluster launcher is not executable: ${CLUSTER_LAUNCHER}" >&2
@@ -280,9 +296,24 @@ if ((TP_SIZE == 2)); then
   fi
 fi
 
+mkdir -p -- "${B12X_COMPILE_CACHE_DIR}"
+if ((TP_SIZE == 2)); then
+  printf -v remote_cache_dir '%q' "${B12X_COMPILE_CACHE_DIR}"
+  ssh "${ssh_opts[@]}" "${WORKER_IP}" "mkdir -p -- ${remote_cache_dir}"
+fi
+
 mount_args="-v ${VLLM_ROOT}:${VLLM_ROOT}"
 mount_args+=" -v ${B12X_ROOT}:${B12X_ROOT}"
+mount_args+=" -v ${B12X_COMPILE_CACHE_DIR}:${B12X_COMPILE_CACHE_DIR}"
 mount_args+=" -v ${MODEL_PATH}:${MODEL_PATH}:ro"
+if [[ "${LOAD_FORMAT}" == b12x ]]; then
+  if ((TP_SIZE == 2)); then
+    printf -v remote_seccomp_dir '%q' "$(dirname -- "${SECCOMP_PROFILE}")"
+    ssh "${ssh_opts[@]}" "${WORKER_IP}" "mkdir -p -- ${remote_seccomp_dir}"
+    rsync -a "${SECCOMP_PROFILE}" "${WORKER_IP}:${SECCOMP_PROFILE}"
+  fi
+  mount_args+=" --security-opt seccomp=${SECCOMP_PROFILE}"
+fi
 if [[ -n "${VLLM_SPARK_EXTRA_DOCKER_ARGS:-}" ]]; then
   mount_args+=" ${VLLM_SPARK_EXTRA_DOCKER_ARGS}"
 fi
@@ -296,6 +327,7 @@ cluster_args=(
   --mem-limit-gb "${CONTAINER_MEMORY_GB}"
   --mem-swap-limit-gb "${CONTAINER_MEMORY_SWAP_GB}"
   --env "PYTHONPATH=${VLLM_ROOT}:${B12X_ROOT}"
+  --env "B12X_COMPILE_CACHE_DIR=${B12X_COMPILE_CACHE_DIR}"
   --env "CUDA_HOME=/usr/local/cuda"
   --env "TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas"
   --env "CUDA_VISIBLE_DEVICES=0"
@@ -373,7 +405,7 @@ vllm_command=(
   --kv-cache-dtype fp8
   --quantization modelopt_mixed
   --block-size 16
-  --load-format fastsafetensors
+  --load-format "${LOAD_FORMAT}"
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
   --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}"
   --max-model-len "${MAX_MODEL_LEN}"

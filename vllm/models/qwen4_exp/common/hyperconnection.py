@@ -54,13 +54,6 @@ class HyperConnectionConfig:
     hc_per_branch_norm: bool = False
 
 
-def load_grouped_norm_weight(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-    # b12x HC/PLE prepared kernels consume BF16 affine weights.
-    if param.dtype == torch.bfloat16 and loaded_weight.dtype == torch.float32:
-        loaded_weight = loaded_weight.to(dtype=torch.bfloat16)
-    default_weight_loader(param, loaded_weight)
-
-
 class GroupedGemmaRMSNorm(nn.Module):
     def __init__(
         self,
@@ -78,7 +71,7 @@ class GroupedGemmaRMSNorm(nn.Module):
         self.variance_epsilon = eps
         self.group_size = group_size
         self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=dtype))
-        self.weight.weight_loader = load_grouped_norm_weight
+        self.weight.weight_loader = default_weight_loader
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
