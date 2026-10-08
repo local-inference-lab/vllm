@@ -237,9 +237,13 @@ def test_gdn_convolution_shards_read_into_final_parameter_slices(tmp_path):
     torch.testing.assert_close(target.cpu(), checkpoint[4:])
 
 
-def test_hyperconnection_weights_load_without_allocator_hooks(tmp_path, monkeypatch):
+@pytest.mark.parametrize("source_dtype", [torch.bfloat16, torch.float32])
+def test_hyperconnection_weights_load_without_allocator_hooks(
+    tmp_path, monkeypatch, source_dtype
+):
     """Loading the norm must preserve separate workspace contents."""
-    from vllm.model_executor.weight_transfer import copy_weight, weight_transfer
+    from vllm.model_executor.models.utils import AutoWeightsLoader
+    from vllm.model_executor.weight_transfer import weight_transfer
     from vllm.models.qwen4_exp.nvidia.hyperconnection import (
         GroupedGemmaRMSNorm,
         HyperConnectionConfig,
@@ -250,9 +254,10 @@ def test_hyperconnection_weights_load_without_allocator_hooks(tmp_path, monkeypa
         "vllm.models.qwen4_exp.nvidia.hyperconnection.get_tensor_model_parallel_world_size",
         lambda: 1,
     )
-    expected = torch.arange(128, dtype=torch.bfloat16)
+    checkpoint = torch.linspace(-0.01739, 0.01917, 128).to(source_dtype)
+    expected = checkpoint.to(torch.bfloat16)
     path = tmp_path / "norm.safetensors"
-    save_file({"weight": expected}, path)
+    save_file({"weight": checkpoint}, path)
     with (
         DirectWeightSession() as session,
         weight_transfer(session),
@@ -270,9 +275,9 @@ def test_hyperconnection_weights_load_without_allocator_hooks(tmp_path, monkeypa
             ),
             8,
         )
-        source = dict(session.weights([path]))["weight"]
-        copy_weight(norm.weight, source)
-    torch.testing.assert_close(norm.weight.cpu(), expected)
+        loaded = AutoWeightsLoader(norm).load_weights(session.weights([path]))
+        assert loaded == {"weight"}
+    torch.testing.assert_close(norm.weight.cpu(), expected, rtol=0, atol=0)
     for buffer in workspace.buffers():
         buffer.fill_(7)
     torch.accelerator.synchronize()

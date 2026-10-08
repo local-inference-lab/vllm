@@ -10,7 +10,6 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import get_current_vllm_config_or_none
-from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.b12x import (
@@ -31,8 +30,6 @@ from vllm.model_executor.weight_transfer import copy_weight, materialize_weight
 from vllm.utils.b12x import get_b12x_a16_max_tokens, is_b12x_a4_prefill_enabled
 from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import set_default_torch_num_threads
-
-logger = init_logger(__name__)
 
 _FORWARD_TOKENS = itertools.count()
 
@@ -365,15 +362,6 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
             self.owner.scale_layers[self.layer_index] = self
             if self.owner.scale_stream is None:
                 self.owner.scale_stream = torch.cuda.Stream(device)
-        logger.info(
-            "NVFP4-CSF layer %d rank %d/%d: native NVFP4 %s, "
-            "shared scale scratch %d bytes",
-            self.layer_index,
-            self.moe.tp_rank,
-            self.moe.tp_size,
-            "A16" if self.use_a16 else "A4",
-            sum(t.numel() for t in scratch),
-        )
 
     def apply(
         self,
