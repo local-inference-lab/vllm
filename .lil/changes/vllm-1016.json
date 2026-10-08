@@ -1,0 +1,25 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-1016",
+  "category": "fix",
+  "summary": "NVFP4-CSF models load faster: GLM-5.3 744B in about 2 minutes instead of 10 to 40",
+  "models": [
+    "GLM-5.3",
+    "GLM-5.3-Flash",
+    "Qwen3.8-Flash-Next"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "NVFP4-CSF expert weights load straight into each layer's packed weights. The loader kept one GPU tensor per expert projection and uploaded every layer again through host memory, which left up to 92.5 GiB reserved for 50 GiB of weights. Releasing that cache blocked the GPUs for minutes, and GLM-5.3 took 38 minutes to load when two servers started together.",
+    "The GLM-5.3 MTP draft reads only its own layer and the embedding, 2 of the 85 shards of the CSF container, instead of the whole checkpoint again.",
+    "Model loading on RTX PRO 6000: GLM-5.3 glm53-csf-tp8 116 s instead of 567 s, GLM-5.3-Flash glm53-tp2 144 s instead of 214 s, Qwen3.8 qwen38-tp2 226 s instead of 310 s. KV cache sizes are unchanged."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    1016,
+    1017
+  ],
+  "requires": []
+}
