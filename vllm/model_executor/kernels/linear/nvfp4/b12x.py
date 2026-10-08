@@ -19,9 +19,11 @@ from vllm.utils.b12x import (
     b12x_layer_prefix,
     get_b12x_a16_max_tokens,
     get_b12x_dense_activation_mode,
+    is_b12x_a4_prefill_enabled,
     register_b12x_layer,
     run_b12x_blockscaled_linear,
     set_b12x_preparation_provider,
+    validate_b12x_a4_prefill_config,
 )
 from vllm.utils.b12x import (
     get_b12x_blockscaled as _import_b12x_blockscaled,
@@ -211,7 +213,7 @@ def _apply_b12x_nvfp4_linear(
             layer.b12x_layer_name,
         )
         return output.view(*output_shape)
-    if mode == "a16":
+    if mode == "a16" or layer.b12x_linear.a4_prefill_enabled:
         raise ValueError("b12x NVFP4 A16 requires BF16 activations and N%8=0")
     x_packed, x_scale_swizzled = scaled_fp4_quant(
         x_2d,
@@ -272,10 +274,17 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
                 )
             mode = "a16"
         layer.b12x_activation_mode = mode
-        a16_max_tokens = get_b12x_a16_max_tokens()
+        a4_prefill_enabled = mode == "auto" and is_b12x_a4_prefill_enabled()
+        if a4_prefill_enabled:
+            validate_b12x_a4_prefill_config()
+        a16_max_tokens = 0 if a4_prefill_enabled else get_b12x_a16_max_tokens()
         n, packed_k = layer.weight.shape
         logical_k = int(packed_k) * 2
-        if (mode == "a16" or a16_max_tokens) and logical_k % 32:
+        if a4_prefill_enabled and (
+            not current_platform.is_device_capability_family(120) or n % 8
+        ):
+            raise ValueError("b12x NVFP4 hybrid activations require SM12x and N%8=0")
+        if (mode == "a16" or a16_max_tokens or a4_prefill_enabled) and logical_k % 32:
             stored_k = (logical_k + 31) // 32 * 32
             # Align serialized storage without changing the model's logical K
             # or splitting a 16-element quantization group.
@@ -309,15 +318,24 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
         layer.b12x_nvfp4_packed_weight = replace(packed, in_features=logical_k)
         layer.b12x_bf16_input_supported = (
             current_platform.is_device_capability_family(120)
-            and (logical_k % 128 == 0 or mode == "a16" or a16_max_tokens > 0)
+            and (
+                logical_k % 128 == 0
+                or mode == "a16"
+                or a16_max_tokens > 0
+                or a4_prefill_enabled
+            )
             and n % 8 == 0
         )
         if a16_max_tokens and not layer.b12x_bf16_input_supported:
             raise ValueError("b12x NVFP4 A16 token cutoff requires SM12x and N%8=0")
         name = b12x_layer_prefix(layer)
-        activation_scale = (
-            None if layer.b12x_weight_only else layer.input_global_scale_inv
-        )
+        activation_scale = None
+        if not layer.b12x_weight_only:
+            activation_scale = (
+                getattr(layer, "input_global_scale_inv", None)
+                if a4_prefill_enabled
+                else layer.input_global_scale_inv
+            )
         # A reload into the same packed storage keeps the holder and its
         # prepared plan; new storage declares anew.
         existing = getattr(layer, "b12x_linear", None)
@@ -328,6 +346,7 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
                 activation_mode=mode,
                 layer_name=name,
                 activation_scale=activation_scale,
+                a4_prefill_enabled=a4_prefill_enabled,
             )
         else:
             layer.b12x_nvfp4_packed_weight = existing.packed
@@ -354,7 +373,9 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
         cutoff = layer.b12x_linear.a16_max_tokens
         if cutoff and workload.output_dtype != torch.bfloat16:
             raise ValueError("b12x NVFP4 A16 token cutoff requires BF16 activations")
-        if layer.b12x_activation_mode == "a16" and not packed_input:
+        if (
+            layer.b12x_activation_mode == "a16" or layer.b12x_linear.a4_prefill_enabled
+        ) and not packed_input:
             raise ValueError(
                 "b12x W4A16 preparation requires BF16 activations and N%8=0"
             )

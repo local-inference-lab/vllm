@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-dense-hybrid-a4-prefill",
+  "category": "fix",
+  "summary": "Apply semantic A4-prefill/A16-decode selection to B12X dense NVFP4 layers",
+  "models": ["NVFP4 models using B12X dense linear kernels"],
+  "compatibility": "B12X_W4A16_A4_PREFILL=1 now covers dense NVFP4 layers in auto activation mode, including shared experts. Explicit dense precision overrides and W4A16 checkpoint precision are preserved. Restart workers to apply the policy.",
+  "details": [
+    "Calibrated prefill rows use A4 independently of token count; decode, verification, draft, profiling, and CUDA graph execution retain A16.",
+    "A4 and A16 plans share one packed weight and reuse a single workspace across semantic token spans.",
+    "Missing or invalid A4 calibration and unsupported A4 input widths retain A16. Encoder-decoder models and token redistribution configurations without a matching row-order contract reject hybrid mode."
+  ],
+  "pull_requests": [],
+  "requires": []
+}

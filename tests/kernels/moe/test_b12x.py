@@ -859,7 +859,7 @@ def test_b12x_nvfp4_preparation_preserves_static_scale_contract(
 
     monkeypatch.setattr(fused_moe, "prepare_weights", prepare_weights)
     monkeypatch.setattr(b12x, "_require_b12x_fused_moe", lambda: fused_moe)
-    monkeypatch.setattr(b12x, "_is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     scales = torch.ones(4)
     if not uniform:
         scales[-1] = torch.nextafter(scales[-1], torch.tensor(float("inf")))
@@ -991,7 +991,7 @@ def test_b12x_hybrid_prefill_preserves_decode_rows_and_shared_workspace(
     """Semantic ranges choose precision without changing row or scratch ownership."""
     monkeypatch.setenv("B12X_W4A16_A4_PREFILL", "1" if enabled else "0")
     monkeypatch.setenv("VLLM_B12X_ACTIVATION_MODE_A16_M", "4096")
-    monkeypatch.setattr(b12x, "_is_current_stream_capturing", lambda: capturing)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
     experts = B12xExperts(
         make_dummy_moe_config(hidden_dim=8, intermediate_size=32),
         _quant_config("nvfp4", None),
@@ -1093,7 +1093,7 @@ def test_b12x_hybrid_prefill_queries_selected_scale_consumers(
 ):
     """Prefetch queries prospective readiness for each following-layer span."""
     monkeypatch.setenv("B12X_W4A16_A4_PREFILL", "1")
-    monkeypatch.setattr(b12x, "_is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     experts = B12xExperts(
         make_dummy_moe_config(hidden_dim=128, intermediate_size=64),
         _quant_config("nvfp4", None),
@@ -1167,12 +1167,12 @@ def test_b12x_hybrid_prefill_rejects_reshaped_inputs_and_ignores_capture_metadat
     context = ForwardContext(
         {}, {}, {}, moe_prefill_metadata=MoEPrefillMetadata(8, ((0, 8),))
     )
-    monkeypatch.setattr(b12x, "_is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     with override_forward_context(context):
         with pytest.raises(ValueError, match="expected 8 rows, got 4"):
-            b12x._a4_prefill_parts(4)
-        monkeypatch.setattr(b12x, "_is_current_stream_capturing", lambda: True)
-        assert b12x._a4_prefill_parts(4) == ((0, 4, False),)
+            b12x.get_b12x_a4_prefill_parts(4)
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        assert b12x.get_b12x_a4_prefill_parts(4) == ((0, 4, False),)
 
 
 @pytest.mark.parametrize(
@@ -2255,7 +2255,7 @@ def test_b12x_mxfp8_preparation_passes_source_tensors_verbatim(
 
     # Only vLLM-side registration surface is stubbed; plan_weights and
     # prepare_weights run for real against the installed b12x.
-    monkeypatch.setattr(b12x, "_is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(b12x, "set_b12x_preparation_provider", lambda *_, **__: None)
     monkeypatch.setattr(
         b12x, "_register_b12x_moe_output_collective", lambda *_, **__: None

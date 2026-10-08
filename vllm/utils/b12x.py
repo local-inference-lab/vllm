@@ -264,6 +264,71 @@ def is_b12x_a4_prefill_enabled() -> bool:
     return value == "1"
 
 
+def validate_b12x_a4_prefill_config() -> None:
+    """Require execution layouts that preserve scheduler-owned token ranges."""
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    if config is None:
+        return
+    if config.model_config is not None and config.model_config.is_encoder_decoder:
+        raise NotImplementedError(
+            "B12X hybrid A4 prefill requires decoder-only token ordering; "
+            "cross-attention projections can consume encoder rows"
+        )
+    parallel = config.parallel_config
+    if (
+        parallel.effective_data_parallel_size != 1
+        or parallel.prefill_context_parallel_size != 1
+        or parallel.enable_expert_parallel
+        or parallel.use_ubatching
+        or config.compilation_config.pass_config.enable_sp
+    ):
+        raise NotImplementedError(
+            "B12X hybrid A4 prefill supports TP/DCP without DP, PCP, "
+            "EP, sequence parallelism or ubatching"
+        )
+    if (
+        config.speculative_config is not None
+        and config.speculative_config.enable_adaptive_verification
+    ):
+        raise NotImplementedError(
+            "B12X hybrid A4 prefill requires host-visible token ranges; "
+            "adaptive verification changes token ranges on the GPU"
+        )
+
+
+def get_b12x_a4_prefill_parts(tokens: int) -> tuple[tuple[int, int, bool], ...]:
+    """Partition target-forward rows into calibrated A4 and A16 spans."""
+    from vllm.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+
+    if not is_forward_context_available() or torch.cuda.is_current_stream_capturing():
+        return ((0, tokens, False),)
+    metadata = get_forward_context().moe_prefill_metadata
+    if metadata is None:
+        return ((0, tokens, False),)
+    if metadata.num_tokens != tokens:
+        raise ValueError(
+            "B12X hybrid prefill requires the target forward's padded token ordering: "
+            f"expected {metadata.num_tokens} rows, got {tokens}"
+        )
+    parts = []
+    previous = 0
+    for start, end in metadata.prefill_ranges:
+        if not previous <= start < end <= tokens:
+            raise ValueError("B12X hybrid prefill ranges must be ordered and disjoint")
+        if previous < start:
+            parts.append((previous, start, False))
+        parts.append((start, end, True))
+        previous = end
+    if previous < tokens:
+        parts.append((previous, tokens, False))
+    return tuple(parts)
+
+
 def build_moe_prefill_metadata(
     num_tokens: int,
     query_start_loc: np.ndarray,

@@ -13,8 +13,6 @@ from typing import Any
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm.config import get_current_vllm_config_or_none
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
@@ -38,11 +36,13 @@ from vllm.utils.b12x import (
     B12xPreparationUnit,
     B12xWorkload,
     PreparationResourceUnavailableError,
+    get_b12x_a4_prefill_parts,
     get_b12x_a16_max_tokens,
     get_b12x_fused_moe,
     is_b12x_a4_prefill_enabled,
     reuse_packed_weight_storage,
     set_b12x_preparation_provider,
+    validate_b12x_a4_prefill_config,
 )
 
 logger = init_logger(__name__)
@@ -222,31 +222,6 @@ def _normalize_topk_weights(topk_weights: torch.Tensor) -> torch.Tensor:
     return topk_weights.to(dtype=torch.float32).contiguous()
 
 
-def _a4_prefill_parts(tokens: int) -> tuple[tuple[int, int, bool], ...]:
-    if _is_current_stream_capturing() or not is_forward_context_available():
-        return ((0, tokens, False),)
-    metadata = get_forward_context().moe_prefill_metadata
-    if metadata is None:
-        return ((0, tokens, False),)
-    if metadata.num_tokens != tokens:
-        raise ValueError(
-            "B12X hybrid prefill requires the target forward's padded token ordering: "
-            f"expected {metadata.num_tokens} rows, got {tokens}"
-        )
-    parts = []
-    previous = 0
-    for start, end in metadata.prefill_ranges:
-        if not previous <= start < end <= tokens:
-            raise ValueError("B12X hybrid prefill ranges must be ordered and disjoint")
-        if previous < start:
-            parts.append((previous, start, False))
-        parts.append((start, end, True))
-        previous = end
-    if previous < tokens:
-        parts.append((previous, tokens, False))
-    return tuple(parts)
-
-
 def _replace_parameter_with_empty(
     layer: torch.nn.Module,
     name: str,
@@ -336,28 +311,18 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             else 0
         )
         if self._a4_prefill_enabled:
+            validate_b12x_a4_prefill_config()
             parallel = moe_config.moe_parallel_config
-            config = get_current_vllm_config_or_none()
             if (
                 parallel.dp_size != 1
                 or parallel.pcp_size != 1
                 or parallel.is_sequence_parallel
                 or parallel.use_ep
                 or parallel.ep_size != 1
-                or (config is not None and config.parallel_config.use_ubatching)
             ):
                 raise NotImplementedError(
                     "B12X hybrid A4 prefill supports TP/DCP without DP, PCP, "
                     "EP, sequence parallelism or ubatching"
-                )
-            if (
-                config is not None
-                and config.speculative_config is not None
-                and config.speculative_config.enable_adaptive_verification
-            ):
-                raise NotImplementedError(
-                    "B12X hybrid A4 prefill requires host-visible token ranges; "
-                    "adaptive verification changes token ranges on the GPU"
                 )
             fused_moe = _require_b12x_fused_moe()
             binding_type = getattr(fused_moe, "Binding", None)
@@ -832,7 +797,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         if self._a4_prefill_enabled and getattr(
             getattr(prepared, "_impl", None), "a4_prefill_scales", False
         ):
-            return _a4_prefill_parts(tokens)
+            return get_b12x_a4_prefill_parts(tokens)
         return ((0, tokens, False),)
 
     def uses_expanded_nvfp4_scales(

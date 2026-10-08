@@ -2,18 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Layer-held block-scaled linear state shared by the b12x linear kernels.
 
-A holder owns one packed weight and the exact-M ``Plan`` declared for the
-serving shapes. The kernel's ``apply_weights`` reaches ``run`` through the
-``vllm::b12x_blockscaled_linear`` custom op, so compiled graphs carry only
+A holder owns one packed weight and the execution plans declared for the
+serving shapes. Semantic NVFP4 prefill uses separate A16 and A4 plans that
+share the packed weight and scratch storage. ``apply_weights`` reaches ``run``
+through the ``vllm::b12x_blockscaled_linear`` custom op, so compiled graphs carry only
 tensors, the output width, and the layer name. ``run`` resolves the prepared
 regime for the live row count and draws its workspace from the worker's
-workspace manager; nothing here allocates during graph capture once the
-workspace is locked.
+workspace manager. Scratch is reserved before CUDA graph capture; returned
+outputs use the graph's allocation pool.
 """
 
 from __future__ import annotations
 
 import weakref
+from dataclasses import replace
 
 import torch
 
@@ -23,6 +25,7 @@ from vllm.utils.b12x import (
     B12xPreparationUnit,
     B12xWorkload,
     PreparationResourceUnavailableError,
+    get_b12x_a4_prefill_parts,
     get_b12x_a16_max_tokens,
     get_b12x_blockscaled,
 )
@@ -54,6 +57,7 @@ class B12xBlockscaledLinear:
         activation_mode: str,
         layer_name: str,
         activation_scale: torch.Tensor | None = None,
+        a4_prefill_enabled: bool = False,
     ) -> None:
         if recipe not in ("nvfp4", "mxfp8", "iq2_xs", "iq2_xxs", "q8_0"):
             raise ValueError(
@@ -62,10 +66,29 @@ class B12xBlockscaledLinear:
         self.packed = packed
         self.recipe = recipe
         self.activation_mode = activation_mode
-        self.a16_max_tokens = get_b12x_a16_max_tokens() if recipe == "nvfp4" else 0
+        self.a4_prefill_enabled = (
+            a4_prefill_enabled and recipe == "nvfp4" and activation_mode == "auto"
+        )
+        self.a16_max_tokens = (
+            get_b12x_a16_max_tokens()
+            if recipe == "nvfp4" and not self.a4_prefill_enabled
+            else 0
+        )
         self.layer_name = layer_name
         self.activation_scale = activation_scale
         self.plan = None
+        self.a4_plan = None
+        self._a4_prefill_supported = (
+            self.a4_prefill_enabled
+            and int(packed.padded_in_features) % 128 == 0
+            and activation_scale is not None
+            and not activation_scale.is_meta
+            and activation_scale.dtype == torch.float32
+            and activation_scale.numel() == 1
+            and bool((activation_scale.isfinite() & (activation_scale > 0)).all())
+        )
+        if self.a4_prefill_enabled and not self._a4_prefill_supported:
+            self.activation_scale = None
         self._plan_key: tuple[int, tuple[int, ...]] | None = None
 
     @property
@@ -96,6 +119,8 @@ class B12xBlockscaledLinear:
         return (
             self.recipe,
             self.activation_mode,
+            self.a4_prefill_enabled,
+            self._a4_prefill_supported,
             self.a16_max_tokens,
             self.in_features,
             int(self.packed.padded_in_features),
@@ -142,7 +167,7 @@ class B12xBlockscaledLinear:
             in_features=self.in_features,
             padded_in_features=int(self.packed.padded_in_features),
             out_features=self.out_features,
-            activation_mode=self.activation_mode,
+            activation_mode="a16" if self.a4_prefill_enabled else self.activation_mode,
             activation_scale_available=self.activation_scale is not None,
             global_scale_kind=global_scale_kind,
             source_contiguous=True,
@@ -151,11 +176,19 @@ class B12xBlockscaledLinear:
             workspace_nbytes=envs.VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES,
             expected_m=None,
         )
+        if self.a4_prefill_enabled:
+            query = replace(query, output_mode="provided")
         self.plan = api.plan_regimes(
             query,
             exact_m=workload.fixed_token_counts,
             a16_max_tokens=self.a16_max_tokens,
         )
+        if self._a4_prefill_supported:
+            self.a4_plan = api.plan_regimes(
+                replace(query, activation_mode="quantized"),
+                exact_m=workload.fixed_token_counts,
+                a16_max_tokens=0,
+            )
         self._plan_key = key
         return self.plan
 
@@ -186,6 +219,11 @@ class B12xBlockscaledLinear:
                 if state.required_workspace
                 else None
             )
+            output = (
+                source.new_empty((rows, holder.out_features))
+                if holder.a4_prefill_enabled
+                else None
+            )
 
             def produce() -> None:
                 source.fill_(0.125)
@@ -197,6 +235,7 @@ class B12xBlockscaledLinear:
                     scales,
                     global_scale,
                     activation_scale=activation_scale,
+                    out=output,
                     workspace=workspace,
                 )
 
@@ -212,11 +251,23 @@ class B12xBlockscaledLinear:
     def unit(self, workload: B12xWorkload, *, name: str) -> B12xPreparationUnit:
         plan = self.ensure_plan(workload)
         calls = {rows: self._call_factory(rows) for rows in plan.token_counts}
-        request = plan.request(name=name, prepare_calls=calls, benchmark_calls=calls)
+        requests = (
+            plan.request(
+                name=f"{name}.a16" if self.a4_prefill_enabled else name,
+                prepare_calls=calls,
+                benchmark_calls=calls,
+            ),
+        )
+        if self.a4_plan is not None:
+            requests += (
+                self.a4_plan.request(
+                    name=f"{name}.a4", prepare_calls=calls, benchmark_calls=calls
+                ),
+            )
         return B12xPreparationUnit(
             name=self.recipe.upper(),
             key=self.signature(workload),
-            requests=(request,),
+            requests=requests,
             stage="weights",
         )
 
@@ -234,14 +285,16 @@ class B12xBlockscaledLinear:
             raise PreparationResourceUnavailableError(
                 f"{self.layer_name}: block-scaled linear has no declared plan"
             )
-        if plan.prepared is None:
-            return self._workspace_size(
-                sum(spec.nbytes for spec in plan.scratch_specs())
-            )
         from b12x.preparation import require_prepared
 
         return self._workspace_size(
-            int(require_prepared(plan, COMPONENT).required_workspace)
+            max(
+                sum(spec.nbytes for spec in candidate.scratch_specs())
+                if candidate.prepared is None
+                else int(require_prepared(candidate, COMPONENT).required_workspace)
+                for candidate in (plan, self.a4_plan)
+                if candidate is not None
+            )
         )
 
     def _workspace_size(self, kernel_bytes: int) -> int:
@@ -259,7 +312,15 @@ class B12xBlockscaledLinear:
         from b12x.preparation import require_prepared
 
         state = require_prepared(plan, COMPONENT, source.device)
-        required_workspace = self._workspace_size(state.required_workspace)
+        kernel_bytes = state.required_workspace
+        if self.a4_plan is not None:
+            kernel_bytes = max(
+                kernel_bytes,
+                require_prepared(
+                    self.a4_plan, COMPONENT, source.device
+                ).required_workspace,
+            )
+        required_workspace = self._workspace_size(kernel_bytes)
         workspace = None
         if required_workspace:
             from vllm.v1.worker.workspace import (
@@ -311,6 +372,28 @@ class B12xBlockscaledLinear:
                 )
         api = get_b12x_blockscaled()
         assert api is not None
+        if self.a4_prefill_enabled:
+            rows = source.numel() // self.in_features
+            parts = (
+                get_b12x_a4_prefill_parts(rows)
+                if self.a4_plan is not None
+                else ((0, rows, False),)
+            )
+            source = source.view(rows, self.in_features)
+            output = source.new_empty((rows, self.out_features))
+            for start, end, is_prefill in parts:
+                api.mm(
+                    source[start:end],
+                    self.packed,
+                    plan=self.a4_plan
+                    if is_prefill and self.a4_plan is not None
+                    else plan,
+                    out=output[start:end],
+                    bias=bias,
+                    workspace=workspace,
+                    activation_global_scale=self.activation_scale,
+                )
+            return output
         return api.mm(
             source,
             self.packed,

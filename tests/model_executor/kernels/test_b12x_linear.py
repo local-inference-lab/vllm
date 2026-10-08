@@ -1349,6 +1349,7 @@ def test_b12x_nvfp4_fp16_preserves_quantized_path(monkeypatch) -> None:
     layer.alpha = torch.tensor(0.25)
     layer.b12x_activation_mode = "auto"
     layer.b12x_bf16_input_supported = True
+    layer.b12x_linear = types.SimpleNamespace(a4_prefill_enabled=False)
     plan = object()
     layer.b12x_nvfp4_serialized_plans = {6: plan}
     name = "nvfp4-fp16-apply-probe"
@@ -1403,7 +1404,9 @@ def _serialized_probe_layer(name: str) -> torch.nn.Module:
     layer.b12x_activation_mode = "quantized"
     layer.b12x_bf16_input_supported = True
     layer.b12x_nvfp4_serialized_activations = True
-    layer.b12x_linear = types.SimpleNamespace(a16_max_tokens=0)
+    layer.b12x_linear = types.SimpleNamespace(
+        a16_max_tokens=0, a4_prefill_enabled=False
+    )
     layer.b12x_nvfp4_packed_weight = types.SimpleNamespace(
         in_features=256,
         padded_in_features=256,
@@ -1663,11 +1666,138 @@ def test_b12x_dense_precision_rejects_invalid_override(monkeypatch, recipe):
         get_b12x_dense_activation_mode(recipe)
 
 
-@pytest.mark.parametrize("recipe", ["nvfp4", "mxfp8"])
-@pytest.mark.parametrize("mode", ["auto", "a16", "quantized"])
-@pytest.mark.parametrize("cutoff", [0, 32])
+@pytest.mark.parametrize(
+    "mode,weight_only,expected_mode,semantic",
+    [
+        ("auto", False, "auto", True),
+        ("a16", False, "a16", False),
+        ("quantized", False, "quantized", False),
+        ("auto", True, "a16", False),
+    ],
+)
+def test_b12x_nvfp4_hybrid_respects_explicit_and_checkpoint_precision(
+    monkeypatch, mode, weight_only, expected_mode, semantic
+):
+    import vllm.model_executor.kernels.linear.nvfp4.b12x as module
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL", "1")
+    monkeypatch.setenv("VLLM_B12X_NVFP4_ACTIVATION_MODE", mode)
+    monkeypatch.setenv("VLLM_B12X_ACTIVATION_MODE_A16_M", "32")
+    monkeypatch.setattr(
+        module.current_platform, "is_device_capability_family", lambda family: True
+    )
+    monkeypatch.setattr(
+        module,
+        "_import_b12x_intrinsics",
+        lambda: types.SimpleNamespace(swizzle_block_scale=lambda value: value),
+    )
+
+    @dataclass(frozen=True)
+    class Packed:
+        values: torch.Tensor
+        scale_mma: torch.Tensor
+        global_scale: torch.Tensor
+        global_scale_kind: str = "multiplier"
+        in_features: int = 128
+        padded_in_features: int = 128
+        out_features: int = 8
+
+    monkeypatch.setattr(
+        module,
+        "_import_b12x_blockscaled",
+        lambda: types.SimpleNamespace(
+            pack_weight=lambda values, scales, *, recipe, global_scale: Packed(
+                values, scales, global_scale
+            )
+        ),
+    )
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(torch.empty(8, 64, dtype=torch.uint8), False)
+    layer.weight_scale = torch.nn.Parameter(
+        torch.ones(8, 8, dtype=torch.float8_e4m3fn), False
+    )
+    layer.weight_global_scale = torch.tensor(1.0)
+    layer.input_global_scale_inv = torch.tensor(2.0)
+    kernel = object.__new__(B12xNvFp4LinearKernel)
+    kernel.config = NvFp4LinearLayerConfig(use_a16=weight_only)
+    with set_current_vllm_config(VllmConfig(device_config=DeviceConfig("cpu"))):
+        kernel.process_weights_after_loading(layer)
+    assert layer.b12x_activation_mode == expected_mode
+    assert layer.b12x_linear.a4_prefill_enabled is semantic
+    assert layer.b12x_linear.packed.values.data_ptr() == layer.weight.data_ptr()
+    assert layer.b12x_linear.activation_scale is (
+        None if weight_only else layer.input_global_scale_inv
+    )
+
+
+@pytest.mark.parametrize(
+    "parallel_updates,sp,adaptive,encoder_decoder,error",
+    [
+        (
+            {"tensor_parallel_size": 4, "decode_context_parallel_size": 2},
+            False,
+            False,
+            False,
+            None,
+        ),
+        (
+            {"data_parallel_size": 2, "data_parallel_mode": "independent"},
+            False,
+            False,
+            False,
+            None,
+        ),
+        ({"data_parallel_size": 2}, False, False, False, "supports TP/DCP"),
+        ({"prefill_context_parallel_size": 2}, False, False, False, "supports TP/DCP"),
+        ({"enable_expert_parallel": True}, False, False, False, "supports TP/DCP"),
+        ({"ubatch_size": 2}, False, False, False, "supports TP/DCP"),
+        ({"enable_dbo": True}, False, False, False, "supports TP/DCP"),
+        ({}, True, False, False, "supports TP/DCP"),
+        ({}, False, True, False, "adaptive verification"),
+        ({}, False, False, True, "decoder-only token ordering"),
+    ],
+)
+def test_b12x_dense_hybrid_requires_scheduler_token_ordering(
+    monkeypatch, parallel_updates, sp, adaptive, encoder_decoder, error
+):
+    import vllm.config as config_module
+    from vllm.config import ParallelConfig
+    from vllm.utils.b12x import validate_b12x_a4_prefill_config
+
+    parallel = ParallelConfig()
+    for name, value in parallel_updates.items():
+        setattr(parallel, name, value)
+    config = types.SimpleNamespace(
+        parallel_config=parallel,
+        model_config=types.SimpleNamespace(is_encoder_decoder=encoder_decoder),
+        compilation_config=types.SimpleNamespace(
+            pass_config=types.SimpleNamespace(enable_sp=sp)
+        ),
+        speculative_config=types.SimpleNamespace(enable_adaptive_verification=adaptive),
+    )
+    monkeypatch.setattr(
+        config_module, "get_current_vllm_config_or_none", lambda: config
+    )
+    if error is None:
+        validate_b12x_a4_prefill_config()
+    else:
+        with pytest.raises(NotImplementedError, match=error):
+            validate_b12x_a4_prefill_config()
+
+
+@pytest.mark.parametrize(
+    "recipe,mode,cutoff,hybrid",
+    [
+        (recipe, mode, cutoff, False)
+        for recipe in ("nvfp4", "mxfp8")
+        for mode in ("auto", "a16", "quantized")
+        for cutoff in (0, 32)
+    ]
+    + [("nvfp4", "auto", 32, True)],
+)
 def test_b12x_dense_precision_gpu_graph_replay(
-    monkeypatch, tmp_path, recipe, mode, cutoff
+    monkeypatch, tmp_path, recipe, mode, cutoff, hybrid
 ):
     """Prepare real exact-M executions, then verify numerical and graph replay."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
@@ -1681,6 +1811,11 @@ def test_b12x_dense_precision_gpu_graph_replay(
 
     from tests.kernels.quantization.nvfp4_utils import dequantize_nvfp4_to_dtype
     from vllm._custom_ops import scaled_fp4_quant
+    from vllm.forward_context import (
+        ForwardContext,
+        MoEPrefillMetadata,
+        override_forward_context,
+    )
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
         _mxfp8_e4m3_quantize_torch,
     )
@@ -1688,6 +1823,7 @@ def test_b12x_dense_precision_gpu_graph_replay(
 
     monkeypatch.setenv(f"VLLM_B12X_{recipe.upper()}_ACTIVATION_MODE", mode)
     monkeypatch.setenv("VLLM_B12X_ACTIVATION_MODE_A16_M", str(cutoff))
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL", "1" if hybrid else "0")
     torch.manual_seed(1234)
     n, k = 4096, 5376
     layer = torch.nn.Module()
@@ -1787,7 +1923,23 @@ def test_b12x_dense_precision_gpu_graph_replay(
         for m in reversed(live_counts):
             source = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
             config = state.resolve(source).config
-            if cutoff and recipe == "nvfp4":
+            if hybrid:
+                assert config.mode == "a16"
+                a4_state = require_prepared(
+                    layer.b12x_linear.a4_plan, "gemm.blockscaled_precision"
+                )
+                assert a4_state.resolve(source).config.mode == "quantized"
+                ranges = ((0, 1), (m // 2, m - 1)) if m > 3 else ((0, m),)
+                context = ForwardContext(
+                    {}, {}, {}, moe_prefill_metadata=MoEPrefillMetadata(m, ranges)
+                )
+                expected = reference(source, True)
+                for start, end in ranges:
+                    expected[start:end] = reference(source[start:end], False)
+                with override_forward_context(context):
+                    actual = kernel.apply_weights(layer, source, bias)
+                torch.testing.assert_close(actual, expected, atol=0.5, rtol=0.02)
+            elif cutoff and recipe == "nvfp4":
                 if m <= cutoff:
                     assert config.mode == "a16"
                 elif mode != "auto":
@@ -1797,7 +1949,14 @@ def test_b12x_dense_precision_gpu_graph_replay(
                 actual = kernel.apply_weights(layer, source, bias)
             torch.testing.assert_close(actual, expected, atol=0.5, rtol=0.02)
             graph = torch.cuda.CUDAGraph()
-            with kernel_resolution_guard("NVFP4 A16 cutoff replay"), session.capture():
+            capture_context = ForwardContext(
+                {}, {}, {}, moe_prefill_metadata=MoEPrefillMetadata(m, ((0, m),))
+            )
+            with (
+                override_forward_context(capture_context),
+                kernel_resolution_guard("NVFP4 dense precision replay"),
+                session.capture(),
+            ):
                 with torch.cuda.graph(graph):
                     output = kernel.apply_weights(layer, source, bias)
                 pointer = output.data_ptr()
@@ -2801,6 +2960,8 @@ def _holder_with_prepared_state(monkeypatch, *, required_workspace: int):
     holder.layer_name = "layer.linear"
     holder.packed = types.SimpleNamespace(out_features=8, in_features=16)
     holder.activation_scale = None
+    holder.a4_prefill_enabled = False
+    holder.a4_plan = None
     holder.plan = types.SimpleNamespace(prepared=object())
     state = types.SimpleNamespace(required_workspace=required_workspace)
     monkeypatch.setattr(
@@ -2818,6 +2979,196 @@ def _holder_with_prepared_state(monkeypatch, *, required_workspace: int):
         lambda: types.SimpleNamespace(mm=mm),
     )
     return holder, calls
+
+
+def _semantic_dense_holder(
+    monkeypatch, *, recipe="nvfp4", mode="auto", enabled=True, scale=2.0, k=128
+):
+    import b12x.preparation as preparation
+    from b12x.gemm.blockscaled import BlockscaledQuery
+
+    import vllm.model_executor.kernels.linear.b12x_blockscaled as module
+
+    queries = []
+    requests = []
+
+    def declare(query, **kwargs):
+        queries.append((query, kwargs))
+        scratch_bytes = 96 if query.activation_mode == "quantized" else 64
+        plan = types.SimpleNamespace(
+            mode=query.activation_mode,
+            token_counts=(1, 64),
+            prepared=types.SimpleNamespace(required_workspace=scratch_bytes),
+            scratch_specs=lambda: (types.SimpleNamespace(nbytes=scratch_bytes),),
+        )
+
+        def request(**kwargs):
+            requests.append(kwargs)
+            return types.SimpleNamespace(name=kwargs["name"])
+
+        plan.request = request
+        return plan
+
+    api = types.SimpleNamespace(BlockscaledQuery=BlockscaledQuery, plan_regimes=declare)
+    monkeypatch.setattr(module, "get_b12x_blockscaled", lambda: api)
+    monkeypatch.setattr(
+        preparation,
+        "require_prepared",
+        lambda plan, component, device=None: plan.prepared,
+    )
+    packed = types.SimpleNamespace(
+        in_features=k,
+        padded_in_features=k,
+        out_features=8,
+        values=torch.empty(8, k // 2, dtype=torch.uint8),
+        scale_mma=torch.empty(8, k // 16, dtype=torch.float8_e4m3fn),
+        global_scale=torch.tensor(1.0),
+        global_scale_kind="multiplier",
+    )
+    packed.weight = packed
+    holder = module.B12xBlockscaledLinear(
+        packed,
+        recipe=recipe,
+        activation_mode=mode,
+        layer_name="model.layers.0.mlp.shared_expert.down_proj",
+        activation_scale=(
+            scale
+            if scale is None or isinstance(scale, torch.Tensor)
+            else torch.tensor(scale)
+        ),
+        a4_prefill_enabled=enabled,
+    )
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(1, 64),
+        fixed_token_counts=(1,),
+        output_dtype=torch.bfloat16,
+        max_tokens=64,
+        max_seqs=8,
+        max_model_len=64,
+    )
+    unit = holder.unit(workload, name="linear.shared_expert.down_proj")
+    return holder, api, queries, requests, unit
+
+
+@pytest.mark.parametrize(
+    "recipe,mode,enabled,scale,k,expected_modes",
+    [
+        ("nvfp4", "auto", True, 2.0, 128, ["a16", "quantized"]),
+        ("nvfp4", "auto", True, None, 128, ["a16"]),
+        ("nvfp4", "auto", True, 0.0, 128, ["a16"]),
+        ("nvfp4", "auto", True, -1.0, 128, ["a16"]),
+        ("nvfp4", "auto", True, float("nan"), 128, ["a16"]),
+        ("nvfp4", "auto", True, float("inf"), 128, ["a16"]),
+        ("nvfp4", "auto", True, torch.tensor(2.0, dtype=torch.float16), 128, ["a16"]),
+        ("nvfp4", "auto", True, [1.0, 2.0], 128, ["a16"]),
+        ("nvfp4", "auto", True, 2.0, 160, ["a16"]),
+        ("nvfp4", "a16", True, None, 128, ["a16"]),
+        ("nvfp4", "quantized", True, 2.0, 128, ["quantized"]),
+        ("nvfp4", "auto", False, 2.0, 128, ["auto"]),
+        ("mxfp8", "auto", True, None, 128, ["auto"]),
+    ],
+)
+def test_b12x_dense_semantic_precision_eligibility_and_shared_storage(
+    monkeypatch, recipe, mode, enabled, scale, k, expected_modes
+):
+    """Semantic policy prepares fixed precisions without repacking weights."""
+    monkeypatch.setenv("VLLM_B12X_ACTIVATION_MODE_A16_M", "32")
+    holder, _, queries, requests, unit = _semantic_dense_holder(
+        monkeypatch, recipe=recipe, mode=mode, enabled=enabled, scale=scale, k=k
+    )
+    assert [query.activation_mode for query, _ in queries] == expected_modes
+    semantic = recipe == "nvfp4" and mode == "auto" and enabled
+    for query, options in queries:
+        assert options["a16_max_tokens"] == (0 if semantic or recipe != "nvfp4" else 32)
+        assert query.output_mode == ("provided" if semantic else "functional")
+    assert len(unit.requests) == len(expected_modes)
+    assert len({request["name"] for request in requests}) == len(expected_modes)
+    assert holder.holds(holder.packed)
+    if semantic and "quantized" not in expected_modes:
+        assert holder.activation_scale is None
+    expected_scratch = (96 if "quantized" in expected_modes else 64) + (
+        256 if recipe == "mxfp8" else 0
+    )
+    assert holder.get_workspace_size(64) == expected_scratch
+    for plan in (holder.plan, holder.a4_plan):
+        if plan is not None:
+            plan.prepared = None
+    assert holder.get_workspace_size(64) == expected_scratch
+
+
+@pytest.mark.parametrize(
+    "ranges,capturing,expected",
+    [
+        (
+            ((0, 1), (7, 17), (23, 25)),
+            False,
+            [
+                (0, 1, True),
+                (1, 7, False),
+                (7, 17, True),
+                (17, 23, False),
+                (23, 25, True),
+                (25, 64, False),
+            ],
+        ),
+        (((0, 64),), False, [(0, 64, True)]),
+        (((0, 64),), True, [(0, 64, False)]),
+        ((), False, [(0, 64, False)]),
+        (None, False, [(0, 64, False)]),
+    ],
+)
+def test_b12x_dense_semantic_rows_preserve_bias_output_and_reserved_workspace(
+    monkeypatch, ranges, capturing, expected
+):
+    """One-row prefill is A4 while long decode remains A16 at identical M."""
+    from vllm.forward_context import (
+        ForwardContext,
+        MoEPrefillMetadata,
+        override_forward_context,
+    )
+    from vllm.v1.worker import workspace
+
+    monkeypatch.setenv("VLLM_B12X_ACTIVATION_MODE_A16_M", "4096")
+    holder, api, _, _, _ = _semantic_dense_holder(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    source = torch.arange(64 * 128, dtype=torch.float32).view(64, 128)
+    bias = torch.arange(8, dtype=torch.float32)
+    reserved = torch.empty(holder.get_workspace_size(64), dtype=torch.uint8)
+    calls = []
+    output_storage = []
+
+    def mm(part, packed, *, plan, out, workspace, bias, **kwargs):
+        start = (part.data_ptr() - source.data_ptr()) // (128 * 4)
+        end = start + len(part)
+        a4 = plan.mode == "quantized"
+        calls.append((start, end, a4))
+        assert packed is holder.packed
+        assert workspace.data_ptr() == reserved.data_ptr()
+        assert workspace.numel() >= plan.prepared.required_workspace
+        output_storage.append(out.untyped_storage().data_ptr())
+        out.copy_(part[:, :8] + bias + (1000 if a4 else 0))
+        return out
+
+    api.mm = mm
+    monkeypatch.setattr(
+        workspace,
+        "current_workspace_manager",
+        lambda: pytest.fail("shared-expert scratch must use its reserved buffer"),
+    )
+    metadata = None if ranges is None else MoEPrefillMetadata(64, ranges)
+    context = ForwardContext({}, {}, {}, moe_prefill_metadata=metadata)
+    with (
+        override_forward_context(context),
+        workspace.use_preallocated_workspace(reserved),
+    ):
+        output = holder.run(source, bias)
+    assert calls == expected
+    assert set(output_storage) == {output.untyped_storage().data_ptr()}
+    for start, end, a4 in expected:
+        torch.testing.assert_close(
+            output[start:end], source[start:end, :8] + bias + (1000 if a4 else 0)
+        )
 
 
 def test_b12x_holder_reports_its_prepared_scratch_requirement(monkeypatch) -> None:
