@@ -651,28 +651,43 @@ def test_normal_expert_hooks_preserve_tp_weights_scales_and_calibration(
         w13_scale_scratch=torch.empty((2, 128, 8), dtype=torch.float8_e4m3fn),
         w2_scale_scratch=torch.empty((2, 128, 4), dtype=torch.float8_e4m3fn),
     )
-    actual = prepare_nvfp4_csf_weights(
+    copied = prepare_nvfp4_csf_weights(
         method._expert_tensors(), intermediate_size=64, tp_rank=0, tp_size=1, **kwargs
     )
+    # The loader's packed layer buffers become the weight storage, uncopied.
+    packed = method._packed
+    in_place = prepare_nvfp4_csf_weights(
+        method._expert_tensors(),
+        intermediate_size=64,
+        tp_rank=0,
+        tp_size=1,
+        packed=packed,
+        **{**kwargs, "device": packed[0].device},
+    )
+    assert in_place.packed.w13 is packed[0] and in_place.packed.w2 is packed[1]
     expected = prepare_nvfp4_csf_weights(
         sources, intermediate_size=128, tp_rank=rank, tp_size=2, **kwargs
     )
-    for name in (
-        "w13",
-        "w2",
-        "w13_global_scales",
-        "w2_global_scales",
-        "input_scale",
-        "intermediate_scale",
-    ):
-        torch.testing.assert_close(
-            getattr(actual.packed, name), getattr(expected.packed, name), rtol=0, atol=0
-        )
-    for name, rows, columns in (("w13_scales", 128, 8), ("w2_scales", 128, 4)):
-        assert torch.equal(
-            decode_planes(getattr(actual, name), rows, columns, 16),
-            decode_planes(getattr(expected, name), rows, columns, 16),
-        )
+    for actual in (copied, in_place):
+        for name in (
+            "w13",
+            "w2",
+            "w13_global_scales",
+            "w2_global_scales",
+            "input_scale",
+            "intermediate_scale",
+        ):
+            torch.testing.assert_close(
+                getattr(actual.packed, name).cpu(),
+                getattr(expected.packed, name),
+                rtol=0,
+                atol=0,
+            )
+        for name, rows, columns in (("w13_scales", 128, 8), ("w2_scales", 128, 4)):
+            assert torch.equal(
+                decode_planes(getattr(actual, name), rows, columns, 16),
+                decode_planes(getattr(expected, name), rows, columns, 16),
+            )
     missing = method._components[(0, "w1")].pop("fixed")
     with pytest.raises(ValueError, match="Missing CSF tensors"):
         list(method._expert_tensors())
