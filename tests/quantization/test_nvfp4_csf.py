@@ -3,7 +3,7 @@
 """Compressed expert storage must retain nonexpert precision and tensors."""
 
 import json
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -134,11 +134,15 @@ def test_prepared_nvfp4_accepts_kernel_order_and_rejects_activation_change(monke
 
 
 @pytest.mark.parametrize("use_a16", [False, True])
-def test_csf_preparation_preserves_explicit_a16_cutoff(monkeypatch, use_a16):
-    """CSF installation must retain the precision constraint in its weight plan."""
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_csf_preparation_preserves_phase_policy_or_a16_cutoff(
+    monkeypatch, use_a16, hybrid
+):
+    """Semantic hybrid precision is independent of the ordinary A16 cutoff."""
     from b12x.moe import fused_moe
 
     monkeypatch.setenv("VLLM_B12X_ACTIVATION_MODE_A16_M", "32")
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL", "1" if hybrid else "0")
     moe = FusedMoEConfig(
         num_experts=1,
         num_local_experts=1,
@@ -178,7 +182,7 @@ def test_csf_preparation_preserves_explicit_a16_cutoff(monkeypatch, use_a16):
     monkeypatch.setattr(fused_moe, "prepare_weights", stop_before_cuda_preparation)
     with pytest.raises(StopIteration):
         method.process_weights_after_loading(layer)
-    assert plans[0].activation.a16_max_tokens == (32 if use_a16 else 0)
+    assert plans[0].activation.a16_max_tokens == (32 if use_a16 and not hybrid else 0)
     assert plans[0].activation.mode == ("a16" if use_a16 else "a4")
 
 
@@ -428,7 +432,6 @@ def test_missing_or_invalid_calibration_is_rejected(bad):
         )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA streams")
 def test_scale_prefetch_expands_the_next_layer_for_this_forward_only(monkeypatch):
     """Layer N expands layer N+1's scales on the side stream after its own MoE;
     layer N+1 skips its expansion in the same forward pass only."""
@@ -436,6 +439,25 @@ def test_scale_prefetch_expands_the_next_layer_for_this_forward_only(monkeypatch
     import b12x.moe.fused_moe as fused_moe
 
     import vllm.forward_context as forward_context
+    import vllm.model_executor.layers.quantization.nvfp4_csf as csf
+
+    main_stream, side_stream = Mock(), Mock()
+    active_stream = main_stream
+
+    @contextmanager
+    def use_stream(stream):
+        nonlocal active_stream
+        previous, active_stream = active_stream, stream
+        try:
+            yield
+        finally:
+            active_stream = previous
+
+    monkeypatch.setattr(csf, "_is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: active_stream)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda: side_stream)
+    monkeypatch.setattr(torch.cuda, "Event", Mock)
+    monkeypatch.setattr(torch.cuda, "stream", use_stream)
 
     expanded = []
     monkeypatch.setattr(
@@ -460,7 +482,7 @@ def test_scale_prefetch_expands_the_next_layer_for_this_forward_only(monkeypatch
     def method(index):
         m = object.__new__(Nvfp4CsfMoEMethod)
         m.owner, m.layer_index = owner, index
-        m.backend = SimpleNamespace(scales_expanded=False)
+        m.backend = SimpleNamespace(scales_expanded=False, _a4_prefill_enabled=False)
         m.prepared = f"layer-{index}"
         m.moe_done, m.scales_ready = torch.cuda.Event(), torch.cuda.Event()
         m.moe_kernel = SimpleNamespace(
@@ -480,8 +502,9 @@ def test_scale_prefetch_expands_the_next_layer_for_this_forward_only(monkeypatch
     )
 
     def forward(x):
+        ids = torch.zeros(x.shape[0], 1, dtype=torch.int64)
         for m in (first, second):
-            m.apply(layer, x, None, None, None, None)
+            m.apply(layer, x, None, ids, None, None)
 
     forward(step(2000))  # above the stage-read limit: the calls expand
     assert calls == [(3, False), (4, True)]
@@ -493,11 +516,23 @@ def test_scale_prefetch_expands_the_next_layer_for_this_forward_only(monkeypatch
     calls.clear()
     second.apply(layer, step(2000), None, None, None, None)
     assert calls == [(4, False)]
+    main_stream.wait_event.assert_called_with(second.scales_ready)
     # Decode-sized calls read compressed scales per stage: nothing to expand.
     expanded.clear()
     calls.clear()
     forward(step(8))
     assert calls == [(3, False), (4, False)] and expanded == []
+    # The following layer's selected consumer governs prefetch independently.
+    first.backend._a4_prefill_enabled = second.backend._a4_prefill_enabled = True
+    first.backend.uses_expanded_nvfp4_scales = Mock(return_value=True)
+    second.backend.uses_expanded_nvfp4_scales = Mock(return_value=False)
+    forward(step(2000))
+    first.backend.uses_expanded_nvfp4_scales.assert_not_called()
+    second.backend.uses_expanded_nvfp4_scales.assert_called_once_with(2000, torch.int64)
+    assert expanded == []
+    second.backend.uses_expanded_nvfp4_scales.return_value = True
+    forward(step(2000))
+    assert [p for p, _ in expanded] == ["layer-4"]
 
 
 @pytest.mark.parametrize("rank", [0, 1])

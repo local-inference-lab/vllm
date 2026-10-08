@@ -989,12 +989,14 @@ def test_b12x_hybrid_prefill_preserves_decode_rows_and_shared_workspace(
     monkeypatch, prefill_ranges, capturing, enabled, calibrated, expected
 ):
     """Semantic ranges choose precision without changing row or scratch ownership."""
-    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", "1536" if enabled else "0")
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL", "1" if enabled else "0")
+    monkeypatch.setenv("VLLM_B12X_ACTIVATION_MODE_A16_M", "4096")
     monkeypatch.setattr(b12x, "_is_current_stream_capturing", lambda: capturing)
     experts = B12xExperts(
         make_dummy_moe_config(hidden_dim=8, intermediate_size=32),
         _quant_config("nvfp4", None),
     )
+    assert experts._a16_max_tokens == (0 if enabled else 4096)
     experts._prepared_experts = SimpleNamespace(
         _impl=SimpleNamespace(a4_prefill_scales=calibrated)
     )
@@ -1031,7 +1033,7 @@ def test_b12x_hybrid_prefill_preserves_decode_rows_and_shared_workspace(
     )
     context = ForwardContext({}, {}, {}, moe_prefill_metadata=metadata)
     # Configuration is fixed when the expert owner is constructed.
-    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", "0" if enabled else "1536")
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL", "0" if enabled else "1")
     with override_forward_context(context):
         experts.apply(
             output=output,
@@ -1057,20 +1059,92 @@ def test_b12x_hybrid_prefill_preserves_decode_rows_and_shared_workspace(
         )
 
 
+def test_b12x_hybrid_prefill_ignores_removed_token_threshold(monkeypatch):
+    monkeypatch.delenv("B12X_W4A16_A4_PREFILL", raising=False)
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", "1")
+    experts = B12xExperts(
+        make_dummy_moe_config(hidden_dim=128, intermediate_size=64),
+        _quant_config("nvfp4", None),
+    )
+    assert not experts._a4_prefill_enabled
+
+
+@pytest.mark.parametrize("value", ["true", "2", ""])
+def test_b12x_hybrid_prefill_rejects_invalid_boolean(monkeypatch, value):
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL", value)
+    with pytest.raises(ValueError, match="B12X_W4A16_A4_PREFILL must be 0 or 1"):
+        B12xExperts(
+            make_dummy_moe_config(hidden_dim=128, intermediate_size=64),
+            _quant_config("nvfp4", None),
+        )
+
+
+@pytest.mark.parametrize(
+    "ranges,calibrated,expected_calls,expanded",
+    [
+        (((0, 3072),), True, [(3072, True)], False),
+        ((), True, [(3072, False)], True),
+        (((4, 3072),), True, [(4, False), (3068, True)], False),
+        (((0, 3072),), False, [(3072, False)], True),
+    ],
+)
+def test_b12x_hybrid_prefill_queries_selected_scale_consumers(
+    monkeypatch, ranges, calibrated, expected_calls, expanded
+):
+    """Prefetch inspects this layer's prepared variants for each semantic span."""
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL", "1")
+    monkeypatch.setattr(b12x, "_is_current_stream_capturing", lambda: False)
+    experts = B12xExperts(
+        make_dummy_moe_config(hidden_dim=128, intermediate_size=64),
+        _quant_config("nvfp4", None),
+    )
+    experts._prepared_experts = SimpleNamespace(
+        _impl=SimpleNamespace(a4_prefill_scales=calibrated)
+    )
+    experts._plan = object()
+    calls = []
+
+    def query(plan, *, num_tokens, a4_prefill, route_ids_dtype):
+        assert plan is experts._plan
+        assert route_ids_dtype == torch.int64
+        calls.append((num_tokens, a4_prefill))
+        return not a4_prefill and num_tokens > 4
+
+    monkeypatch.setattr(
+        b12x,
+        "_require_b12x_fused_moe",
+        lambda: SimpleNamespace(uses_expanded_nvfp4_scales=query),
+    )
+    context = ForwardContext(
+        {}, {}, {}, moe_prefill_metadata=MoEPrefillMetadata(3072, ranges)
+    )
+    with override_forward_context(context):
+        assert experts.uses_expanded_nvfp4_scales(3072, torch.int64) is expanded
+    assert calls == expected_calls
+
+
 @pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("compatible", [False, True])
-def test_b12x_hybrid_prefill_requires_compatible_api(monkeypatch, enabled, compatible):
-    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", "1536" if enabled else "0")
+@pytest.mark.parametrize("binding_supported", [False, True])
+@pytest.mark.parametrize("semantic_supported", [False, True])
+def test_b12x_hybrid_prefill_requires_compatible_api(
+    monkeypatch, enabled, binding_supported, semantic_supported
+):
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL", "1" if enabled else "0")
     binding_type = make_dataclass(
-        "Binding", [("a4_prefill_launches", object, None)] if compatible else []
+        "Binding", [("a4_prefill_launches", object, None)] if binding_supported else []
     )
     monkeypatch.setattr(
         b12x,
         "_require_b12x_fused_moe",
-        lambda: SimpleNamespace(Binding=binding_type),
+        lambda: SimpleNamespace(
+            Binding=binding_type,
+            uses_expanded_nvfp4_scales=(lambda *a, **k: False)
+            if semantic_supported
+            else None,
+        ),
     )
     config = make_dummy_moe_config(hidden_dim=128, intermediate_size=64)
-    if enabled and not compatible:
+    if enabled and not (binding_supported and semantic_supported):
         with pytest.raises(
             RuntimeError, match="requires a compatible FlashInfer build"
         ):
@@ -1098,7 +1172,7 @@ def test_b12x_hybrid_prefill_rejects_reshaped_inputs_and_ignores_capture_metadat
     "field,value", [("dp_size", 2), ("pcp_size", 2), ("sp_size", 2)]
 )
 def test_b12x_hybrid_prefill_rejects_token_redistribution(monkeypatch, field, value):
-    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", "1536")
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL", "1")
     config = make_dummy_moe_config(hidden_dim=128, intermediate_size=64)
     setattr(config.moe_parallel_config, field, value)
     with pytest.raises(NotImplementedError, match="supports TP/DCP"):

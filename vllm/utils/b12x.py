@@ -258,7 +258,10 @@ def get_b12x_a16_max_tokens() -> int:
 
 def is_b12x_a4_prefill_enabled() -> bool:
     """Read the opt-in activation policy during model preparation."""
-    return int(os.environ.get("B12X_W4A16_A4_PREFILL_MIN_TOKENS", "0") or 0) > 0
+    value = os.environ.get("B12X_W4A16_A4_PREFILL", "0")
+    if value not in ("0", "1"):
+        raise ValueError("B12X_W4A16_A4_PREFILL must be 0 or 1")
+    return value == "1"
 
 
 def build_moe_prefill_metadata(

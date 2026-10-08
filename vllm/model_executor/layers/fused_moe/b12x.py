@@ -324,13 +324,15 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 f"unsupported b12x MoE quantization scheme {scheme}"
             ) from exc
         self._prepared_experts: Any | None = None
-        self._a16_max_tokens = (
-            get_b12x_a16_max_tokens() if self._source_format == "modelopt_nvfp4" else 0
-        )
         self._a4_prefill_enabled = (
             self._quant_mode == "w4a16"
             and self._source_format == "modelopt_nvfp4"
             and is_b12x_a4_prefill_enabled()
+        )
+        self._a16_max_tokens = (
+            get_b12x_a16_max_tokens()
+            if self._source_format == "modelopt_nvfp4" and not self._a4_prefill_enabled
+            else 0
         )
         if self._a4_prefill_enabled:
             parallel = moe_config.moe_parallel_config
@@ -356,13 +358,15 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                     "B12X hybrid A4 prefill requires host-visible token ranges; "
                     "adaptive verification changes token ranges on the GPU"
                 )
-            binding_type = getattr(_require_b12x_fused_moe(), "Binding", None)
-            if "a4_prefill_launches" not in getattr(
-                binding_type, "__dataclass_fields__", {}
+            fused_moe = _require_b12x_fused_moe()
+            binding_type = getattr(fused_moe, "Binding", None)
+            if not callable(getattr(fused_moe, "uses_expanded_nvfp4_scales", None)) or (
+                "a4_prefill_launches"
+                not in getattr(binding_type, "__dataclass_fields__", {})
             ):
                 raise RuntimeError(
                     "B12X hybrid A4 prefill requires a compatible FlashInfer build "
-                    "with B12X hybrid kernels and the bind(a4_prefill=...) API"
+                    "with semantic A4 selection and the uses_expanded_nvfp4_scales API"
                 )
         self._source_parameters_released = False
         self._unit_scales: dict[torch.device, torch.Tensor] = {}
@@ -818,6 +822,28 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             )
         return self._prepared_experts
 
+    def _execution_parts(self, tokens: int) -> tuple[tuple[int, int, bool], ...]:
+        prepared = self._prepared()
+        if self._a4_prefill_enabled and getattr(
+            getattr(prepared, "_impl", None), "a4_prefill_scales", False
+        ):
+            return _a4_prefill_parts(tokens)
+        return ((0, tokens, False),)
+
+    def uses_expanded_nvfp4_scales(
+        self, tokens: int, route_ids_dtype: torch.dtype
+    ) -> bool:
+        """Query the prepared consumers for this layer's semantic row ranges."""
+        return any(
+            _require_b12x_fused_moe().uses_expanded_nvfp4_scales(
+                self._plan,
+                num_tokens=end - start,
+                a4_prefill=a4_prefill,
+                route_ids_dtype=route_ids_dtype,
+            )
+            for start, end, a4_prefill in self._execution_parts(tokens)
+        )
+
     def _prepared_plan(
         self, *, activation: MoEActivation, apply_router_weight_on_input: bool
     ) -> Any:
@@ -1054,12 +1080,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         expanded = {"scales_expanded": True} if self.scales_expanded else {}
         if getattr(getattr(prepared, "_impl", None), "a4_prefill_scales", False):
             tokens = int(hidden_states.shape[0])
-            parts = (
-                _a4_prefill_parts(tokens)
-                if self._a4_prefill_enabled
-                else ((0, tokens, False),)
-            )
-            for start, end, a4_prefill in parts:
+            for start, end, a4_prefill in self._execution_parts(tokens):
                 binding = _require_b12x_fused_moe().bind(
                     plan,
                     scratch=scratch,
