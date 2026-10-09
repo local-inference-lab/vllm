@@ -134,6 +134,7 @@ def FusedMoEFactory(
     hash_indices_table: torch.Tensor | None = None,
     bias_vl: torch.Tensor | None = None,
     image_sentinel_lo: int = 0,
+    image_sentinel_count: int = 5,
     runner_cls: type[MoERunner] | None = None,
     runner_args: dict[str, Any] | None = None,
     routed_experts_cls: type[RoutedExperts] | None = None,
@@ -210,8 +211,9 @@ def FusedMoEFactory(
         zero_expert_type: Type of zero expert handling
         hash_indices_table: Hash table for expert indices
         bias_vl: Vision routing bias for image tokens (Deepseek V4)
-        image_sentinel_lo: First of five consecutive in-vocab image sentinel
-            ids (0 = vision routing disabled)
+        image_sentinel_lo: First consecutive in-vocab image sentinel ID
+            (0 = vision routing disabled).
+        image_sentinel_count: Number of consecutive image sentinel IDs.
         runner_cls: Custom MoERunner class (None = use default MoERunner)
         runner_args: Additional arguments for runner constructor
         routed_experts_cls: Custom RoutedExperts class (None = use default)
@@ -331,6 +333,7 @@ def FusedMoEFactory(
             hash_indices_table=hash_indices_table,
             bias_vl=bias_vl,
             image_sentinel_lo=image_sentinel_lo,
+            image_sentinel_count=image_sentinel_count,
         )
 
     if params_dtype is None:

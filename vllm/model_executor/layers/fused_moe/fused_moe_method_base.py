@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 
@@ -25,6 +25,20 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+class _WorkspaceMoEApply(Protocol):
+    def __call__(
+        self,
+        layer: "RoutedExperts",
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts: "SharedExperts | None",
+        shared_experts_input: torch.Tensor | None,
+        *,
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor: ...
+
+
 class FusedMoEMethodBase(QuantizeMethodBase):
     def __init__(self, moe: FusedMoEConfig):
         super().__init__()
@@ -45,6 +59,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         return (
             self.moe_kernel is not None and self.moe_kernel.can_overlap_shared_experts
         )
+
+    @property
+    def output_dtype(self) -> torch.dtype:
+        """Dtype produced by the routed experts."""
+        return self.moe.in_dtype
 
     @abstractmethod
     def create_weights(
@@ -139,6 +158,68 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             else:
                 return False
         return self.moe_kernel.is_monolithic
+
+    def prepare_workspace(
+        self, hidden_states: torch.Tensor, shared_workspace_size: int
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+        """Reserve disjoint routed/shared scratch before either branch runs.
+
+        Any modular kernel leases both from the workspace manager in one call,
+        so the shared experts never draw a view that overlaps the routed
+        experts' buffers while the two branches run on different streams.
+        """
+        kernel = self.moe_kernel
+        impl = getattr(kernel, "impl", None)
+        if not isinstance(impl, mk.FusedMoEKernelModularImpl):
+            raise NotImplementedError(
+                "This MoE backend cannot coordinate arena-backed shared-expert scratch"
+            )
+        rows = hidden_states.shape[0]
+        hidden_dim = self.moe.hidden_dim
+        # Workspace geometry follows the prepared activation storage width.
+        if (
+            impl.fused_experts.quant_dtype == "nvfp4"
+            and not impl.fused_experts.expects_unquantized_inputs
+        ):
+            hidden_dim //= 2
+        workspace13, workspace2, output, _, shared_workspace = impl._allocate_buffers(
+            hidden_states.dtype,
+            impl.fused_experts.output_dtype,
+            hidden_states.device,
+            rows,
+            rows,
+            self.moe.intermediate_size_per_partition,
+            hidden_dim,
+            self.moe.experts_per_token,
+            self.moe.num_experts,
+            self.moe.num_local_experts,
+            None,
+            self.moe.activation,
+            shared_workspace_size,
+        )
+        assert shared_workspace is not None
+        return (workspace13, workspace2, output), shared_workspace
+
+    def apply_with_workspace(
+        self,
+        layer: "RoutedExperts",
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts: "SharedExperts | None",
+        shared_experts_input: torch.Tensor | None,
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        apply = cast(_WorkspaceMoEApply, self.apply)
+        return apply(
+            layer,
+            x,
+            topk_weights,
+            topk_ids,
+            shared_experts,
+            shared_experts_input,
+            workspace=workspace,
+        )
 
     def apply(
         self,

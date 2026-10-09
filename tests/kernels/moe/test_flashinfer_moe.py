@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -244,6 +246,163 @@ def test_flashinfer_fp4_moe_no_graph(
         torch.testing.assert_close(
             torch_output, flashinfer_output, atol=1e-1, rtol=1e-1
         )
+
+
+@pytest.mark.parametrize(
+    "backend,quant_dtype",
+    [
+        ("cutlass", "nvfp4"),
+        ("cutedsl", "nvfp4"),
+        ("trtllm", "nvfp4"),
+        ("b12x", "nvfp4"),
+        ("cutlass_a16", "nvfp4"),
+        ("emulation", "nvfp4"),
+        ("cutlass", torch.float8_e4m3fn),
+        ("cutlass", "mxfp8"),
+        ("cutlass", None),
+    ],
+)
+def test_preallocated_moe_output_matches_activation_packing(
+    monkeypatch, backend, quant_dtype
+):
+    import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+    from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
+        CutlassExpertsFp4,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.flashinfer_b12x_moe import (
+        FlashInferB12xExperts,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe import (
+        FlashInferCuteDSLExperts,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.nvfp4_emulation_moe import (
+        Nvfp4QuantizationEmulationTritonExperts,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
+        TrtLlmNvFp4ExpertsModular,
+    )
+    from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+        FusedMoEMethodBase,
+    )
+
+    classes = {
+        "cutlass": FlashInferExperts,
+        "cutedsl": FlashInferCuteDSLExperts,
+        "trtllm": TrtLlmNvFp4ExpertsModular,
+        "b12x": FlashInferB12xExperts,
+        "cutlass_a16": CutlassExpertsFp4,
+        "emulation": Nvfp4QuantizationEmulationTritonExperts,
+    }
+    moe = SimpleNamespace(
+        in_dtype=torch.bfloat16,
+        hidden_dim=128,
+        intermediate_size_per_partition=256,
+        experts_per_token=2,
+        num_experts=4,
+        num_local_experts=4,
+        activation=MoEActivation.SILU,
+    )
+    experts = object.__new__(classes[backend])
+    experts.moe_config = moe
+    experts.quant_config = FusedMoEQuantConfig.make(quant_dtype=quant_dtype)
+    experts.hidden_dim = moe.hidden_dim
+    experts.per_token_activation = False
+    impl = object.__new__(mk.FusedMoEKernelModularImpl)
+    impl.fused_experts = experts
+    from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
+        MoEPrepareAndFinalizeNoDPEPModular,
+    )
+
+    impl.prepare_finalize = MoEPrepareAndFinalizeNoDPEPModular()
+    method = SimpleNamespace(moe=moe, moe_kernel=SimpleNamespace(impl=impl))
+    hidden = torch.empty((7, moe.hidden_dim), dtype=moe.in_dtype)
+    monkeypatch.setattr(mk.current_platform, "is_cpu", lambda: True)
+
+    workspace, shared = FusedMoEMethodBase.prepare_workspace(method, hidden, 512)
+
+    assert workspace[2].shape == hidden.shape
+    assert shared.numel() == 512
+    assert shared.untyped_storage().data_ptr() not in {
+        buffer.untyped_storage().data_ptr() for buffer in workspace
+    }
+
+
+@pytest.mark.parametrize("rows", [1, 32, 4096])
+@torch.inference_mode()
+def test_flashinfer_nvfp4_shared_workspace_graph(rows, workspace_init):
+    from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+        FusedMoEMethodBase,
+    )
+    from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
+        MoEPrepareAndFinalizeNoDPEPModular,
+    )
+
+    set_random_seed(13)
+    hidden_dim, intermediate, experts_count, topk = 4096, 512, 4, 2
+    hidden = torch.randn(rows, hidden_dim, device="cuda", dtype=torch.bfloat16) / 10
+    w1, w2, quant = make_test_quant_config(
+        experts_count,
+        intermediate,
+        hidden_dim,
+        in_dtype=hidden.dtype,
+        quant_dtype="nvfp4",
+        block_shape=None,
+        per_act_token_quant=False,
+    )
+    moe = FusedMoEConfig(
+        num_experts=experts_count,
+        experts_per_token=topk,
+        hidden_dim=hidden_dim,
+        intermediate_size=intermediate,
+        num_local_experts=experts_count,
+        num_logical_experts=experts_count,
+        activation=MoEActivation.SILU,
+        device="cuda",
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+        in_dtype=hidden.dtype,
+        routing_method=RoutingMethodType.TopK,
+        max_num_tokens=rows,
+    )
+    kernel = FusedMoEKernel(
+        MoEPrepareAndFinalizeNoDPEPModular(),
+        FlashInferExperts(moe_config=moe, quant_config=quant),
+    )
+    weights, ids, _ = fused_topk(
+        hidden,
+        torch.randn(rows, experts_count, device="cuda", dtype=hidden.dtype),
+        topk,
+        renormalize=False,
+    )
+    kwargs = dict(
+        hidden_states=hidden,
+        w1=w1,
+        w2=w2,
+        topk_weights=weights,
+        topk_ids=ids,
+        activation=moe.activation,
+        global_num_experts=experts_count,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+    )
+    expected = kernel.apply(**kwargs).clone()
+    method = SimpleNamespace(moe=moe, moe_kernel=kernel)
+    workspace, shared = FusedMoEMethodBase.prepare_workspace(method, hidden, 4096)
+    shared.fill_(37)
+    actual = kernel.apply(**kwargs, workspace=workspace)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = kernel.apply(**kwargs, workspace=workspace)
+    torch.accelerator.synchronize()
+    allocations = torch.accelerator.memory_stats()["allocation.all.allocated"]
+    for _ in range(3):
+        workspace[2].fill_(float("nan"))
+        graph.replay()
+    torch.accelerator.synchronize()
+    assert torch.accelerator.memory_stats()["allocation.all.allocated"] == allocations
+    assert replayed.data_ptr() == workspace[2].data_ptr()
+    assert torch.all(shared == 37)
+    torch.testing.assert_close(replayed, expected, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

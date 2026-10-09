@@ -212,12 +212,13 @@ def test_qianfan_online_fp8_keeps_vision_layers_unquantized(
     assert args.ignore == []
 
 
+@pytest.mark.parametrize("use_a16", [False, True])
 @pytest.mark.parametrize(
     ("is_act_and_mul", "expected_hidden_alignment"),
     [(True, 256), (False, 512)],
 )
 def test_online_nvfp4_reuses_kernel_when_weights_are_reprocessed(
-    monkeypatch, is_act_and_mul, expected_hidden_alignment
+    monkeypatch, is_act_and_mul, expected_hidden_alignment, use_a16
 ) -> None:
     monkeypatch.setattr(current_platform, "is_device_capability_family", lambda _: True)
     select_backend = Mock(return_value=(object(), object))
@@ -225,12 +226,12 @@ def test_online_nvfp4_reuses_kernel_when_weights_are_reprocessed(
         "vllm.model_executor.layers.quantization.online.nvfp4.select_nvfp4_moe_backend",
         select_backend,
     )
-    moe_config = SimpleNamespace(is_act_and_mul=is_act_and_mul)
-    method = Nvfp4OnlineMoEMethod(moe=moe_config)
+    moe_config = SimpleNamespace(is_act_and_mul=is_act_and_mul, in_dtype=torch.bfloat16)
+    method = Nvfp4OnlineMoEMethod(moe=moe_config, use_a16=use_a16)
     select_backend.assert_called_once_with(
         config=moe_config,
         weight_key=kNvfp4Static,
-        activation_key=kNvfp4DynamicToken,
+        activation_key=None if use_a16 else kNvfp4DynamicToken,
     )
 
     layer = Mock()
@@ -287,13 +288,21 @@ def test_online_nvfp4_reuses_kernel_when_weights_are_reprocessed(
     assert method.moe_kernel is kernel
     assert convert_weights.call_count == 3
     assert all(
-        call.kwargs["trtllm_hidden_alignment"] == expected_hidden_alignment
+        call.kwargs["trtllm_hidden_alignment"]
+        == (256 if use_a16 else expected_hidden_alignment)
         for call in convert_weights.call_args_list
     )
     make_kernel.assert_called_once()
-    assert make_kernel.call_args.kwargs["per_token_activation"] is True
     get_quant_config.assert_called_once()
     assert process_weights.call_count == 3
+    assert convert_weights.call_args.kwargs["use_a16"] is use_a16
+    assert make_kernel.call_args.kwargs["per_token_activation"] is not use_a16
+
+
+def test_online_nvfp4_a16_rejects_fp16_activations() -> None:
+    config = cast(Any, SimpleNamespace(in_dtype=torch.float16))
+    with pytest.raises(ValueError, match="requires BF16 activations"):
+        Nvfp4OnlineMoEMethod(moe=config, use_a16=True)
 
 
 def _fully_quantized_quark_config() -> QuarkConfig:
@@ -1310,6 +1319,65 @@ def test_online_quantization_records_global_config(
     }
 
 
+@pytest.mark.parametrize(
+    "target", ["re:.*attn.*", "model.*.q_proj", "model.layers.[01].q_proj"]
+)
+def test_strict_online_targets_reject_patterns(target) -> None:
+    with pytest.raises(ValueError, match="exact names"):
+        QuantizationConfigArgs(targets={target: "mxfp8"}, strict_targets=True)
+
+
+def test_strict_online_targets_cover_every_fused_projection(
+    default_vllm_config,
+    dist_init,
+) -> None:
+    """A fused QKV counts all three source targets; unlisted layers stay BF16."""
+    default_vllm_config.model_config = ModelConfig()
+    prefix = "model.layers.0.self_attn"
+    targets = {f"{prefix}.{p}_proj": "fp8_per_tensor" for p in ("q", "k", "v")}
+    config = OnlineQuantizationConfig(
+        QuantizationConfigArgs(targets=targets, strict_targets=True)
+    )
+    config.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+    layer = ColumnParallelLinear(32, 32, bias=False, disable_tp=True)
+    with pytest.raises(ValueError, match="every strict target"):
+        config.validate_target_coverage()
+    layer.quant_method = config.get_quant_method(layer, f"{prefix}.qkv_proj")
+    config.validate_target_coverage()
+    assert set(config.quantized_targets) == set(targets)
+    assert isinstance(
+        config.get_quant_method(layer, f"{prefix}.o_proj"), UnquantizedLinearMethod
+    )
+    assert set(config.quantized_layers) == {f"{prefix}.qkv_proj"}
+    model = torch.nn.Module()
+    model.add_module("qkv", layer)
+    config.validate_target_coverage(model)
+    with pytest.raises(ValueError, match="not present in the constructed model"):
+        config.validate_target_coverage(torch.nn.Module())
+    head = torch.nn.Module()
+    head.quant_method = Fp8PerTensorOnlineLinearMethod()
+    model.add_module("head", head)
+    with pytest.raises(ValueError, match="outside strict targets"):
+        config.validate_target_coverage(model)
+
+
+def test_strict_online_targets_reject_missing_fused_projection(
+    default_vllm_config,
+    dist_init,
+) -> None:
+    default_vllm_config.model_config = ModelConfig()
+    config = OnlineQuantizationConfig(
+        QuantizationConfigArgs(
+            targets={"model.q_proj": "fp8_per_tensor"},
+            strict_targets=True,
+        )
+    )
+    config.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+    layer = ColumnParallelLinear(32, 32, bias=False, disable_tp=True)
+    with pytest.raises(ValueError, match="unmatched shards"):
+        config.get_quant_method(layer, "model.qkv_proj")
+
+
 def test_online_quantization_targets_ignore_collision() -> None:
     """A targets/ignore collision is reported when the layer is dispatched."""
     config = OnlineQuantizationConfig(
@@ -1555,11 +1623,14 @@ def test_online_moe_tp_weight_quant_matches_ep(monkeypatch, scheme: str) -> None
         if (
             not (
                 current_platform.is_cuda()
-                and current_platform.is_device_capability_family(100)
+                and (
+                    current_platform.is_device_capability_family(100)
+                    or current_platform.is_device_capability_family(120)
+                )
             )
             or current_platform.is_xpu()
         ):
-            pytest.skip("NVFP4 weight quantization needs a Blackwell (SM100) GPU.")
+            pytest.skip("NVFP4 weight quantization needs a Blackwell GPU.")
     elif not is_quant_method_supported("fp8"):
         pytest.skip("FP8 is not supported on this GPU type.")
 
@@ -1616,9 +1687,13 @@ def test_online_int8_moe_w2_scale_matches_unsharded(monkeypatch) -> None:
 
 @pytest.mark.skipif(
     not (
-        current_platform.is_cuda() and current_platform.is_device_capability_family(100)
+        current_platform.is_cuda()
+        and (
+            current_platform.is_device_capability_family(100)
+            or current_platform.is_device_capability_family(120)
+        )
     ),
-    reason="NVFP4 weight quantization needs a Blackwell (SM100) GPU.",
+    reason="NVFP4 weight quantization needs a Blackwell GPU.",
 )
 def test_online_nvfp4_quantizes_original_expert_weights() -> None:
     torch.manual_seed(0)
@@ -1647,6 +1722,32 @@ def test_online_nvfp4_quantizes_original_expert_weights() -> None:
         block_scale,
         torch.stack([expert_scale for _, expert_scale in expected]),
     )
+
+
+def test_online_moe_uses_caller_workspace() -> None:
+    """Online methods must preserve the runner's routed/shared scratch split."""
+    method = Nvfp4OnlineMoEMethod.__new__(Nvfp4OnlineMoEMethod)
+    workspace = tuple(torch.empty(2, 4) for _ in range(3))
+    x = torch.ones(2, 4)
+
+    def apply_kernel(inputs, *args, workspace, **kwargs):
+        torch.add(inputs, 1, out=workspace[-1])
+        return workspace[-1]
+
+    method.moe_kernel = SimpleNamespace(is_monolithic=False, apply=apply_kernel)
+    layer = SimpleNamespace(
+        w13_weight=None,
+        w2_weight=None,
+        activation=None,
+        global_num_experts=2,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+    )
+    result = method.apply_with_workspace(
+        layer, x, torch.ones(2, 1), torch.zeros(2, 1), None, None, workspace
+    )
+    assert result is workspace[-1]
+    torch.testing.assert_close(result, x + 1)
 
 
 @pytest.mark.skipif(

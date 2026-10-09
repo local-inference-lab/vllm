@@ -15,11 +15,11 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.model_executor.warmup.b12x_warmup import b12x_warmup
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     resolve_flashinfer_autotune_file,
+    save_flashinfer_autotune_cache,
 )
 from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     autotune_hisparse_flashinfer_attention,
@@ -192,9 +192,6 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     qwen_vl_triton_warmup(worker.model_runner)
     mamba_triton_warmup(worker.model_runner)
 
-    compilation_config = worker.vllm_config.compilation_config
-    cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
-
     # Run next so input-prep kernels JIT against pristine runner state.
     if enable_jit_warmup:
         kimi_k3_triton_warmup(worker)
@@ -239,8 +236,6 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         model = worker.get_model()
         max_tokens = worker.scheduler_config.max_num_batched_tokens
         deep_gemm_warmup(model, max_tokens)
-
-    b12x_warmup(worker, cudagraph_capture_sizes)
 
     minimax_m3_msa_warmup(worker)
 
@@ -495,9 +490,7 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     finally:
         set_autotune_process_group(None)
 
-    if world.world_size > 1:
-        world.barrier()
     # Skip the rewrite when nothing was tuned this start (every entry came from
     # the file). FlashInfer gates its own autotune(cache=...) save the same way.
     if tuner._dirty:
-        tuner.save_configs(str(cache_path))
+        save_flashinfer_autotune_cache(cache_path, tuner)

@@ -54,7 +54,7 @@ class BaseModelLoader(ABC):
             model_config=model_config,
             prefix=prefix,
         )
-        log_online_quantization(vllm_config)
+        log_online_quantization(vllm_config, model)
         log_model_inspection(model)
         return model
 
@@ -133,11 +133,15 @@ def _get_online_quantization_config(vllm_config: VllmConfig):
     return quant_config
 
 
-def log_online_quantization(vllm_config: VllmConfig) -> None:
+def log_online_quantization(
+    vllm_config: VllmConfig, model: nn.Module | None = None
+) -> None:
     """Log the online-quantized layer count and types, when applicable."""
     quant_config = _get_online_quantization_config(vllm_config)
     if quant_config is None:
         return
+
+    quant_config.validate_target_coverage(model)
 
     logger.info(
         "Quantizing %d layers of types: %s",

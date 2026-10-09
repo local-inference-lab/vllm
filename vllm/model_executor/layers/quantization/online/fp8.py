@@ -122,6 +122,7 @@ class OnlineLinearBase(LinearMethodBase):
 
     uses_meta_device: bool = True
     activation_quant_key: QuantKey | None
+    _online_target_prefix: str | None = None
 
     def __init__(self):
         self.out_dtype = torch.get_default_dtype()

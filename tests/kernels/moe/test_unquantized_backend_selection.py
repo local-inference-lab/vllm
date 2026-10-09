@@ -567,6 +567,17 @@ def test_select_lora_explicit_non_triton_backend():
 
 
 @skipif_not_cuda_rocm
+@pytest.mark.parametrize("quantized_backend", ["b12x", "humming"])
+def test_quantized_backend_does_not_constrain_unquantized_layer(quantized_backend):
+    moe_config = make_dummy_moe_config()
+    moe_config.moe_backend = quantized_backend
+
+    _, experts_cls = select_unquantized_moe_backend(moe_config=moe_config)
+
+    assert experts_cls is not None
+
+
+@skipif_not_cuda_rocm
 @pytest.mark.parametrize("is_lora_enabled", [False, True])
 def test_select_explicit_triton_backend(is_lora_enabled):
     """Explicit triton backend selection should return Triton."""

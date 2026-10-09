@@ -4,6 +4,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 import vllm._custom_ops as ops
+from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import (
@@ -77,8 +78,14 @@ class GateLinear(ReplicatedLinear):
                 input_size,
                 output_size,
             ) in ROCM_FP32_ROUTER_GEMM_SUPPORTED_SHAPES
+        is_blackwell_rtx = current_platform.is_device_capability((12, 0))
         can_use_specialized_kernels = (
             current_platform.is_cuda() and (is_hopper or is_blackwell) and not bias
+        )
+        self._can_use_ll_bf16 = (
+            current_platform.is_cuda()
+            and (is_hopper or is_blackwell or is_blackwell_rtx)
+            and not bias
         )
 
         # If fp32 compute is required and no specialized kernel is available,
@@ -119,6 +126,7 @@ class GateLinear(ReplicatedLinear):
                 or (is_gfx950 and is_rocm_fp32_shape)
             )
         )
+        vllm_config = get_current_vllm_config_or_none()
         self.allow_bf16x3_router_gemm = (
             self.is_unquantized
             and not bias
@@ -126,6 +134,8 @@ class GateLinear(ReplicatedLinear):
             and current_platform.is_cuda()
             and is_blackwell
             and input_size % 8 == 0
+            and vllm_config is not None
+            and vllm_config.kernel_config.enable_bf16x3_router_gemm
         )
 
         # Fused bf16 x bf16 -> fp32 GEMM eligibility. torch.mm's out_dtype
@@ -135,6 +145,7 @@ class GateLinear(ReplicatedLinear):
         # applies on any CUDA-alike device (no bias, since torch.mm has no bias
         # term). The specialized-kernel gate above excludes family-120 Blackwell
         # (GB10 / DGX Spark), which this tier still covers. See #49921.
+        self._sm120_graph_pool_lifetime_guard = is_blackwell_rtx
         self._router_gemm_no_bias = self.is_unquantized and not bias
         self._router_gemm_cublas_capable = (
             current_platform.is_cuda() or current_platform.is_rocm()
@@ -176,7 +187,7 @@ class GateLinear(ReplicatedLinear):
         # 1. PDL support. Both dot-product and split-K kernels.
         # 2. Thread Block Clusters. Split-K kernel for cross-CTA reduction.
         self.allow_ll_bf16_gemm = False
-        if can_use_specialized_kernels:
+        if self._can_use_ll_bf16:
             from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
                 is_available,
             )
@@ -209,7 +220,7 @@ class GateLinear(ReplicatedLinear):
             self._rocm_bf16x3_weight_eligible and out_dtype == torch.float32
         )
 
-        if self.allow_specialized_router_gemm:
+        if self._can_use_ll_bf16:
             from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
                 is_available,
             )
@@ -281,6 +292,13 @@ class GateLinear(ReplicatedLinear):
 
         # Tier 5: cuBLAS bf16→fp32
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
+            if self._sm120_graph_pool_lifetime_guard:
+                # Keep the stream-capture query and allocation at runtime.
+                # Dynamo cannot trace the CUDA query's non-Tensor result.
+                return (
+                    torch.ops.vllm.sm120_cublas_router_gemm(x, self.weight),
+                    None,
+                )
             output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
             return self._return(output)
 
@@ -383,6 +401,39 @@ direct_register_custom_op(
     op_name="rocm_bf16x3_router_gemm_dispatch",
     op_func=rocm_bf16x3_router_gemm_dispatch_impl,
     fake_impl=rocm_bf16x3_router_gemm_dispatch_fake,
+    mutates_args=[],
+)
+
+
+def sm120_cublas_router_gemm_impl(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+    graph_pool_guard = None
+    if (
+        BreakableCUDAGraphCapture.current() is not None
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        # Preserve the former BF16-output allocation before the fused FP32
+        # result. Auxiliary-stream graph nodes retain these addresses across
+        # differently sized captures that share a graph memory pool.
+        graph_pool_guard = x.new_empty((*x.shape[:-1], weight.shape[0]))
+    output = torch.mm(x, weight.T, out_dtype=torch.float32)
+    del graph_pool_guard
+    return output
+
+
+def sm120_cublas_router_gemm_fake(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], weight.shape[0]), dtype=torch.float32)
+
+
+direct_register_custom_op(
+    op_name="sm120_cublas_router_gemm",
+    op_func=sm120_cublas_router_gemm_impl,
+    fake_impl=sm120_cublas_router_gemm_fake,
 )
 
 

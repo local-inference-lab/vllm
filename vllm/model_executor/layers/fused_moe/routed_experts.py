@@ -31,6 +31,11 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     resolve_quant_method,
 )
+from vllm.model_executor.weight_transfer import (
+    copy_weight,
+    flush_weight_transfers,
+    is_weight_transfer_active,
+)
 from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
@@ -341,10 +346,10 @@ class RoutedExperts(PluggableLayer):
             # We have to keep the weight scales of w1 and w3 because
             # we need to re-quantize w1/w3 weights after weight loading.
             idx = 0 if shard_id == "w1" else 1
-            param_data[expert_id][idx] = self._to_scalar(loaded_weight)
+            copy_weight(param_data[expert_id][idx], self._to_scalar(loaded_weight))
         # If we are in the row parallel case (down_proj)
         elif shard_id == "w2":
-            param_data[expert_id] = self._to_scalar(loaded_weight)
+            copy_weight(param_data[expert_id], self._to_scalar(loaded_weight))
 
     def _load_combined_w13_weight_scale(
         self,
@@ -360,7 +365,7 @@ class RoutedExperts(PluggableLayer):
         loaded_weight = loaded_weight.narrow(
             shard_dim, shard_size * tp_rank, shard_size
         )
-        param.copy_(loaded_weight)
+        copy_weight(param, loaded_weight)
 
     def _load_model_weight_or_group_weight_scale(
         self,
@@ -442,7 +447,7 @@ class RoutedExperts(PluggableLayer):
                 hidden_dim=hidden_dim,
                 shard_dim=shard_dim,
             )
-            expert_data.copy_(loaded_weight)
+            copy_weight(expert_data, loaded_weight)
         elif shard_id in ("w1", "w3"):
             self._load_w13(
                 shard_id=shard_id,
@@ -543,10 +548,15 @@ class RoutedExperts(PluggableLayer):
             # size.  Compute the offset into the checkpoint weight using
             # the *unpadded* per-rank size so that every TP rank lands at
             # the correct slice.
-            tp_size = self.moe_config.moe_parallel_config.tp_size
-            loaded_per_rank = loaded_weight.shape[shard_dim] // tp_size
+            loaded_per_rank = self._loaded_per_rank(
+                loaded_weight, shard_dim, shard_size
+            )
             start_offset = loaded_per_rank * tp_rank
             available = loaded_weight.shape[shard_dim] - start_offset
+            if min(loaded_per_rank, available) < shard_size:
+                # The padded tail of this rank's half must be zero.
+                half = 0 if shard_id == "w1" else shard_size
+                expert_data.narrow(shard_dim, half, shard_size).zero_()
             if available <= 0:
                 # If there is no available weight to load for this TP rank
                 # (can happen on last TP rank with padding), we can skip
@@ -569,7 +579,24 @@ class RoutedExperts(PluggableLayer):
             hidden_dim=hidden_dim,
             shard_dim=shard_dim,
         )
-        expert_data.copy_(loaded_weight)
+        copy_weight(expert_data, loaded_weight)
+
+    def _loaded_per_rank(
+        self, loaded_weight: torch.Tensor, shard_dim: int, shard_size: int
+    ) -> int:
+        """Checkpoint channels per TP rank along ``shard_dim``.
+
+        A width the TP size divides is split evenly; each rank's share may be
+        padded in the parameter (MXFP4 tile rounding). A width it does not
+        divide was padded as a whole (GLM-5.3 at TP6): rank r holds channels
+        [r * shard_size, (r + 1) * shard_size) and the last rank's tail is
+        zero.
+        """
+        tp_size = self.moe_config.moe_parallel_config.tp_size
+        loaded_size = loaded_weight.shape[shard_dim]
+        if loaded_size % tp_size == 0:
+            return loaded_size // tp_size
+        return shard_size
 
     def _load_w2(
         self,
@@ -584,10 +611,14 @@ class RoutedExperts(PluggableLayer):
         # Padded TP weights have already been sliced by the grouped loader.
         if not load_full and loaded_weight.ndim > 0:
             # Same padding fix as _load_w13: use unpadded per-rank size.
-            tp_size = self.moe_config.moe_parallel_config.tp_size
-            loaded_per_rank = loaded_weight.shape[shard_dim] // tp_size
+            loaded_per_rank = self._loaded_per_rank(
+                loaded_weight, shard_dim, expert_data.shape[shard_dim]
+            )
             start_offset = loaded_per_rank * tp_rank
             available = loaded_weight.shape[shard_dim] - start_offset
+            if min(loaded_per_rank, available) < expert_data.shape[shard_dim]:
+                # The padded tail of this rank's columns must be zero.
+                expert_data.zero_()
             if available <= 0:
                 # If there is no available weight to load for this TP rank
                 # (can happen on last TP rank with padding), we can skip
@@ -604,7 +635,8 @@ class RoutedExperts(PluggableLayer):
             shard_dim=shard_dim,
         )
         if (
-            loaded_weight.device.type == "cpu"
+            not is_weight_transfer_active()
+            and loaded_weight.device.type == "cpu"
             and expert_data.device.type == "cuda"
             and not expert_data.is_contiguous()
             and expert_data.ndim == 2
@@ -620,17 +652,15 @@ class RoutedExperts(PluggableLayer):
             ):
                 dst.copy_(src)
             return
-        expert_data.copy_(loaded_weight)
+        copy_weight(expert_data, loaded_weight)
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
     ):
         param_data = param.data
 
-        # Used for both scalar input_scale and the size-2 `weight_shape`
-        # param (compressed-tensors). Assign directly so both shapes load;
-        # _to_scalar's reshape(()) would reject the size-2 weight_shape.
-        param_data[expert_id] = loaded_weight
+        # Preserve vector weight_shape parameters as well as scalar scales.
+        copy_weight(param_data[expert_id], loaded_weight)
 
     def _get_fused_shared_expert_quantizer(
         self,
@@ -693,11 +723,11 @@ class RoutedExperts(PluggableLayer):
             # (FIXME) for gpt-oss all experts are combined
             if "bias" in weight_name:
                 dim1 = loaded_weight.shape[1]
-                param.data[:, :dim1].copy_(loaded_weight)
+                copy_weight(param.data[:, :dim1], loaded_weight)
             else:
                 dim1 = loaded_weight.shape[1]
                 dim2 = loaded_weight.shape[2]
-                param.data[:, :dim1, :dim2].copy_(loaded_weight)
+                copy_weight(param.data[:, :dim1, :dim2], loaded_weight)
             return True if return_success else None
 
         quant_method_name = self.quant_method.__class__.__name__
@@ -789,7 +819,7 @@ class RoutedExperts(PluggableLayer):
                     loaded_weight,
                     hidden_dim=0,
                 )
-                expert_data.copy_(loaded_weight)
+                copy_weight(expert_data, loaded_weight)
             else:
                 self._load_w13(
                     shard_id=shard_id,
@@ -802,9 +832,6 @@ class RoutedExperts(PluggableLayer):
 
         # Case input scale: input_scale loading is only supported for fp8
         if "input_scale" in weight_name:
-            # this is needed for compressed-tensors only
-            loaded_weight = loaded_weight.to(param.data.device)
-
             # ModelOpt NVFP4 stores w13 input scales as two logical shards.
             # The generic assignment below would broadcast w1/w3 into the
             # whole expert row, so the second shard would overwrite the first.
@@ -815,10 +842,15 @@ class RoutedExperts(PluggableLayer):
             ):
                 scale_expert_id = global_expert_id if use_global_sf else expert_id
                 scale_shard_id = 0 if shard_id == "w1" else 1
-                param.data[scale_expert_id][scale_shard_id] = self._to_scalar(
-                    loaded_weight
+                copy_weight(
+                    param.data[scale_expert_id][scale_shard_id],
+                    self._to_scalar(loaded_weight),
                 )
                 return True if return_success else None
+
+            if "compressed" in quant_method_name.lower():
+                flush_weight_transfers()
+                loaded_weight = loaded_weight.to(param.data.device)
 
             if (
                 "compressed" in quant_method_name.lower()
@@ -986,13 +1018,15 @@ class RoutedExperts(PluggableLayer):
 
         for expert_name, loaded_weight in weights:
             qual_name = f"{self.layer_name}.{expert_name}"
-            is_fused = loaded_weight.dim() == 3
-            # Fused tensors and ambiguous names keep the full mapping.
-            candidates = expert_mapping
-            if not is_fused and qual_name.count("experts.") == 1:
+            named_expert_mapping = None
+            if qual_name.count("experts.") == 1:
                 expert_key = qual_name.partition("experts.")[2].partition(".")[0]
-                candidates = mapping_by_expert.get(expert_key, expert_mapping)
-
+                named_expert_mapping = mapping_by_expert.get(expert_key)
+            # Packed scales may be rank three for one named expert.
+            is_fused = loaded_weight.dim() == 3 and named_expert_mapping is None
+            candidates = (
+                expert_mapping if is_fused else (named_expert_mapping or expert_mapping)
+            )
             matched = False
             for param_name, weight_name, expert_id, shard_id in candidates:
                 if weight_name not in qual_name:
@@ -1011,7 +1045,14 @@ class RoutedExperts(PluggableLayer):
                 )
                 weight_name = qual_name.replace(weight_name, param_name)
                 param_name = weight_name.removeprefix(f"{self.layer_name}.")
-                param = getattr(self, param_name, None)
+                try:
+                    param = (
+                        self.get_parameter(param_name)
+                        if "." in param_name
+                        else getattr(self, param_name, None)
+                    )
+                except AttributeError:
+                    param = None
                 if param is None:
                     if param_name.endswith(("w13_bias", "w2_bias")):
                         continue
@@ -1342,6 +1383,7 @@ class RoutedExperts(PluggableLayer):
         topk_ids: torch.Tensor,
         shared_experts: "SharedExperts | None" = None,
         shared_experts_input: torch.Tensor | None = None,
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor | UnfinalizedMoEOutput:
         """Execute routed experts using the quantization method's apply function.
 
@@ -1355,12 +1397,23 @@ class RoutedExperts(PluggableLayer):
             topk_ids: Selected expert IDs from router (for modular kernels)
             shared_experts: The shared experts (if any)
             shared_experts_input: Input for shared experts (if any)
+            workspace: Optional routed-expert buffers reserved before execution.
 
         Returns:
             Finalized routed states or a deferred-finalize output.
 
         """
         assert not self.quant_method.is_monolithic
+        if workspace is not None:
+            return self.quant_method.apply_with_workspace(
+                layer=self,
+                x=x,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                shared_experts=shared_experts,
+                shared_experts_input=shared_experts_input,
+                workspace=workspace,
+            )
 
         # Modular kernels use pre-computed routing
         return self.quant_method.apply(

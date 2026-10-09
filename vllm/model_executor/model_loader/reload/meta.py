@@ -150,7 +150,8 @@ def materialize_layer(layer: torch.nn.Module, info: LayerReloadingInfo):
     with info.restore_device:
         for name, tensor in get_layer_tensors(layer).items():
             if name not in SKIP_TENSORS and tensor.is_meta:
-                setattr(layer, name, materialize_meta_tensor(tensor))
+                tensor = materialize_meta_tensor(tensor)
+                setattr(layer, name, tensor)
 
 
 class CopyCounter(TorchDispatchMode):

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A layer that compute logits from hidden_stats."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from functools import cache
 
 import torch
@@ -21,6 +21,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.platforms import current_platform
+from vllm.utils.b12x import (
+    B12xPreparationUnit,
+    B12xWorkload,
+    get_b12x_bf16_vocab_projection,
+    set_b12x_preparation_provider,
+)
 from vllm.utils.flashinfer import has_flashinfer
 
 logger = init_logger(__name__)
@@ -73,6 +79,8 @@ class LogitsProcessor(PluggableLayer):
         scale: float = 1.0,
         logits_as_input: bool = False,
         soft_cap: float | None = None,
+        *,
+        lm_head: torch.nn.Module | None = None,
     ) -> None:
         """Args:
         scale: A scaling factor to apply to the logits.
@@ -94,6 +102,149 @@ class LogitsProcessor(PluggableLayer):
         # required for RL training-inference consistency.
         model_config = get_current_vllm_config().model_config
         self.head_dtype = model_config.head_dtype if model_config is not None else None
+        kernel_config = get_current_vllm_config().kernel_config
+        self._b12x_vocab_projection = get_b12x_bf16_vocab_projection()
+        self._b12x_vocab_plans: dict[int, dict[int, object]] = {}
+        self._b12x_vocab_heads: dict[int, VocabParallelEmbedding] = {}
+        self.use_b12x_vocab_projection = bool(
+            kernel_config.linear_backend == "b12x"
+            and self._b12x_vocab_projection is not None
+            and self._b12x_vocab_projection.is_supported()
+        )
+        if lm_head is not None:
+            self.prepare_b12x_vocab_projection(lm_head)
+
+    def prepare_b12x_vocab_projection(
+        self,
+        lm_head: torch.nn.Module,
+    ) -> None:
+        """Register the loaded LM head; preparation happens in worker lifecycle."""
+        if (
+            not self.use_b12x_vocab_projection
+            or not isinstance(lm_head, VocabParallelEmbedding)
+            or not isinstance(
+                lm_head.quant_method,
+                (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
+            )
+            or lm_head.weight.ndim != 2
+            or lm_head.weight.dtype != torch.bfloat16
+            or not lm_head.weight.is_cuda
+            or not lm_head.weight.is_contiguous()
+        ):
+            return
+        owner = getattr(lm_head, "_b12x_vocab_projection_owner", None)
+        if owner is not None:
+            owner._b12x_vocab_heads.update(self._b12x_vocab_heads)
+            for head_id, plans in self._b12x_vocab_plans.items():
+                shared_plans = owner._b12x_vocab_plans.setdefault(head_id, {})
+                for rows, plan in plans.items():
+                    shared_plans.setdefault(rows, plan)
+            self._b12x_vocab_plans = owner._b12x_vocab_plans
+            self._b12x_vocab_heads = owner._b12x_vocab_heads
+            return
+        self._b12x_vocab_heads[id(lm_head)] = lm_head
+        object.__setattr__(lm_head, "_b12x_vocab_projection_owner", self)
+        set_b12x_preparation_provider(self, self)
+
+    def _b12x_vocab_name(self, head: VocabParallelEmbedding, tokens: int) -> str:
+        return f"logits.vocab.{id(self):x}.{id(head):x}.m{tokens}"
+
+    def _declare_b12x_vocab_plan(self, head: VocabParallelEmbedding, rows: int):
+        projection = self._b12x_vocab_projection
+        assert head is not None and projection is not None
+        out_features, in_features = map(int, head.weight.shape)
+        return projection.plan(
+            projection.Caps(
+                device=head.weight.device,
+                max_tokens=rows,
+                in_features=in_features,
+                out_features=out_features,
+            )
+        )
+
+    def _b12x_vocab_call(self, head: VocabParallelEmbedding, rows: int):
+        in_features = int(head.weight.shape[1])
+
+        def call(state):
+            from b12x.preparation import PreparedCall
+
+            # This is deliberately an isolated representative hidden-state
+            # buffer.  The loaded vocabulary matrix remains borrowed.
+            source = torch.empty(
+                (rows, in_features),
+                dtype=torch.bfloat16,
+                device=head.weight.device,
+            )
+
+            def produce() -> None:
+                indices = torch.arange(
+                    source.numel(),
+                    device=source.device,
+                    dtype=torch.float32,
+                ).reshape_as(source)
+                source.copy_((indices.remainder(53).sub_(26)).mul_(1 / 32))
+
+            return PreparedCall(
+                run=lambda: state.run(source, head.weight),
+                produce=produce,
+                owners=(head.weight,),
+            )
+
+        return call
+
+    def _b12x_vocab_plan_for(self, head: VocabParallelEmbedding, rows: int):
+        """Reuse a prepared capacity for the unpadded sampled positions."""
+        plans = self._b12x_vocab_plans.setdefault(id(head), {})
+        capacity = (
+            rows
+            if rows in plans
+            else min(
+                (count for count in plans if count >= rows),
+                default=rows,
+            )
+        )
+        plan = plans.get(capacity)
+        if plan is None:
+            plan = self._declare_b12x_vocab_plan(head, capacity)
+            plans[capacity] = plan
+        return plan
+
+    def get_b12x_preparation_units(
+        self,
+        layer: torch.nn.Module,
+        workload: B12xWorkload,
+    ) -> Sequence[B12xPreparationUnit]:
+        if layer is not self:
+            return ()
+        units = []
+        for head_id, head in self._b12x_vocab_heads.items():
+            if head.weight.is_meta:
+                continue
+            plans = self._b12x_vocab_plans.setdefault(head_id, {})
+            requests = []
+            for tokens in workload.token_counts:
+                plan = plans.get(tokens)
+                if plan is None:
+                    plan = self._declare_b12x_vocab_plan(head, tokens)
+                    plans[tokens] = plan
+                call = self._b12x_vocab_call(head, tokens)
+                requests.append(
+                    plan.request(
+                        name=self._b12x_vocab_name(head, tokens),
+                        prepare_call=call,
+                        benchmark_call=call,
+                    )
+                )
+            if requests:
+                units.append(
+                    B12xPreparationUnit(
+                        name="VOCAB_PROJECTION",
+                        key=(id(self), head_id, tuple(sorted(plans))),
+                        requests=tuple(requests),
+                        stage="weights",
+                    )
+                )
+        return tuple(units)
 
     def forward(
         self,
@@ -141,6 +292,27 @@ class LogitsProcessor(PluggableLayer):
     ) -> torch.Tensor:
         """Project hidden states through the lm_head, honoring head_dtype."""
         if self.head_dtype is None or self.head_dtype == hidden_states.dtype:
+            if (
+                self.use_b12x_vocab_projection
+                and embedding_bias is None
+                and isinstance(
+                    lm_head.quant_method,
+                    (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
+                )
+            ):
+                # compute_logits runs outside the compiled model graph, so
+                # this capacity lookup is plain Python, not traced.
+                flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+                plan = self._b12x_vocab_plan_for(lm_head, int(flat.shape[0]))
+                projection = self._b12x_vocab_projection
+                assert projection is not None
+                binding = projection.bind(
+                    plan,
+                    source=flat,
+                    weight=lm_head.weight,
+                )
+                logits = projection.run(binding)
+                return logits.reshape(*hidden_states.shape[:-1], -1)
             return lm_head.quant_method.apply(
                 lm_head, hidden_states, bias=embedding_bias
             )
@@ -151,10 +323,19 @@ class LogitsProcessor(PluggableLayer):
         if not isinstance(
             lm_head.quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
         ):
-            raise ValueError(
-                "A head_dtype different from the model dtype is only "
-                "supported for an unquantized lm_head."
+            # A runtime-quantized head (for example a drafter's NVFP4 head next
+            # to an FP32 target head) keeps its own kernel; its logits are only
+            # widened, since the quantized weights already bound its precision.
+            logger.warning_once(
+                "head_dtype=%s: a quantized LM head computes in its own format; "
+                "its logits are widened to %s.",
+                self.head_dtype,
+                self.head_dtype,
             )
+            logits = lm_head.quant_method.apply(
+                lm_head, hidden_states, bias=embedding_bias
+            )
+            return logits.to(self.head_dtype)
         if (
             self.head_dtype == torch.float32
             and (current_platform.is_cuda() or current_platform.is_rocm())
@@ -303,10 +484,23 @@ class LogitsProcessor(PluggableLayer):
         ids = ids.to(torch.int64) + lm_head.shard_indices.org_vocab_start_index
 
         if lm_head.tp_size > 1:
-            values = tensor_model_parallel_all_gather(values, dim=-1)
-            ids = tensor_model_parallel_all_gather(ids, dim=-1)
+            # One exchange carries both the values and the ids: the fp32
+            # values and the int32 ids (bit-cast, not converted) share a
+            # [..., 2k] fp32 row per rank.  One collective instead of two,
+            # 8 bytes per candidate instead of 10, and for even k the rows are
+            # 16-byte multiples, which the RoCE all-gather writes in place.
+            # Vocab ids fit in int32 and the values are widened to fp32 for
+            # the final scaling anyway, so nothing is lost in the packing.
+            batch_shape = values.shape[:-1]
+            packed = torch.cat(
+                [values.float(), ids.to(torch.int32).view(torch.float32)], dim=-1
+            )
+            gathered = tensor_model_parallel_all_gather(packed, dim=-1)
+            gathered = gathered.view(*batch_shape, lm_head.tp_size, 2 * k)
+            values = gathered[..., :k].reshape(*batch_shape, -1)
+            ids = gathered[..., k:].reshape(*batch_shape, -1).view(torch.int32)
             values, selected = _topk(values, k)
-            ids = ids.gather(-1, selected)
+            ids = ids.gather(-1, selected).to(torch.int64)
 
         values = values.float()
         if return_log_probs:

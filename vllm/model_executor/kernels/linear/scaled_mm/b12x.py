@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from __future__ import annotations
+from collections.abc import Sequence
 
 import torch
 
@@ -11,14 +11,28 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
-from vllm.utils.b12x import B12xWarmupUnit, reuse_packed_weight_storage
+from vllm.utils.b12x import (
+    B12xPreparationUnit,
+    B12xWorkload,
+    PreparationResourceUnavailableError,
+    b12x_layer,
+    b12x_layer_prefix,
+    register_b12x_layer,
+    reuse_packed_weight_storage,
+    set_b12x_preparation_provider,
+)
 from vllm.utils.b12x import (
     get_b12x_blockscaled as _import_b12x_blockscaled,
 )
 from vllm.utils.b12x import (
     get_b12x_tensor_fp8_linear as _import_b12x_tensor_fp8,
 )
-from vllm.utils.torch_utils import current_stream
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _encode_layer_name,
+    _resolve_layer_name,
+    direct_register_custom_op,
+)
 
 from .BlockScaledMMLinearKernel import (
     Fp8BlockScaledMMLinearKernel,
@@ -27,22 +41,95 @@ from .BlockScaledMMLinearKernel import (
 from .ScaledMMLinearKernel import FP8ScaledMMLinearKernel
 
 
-def _run_b12x_fp8_block_scaled_mm(
+def _block_fp8_plan(
+    layer: torch.nn.Module,
+    rows: int,
+    out_dtype: torch.dtype,
+    *,
+    dynamic_rows: bool = False,
+):
+    plans = layer.b12x_block_fp8_plans
+    key = None if dynamic_rows else rows
+    plan = plans.get(key)
+    if plan is None:
+        api = _import_b12x_blockscaled()
+        assert api is not None
+        n, k = map(int, layer.weight.shape)
+        query = api.FixedBlockscaledQuery(
+            recipe="block_fp8",
+            call_kind="serialized",
+            max_rows=rows,
+            in_features=k,
+            padded_in_features=k,
+            out_features=n,
+            input_dtype="float8_e4m3fn",
+            output_dtype=str(out_dtype).removeprefix("torch."),
+            expected_m=None if dynamic_rows else rows,
+        )
+        plan = api.plan(query)
+        plans[key] = plan
+    elif plan.query.max_rows != rows:
+        raise ValueError("B12x block-FP8 preparation capacity changed")
+    return plan
+
+
+def _b12x_block_fp8_linear(
     a: torch.Tensor,
-    weight: torch.Tensor,
     a_scale: torch.Tensor,
+    weight: torch.Tensor,
     weight_scale: torch.Tensor,
     out_dtype: torch.dtype,
+    layer_name: LayerNameType,
 ) -> torch.Tensor:
+    layer = b12x_layer(_resolve_layer_name(layer_name))
+    plans = layer.b12x_block_fp8_plans
+    plan = plans.get(int(a.shape[0]), plans.get(None))
+    if plan is None:
+        raise PreparationResourceUnavailableError(
+            "B12x block-FP8 linear has no prepared capacity plan"
+        )
     blockscaled = _import_b12x_blockscaled()
     assert blockscaled is not None
-
     return blockscaled.mm_block_fp8(
         a,
         a_scale,
         weight,
         weight_scale,
+        plan=plan,
         out_dtype=out_dtype,
+    )
+
+
+def _b12x_block_fp8_linear_fake(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    del a_scale, weight_scale, layer_name
+    return a.new_empty((a.shape[0], weight.shape[0]), dtype=out_dtype)
+
+
+direct_register_custom_op(
+    op_name="b12x_block_fp8_linear",
+    op_func=_b12x_block_fp8_linear,
+    fake_impl=_b12x_block_fp8_linear_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def run_b12x_block_fp8_linear(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    return torch.ops.vllm.b12x_block_fp8_linear(
+        a, a_scale, weight, weight_scale, out_dtype, layer_name
     )
 
 
@@ -94,13 +181,19 @@ class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         out_features, in_features = config.weight_shape
         if in_features <= 0 or in_features % 128 != 0:
             return False, "Input features must be a positive multiple of 128"
-        if out_features <= 0 or out_features % 128 != 0:
-            return False, "Output features must be a positive multiple of 128"
+        if out_features <= 0:
+            return False, "Output features must be positive"
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
         params = self._get_layer_params(layer)
+        n, k = params.weight.shape
+        if n % 128:
+            # Complete the final scale block without changing its FP8 values.
+            padded = params.weight.new_zeros(((n + 127) // 128 * 128, k))
+            padded[:n].copy_(params.weight)
+            replace_parameter(layer, params.WEIGHT, padded)
         if params.weight_scale_inv is not None:
             weight_scale = params.weight_scale_inv
             scale_attr = params.WEIGHT_SCALE_INV
@@ -117,45 +210,115 @@ class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
                 scale_attr,
                 _upcast_e8m0_to_fp32(weight_scale).contiguous(),
             )
-        layer.b12x_warmup_provider = self
+        name = b12x_layer_prefix(layer)
+        layer.b12x_layer_name = _encode_layer_name(name)
+        register_b12x_layer(name, layer)
+        layer.b12x_block_fp8_plans = {}
+        self._b12x_block_fp8_owner = layer
+        if not getattr(layer, "b12x_preparation_suppressed", False):
+            set_b12x_preparation_provider(layer, self)
 
-    def get_b12x_warmup_unit(
+    def get_b12x_preparation_units(
         self,
         layer: torch.nn.Module,
-        token_counts: tuple[int, ...],
-        output_dtype: torch.dtype,
-    ) -> B12xWarmupUnit:
+        workload: B12xWorkload,
+    ) -> Sequence[B12xPreparationUnit]:
         weight = layer.weight
         weight_scale = getattr(layer, "weight_scale_inv", None)
         if weight_scale is None:
             weight_scale = layer.weight_scale
-        n, k = map(int, weight.shape)
+        if weight.is_meta or weight_scale.is_meta:
+            return ()
+        k = int(weight.shape[1])
+        prefix = _resolve_layer_name(layer.b12x_layer_name)
+        requests = []
+        for rows in (*workload.token_counts, None):
+            capacity = workload.max_tokens if rows is None else rows
+            plan = _block_fp8_plan(
+                layer, capacity, workload.output_dtype, dynamic_rows=rows is None
+            )
 
-        def compile() -> None:
-            for tokens in token_counts:
-                a = torch.empty((tokens, k), dtype=weight.dtype, device=weight.device)
-                a_scale = torch.empty(
-                    (tokens, k // 128),
+            def call(state, *, m=capacity):
+                from b12x.preparation import PreparedCall
+
+                values = torch.empty(
+                    (m, k),
+                    dtype=torch.float8_e4m3fn,
+                    device=weight.device,
+                )
+                scales = torch.empty(
+                    (m, k // 128),
                     dtype=torch.float32,
                     device=weight.device,
                 )
-                _run_b12x_fp8_block_scaled_mm(
-                    a, weight, a_scale, weight_scale, output_dtype
+
+                def produce() -> None:
+                    indices = torch.arange(
+                        values.numel(),
+                        device=values.device,
+                        dtype=torch.float32,
+                    ).reshape_as(values)
+                    values.copy_((indices.remainder(31).sub_(15)).mul_(1 / 32))
+                    # Dynamic block-FP8 consumes a per-token, per-K-block scale.
+                    scales.copy_(
+                        torch.linspace(
+                            0.5,
+                            1.0,
+                            scales.numel(),
+                            device=scales.device,
+                            dtype=scales.dtype,
+                        ).reshape_as(scales),
+                    )
+
+                return PreparedCall(
+                    run=lambda: state.run_serialized(
+                        values,
+                        scales,
+                        weight,
+                        weight_scale,
+                        None,
+                        ab_dtype="float8_e4m3fn",
+                        sf_dtype="float32",
+                        c_dtype=str(workload.output_dtype).removeprefix("torch."),
+                        sf_vec_size=128,
+                        block_fp8=True,
+                        stream=None,
+                    ),
+                    produce=produce,
+                    owners=(weight, weight_scale),
                 )
 
-        return B12xWarmupUnit(
-            name="block-FP8",
-            key=(
-                type(self),
-                weight.device,
-                n,
-                k,
-                weight.dtype,
-                weight_scale.dtype,
-                output_dtype,
+            requests.append(
+                plan.request(
+                    name=f"linear.block_fp8.{prefix}."
+                    f"{'capacity' if rows is None else f'm{rows}'}",
+                    prepare_call=call,
+                    benchmark_call=call,
+                )
+            )
+        if not requests:
+            return ()
+        return (
+            B12xPreparationUnit(
+                name="BLOCK_FP8",
+                key=(prefix, workload.token_counts, workload.max_tokens),
+                requests=tuple(requests),
+                stage="weights",
             ),
-            compile=compile,
         )
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        output = super().apply_weights(layer, x, bias=None, **kwargs)
+        output = output[..., : self.config.weight_shape[0]]
+        if bias is not None:
+            output = (output + bias).to(self.config.out_dtype)
+        return output
 
     def apply_block_scaled_mm(
         self,
@@ -164,13 +327,88 @@ class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         As: torch.Tensor,
         Bs: torch.Tensor,
     ) -> torch.Tensor:
-        return _run_b12x_fp8_block_scaled_mm(
+        return run_b12x_block_fp8_linear(
             A,
-            B,
             As,
+            B,
             Bs,
             self.config.out_dtype,
+            self._b12x_block_fp8_owner.b12x_layer_name,
         )
+
+
+def _tensor_fp8_plan(layer: torch.nn.Module, rows: int, out_dtype: torch.dtype):
+    plans = layer.b12x_tensor_fp8_plans
+    plan = plans.get(rows)
+    if plan is None:
+        api = _import_b12x_tensor_fp8()
+        assert api is not None
+        packed = layer.b12x_tensor_fp8_packed_weight
+        n, k, padded_k = (
+            int(packed.out_features),
+            int(packed.in_features),
+            int(packed.padded_in_features),
+        )
+        query = api.FixedBlockscaledQuery(
+            recipe="tensor_fp8",
+            call_kind="packed",
+            max_rows=rows,
+            in_features=k,
+            padded_in_features=padded_k,
+            out_features=n,
+            input_dtype="float8_e4m3fn",
+            output_dtype=str(out_dtype).removeprefix("torch."),
+            expected_m=rows,
+        )
+        plan = api.plan(query)
+        plans[rows] = plan
+    return plan
+
+
+def _b12x_tensor_fp8_linear(
+    source: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_features: int,
+    out_dtype: torch.dtype,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    layer = b12x_layer(_resolve_layer_name(layer_name))
+    packed = layer.b12x_tensor_fp8_packed_weight
+    plan = _tensor_fp8_plan(layer, int(source.shape[0]), out_dtype)
+    tensor_fp8 = _import_b12x_tensor_fp8()
+    assert tensor_fp8 is not None
+    return tensor_fp8.mm(source, packed, plan=plan, bias=bias, out_dtype=out_dtype)
+
+
+def _b12x_tensor_fp8_linear_fake(
+    source: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_features: int,
+    out_dtype: torch.dtype,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    del bias, layer_name
+    return source.new_empty((source.shape[0], out_features), dtype=out_dtype)
+
+
+direct_register_custom_op(
+    op_name="b12x_tensor_fp8_linear",
+    op_func=_b12x_tensor_fp8_linear,
+    fake_impl=_b12x_tensor_fp8_linear_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def run_b12x_tensor_fp8_linear(
+    source: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_features: int,
+    out_dtype: torch.dtype,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    return torch.ops.vllm.b12x_tensor_fp8_linear(
+        source, bias, out_features, out_dtype, layer_name
+    )
 
 
 def _apply_b12x_tensor_fp8_packed_linear(
@@ -180,18 +418,15 @@ def _apply_b12x_tensor_fp8_packed_linear(
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
     packed_weight = layer.b12x_tensor_fp8_packed_weight
-
-    tensor_fp8 = _import_b12x_tensor_fp8()
-    assert tensor_fp8 is not None
-
     input_2d = x_q.reshape(-1, x_q.shape[-1]).contiguous()
-    output_shape = [*x_q.shape[:-1], int(packed_weight.out_features)]
-    output = tensor_fp8.mm(
+    out_features = int(packed_weight.out_features)
+    output_shape = [*x_q.shape[:-1], out_features]
+    output = run_b12x_tensor_fp8_linear(
         input_2d,
-        packed_weight,
-        bias=bias,
-        out_dtype=out_dtype,
-        expected_m=max(1, int(input_2d.shape[0])),
+        bias,
+        out_features,
+        out_dtype,
+        layer.b12x_layer_name,
     )
     return output.view(*output_shape)
 
@@ -265,38 +500,79 @@ class B12xTensorFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         weight_name, weight_scale_name, _, _ = self.layer_param_names
         replace_parameter(layer, weight_name, weight.new_empty((0,)))
         replace_parameter(layer, weight_scale_name, weight_scale.new_empty((0,)))
-        layer.b12x_warmup_provider = self
+        name = b12x_layer_prefix(layer)
+        layer.b12x_layer_name = _encode_layer_name(name)
+        register_b12x_layer(name, layer)
+        layer.b12x_tensor_fp8_plans = {}
+        if not getattr(layer, "b12x_preparation_suppressed", False):
+            set_b12x_preparation_provider(layer, self)
+        self._b12x_tensor_fp8_owner = layer
 
-    def get_b12x_warmup_unit(
+    def get_b12x_preparation_units(
         self,
         layer: torch.nn.Module,
-        token_counts: tuple[int, ...],
-        output_dtype: torch.dtype,
-    ) -> B12xWarmupUnit:
-        packed_weight = layer.b12x_tensor_fp8_packed_weight
-        device = torch.device(packed_weight.values.device)
+        workload: B12xWorkload,
+    ) -> Sequence[B12xPreparationUnit]:
+        packed = layer.b12x_tensor_fp8_packed_weight
+        if packed.values.is_meta:
+            return ()
+        prefix = _resolve_layer_name(layer.b12x_layer_name)
+        requests = []
+        for rows in workload.token_counts:
+            plan = _tensor_fp8_plan(layer, rows, self.config.out_dtype)
 
-        def compile() -> None:
-            tensor_fp8 = _import_b12x_tensor_fp8()
-            assert tensor_fp8 is not None
-            tensor_fp8.prewarm(
-                packed_weight,
-                token_counts,
-                out_dtype=output_dtype,
-                stream=current_stream().cuda_stream,
+            def call(state, *, m=rows):
+                from b12x.preparation import PreparedCall
+
+                source = torch.empty(
+                    (m, int(packed.in_features)),
+                    dtype=torch.float8_e4m3fn,
+                    device=packed.values.device,
+                )
+
+                def produce() -> None:
+                    indices = torch.arange(
+                        source.numel(),
+                        device=source.device,
+                        dtype=torch.float32,
+                    ).reshape_as(source)
+                    source.copy_((indices.remainder(29).sub_(14)).mul_(1 / 32))
+
+                return PreparedCall(
+                    run=lambda: state.run_tensor_fp8(
+                        source,
+                        packed.values,
+                        packed.scale_mma,
+                        packed.block_scale,
+                        packed.output_scale,
+                        out_dtype=self.config.out_dtype,
+                        stream=None,
+                    ),
+                    produce=produce,
+                    owners=(
+                        packed.values,
+                        packed.scale_mma,
+                        packed.block_scale,
+                        packed.output_scale,
+                    ),
+                )
+
+            requests.append(
+                plan.request(
+                    name=f"linear.tensor_fp8.{prefix}.m{rows}",
+                    prepare_call=call,
+                    benchmark_call=call,
+                )
             )
-
-        return B12xWarmupUnit(
-            name="tensor FP8",
-            key=(
-                type(self),
-                device,
-                int(packed_weight.in_features),
-                int(packed_weight.padded_in_features),
-                int(packed_weight.out_features),
-                output_dtype,
+        if not requests:
+            return ()
+        return (
+            B12xPreparationUnit(
+                name="TENSOR_FP8",
+                key=(prefix, workload.token_counts),
+                requests=tuple(requests),
+                stage="weights",
             ),
-            compile=compile,
         )
 
     def apply_weights(

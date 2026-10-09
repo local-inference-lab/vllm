@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+
 import pytest
+import torch
 from torch import nn
 
 from vllm.config import ModelConfig
@@ -61,6 +64,18 @@ def test_default_loader_rejects_multithread_with_non_lazy_strategy():
         )
 
 
+@pytest.mark.parametrize("option", ["instanttensor_copy", "instanttensor_distributed"])
+@pytest.mark.parametrize("load_format", ["instanttensor", "fastsafetensors"])
+def test_default_loader_rejects_removed_instanttensor_options(option, load_format):
+    with pytest.raises(ValueError, match="Unexpected extra config keys"):
+        DefaultModelLoader(
+            LoadConfig(
+                load_format=load_format,
+                model_loader_extra_config={option: False},
+            )
+        )
+
+
 def test_default_loader_explicit_safetensors_does_not_misread_pt(tmp_path):
     # Explicit safetensors must not fall back to a .pt and open it as safetensors.
     (tmp_path / "model.pt").write_bytes(b"\x00\x00\x00\x00")
@@ -88,3 +103,141 @@ def test_default_loader_hf_still_falls_back_to_pt(tmp_path):
     )
     assert use_safetensors is False
     assert any(f.endswith("model.pt") for f in files)
+
+
+@pytest.mark.parametrize(
+    "load_format", ["safetensors", "fastsafetensors", "instanttensor"]
+)
+def test_default_loader_restricts_safetensors_shards_by_weight_prefix(
+    tmp_path, load_format
+):
+    base_shard = tmp_path / "model-00001-of-00002.safetensors"
+    mtp_shard = tmp_path / "model-00002-of-00002.safetensors"
+    base_shard.write_bytes(b"")
+    mtp_shard.write_bytes(b"")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        '{"weight_map": {'
+        f'"model.layers.0.weight": "{base_shard.name}",'
+        f'"model.layers.45.weight": "{mtp_shard.name}"'
+        "}}"
+    )
+    loader = DefaultModelLoader(LoadConfig(load_format=load_format))
+
+    _, files, use_safetensors, _ = loader._prepare_weights(
+        str(tmp_path),
+        None,
+        None,
+        fall_back_to_pt=False,
+        allow_patterns_overrides=None,
+        weight_name_prefixes=("model.layers.45.",),
+    )
+
+    assert use_safetensors
+    assert files == [str(mtp_shard)]
+
+
+@pytest.mark.parametrize("remote", [False, True])
+def test_default_loader_uses_nested_index_paths(tmp_path, monkeypatch, remote):
+    import vllm.model_executor.model_loader.default_loader as module
+
+    (tmp_path / "tensors").mkdir()
+    shard = tmp_path / "tensors/model-00001-of-00001.safetensors"
+    shard.write_bytes(b"")
+    (tmp_path / "unused.safetensors").write_bytes(b"")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"weight": "tensors/" + shard.name}})
+    )
+    if remote:
+        monkeypatch.setattr(module, "maybe_download_from_modelscope", lambda *a: None)
+        monkeypatch.setattr(
+            module, "download_weights_from_hf", lambda *a, **kw: str(tmp_path)
+        )
+        monkeypatch.setattr(
+            module, "download_safetensors_index_file_from_hf", lambda *a, **kw: None
+        )
+    loader = DefaultModelLoader(LoadConfig(load_format="safetensors"))
+    _, files, use_safetensors, _ = loader._prepare_weights(
+        "owner/model" if remote else str(tmp_path),
+        None,
+        None,
+        fall_back_to_pt=False,
+        allow_patterns_overrides=None,
+    )
+    assert use_safetensors and files == [str(shard)]
+
+
+@pytest.mark.parametrize("prefixes", ["vision.", [], [""], [1]])
+def test_default_loader_rejects_invalid_priority_prefixes(prefixes):
+    with pytest.raises(ValueError, match="non-empty list of non-empty strings"):
+        DefaultModelLoader(
+            LoadConfig(
+                load_format="instanttensor",
+                model_loader_extra_config={
+                    "instanttensor_priority_weight_name_prefixes": prefixes,
+                },
+            )
+        )
+
+
+@pytest.mark.parametrize("threshold", [0, -1, True, "4096"])
+def test_default_loader_rejects_invalid_small_checkpoint_threshold(threshold):
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        DefaultModelLoader(
+            LoadConfig(
+                load_format="instanttensor",
+                model_loader_extra_config={
+                    "instanttensor_small_checkpoint_max_bytes": threshold,
+                },
+            )
+        )
+
+
+def test_instanttensor_loader_retains_index_and_priority_for_selected_shard(
+    tmp_path, monkeypatch
+):
+    """Shard selection must not discard tensor identity or priority ordering."""
+    shard = tmp_path / "model.safetensors"
+    shard.touch()
+    weight_name = "vision.proj.weight"
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {weight_name: shard.name}})
+    )
+    weight = torch.ones(2, 2)
+    observed: dict[str, object] = {}
+
+    def iterator(files, use_tqdm, **kwargs):
+        observed.update(files=files, **kwargs)
+        yield weight_name, weight
+
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.default_loader.instanttensor_weights_iterator",
+        iterator,
+    )
+    loader = DefaultModelLoader(
+        LoadConfig(
+            load_format="instanttensor",
+            model_loader_extra_config={
+                "instanttensor_priority_weight_name_prefixes": ["vision."],
+                "instanttensor_small_checkpoint_max_bytes": 4096,
+            },
+        )
+    )
+    result = list(
+        loader._get_weights_iterator(
+            DefaultModelLoader.Source(
+                str(tmp_path),
+                None,
+                prefix="target.",
+                weight_name_prefixes=("vision.",),
+            )
+        )
+    )
+
+    assert result == [("target." + weight_name, weight)]
+    assert observed == {
+        "files": [str(shard)],
+        "weight_name_prefixes": ("vision.",),
+        "indexed_tensor_files": {weight_name: str(shard)},
+        "priority_weight_name_prefixes": ["vision."],
+        "small_checkpoint_max_bytes": 4096,
+    }

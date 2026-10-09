@@ -339,7 +339,9 @@ def test_pp_stage_cache_roundtrip_isolated_and_asymmetric_hits_safe(
     cold = autotune_run().execute()
     cold.assert_collectives_match()
     assert [rank for rank, _, _ in cold.saves] == list(range(8))
-    assert [path for _, path, _ in cold.saves] == [cold.cache_path(r) for r in range(8)]
+    for rank, path, cache in cold.saves:
+        assert path.name == cold.cache_path(rank).name
+        assert json.loads(cold.cache_path(rank).read_text()) == cache
     assert json.loads(legacy.read_text()) == {"legacy_world_cache": 99}
     stage_caches = [{"shared_gemm": 0, "pp0_extra_gemm": 0}, {"shared_gemm": 1}]
     assert all(cache == stage_caches[r // 4] for r, _, cache in cold.saves)
@@ -359,9 +361,10 @@ def test_pp_stage_cache_roundtrip_isolated_and_asymmetric_hits_safe(
 def test_pp1_tunes_world_group_and_saves_per_rank(autotune_run):
     run = autotune_run(pp=1, tp=4).execute()
     run.assert_collectives_match()
-    assert [(rank, path) for rank, path, _ in run.saves] == [
-        (rank, run.cache_path(rank)) for rank in range(4)
-    ]
+    assert [rank for rank, _, _ in run.saves] == list(range(4))
+    for rank, path, cache in run.saves:
+        assert path.name == run.cache_path(rank).name
+        assert json.loads(run.cache_path(rank).read_text()) == cache
     assert all(groups == [(0, 1, 2, 3)] for groups in run.profile_groups.values())
 
 

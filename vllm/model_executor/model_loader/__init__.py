@@ -14,6 +14,7 @@ from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 from vllm.model_executor.model_loader.modelexpress_loader import (
     ModelExpressModelLoader,
 )
+from vllm.model_executor.model_loader.mxfp4_csf_loader import Mxfp4CsfModelLoader
 from vllm.model_executor.model_loader.runai_streamer_loader import (
     RunaiModelStreamerLoader,
 )
@@ -32,10 +33,12 @@ logger = init_logger(__name__)
 # if a new load format is added here
 LoadFormats = Literal[
     "auto",
+    "b12x",
     "hf",
     "dummy",
     "fastsafetensors",
     "instanttensor",
+    "mxfp4_csf",
     "ipc_cache",
     "mistral",
     "modelexpress",
@@ -53,6 +56,7 @@ _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
     "dummy": DummyModelLoader,
     "fastsafetensors": DefaultModelLoader,
     "instanttensor": DefaultModelLoader,
+    "mxfp4_csf": Mxfp4CsfModelLoader,
     "ipc_cache": IpcModelLoader,
     "mistral": DefaultModelLoader,
     "modelexpress": ModelExpressModelLoader,
@@ -123,6 +127,10 @@ def register_model_loader(load_format: str):
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     """Get a model loader based on the load format."""
     load_format = load_config.load_format
+    if load_format == "b12x" and load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
+        from vllm.model_executor.model_loader.b12x_loader import B12xModelLoader
+
+        _LOAD_FORMAT_TO_MODEL_LOADER[load_format] = B12xModelLoader
     if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
         raise ValueError(f"Load format `{load_format}` is not supported")
     return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)

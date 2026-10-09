@@ -18,6 +18,7 @@ from vllm.model_executor.layers.fused_moe.router.dsv4_topk import (
     can_use_dsv4_topk,
     dsv4_topk,
 )
+from vllm.platforms import current_platform
 
 # AITER instantiates biased_grouped_topk only for these NUM_GRP values, with at
 # most this many experts per group.
@@ -156,6 +157,7 @@ def fused_topk_bias(
     routed_scaling_factor: float = 1.0,
     bias_vl: torch.Tensor | None = None,
     image_sentinel_lo: int = 0,
+    image_sentinel_count: int = 5,
 ):
     if (
         input_tokens is not None
@@ -165,10 +167,24 @@ def fused_topk_bias(
         input_tokens = input_tokens.to(dtype=hash_indices_table.dtype)
 
     if bias_vl is not None:
-        # Image tokens carry five consecutive in-vocab sentinel ids starting
-        # at image_sentinel_lo and select experts with bias_vl instead of the
-        # regular routing path. image_sentinel_lo == 0 disables this.
         assert input_tokens is not None, "bias_vl routing requires input_tokens"
+    if current_platform.is_cuda() and bias_vl is not None and image_sentinel_lo > 0:
+        if scoring_func != "sqrtsoftplus":
+            raise ValueError("DeepSeek V4 vision routing requires sqrtsoftplus scoring")
+        return dsv4_topk(
+            gating_output,
+            e_score_correction_bias,
+            torch.int32 if indices_type is None else indices_type,
+            routed_scaling_factor,
+            input_ids=input_tokens,
+            bias_vl=bias_vl,
+            image_sentinel_lo=image_sentinel_lo,
+            image_sentinel_count=image_sentinel_count,
+            hash_indices_table=hash_indices_table,
+            is_padding=_get_padding_mask(gating_output.shape[0]),
+            topk=topk,
+            renormalize=renormalize,
+        )
 
     if not rocm_aiter_ops.is_fused_moe_enabled():
         assert hidden_states.size(0) == gating_output.size(0), (
@@ -388,6 +404,7 @@ class FusedTopKBiasRouter(BaseRouter):
         shared_expert_weight: float = 1.0,
         bias_vl: torch.Tensor | None = None,
         image_sentinel_lo: int = 0,
+        image_sentinel_count: int = 5,
     ):
         super().__init__(
             top_k=top_k,
@@ -400,11 +417,11 @@ class FusedTopKBiasRouter(BaseRouter):
         self.routed_scaling_factor = routed_scaling_factor
         self.scoring_func = scoring_func
         self._hash_indices_table = hash_indices_table
-        # Vision bias: image sentinel tokens (five consecutive in-vocab ids
-        # starting at image_sentinel_lo) select experts with bias_vl instead
-        # of e_score_correction_bias / the hash table.
+        # Image sentinel tokens select with the vision bias instead of the
+        # regular correction bias or hash table.
         self.bias_vl = bias_vl
         self.image_sentinel_lo = image_sentinel_lo
+        self.image_sentinel_count = image_sentinel_count
         # Fused shared experts: append constant slots (ids immediately after
         # the routed experts, [global, global+n)) routed to by every token at
         # ``shared_expert_weight``, AFTER the routed top-k is renormalized.
@@ -445,6 +462,7 @@ class FusedTopKBiasRouter(BaseRouter):
             routed_scaling_factor=self.routed_scaling_factor,
             bias_vl=self.bias_vl.data if self.bias_vl is not None else None,
             image_sentinel_lo=self.image_sentinel_lo,
+            image_sentinel_count=self.image_sentinel_count,
         )
 
         if self.num_fused_shared_experts > 0:

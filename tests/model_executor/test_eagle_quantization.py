@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
 from vllm.config import LoadConfig, ModelConfig, SpeculativeConfig, VllmConfig
-from vllm.model_executor.models.utils import get_draft_quant_config
+from vllm.model_executor.models.utils import (
+    get_draft_quant_config,
+    with_draft_quantization,
+)
 from vllm.platforms import current_platform
 
 DEVICE_TYPE = current_platform.device_type
@@ -54,6 +58,32 @@ def test_get_draft_quant_config_without_draft_model():
     assert result is None
 
 
+@pytest.mark.parametrize("quantized_draft", [False, True])
+def test_draft_quantization_preserves_target_runtime_and_unquantized_drafts(
+    quantized_draft,
+):
+    """A draft must not inherit target quantization or rebuild target planning."""
+    target_quantization = object()
+    draft_quantization = object() if quantized_draft else None
+    target = SimpleNamespace(
+        model_config=object(),
+        compilation_config=object(),
+        quant_config=target_quantization,
+        use_replayssm=True,
+    )
+    with patch(
+        "vllm.model_executor.models.utils.get_draft_quant_config",
+        return_value=draft_quantization,
+    ):
+        draft = with_draft_quantization(target)
+    assert draft is not target
+    assert draft.quant_config is draft_quantization
+    assert target.quant_config is target_quantization
+    assert draft.model_config is target.model_config
+    assert draft.compilation_config is target.compilation_config
+    assert draft.use_replayssm
+
+
 @torch.inference_mode()
 @pytest.mark.parametrize("device", DEVICES)
 def test_fc_layer_quant_config_usage(default_vllm_config, dist_init, device) -> None:
@@ -64,41 +94,40 @@ def test_fc_layer_quant_config_usage(default_vllm_config, dist_init, device) -> 
     if current_platform.is_cuda_alike():
         torch.accelerator.set_device_index(device)
 
-    torch.set_default_device(device)
+    with torch.device(device):
+        input_size = 256
+        output_size = 128
 
-    input_size = 256
-    output_size = 128
+        fc_no_quant = ReplicatedLinear(
+            input_size=input_size,
+            output_size=output_size,
+            bias=False,
+            params_dtype=torch.float16,
+            quant_config=None,
+            prefix="fc",
+        )
 
-    fc_no_quant = ReplicatedLinear(
-        input_size=input_size,
-        output_size=output_size,
-        bias=False,
-        params_dtype=torch.float16,
-        quant_config=None,
-        prefix="fc",
-    )
+        assert fc_no_quant.quant_config is None
+        assert fc_no_quant.input_size == input_size
+        assert fc_no_quant.output_size == output_size
 
-    assert fc_no_quant.quant_config is None
-    assert fc_no_quant.input_size == input_size
-    assert fc_no_quant.output_size == output_size
+        mock_quant_config = Mock()
+        mock_quant_config.online_quantization_config = None
+        fc_with_quant = ReplicatedLinear(
+            input_size=input_size,
+            output_size=output_size,
+            bias=False,
+            params_dtype=torch.float16,
+            quant_config=mock_quant_config,
+            prefix="fc",
+        )
 
-    mock_quant_config = Mock()
-    mock_quant_config.online_quantization_config = None
-    fc_with_quant = ReplicatedLinear(
-        input_size=input_size,
-        output_size=output_size,
-        bias=False,
-        params_dtype=torch.float16,
-        quant_config=mock_quant_config,
-        prefix="fc",
-    )
+        assert fc_with_quant.quant_config == mock_quant_config
 
-    assert fc_with_quant.quant_config == mock_quant_config
-
-    # Check forward pass
-    x = torch.randn(2, input_size, dtype=torch.float16)
-    output, _ = fc_no_quant(x)
-    assert output.shape == (2, output_size)
+        # Check forward pass
+        x = torch.randn(2, input_size, dtype=torch.float16)
+        output, _ = fc_no_quant(x)
+        assert output.shape == (2, output_size)
 
 
 def test_maybe_remap_kv_scale_name():

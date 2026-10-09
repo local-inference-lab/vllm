@@ -500,6 +500,67 @@ def _marlin_gemm_fake(
 direct_register_custom_op("marlin_gemm", _marlin_gemm, fake_impl=_marlin_gemm_fake)
 
 
+def _marlin_gemm_out(
+    a: torch.Tensor,
+    c: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_bias: torch.Tensor | None,
+    b_scales: torch.Tensor,
+    workspace: torch.Tensor | None,
+    b_q_type_id: int,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+    use_atomic_add: bool = False,
+    use_fp32_reduce: bool = False,
+) -> None:
+    if workspace is None:
+        workspace = get_marlin_workspace(a.device)
+    torch.ops._C.marlin_gemm(
+        a,
+        c,
+        b_q_weight,
+        b_bias,
+        b_scales,
+        None,
+        None,
+        None,
+        workspace,
+        b_q_type_id,
+        size_m,
+        size_n,
+        size_k,
+        use_atomic_add,
+        use_fp32_reduce,
+        False,
+    )
+
+
+def _marlin_gemm_out_fake(
+    a: torch.Tensor,
+    c: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_bias: torch.Tensor | None,
+    b_scales: torch.Tensor,
+    workspace: torch.Tensor | None,
+    b_q_type_id: int,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+    use_atomic_add: bool = False,
+    use_fp32_reduce: bool = False,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    "marlin_gemm_out",
+    _marlin_gemm_out,
+    mutates_args=["c"],
+    fake_impl=_marlin_gemm_out_fake,
+)
+
+
 def marlin_repeat_scales_on_all_ranks(group_size: int, is_row_parallel: bool) -> bool:
     is_channelwise = group_size == -1
     return is_channelwise and is_row_parallel

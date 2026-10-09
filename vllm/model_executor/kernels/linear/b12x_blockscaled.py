@@ -1,0 +1,404 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Layer-held block-scaled linear state shared by the b12x linear kernels.
+
+A holder owns one packed weight and the execution plans declared for the
+serving shapes. Semantic NVFP4 prefill uses separate A16 and A4 plans that
+share the packed weight and scratch storage. ``apply_weights`` reaches ``run``
+through the ``vllm::b12x_blockscaled_linear`` custom op, so compiled graphs carry only
+tensors, the output width, and the layer name. ``run`` resolves the prepared
+regime for the live row count and draws its workspace from the worker's
+workspace manager. Scratch is reserved before CUDA graph capture; returned
+outputs use the graph's allocation pool.
+"""
+
+from __future__ import annotations
+
+import weakref
+from dataclasses import replace
+
+import torch
+
+import vllm.envs as envs
+from vllm.logger import init_logger
+from vllm.utils.b12x import (
+    B12xPreparationUnit,
+    B12xWorkload,
+    PreparationResourceUnavailableError,
+    get_b12x_a4_prefill_parts,
+    get_b12x_a16_max_tokens,
+    get_b12x_blockscaled,
+)
+
+COMPONENT = "gemm.blockscaled_precision"
+logger = init_logger(__name__)
+
+
+def _operands(packed, recipe: str):
+    if recipe in ("iq2_xs", "iq2_xxs", "q8_0"):
+        return packed.values, packed.metadata, None, "none"
+    if recipe == "nvfp4":
+        return (
+            packed.values,
+            packed.scale_mma,
+            packed.global_scale,
+            packed.global_scale_kind,
+        )
+    weight = packed.weight
+    return weight.values, weight.scale_mma, None, "none"
+
+
+class B12xBlockscaledLinear:
+    def __init__(
+        self,
+        packed,
+        *,
+        recipe: str,
+        activation_mode: str,
+        layer_name: str,
+        activation_scale: torch.Tensor | None = None,
+        a4_prefill_enabled: bool = False,
+    ) -> None:
+        if recipe not in ("nvfp4", "mxfp8", "iq2_xs", "iq2_xxs", "q8_0"):
+            raise ValueError(
+                "block-scaled linear recipe must be nvfp4, mxfp8 or iq2_xs"
+            )
+        self.packed = packed
+        self.recipe = recipe
+        self.activation_mode = activation_mode
+        self.a4_prefill_enabled = (
+            a4_prefill_enabled and recipe == "nvfp4" and activation_mode == "auto"
+        )
+        self.a16_max_tokens = (
+            get_b12x_a16_max_tokens()
+            if recipe == "nvfp4" and not self.a4_prefill_enabled
+            else 0
+        )
+        self.layer_name = layer_name
+        self.activation_scale = activation_scale
+        self.plan = None
+        self.a4_plan = None
+        self._a4_prefill_supported = (
+            self.a4_prefill_enabled
+            and int(packed.padded_in_features) % 128 == 0
+            and activation_scale is not None
+            and not activation_scale.is_meta
+            and activation_scale.dtype == torch.float32
+            and activation_scale.numel() == 1
+            and bool((activation_scale.isfinite() & (activation_scale > 0)).all())
+        )
+        if self.a4_prefill_enabled and not self._a4_prefill_supported:
+            self.activation_scale = None
+        self._plan_key: tuple[int, tuple[int, ...]] | None = None
+
+    @property
+    def out_features(self) -> int:
+        return int(self.packed.out_features)
+
+    @property
+    def in_features(self) -> int:
+        return int(self.packed.in_features)
+
+    @property
+    def device(self) -> torch.device:
+        return self._operands()[0].device
+
+    def _operands(self):
+        return _operands(self.packed, self.recipe)
+
+    def holds(self, packed) -> bool:
+        """Whether ``packed`` shares the storage bound to this plan."""
+        mine = _operands(self.packed, self.recipe)[:2]
+        theirs = _operands(packed, self.recipe)[:2]
+        return all(
+            a.data_ptr() == b.data_ptr() and a.shape == b.shape and a.dtype == b.dtype
+            for a, b in zip(mine, theirs)
+        )
+
+    def signature(self, workload: B12xWorkload):
+        return (
+            self.recipe,
+            self.activation_mode,
+            self.a4_prefill_enabled,
+            self._a4_prefill_supported,
+            self.a16_max_tokens,
+            self.in_features,
+            int(self.packed.padded_in_features),
+            self.out_features,
+            self.activation_scale is not None,
+            workload.max_tokens,
+            workload.fixed_token_counts,
+            workload.output_dtype,
+        )
+
+    def ensure_plan(self, workload: B12xWorkload):
+        """Declare the exact-M regimes for the first workload; reuse afterward.
+
+        The plan is never replaced once declared, so a prepared plan stays
+        installed. A later workload that asks for more exact-M regimes is
+        served by the capacity regime for those counts.
+        """
+        key = (workload.max_tokens, workload.fixed_token_counts)
+        if self.plan is not None:
+            assert self._plan_key is not None
+            if self._plan_key != key:
+                if workload.max_tokens != self._plan_key[0]:
+                    raise ValueError(
+                        f"{self.layer_name}: block-scaled linear capacity changed "
+                        f"from {self._plan_key[0]} to {workload.max_tokens}"
+                    )
+                missing = sorted(
+                    set(workload.fixed_token_counts) - set(self._plan_key[1])
+                )
+                if missing:
+                    logger.warning_once(
+                        "%s: exact-M regimes for %s were not declared in the weights "
+                        "stage; the capacity regime serves those counts.",
+                        self.layer_name,
+                        tuple(missing),
+                    )
+            return self.plan
+        api = get_b12x_blockscaled()
+        assert api is not None
+        _, _, _, global_scale_kind = self._operands()
+        query = api.BlockscaledQuery(
+            recipe=self.recipe,
+            num_tokens=workload.max_tokens,
+            in_features=self.in_features,
+            padded_in_features=int(self.packed.padded_in_features),
+            out_features=self.out_features,
+            activation_mode="a16" if self.a4_prefill_enabled else self.activation_mode,
+            activation_scale_available=self.activation_scale is not None,
+            global_scale_kind=global_scale_kind,
+            source_contiguous=True,
+            source_aligned=True,
+            workspace_form="provided",
+            workspace_nbytes=envs.VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES,
+            expected_m=None,
+        )
+        if self.a4_prefill_enabled:
+            query = replace(query, output_mode="provided")
+        self.plan = api.plan_regimes(
+            query,
+            exact_m=workload.fixed_token_counts,
+            a16_max_tokens=self.a16_max_tokens,
+        )
+        if self._a4_prefill_supported:
+            self.a4_plan = api.plan_regimes(
+                replace(query, activation_mode="quantized"),
+                exact_m=workload.fixed_token_counts,
+                a16_max_tokens=0,
+            )
+        self._plan_key = key
+        return self.plan
+
+    def _call_factory(self, rows: int):
+        values, scales, global_scale, _ = self._operands()
+        activation_scale = self.activation_scale
+        shared: tuple[weakref.ref, ...] | None = None
+        holder = self
+
+        def prepare(state):
+            from b12x.preparation import PreparedCall
+
+            nonlocal shared
+            tensors = None if shared is None else tuple(ref() for ref in shared)
+            if tensors is None or any(tensor is None for tensor in tensors):
+                source = torch.empty(
+                    (rows, holder.in_features),
+                    dtype=torch.bfloat16,
+                    device=values.device,
+                )
+                shared = (weakref.ref(source),)
+            else:
+                (source,) = tensors
+            workspace = (
+                torch.empty(
+                    state.required_workspace, dtype=torch.uint8, device=values.device
+                )
+                if state.required_workspace
+                else None
+            )
+            output = (
+                source.new_empty((rows, holder.out_features))
+                if holder.a4_prefill_enabled
+                else None
+            )
+
+            def produce() -> None:
+                source.fill_(0.125)
+
+            def run() -> None:
+                state.run(
+                    source,
+                    values,
+                    scales,
+                    global_scale,
+                    activation_scale=activation_scale,
+                    out=output,
+                    workspace=workspace,
+                )
+
+            return PreparedCall(
+                run=run,
+                produce=produce,
+                owners=(values, scales),
+                capture_safe=False,
+            )
+
+        return prepare
+
+    def unit(self, workload: B12xWorkload, *, name: str) -> B12xPreparationUnit:
+        plan = self.ensure_plan(workload)
+        calls = {rows: self._call_factory(rows) for rows in plan.token_counts}
+        requests = (
+            plan.request(
+                name=f"{name}.a16" if self.a4_prefill_enabled else name,
+                prepare_calls=calls,
+                benchmark_calls=calls,
+            ),
+        )
+        if self.a4_plan is not None:
+            requests += (
+                self.a4_plan.request(
+                    name=f"{name}.a4", prepare_calls=calls, benchmark_calls=calls
+                ),
+            )
+        return B12xPreparationUnit(
+            name=self.recipe.upper(),
+            key=self.signature(workload),
+            requests=requests,
+            stage="weights",
+        )
+
+    def get_workspace_size(self, rows: int) -> int:
+        """Scratch bytes a call needs, so a caller can reserve them ahead of time.
+
+        The shared-experts runner reserves this beside the routed experts'
+        buffers before either branch runs, because the shared experts execute
+        on a side stream and must not draw an overlapping view from the
+        workspace manager.
+        """
+        del rows
+        plan = self.plan
+        if plan is None:
+            raise PreparationResourceUnavailableError(
+                f"{self.layer_name}: block-scaled linear has no declared plan"
+            )
+        from b12x.preparation import require_prepared
+
+        return self._workspace_size(
+            max(
+                sum(spec.nbytes for spec in candidate.scratch_specs())
+                if candidate.prepared is None
+                else int(require_prepared(candidate, COMPONENT).required_workspace)
+                for candidate in (plan, self.a4_plan)
+                if candidate is not None
+            )
+        )
+
+    def _workspace_size(self, kernel_bytes: int) -> int:
+        if self.recipe == "mxfp8":
+            return (kernel_bytes + 15) // 16 * 16 + self.in_features * 2
+        return kernel_bytes
+
+    def run(self, source: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+        """Execute the prepared regime for ``source``; op-body only."""
+        plan = self.plan
+        if plan is None:
+            raise PreparationResourceUnavailableError(
+                f"{self.layer_name}: block-scaled linear has no declared plan"
+            )
+        from b12x.preparation import require_prepared
+
+        state = require_prepared(plan, COMPONENT, source.device)
+        kernel_bytes = state.required_workspace
+        if self.a4_plan is not None:
+            kernel_bytes = max(
+                kernel_bytes,
+                require_prepared(
+                    self.a4_plan, COMPONENT, source.device
+                ).required_workspace,
+            )
+        required_workspace = self._workspace_size(kernel_bytes)
+        workspace = None
+        if required_workspace:
+            from vllm.v1.worker.workspace import (
+                current_preallocated_workspace,
+                current_workspace_manager,
+            )
+
+            reserved = current_preallocated_workspace()
+            if reserved is not None:
+                reserved = reserved.view(torch.uint8)
+                if reserved.numel() < required_workspace:
+                    raise ValueError(
+                        f"{self.layer_name}: reserved scratch holds {reserved.numel()} "
+                        f"bytes, the prepared regime needs {required_workspace}"
+                    )
+                workspace = reserved[:required_workspace]
+            else:
+                manager = current_workspace_manager()
+                (workspace,) = manager.get_simultaneous(
+                    ((required_workspace,), torch.uint8)
+                )
+                source_end = source.data_ptr() + source.numel() * source.element_size()
+                if (
+                    source.data_ptr() < workspace.data_ptr() + workspace.numel()
+                    and workspace.data_ptr() < source_end
+                ):
+                    # A latent MoE projection consumes an arena-backed output.
+                    # Keep that live prefix intact while borrowing GEMM scratch.
+                    live_bytes = source_end - workspace.data_ptr()
+                    _, workspace = manager.get_simultaneous(
+                        ((live_bytes,), torch.uint8),
+                        ((required_workspace,), torch.uint8),
+                    )
+            if (
+                self.recipe == "mxfp8"
+                and source.numel() == self.in_features
+                and source.data_ptr() % 16
+            ):
+                # A singleton slice is contiguous even when its offset is unaligned.
+                offset = (state.required_workspace + 15) // 16 * 16
+                aligned_source = workspace[offset:].view(torch.bfloat16).view_as(source)
+                aligned_source.copy_(source)
+                source = aligned_source
+            if self.recipe == "mxfp8":
+                workspace = (
+                    workspace[: state.required_workspace]
+                    if state.required_workspace
+                    else None
+                )
+        api = get_b12x_blockscaled()
+        assert api is not None
+        if self.a4_prefill_enabled:
+            rows = source.numel() // self.in_features
+            parts = (
+                get_b12x_a4_prefill_parts(rows)
+                if self.a4_plan is not None
+                else ((0, rows, False),)
+            )
+            source = source.view(rows, self.in_features)
+            output = source.new_empty((rows, self.out_features))
+            for start, end, is_prefill in parts:
+                api.mm(
+                    source[start:end],
+                    self.packed,
+                    plan=self.a4_plan
+                    if is_prefill and self.a4_plan is not None
+                    else plan,
+                    out=output[start:end],
+                    bias=bias,
+                    workspace=workspace,
+                    activation_global_scale=self.activation_scale,
+                )
+            return output
+        return api.mm(
+            source,
+            self.packed,
+            plan=plan,
+            bias=bias,
+            workspace=workspace,
+            activation_global_scale=self.activation_scale,
+        )

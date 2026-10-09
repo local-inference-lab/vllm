@@ -40,8 +40,10 @@ from vllm.model_executor.parameter import (
     PackedvLLMParameter,
     PerTensorScaleParameter,
     RowvLLMParameter,
+    copy_tensor_parallel_shard,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.weight_transfer import copy_weight
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -67,6 +69,37 @@ def register_weight_loader_v2_supported_method(cls):
     """Decorator to register a LinearMethod as supporting weight_loader_v2."""
     WEIGHT_LOADER_V2_SUPPORTED.append(cls.__name__)
     return cls
+
+
+def _register_b12x_row_parallel_collective(
+    owner, prefix: str, output_size: int, enabled: bool
+) -> None:
+    """Describe the real row-parallel output; transport owns preparation."""
+    if not enabled:
+        return
+    from vllm.distributed.parallel_state import register_b12x_collective_describer
+
+    def describe(requirements):
+        if not prefix:
+            raise ValueError(
+                "B12X row-parallel collective preparation requires "
+                "a stable module prefix"
+            )
+        from vllm.distributed.device_communicators.b12x_pcie_all_reduce import (
+            B12xPcieInvocation,
+        )
+
+        return tuple(
+            B12xPcieInvocation(
+                name=f"{prefix}.row_all_reduce.m{rows}",
+                operation="all_reduce",
+                shape=(rows, output_size),
+                dtype=requirements.output_dtype,
+            )
+            for rows in requirements.token_counts
+        )
+
+    register_b12x_collective_describer(owner, describe)
 
 
 def adjust_marlin_shard(
@@ -161,6 +194,17 @@ class LinearMethodBase(QuantizeMethodBase):
         Expects create_weights to have been called before on the layer."""
         raise NotImplementedError
 
+    def get_workspace_size(self, layer: torch.nn.Module, rows: int) -> int:
+        """Scratch bytes one call at ``rows`` needs from a caller-reserved view.
+
+        The shared-experts runner reserves the maximum over its linears and
+        binds it while they run on a side stream. Methods that own a kernel
+        report the kernel's requirement; everything else needs none.
+        """
+        kernel = getattr(self, "kernel", None)
+        report = getattr(kernel, "get_workspace_size", None)
+        return 0 if report is None else int(report(layer, rows))
+
 
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
@@ -172,6 +216,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         linear_backend = (
             config.kernel_config.linear_backend if config is not None else "auto"
         )
+        self._linear_backend = linear_backend
         self._gemm_impl = dispatch_unquantized_gemm(linear_backend)
 
     def create_weights(
@@ -204,6 +249,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self._linear_backend == "b12x" and current_platform.is_cuda():
+            from vllm.model_executor.kernels.linear.b12x_unquantized import (
+                maybe_attach_b12x_bf16_gemv,
+            )
+
+            maybe_attach_b12x_bf16_gemv(layer)
         if current_platform.is_cpu():
             # MLA's kv_b_proj (see `_cpu_skip_gemm_dispatch`): not
             # perf-critical, so skip packing and use a plain fallback.
@@ -406,7 +457,7 @@ class ReplicatedLinear(LinearBase):
             f"Tried to load weights of size {loaded_weight.size()}"
             f"to a parameter of size {param.size()}"
         )
-        param.data.copy_(loaded_weight)
+        copy_weight(param.data, loaded_weight)
 
     def forward(
         self,
@@ -582,7 +633,15 @@ class ColumnParallelLinear(LinearBase):
         if output_dim is not None and not is_sharded_weight:
             shard_size = param_data.shape[output_dim]
             start_idx = self.tp_rank * shard_size
-            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+            copy_tensor_parallel_shard(
+                param_data,
+                loaded_weight,
+                output_dim,
+                start_idx,
+                shard_size,
+                allow_padding=getattr(param, "allow_tp_padding", False),
+            )
+            return
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
@@ -590,7 +649,7 @@ class ColumnParallelLinear(LinearBase):
             loaded_weight = loaded_weight.reshape(1)
 
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        copy_weight(param_data, loaded_weight)
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
         # Special case for loading scales off disk, which often do not
@@ -779,7 +838,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     )
 
                 assert param_data.shape == loaded_weight.shape
-                param_data.copy_(loaded_weight)
+                copy_weight(param_data, loaded_weight)
                 return
 
             output_sizes = (
@@ -847,7 +906,15 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             start_idx = self.tp_rank * shard_size
             if not is_sharded_weight:
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+                copy_tensor_parallel_shard(
+                    param_data,
+                    loaded_weight,
+                    output_dim,
+                    start_idx,
+                    shard_size,
+                    allow_padding=getattr(param, "allow_tp_padding", False),
+                )
+                return
         # Special case for per-tensor scales in fused case.
         elif needs_scalar_to_array:
             param_data, loaded_weight = adjust_scalar_to_fused_array(
@@ -864,7 +931,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 )
 
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        copy_weight(param_data, loaded_weight)
 
     def _load_fused_module_from_checkpoint(
         self,
@@ -1219,7 +1286,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                     )
 
                 assert param_data.shape == loaded_weight.shape
-                param_data.copy_(loaded_weight)
+                copy_weight(param_data, loaded_weight)
                 return
             shard_offsets = [
                 # (shard_id, shard_offset, shard_size)
@@ -1304,7 +1371,15 @@ class QKVParallelLinear(ColumnParallelLinear):
             start_idx = shard_rank * shard_size
 
             if not is_sharded_weight:
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+                copy_tensor_parallel_shard(
+                    param_data,
+                    loaded_weight,
+                    output_dim,
+                    start_idx,
+                    shard_size,
+                    allow_padding=getattr(param, "allow_tp_padding", False),
+                )
+                return
 
         # Special case for per-tensor scales in fused case.
         elif needs_scalar_to_array:
@@ -1321,7 +1396,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 )
 
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        copy_weight(param_data, loaded_weight)
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
@@ -1525,11 +1600,14 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
             shard_rank = 0  # replicated to every rank
         else:
             shard_rank = self.tp_rank // self.num_kv_head_replicas
-        loaded_weight = loaded_weight.narrow(
-            output_dim, shard_rank * shard_size, shard_size
+        copy_tensor_parallel_shard(
+            param_data,
+            loaded_weight,
+            output_dim,
+            shard_rank * shard_size,
+            shard_size,
+            allow_padding=getattr(param, "allow_tp_padding", False),
         )
-        assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
 
 
 class KimiK3MergedQKVGateLinear(MergedColumnParallelLinear):
@@ -1540,9 +1618,9 @@ class KimiK3MergedQKVGateLinear(MergedColumnParallelLinear):
     linear layer. It lives here alongside ``MergedColumnParallelLinear``, whose
     sharding and weight-loading machinery it reuses.
 
-    The per-rank shard layout is ``[q_a | kv_a | gate]``. The latent shards
-    stay replicated across tensor-parallel ranks while the gate shard is
-    tensor-parallel, matching the standalone projections they replace.
+    The per-rank shard layout is ``[q_a | kv_a | gate]``. Latent weights are
+    replicated unless ``shard_latents`` is enabled. Sharded latent results
+    are gathered in logical Q/KV order; the gate remains rank-local.
     """
 
     def __init__(
@@ -1556,14 +1634,18 @@ class KimiK3MergedQKVGateLinear(MergedColumnParallelLinear):
         bias: bool = False,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        shard_latents: bool = False,
     ) -> None:
         tp_size = get_tensor_model_parallel_world_size()
+        self.shard_latents = shard_latents and tp_size > 1
+        self.latent_output_sizes = [q_lora_rank, kv_lora_rank + qk_rope_head_dim]
 
         # MergedColumnParallelLinear divides every logical shard by TP size.
         # Inflate the replicated latent shards to retain their checkpoint widths.
+        replication = 1 if self.shard_latents else tp_size
         output_sizes = [
-            q_lora_rank * tp_size,
-            (kv_lora_rank + qk_rope_head_dim) * tp_size,
+            q_lora_rank * replication,
+            (kv_lora_rank + qk_rope_head_dim) * replication,
             total_num_heads * v_head_dim,
         ]
         super().__init__(
@@ -1573,6 +1655,26 @@ class KimiK3MergedQKVGateLinear(MergedColumnParallelLinear):
             quant_config=quant_config,
             prefix=prefix,
         )
+        self._latent_transport = None
+        config = get_current_vllm_config_or_none()
+        if (
+            self.shard_latents
+            and envs.VLLM_USE_B12X_DCP_A2A
+            and config is not None
+            and config.model_config.dtype == torch.bfloat16
+            and not config.parallel_config.use_ubatching
+        ):
+            from vllm.distributed import get_tp_group
+            from vllm.distributed.device_communicators.b12x_dcp import (
+                get_b12x_kimi_projection_transport,
+            )
+
+            width = sum(self.latent_output_sizes) // tp_size
+            self._latent_transport = get_b12x_kimi_projection_transport(
+                get_tp_group(),
+                next(self.parameters()).device,
+                latent_width=(width + 7) // 8 * 8,
+            )
 
     def _load_with_replicated_latents(
         self,
@@ -1581,7 +1683,11 @@ class KimiK3MergedQKVGateLinear(MergedColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: tuple[int, ...] | int | None,
     ) -> None:
-        is_replicated = isinstance(loaded_shard_id, int) and loaded_shard_id < 2
+        is_replicated = (
+            not self.shard_latents
+            and isinstance(loaded_shard_id, int)
+            and loaded_shard_id < 2
+        )
         if not is_replicated:
             loader(param, loaded_weight, loaded_shard_id)
             return
@@ -1619,6 +1725,31 @@ class KimiK3MergedQKVGateLinear(MergedColumnParallelLinear):
         self._load_with_replicated_latents(
             super().weight_loader_v2, param, loaded_weight, loaded_shard_id
         )
+
+    def forward(self, x: torch.Tensor):
+        output, bias = super().forward(x)
+        if not self.shard_latents:
+            return output, bias
+        local_sizes = [size // self.tp_size for size in self.latent_output_sizes]
+        latent_rows = sum(local_sizes)
+        local_latents = output[..., :latent_rows].contiguous()
+        if self._latent_transport is not None and 0 < x.shape[0] <= 8:
+            transport = self._latent_transport
+            query = (
+                torch.nn.functional.pad(
+                    local_latents, (0, transport.query_dim - latent_rows)
+                )
+                if transport.query_dim != latent_rows
+                else local_latents
+            )
+            rank_major = transport.gather(query.unsqueeze(1))[..., :latent_rows]
+        else:
+            gathered = tensor_model_parallel_all_gather(local_latents, dim=-1)
+            rank_major = gathered.unflatten(-1, (self.tp_size, latent_rows))
+        query, kv = rank_major.split(local_sizes, dim=-1)
+        return torch.cat(
+            [query.flatten(-2), kv.flatten(-2), output[..., latent_rows:]], dim=-1
+        ), bias
 
 
 # --8<-- [start:row_parallel_linear]
@@ -1694,6 +1825,12 @@ class RowParallelLinear(LinearBase):
             disable_tp=disable_tp,
         )
 
+        _register_b12x_row_parallel_collective(
+            self,
+            prefix,
+            self.output_size,
+            reduce_results and self.tp_size > 1,
+        )
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
 
@@ -1740,7 +1877,15 @@ class RowParallelLinear(LinearBase):
         if input_dim is not None and not is_sharded_weight:
             shard_size = param_data.shape[input_dim]
             start_idx = self.tp_rank * shard_size
-            loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
+            copy_tensor_parallel_shard(
+                param_data,
+                loaded_weight,
+                input_dim,
+                start_idx,
+                shard_size,
+                allow_padding=getattr(param, "allow_tp_padding", False),
+            )
+            return
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
@@ -1748,7 +1893,7 @@ class RowParallelLinear(LinearBase):
             loaded_weight = loaded_weight.reshape(1)
 
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        copy_weight(param_data, loaded_weight)
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
         # Special case for loading scales off disk, which often do not
@@ -1777,6 +1922,11 @@ class RowParallelLinear(LinearBase):
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         output_parallel = self.quant_method.apply(self, input_parallel, bias_)
 
+        # Optional model-installed callback fired before the all-reduce (GLM-5.3
+        # L2 weight prefetch: the reduction leaves device memory idle).
+        _hook = getattr(self, "_l2_prefetch_pre_reduce_hook", None)
+        if _hook is not None:
+            _hook(output_parallel.shape[0])
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import gc
+from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -478,3 +480,54 @@ def test_cudagraph_pool_sleep(level):
     weight.fill_(2.0)  # Level 2 discards weights; emulate the reload.
     held[0].replay()
     assert torch.equal(held[1], torch.full_like(x, 5.0))
+
+
+@pytest.mark.parametrize("failure", [False, True])
+@pytest.mark.parametrize(
+    "active_conf,pool_conf",
+    [
+        ("", None),
+        ("max_split_size_mb:64", None),
+        ("expandable_segments:False,max_split_size_mb:64", None),
+        ("expandable_segments:True", "expandable_segments:False"),
+        (
+            "max_split_size_mb:64, expandable_segments : True",
+            "max_split_size_mb:64,expandable_segments:False",
+        ),
+        (
+            "expandable_segments:True,max_split_size_mb:64",
+            "expandable_segments:False,max_split_size_mb:64",
+        ),
+    ],
+)
+def test_cumem_pool_restores_effective_allocator_config(
+    monkeypatch, active_conf, pool_conf, failure
+):
+    """Preserve the applied configuration across pool entry and exceptional exit."""
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.setattr(cumem, "current_alloc_conf", lambda: active_conf)
+    settings: list[str] = []
+    monkeypatch.setattr(
+        "vllm.device_allocator.cumem.set_alloc_conf",
+        settings.append,
+    )
+    pool = SimpleNamespace(snapshot=lambda: [])
+
+    @contextmanager
+    def fake_pool(*_args):
+        assert settings == ([pool_conf] if pool_conf is not None else [])
+        yield pool, None
+
+    monkeypatch.setattr(cumem, "use_memory_pool_with_allocator", fake_pool)
+    allocator = cumem.CuMemAllocator()
+    outcome = (
+        pytest.raises(RuntimeError, match="pool body") if failure else nullcontext()
+    )
+    with outcome, allocator.use_memory_pool("weights"):
+        assert allocator.current_tag == "weights"
+        if failure:
+            raise RuntimeError("pool body")
+    assert allocator.current_tag == allocator.default_tag
+    assert allocator.allocator_and_pools["weights"][0][0] is pool
+    assert settings == ([pool_conf, active_conf] if pool_conf is not None else [])

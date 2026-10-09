@@ -14,6 +14,7 @@ from vllm.distributed import (
     get_pcp_group,
     tensor_model_parallel_all_reduce,
 )
+from vllm.distributed.communication_op import tensor_model_parallel_all_reduce_in_place
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import (
     ForwardContext,
@@ -121,6 +122,7 @@ def _moe_forward(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    routed_output_dtype: torch.dtype,
 ) -> torch.Tensor:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
     return cast(
@@ -141,14 +143,18 @@ def _moe_forward_fake(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    routed_output_dtype: torch.dtype,
 ) -> torch.Tensor:
     # `hidden_dim_unpadded > 0` only on the TRT-LLM MXFP4 path, where the
     # real kernel writes narrower than `hidden_states.shape[-1]`. Plumbed
     # as an op arg (not peeked from the layer registry) to keep the fake
     # a pure shape function of its inputs and preserve subgraph dedup.
     if hidden_dim_unpadded > 0:
-        return hidden_states.new_empty((*hidden_states.shape[:-1], hidden_dim_unpadded))
-    return torch.empty_like(hidden_states)
+        return hidden_states.new_empty(
+            (*hidden_states.shape[:-1], hidden_dim_unpadded),
+            dtype=routed_output_dtype,
+        )
+    return torch.empty_like(hidden_states, dtype=routed_output_dtype)
 
 
 def _moe_forward_shared(
@@ -158,6 +164,7 @@ def _moe_forward_shared(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    routed_output_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
     return cast(
@@ -178,16 +185,18 @@ def _moe_forward_shared_fake(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
+    routed_output_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # `fused_out`: see `_moe_forward_fake` for hidden_dim_unpadded semantics.
     # `shared_out`: matches `shared_experts_input` if provided (latent MoE),
     # else `hidden_states`.
     if hidden_dim_unpadded > 0:
         fused_out = hidden_states.new_empty(
-            (*hidden_states.shape[:-1], hidden_dim_unpadded)
+            (*hidden_states.shape[:-1], hidden_dim_unpadded),
+            dtype=routed_output_dtype,
         )
     else:
-        fused_out = torch.empty_like(hidden_states)
+        fused_out = torch.empty_like(hidden_states, dtype=routed_output_dtype)
     if shared_experts_input is not None:
         shared_out = torch.empty_like(shared_experts_input)
     else:
@@ -482,6 +491,8 @@ class MoERunner(MoERunnerInterface):
         states: torch.Tensor,
         trunc_size: int | None,
         output_is_reduced: bool | None = None,
+        *,
+        in_place: bool = False,
     ) -> torch.Tensor:
         """All-reduce the combined output if needed.
 
@@ -503,13 +514,22 @@ class MoERunner(MoERunnerInterface):
         if output_is_reduced is None:
             output_is_reduced = self._fused_output_is_reduced
 
+        # Optional model-installed callback fired before the final all-reduce
+        # (GLM-5.3 L2 weight prefetch: the reduction leaves device memory idle).
+        _hook = getattr(self, "_l2_prefetch_pre_reduce_hook", None)
+        if _hook is not None:
+            _hook(states.shape[0])
         if (
             not self.moe_config.is_sequence_parallel
             and not self.moe_config.skip_final_all_reduce
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not output_is_reduced
         ):
-            states = tensor_model_parallel_all_reduce(states)
+            states = (
+                tensor_model_parallel_all_reduce_in_place(states)
+                if in_place
+                else tensor_model_parallel_all_reduce(states)
+            )
 
         return states[..., :trunc_size] if trunc_size is not None else states
 
@@ -587,10 +607,14 @@ class MoERunner(MoERunnerInterface):
         self,
         shared_experts_input: torch.Tensor | None,
         order: SharedExpertsOrder,
+        workspace: torch.Tensor | None = None,
     ):
         if self._shared_experts is not None:
             assert shared_experts_input is not None
-            self._shared_experts(shared_experts_input, order)
+            if workspace is None:
+                self._shared_experts(shared_experts_input, order)
+            else:
+                self._shared_experts(shared_experts_input, order, workspace=workspace)
 
     def _apply_quant_method(
         self,
@@ -610,8 +634,17 @@ class MoERunner(MoERunnerInterface):
         overlap. Then the shared expert was already launched in a separate
         stream, so the results only have to be awaited here.
         """
+        workspace = None
+        shared_workspace = None
+        if self._shared_experts is not None:
+            assert shared_experts_input is not None
+            shared_size = self._shared_experts.workspace_size(shared_experts_input)
+            if shared_size:
+                workspace, shared_workspace = self._quant_method.prepare_workspace(
+                    hidden_states, shared_size
+                )
         self._maybe_apply_shared_experts(
-            shared_experts_input, SharedExpertsOrder.NO_OVERLAP
+            shared_experts_input, SharedExpertsOrder.NO_OVERLAP, shared_workspace
         )
 
         if self.routed_experts.quant_method.is_monolithic:
@@ -630,17 +663,33 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
-            fused_out = self.routed_experts.forward_modular(
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=self._shared_experts,
-                shared_experts_input=shared_experts_input,
-            )
+            if workspace is None:
+                fused_out = self.routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
+                )
+            else:
+                fused_out = self.routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
+                    workspace=workspace,
+                )
 
         if shared_experts_overlapping:
             assert self._shared_experts is not None
             self._shared_experts.wait()
+        else:
+            self._maybe_apply_shared_experts(
+                shared_experts_input,
+                SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+                shared_workspace,
+            )
 
         return (
             self._shared_experts.output if self._shared_experts is not None else None,
@@ -740,6 +789,7 @@ class MoERunner(MoERunnerInterface):
             self.moe_config.hidden_dim_unpadded
             if self._quant_method.has_unpadded_output
             else 0,
+            self._quant_method.output_dtype,
         )
 
         #
@@ -769,27 +819,71 @@ class MoERunner(MoERunnerInterface):
             )
         )
 
-        # If routed output is already reduced, reduce shared to match.
+        # A sharded output transform turns the reduced latent into partial
+        # hidden states. Keep shared output partial for their final joint sum.
+        output_transform_is_tp_partial = bool(
+            self.routed_output_transform is not None
+            and getattr(self.routed_output_transform, "output_is_tp_partial", False)
+        )
+        # If routed output stays reduced, reduce shared to match.
         # See note above re: the two all-reduce points.
         shared_output = self._maybe_reduce_shared_expert_output(
-            shared_output, fused_output_is_reduced
+            shared_output,
+            fused_output_is_reduced and not output_transform_is_tp_partial,
         )
 
         shared_output, fused_output = self._maybe_apply_routed_scale_to_output(
             shared_output, fused_output
         )
 
-        # Apply output transform (e.g. latent -> full dim)
-        fused_output = self.apply_routed_output_transform(fused_output)
+        # Shared experts have finished reading their input. A model-declared
+        # prefill transform may reuse that consumed buffer outside the opaque
+        # MoE custom op, preserving the op's non-aliasing return contract.
+        can_write_output = getattr(
+            self.routed_output_transform, "can_write_output", None
+        )
+        reuse_output = bool(
+            shared_experts_input is not None
+            and not self.moe_config.is_sequence_parallel
+            and can_write_output is not None
+            and can_write_output(fused_output, shared_experts_input)
+            and (
+                shared_output is None
+                or shared_output.untyped_storage().data_ptr()
+                != shared_experts_input.untyped_storage().data_ptr()
+            )
+        )
+        if reuse_output:
+            assert self.routed_output_transform is not None
+            fused_output = self.routed_output_transform(
+                fused_output,
+                output=shared_experts_input,
+            )
+        else:
+            fused_output = self.apply_routed_output_transform(fused_output)
+        if output_transform_is_tp_partial:
+            fused_output_is_reduced = False
 
         if shared_output is not None:
-            result = shared_output + fused_output
+            result = (
+                fused_output.add_(shared_output)
+                if reuse_output
+                else shared_output + fused_output
+            )
         else:
             result = fused_output
 
-        result = self._maybe_reduce_final_output(
-            result, og_hidden_dim_post_xform, fused_output_is_reduced
-        )
+        if reuse_output:
+            result = self._maybe_reduce_final_output(
+                result,
+                og_hidden_dim_post_xform,
+                fused_output_is_reduced,
+                in_place=True,
+            )
+        else:
+            result = self._maybe_reduce_final_output(
+                result, og_hidden_dim_post_xform, fused_output_is_reduced
+            )
 
         return self._maybe_add_zero_expert_output(result)
 
@@ -893,9 +987,17 @@ class MoERunner(MoERunnerInterface):
         # before routed expert dispatch.
         shared_experts_overlapping = False
         if self._shared_experts is not None:
-            shared_experts_overlapping = self._shared_experts.maybe_forward_async(
-                shared_experts_input
-            )
+            assert shared_experts_input is not None
+            if self._shared_experts.workspace_size(shared_experts_input):
+                # Dispatch determines routed scratch sizes. Reserve both branches
+                # together before launching arena-backed shared experts.
+                self._shared_experts.maybe_sync_shared_experts_stream(
+                    shared_experts_input
+                )
+            else:
+                shared_experts_overlapping = self._shared_experts.maybe_forward_async(
+                    shared_experts_input
+                )
 
         # If the Runner holds the gate, apply it after the stream sync,
         # so it can run overlapped with the
@@ -918,6 +1020,7 @@ class MoERunner(MoERunnerInterface):
                 router_logits,
             )
 
+            num_tokens = hidden_states.shape[0]
             shared_output, hidden_states = self._apply_quant_method(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -926,10 +1029,17 @@ class MoERunner(MoERunnerInterface):
                 shared_experts_overlapping=shared_experts_overlapping,
             )
 
-            return self._maybe_combine(
+            output = self._maybe_combine(
                 shared_output,
                 hidden_states,
             )
+        # Optional model-installed callback fired inside the opaque MoE op,
+        # after the experts and before the final all-reduce (L2 weight
+        # prefetch for torch.compiled models).
+        prefetch = getattr(self, "_l2_prefetch_post_experts_hook", None)
+        if prefetch is not None:
+            prefetch(num_tokens)
+        return output
 
     #########################################################
     #

@@ -2570,7 +2570,7 @@ def test_quark_override_delegates_to_quark_config(
         # Module was renamed from deepseek_v4_1 to deepseek_v41 upstream.
         for mod_name in (
             "vllm.models.deepseek_v41.quant_config",
-            "vllm.models.deepseek_v4_1.quant_config",
+            "vllm.models.deepseek_v41.nvidia.b12x.quant_config",
         ):
             try:
                 mod = importlib.import_module(mod_name)
