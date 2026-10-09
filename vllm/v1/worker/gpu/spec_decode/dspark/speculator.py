@@ -27,11 +27,15 @@ from typing import Any
 
 import torch
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
+    sample_greedy_markov,
+    scratch_shape,
+)
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 
 logger = init_logger(__name__)
@@ -80,6 +84,36 @@ class DSparkSpeculator(DFlashSpeculator):
         )
 
         self.use_confidence_head: bool = False
+        draft_vocab = max(
+            self.draft_model_config.hf_config.vocab_size,
+            getattr(self.draft_model_config.hf_config, "draft_vocab_size", None) or 0,
+        )
+        shape = scratch_shape(self.max_num_reqs, draft_vocab)
+        self._greedy_partial_values = torch.empty(
+            shape, dtype=torch.float32, device=device
+        )
+        self._greedy_partial_indices = torch.empty(
+            shape, dtype=torch.int32, device=device
+        )
+
+    @property
+    def attn_vllm_config(self) -> VllmConfig:
+        config = super().attn_vllm_config
+        if self.draft_model_config.hf_config.model_type != "glm53_dspark":
+            return config
+        # The draft's sliding-window MLA geometry differs from the GLM verifier.
+        config.model_config = self.draft_model_config
+        config.quant_config = None
+        config.attention_config = replace(
+            config.attention_config,
+            backend=self.speculative_config.attention_backend,
+        )
+        if self.speculative_config.kv_cache_dtype is not None:
+            config.cache_config = replace(
+                config.cache_config,
+                cache_dtype=self.speculative_config.kv_cache_dtype,
+            )
+        return config
 
     def load_draft_model(
         self,
@@ -87,6 +121,9 @@ class DSparkSpeculator(DFlashSpeculator):
         target_attn_layer_names: set[str],
     ) -> torch.nn.Module:
         model = load_dspark_model(target_model, self.vllm_config)
+        bind_auxiliary_stream = getattr(model, "bind_target_auxiliary_stream", None)
+        if callable(bind_auxiliary_stream):
+            bind_auxiliary_stream(target_model, self.hidden_states)
         # Reduced draft vocab: probabilistic rejection sampling indexes draft
         # logits by target id, so precompute the draft->target column map and a
         # scratch buffer to scatter logits into target vocab before sampling.
@@ -105,7 +142,7 @@ class DSparkSpeculator(DFlashSpeculator):
             )
         self.use_confidence_head = (
             self.enable_adaptive_verification
-            and model.model.confidence_head is not None
+            and getattr(model.model, "confidence_head", None) is not None
         )
         if self.use_confidence_head:
             # The acceptance estimator is not needed when a trained confidence head
@@ -164,7 +201,12 @@ class DSparkSpeculator(DFlashSpeculator):
         # Per-(req, position) head hidden, ordered (req, step).
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
         # Draft-vocab logits; sampled ids are remapped to target vocab below.
-        base_logits = self.model.compute_draft_logits(sample_hidden)
+        local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
+        base_logits = (
+            self.model.compute_local_draft_logits(sample_hidden)
+            if local_head
+            else self.model.compute_draft_logits(sample_hidden)
+        )
         vocab_size = base_logits.shape[-1]
         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
 
@@ -181,12 +223,43 @@ class DSparkSpeculator(DFlashSpeculator):
             markov_embed = self.model.markov_embed(prev)
             if self.use_confidence_head:
                 confidence_markov_embeds.append(markov_embed)
+            if local_head:
+                bias = self.model.compute_local_markov_bias(markov_embed)
+                if self.draft_logits is None and self.acceptance_estimator is None:
+                    draft_sampled_i = self.model.sample_local_draft_logits(
+                        base_logits[:, i], bias
+                    )
+                else:
+                    logits_i = self.model.gather_local_draft_logits(
+                        base_logits[:, i], bias
+                    )
+                    draft_sampled_i = self._sample_logits(
+                        logits_i, idx_map[:, i], sample_pos[:, i], i
+                    )
+                self.draft_tokens[:num_reqs, i] = draft_sampled_i
+                prev = draft_sampled_i
+                continue
             bias = self.model.markov_bias(markov_embed)
-            logits_i = base_logits[:, i] + bias
-            draft_sampled_i = self._sample_logits(
-                logits_i, idx_map[:, i], sample_pos[:, i], i
-            )
-            self.draft_tokens[:num_reqs, i] = draft_sampled_i
+            if (
+                self.draft_logits is None
+                and self.model.draft_id_to_target_id is None
+                and base_logits.dtype == bias.dtype
+                and self.acceptance_estimator is None
+            ):
+                draft_sampled_i = self.draft_tokens[:num_reqs, i]
+                sample_greedy_markov(
+                    base_logits[:, i],
+                    bias,
+                    draft_sampled_i,
+                    self._greedy_partial_values,
+                    self._greedy_partial_indices,
+                )
+            else:
+                logits_i = base_logits[:, i] + bias
+                draft_sampled_i = self._sample_logits(
+                    logits_i, idx_map[:, i], sample_pos[:, i], i
+                )
+                self.draft_tokens[:num_reqs, i] = draft_sampled_i
             prev = draft_sampled_i
 
         if self.use_confidence_head:

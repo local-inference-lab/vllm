@@ -504,7 +504,11 @@ def _gumbel_drafted_tokens(
 
 
 @pytest.mark.parametrize("num_speculative_steps", [1, 3])
-def test_gumbel_drafted_rejection_sample_is_unbiased(num_speculative_steps: int):
+@pytest.mark.parametrize("draft_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("temperature", [0.6, 1.0])
+def test_gumbel_drafted_rejection_sample_is_unbiased(
+    num_speculative_steps: int, draft_dtype: torch.dtype, temperature: float
+):
     """The proposal and the residual resample must not share a noise vector.
 
     Draws proposals on the same (seed, pos) stream the sampler verifies and
@@ -529,13 +533,14 @@ def test_gumbel_drafted_rejection_sample_is_unbiased(num_speculative_steps: int)
     target_logits_1d = torch.randn(
         NARROW_VOCAB_SIZE, device=device, dtype=torch.float32
     )
-    draft_logits_1d = -target_logits_1d
+    draft_logits_1d = (-target_logits_1d).to(draft_dtype)
+    target_logits_1d = target_logits_1d / temperature
 
     inputs = _build_rejection_sample_inputs(
         target_logits_1d,
         draft_logits_1d,
         num_speculative_steps,
-        temperature=1.0,
+        temperature=temperature,
         num_trials=NARROW_NUM_TRIALS,
     )
     inputs["draft_sampled"] = _gumbel_drafted_tokens(

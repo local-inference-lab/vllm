@@ -158,6 +158,11 @@ class DefaultModelState(ModelState):
         positions = self.rope_state.get_positions(input_batch.num_tokens_after_padding)
         return {"positions": positions}
 
+    def get_model_positions(self, input_batch: InputBatch) -> torch.Tensor:
+        if self.rope_state is None:
+            return super().get_model_positions(input_batch)
+        return self.rope_state.get_positions(input_batch.num_tokens_after_padding)
+
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         model_inputs = {}
         if self.supports_mm_inputs or self.prompt_embeds_state is not None:
@@ -209,6 +214,19 @@ class DefaultModelState(ModelState):
                 req_ids=input_batch.req_ids,
                 mm_features=self.encoder_cache.mm_features,
                 sliding_window=self.model_config.get_sliding_window(),
+                clamp_sliding_window=(
+                    getattr(self.model, "mm_prefix_clamp_sliding_window", False)
+                    or getattr(
+                        self.model_config.hf_text_config,
+                        "mm_prefix_clamp_sliding_window",
+                        False,
+                    )
+                ),
+                span_leading_pad_modulus=getattr(
+                    self.model_config.hf_text_config,
+                    "mm_prefix_span_leading_pad_modulus",
+                    0,
+                ),
             )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import itertools
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, NamedTuple
 
 import torch
@@ -10,6 +10,7 @@ import torch
 from vllm.config import CacheConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateCopyFunc,
     MambaStateCopyFuncsByType,
     get_conv_copy_spec,
     get_temporal_copy_spec,
@@ -18,6 +19,8 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.core.boundary_checkpoint import NUM_BOUNDARY_CHECKPOINT_SLOTS
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -63,8 +66,7 @@ def get_aligned_state_indices_multi_group_kernel(
     )
     first_state_slot = tl.maximum((seq_lens - 1) // CACHE_BLOCK_SIZE, 0)
 
-    # load multiple block table for each group
-    groups = tl.arange(0, BLOCK_GROUPS)
+    groups = tl.program_id(1) * BLOCK_GROUPS + tl.arange(0, BLOCK_GROUPS)
     valid_group = groups < NUM_GROUPS
     group_base_addrs = tl.load(
         block_table_ptrs_ptr + groups,
@@ -82,8 +84,13 @@ def get_aligned_state_indices_multi_group_kernel(
         mask=(
             valid_group[:, None, None]
             & valid_row[None, :, None]
+            & (seq_lens[None, :, None] > 0)
             & valid_state_slot[None, None, :]
         ),
+        # Padding must use the recurrent/conv NULL_BLOCK_ID (reserved block 0).
+        # MTP0 reuses this buffer directly during full CUDA graph replay;
+        # -1 would be interpreted as a real state address before the pool.
+        other=0,
     )
     tl.store(
         state_indices_ptr
@@ -209,6 +216,7 @@ def _copy_mamba_state_block(
     COPY_BLOCK_SIZE: tl.constexpr,
     CONV_STATE_DIM_FIRST: tl.constexpr,
     TEMPORAL_TILES: tl.constexpr,
+    destination_block_id=None,
 ):
     """Copy one (layer, state-type) mamba state block between block columns.
 
@@ -248,7 +256,10 @@ def _copy_mamba_state_block(
     # Widen block ids to int64 before they reach `block_id * state_block_stride`
     # below: state_block_stride can exceed 2**31 bytes for large mamba caches,
     # and Triton would otherwise do the multiply in int32 and wrap.
-    dest_block_id = tl.load(block_table_base + dst_col).to(tl.int64)
+    if destination_block_id is None:
+        dest_block_id = tl.load(block_table_base + dst_col).to(tl.int64)
+    else:
+        dest_block_id = destination_block_id.to(tl.int64)
     dst_addr = state_base_addr + dest_block_id * state_block_stride
 
     is_conv_state = conv_width > 0
@@ -362,6 +373,74 @@ def _copy_mamba_state_block(
         tile_idx,
         COPY_BLOCK_SIZE=COPY_BLOCK_SIZE,
         NUM_TILES=TEMPORAL_TILES,
+    )
+
+
+@triton.jit
+def checkpoint_mamba_states_kernel(
+    idx_mapping_ptr,
+    state_idx_ptr,
+    capture_tokens_ptr,
+    capture_bias_ptr,
+    destination_blocks_ptr,
+    block_table_ptrs_ptr,
+    block_table_stride_req: tl.int64,
+    state_base_addrs_ptr,
+    state_block_strides_ptr,
+    state_elem_sizes_ptr,
+    state_inner_sizes_ptr,
+    state_conv_widths_ptr,
+    state_group_indices_ptr,
+    state_dim_row_count_ptr,
+    state_dim_row_stride_ptr,
+    NUM_GROUPS: tl.constexpr,
+    NUM_CAPTURES: tl.constexpr,
+    CONV_STATE_DIM_FIRST: tl.constexpr,
+    TEMPORAL_TILES: tl.constexpr,
+    ACCEPTED_STATE_COMMITTED: tl.constexpr,
+):
+    batch_idx = tl.program_id(0) // NUM_CAPTURES
+    kind = tl.program_id(0) % NUM_CAPTURES
+    state_idx = tl.program_id(1)
+    tile_idx = tl.program_id(2)
+    if tl.load(capture_tokens_ptr + batch_idx * NUM_CAPTURES + kind) <= 0:
+        return
+    req_idx = tl.load(idx_mapping_ptr + batch_idx)
+    if req_idx < 0:
+        return
+    src_col = tl.load(state_idx_ptr + req_idx)
+    token_bias = 0
+    if not ACCEPTED_STATE_COMMITTED:
+        token_bias = tl.load(capture_bias_ptr + batch_idx * NUM_CAPTURES + kind)
+    group_idx = tl.load(state_group_indices_ptr + state_idx)
+    destination = tl.load(
+        destination_blocks_ptr
+        + (req_idx * NUM_CAPTURES + kind) * NUM_GROUPS
+        + group_idx
+    )
+    if destination <= 0:
+        return
+    _copy_mamba_state_block(
+        state_idx,
+        batch_idx,
+        src_col,
+        0,
+        token_bias,
+        block_table_ptrs_ptr,
+        block_table_stride_req,
+        state_base_addrs_ptr,
+        state_block_strides_ptr,
+        state_elem_sizes_ptr,
+        state_inner_sizes_ptr,
+        state_conv_widths_ptr,
+        state_group_indices_ptr,
+        state_dim_row_count_ptr,
+        state_dim_row_stride_ptr,
+        tile_idx,
+        COPY_BLOCK_SIZE=1024,
+        CONV_STATE_DIM_FIRST=CONV_STATE_DIM_FIRST,
+        TEMPORAL_TILES=TEMPORAL_TILES,
+        destination_block_id=destination,
     )
 
 
@@ -717,6 +796,129 @@ def validate_mamba_state_copy_funcs(
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class MambaLayerGroup:
+    """Per-layer Mamba specs sharing one physical block table."""
+
+    group_id: int
+    layer_specs: dict[str, MambaSpec]
+
+
+def _get_mamba_layer_specs(
+    group: KVCacheGroupSpec,
+) -> dict[str, MambaSpec]:
+    spec = group.kv_cache_spec
+    if isinstance(spec, MambaSpec):
+        return {layer_name: spec for layer_name in group.layer_names}
+    if not isinstance(spec, UniformTypeKVCacheSpecs):
+        return {}
+
+    layer_specs: dict[str, MambaSpec] = {}
+    for layer_name in group.layer_names:
+        layer_spec = spec.kv_cache_specs.get(layer_name)
+        if isinstance(layer_spec, MambaSpec):
+            layer_specs[layer_name] = layer_spec
+    if layer_specs and len(layer_specs) != len(group.layer_names):
+        missing = sorted(set(group.layer_names) - layer_specs.keys())
+        raise ValueError(
+            "A KV cache group cannot mix Mamba and non-Mamba layer specs; "
+            f"non-Mamba layers: {missing}"
+        )
+    return layer_specs
+
+
+def get_mamba_layer_groups(kv_cache_config: KVCacheConfig) -> list[MambaLayerGroup]:
+    """Discover Mamba layers without discarding uniform per-layer wrappers."""
+    groups = [
+        MambaLayerGroup(group_id, layer_specs)
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+        if (layer_specs := _get_mamba_layer_specs(group))
+    ]
+    if not groups:
+        raise ValueError("no mamba layers in the model")
+
+    specs = [spec for group in groups for spec in group.layer_specs.values()]
+    block_sizes = {spec.block_size for spec in specs}
+    if len(block_sizes) != 1:
+        raise ValueError(
+            "All Mamba layers must use the same scheduling block size, got "
+            f"{sorted(block_sizes)}"
+        )
+    speculative_blocks = {spec.num_speculative_blocks for spec in specs}
+    if len(speculative_blocks) != 1:
+        raise ValueError(
+            "All Mamba layers must reserve the same number of speculative "
+            f"blocks, got {sorted(speculative_blocks)}"
+        )
+    checkpoint_blocks = {spec.num_prefill_checkpoint_blocks for spec in specs}
+    if len(checkpoint_blocks) != 1:
+        raise ValueError(
+            "All Mamba layers must reserve the same number of prefill "
+            f"checkpoint blocks, got {sorted(checkpoint_blocks)}"
+        )
+    return groups
+
+
+def _normalize_mamba_state_copy_funcs(
+    layer_groups: list[MambaLayerGroup],
+    copy_funcs: Mapping[MambaAttentionBackendEnum, tuple[MambaStateCopyFunc, ...]]
+    | tuple[MambaStateCopyFunc, ...],
+) -> MambaStateCopyFuncsByType:
+    mamba_types = {
+        spec.mamba_type for group in layer_groups for spec in group.layer_specs.values()
+    }
+    if isinstance(copy_funcs, Mapping):
+        funcs_by_type = {kind: tuple(funcs) for kind, funcs in copy_funcs.items()}
+    else:
+        if len(mamba_types) != 1:
+            raise ValueError(
+                "A legacy Mamba state-copy tuple is only valid for a model with "
+                f"one Mamba type, got {sorted(kind.name for kind in mamba_types)}"
+            )
+        funcs_by_type = {next(iter(mamba_types)): tuple(copy_funcs)}
+
+    missing = mamba_types - funcs_by_type.keys()
+    if missing:
+        raise ValueError(
+            "Missing Mamba state-copy functions for "
+            f"{sorted(kind.name for kind in missing)}"
+        )
+    for group in layer_groups:
+        for layer_name, spec in group.layer_specs.items():
+            num_funcs = len(funcs_by_type[spec.mamba_type])
+            if not 0 < num_funcs <= len(spec.shapes):
+                raise ValueError(
+                    f"Mamba layer {layer_name!r} ({spec.mamba_type.name}) has "
+                    f"{len(spec.shapes)} state tensors but {num_funcs} copy functions; "
+                    "expected a non-empty copyable prefix"
+                )
+    return {kind: funcs_by_type[kind] for kind in mamba_types}
+
+
+def resolve_mamba_state_copy_funcs(
+    model: Any,
+    kv_cache_config: KVCacheConfig,
+) -> MambaStateCopyFuncsByType:
+    """Resolve the heterogeneous copy API, adapting legacy single-type models."""
+    layer_groups = get_mamba_layer_groups(kv_cache_config)
+    mamba_types = {
+        spec.mamba_type for group in layer_groups for spec in group.layer_specs.values()
+    }
+    get_by_type = getattr(model, "get_mamba_state_copy_funcs", None)
+    if get_by_type is not None:
+        copy_funcs = get_by_type(mamba_types)
+    else:
+        if len(mamba_types) != 1:
+            raise ValueError(
+                f"{type(model).__name__} has multiple Mamba state layouts "
+                f"({sorted(kind.name for kind in mamba_types)}) but only exposes "
+                "get_mamba_state_copy_func(); implement "
+                "get_mamba_state_copy_funcs(mamba_types)"
+            )
+        copy_funcs = model.get_mamba_state_copy_func()
+    return _normalize_mamba_state_copy_funcs(layer_groups, copy_funcs)
+
+
 @dataclasses.dataclass
 class MambaCopyBuffers:
     src_ptrs: CpuGpuBuffer
@@ -724,6 +926,8 @@ class MambaCopyBuffers:
     sizes: CpuGpuBuffer
     mamba_group_ids: list[int]
     mamba_spec: MambaSpec
+    layer_groups: list[MambaLayerGroup]
+    copy_funcs_by_type: MambaStateCopyFuncsByType
     offset: int = 0
 
     @classmethod
@@ -731,28 +935,17 @@ class MambaCopyBuffers:
         cls,
         max_num_reqs: int,
         kv_cache_config: KVCacheConfig,
-        copy_funcs: MambaStateCopyFuncsByType,
+        copy_funcs: MambaStateCopyFuncsByType | tuple[MambaStateCopyFunc, ...],
         make_buffer: Callable[..., CpuGpuBuffer],
     ) -> "MambaCopyBuffers":
-        mamba_groups = get_mamba_groups(kv_cache_config)
-        mamba_spec = next(iter(mamba_groups))
-        assert all(
-            spec.block_size == mamba_spec.block_size
-            and spec.num_speculative_blocks == mamba_spec.num_speculative_blocks
-            and spec.mamba_cache_mode == mamba_spec.mamba_cache_mode
-            for spec in mamba_groups
-        ), "all mamba groups must share cache scheduling parameters"
-        mamba_group_ids = get_mamba_group_ids(mamba_groups)
+        layer_groups = get_mamba_layer_groups(kv_cache_config)
+        funcs_by_type = _normalize_mamba_state_copy_funcs(layer_groups, copy_funcs)
+        mamba_group_ids = [group.group_id for group in layer_groups]
+        mamba_spec = next(iter(layer_groups[0].layer_specs.values()))
         entries_per_req = sum(
-            len(
-                copy_funcs[
-                    _get_mamba_spec_for_layer(
-                        kv_cache_config.kv_cache_groups[gid], layer_name
-                    ).mamba_type
-                ]
-            )
-            for gid in mamba_group_ids
-            for layer_name in kv_cache_config.kv_cache_groups[gid].layer_names
+            len(funcs_by_type[spec.mamba_type])
+            for group in layer_groups
+            for spec in group.layer_specs.values()
         )
         n = max_num_reqs * entries_per_req
 
@@ -762,6 +955,8 @@ class MambaCopyBuffers:
             sizes=make_buffer(n, dtype=torch.int32),
             mamba_group_ids=mamba_group_ids,
             mamba_spec=mamba_spec,
+            layer_groups=layer_groups,
+            copy_funcs_by_type=funcs_by_type,
         )
 
 
@@ -799,6 +994,8 @@ class MambaSpecDecodeGPUContext:
     num_states: int
     mamba_group_ids: list[int]
     num_groups: int
+    layer_groups: list[MambaLayerGroup]
+    copy_funcs_by_type: MambaStateCopyFuncsByType | None
 
     # Output buffer for num_accepted_tokens updates
     num_accepted_tokens_out: torch.Tensor
@@ -839,31 +1036,16 @@ class MambaSpecDecodeGPUContext:
         make_buffer: Callable[..., CpuGpuBuffer],
     ) -> "MambaSpecDecodeGPUContext":
         """Create context with allocated buffers (metadata populated later)."""
-        mamba_groups = get_mamba_groups(kv_cache_config)
-        mamba_group_ids = get_mamba_group_ids(mamba_groups)
-        mamba_spec = next(iter(mamba_groups))
-        assert all(
-            spec.block_size == mamba_spec.block_size
-            and spec.num_speculative_blocks == mamba_spec.num_speculative_blocks
-            and spec.mamba_cache_mode == mamba_spec.mamba_cache_mode
-            for spec in mamba_groups
-        ), "all mamba groups must share cache scheduling parameters"
-        copy_funcs_by_spec = {
-            spec: copy_funcs[spec.mamba_type] for spec in mamba_groups
-        }
-
-        # Count physical state tensors across all Mamba groups. Different
-        # groups may expose different state specs.
+        layer_groups = get_mamba_layer_groups(kv_cache_config)
+        mamba_group_ids = [group.group_id for group in layer_groups]
+        mamba_spec = next(iter(layer_groups[0].layer_specs.values()))
+        resolved_copy_funcs = _normalize_mamba_state_copy_funcs(
+            layer_groups, copy_funcs
+        )
         total_states = sum(
-            len(
-                copy_funcs_by_spec[
-                    _get_mamba_spec_for_layer(
-                        kv_cache_config.kv_cache_groups[gid], layer_name
-                    )
-                ]
-            )
-            for gid in mamba_group_ids
-            for layer_name in kv_cache_config.kv_cache_groups[gid].layer_names
+            len(resolved_copy_funcs[spec.mamba_type])
+            for group in layer_groups
+            for spec in group.layer_specs.values()
         )
 
         return cls(
@@ -895,6 +1077,8 @@ class MambaSpecDecodeGPUContext:
             num_states=total_states,
             mamba_group_ids=mamba_group_ids,
             num_groups=len(mamba_group_ids),
+            layer_groups=layer_groups,
+            copy_funcs_by_type=resolved_copy_funcs,
             num_accepted_tokens_out=torch.zeros(
                 max_num_reqs, dtype=torch.int32, device=device
             ),
@@ -926,7 +1110,9 @@ class MambaSpecDecodeGPUContext:
         self,
         kv_cache_config: KVCacheConfig,
         forward_context: dict[str, Any],
-        mamba_state_copy_funcs: MambaStateCopyFuncsByType,
+        mamba_state_copy_funcs: MambaStateCopyFuncsByType
+        | tuple[MambaStateCopyFunc, ...]
+        | None,
         block_tables: list[torch.Tensor],
         aligned_index_block_tables: list[torch.Tensor] | None = None,
     ) -> None:
@@ -957,8 +1143,8 @@ class MambaSpecDecodeGPUContext:
             forward_context: Dictionary mapping layer names to attention objects,
                 populated after the model is loaded. Each attention object must
                 have a `kv_cache` attribute containing the list of state tensors.
-            mamba_state_copy_funcs: Mapping from MambaAttentionBackendEnum to
-                copy functions.
+            mamba_state_copy_funcs: Copy functions keyed by Mamba type. A
+                legacy tuple is accepted for single-type models.
             block_tables: per-mamba-group persistent block-table tensors, in
                 the same order as `mamba_group_ids`, with one row per request
                 state slot. Their `data_ptr()` / `stride(0)` are captured once
@@ -970,12 +1156,18 @@ class MambaSpecDecodeGPUContext:
         """
         if self.is_initialized:
             return
+        if mamba_state_copy_funcs is not None:
+            self.copy_funcs_by_type = _normalize_mamba_state_copy_funcs(
+                self.layer_groups, mamba_state_copy_funcs
+            )
+        if self.copy_funcs_by_type is None:
+            raise ValueError("Mamba state-copy functions were not provided")
         # This only runs once per worker.
         with gpu_sync_allowed():
             self._populate_metadata(
                 kv_cache_config,
                 forward_context,
-                mamba_state_copy_funcs,
+                self.copy_funcs_by_type,
                 block_tables,
                 aligned_index_block_tables or block_tables,
             )
@@ -989,21 +1181,20 @@ class MambaSpecDecodeGPUContext:
         aligned_index_block_tables: list[torch.Tensor],
     ) -> None:
         idx = 0
-        for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
-            kv_cache_group = kv_cache_config.kv_cache_groups[mamba_group_id]
-            layer_names = kv_cache_group.layer_names
-            for layer_name in layer_names:
-                mamba_spec = _get_mamba_spec_for_layer(kv_cache_group, layer_name)
-                state_copy_funcs = mamba_state_copy_funcs[mamba_spec.mamba_type]
+        for group_local_idx, layer_group in enumerate(self.layer_groups):
+            for layer_name, layer_spec in layer_group.layer_specs.items():
                 attention = forward_context[layer_name]
                 kv_caches: list[torch.Tensor] = attention.kv_cache
-                if len(kv_caches) < len(state_copy_funcs):
+                copy_funcs = mamba_state_copy_funcs[layer_spec.mamba_type]
+
+                if len(kv_caches) < len(copy_funcs):
                     raise ValueError(
-                        f"Expected at least {len(state_copy_funcs)} Mamba state "
-                        f"tensors, got {len(kv_caches)}"
+                        f"Expected at least {len(copy_funcs)} Mamba state tensors "
+                        f"for {layer_name!r}, got {len(kv_caches)}"
                     )
-                for state_type_idx, copy_func in enumerate(state_copy_funcs):
-                    state = kv_caches[state_type_idx]
+                for state, copy_func in zip(
+                    kv_caches[: len(copy_funcs)], copy_funcs, strict=True
+                ):
                     # Base address
                     self.state_base_addrs[idx] = _reinterpret_u64_as_i64(
                         state.data_ptr()
@@ -1118,8 +1309,21 @@ class MambaSpecDecodeGPUContext:
             return self.aligned_state_indices[:, :0]
 
         num_state_slots = self.aligned_state_indices.shape[2]
-        block_rows = 32
-        grid = (triton.cdiv(num_reqs, block_rows),)
+        block_state_slots = triton.next_power_of_2(num_state_slots)
+        # Bound each program's gather tile: large group counts otherwise spill
+        # registers and reserve hundreds of MiB of device-local backing memory.
+        block_rows = min(
+            32, triton.next_power_of_2(num_reqs), max(1, 1024 // block_state_slots)
+        )
+        block_groups = min(
+            8,
+            triton.next_power_of_2(self.num_groups),
+            max(1, 1024 // (block_rows * block_state_slots)),
+        )
+        grid = (
+            triton.cdiv(num_reqs, block_rows),
+            triton.cdiv(self.num_groups, block_groups),
+        )
         get_aligned_state_indices_multi_group_kernel[grid](
             self.aligned_index_block_table_ptrs,
             seq_lens,
@@ -1132,9 +1336,9 @@ class MambaSpecDecodeGPUContext:
             num_reqs,
             CACHE_BLOCK_SIZE=self.block_size,
             NUM_GROUPS=self.num_groups,
-            BLOCK_GROUPS=triton.next_power_of_2(self.num_groups),
+            BLOCK_GROUPS=block_groups,
             NUM_STATE_SLOTS=num_state_slots,
-            BLOCK_STATE_SLOTS=triton.next_power_of_2(num_state_slots),
+            BLOCK_STATE_SLOTS=block_state_slots,
             BLOCK_ROWS=block_rows,
             num_warps=1,
         )
@@ -1245,6 +1449,66 @@ class MambaSpecDecodeGPUContext:
             TEMPORAL_TILES=_TEMPORAL_TILES,
         )
 
+    def checkpoint_request_boundaries(
+        self,
+        idx_mapping: torch.Tensor,
+        state_idx: torch.Tensor,
+        capture_tokens: torch.Tensor,
+        capture_bias: torch.Tensor,
+        destination_blocks: torch.Tensor,
+        *,
+        accepted_state_committed: bool = False,
+    ) -> None:
+        """Copy endpoints from speculative columns or an already recovered state.
+
+        Recovery commits and compacts both convolution and recurrent state.
+        Applying the original acceptance offset again would copy a stale page.
+        """
+        assert self.is_initialized
+        num_reqs = idx_mapping.numel()
+        assert (
+            capture_tokens.shape
+            == capture_bias.shape
+            == (
+                num_reqs,
+                NUM_BOUNDARY_CHECKPOINT_SLOTS,
+            )
+        )
+        assert destination_blocks.shape[1:] == (
+            NUM_BOUNDARY_CHECKPOINT_SLOTS,
+            self.num_groups,
+        )
+        if not num_reqs:
+            return
+        checkpoint_mamba_states_kernel[
+            (
+                num_reqs * NUM_BOUNDARY_CHECKPOINT_SLOTS,
+                self.num_states,
+                _TEMPORAL_TILES,
+            )
+        ](
+            idx_mapping,
+            state_idx,
+            capture_tokens,
+            capture_bias,
+            destination_blocks,
+            self.block_table_ptrs,
+            self.block_table_stride_req,
+            self.state_base_addrs,
+            self.state_block_strides,
+            self.state_elem_sizes,
+            self.state_inner_sizes,
+            self.state_conv_widths,
+            self.state_group_indices,
+            self.state_dim_row_count,
+            self.state_dim_row_stride,
+            NUM_GROUPS=self.num_groups,
+            NUM_CAPTURES=NUM_BOUNDARY_CHECKPOINT_SLOTS,
+            CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
+            TEMPORAL_TILES=_TEMPORAL_TILES,
+            ACCEPTED_STATE_COMMITTED=accepted_state_committed,
+        )
+
     def run_fused_postprocess_align(
         self,
         num_reqs: int,
@@ -1319,20 +1583,22 @@ class MambaBuffers:
         cls,
         max_num_reqs: int,
         kv_cache_config: KVCacheConfig,
-        copy_funcs: MambaStateCopyFuncsByType,
+        copy_funcs: MambaStateCopyFuncsByType | tuple[MambaStateCopyFunc, ...],
         make_buffer: Callable[..., CpuGpuBuffer],
         device: torch.device,
         with_postprocess_align: bool,
     ) -> "MambaBuffers":
+        layer_groups = get_mamba_layer_groups(kv_cache_config)
+        funcs_by_type = _normalize_mamba_state_copy_funcs(layer_groups, copy_funcs)
         return cls(
             preprocess=MambaCopyBuffers.create(
-                max_num_reqs, kv_cache_config, copy_funcs, make_buffer
+                max_num_reqs, kv_cache_config, funcs_by_type, make_buffer
             ),
             postprocess_align=(
                 MambaSpecDecodeGPUContext.create(
                     max_num_reqs=max_num_reqs,
                     kv_cache_config=kv_cache_config,
-                    copy_funcs=copy_funcs,
+                    copy_funcs=funcs_by_type,
                     device=device,
                     make_buffer=make_buffer,
                 )
@@ -1345,7 +1611,7 @@ class MambaBuffers:
 def collect_mamba_copy_meta(
     copy_bufs: MambaCopyBuffers,
     kv_cache_config: KVCacheConfig,
-    mamba_state_copy_funcs: MambaStateCopyFuncsByType,
+    mamba_state_copy_funcs: MambaStateCopyFuncsByType | tuple[MambaStateCopyFunc, ...],
     mamba_group_ids: list[int],
     src_block_idx: int,
     dest_block_idx: int,
@@ -1360,26 +1626,43 @@ def collect_mamba_copy_meta(
     dst_ptrs_np = copy_bufs.dst_ptrs.np
     sizes_np = copy_bufs.sizes.np
     offset = copy_bufs.offset
+    layer_groups_by_id = {group.group_id: group for group in copy_bufs.layer_groups}
 
+    layers_to_copy: list[
+        tuple[list[int], list[torch.Tensor], tuple[MambaStateCopyFunc, ...]]
+    ] = []
     for mamba_group_id in mamba_group_ids:
         block_ids = req_state.block_ids[mamba_group_id]
-        dest_block_id = block_ids[dest_block_idx]
-        kv_cache_group = kv_cache_config.kv_cache_groups[mamba_group_id]
-        layer_names = kv_cache_group.layer_names
-        for layer_name in layer_names:
-            mamba_spec = _get_mamba_spec_for_layer(kv_cache_group, layer_name)
-            state_copy_funcs = mamba_state_copy_funcs[mamba_spec.mamba_type]
+        layer_group = layer_groups_by_id[mamba_group_id]
+        for layer_name, layer_spec in layer_group.layer_specs.items():
             attention = forward_context[layer_name]
             kv_caches: list[torch.Tensor] = attention.kv_cache
-            for state, state_copy_func in zip(kv_caches, state_copy_funcs):
-                copy_spec = state_copy_func(
-                    state, block_ids, src_block_idx, accept_token_bias + 1
+            copy_funcs = copy_bufs.copy_funcs_by_type[layer_spec.mamba_type]
+            if len(kv_caches) < len(copy_funcs):
+                raise ValueError(
+                    f"Expected at least {len(copy_funcs)} Mamba state tensors "
+                    f"for {layer_name!r}, got {len(kv_caches)}"
                 )
+            layers_to_copy.append((block_ids, kv_caches[: len(copy_funcs)], copy_funcs))
 
-                src_ptrs_np[offset] = copy_spec.start_addr
-                dst_ptrs_np[offset] = state[dest_block_id].data_ptr()
-                sizes_np[offset] = copy_spec.num_elements * state.element_size()
-                offset += 1
+    required = sum(len(copy_funcs) for _, _, copy_funcs in layers_to_copy)
+    if offset + required > len(src_ptrs_np):
+        raise RuntimeError(
+            "Mamba copy metadata exceeded its planned capacity: "
+            f"need {offset + required} entries, have {len(src_ptrs_np)}"
+        )
+
+    for block_ids, kv_caches, copy_funcs in layers_to_copy:
+        dest_block_id = block_ids[dest_block_idx]
+        for state, state_copy_func in zip(kv_caches, copy_funcs, strict=True):
+            copy_spec = state_copy_func(
+                state, block_ids, src_block_idx, accept_token_bias + 1
+            )
+
+            src_ptrs_np[offset] = copy_spec.start_addr
+            dst_ptrs_np[offset] = state[dest_block_id].data_ptr()
+            sizes_np[offset] = copy_spec.num_elements * state.element_size()
+            offset += 1
 
     copy_bufs.offset = offset
 
@@ -1451,7 +1734,7 @@ def preprocess_mamba(
     input_batch: InputBatch,
     requests: dict[str, CachedRequestState],
     forward_context: dict[str, Any],
-    mamba_state_copy_funcs: MambaStateCopyFuncsByType,
+    mamba_state_copy_funcs: MambaStateCopyFuncsByType | tuple[MambaStateCopyFunc, ...],
     copy_bufs: MambaCopyBuffers,
     align_ctx: MambaSpecDecodeGPUContext | None = None,
 ):
@@ -1558,7 +1841,7 @@ def postprocess_mamba_align_gpu(
     input_batch: InputBatch,
     kv_cache_config: KVCacheConfig,
     forward_context: dict[str, Any],
-    mamba_state_copy_funcs: MambaStateCopyFuncsByType,
+    mamba_state_copy_funcs: MambaStateCopyFuncsByType | tuple[MambaStateCopyFunc, ...],
 ) -> None:
     """GPU-side mamba postprocess for spec decode + hybrid + align mode.
 

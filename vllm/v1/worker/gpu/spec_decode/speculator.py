@@ -62,6 +62,10 @@ class BaseSpeculator(ABC):
     # Extra query slots reserved per request outside the regular queries.
     num_extra_query_per_req: int = 0
 
+    def reset_attn(self) -> None:
+        """Release objects derived from a target KV-cache allocation."""
+        return None
+
     @abstractmethod
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         pass
@@ -93,11 +97,11 @@ class BaseSpeculator(ABC):
         # [max_num_reqs]
         seeds: torch.Tensor,
         dp_sync: DPSyncState | None = None,
+        num_speculative_tokens: int | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
-        num_speculative_tokens: int | None = None,
     ) -> torch.Tensor:
         pass
 
@@ -258,6 +262,13 @@ class DraftModelSpeculator(BaseSpeculator):
                 self.device,
             )
 
+    def update_max_model_len(self, max_model_len: int) -> None:
+        self.max_model_len = int(max_model_len)
+        self.draft_max_seq_len = self.max_model_len
+        update_model_len = getattr(self.model, "update_max_model_len", None)
+        if update_model_len is not None:
+            update_model_len(self.max_model_len)
+
     def set_eplb_state(self, eplb_state: EplbState) -> None:
         """Inject EPLB state after construction."""
         self.eplb_state = eplb_state
@@ -299,6 +310,28 @@ class DraftModelSpeculator(BaseSpeculator):
         # builders and buffers.
         self.target_input_buffers = target_input_buffers
         self.target_attn_groups = target_attn_groups
+
+    def reset_attn(self) -> None:
+        """Release attention builders, tables, and graphs created by set_attn."""
+        self.pcp_manager = None
+        for name in (
+            "model_state",
+            "kv_cache_config",
+            "attn_groups",
+            "attn_cg_support",
+            "block_tables",
+            "target_attn_groups",
+        ):
+            if hasattr(self, name):
+                delattr(self, name)
+        for name in (
+            "prefill_cudagraph_manager",
+            "decode_cudagraph_manager",
+            "cudagraph_manager",
+            "query_cudagraph_manager",
+        ):
+            if hasattr(self, name):
+                setattr(self, name, None)
 
     def _build_attn_metadata(
         self,
@@ -353,6 +386,12 @@ class DraftModelSpeculator(BaseSpeculator):
                 self.block_tables.cp_rank,
                 self.block_tables.cp_interleave,
             )
+        model_specific_attn_metadata = self.model_state.prepare_draft_attn_metadata(
+            idx_mapping=self.idx_mapping,
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
+            draft_index=step,
+        )
         attn_metadata = build_attn_metadata(
             attn_groups=self.attn_groups,
             num_reqs=num_reqs_padded,
@@ -376,6 +415,7 @@ class DraftModelSpeculator(BaseSpeculator):
             seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
             positions=self.input_buffers.positions[:num_tokens],
             is_prefilling=self.draft_is_prefilling[:num_reqs_padded],
+            model_specific_attn_metadata=model_specific_attn_metadata,
         )
         return attn_metadata
 

@@ -40,6 +40,18 @@ class ModelSpecificAttnMetadata:
 
 
 class ModelState(ABC):
+    single_request_prefill_cudagraph_tokens: int = 0
+    """Optional exact-row, single-request piecewise capture outside decode sizes."""
+
+    def can_use_single_request_prefill_graph(self, num_reqs, num_tokens, req_ids):
+        return False
+
+    def finalize_cudagraph_inputs(self, model_inputs, cg_mode):
+        """Refresh model-owned inputs after capture attention metadata is staged."""
+        return None
+
+    specialize_full_decode_graphs: ClassVar[bool] = False
+    """Capture decode-specific graphs alongside general full-model graphs."""
     supports_prompt_embeds: ClassVar[bool] = False
     """Whether this state implements user-provided prompt embeddings."""
 
@@ -97,7 +109,7 @@ class ModelState(ABC):
 
     @property
     def max_model_len(self) -> int:
-        # Auto-fit can reduce the limit after model state initialization.
+        """Use the worker's effective context limit, including KV auto-fit."""
         return self.model_config.max_model_len
 
     def get_supported_generation_tasks(self) -> tuple[GenerationTask, ...]:
@@ -143,6 +155,10 @@ class ModelState(ABC):
         """Capture the CUDA graphs this state runs inside the model's forward."""
         return None
 
+    def reset_kv_cache_state(self) -> None:
+        """Release model-state objects derived from an allocated KV cache."""
+        return None
+
     def get_additional_cg_support(self) -> tuple[AttentionCGSupport, str | None]:
         """Cudagraph support of attention groups this ModelState builds outside
         ``init_attn_backend`` (e.g. encoder-only layers).
@@ -164,6 +180,25 @@ class ModelState(ABC):
         across block boundaries. No-op by default."""
         return None
 
+    def get_recurrent_checkpoint_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return persistent per-request auxiliary state for boundary caching."""
+        return ()
+
+    def get_recurrent_checkpoint_acceptance(self) -> torch.Tensor:
+        """Return per-request selector acceptance for boundary MTP replay."""
+        raise NotImplementedError
+
+    def get_recurrent_checkpoint_fresh(self) -> torch.Tensor:
+        """Return the per-request selector fresh flag for boundary restores.
+
+        Any restore path must clear it: the pools the restore writes are
+        'restored, not recycled', and the next forward's fresh-reset would
+        otherwise re-zero them.  Models without a selector fresh flag raise;
+        the boundary path only calls this when a checkpoint (and therefore a
+        restorable pool set) exists.
+        """
+        raise NotImplementedError
+
     def postprocess_state(
         self,
         idx_mapping: torch.Tensor,
@@ -171,6 +206,21 @@ class ModelState(ABC):
         num_computed_tokens: torch.Tensor | None = None,
     ) -> None:
         return None
+
+    def prepare_draft_attn_metadata(
+        self,
+        *,
+        idx_mapping: torch.Tensor,
+        num_reqs: int,
+        num_reqs_padded: int,
+        draft_index: int,
+    ) -> ModelSpecificAttnMetadata | None:
+        """Build model-specific metadata for a draft lookahead forward."""
+        return None
+
+    def get_model_positions(self, input_batch: InputBatch) -> torch.Tensor:
+        """Return the positions prepared for the target model forward."""
+        return input_batch.positions
 
     @abstractmethod
     def prepare_inputs_embeds(

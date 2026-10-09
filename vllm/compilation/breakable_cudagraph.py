@@ -47,6 +47,10 @@ from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivati
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import weak_ref_tensor, weak_ref_tensors
+from vllm.v1.worker.workspace import (
+    collect_cuda_graph_capture_resources,
+    suspend_cuda_graph_capture_resources,
+)
 
 logger = init_logger(__name__)
 
@@ -56,12 +60,6 @@ def is_breakable_cudagraph_enabled() -> bool:
 
 
 F = TypeVar("F", bound=Callable[..., Any])
-
-
-def _weak_ref_capture_arg(arg: Any) -> Any:
-    if isinstance(arg, QuantizedActivation):
-        return arg.weak_ref()
-    return weak_ref_tensor(arg)
 
 
 def eager_break_during_capture(fn: F) -> F:
@@ -113,11 +111,26 @@ def eager_break_during_capture(fn: F) -> F:
         # Weak-ref args: strong refs in the replay lambda pin cudagraph-pool
         # slots across batch descriptors. cudagraph owns the slot, so the
         # weak_ref is safe to deref on replay.
-        weak_args = tuple(_weak_ref_capture_arg(a) for a in args)
-        weak_kwargs = {k: _weak_ref_capture_arg(v) for k, v in kwargs.items()}
+        weak_args = _weak_tensor_arguments(args)
+        weak_kwargs = _weak_tensor_arguments(kwargs)
         return capture.add_eager(lambda: fn(*weak_args, **weak_kwargs))
 
     return wrapper  # type: ignore[return-value]
+
+
+def _weak_tensor_arguments(value: Any) -> Any:
+    """Keep tensor arguments weak even inside ordinary tuple/list/dict bundles."""
+    if isinstance(value, QuantizedActivation):
+        return value.weak_ref()
+    if isinstance(value, torch.Tensor):
+        return weak_ref_tensor(value)
+    if type(value) is tuple:
+        return tuple(_weak_tensor_arguments(item) for item in value)
+    if type(value) is list:
+        return [_weak_tensor_arguments(item) for item in value]
+    if type(value) is dict:
+        return {key: _weak_tensor_arguments(item) for key, item in value.items()}
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +166,7 @@ class BreakableCUDAGraphCapture:
     def __init__(self, pool: Any | None = None) -> None:
         self.pool = pool
         self.segments: list[Callable[[], Any]] = []
+        self._graphs: list[torch.cuda.CUDAGraph] = []
         self._num_graphs: int = 0
         self._num_eager_breaks: int = 0
         self._current_graph: torch.cuda.CUDAGraph | None = None
@@ -190,6 +204,7 @@ class BreakableCUDAGraphCapture:
             return
         assert self._current_graph is not None
         self._current_graph.capture_end()
+        self._graphs.append(self._current_graph)
         self.segments.append(self._current_graph.replay)
         self._num_graphs += 1
         self._current_graph = None
@@ -204,7 +219,10 @@ class BreakableCUDAGraphCapture:
         downstream dependencies via static output buffers.
         """
         self._end_segment()
-        result = fn()
+        # Eager operations own their temporary allocations per invocation;
+        # only their caller-owned in-place outputs cross the graph boundary.
+        with suspend_cuda_graph_capture_resources():
+            result = fn()
         self.segments.append(fn)
         self._num_eager_breaks += 1
         self._begin_segment()
@@ -215,6 +233,15 @@ class BreakableCUDAGraphCapture:
     def replay(self) -> None:
         for r in self.segments:
             r()
+
+    def reset(self) -> None:
+        """Destroy every graph segment after its pending work has completed."""
+        if self._capturing:
+            raise RuntimeError("Cannot reset an active breakable CUDA graph capture.")
+        for graph in self._graphs:
+            graph.reset()
+        self._graphs.clear()
+        self.segments.clear()
 
     # --- introspection ---------------------------------------------------
 
@@ -244,6 +271,7 @@ class _BreakableEntry:
     capture: BreakableCUDAGraphCapture | None = None
     output: Any = None
     input_addresses: list[int] | None = None
+    resources: list[Any] | None = None
 
 
 class BreakableCUDAGraphWrapper:
@@ -271,6 +299,12 @@ class BreakableCUDAGraphWrapper:
     def clear_all_graphs(cls) -> None:
         for instance in list(cls._all_instances):
             instance.clear_graphs()
+
+    @classmethod
+    def reset_all_graphs(cls) -> None:
+        """Destroy graph segments without releasing entry-owned resources."""
+        for instance in list(cls._all_instances):
+            instance.reset_graphs()
 
     def __init__(
         self,
@@ -312,6 +346,14 @@ class BreakableCUDAGraphWrapper:
 
     def clear_graphs(self) -> None:
         self.entries.clear()
+
+    def reset_graphs(self) -> None:
+        """Destroy graph segments while retaining their captured resources."""
+        for entry in self.entries.values():
+            capture = entry.capture
+            if capture is not None:
+                capture.reset()
+                entry.capture = None
 
     # --- dispatch --------------------------------------------------------
 
@@ -370,6 +412,9 @@ class BreakableCUDAGraphWrapper:
 
         entry.input_addresses = self._collect_tensor_addresses(args, kwargs)
 
+        # Warmup may use auxiliary streams and shared communication scratch.
+        torch.accelerator.synchronize()
+
         # Match torch.cuda.graph()'s pre-capture cleanup, which we bypass.
         # Skip it when gc is disabled: bulk capture runs under
         # freeze_gc_for_cudagraph_capture, which already did this cleanup,
@@ -383,6 +428,7 @@ class BreakableCUDAGraphWrapper:
 
         with (
             capture_pool(self.graph_pool, self.vllm_config) as pool,
+            collect_cuda_graph_capture_resources() as resources,
             BreakableCUDAGraphCapture(pool=pool) as capture,
         ):
             output = self.runnable(*args, **kwargs)
@@ -397,6 +443,7 @@ class BreakableCUDAGraphWrapper:
             output = weak_ref_tensors(output)
 
         entry.capture = capture
+        entry.resources = resources
         entry.output = weak_ref_tensors(output)
 
         logger.debug(

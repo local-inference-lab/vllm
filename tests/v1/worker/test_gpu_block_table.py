@@ -6,7 +6,8 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.kv_cache_interface import CircularBufferSpec, FullAttentionSpec
+from vllm.v1.worker.gpu.block_table import BlockTables, slot_mapping_mode
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda(),
@@ -215,6 +216,111 @@ def test_dcp_slot_mapping_with_smaller_kernel_blocks(cp_rank: int):
     assert torch.equal(actual[1], positions + 10 * 128)
 
 
+def test_mixed_group_cp_slot_mapping():
+    """Replicated draft and sharded target groups use independent CP geometry."""
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[128, 128],
+        max_num_reqs=1,
+        max_num_batched_tokens=1024,
+        max_num_blocks_per_group=[2, 8],
+        device=device,
+        kernel_block_sizes=[128, 128],
+        cp_size=4,
+        cp_rank=1,
+        cp_interleave=128,
+        dcp_sharded=[True, False],
+    )
+    block_tables.append_block_ids(
+        req_index=0,
+        new_block_ids=([5, 9], list(range(20, 28))),
+        overwrite=True,
+    )
+    block_tables.apply_staged_writes()
+
+    idx_mapping = torch.zeros(1, dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 1024], dtype=torch.int32, device=device)
+    positions = torch.arange(1024, dtype=torch.int64, device=device)
+    actual = block_tables.compute_slot_mappings(
+        idx_mapping,
+        query_start_loc,
+        positions,
+        num_tokens_padded=1024,
+    )
+
+    expected_sharded = torch.full((1024,), -1, dtype=torch.int64, device=device)
+    expected_sharded[128:256] = torch.arange(
+        5 * 128, 6 * 128, dtype=torch.int64, device=device
+    )
+    expected_sharded[640:768] = torch.arange(
+        9 * 128, 10 * 128, dtype=torch.int64, device=device
+    )
+    expected_replicated = torch.cat(
+        [
+            torch.arange(block_id * 128, (block_id + 1) * 128, device=device)
+            for block_id in range(20, 28)
+        ]
+    )
+
+    assert torch.equal(actual[0], expected_sharded)
+    assert torch.equal(actual[1], expected_replicated)
+
+
+def test_dcp_sharding_rebuilt_with_layout_tensors():
+    """CuMem wake-up must restore group CP constants, not undefined storage."""
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[128, 128],
+        max_num_reqs=1,
+        max_num_batched_tokens=16,
+        max_num_blocks_per_group=[1, 1],
+        device=device,
+        kernel_block_sizes=[128, 128],
+        cp_size=4,
+        cp_rank=1,
+        cp_interleave=128,
+        dcp_sharded=[True, False],
+    )
+    block_tables.dcp_sharded.fill_(True)
+
+    block_tables.init_block_table_layout_tensors()
+
+    assert block_tables.dcp_sharded.tolist() == [True, False]
+
+
+def test_gather_block_tables_clears_shortened_row_tail():
+    """A shortened request row must not retain block ids from its prior owner."""
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[16],
+        max_num_reqs=1,
+        max_num_batched_tokens=16,
+        max_num_blocks_per_group=[4],
+        device=device,
+        kernel_block_sizes=[16],
+    )
+    idx_mapping = torch.zeros(1, dtype=torch.int32, device=device)
+    block_tables.append_block_ids(
+        req_index=0,
+        new_block_ids=([7, 8, 9],),
+        overwrite=True,
+    )
+    block_tables.apply_staged_writes()
+    block_tables.gather_block_tables(idx_mapping, num_reqs_padded=1)
+    block_tables.append_block_ids(
+        req_index=0,
+        new_block_ids=([11],),
+        overwrite=True,
+    )
+    block_tables.apply_staged_writes()
+
+    gathered = block_tables.gather_block_tables(idx_mapping, num_reqs_padded=1)[0]
+    torch.accelerator.synchronize()
+
+    assert gathered[0, 0].item() == 11
+    assert (gathered[0, 1:] == 0).all()
+
+
 def test_v1_block_table_move_row_clears_vacated_row():
     """condense() moves the last row into a freed slot; the vacated row must
     not keep stale block ids. Padded dummy-run batches dereference stale rows
@@ -314,3 +420,55 @@ def test_dummy_request_slot_mapping_is_pad():
         num_tokens_padded=3,
     )
     assert dummy[0].tolist() == [PAD_SLOT_ID] * 3
+
+
+def test_block_tables_circular_group_maps_positions_into_its_ring():
+    """A circular-buffer group holds one block per request as a ring. With the
+    runner's per-spec settings, every position maps into that block at position
+    modulo the block size; a request without a ring block and padding tokens map
+    to padding, and positional groups are unchanged."""
+    device = torch.device("cuda")
+    specs = (
+        FullAttentionSpec(
+            block_size=16, num_kv_heads=1, head_size=64, dtype=torch.bfloat16
+        ),
+        CircularBufferSpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=1024,
+            head_size_v=0,
+            dtype=torch.float32,
+        ),
+    )
+    enabled, circular = zip(*(slot_mapping_mode(spec) for spec in specs))
+    block_tables = BlockTables(
+        block_sizes=[spec.block_size for spec in specs],
+        max_num_reqs=2,
+        max_num_batched_tokens=64,
+        max_num_blocks_per_group=[4, 1],
+        device=device,
+        kernel_block_sizes=[spec.block_size for spec in specs],
+        slot_mapping_enabled=list(enabled),
+        slot_mapping_circular=list(circular),
+    )
+    block_tables.append_block_ids(
+        req_index=0, new_block_ids=([3, 4, 5], [9]), overwrite=True
+    )
+    block_tables.append_block_ids(req_index=1, new_block_ids=([6], []), overwrite=True)
+    block_tables.apply_staged_writes()
+
+    positions = list(range(3, 40)) + [5, 6]
+    idx_mapping = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 37, 39], dtype=torch.int32, device=device)
+    slot_mappings = block_tables.compute_slot_mappings(
+        idx_mapping,
+        query_start_loc,
+        torch.tensor(positions + [0, 0], dtype=torch.int64, device=device),
+        num_tokens_padded=len(positions) + 2,
+    )
+    torch.accelerator.synchronize()
+
+    ring = [9 * 8 + p % 8 for p in positions[:37]]
+    assert slot_mappings[1].tolist() == ring + [-1] * 4
+    paged = [[3, 4, 5][p // 16] * 16 + p % 16 for p in positions[:37]]
+    assert slot_mappings[0].tolist() == paged + [6 * 16 + 5, 6 * 16 + 6, -1, -1]

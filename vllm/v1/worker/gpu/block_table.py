@@ -6,12 +6,19 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheSpec
 from vllm.v1.worker.gpu.buffer_utils import (
     FusedStagedWriter,
     StagedWriteTensor,
     UvaBackedTensor,
     _load_ptr,
 )
+
+
+def slot_mapping_mode(layer_spec: KVCacheSpec) -> tuple[bool, bool]:
+    """Return whether the worker computes slot mappings for a group with this
+    layer spec, and whether the group is a per-request ring."""
+    return layer_spec.uses_slot_mapping, isinstance(layer_spec, CircularBufferSpec)
 
 
 class BlockTables:
@@ -31,6 +38,7 @@ class BlockTables:
         cp_interleave: int = 1,
         slot_mapping_enabled: list[bool] | None = None,
         dcp_sharded: list[bool] | None = None,
+        slot_mapping_circular: list[bool] | None = None,
     ):
         self.block_sizes = block_sizes
         self.kernel_block_sizes = kernel_block_sizes
@@ -51,7 +59,13 @@ class BlockTables:
         if dcp_sharded is None:
             dcp_sharded = [True] * self.num_kv_cache_groups
         assert len(dcp_sharded) == self.num_kv_cache_groups
-        self.dcp_sharded = torch.tensor(dcp_sharded, dtype=torch.bool, device=device)
+        self._dcp_sharded = list(dcp_sharded)
+        # A circular group keeps one block per request as a ring: every position maps
+        # into that block at position modulo the block size.
+        if slot_mapping_circular is None:
+            slot_mapping_circular = [False] * self.num_kv_cache_groups
+        assert len(slot_mapping_circular) == self.num_kv_cache_groups
+        self._slot_mapping_circular = slot_mapping_circular
 
         self.blocks_per_kv_block = [
             bs // kbs for bs, kbs in zip(block_sizes, kernel_block_sizes)
@@ -115,7 +129,18 @@ class BlockTables:
         self.slot_mapping_enabled = torch.tensor(
             self._slot_mapping_enabled, dtype=torch.bool, device=self.device
         )
+        self.slot_mapping_circular = torch.tensor(
+            self._slot_mapping_circular, dtype=torch.bool, device=self.device
+        )
+        self.dcp_sharded = torch.tensor(
+            self._dcp_sharded, dtype=torch.bool, device=self.device
+        )
         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
+
+    def get_group_cp_parameters(self, group_id: int) -> tuple[int, int, int]:
+        if not self._dcp_sharded[group_id]:
+            return 0, 1, 1
+        return self.cp_rank, self.cp_size, self.cp_interleave
 
     def append_block_ids(
         self,
@@ -217,10 +242,13 @@ class BlockTables:
             positions,
             self.block_table_ptrs,
             self.block_table_strides,
+            self.num_blocks.gpu,
+            self.num_blocks.gpu.stride(0),
             self.block_sizes_tensor,
             self.kernel_block_sizes_tensor,
             self.slot_mapping_enabled,
             self.dcp_sharded,
+            self.slot_mapping_circular,
             slot_mappings,
             slot_mappings.stride(0),
             self.cp_rank,
@@ -282,6 +310,10 @@ def _gather_block_tables_kernel(
         block_ids = tl.load(src_row_ptr + offset, mask=offset < num_blocks)
         tl.store(dst_row_ptr + offset, block_ids, mask=offset < num_blocks)
 
+    for i in tl.range(num_blocks, max_num_blocks, BLOCK_SIZE):
+        offset = i + tl.arange(0, BLOCK_SIZE)
+        tl.store(dst_row_ptr + offset, 0, mask=offset < max_num_blocks)
+
 
 @triton.jit
 def _compute_slot_mappings_kernel(
@@ -291,10 +323,13 @@ def _compute_slot_mappings_kernel(
     pos,  # [num_tokens]
     block_table_ptrs,  # [num_kv_cache_groups]
     block_table_strides,  # [num_kv_cache_groups]
+    num_blocks_ptr,  # [num_kv_cache_groups, max_num_reqs]
+    num_blocks_stride,
     block_sizes,  # [num_kv_cache_groups]
     kernel_block_sizes,  # [num_kv_cache_groups]
     slot_mapping_enabled,  # [num_kv_cache_groups]
     dcp_sharded,  # [num_kv_cache_groups]
+    slot_mapping_circular,  # [num_kv_cache_groups]
     slot_mappings_ptr,  # [num_kv_cache_groups, max_num_tokens]
     slot_mappings_stride,
     cp_rank,
@@ -321,6 +356,7 @@ def _compute_slot_mappings_kernel(
 
     block_table_ptr = _load_ptr(block_table_ptrs + group_id, tl.int32)
     block_table_stride = tl.load(block_table_strides + group_id)
+    group_num_blocks_ptr = num_blocks_ptr + group_id * num_blocks_stride
     kv_block_size = tl.load(block_sizes + group_id)
     kernel_block_size = tl.load(kernel_block_sizes + group_id)
     mapping_enabled = tl.load(slot_mapping_enabled + group_id)
@@ -331,16 +367,21 @@ def _compute_slot_mappings_kernel(
     # idx_mapping == -1 marks a dummy (or CUDA-graph padding) request that owns
     # no blocks: never read its block-table row and emit PAD for its tokens.
     is_real_req = req_state_idx >= 0
+    circular = tl.load(slot_mapping_circular + group_id)
+    num_blocks = tl.load(
+        group_num_blocks_ptr + req_state_idx, mask=is_real_req, other=0
+    )
     start_idx = tl.load(query_start_loc + batch_idx)
     end_idx = tl.load(query_start_loc + batch_idx + 1)
     for i in range(start_idx, end_idx, TRITON_BLOCK_SIZE):
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
-        positions = tl.load(pos + offset, mask=offset < end_idx, other=0)
+        token_mask = offset < end_idx
+        positions = tl.load(pos + offset, mask=token_mask, other=0)
 
         if CP_SIZE == 1:
             # Common case: Context parallelism is not used.
             local_positions = positions
-            is_local = True
+            is_local = token_mask
         else:
             # Context parallelism is used.
             virtual_block_size = kv_block_size * CP_SIZE
@@ -355,17 +396,19 @@ def _compute_slot_mappings_kernel(
             is_local = ~sharded | is_local
 
         block_indices = tl.where(
-            mapping_enabled, local_positions // kernel_block_size, 0
+            mapping_enabled & ~circular, local_positions // kernel_block_size, 0
         )
         block_offsets = local_positions % kernel_block_size
+        valid_block = token_mask & (block_indices < num_blocks)
         block_numbers = tl.load(
             block_table_ptr + req_state_idx * block_table_stride + block_indices,
-            mask=is_local & is_real_req,
+            mask=is_local & valid_block & is_real_req,
             other=0,
         )
         slot_ids = block_numbers * kernel_block_size + block_offsets
         if CP_SIZE != 1:
             slot_ids = tl.where(is_local, slot_ids, PAD_ID)
+        slot_ids = tl.where(valid_block, slot_ids, PAD_ID)
 
         slot_ids = tl.where(mapping_enabled & is_real_req, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)

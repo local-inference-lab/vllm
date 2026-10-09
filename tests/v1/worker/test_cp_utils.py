@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm.v1.worker.cp_utils as cp_utils
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.worker.cp_utils import should_skip_dcp_context_attention
 
@@ -41,11 +42,165 @@ def test_cp_checks_allow_a_replicated_draft_backend_without_dcp(monkeypatch):
         cp_utils.check_attention_cp_compatibility(config)
 
 
+@pytest.mark.parametrize(
+    "kwargs,expected",
+    [
+        ({}, 0),
+        ({"single_request_prefill": True}, 16),
+        ({"create_mixed_batch": True}, 16),
+    ],
+)
+def test_dcp_dummy_context_covers_single_request_prefill(kwargs, expected):
+    arguments = {
+        "dcp_world_size": 4,
+        "cp_kv_cache_interleave_size": 4,
+        "has_kv_cache_config": True,
+        "create_mixed_batch": False,
+        "is_graph_capturing": False,
+        "uniform_decode": False,
+    }
+    arguments.update(kwargs)
+    assert cp_utils.get_dcp_dummy_context_len(**arguments) == expected
+
+
 def test_skip_gate_only_for_zero_context():
     assert should_skip_dcp_context_attention(torch.zeros(3, dtype=torch.int32))
     assert not should_skip_dcp_context_attention(
         torch.tensor([0, 5, 0], dtype=torch.int32)
     )
+
+
+@pytest.mark.parametrize("backend_name", ["FLASH_ATTN", "TRITON_ATTN", "B12X"])
+def test_replicated_draft_attention_executes_as_local_dcp(monkeypatch, backend_name):
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    layer_impl = SimpleNamespace(
+        supports_mtp_with_cp_non_trivial_interleave_size=False,
+        need_to_return_lse_for_decode=False,
+        dcp_world_size=4,
+        dcp_rank=2,
+        total_cp_world_size=4,
+        total_cp_rank=2,
+    )
+    backend = AttentionBackendEnum[backend_name].get_class()
+    layer = SimpleNamespace(
+        impl=layer_impl,
+        get_kv_cache_spec=lambda _config: SimpleNamespace(dcp_sharded=False),
+        get_attn_backend=lambda: backend,
+    )
+    monkeypatch.setattr(
+        cp_utils,
+        "get_layers_from_vllm_config",
+        lambda *_args, **_kwargs: {"draft": layer},
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=4,
+            cp_kv_cache_interleave_size=4,
+        ),
+        speculative_config=SimpleNamespace(method="dflash"),
+    )
+
+    cp_utils.check_attention_cp_compatibility(config)
+
+    assert layer_impl.dcp_world_size == 1
+    assert layer_impl.dcp_rank == 0
+    assert layer_impl.total_cp_world_size == 1
+    assert layer_impl.total_cp_rank == 0
+
+
+def test_replicated_draft_rejects_backend_without_local_dcp(monkeypatch):
+    layer_impl = SimpleNamespace(
+        supports_mtp_with_cp_non_trivial_interleave_size=False,
+        need_to_return_lse_for_decode=False,
+    )
+    backend = SimpleNamespace(
+        supports_dcp_replicated=False,
+        get_name=lambda: "TEST_UNSUPPORTED",
+    )
+    layer = SimpleNamespace(
+        impl=layer_impl,
+        get_kv_cache_spec=lambda _config: SimpleNamespace(dcp_sharded=False),
+        get_attn_backend=lambda: backend,
+    )
+    monkeypatch.setattr(
+        cp_utils,
+        "get_layers_from_vllm_config",
+        lambda *_args, **_kwargs: {"draft": layer},
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=4,
+            cp_kv_cache_interleave_size=1,
+        ),
+        speculative_config=SimpleNamespace(method="dflash"),
+    )
+
+    with pytest.raises(AssertionError, match="replicated DCP"):
+        cp_utils.check_attention_cp_compatibility(config)
+
+
+def test_replicated_draft_rejects_missing_backend(monkeypatch):
+    layer = SimpleNamespace(
+        impl=SimpleNamespace(
+            supports_mtp_with_cp_non_trivial_interleave_size=False,
+            need_to_return_lse_for_decode=False,
+        ),
+        get_kv_cache_spec=lambda _config: SimpleNamespace(dcp_sharded=False),
+    )
+    monkeypatch.setattr(
+        cp_utils,
+        "get_layers_from_vllm_config",
+        lambda *_args, **_kwargs: {"draft": layer},
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=4,
+            cp_kv_cache_interleave_size=1,
+        ),
+        speculative_config=SimpleNamespace(method="dflash"),
+    )
+
+    with pytest.raises(AssertionError, match="replicated DCP"):
+        cp_utils.check_attention_cp_compatibility(config)
+
+
+def test_attention_cache_spec_errors_are_not_swallowed(monkeypatch):
+    layer_impl = SimpleNamespace(
+        supports_mtp_with_cp_non_trivial_interleave_size=False,
+        need_to_return_lse_for_decode=True,
+    )
+
+    def raise_spec_error(_config):
+        raise RuntimeError("invalid cache spec")
+
+    layer = SimpleNamespace(
+        impl=layer_impl,
+        get_kv_cache_spec=raise_spec_error,
+        get_attn_backend=lambda: SimpleNamespace(
+            supports_dcp_replicated=False,
+            get_name=lambda: "TEST",
+        ),
+    )
+    monkeypatch.setattr(
+        cp_utils,
+        "get_layers_from_vllm_config",
+        lambda *_args, **_kwargs: {"layer": layer},
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=4,
+            cp_kv_cache_interleave_size=1,
+        ),
+        speculative_config=None,
+    )
+
+    with pytest.raises(RuntimeError, match="invalid cache spec"):
+        cp_utils.check_attention_cp_compatibility(config)
 
 
 @pytest.mark.parametrize(

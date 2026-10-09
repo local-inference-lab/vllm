@@ -731,10 +731,14 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
     alone does not release the KV cache memory on teardown paths.
     """
     for layer in layers:
-        if not hasattr(layer, "kv_cache"):
-            continue
-        kv_cache = layer.kv_cache
-        layer.kv_cache = torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
+        unbind = getattr(layer, "unbind_kv_cache", None)
+        if callable(unbind):
+            unbind()
+        elif hasattr(layer, "kv_cache"):
+            kv_cache = layer.kv_cache
+            layer.kv_cache = (
+                torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
+            )
         # Clean up quantized KV cache scale views
         # (int8_per_token_head, fp8_per_token_head)
         if hasattr(layer, "impl"):

@@ -99,11 +99,11 @@ class ExtractHiddenStatesSpeculator(DraftModelSpeculator):
         temperature: torch.Tensor,
         seeds: torch.Tensor,
         dp_sync: DPSyncState | None = None,
+        num_speculative_tokens: int | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
-        num_speculative_tokens: int | None = None,
     ) -> torch.Tensor:
         del (
             last_hidden_states,
@@ -112,6 +112,7 @@ class ExtractHiddenStatesSpeculator(DraftModelSpeculator):
             next_prefill_tokens,
             temperature,
             seeds,
+            num_speculative_tokens,
             dummy_run,
             mm_inputs,
             is_profile,

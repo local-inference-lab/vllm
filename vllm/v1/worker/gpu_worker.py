@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A GPU worker class."""
 
+import contextlib
 import gc
 import os
 import time
@@ -12,6 +13,7 @@ from fnmatch import filter as fnmatch_filter
 from types import NoneType
 from typing import TYPE_CHECKING, Any, cast
 
+import regex as re
 import torch
 import torch.nn as nn
 
@@ -147,6 +149,7 @@ def maybe_rocm_profiling_fallback(profile_result: MemoryProfilingResult) -> int 
 if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
+    from vllm.model_executor.warmup.b12x_prepare import B12xPreparedBatch
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -181,6 +184,30 @@ class AsyncIntermediateTensors(IntermediateTensors):
         if name == "tensors" and not object.__getattribute__(self, "_comm_waited"):
             object.__getattribute__(self, "wait_for_comm")()
         return object.__getattribute__(self, name)
+
+
+class _B12xRoceCheckedAsyncOutput(AsyncModelRunnerOutput):
+    """An asynchronous output whose completion is followed by the RoCEnante check."""
+
+    def __init__(
+        self, inner: AsyncModelRunnerOutput, check: Callable[[], None]
+    ) -> None:
+        self._inner = inner
+        self._check = check
+
+    def get_output(self) -> ModelRunnerOutput:
+        """Wait for the wrapped output, then run the fail-stop check.
+
+        Returns:
+            The completed ModelRunnerOutput.
+
+        Raises:
+            RuntimeError: When a RoCEnante wait timed out or its proxy died.
+
+        """
+        output = self._inner.get_output()
+        self._check()
+        return output
 
 
 class Worker(WorkerBase):
@@ -232,7 +259,15 @@ class Worker(WorkerBase):
 
         # Device handles of the previous step's PP intermediate-tensor send.
         self._pp_send_work: list[Handle] = []
-
+        # Owned before model/communicator registration so providers always see
+        # the worker-local registry while publishing native resources.
+        self._b12x_session = None
+        self._b12x_stage: str | None = None
+        self._b12x_profile_batch: B12xPreparedBatch | None = None
+        self._b12x_tuning_batch: B12xPreparedBatch | None = None
+        self._b12x_tuning_cache = False
+        # Startup-plan key computed before profiling can rewrite the config.
+        self.startup_plan_fingerprint: str | None = None
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
 
@@ -402,11 +437,24 @@ class Worker(WorkerBase):
                 "PYTORCH_CUDA_ALLOC_CONF"
             ]
 
-        # The setter resets other allocator options unless they are included.
-        prefix = original_settings.strip().rstrip(",")
-        settings = f"max_split_size_mb:{max_split_size_mb}"
-        if prefix:
-            settings = f"{prefix},{settings}"
+        if isinstance(original_settings, bytes):
+            original_settings = original_settings.decode()
+        if re.search(
+            r"(?:^|,)\s*expandable_segments\s*:\s*True\s*(?:,|$)", original_settings
+        ):
+            # Expandable segments release free pages, not whole cached blocks.
+            # A split limit there strands the pages that weights share with
+            # freed loading temporaries (1 GiB per GPU on DeepSeek-V4.1 TP4).
+            yield
+            return
+        settings, replacements = re.subn(
+            r"(\bmax_split_size_mb\s*:\s*)\d+\b",
+            lambda match: f"{match.group(1)}{max_split_size_mb}",
+            original_settings,
+        )
+        if not replacements:
+            settings = f"{original_settings}," if original_settings else ""
+            settings += f"max_split_size_mb:{max_split_size_mb}"
         try:
             torch._C._accelerator_setAllocatorSettings(settings)
             yield
@@ -501,6 +549,12 @@ class Worker(WorkerBase):
             # Set random seed.
             set_random_seed(self.model_config.seed)
 
+            if current_platform.is_cuda():
+                # cuBLAS allocates outside the Torch cache. Initialize its
+                # per-thread handle before weights can fill physical memory,
+                # and include its retained storage in the admission snapshot.
+                torch.cuda.current_blas_handle()
+
             # Now take memory snapshot after NCCL is initialized
             gc.collect()
             torch.accelerator.empty_cache()
@@ -561,8 +615,6 @@ class Worker(WorkerBase):
         assert self.worker_sentinel is not None
         return self.worker_sentinel.handle_command(ft_request)
 
-    # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
-    # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         with (
             self._maybe_get_memory_pool_context(tag="weights"),
@@ -595,30 +647,81 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.reload_weights(*args, **kwargs)
 
+    def begin_b12x_preparation(self, *, stage: str = "weights") -> dict[str, object]:
+        """Collect this stage's units and initialize local preparation."""
+        from vllm.model_executor.warmup.b12x_prepare import begin_b12x_preparation
+
+        if self._b12x_startup_coordinator is not None:
+            raise RuntimeError("b12x preparation is already active")
+        with set_current_vllm_config(self.vllm_config):
+            coordinator = begin_b12x_preparation(self, stage=stage)
+        self._b12x_startup_coordinator = coordinator
+        self._b12x_stage = stage
+        return coordinator.status()
+
+    def _prepare_b12x_profile_state(self) -> None:
+        """Prepare pool-dependent plans against the profiling pool, untimed."""
+        from vllm.model_executor.warmup.b12x_prepare import prepare_b12x_profile
+
+        self._b12x_profile_batch = prepare_b12x_profile(self, stage="state")
+
+    def _release_b12x_profile_state(self) -> None:
+        batch, self._b12x_profile_batch = self._b12x_profile_batch, None
+        try:
+            if batch is not None:
+                batch.release()
+        finally:
+            # Plans can outlive the runner's profiling-pool teardown.
+            del batch
+            gc.collect()
+            torch.accelerator.synchronize()
+            torch.accelerator.empty_cache()
+
+    def advance_b12x_preparation(
+        self, *, cancel_tuning: bool = False
+    ) -> dict[str, object]:
+        coordinator = self._b12x_startup_coordinator
+        if coordinator is None:
+            raise RuntimeError("b12x preparation is not active")
+        with set_current_vllm_config(self.vllm_config):
+            outcome = coordinator.advance(cancel_tuning=cancel_tuning)
+        if outcome["done"]:
+            self._b12x_startup_coordinator = None
+            self._b12x_stage = None
+            # Timing trials leave freed blocks in the caching allocator; return
+            # them so memory profiling after the weights stage sees the same
+            # free memory as a start that reused cached selections.
+            del coordinator
+            gc.collect()
+            torch.accelerator.synchronize()
+            torch.accelerator.empty_cache()
+        return outcome
+
+    def abort_b12x_preparation(self) -> dict[str, object]:
+        coordinator = self._b12x_startup_coordinator
+        if coordinator is None:
+            return {"done": True, "cleanup_complete": True}
+        try:
+            with set_current_vllm_config(self.vllm_config):
+                return coordinator.abort()
+        finally:
+            self._b12x_startup_coordinator = None
+            self._b12x_stage = None
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
-        """Profiles the peak memory usage of the model to determine how much
-        memory can be used for KV cache without OOMs.
-
-        The engine will first conduct a profiling of the existing memory usage.
-        Then, it calculates the free memory that can be used for KV cache in
-        bytes.
-
-        Tip:
-            You may limit the usage of GPU memory
-            by adjusting the `gpu_memory_utilization` parameter.
-
-        """
+        """Profile model memory through the ordinary vLLM admission path."""
         maybe_apply_startup_plan(self)
 
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
-            # still need a profile run which compiles the model for
-            # max_num_batched_tokens
-            with set_current_vllm_config(self.vllm_config):
-                self.model_runner.profile_run(
-                    randomize_inputs=self.randomize_dummy_inputs
-                )
-
+            try:
+                with set_current_vllm_config(self.vllm_config):
+                    self.model_runner.profile_run(
+                        self._prepare_b12x_profile_state,
+                        randomize_inputs=self.randomize_dummy_inputs,
+                    )
+            finally:
+                self._release_b12x_profile_state()
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
                 f"GiB, reserved {format_gib(kv_cache_memory_bytes)} GiB memory for "
@@ -655,7 +758,19 @@ class Worker(WorkerBase):
             self._scoped_allocator_max_split(max_split_size_mb=20),
             set_current_vllm_config(self.vllm_config),
         ):
-            self.model_runner.profile_run(randomize_inputs=self.randomize_dummy_inputs)
+            try:
+                self.model_runner.profile_run(
+                    self._prepare_b12x_profile_state,
+                    randomize_inputs=self.randomize_dummy_inputs,
+                )
+            finally:
+                self._release_b12x_profile_state()
+            try:
+                self.model_runner.profile_glm_dcp_attention(
+                    self._prepare_b12x_profile_state
+                )
+            finally:
+                self._release_b12x_profile_state()
 
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
@@ -666,17 +781,58 @@ class Worker(WorkerBase):
         if (
             current_platform.is_cuda_alike() or current_platform.is_xpu()
         ) and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
-            cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
+            # The graph-memory profiler temporarily binds a minimal KV cache.
+            # Pool-dependent plans are prepared against it with their default
+            # configurations and released once the throwaway graphs are gone.
+            try:
+                cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory(
+                    self._prepare_b12x_profile_state
+                )
+            finally:
+                self._release_b12x_profile_state()
 
-        # Respect the opt-in flag as originally designed.
+        # Prepared plans can retain profiling tensors beyond graph teardown.
+        # Reclaim their released allocator blocks before measuring persistence.
+        gc.collect()
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
+
+        # Backend and CUDA-graph profiling can initialize communication pools,
+        # compiled modules, and other persistent device allocations after the
+        # main activation profile. Include their retained footprint before the
+        # remaining memory is assigned to production KV cache storage.
+        final_profile_snapshot = MemorySnapshot(device=self.device)
+        late_persistent_memory = max(
+            profile_result.after_profile.free_memory
+            - final_profile_snapshot.free_memory,
+            0,
+        )
+        native_profile = getattr(
+            self.model_runner, "cudagraph_native_memory_profile", None
+        )
+        if native_profile is not None:
+            native_before, native_after, measured = native_profile
+            # Count capture-initialized modules/communication storage once.
+            # Sample retention only after prepared plans have been released;
+            # bootstrap-only and cleanup-only growth do not discount graphs.
+            retained_native_capture = max(
+                min(native_after, final_profile_snapshot.non_torch_memory)
+                - native_before,
+                0,
+            )
+            cudagraph_memory_estimate -= min(
+                retained_native_capture,
+                late_persistent_memory,
+                max(measured, 0),
+                cudagraph_memory_estimate,
+            )
         cudagraph_memory_estimate_applied = (
             cudagraph_memory_estimate
             if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
             else 0
         )
-
         init_free_memory = self.init_snapshot.free_memory
-        free_gpu_memory = profile_result.after_profile.free_memory
+        free_gpu_memory = final_profile_snapshot.free_memory
         rocm_fallback = maybe_rocm_profiling_fallback(profile_result)
         if rocm_fallback is None:
             # NOTE(woosuk): Here we assume that the other processes using the same
@@ -696,15 +852,16 @@ class Worker(WorkerBase):
                 profile_result.total_consumed + profile_result.transient_peak_headroom
             )
 
-        self.total_consumed = profile_result.total_consumed
-        self.peak_activation_memory = (
-            profile_result.transient_peak_headroom + cudagraph_memory_estimate_applied
-        )
+        self.total_consumed = profile_result.total_consumed + late_persistent_memory
+        # KV admission subtracts the graph estimate separately. Post-capture
+        # recommendations add measured graph memory to this activation peak.
+        self.peak_activation_memory = profile_result.transient_peak_headroom
         self.cudagraph_memory_estimate = cudagraph_memory_estimate
 
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
             - profile_result.non_kv_cache_memory
+            - late_persistent_memory
             - cudagraph_memory_estimate_applied
         )
 
@@ -803,12 +960,9 @@ class Worker(WorkerBase):
         return self.model_runner.get_kv_cache_spec()
 
     def update_max_model_len(self, max_model_len: int) -> None:
-        """Update max_model_len after auto-fit to GPU memory.
-        This is called when max_model_len=-1 is used and the engine
-        automatically determines the maximum context length that fits
-        in GPU memory. Workers need to update their cached max_model_len
-        to match the engine's decision.
-        """
+        """Update max_model_len after auto-fit to GPU memory."""
+        if max_model_len == self.model_config.max_model_len:
+            return
         self.model_config.max_model_len = max_model_len
         if self.model_runner is not None:
             self.model_runner.update_max_model_len(max_model_len)
@@ -817,6 +971,12 @@ class Worker(WorkerBase):
     @instrument(span_name="Allocate KV cache")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
+        # Reclaim temporary profiling/tuning allocations on every rank before
+        # allocating the serving pool, including when its size is explicit.
+        gc.collect()
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
+
         # Update local config with adjusted num blocks after profiling,
         # so that it's available to the warmup stage.
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
@@ -855,22 +1015,46 @@ class Worker(WorkerBase):
             if current_platform.is_xpu()
             else self._maybe_get_memory_pool_context(tag="runtime")
         )
-        with runtime_pool:
+        with runtime_pool, set_current_vllm_config(self.vllm_config):
             self.model_runner.initialize_kv_cache(
                 kv_cache_config,
                 kv_cache_allocation_context=mem_pool_context,
             )
 
-        # Build KV-zero metadata outside the CuMem pool so the bookkeeping
-        # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch
-        # allocator and are not discarded during sleep/wake cycles.
+        # Zeroing metadata must remain outside the offloaded allocation pools.
         if kv_cache_config.needs_kv_cache_zeroing and hasattr(
             self.model_runner, "_init_kv_zero_meta"
         ):
             self.model_runner._init_kv_zero_meta()
 
+    def initialize_b12x_tuning_cache(
+        self, kv_cache_configs: list[KVCacheConfig]
+    ) -> bool:
+        from vllm.model_executor.warmup.b12x_prepare import (
+            initialize_b12x_tuning_cache,
+        )
+
+        with set_current_vllm_config(self.vllm_config):
+            return initialize_b12x_tuning_cache(self, kv_cache_configs[self.rank])
+
+    def release_b12x_tuning_cache(self) -> None:
+        from vllm.model_executor.warmup.b12x_prepare import release_b12x_tuning_cache
+
+        with set_current_vllm_config(self.vllm_config):
+            release_b12x_tuning_cache(self)
+
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        with set_current_vllm_config(self.vllm_config):
+            return self._compile_or_warm_up_model_after_preparation()
+
+    def _compile_or_warm_up_model_after_preparation(self) -> CompilationTimes:
+        # Drop to the serving thread count before any warmup. Dynamo guards
+        # compiled functions on torch.get_num_threads(), so changing it after
+        # warmup and graph capture made the first request recompile every
+        # torch.compile'd helper. Weight loading, the only startup phase that
+        # benefits from intra-op parallelism, is already done.
+        set_torch_threads_for_runtime()
         warmup_sizes: list[int] = []
 
         if (
@@ -923,7 +1107,15 @@ class Worker(WorkerBase):
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
-            with self._get_cudagraph_capture_context():
+            # Under capture the b12x session refuses kernel resolution and an
+            # unprepared plan is an error; captured shapes are always planned.
+            session = self._b12x_session
+            guard = (
+                session.capture()
+                if session is not None and session.state != "CLOSED"
+                else contextlib.nullcontext()
+            )
+            with guard, self._get_cudagraph_capture_context():
                 cuda_graph_memory_bytes = self.model_runner.capture_model()
 
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
@@ -1000,7 +1192,16 @@ class Worker(WorkerBase):
 
             maybe_save_startup_plan(self, kv_cache_memory_bytes_to_requested_limit)
 
-        if not self.use_v2_model_runner and get_pp_group().is_last_rank:
+        if self.use_v2_model_runner:
+            if (
+                not self.model_config.enforce_eager
+                and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            ):
+                # Exercise captured execution paths before serving requests.
+                warmup_kernels(
+                    self.model_runner, self.execute_model, self.sample_tokens
+                )
+        elif get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other
             # sampling related tensors of max possible shape to avoid memory
             # fragmentation issue.
@@ -1087,6 +1288,11 @@ class Worker(WorkerBase):
 
     def reset_mm_cache(self) -> None:
         self.model_runner.reset_mm_cache()
+
+    def wait_for_boundary_checkpoint_copies(self) -> None:
+        state = getattr(self.model_runner, "boundary_checkpoint_state", None)
+        if state is not None:
+            state.wait_for_copies()
 
     def reset_encoder_cache(self) -> None:
         self.model_runner.reset_encoder_cache()
@@ -1260,7 +1466,49 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        return self._b12x_roce_guarded(self.model_runner.sample_tokens(grammar_output))
+
+    def _b12x_roce_health_check(self) -> Callable[[], None] | None:
+        """The RoCEnante health check of the TP communicator, if one is active.
+
+        Returns:
+            The check callable, or None when RoCEnante is not in use.
+
+        """
+        communicator = get_tp_group().device_communicator
+        comm = getattr(communicator, "b12x_ar_comm", None)
+        return getattr(comm, "check_health", None)
+
+    def _b12x_roce_guarded(self, output):
+        """Fail-stop RoCEnante check once the step's output is on the host.
+
+        A RoCEnante wait that timed out records itself and freezes the runtime.
+        A synchronous output already holds the sampled tokens on the host, so
+        every collective of the step has completed and the check runs now; an
+        asynchronous output is wrapped so the check runs right after its
+        ``get_output()`` completes the copy.  Either way a failed collective's
+        output never leaves the worker.  Every rank reaches the same state on
+        its own (a stalled rank starves its peers' waits), so the raise is
+        coordinated without a supervisor.  Two pinned-memory reads; no added
+        synchronization.
+
+        Args:
+            output: The model runner's output for this step, possibly None.
+
+        Returns:
+            The same output, or a wrapper for an asynchronous output.
+
+        Raises:
+            RuntimeError: When a RoCEnante wait timed out or its proxy died.
+
+        """
+        check = self._b12x_roce_health_check()
+        if check is None:
+            return output
+        if isinstance(output, AsyncModelRunnerOutput):
+            return _B12xRoceCheckedAsyncOutput(output, check)
+        check()
+        return output
 
     @torch.inference_mode()
     @with_gpu_sync_check
@@ -1302,7 +1550,7 @@ class Worker(WorkerBase):
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
-                return output
+                return self._b12x_roce_guarded(output)
 
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config
@@ -1579,6 +1827,11 @@ class Worker(WorkerBase):
         # can be reclaimed when running in-process
         if model_runner := getattr(self, "model_runner", None):
             model_runner.shutdown()
+        # Runner shutdown destroys graphs first; only then may prepared
+        # plans and the session be released.
+        if session := getattr(self, "_b12x_session", None):
+            session.close()
+            self._b12x_session = None
 
         # Release kept-alive cumem pools while the pluggable allocator wrappers
         # and callbacks are still alive, so MemPool teardown is not deferred to

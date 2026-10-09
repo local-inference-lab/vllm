@@ -108,6 +108,43 @@ def test_head_dtype_equal_to_model_dtype_uses_quant_method(default_vllm_config):
     assert logits.dtype == torch.bfloat16
 
 
+def test_b12x_vocab_projection_bypasses_unquantized_method(default_vllm_config):
+    from unittest import mock
+
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    vocab_size, hidden_size = 64, 16
+    lp = _build_processor(vocab_size)
+    lp.use_b12x_vocab_projection = True
+    hidden_states = torch.randn(1, hidden_size, dtype=torch.bfloat16)
+    weight = torch.randn(vocab_size, hidden_size, dtype=torch.bfloat16)
+    lm_head = _FakeLmHead(weight)
+    lm_head.quant_method = UnquantizedLinearMethod()
+    expected = torch.nn.functional.linear(hidden_states, weight)
+    api = mock.Mock()
+    planned = mock.Mock()
+    planned.caps.out_features = vocab_size
+    planned.caps.in_features = hidden_size
+    binding = mock.sentinel.binding
+    api.bind.return_value = binding
+    api.run.return_value = expected
+    lp._b12x_vocab_projection = api
+    lp._b12x_vocab_projection_plan = planned
+
+    with (
+        mock.patch.object(lm_head.quant_method, "apply") as apply_mock,
+    ):
+        logits = lp._get_logits(hidden_states, lm_head, None)
+
+    api.bind.assert_called_once()
+    assert api.bind.call_args.args == (planned,)
+    assert torch.equal(api.bind.call_args.kwargs["source"], hidden_states)
+    assert api.bind.call_args.kwargs["weight"] is weight
+    api.run.assert_called_once_with(binding)
+    apply_mock.assert_not_called()
+    torch.testing.assert_close(logits, expected)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="Exercises the torch.mm(out_dtype=...) device fast path, "

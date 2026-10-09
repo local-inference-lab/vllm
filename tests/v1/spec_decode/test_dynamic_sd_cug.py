@@ -27,6 +27,7 @@ def _create_vllm_config_for_dsd(
     *,
     cudagraph_mode: CUDAGraphMode = CUDAGraphMode.FULL_AND_PIECEWISE,
     use_dynamic_sd: bool = True,
+    use_acceptance_adaptation: bool = False,
     num_spec_per_batch_size: list[tuple[int, int, int]] | None = None,
 ) -> MagicMock:
     """Create a minimal config that exercises DSD cudagraph dispatch.
@@ -62,7 +63,15 @@ def _create_vllm_config_for_dsd(
     vllm_config.num_speculative_tokens = max_spec_tokens
 
     speculative_config = MagicMock()
-    speculative_config.uses_dynamic_speculative_decoding.return_value = use_dynamic_sd
+    speculative_config.uses_dynamic_speculative_decoding.return_value = (
+        use_dynamic_sd or use_acceptance_adaptation
+    )
+    speculative_config.uses_batch_size_dynamic_speculative_decoding.return_value = (
+        use_dynamic_sd
+    )
+    speculative_config.uses_acceptance_length_adaptation.return_value = (
+        use_acceptance_adaptation
+    )
     if use_dynamic_sd:
         # DSD reads the per-batch-size schedule; a schedule entry with K
         # speculative tokens maps to decode query length K + 1. By default
@@ -81,6 +90,85 @@ def _create_vllm_config_for_dsd(
     vllm_config.speculative_config = speculative_config
 
     return vllm_config
+
+
+@pytest.mark.parametrize(
+    ("use_batch_size_schedule", "schedule", "min_query_len"),
+    [
+        (False, None, 2),
+        (True, [(1, 2, 5), (3, 4, 3), (5, 8, 0)], 1),
+    ],
+)
+def test_adaptive_sd_captures_every_selectable_depth(
+    monkeypatch,
+    use_batch_size_schedule,
+    schedule,
+    min_query_len,
+):
+    max_num_seqs = 8
+    max_spec_tokens = 5
+    max_decode_query_len = max_spec_tokens + 1
+
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    vllm_config = _create_vllm_config_for_dsd(
+        max_num_seqs=max_num_seqs,
+        max_spec_tokens=max_spec_tokens,
+        use_dynamic_sd=use_batch_size_schedule,
+        use_acceptance_adaptation=True,
+        num_spec_per_batch_size=schedule,
+    )
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        decode_query_len=max_decode_query_len,
+    )
+    manager._graphs_captured = True
+
+    for num_reqs in range(1, max_num_seqs + 1):
+        for query_len in range(min_query_len, max_decode_query_len + 1):
+            num_tokens = num_reqs * query_len
+            desc = manager.dispatch(
+                num_reqs=num_reqs,
+                num_tokens=num_tokens,
+                uniform_token_count=query_len,
+                num_active_loras=0,
+            )
+            assert desc.cg_mode == CUDAGraphMode.FULL
+            assert desc.uniform_token_count == query_len
+
+
+def test_adaptive_sd_keeps_internal_draft_step_graph_fixed(monkeypatch):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    vllm_config = _create_vllm_config_for_dsd(
+        max_num_seqs=8,
+        max_spec_tokens=5,
+        use_dynamic_sd=False,
+        use_acceptance_adaptation=True,
+    )
+
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        decode_query_len=1,
+    )
+
+    captured_query_lens = {
+        desc.uniform_token_count
+        for descs in manager._candidates.values()
+        for desc in descs
+        if desc.cg_mode == CUDAGraphMode.FULL
+    }
+    assert captured_query_lens == {1}
 
 
 def test_dynamic_sd_full_cudagraph_covers_all_uniform_decode_shapes(monkeypatch):

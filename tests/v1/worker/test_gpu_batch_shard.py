@@ -315,6 +315,7 @@ def test_shard_grammar_output(tp_size: int):
     grammar_output = GrammarOutput(
         structured_output_request_ids=grammar_req_ids,
         grammar_bitmask=bitmask,
+        num_acceptable_drafts=[int(k[i]) for i in grammar_idx],
     )
 
     kept_total = 0
@@ -327,6 +328,7 @@ def test_shard_grammar_output(tp_size: int):
             continue
         assert local is not None
         assert local.structured_output_request_ids == [req_ids[i] for i in expected_idx]
+        assert local.num_acceptable_drafts == [int(k[i]) for i in expected_idx]
         expected_rows = np.concatenate(
             [
                 np.arange(row_offsets[i], row_offsets[i] + cu[i + 1] - cu[i])

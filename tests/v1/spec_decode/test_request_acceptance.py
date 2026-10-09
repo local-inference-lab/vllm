@@ -96,17 +96,17 @@ def test_empty_metrics_do_not_divide_by_zero():
     assert "per_step_accepted" not in d
 
 
-def test_observe_records_proposed_and_accepted_independently():
-    # observe() takes proposed and accepted as independent inputs: the histogram
-    # is keyed by accepted, num_draft_tokens sums the proposed as given. (The
-    # grammar-invalidated-draft subtraction happens in the scheduler before
-    # observe() -- see test_per_request_spec_decode_subtracts_invalid_drafts.)
+def test_observe_records_verified_and_accepted_independently():
+    # observe() takes verified and accepted as independent inputs: the histogram
+    # is keyed by accepted, num_draft_tokens sums the verified count as given.
+    # Grammar invalidation and adaptive selection happen in the scheduler before
+    # observe().
     s = RequestSpecDecodeMetrics.new(num_spec_tokens=3)
     s.observe(num_draft_tokens=2, num_accepted=1)
     s.observe(num_draft_tokens=3, num_accepted=1)
     d = s.to_dict()
     assert d["acceptance_histogram"] == [0, 2, 0, 0]  # both steps accepted 1
-    assert d["num_draft_tokens"] == 5  # proposed summed independently: 2 + 3
+    assert d["num_draft_tokens"] == 5  # verified summed independently: 2 + 3
 
 
 def test_engine_core_output_round_trips_spec_decode_metrics():

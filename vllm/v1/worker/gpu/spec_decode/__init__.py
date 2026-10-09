@@ -31,7 +31,10 @@ def init_speculator(
             )
 
             return LiLiCorrSpeculator(vllm_config, device)
-        if "DFlash2DraftModel" in speculative_config.draft_model_config.architectures:
+        if any(
+            arch in ("DFlash2DraftModel", "DFlash2KimiK3Model")
+            for arch in speculative_config.draft_model_config.architectures
+        ):
             from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
                 DFlash2Speculator,
             )

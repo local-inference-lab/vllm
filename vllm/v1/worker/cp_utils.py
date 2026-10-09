@@ -31,8 +31,8 @@ def check_attention_cp_compatibility(
         for layer_name, layer in layers.items():
             check_pcp = target_layer_names is None or layer_name in target_layer_names
             get_attn_backend = getattr(layer, "get_attn_backend", None)
-            if pcp_size > 1 and check_pcp and get_attn_backend is not None:
-                backend = get_attn_backend()
+            backend = get_attn_backend() if get_attn_backend is not None else None
+            if pcp_size > 1 and check_pcp and backend is not None:
                 assert backend.supports_pcp(), (
                     "PCP requires attention backend support, "
                     f"but {backend.get_name()} does not support PCP."
@@ -40,6 +40,26 @@ def check_attention_cp_compatibility(
             layer_impl = getattr(layer, "impl", None)
             if layer_impl is None:
                 continue
+            get_spec = getattr(layer, "get_kv_cache_spec", None)
+            if get_spec is not None:
+                spec = get_spec(vllm_config)
+                if spec is not None and not spec.dcp_sharded:
+                    assert backend is not None, (
+                        "Attention with replicated DCP requires an attention "
+                        "backend that advertises local-DCP support."
+                    )
+                    assert backend.supports_dcp_replicated, (
+                        "Attention with replicated DCP requires backend support, "
+                        f"but {backend.get_name()} does not provide it."
+                    )
+                    # Replicated draft KV contains the complete sequence on
+                    # every rank, so its attention executes as a local DCP1 op.
+                    layer_impl.dcp_world_size = 1
+                    layer_impl.dcp_rank = 0
+                    layer_impl.total_cp_world_size = 1
+                    layer_impl.total_cp_rank = 0
+                    layer_impl.need_to_return_lse_for_decode = False
+                    continue
             if not check_pcp and layer_impl.dcp_world_size == 1:
                 continue
             if vllm_config.speculative_config is not None and interleave_size > 1:
@@ -64,11 +84,16 @@ def get_dcp_dummy_context_len(
     create_mixed_batch: bool,
     is_graph_capturing: bool,
     uniform_decode: bool,
+    single_request_prefill: bool = False,
 ) -> int:
     if (
         dcp_world_size <= 1
         or not has_kv_cache_config
-        or not (create_mixed_batch or (is_graph_capturing and uniform_decode))
+        or not (
+            create_mixed_batch
+            or (is_graph_capturing and uniform_decode)
+            or single_request_prefill
+        )
     ):
         return 0
     return dcp_world_size * cp_kv_cache_interleave_size

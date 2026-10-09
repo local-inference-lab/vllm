@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import AbstractContextManager, nullcontext
+
 import torch.nn as nn
 
 from vllm.config import ModelConfig, ParallelConfig, VllmConfig, replace
@@ -82,6 +84,14 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             vllm_config.parallel_config,
             speculative_config.draft_parallel_config.tensor_parallel_size,
         ),
+        kernel_config=(
+            replace(
+                vllm_config.kernel_config,
+                moe_backend=speculative_config.moe_backend,
+            )
+            if speculative_config.moe_backend is not None
+            else vllm_config.kernel_config
+        ),
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
@@ -101,9 +111,20 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     # config is retained for DSpark's target-layer metadata, so we must override it.
     draft_vllm_config.quant_config = get_draft_quant_config(vllm_config)
 
-    with set_model_tag("dspark_head"):
+    rope_ownership: AbstractContextManager[None]
+    if draft_model_config.hf_config.model_type == "k3_dspark":
+        from vllm.models.kimi_k3.nvidia.dspark_mla import (
+            protect_k3_compact_rope_sources,
+        )
+
+        rope_ownership = protect_k3_compact_rope_sources(target_model)
+    else:
+        rope_ownership = nullcontext()
+    with rope_ownership, set_model_tag("dspark_head"):
         draft_model = get_model(
-            vllm_config=draft_vllm_config, model_config=draft_model_config
+            vllm_config=draft_vllm_config,
+            model_config=draft_model_config,
+            load_config=speculative_config.draft_load_config,
         )
 
     target_language_model = (

@@ -54,6 +54,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import (
     BatchDescriptor,
+    MoEPrefillMetadata,
     set_forward_context,
 )
 from vllm.logger import init_logger
@@ -222,9 +223,10 @@ from vllm.v1.worker.ubatch_utils import (
 )
 from vllm.v1.worker.utils import (
     EncoderTimingStats,
+    clear_layer_kv_caches,
     raise_if_nan_logits,
 )
-from vllm.v1.worker.workspace import lock_workspace
+from vllm.v1.worker.workspace import current_workspace_manager, lock_workspace
 
 from .utils import (
     AttentionGroup,
@@ -252,6 +254,18 @@ def _get_parameter_for_reload(model: nn.Module, name: str) -> nn.Parameter:
     if isinstance(module, BaseLayerWithLoRA):
         module = module.base_layer
     return module.get_parameter(parameter_name)
+
+
+def _flushed_free_memory() -> int:
+    """Read free device memory around a graph memory sample, cache empty.
+
+    ``torch.cuda.graph`` empties the allocator cache on entry. Blocks cached
+    before the sample would otherwise be released inside it and subtracted
+    from the graphs' memory, and blocks cached at its end would be added.
+    """
+    torch.accelerator.synchronize()
+    torch.accelerator.empty_cache()
+    return torch.accelerator.get_memory_info()[0]
 
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
@@ -478,6 +492,8 @@ class ExecuteModelState(NamedTuple):
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
+    jit_warmup_registry: JitWarmupRegistry
+
     @JitWarmupRegistry.capture
     def __init__(
         self,
@@ -495,6 +511,10 @@ class GPUModelRunner(
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+
+        from vllm.utils.b12x import is_b12x_a4_prefill_enabled
+
+        self._b12x_a4_prefill_enabled = is_b12x_a4_prefill_enabled()
 
         model_config = self.model_config
         cache_config = self.cache_config
@@ -725,35 +745,39 @@ class GPUModelRunner(
             self.parallel_config.cp_kv_cache_interleave_size
         )
         # Capture warmup providers registered by the initial placeholder InputBatch
-        self.input_batch = InputBatch(
-            max_num_reqs=self.max_num_reqs,
-            # We need to use the encoder length for encoder-decoder
-            # because of KV cache for cross-attention.
-            max_model_len=max(self.max_model_len, self.max_encoder_len),
-            max_num_batched_tokens=self.max_num_tokens,
-            device=self.device,
-            vocab_size=self.model_config.get_vocab_size(),
-            block_sizes=[placeholder_block_size],
-            kernel_block_sizes=[placeholder_block_size],
-            max_num_blocks_per_req=[placeholder_max_num_blocks],
-            num_spec_tokens=self.num_spec_tokens,
-            logitsprocs=build_logitsprocs(
-                self.vllm_config,
-                self.device,
-                PIN_MEMORY,
-                self.is_pooling_model,
-                custom_logitsprocs,
-            ),
-            # We currently don't know whether a particular custom logits processor
-            # uses output token ids so we set this conservatively. Thinking-budget
-            # tracking is requested dynamically when a budgeted request is in the
-            # batch.
-            logitsprocs_need_output_token_ids=bool(custom_logitsprocs),
-            is_pooling_model=self.is_pooling_model,
-            cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
-            reasoning_config=self.vllm_config.reasoning_config,
-            use_replayssm=self.cache_config.use_replayssm,
-        )
+        with self.jit_warmup_registry.activate():
+            self.input_batch = InputBatch(
+                max_num_reqs=self.max_num_reqs,
+                # We need to use the encoder length for encoder-decoder
+                # because of KV cache for cross-attention.
+                max_model_len=max(self.max_model_len, self.max_encoder_len),
+                max_num_batched_tokens=self.max_num_tokens,
+                device=self.device,
+                vocab_size=self.model_config.get_vocab_size(),
+                block_sizes=[placeholder_block_size],
+                kernel_block_sizes=[placeholder_block_size],
+                max_num_blocks_per_req=[placeholder_max_num_blocks],
+                num_spec_tokens=self.num_spec_tokens,
+                logitsprocs=build_logitsprocs(
+                    self.vllm_config,
+                    self.device,
+                    PIN_MEMORY,
+                    self.is_pooling_model,
+                    custom_logitsprocs,
+                ),
+                # We currently don't know whether a particular custom logits processor
+                # uses output token ids so we set this conservatively. Thinking-budget
+                # tracking is requested dynamically when a budgeted request is in the
+                # batch.
+                logitsprocs_need_output_token_ids=(
+                    bool(custom_logitsprocs)
+                    or self.model_config.hf_config.model_type == "deepseek_v41"
+                ),
+                is_pooling_model=self.is_pooling_model,
+                cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+                reasoning_config=self.vllm_config.reasoning_config,
+                use_replayssm=bool(self.cache_config.use_replayssm),
+            )
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
         # GPU to CPU when async scheduling is enabled.
@@ -980,6 +1004,11 @@ class GPUModelRunner(
             draft_config = self.speculative_config.draft_model_config
             if draft_config is None or draft_config.max_model_len is None:
                 self.effective_drafter_max_model_len = self.max_model_len
+        update_model_len = getattr(
+            getattr(self, "model", None), "update_max_model_len", None
+        )
+        if update_model_len is not None:
+            update_model_len(max_model_len)
 
     def reset_mm_cache(self) -> None:
         """Clear the multi-modal cache that was used during profiling,
@@ -1023,11 +1052,9 @@ class GPUModelRunner(
 
     def _get_mamba_state_copy_funcs(self) -> MambaStateCopyFuncsByType:
         if self._mamba_state_copy_funcs is None:
-            mamba_groups = mamba_utils.get_mamba_groups(self.kv_cache_config)
-            mamba_types = {spec.mamba_type for spec in mamba_groups}
-            copy_funcs = self.model.get_mamba_state_copy_funcs(mamba_types)
-            mamba_utils.validate_mamba_state_copy_funcs(mamba_groups, copy_funcs)
-            self._mamba_state_copy_funcs = copy_funcs
+            self._mamba_state_copy_funcs = mamba_utils.resolve_mamba_state_copy_funcs(
+                self.model, self.kv_cache_config
+            )
         return self._mamba_state_copy_funcs
 
     def _get_mamba_bufs(self) -> mamba_utils.MambaBuffers:
@@ -1049,11 +1076,36 @@ class GPUModelRunner(
         return self._mamba_bufs
 
     def _prepare_lookback_token_ids(self, num_reqs: int) -> torch.Tensor:
-        """Gather, per request, the `depth` prompt token ids preceding its
-        first scheduled token (column j is position start - 1 - j); -1 where
-        the position is before the prompt or already past it. Generated
-        positions are left to the model: under async scheduling the CPU token
-        table holds placeholders for them."""
+        """Gather the model's prompt-only or accepted chronological history."""
+        if getattr(self.model, "requires_accepted_token_lookback", False):
+            buf = self.lookback_token_ids
+            assert buf is not None
+            buf.np.fill(-1)
+            if num_reqs:
+                self.input_batch.update_async_output_token_ids()
+                depth = buf.np.shape[1]
+                starts = (
+                    self.num_computed_tokens[:num_reqs].cpu().tolist()
+                    if self.use_async_spec_decode
+                    else self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                )
+                for row, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                    req = self.requests[req_id]
+                    prompt = req.prompt_token_ids or []
+                    start = int(starts[row])
+                    for column, position in enumerate(range(start - depth, start)):
+                        if 0 <= position < len(prompt):
+                            buf.np[row, column] = prompt[position]
+                        elif (
+                            len(prompt)
+                            <= position
+                            < len(prompt) + len(req.output_token_ids)
+                        ):
+                            buf.np[row, column] = req.output_token_ids[
+                                position - len(prompt)
+                            ]
+            return buf.copy_to_gpu()
+
         buf = self.lookback_token_ids
         assert buf is not None
         buf.np.fill(-1)
@@ -1070,12 +1122,9 @@ class GPUModelRunner(
 
     def _init_model_kwargs(self, num_reqs: int | None = None):
         model_kwargs = dict[str, Any]()
-
         if self.lookback_token_ids is not None:
-            if num_reqs is None:
-                num_reqs = self.input_batch.num_reqs
             model_kwargs["lookback_token_ids"] = self._prepare_lookback_token_ids(
-                num_reqs
+                self.input_batch.num_reqs if num_reqs is None else num_reqs
             )
 
         if not self.is_pooling_model:
@@ -1140,6 +1189,19 @@ class GPUModelRunner(
                 scheduler_output,
                 decode_threshold=self.reorder_batch_threshold,
             )
+
+    def _build_moe_prefill_metadata(self, num_tokens: int) -> MoEPrefillMetadata | None:
+        if not self._b12x_a4_prefill_enabled:
+            return None
+        from vllm.utils.b12x import build_moe_prefill_metadata
+
+        num_reqs = self.input_batch.num_reqs
+        return build_moe_prefill_metadata(
+            num_tokens,
+            self.query_start_loc.np[: num_reqs + 1],
+            self.input_batch.num_computed_tokens_cpu[:num_reqs],
+            self.input_batch.num_prompt_tokens[:num_reqs],
+        )
 
     def _init_kv_zero_meta(self) -> None:
         """One-time precomputation for _zero_block_ids.
@@ -4373,6 +4435,9 @@ class GPUModelRunner(
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
                 is_padding=is_padding,
+                moe_prefill_metadata=self._build_moe_prefill_metadata(
+                    num_tokens_padded
+                ),
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -4936,7 +5001,9 @@ class GPUModelRunner(
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
-        num_spec_tokens_to_schedule = scheduler_output.num_spec_tokens_to_schedule
+        num_spec_tokens_to_schedule = (
+            scheduler_output.resolve_num_spec_tokens_to_schedule(self.num_spec_tokens)
+        )
         self._draft_probs = None
         self._draft_prob_req_ids = None
         if spec_config.method == "ngram":
@@ -5765,6 +5832,7 @@ class GPUModelRunner(
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         randomize_inputs: bool = False,
+        single_request_prefill: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run a dummy forward pass to warm up/profile run or capture the
         CUDA graph for the model.
@@ -5796,6 +5864,11 @@ class GPUModelRunner(
             is_graph_capturing: Whether this run is a cudagraph capture.
             randomize_inputs: Whether to fill the dummy inputs with random
                 values rather than zeros.
+
+            single_request_prefill: If True, place the complete token budget in
+                one prefill request. This exposes attention and collective
+                workspace peaks that are hidden when the ordinary profile
+                distributes the same token budget across many requests.
 
         """
         mm_config = self.vllm_config.model_config.multimodal_config
@@ -5829,7 +5902,13 @@ class GPUModelRunner(
         # has num_tokens in total.
         assert num_tokens <= self.max_num_tokens
         max_num_reqs = self.scheduler_config.max_num_seqs
-        if create_mixed_batch:
+        if single_request_prefill:
+            assert not create_mixed_batch
+            assert not uniform_decode
+            num_reqs = 1
+            num_scheduled_tokens_list = [num_tokens]
+            max_query_len = num_tokens
+        elif create_mixed_batch:
             assert not uniform_decode
             # Create mixed batch:
             # first half decode tokens, second half one prefill
@@ -5904,6 +5983,7 @@ class GPUModelRunner(
             create_mixed_batch,
             is_graph_capturing,
             uniform_decode,
+            single_request_prefill,
         )
         ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
             should_ubatch,
@@ -6375,7 +6455,28 @@ class GPUModelRunner(
         max_task = max(output_size.items(), key=lambda x: x[1])[0]
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
-    def profile_run(self, randomize_inputs: bool = False) -> None:
+    def _reserve_profile_scratch(self) -> None:
+        # Mirror of the V2 runner hook: pre-reserve any per-module scratch
+        # (e.g. DeepSeek-V4 padded-Q) during the memory-profiling peak so the
+        # KV-cache sizing accounts for it. Without this, buffers materialized
+        # lazily after profiling (notably the ubatch-1 padded-Q scratch when
+        # enable_dbo=True) would be charged against already-claimed KV memory.
+        seen: set[int] = set()
+        for module in self.compilation_config.static_forward_context.values():
+            if id(module) in seen:
+                continue
+            seen.add(id(module))
+            reserve = getattr(module, "reserve_profile_scratch", None)
+            if reserve is not None:
+                reserve()
+        current_workspace_manager().reserve_all()
+
+    def profile_run(
+        self,
+        prepare_profile_state: Callable[[], None] | None = None,
+        randomize_inputs: bool = False,
+    ) -> None:
+        self._reserve_profile_scratch()
         # Profile with multimodal encoder & encoder cache.
         if self.supports_mm_inputs:
             mm_config = self.model_config.multimodal_config
@@ -6445,12 +6546,94 @@ class GPUModelRunner(
                 output = self._dummy_sampler_run(last_hidden_states)
         else:
             output = None
+        # The generic and DeepSeek-specific passes represent separate scheduler
+        # steps. Release the generic outputs so KV admission uses the larger
+        # transient peak instead of an unreachable sum of both passes.
         self._sync_device()
-        del hidden_states, output
+        del hidden_states, last_hidden_states, output
+        self._profile_deepseek_v4_attention(prepare_profile_state)
+        current_workspace_manager().reserve_all()
         self.encoder_cache.clear()
         gc.collect()
 
-    def _init_minimal_kv_cache_for_profiling(self) -> None:
+    @torch.inference_mode()
+    def _profile_deepseek_v4_attention(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> None:
+        """Include the maximum DeepSeek V4 prefill peak in KV admission.
+
+        The generic profile does not create attention metadata and distributes
+        its token budget across requests. DeepSeek V4 can execute the complete
+        scheduler token budget as one prefill, where query projection and
+        auxiliary-stream indexer work overlap. Run that reachable shape while
+        multimodal encoder outputs from ``profile_run`` remain resident. A
+        minimal temporary cache makes attention executable without reserving
+        the production KV pool.
+        """
+        if self.model_config.architecture not in {
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
+        }:
+            return
+
+        model_output: tuple[torch.Tensor, torch.Tensor] | None = None
+        try:
+            with set_current_vllm_config(self.vllm_config):
+                self._init_minimal_kv_cache_for_profiling(num_blocks=1)
+                if prepare_profile_state is not None:
+                    prepare_profile_state()
+            model_output = self._dummy_run(
+                self.max_num_tokens,
+                force_attention=True,
+                skip_eplb=True,
+                is_profile=True,
+                single_request_prefill=True,
+            )
+            self._sync_device()
+        finally:
+            del model_output
+            self._cleanup_profiling_kv_cache()
+
+    @torch.inference_mode()
+    def profile_glm_dcp_attention(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> None:
+        """Profile GLM split-cache DCP attention before KV cache sizing.
+
+        The generic activation profile omits attention metadata and spreads the
+        scheduler token budget across many requests. GLM sparse MLA can instead
+        receive one full prefill quantum and gather its query heads across the
+        decode-context-parallel group. A minimal temporary cache makes that
+        backend path reachable without reserving production KV storage.
+        """
+        if (
+            self.model_config.architecture != "Glm5NextForConditionalGeneration"
+            or self.dcp_world_size <= 1
+        ):
+            return
+
+        model_output: tuple[torch.Tensor, torch.Tensor] | None = None
+        try:
+            with set_current_vllm_config(self.vllm_config):
+                self._init_minimal_kv_cache_for_profiling(num_blocks=1)
+            if prepare_profile_state is not None:
+                prepare_profile_state()
+            model_output = self._dummy_run(
+                self.max_num_tokens,
+                force_attention=True,
+                skip_eplb=True,
+                is_profile=True,
+                single_request_prefill=True,
+            )
+            self._sync_device()
+        finally:
+            del model_output
+            self._cleanup_profiling_kv_cache()
+
+    def _init_minimal_kv_cache_for_profiling(
+        self, *, num_blocks: int | None = None
+    ) -> None:
         from vllm.v1.core.kv_cache_utils import (
             get_kv_cache_config_from_groups,
             get_kv_cache_groups,
@@ -6460,18 +6643,26 @@ class GPUModelRunner(
         KVCacheSpecRegistry.check_kv_cache_spec_registry(kv_cache_spec)
         kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
         # the minimum number of blocks required is 1 block *per sequence*
-        min_blocks = (
-            min(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
-            or 1
-        )
+        if num_blocks is None:
+            num_blocks = (
+                min(
+                    self.max_num_reqs,
+                    self.compilation_config.max_cudagraph_capture_size,
+                )
+                or 1
+            )
+        if num_blocks < 1:
+            raise ValueError("Profiling KV cache requires at least one block")
 
         # Temporarily change num_gpu_blocks_override to allocate a minimal KV cache
         saved_override = self.cache_config.num_gpu_blocks_override
-        self.cache_config.num_gpu_blocks_override = min_blocks
-        minimal_config = get_kv_cache_config_from_groups(
-            self.vllm_config, kv_cache_groups, available_memory=0
-        )
-        self.cache_config.num_gpu_blocks_override = saved_override
+        self.cache_config.num_gpu_blocks_override = num_blocks
+        try:
+            minimal_config = get_kv_cache_config_from_groups(
+                self.vllm_config, kv_cache_groups, available_memory=0
+            )
+        finally:
+            self.cache_config.num_gpu_blocks_override = saved_override
 
         self.initialize_kv_cache(minimal_config, is_profiling=True)
         self.cache_config.num_gpu_blocks = minimal_config.num_blocks
@@ -6512,6 +6703,8 @@ class GPUModelRunner(
             self.kv_caches.clear()
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
+        if hasattr(self, "drafter") and hasattr(self.drafter, "draft_attn_groups"):
+            self.drafter.draft_attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
             delattr(self, "kv_cache_config")
         self.cache_config.num_gpu_blocks = None
@@ -6519,19 +6712,8 @@ class GPUModelRunner(
         # "runtime" pool; the real initialize_kv_cache rebuilds it.
         self._init_block_sizes = []
 
-        for layer in self.compilation_config.static_forward_context.values():
-            if hasattr(layer, "kv_cache"):
-                kv_cache = layer.kv_cache
-                layer.kv_cache = (
-                    torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
-                )
-            # Clean up quantized KV cache scale views
-            # (int8_per_token_head, fp8_per_token_head)
-            if hasattr(layer, "impl"):
-                if hasattr(layer.impl, "_k_scale_cache"):
-                    layer.impl._k_scale_cache = None
-                if hasattr(layer.impl, "_v_scale_cache"):
-                    layer.impl._v_scale_cache = None
+        clear_layer_kv_caches(self.compilation_config.static_forward_context.values())
+        self._mamba_bufs = None
 
         gc.collect()
         torch.accelerator.empty_cache()
@@ -6575,9 +6757,19 @@ class GPUModelRunner(
                 logger.info("Initialized EncoderCudaGraphManager for vision encoder")
 
     @torch.inference_mode()
-    def profile_cudagraph_memory(self) -> int:
-        with set_current_vllm_config(self.vllm_config):
-            self._init_minimal_kv_cache_for_profiling()
+    def profile_cudagraph_memory(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> int:
+        profiling_state_initialized = False
+        try:
+            with set_current_vllm_config(self.vllm_config):
+                self._init_minimal_kv_cache_for_profiling()
+                if prepare_profile_state is not None:
+                    prepare_profile_state()
+            profiling_state_initialized = True
+        finally:
+            if not profiling_state_initialized:
+                self._cleanup_profiling_kv_cache()
 
         saved_num_cudagraph_captured = compilation_counter.num_cudagraph_captured
 
@@ -6641,7 +6833,7 @@ class GPUModelRunner(
                     mem_samples: list[int] = []
 
                     for i, desc in enumerate(profile_descs):
-                        mem_before = torch.accelerator.get_memory_info()[0]
+                        mem_before = _flushed_free_memory()
                         self._warmup_and_capture(
                             desc,
                             cudagraph_runtime_mode=mode,
@@ -6654,9 +6846,7 @@ class GPUModelRunner(
                                 else None
                             ),
                         )
-                        torch.accelerator.synchronize()
-                        free_after = torch.accelerator.get_memory_info()[0]
-                        mem_samples.append(mem_before - free_after)
+                        mem_samples.append(mem_before - _flushed_free_memory())
 
                     first_capture = mem_samples[0]
                     # Use at least 1 MiB per graph for driver overhead
@@ -6677,11 +6867,11 @@ class GPUModelRunner(
                     )
 
                 if encoder_cudagraph_manager is not None:
-                    mem_before = torch.accelerator.get_memory_info()[0]
+                    mem_before = _flushed_free_memory()
                     encoder_cudagraph_manager.capture(graph_pool=encoder_profiling_pool)
-                    torch.accelerator.synchronize()
-                    free_after = torch.accelerator.get_memory_info()[0]
-                    encoder_memory_estimate = max(mem_before - free_after, 0)
+                    encoder_memory_estimate = max(
+                        mem_before - _flushed_free_memory(), 0
+                    )
 
                     logger.debug(
                         "Estimated encoder CUDA graph memory: %.2f MiB for %d graphs",
@@ -7168,7 +7358,10 @@ class GPUModelRunner(
                 continue
             block_size = kv_cache_spec.block_size
             block_sizes.append(block_size)
-            if kv_cache_spec_kind == KVCacheSpecKind.MAMBA:
+            if kv_cache_spec_kind in (
+                KVCacheSpecKind.MAMBA,
+                KVCacheSpecKind.CIRCULAR_BUFFER,
+            ):
                 slot_mapping_modes.append(SlotMappingMode.NONE)
             else:
                 slot_mapping_modes.append(SlotMappingMode.TOKEN_TO_KV_SLOT)
@@ -7209,7 +7402,7 @@ class GPUModelRunner(
                     is_pooling_model=self.is_pooling_model,
                     cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
                     reasoning_config=self.vllm_config.reasoning_config,
-                    use_replayssm=self.cache_config.use_replayssm,
+                    use_replayssm=bool(self.cache_config.use_replayssm),
                     slot_mapping_modes=slot_mapping_modes,
                 )
 
@@ -7329,7 +7522,7 @@ class GPUModelRunner(
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config,
             self.kv_cache_config,
-            use_replayssm=self.vllm_config.cache_config.use_replayssm,
+            use_replayssm=bool(self.vllm_config.cache_config.use_replayssm),
         )
         # The kernel block size for all KV cache groups. For example, if
         # kv_cache_manager uses block_size 256 for a given group, but the attention

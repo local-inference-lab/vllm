@@ -61,6 +61,10 @@ def _make_fake_speculator(
         kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
         max_model_len=max_model_len,
         draft_max_seq_len=draft_max_seq_len,
+        idx_mapping=torch.arange(max_num_reqs, dtype=torch.int32),
+        model_state=SimpleNamespace(
+            prepare_draft_attn_metadata=lambda **_: None,
+        ),
     )
     # The uniform wrapper delegates through self; bind the real implementation.
     fake._build_attn_metadata = MethodType(EagleSpeculator._build_attn_metadata, fake)
@@ -189,3 +193,65 @@ def test_build_draft_attn_metadata_recomputes_dcp_local_seq_lens(draft_dcp_size)
     assert isinstance(local, torch.Tensor)
     assert local.data_ptr() == fake.input_buffers.dcp_local_seq_lens.data_ptr()
     assert local.tolist() == [1, 4, 8, 0]
+
+
+def test_build_draft_attn_metadata_forwards_model_specific_metadata():
+    fake = _make_fake_speculator()
+    hook_args: dict[str, object] = {}
+    model_metadata = object()
+
+    def prepare_draft_attn_metadata(**kwargs):
+        hook_args.update(kwargs)
+        return model_metadata
+
+    fake.model_state.prepare_draft_attn_metadata = prepare_draft_attn_metadata
+    captured = _run_build(
+        fake,
+        num_reqs=2,
+        num_reqs_padded=4,
+        base=torch.tensor([10, 20], dtype=torch.int32),
+        step=1,
+    )
+
+    assert hook_args == {
+        "idx_mapping": fake.idx_mapping,
+        "num_reqs": 2,
+        "num_reqs_padded": 4,
+        "draft_index": 1,
+    }
+    assert captured["model_specific_attn_metadata"] is model_metadata
+
+
+def test_build_draft_attn_metadata_populates_dcp_local_seq_lens():
+    fake = _make_fake_speculator()
+    fake.dcp_size = 4
+    fake.block_tables.cp_size = 4
+    fake.block_tables.cp_rank = 2
+    fake.block_tables.cp_interleave = 1
+    fake.input_buffers.seq_lens[:4] = torch.tensor([1, 2, 5, 8])
+
+    def fake_prepare(out, seq_lens, num_reqs, dcp_size, dcp_rank, interleave):
+        for index in range(num_reqs):
+            length = int(seq_lens[index])
+            rounds, remainder = divmod(length, dcp_size * interleave)
+            owned_remainder = min(max(remainder - dcp_rank * interleave, 0), interleave)
+            out[index] = rounds * interleave + owned_remainder
+        return out
+
+    with patch.object(
+        base_speculator,
+        "prepare_dcp_local_seq_lens",
+        fake_prepare,
+    ):
+        captured = _run_build(
+            fake,
+            num_reqs=4,
+            num_reqs_padded=4,
+            base=torch.tensor([1, 2, 5, 8], dtype=torch.int32),
+            step=1,
+        )
+
+    assert torch.equal(
+        captured["dcp_local_seq_lens"],
+        torch.tensor([0, 0, 1, 2], dtype=torch.int32),
+    )

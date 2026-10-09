@@ -8,7 +8,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from itertools import accumulate
 from math import prod
-from typing import TypeVar, cast
+from typing import Any, TypeVar, cast
 
 import torch
 
@@ -32,6 +32,12 @@ _GiB = 1024**3
 # Global workspace manager instance
 _manager: "WorkspaceManager | None" = None
 _workspace_lane: ContextVar[int] = ContextVar("vllm_workspace_lane", default=0)
+_preallocated_workspace: ContextVar[torch.Tensor | None] = ContextVar(
+    "vllm_preallocated_workspace", default=None
+)
+_cuda_graph_capture_resources: ContextVar[list[Any] | None] = ContextVar(
+    "vllm_cuda_graph_capture_resources", default=None
+)
 
 
 @contextmanager
@@ -44,6 +50,65 @@ def use_workspace_lane(lane: int) -> Iterator[None]:
         yield
     finally:
         _workspace_lane.reset(token)
+
+
+@contextmanager
+def use_preallocated_workspace(scratch: torch.Tensor | None) -> Iterator[None]:
+    """Bind a caller-reserved scratch view; this scope never allocates storage."""
+    token = _preallocated_workspace.set(scratch)
+    try:
+        yield
+    finally:
+        _preallocated_workspace.reset(token)
+
+
+def current_preallocated_workspace() -> torch.Tensor | None:
+    return _preallocated_workspace.get()
+
+
+@contextmanager
+def collect_cuda_graph_capture_resources() -> Iterator[list[Any]]:
+    """Collect objects whose storage is referenced by one CUDA graph.
+
+    A CUDA graph records device pointers, but it does not retain the Python
+    objects that own those allocations. Callers that allocate custom-op output
+    or scratch tensors during capture can register their owner with
+    :func:`retain_cuda_graph_capture_resource`. The graph manager keeps the
+    returned list alive for exactly as long as the captured graph.
+    """
+    resources: list[Any] = []
+    token = _cuda_graph_capture_resources.set(resources)
+    try:
+        yield resources
+    finally:
+        _cuda_graph_capture_resources.reset(token)
+
+
+@contextmanager
+def suspend_cuda_graph_capture_resources() -> Iterator[None]:
+    """Do not retain temporary owners from an uncaptured, in-place operation."""
+    token = _cuda_graph_capture_resources.set(None)
+    try:
+        yield
+    finally:
+        _cuda_graph_capture_resources.reset(token)
+
+
+def retain_cuda_graph_capture_resource(resource: Any) -> bool:
+    """Retain an object whose storage is referenced by a CUDA graph.
+
+    Args:
+        resource: Python owner that must remain alive while the graph exists.
+
+    Returns:
+        ``True`` when a capture resource collector retained the object.
+
+    """
+    resources = _cuda_graph_capture_resources.get()
+    if resources is None:
+        return False
+    resources.append(resource)
+    return True
 
 
 class WorkspaceManager:
@@ -178,6 +243,12 @@ class WorkspaceManager:
             )
         return workspace
 
+    def available_bytes(self) -> int:
+        """Capacity of the active execution slot, without allocating storage."""
+        return self._workspace_size_bytes(
+            self._current_workspaces[self._get_workspace_id()]
+        )
+
     def get_simultaneous(
         self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
     ) -> list[torch.Tensor]:
@@ -205,6 +276,82 @@ class WorkspaceManager:
             .reshape(shapes_and_dtypes[i][0])
             for i in range(len(shapes_and_dtypes))
         ]
+
+    def reserve_all(
+        self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
+    ) -> None:
+        """Reserve one equal-size workspace for every execution slot.
+
+        Startup code uses this method when a runtime path can execute in any
+        microbatch or model lane. Reserving every slot before memory profiling
+        prevents the first request on an otherwise unused slot from growing
+        device memory after the KV-cache budget has been assigned.
+
+        Args:
+            *shapes_and_dtypes: Simultaneously live tensor shapes and dtypes.
+
+        Raises:
+            AssertionError: If the manager is locked and any slot is too small.
+
+        """
+        required_bytes = sum(
+            round_up(_compute_bytes(shape, dtype), 256)
+            for shape, dtype in shapes_and_dtypes
+        )
+        required_bytes = max(
+            required_bytes,
+            max(map(self._workspace_size_bytes, self._current_workspaces), default=0),
+        )
+        self._reserve_slots(
+            [required_bytes] * len(self._current_workspaces), operation="reserve_all"
+        )
+
+    def reserve_by_lane(self) -> None:
+        """Cover every microbatch without copying capacity between model lanes.
+
+        A target and its drafter have separate scratch contracts. A microbatch
+        can execute either model, but each model always uses its assigned lane.
+        """
+        lane_bytes = [
+            max(
+                map(
+                    self._workspace_size_bytes,
+                    self._current_workspaces[lane :: self._num_lanes],
+                ),
+                default=0,
+            )
+            for lane in range(self._num_lanes)
+        ]
+        self._reserve_slots(
+            lane_bytes * self._num_ubatches, operation="reserve_by_lane"
+        )
+
+    def _reserve_slots(self, sizes: list[int], *, operation: str) -> None:
+        undersized = [
+            workspace_id
+            for workspace_id, workspace in enumerate(self._current_workspaces)
+            if self._workspace_size_bytes(workspace) < sizes[workspace_id]
+        ]
+        if self._locked and undersized:
+            raise AssertionError(
+                f"Workspace is locked but {operation} requires "
+                f"larger capacity in slot(s) {undersized}."
+            )
+
+        for workspace_id in undersized:
+            current_workspace = self._current_workspaces[workspace_id]
+            self._current_workspaces[workspace_id] = None
+            del current_workspace
+            torch.accelerator.empty_cache()
+            self._current_workspaces[workspace_id] = torch.empty(
+                (sizes[workspace_id],), dtype=torch.uint8, device=self._device
+            )
+
+        if envs.VLLM_DEBUG_WORKSPACE and undersized:
+            logger.info(
+                "[WORKSPACE DEBUG] Reserved execution slots (slot, MB): %s",
+                [(slot, sizes[slot] / _MB) for slot in undersized],
+            )
 
     def _ensure_workspace_size(self, required_bytes: int) -> torch.Tensor:
         """Ensure workspace is allocated and large enough, return current workspace.
@@ -246,11 +393,27 @@ class WorkspaceManager:
                     f"{current_size / _MB:.2f} MB. "
                     "Workspace growth is not allowed after locking."
                 )
+            if self._device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+                # Growth frees and reallocates the slot; inside a capture that
+                # bakes a transient address into the graph and, across TP
+                # ranks, diverges the captured launch sequence.
+                raise RuntimeError(
+                    f"Workspace growth requested from '{get_caller_info()}' during "
+                    f"CUDA graph capture ({current_size / _MB:.2f} MB -> "
+                    f"{required_bytes / _MB:.2f} MB). "
+                    "Size the workspace before capture."
+                )
 
             # Only resize the requesting ubatch/lane workspace. Other slots
             # resize lazily on their next get_simultaneous call.
             # Resizing all ubatches here would orphan the other ubatch's
             # old tensor when it still holds views into it (DBO leak).
+            # Kernels already queued on any stream may still read the slot
+            # being replaced; releasing its segment to the driver below is not
+            # stream-ordered, so wait for the device first. Growth happens only
+            # before the workspace is locked, never in steady-state serving.
+            if self._device.type == "cuda" and current_workspace is not None:
+                torch.accelerator.synchronize(self._device)
             self._current_workspaces[workspace_id] = None
             del current_workspace
             # Release the freed segment back to CUDA so the caching

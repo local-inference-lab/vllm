@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from contextlib import nullcontext
+import json
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from weakref import ref
 
 import pytest
 import torch
+from torch import nn
 
 from tests.utils import create_new_process_for_each_test
 from vllm.platforms import current_platform
@@ -166,7 +170,7 @@ def test_memory_profile_bounds_decode_logits_rows(monkeypatch, kv_cache_memory_b
     class Profiled(Exception):
         pass
 
-    def profile_run(*, randomize_inputs=False):
+    def profile_run(prepare_profile_state, *, randomize_inputs=False):
         assert randomize_inputs is True
         # Without the config context, the helper falls back to all 32768
         # batched tokens, which would reserve 128 GiB at 1M context.
@@ -178,6 +182,8 @@ def test_memory_profile_bounds_decode_logits_rows(monkeypatch, kv_cache_memory_b
         randomize_dummy_inputs=True,
         cache_config=SimpleNamespace(kv_cache_memory_bytes=kv_cache_memory_bytes),
         model_runner=SimpleNamespace(profile_run=profile_run, model_memory_usage=0),
+        _prepare_b12x_profile_state=lambda: None,
+        _release_b12x_profile_state=lambda: None,
         init_snapshot=SimpleNamespace(free_memory=2),
         _scoped_allocator_max_split=lambda **kwargs: nullcontext(),
     )
@@ -190,6 +196,102 @@ def test_memory_profile_bounds_decode_logits_rows(monkeypatch, kv_cache_memory_b
     with pytest.raises(Profiled):
         gpu_worker.Worker.determine_available_memory(worker)
     assert get_current_vllm_config_or_none() is None
+
+
+def test_mark_b12x_eager_shapes_covers_encoder_and_connector_profile_shapes(
+    monkeypatch,
+) -> None:
+    import vllm.multimodal.encoder_budget as encoder_budget
+    from vllm.model_executor.warmup.b12x_prepare import mark_b12x_eager_shapes
+
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.visual = nn.Module()
+            self.visual.block = nn.Module()
+            self.visual.merger = nn.Sequential(nn.Module())
+            self.visual.deepstack_merger_list = nn.ModuleList([nn.Module()])
+
+        def get_mm_lora_token_counts(self, *, modality, mm_kwargs, num_mm_embeds):
+            assert modality == "image"
+            assert mm_kwargs is None
+            return num_mm_embeds * 4, num_mm_embeds
+
+        def get_mm_mapping(self):
+            return SimpleNamespace(
+                connector=("visual.merger", "visual.deepstack_merger_list")
+            )
+
+    class _FakeBudget:
+        def __init__(self, vllm_config, mm_registry, enable_cache):
+            del vllm_config, mm_registry, enable_cache
+
+        def get_encoder_budget(self):
+            return 16_384
+
+    monkeypatch.setattr(encoder_budget, "MultiModalBudget", _FakeBudget)
+    model = _Model()
+    worker = SimpleNamespace(
+        get_model=lambda: model,
+        vllm_config=SimpleNamespace(),
+        model_runner=SimpleNamespace(mm_registry=object()),
+    )
+
+    mark_b12x_eager_shapes(worker)
+
+    assert model.visual.block.b12x_eager_token_counts == (65_536,)
+    assert model.visual.block.b12x_eager_only is True
+    for connector in (model.visual.merger, model.visual.deepstack_merger_list):
+        assert connector.b12x_eager_token_counts == (16_384,)
+        assert all(module.b12x_eager_only for module in connector.modules())
+
+
+def test_mark_b12x_eager_shapes_skips_missing_vision_stage() -> None:
+    from vllm.model_executor.models.utils import StageMissingLayer
+    from vllm.model_executor.warmup.b12x_prepare import mark_b12x_eager_shapes
+
+    model = nn.Module()
+    model.visual = StageMissingLayer("vision_tower")
+    model.get_mm_lora_token_counts = lambda **kwargs: (1, 1)
+    model.get_mm_mapping = lambda: SimpleNamespace(connector=("visual.merger",))
+    worker = SimpleNamespace(
+        get_model=lambda: model,
+        model_runner=SimpleNamespace(mm_registry=object()),
+    )
+
+    mark_b12x_eager_shapes(worker)
+
+
+def test_b12x_workload_covers_target_and_draft_profile_shapes() -> None:
+    from vllm.model_executor.warmup.b12x_prepare import b12x_workload
+
+    compilation = SimpleNamespace(
+        cudagraph_capture_sizes=(1, 2, 4, 8),
+        compile_sizes=(),
+        get_compile_ranges=lambda: (SimpleNamespace(end=128),),
+    )
+    worker = SimpleNamespace(
+        get_model=lambda: nn.Module(),
+        model_runner=SimpleNamespace(mm_registry=None),
+        vllm_config=SimpleNamespace(
+            compilation_config=compilation,
+            speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=128,
+            max_num_seqs=1,
+        ),
+        model_config=SimpleNamespace(dtype="bf16", max_model_len=4096),
+    )
+
+    workload = b12x_workload(worker, stage="weights")
+
+    # b12x_preparation_token_counts also reserves the post-speculative decode
+    # regime (max_tokens - speculative_tokens = 128 - 3 = 125).
+    assert workload.token_counts == (1, 2, 4, 8, 125, 128)
+    assert workload.fixed_token_counts == (1, 2, 4, 8)
+    assert workload.max_tokens == 128
+    assert workload.speculative_tokens == 3
 
 
 # Startup-plan persistence (vllm/v1/worker/startup_plan.py), applied and
@@ -258,7 +360,197 @@ def test_startup_plan_apply_gate(plan_env):
     assert explicit.cache_config.kv_cache_memory_bytes == 7 * GiB_bytes
 
 
+def test_startup_plan_revision_rejects_existing_plan(plan_env):
+    worker = _plan_worker()
+    with patch.object(startup_plan, "PLAN_SCHEMA_VERSION", 1):
+        previous = startup_plan.compute_plan_fingerprint(worker.vllm_config, 0, 1)
+        maybe_save_startup_plan(worker, 50 * GiB_bytes)
+
+    fingerprint = startup_plan.compute_plan_fingerprint(worker.vllm_config, 0, 1)
+    assert fingerprint != previous
+    maybe_apply_startup_plan(worker)
+    assert worker.cache_config.kv_cache_memory_bytes is None
+
+    payload = json.loads(Path(startup_plan._plan_path(previous)).read_text())
+    payload["fingerprint"] = fingerprint
+    Path(startup_plan._plan_path(fingerprint)).write_text(json.dumps(payload))
+    maybe_apply_startup_plan(worker)
+    assert worker.cache_config.kv_cache_memory_bytes is None
+
+
+def test_startup_plan_survives_profiling_config_rewrites(plan_env):
+    """A boot saves under the key computed before profiling, so the next
+    boot finds the plan although profiling rewrote the config (DS4 falls
+    back from FULL_AND_PIECEWISE to FULL_DECODE_ONLY graphs)."""
+    config_hash = ["before-profiling"]
+    first = _plan_worker()
+    first.vllm_config = SimpleNamespace(compute_hash=lambda: config_hash[0])
+    maybe_apply_startup_plan(first)
+    assert first.cache_config.kv_cache_memory_bytes is None
+    config_hash[0] = "after-capture"
+    maybe_save_startup_plan(first, 50 * GiB_bytes)
+
+    second = _plan_worker(config_hash="before-profiling")
+    maybe_apply_startup_plan(second)
+    assert second.cache_config.kv_cache_memory_bytes == 50 * GiB_bytes
+
+
+@pytest.mark.parametrize("failure", [False, True])
+@pytest.mark.parametrize(
+    "active_conf,load_conf",
+    [
+        ("expandable_segments:True", None),
+        ("expandable_segments:True,large_segment_size_mb:12", None),
+        ("expandable_segments : True", None),
+        ("", "max_split_size_mb:20"),
+        ("expandable_segments:False", "expandable_segments:False,max_split_size_mb:20"),
+        ("max_split_size_mb : 128", "max_split_size_mb : 20"),
+        (
+            "garbage_collection_threshold:0.8",
+            "garbage_collection_threshold:0.8,max_split_size_mb:20",
+        ),
+        (
+            "expandable_segments:False,max_split_size_mb:64,garbage_collection_threshold:0.8",
+            "expandable_segments:False,max_split_size_mb:20,garbage_collection_threshold:0.8",
+        ),
+    ],
+)
+def test_weight_loading_split_limit_preserves_runtime_settings(
+    monkeypatch, active_conf, load_conf, failure
+):
+    """Respect active VMM policy and restore every allocator option after loading."""
+    settings: list[str] = []
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.setattr(gpu_worker.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        gpu_worker.torch._C, "_accelerator_getAllocatorSettings", lambda: active_conf
+    )
+    monkeypatch.setattr(
+        gpu_worker.torch._C, "_accelerator_setAllocatorSettings", settings.append
+    )
+    outcome = pytest.raises(RuntimeError, match="loading") if failure else nullcontext()
+    with (
+        outcome,
+        gpu_worker.Worker._scoped_allocator_max_split(None, max_split_size_mb=20),
+    ):
+        assert settings == ([load_conf] if load_conf is not None else [])
+        if failure:
+            raise RuntimeError("loading")
+    assert settings == ([load_conf, active_conf] if load_conf is not None else [])
+
+
+def test_weight_loading_split_limit_keeps_non_cuda_defaults(monkeypatch):
+    monkeypatch.setattr(gpu_worker.current_platform, "is_cuda_alike", lambda: False)
+
+    def unexpected_allocator_access(*args):
+        pytest.fail("non-CUDA workers must not access CUDA allocator settings")
+
+    monkeypatch.setattr(
+        gpu_worker.torch._C,
+        "_accelerator_getAllocatorSettings",
+        unexpected_allocator_access,
+    )
+    monkeypatch.setattr(
+        gpu_worker.torch._C,
+        "_accelerator_setAllocatorSettings",
+        unexpected_allocator_access,
+    )
+    with gpu_worker.Worker._scoped_allocator_max_split(None, max_split_size_mb=20):
+        pass
+
+
 # Memory accounting of the profiling run (Worker.determine_available_memory).
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_profile_release_collects_cycles_before_flushing_allocator(
+    monkeypatch, failure
+):
+    """The allocator flush must follow plan release and Python cycle collection."""
+
+    class _Batch:
+        def release(self):
+            self.resource = None
+            if failure:
+                raise RuntimeError("release failed")
+
+    class _Temporary:
+        def __init__(self):
+            self.cycle = self
+
+    batch = _Batch()
+    batch.resource = _Temporary()
+    resource_ref = ref(batch.resource)
+    worker = SimpleNamespace(_b12x_profile_batch=batch)
+    del batch
+    events = []
+
+    def empty_cache():
+        assert resource_ref() is None
+        assert worker._b12x_profile_batch is None
+        events.append("empty_cache")
+
+    monkeypatch.setattr(
+        gpu_worker.torch.accelerator, "synchronize", lambda: events.append("sync")
+    )
+    monkeypatch.setattr(gpu_worker.torch.accelerator, "empty_cache", empty_cache)
+    if failure:
+        with pytest.raises(RuntimeError, match="release failed"):
+            gpu_worker.Worker._release_b12x_profile_state(worker)
+    else:
+        gpu_worker.Worker._release_b12x_profile_state(worker)
+    assert events == ["sync", "empty_cache"]
+
+
+def test_serving_kv_allocation_collects_temporary_cycles(monkeypatch):
+    """No profiling garbage or freed allocator blocks survive into KV allocation."""
+
+    class _Temporary:
+        def __init__(self):
+            self.cycle = self
+
+    temporary = _Temporary()
+    temporary_ref = ref(temporary)
+    del temporary
+    events: list[str] = []
+
+    def allocate(*args, **kwargs):
+        assert temporary_ref() is None
+        assert events == ["sync", "empty_cache"]
+        events.append("allocate")
+
+    worker = SimpleNamespace(
+        cache_config=SimpleNamespace(),
+        vllm_config=object(),
+        model_config=SimpleNamespace(enable_return_routed_experts=False),
+        model_runner=SimpleNamespace(initialize_kv_cache=allocate),
+        _maybe_get_memory_pool_context=lambda **kw: nullcontext(),
+    )
+    monkeypatch.setattr(gpu_worker, "set_current_vllm_config", lambda _: nullcontext())
+    monkeypatch.setattr(
+        gpu_worker, "ensure_kv_transfer_initialized", lambda *args: None
+    )
+    monkeypatch.setattr(
+        gpu_worker.torch.accelerator, "synchronize", lambda: events.append("sync")
+    )
+    monkeypatch.setattr(
+        gpu_worker.torch.accelerator,
+        "empty_cache",
+        lambda: events.append("empty_cache"),
+    )
+
+    gpu_worker.Worker.initialize_from_config(
+        worker,
+        SimpleNamespace(
+            num_blocks=32,
+            kv_cache_layout=None,
+            needs_kv_cache_zeroing=False,
+            hash_block_size=16,
+            cache_hit_alignment_tokens=16,
+        ),
+    )
+    assert events[-1] == "allocate"
+
 
 # The fallback reads only the sign of the measured drop and this process's torch
 # reservation; free memory is only logged, so no amount here is a device size.
@@ -424,3 +716,283 @@ def test_jit_monitor_activation_follows_enable_jit_warmup(
     calls.clear()
     gpu_worker.Worker._maybe_activate_jit_monitor(worker(False))
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "final_free_memory,expected_available_memory",
+    [(90, 75), (85, 70)],
+)
+@pytest.mark.parametrize("graph_estimate", [0, 4])
+@pytest.mark.parametrize("estimate_graphs", [False, True])
+@pytest.mark.parametrize(
+    "native_profile,final_native,overlap",
+    [
+        (None, 0, 0),  # Runners without native capture measurements retain the budget.
+        ((100, 103, 4), 103, 3),  # Persistent capture initialization.
+        ((100, 103, 4), 101, 1),  # Prepared-plan release frees part of the growth.
+        ((100, 103, 4), 100, 0),  # All native capture storage was temporary.
+        ((103, 103, 4), 107, 0),  # Bootstrap and cleanup growth are not capture cost.
+        ((100, 103, 1), 107, 1),  # The measured capture delta bounds the overlap.
+        ((100, 103, 4), 107, 3),  # Cleanup-only growth cannot increase the discount.
+    ],
+)
+def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
+    monkeypatch,
+    final_free_memory,
+    expected_available_memory,
+    graph_estimate,
+    estimate_graphs,
+    native_profile,
+    final_native,
+    overlap,
+):
+    """KV admission counts retained allocations, not released profiling blocks."""
+    events: list[object] = []
+
+    def profile_cudagraph_memory(prepare_profile_state):
+        prepare_profile_state()
+        events.append("profile_cudagraph_memory")
+        return graph_estimate
+
+    def profile_run(prepare_profile_state, *, randomize_inputs=False):
+        prepare_profile_state()
+        events.append("profile_run")
+
+    def profile_glm_dcp_attention(prepare_profile_state):
+        prepare_profile_state()
+        events.append("profile_glm_dcp_attention")
+
+    model_runner = SimpleNamespace(
+        cudagraph_native_memory_profile=native_profile,
+        model_memory_usage=0,
+        profile_run=profile_run,
+        profile_glm_dcp_attention=profile_glm_dcp_attention,
+        profile_cudagraph_memory=profile_cudagraph_memory,
+    )
+    profile_result = SimpleNamespace(
+        total_consumed=10,
+        transient_peak_headroom=5,
+        after_profile=SimpleNamespace(free_memory=90),
+        non_kv_cache_memory=15,
+    )
+
+    @contextmanager
+    def fake_memory_profiling(*args, **kwargs):
+        yield profile_result
+
+    worker = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            kv_cache_memory_bytes=None,
+            gpu_memory_utilization=0.9,
+        ),
+        model_runner=model_runner,
+        init_snapshot=SimpleNamespace(free_memory=100, total_memory=100),
+        requested_memory=90,
+        device="cuda:0",
+        model_config=SimpleNamespace(multimodal_config=None),
+        parallel_config=SimpleNamespace(),
+        _scoped_allocator_max_split=lambda **kwargs: nullcontext(),
+        randomize_dummy_inputs=False,
+        _prepare_b12x_profile_state=lambda: events.append("prepare_b12x_profile_state"),
+        _release_b12x_profile_state=lambda: events.append("release_b12x_profile_state"),
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                cudagraph_mode=gpu_worker.CUDAGraphMode.PIECEWISE,
+                cudagraph_capture_sizes=[8, 4],
+            )
+        ),
+    )
+
+    monkeypatch.setattr(gpu_worker, "maybe_apply_startup_plan", lambda worker: None)
+    monkeypatch.setenv(
+        "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", str(int(estimate_graphs))
+    )
+    monkeypatch.setattr(gpu_worker, "memory_profiling", fake_memory_profiling)
+
+    def final_snapshot(**_kwargs):
+        assert events[-3:] == ["collect", "synchronize", "empty_cache"]
+        events.append("final_snapshot")
+        return SimpleNamespace(
+            free_memory=final_free_memory, non_torch_memory=final_native
+        )
+
+    monkeypatch.setattr(gpu_worker.gc, "collect", lambda: events.append("collect"))
+    monkeypatch.setattr(
+        gpu_worker.torch.accelerator,
+        "synchronize",
+        lambda: events.append("synchronize"),
+    )
+    monkeypatch.setattr(
+        gpu_worker.torch.accelerator,
+        "empty_cache",
+        lambda: events.append("empty_cache"),
+    )
+    monkeypatch.setattr(
+        gpu_worker,
+        "MemorySnapshot",
+        final_snapshot,
+    )
+    monkeypatch.setattr(
+        gpu_worker,
+        "current_platform",
+        SimpleNamespace(is_cuda_alike=lambda: True),
+    )
+    monkeypatch.setattr(
+        gpu_worker,
+        "reserve_mm_ipc_gpu_memory",
+        lambda requested, *args: requested,
+    )
+
+    available = gpu_worker.Worker.determine_available_memory(worker)
+
+    assert events == [
+        "prepare_b12x_profile_state",
+        "profile_run",
+        "release_b12x_profile_state",
+        "prepare_b12x_profile_state",
+        "profile_glm_dcp_attention",
+        "release_b12x_profile_state",
+        "prepare_b12x_profile_state",
+        "profile_cudagraph_memory",
+        "release_b12x_profile_state",
+        "collect",
+        "synchronize",
+        "empty_cache",
+        "final_snapshot",
+    ]
+    graph_estimate -= min(overlap, graph_estimate, 90 - final_free_memory)
+    applied_graph_estimate = graph_estimate if estimate_graphs else 0
+    assert available == expected_available_memory - applied_graph_estimate
+    assert worker.peak_activation_memory == 5
+    assert worker.total_consumed == 10 + (90 - final_free_memory)
+    assert worker.cudagraph_memory_estimate == graph_estimate
+
+
+@pytest.mark.parametrize("estimated_gib", [0, 4])
+@pytest.mark.parametrize("measured_gib", [3, 7])
+def test_post_capture_recommendation_counts_measured_graph_memory_once(
+    monkeypatch, estimated_gib, measured_gib
+):
+    """The saved KV budget uses measured graph storage, not its estimate."""
+    compilation = SimpleNamespace(
+        mode=gpu_worker.CompilationMode.NONE,
+        compilation_time=0.0,
+        encoder_compilation_time=0.0,
+    )
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(compilation_config=compilation),
+        compilation_config=compilation,
+        model_runner=SimpleNamespace(
+            lora_config=None,
+            maybe_remove_all_loras=lambda config: None,
+            capture_model=lambda: measured_gib * GiB_bytes,
+        ),
+        model_config=SimpleNamespace(enforce_eager=False, seed=0),
+        parallel_config=SimpleNamespace(data_parallel_index=0),
+        cache_config=SimpleNamespace(
+            kv_cache_memory_bytes=None, gpu_memory_utilization=0.9
+        ),
+        init_snapshot=SimpleNamespace(
+            free_memory=100 * GiB_bytes, total_memory=100 * GiB_bytes
+        ),
+        requested_memory=90 * GiB_bytes,
+        total_consumed=10 * GiB_bytes,
+        peak_activation_memory=5 * GiB_bytes,
+        cudagraph_memory_estimate=estimated_gib * GiB_bytes,
+        available_kv_cache_memory_bytes=(75 - estimated_gib) * GiB_bytes,
+        use_v2_model_runner=False,
+        observability_config=SimpleNamespace(
+            jit_monitor_mode="off", jit_monitor_verbose=False
+        ),
+    )
+    saved = []
+    monkeypatch.setattr(
+        gpu_worker, "maybe_save_startup_plan", lambda w, budget: saved.append(budget)
+    )
+    monkeypatch.setattr(
+        gpu_worker, "get_pp_group", lambda: SimpleNamespace(is_last_rank=False)
+    )
+    for name in (
+        "kernel_warmup",
+        "set_random_seed",
+        "freeze_gc_heap",
+        "maybe_attach_gc_debug_callback",
+        "enable_gpu_sync_check",
+        "set_torch_threads_for_runtime",
+    ):
+        monkeypatch.setattr(gpu_worker, name, lambda *args: None)
+    monkeypatch.setattr("vllm.utils.jit_monitor.activate", lambda **kwargs: None)
+
+    worker._compile_or_warm_up_model_after_preparation = lambda: (
+        gpu_worker.Worker._compile_or_warm_up_model_after_preparation(worker)
+    )
+    worker._b12x_session = None
+    worker._get_cudagraph_capture_context = nullcontext
+    worker._maybe_activate_jit_monitor = lambda: None
+    gpu_worker.Worker.compile_or_warm_up_model(worker)
+
+    assert saved == [(90 - 10 - 5 - measured_gib) * GiB_bytes - 150 * (1 << 20)]
+
+
+def test_serving_thread_count_is_set_before_warmup(monkeypatch):
+    """Dynamo guards compiled functions on torch.get_num_threads(); dropping to
+    the serving count after warmup made the first request recompile every
+    torch.compile'd function."""
+    events: list[str] = []
+
+    def capture_model():
+        events.append("capture_model")
+        return 0
+
+    compilation = SimpleNamespace(
+        mode=gpu_worker.CompilationMode.NONE,
+        compilation_time=0.0,
+        encoder_compilation_time=0.0,
+    )
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(compilation_config=compilation),
+        compilation_config=compilation,
+        model_runner=SimpleNamespace(
+            lora_config=None,
+            maybe_remove_all_loras=lambda config: None,
+            capture_model=capture_model,
+        ),
+        model_config=SimpleNamespace(enforce_eager=False, seed=0),
+        parallel_config=SimpleNamespace(data_parallel_index=0),
+        cache_config=SimpleNamespace(kv_cache_memory_bytes=1),
+        use_v2_model_runner=False,
+        observability_config=SimpleNamespace(
+            jit_monitor_mode="off", jit_monitor_verbose=False
+        ),
+    )
+    monkeypatch.setattr(
+        gpu_worker, "get_pp_group", lambda: SimpleNamespace(is_last_rank=False)
+    )
+    for name in (
+        "set_random_seed",
+        "freeze_gc_heap",
+        "maybe_attach_gc_debug_callback",
+        "enable_gpu_sync_check",
+    ):
+        monkeypatch.setattr(gpu_worker, name, lambda *args: None)
+    monkeypatch.setattr(
+        gpu_worker,
+        "set_torch_threads_for_runtime",
+        lambda: events.append("set_torch_threads_for_runtime"),
+    )
+    monkeypatch.setattr(
+        gpu_worker, "kernel_warmup", lambda *args: events.append("kernel_warmup")
+    )
+    monkeypatch.setattr("vllm.utils.jit_monitor.activate", lambda **kwargs: None)
+
+    worker._compile_or_warm_up_model_after_preparation = lambda: (
+        gpu_worker.Worker._compile_or_warm_up_model_after_preparation(worker)
+    )
+    worker._b12x_session = None
+    worker._get_cudagraph_capture_context = nullcontext
+    worker._maybe_activate_jit_monitor = lambda: None
+    gpu_worker.Worker.compile_or_warm_up_model(worker)
+
+    assert events[0] == "set_torch_threads_for_runtime"
+    assert events.count("set_torch_threads_for_runtime") == 1
+    assert "kernel_warmup" in events and "capture_model" in events

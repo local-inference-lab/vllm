@@ -8,8 +8,38 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.utils import get_draft_load_config
-from vllm.model_executor.models.utils import PPMissingLayer
+from vllm.model_executor.models.utils import PPMissingLayer, with_draft_quantization
 from vllm.v1.worker.gpu.spec_decode.utils import get_pp_safe_draft_load_config
+
+
+def _make_eagle_draft_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
+    speculative_config = vllm_config.speculative_config
+    assert speculative_config is not None
+
+    if speculative_config.moe_backend is not None:
+        vllm_config = replace(
+            vllm_config,
+            kernel_config=replace(
+                vllm_config.kernel_config,
+                moe_backend=speculative_config.moe_backend,
+            ),
+        )
+    vllm_config = replace(
+        vllm_config,
+        attention_config=replace(
+            vllm_config.attention_config,
+            backend=speculative_config.attention_backend,
+        ),
+    )
+    if speculative_config.kv_cache_dtype is not None:
+        vllm_config = replace(
+            vllm_config,
+            cache_config=replace(
+                vllm_config.cache_config,
+                cache_dtype=speculative_config.kv_cache_dtype,
+            ),
+        )
+    return vllm_config
 
 
 def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
@@ -77,6 +107,7 @@ def maybe_share_target_embed(
 def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
     from vllm.compilation.backends import set_model_tag
 
+    vllm_config = _make_eagle_draft_vllm_config(vllm_config)
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
@@ -86,6 +117,7 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     )
     if draft_load_config is not vllm_config.load_config:
         vllm_config = replace(vllm_config, load_config=draft_load_config)
+    vllm_config = with_draft_quantization(vllm_config)
     with set_model_tag("eagle_head"):
         eagle_model = get_model(
             vllm_config=vllm_config, model_config=draft_model_config
@@ -121,11 +153,23 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
                     del sh.head
                     sh.head = target_lm_head
 
+    prepare_draft_lm_head = getattr(eagle_model, "prepare_draft_lm_head", None)
+    effective_draft_lm_head = getattr(eagle_model, "lm_head", None)
+    if prepare_draft_lm_head is not None and effective_draft_lm_head is not None:
+        prepare_draft_lm_head(effective_draft_lm_head)
+
     # MTP shares topk_indices_buffer with the target model. We update
     # every module in the draft that holds a buffer reference so that
     # the per-layer indexer and sparse-attention backends all point to
     # the target's buffer.
-    if hasattr(target_inner, "topk_indices_buffer"):
+    share_indexer_storage = getattr(eagle_model, "share_target_indexer_storage", None)
+    if share_indexer_storage is not None:
+        if (
+            get_pp_group().world_size == 1
+            and not vllm_config.parallel_config.enable_dbo
+        ):
+            share_indexer_storage(target_inner)
+    elif hasattr(target_inner, "topk_indices_buffer"):
         target_buffer = target_inner.topk_indices_buffer
         if target_buffer is not None:
             for _, module in draft_inner.named_modules():

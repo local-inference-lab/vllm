@@ -4,11 +4,14 @@
 import contextlib
 from types import SimpleNamespace
 from unittest.mock import Mock
+from weakref import ref
 
+import numpy as np
 import pytest
 import torch
 
 import vllm.v1.worker.gpu.model_runner as model_runner_module
+from vllm.forward_context import MoEPrefillMetadata
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
@@ -20,6 +23,61 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import ExecuteModelState, GPUModelRunner
+
+
+@pytest.mark.parametrize(
+    "num_tokens,has_prefill,allow_exact_prefill,expected_query_len,expected_eager",
+    [
+        (4, False, False, 4, False),
+        (4, True, False, None, False),
+        (100, True, False, None, True),
+        (4096, True, True, 4096, False),
+        (4096, True, False, None, True),
+    ],
+)
+def test_prefill_dispatch_respects_model_decode_bound_and_exact_prefill_graph(
+    monkeypatch,
+    num_tokens,
+    has_prefill,
+    allow_exact_prefill,
+    expected_query_len,
+    expected_eager,
+):
+    runner = SimpleNamespace(
+        gather_batch_req_state=lambda *args: (
+            SimpleNamespace(num_tokens=num_tokens, has_prefill=has_prefill),
+            None,
+        ),
+        pcp_manager=None,
+        lora_config=None,
+        is_encoder_decoder=False,
+        model_state=SimpleNamespace(
+            max_cudagraph_query_len=32,
+            can_use_single_request_prefill_graph=lambda *args: allow_exact_prefill,
+        ),
+        cudagraph_manager=None,
+        dp_size=1,
+        dp_rank=0,
+        parallel_config=SimpleNamespace(),
+        ubatch_runner=None,
+        decode_query_len=1,
+    )
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"request": num_tokens},
+        total_num_scheduled_tokens=num_tokens,
+    )
+
+    class DispatchReached(Exception):
+        pass
+
+    def dispatch(*args, **kwargs):
+        assert kwargs["max_query_len"] == expected_query_len
+        assert kwargs["need_eager"] == expected_eager
+        raise DispatchReached
+
+    monkeypatch.setattr(model_runner_module, "dispatch_cg_and_sync_dp", dispatch)
+    with pytest.raises(DispatchReached):
+        GPUModelRunner.execute_model(runner, scheduler_output, dummy_run=True)
 
 
 def test_non_last_pp_rank_uses_global_batch_for_sample_feedback():
@@ -59,6 +117,81 @@ def test_non_last_pp_rank_uses_global_batch_for_sample_feedback():
     runner.pcp_manager.restore_for_sampling.assert_not_called()
 
 
+@pytest.mark.parametrize("draft_tokens", [0, 1, 3, 5, 7])
+def test_moe_prefill_metadata_uses_original_prompt_in_request_state_order(draft_tokens):
+    """Recomputed completion tokens and speculative rows must retain A16."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner._b12x_a4_prefill_enabled = True
+    runner.req_states = SimpleNamespace(
+        prompt_len=SimpleNamespace(np=np.array([100, 2, 80])),
+    )
+    query = draft_tokens + 1
+    batch = SimpleNamespace(
+        num_reqs=3,
+        num_tokens_after_padding=query + 16,
+        idx_mapping_np=np.array([2, 1, 0]),
+        query_start_loc_np=np.array([0, query, query + 2, query + 10]),
+        num_computed_tokens_np=np.array([100, 0, 98]),
+        prefill_len_np=np.array([120, 2, 110]),
+    )
+    assert runner._build_moe_prefill_metadata(batch) == MoEPrefillMetadata(
+        query + 16, ((query, query + 4),)
+    )
+    runner._b12x_a4_prefill_enabled = False
+    assert runner._build_moe_prefill_metadata(batch) is None
+
+
+@pytest.mark.parametrize("recovery", [False, True])
+@pytest.mark.parametrize("logits_only", [False, True])
+def test_boundary_capture_uses_recovered_accepted_state(
+    monkeypatch, recovery, logits_only
+):
+    """Trim before export; logits-only restores reuse their existing checkpoint."""
+    events = []
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.is_last_pp_rank = False
+    runner.cache_config = SimpleNamespace(use_kda_recoverssm=recovery)
+    runner.req_states = SimpleNamespace(
+        num_computed_tokens=SimpleNamespace(gpu=torch.tensor([19])),
+        last_sampled_tokens=None,
+        all_token_ids=SimpleNamespace(gpu=None),
+        total_len=SimpleNamespace(gpu=None),
+    )
+    sampled = torch.tensor([4])
+
+    def update(*args):
+        # A restored prompt can terminate after sampling its first token.
+        sampled.fill_(1 if logits_only else 2)
+        events.append("trim")
+
+    def commit(*args):
+        assert not logits_only
+        assert sampled.item() == 2
+        events.append("commit")
+
+    def capture(*args, accepted_state_committed=False):
+        assert accepted_state_committed is recovery
+        events.append("capture")
+
+    monkeypatch.setattr(model_runner_module, "post_update", update)
+    runner.model_state = SimpleNamespace(postprocess_state=commit)
+    runner.boundary_checkpoint_state = SimpleNamespace(capture_mamba=capture)
+    runner.postprocess_sampled(
+        torch.tensor([0]),
+        torch.tensor([[1, 2, 3, 4]]),
+        sampled,
+        torch.tensor([0]),
+        boundary_capture=None if logits_only else torch.empty(3, 1, 3),
+        logits_only=logits_only,
+    )
+    if logits_only:
+        assert events == ["trim"]
+    else:
+        assert events == (
+            ["trim", "commit", "capture"] if recovery else ["trim", "capture", "commit"]
+        )
+
+
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.max_model_len = 262144
@@ -82,6 +215,7 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
         num_new_sampled_tokens_per_step=1,
     )
     runner.speculator = None
+    runner.speculative_config = None
     runner.req_states = []
     runner.input_buffers = SimpleNamespace(query_start_loc=None)
     runner.vocab_size = 1
@@ -147,7 +281,9 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
         runner.initialize_kv_cache(kv_cache_config)
 
     assert captured["max_num_blocks_per_group"] == [1, 1]
-    assert captured["slot_mapping_enabled"] == [False, True]
+    # The worker maps the ring into its block; QSA still builds its own slots.
+    assert captured["slot_mapping_enabled"] == [True, True]
+    assert captured["slot_mapping_circular"] == [True, False]
 
 
 @pytest.mark.parametrize(
@@ -200,6 +336,7 @@ def test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table(
     runner = SimpleNamespace(
         max_model_len=max_model_len,
         is_encoder_decoder=False,
+        dcp_size=dcp_size,
         vllm_config=vllm_config,
         parallel_config=parallel_config,
     )
@@ -357,3 +494,423 @@ def test_get_drafter_hidden_states_tolerates_missing_target_buffer(target_buffer
         assert torch.equal(out, buffer[:4])
     else:
         assert out is hidden_states
+
+
+@pytest.mark.parametrize("cudagraph_metrics", [False, True])
+def test_boundary_logits_only_dispatches_pending_cache_tasks(
+    monkeypatch, cudagraph_metrics
+):
+    """A restored prompt can share a step with another request's cache store."""
+    checkpoint = SimpleNamespace(num_tokens=4, auxiliary_block_ids=[3])
+    hidden_states = torch.ones(1, 8)
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        **{
+            name: torch.empty(1, dtype=torch.int32)
+            for name in (
+                "positions",
+                "input_ids",
+                "seq_lens",
+                "seq_lens_cpu_upper_bound",
+            )
+        },
+    )
+    dispatched_tasks = []
+    dp_sync = object()
+    cudagraph_stats = object()
+    scheduler_output = SimpleNamespace(
+        boundary_logits_only=True,
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                boundary_checkpoint=checkpoint, prefill_token_ids=[1, 2, 3, 4]
+            )
+        ],
+        total_num_scheduled_tokens=1,
+        num_scheduled_tokens={"restored-request": 1},
+        finished_req_ids=set(),
+        kv_connector_metadata=["store-another-request"],
+        resolve_num_spec_tokens_to_schedule=lambda _: 0,
+    )
+    runner = SimpleNamespace(
+        **{
+            name: lambda *args: None
+            for name in (
+                "update_pp_decode_requests",
+                "finish_requests",
+                "free_states",
+                "add_requests",
+                "update_requests",
+            )
+        },
+        block_tables=SimpleNamespace(apply_staged_writes=lambda: None),
+        boundary_checkpoint_state=SimpleNamespace(
+            get_hidden_states=lambda _: hidden_states
+        ),
+        aux_output_connector=None,
+        kv_connector=SimpleNamespace(
+            pre_forward=lambda output: dispatched_tasks.extend(
+                output.kv_connector_metadata
+            )
+        ),
+        speculator=None,
+        model_state=SimpleNamespace(),
+        lora_config=None,
+        is_encoder_decoder=False,
+        dp_size=1,
+        dp_rank=0,
+        pcp_manager=None,
+        ubatch_runner=None,
+        parallel_config=SimpleNamespace(),
+        observability_config=SimpleNamespace(cudagraph_metrics=cudagraph_metrics),
+        num_speculative_steps=0,
+        decode_query_len=1,
+        cudagraph_manager=None,
+        gather_batch_req_state=lambda *args: (
+            SimpleNamespace(num_tokens=1, has_prefill=False),
+            1,
+        ),
+        prepare_inputs=lambda *args: input_batch,
+        prepare_attn=lambda *args: pytest.fail("logits-only must skip attention"),
+        draft_tokens_handler=SimpleNamespace(set_consumed_draft_tokens=lambda *a: None),
+        req_states=SimpleNamespace(draft_tokens=None),
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "dispatch_cg_and_sync_dp",
+        lambda *args, **kwargs: (SimpleNamespace(num_tokens=1), dp_sync),
+    )
+    monkeypatch.setattr(
+        model_runner_module, "make_cudagraph_stats", lambda *args: cudagraph_stats
+    )
+
+    assert GPUModelRunner.execute_model(runner, scheduler_output) is None
+
+    assert dispatched_tasks == ["store-another-request"]
+    assert runner.execute_model_state.boundary_logits_only
+    assert runner.execute_model_state.hidden_states is hidden_states
+    assert runner.execute_model_state.dp_sync is dp_sync
+    assert runner.execute_model_state.cudagraph_stats is (
+        cudagraph_stats if cudagraph_metrics else None
+    )
+    assert input_batch.positions.item() == 3
+
+
+@pytest.mark.parametrize("failure_stage", [None, "init", "prepare", "forward"])
+def test_glm_dcp_attention_profile_uses_single_request_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str | None,
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model_config = SimpleNamespace(
+        architecture="Glm5NextForConditionalGeneration"
+    )
+    runner.dcp_size = 4
+    runner.cp_interleave = 4
+    runner.max_num_tokens = 4096
+    events: list[object] = []
+
+    def initialize(_, *, num_blocks):
+        assert num_blocks == 1
+        events.append("init-kv")
+        if failure_stage == "init":
+            raise RuntimeError("expected DCP profile failure")
+
+    def prepare():
+        events.append("prepare")
+        if failure_stage == "prepare":
+            raise RuntimeError("expected DCP profile failure")
+
+    monkeypatch.setattr(
+        model_runner_module,
+        "_init_minimal_kv_cache_for_profiling",
+        initialize,
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "_teardown_profiling_state",
+        lambda _: events.append("cleanup"),
+    )
+
+    def dummy_run(*args, **kwargs):
+        events.append(("dummy-run", args, kwargs))
+        if failure_stage == "forward":
+            raise RuntimeError("expected DCP profile failure")
+        return torch.empty(1), torch.empty(1)
+
+    runner._dummy_run = dummy_run
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
+
+    if failure_stage is not None:
+        with pytest.raises(RuntimeError, match="expected DCP profile failure"):
+            runner.profile_glm_dcp_attention(prepare)
+    else:
+        runner.profile_glm_dcp_attention(prepare)
+
+    assert events[0] == "init-kv"
+    assert events[-1] == "cleanup"
+    if failure_stage == "init":
+        assert events == ["init-kv", "cleanup"]
+        return
+    assert events[1] == "prepare"
+    if failure_stage == "prepare":
+        assert events == ["init-kv", "prepare", "cleanup"]
+        return
+    assert events[2] == (
+        "dummy-run",
+        (4096,),
+        {
+            "context_len": 16,
+            "skip_eplb": True,
+            "is_profile": True,
+            "single_request_prefill": True,
+            "profile_all_kv_cache_groups": True,
+        },
+    )
+    if failure_stage is None:
+        assert events[-2] == "sync"
+
+
+@pytest.mark.parametrize(
+    ("architecture", "dcp_size"),
+    [("OtherArchitecture", 4), ("Glm5NextForConditionalGeneration", 1)],
+)
+def test_glm_dcp_attention_profile_skips_irrelevant_configurations(
+    monkeypatch: pytest.MonkeyPatch,
+    architecture: str,
+    dcp_size: int,
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model_config = SimpleNamespace(architecture=architecture)
+    runner.dcp_size = dcp_size
+    initialized = False
+
+    def record_initialization(_):
+        nonlocal initialized
+        initialized = True
+
+    monkeypatch.setattr(
+        model_runner_module,
+        "_init_minimal_kv_cache_for_profiling",
+        record_initialization,
+    )
+
+    runner.profile_glm_dcp_attention()
+
+    assert not initialized
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "DeepseekV4ForCausalLM",
+        "DeepseekV4ForConditionalGeneration",
+        "DeepseekV41ForCausalLM",
+    ],
+)
+@pytest.mark.parametrize(
+    ("init_fails", "dummy_run_fails"),
+    [(False, False), (False, True), (True, False)],
+)
+def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+    architecture: str,
+    init_fails: bool,
+    dummy_run_fails: bool,
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model_config = SimpleNamespace(architecture=architecture)
+    runner.max_num_tokens = 4096
+    events: list[object] = []
+
+    def init_kv(_, *, num_blocks=None):
+        events.append(("init-kv", num_blocks))
+        if init_fails:
+            raise RuntimeError("expected DeepSeek V4 KV initialization failure")
+
+    monkeypatch.setattr(
+        model_runner_module, "_init_minimal_kv_cache_for_profiling", init_kv
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "_teardown_profiling_state",
+        lambda _: events.append("cleanup"),
+    )
+
+    def dummy_run(*args, **kwargs):
+        events.append(("dummy-run", args, kwargs))
+        if dummy_run_fails:
+            raise RuntimeError("expected DeepSeek V4 profile failure")
+        return torch.empty(1), torch.empty(1)
+
+    runner._dummy_run = dummy_run
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
+
+    prepare = lambda: events.append("prepare")
+
+    if init_fails:
+        with pytest.raises(
+            RuntimeError, match="expected DeepSeek V4 KV initialization failure"
+        ):
+            runner._profile_deepseek_v4_attention(prepare)
+    elif dummy_run_fails:
+        with pytest.raises(RuntimeError, match="expected DeepSeek V4 profile failure"):
+            runner._profile_deepseek_v4_attention(prepare)
+    else:
+        runner._profile_deepseek_v4_attention(prepare)
+
+    assert events[0] == ("init-kv", 1)
+    if init_fails:
+        assert events == [("init-kv", 1), "cleanup"]
+    else:
+        assert events[1] == "prepare"
+        assert events[2] == (
+            "dummy-run",
+            (4096,),
+            {
+                "skip_eplb": True,
+                "is_profile": True,
+                "single_request_prefill": True,
+                "profile_all_kv_cache_groups": True,
+            },
+        )
+    assert events[-1] == "cleanup"
+    if not init_fails and not dummy_run_fails:
+        assert events[-2] == "sync"
+
+
+def test_deepseek_v4_attention_profile_skips_other_architectures(monkeypatch):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model_config = SimpleNamespace(architecture="OtherArchitecture")
+    initialized = False
+
+    def record_initialization(_):
+        nonlocal initialized
+        initialized = True
+
+    monkeypatch.setattr(
+        model_runner_module,
+        "_init_minimal_kv_cache_for_profiling",
+        record_initialization,
+    )
+
+    runner._profile_deepseek_v4_attention()
+
+    assert not initialized
+
+
+def test_profile_run_releases_generic_outputs_before_deepseek_profile(
+    monkeypatch, workspace_init
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.supports_mm_inputs = False
+    runner.max_num_tokens = 4096
+    runner.is_last_pp_rank = False
+    runner.model = torch.nn.Module()
+    runner.speculator = None
+    runner._draft_workspace_lane = 1
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    events: list[object] = []
+    output_refs: list[ref] = []
+
+    class ProfileOutput:
+        pass
+
+    def dummy_run(*args, **kwargs):
+        events.append(("dummy-run", args, kwargs))
+        outputs = (ProfileOutput(), ProfileOutput())
+        output_refs.extend(ref(output) for output in outputs)
+        return outputs
+
+    def profile_attention(prepare_profile_state=None):
+        assert all(output_ref() is None for output_ref in output_refs)
+        events.append("profile-attention")
+
+    runner._dummy_run = dummy_run
+    runner._profile_deepseek_v4_attention = profile_attention
+    runner.reset_encoder_cache = lambda: events.append("reset-encoder-cache")
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
+
+    runner.profile_run()
+
+    assert events == [
+        (
+            "dummy-run",
+            (4096,),
+            {"skip_attn": True, "is_profile": True, "randomize_inputs": False},
+        ),
+        "sync",
+        "profile-attention",
+        "reset-encoder-cache",
+    ]
+
+
+@pytest.mark.parametrize("num_speculative_steps", [0, 2])
+def test_pipeline_drafts_do_not_depend_on_boundary_checkpoints(
+    monkeypatch, num_speculative_steps
+):
+    from unittest.mock import Mock
+
+    batch = SimpleNamespace(
+        req_ids=["request"],
+        num_reqs=1,
+        idx_mapping=torch.tensor([0]),
+        query_start_loc=torch.tensor([0, 1]),
+        num_draft_tokens_per_req=None,
+    )
+    states = SimpleNamespace(
+        draft_tokens=torch.tensor([[3, 4]]),
+        all_token_ids=SimpleNamespace(gpu=None),
+        num_computed_tokens=SimpleNamespace(gpu=None),
+        prompt_len=SimpleNamespace(np=None),
+    )
+    pp = SimpleNamespace(broadcast=Mock(), broadcast_drafts=Mock())
+    sampler_output = SimpleNamespace(sampled_token_ids=torch.tensor([[1]]))
+    runner = SimpleNamespace(
+        execute_model_state=model_runner_module.ExecuteModelState(
+            input_batch=batch,
+            attn_metadata=None,
+            slot_mappings_by_layer=None,
+            hidden_states=torch.ones(1, 8),
+            aux_hidden_states=None,
+            dp_sync=None,
+            finished_req_ids=set(),
+            ec_connector_output=None,
+            cudagraph_stats=None,
+            num_spec_tokens_to_schedule=0,
+        ),
+        is_last_pp_rank=True,
+        pcp_manager=None,
+        pp_handler=pp,
+        sample=lambda *args: (sampler_output, torch.tensor([1]), torch.tensor([0])),
+        prompt_logprobs_worker=SimpleNamespace(
+            compute_prompt_logprobs=lambda *a: {},
+            compute_prompt_token_id_logprobs=lambda *a: {},
+        ),
+        aux_output_connector=None,
+        model=SimpleNamespace(compute_logits=None),
+        req_states=states,
+        adaptive_verification=None,
+        boundary_checkpoint_state=None,
+        main_stream=None,
+        output_copy_stream=None,
+        check_ep_fault=False,
+        speculator=None,
+        num_speculative_steps=num_speculative_steps,
+        device=torch.device("cpu"),
+        postprocess_sampled=Mock(),
+        block_tables=None,
+        draft_tokens_handler=SimpleNamespace(set_draft_tokens=Mock()),
+        kv_connector=SimpleNamespace(post_forward=lambda *a: None),
+        eplb=SimpleNamespace(step=Mock()),
+    )
+    monkeypatch.setattr(model_runner_module, "AsyncOutput", lambda **kwargs: kwargs)
+
+    GPUModelRunner.sample_tokens(runner, None)
+
+    pp.broadcast.assert_called_once()
+    if num_speculative_steps:
+        pp.broadcast_drafts.assert_called_once_with(states.draft_tokens, batch)
+        runner.draft_tokens_handler.set_draft_tokens.assert_called_once()
+    else:
+        pp.broadcast_drafts.assert_not_called()
+        runner.draft_tokens_handler.set_draft_tokens.assert_not_called()

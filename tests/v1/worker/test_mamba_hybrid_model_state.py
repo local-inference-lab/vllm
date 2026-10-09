@@ -327,6 +327,134 @@ def test_chunked_prefill_tail_of_two_or_three_tokens_keeps_the_sentinel(
     assert metadata.num_decode_draft_tokens_cpu.tolist() == [-1, -1]
 
 
+def test_reset_kv_cache_state_recreates_align_context(monkeypatch) -> None:
+    import vllm.v1.worker.gpu.model_states.mamba_hybrid as state_module
+
+    state = object.__new__(MambaHybridModelState)
+    state._align_mode = True
+    state._mamba_ctx = object()
+    state._mamba_state_copy_funcs = object()
+    state._mamba_group_ids = [1]
+    state._mamba_spec = object()
+    state.recoverssm = RecoverSSMState()
+    state.recoverssm._step = (object(),)
+    state.model = object()
+    state.max_num_reqs = 2
+    state.device = torch.device("cpu")
+    new_cache = torch.empty(2, 1)
+    forward_context = {"layer": SimpleNamespace(kv_cache=(new_cache,))}
+    state.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context=forward_context)
+    )
+    kv_cache_config = object()
+    unused_block_table = torch.empty(2, 1, dtype=torch.int32)
+    new_block_table = torch.empty(2, 1, dtype=torch.int32)
+    copy_funcs = object()
+    initialized_with: list[tuple[object, object, object]] = []
+
+    class _Context:
+        is_initialized = False
+
+        def initialize_from_forward_context(
+            self, config, context, funcs, block_tables, input_block_tables
+        ) -> None:
+            initialized_with.append((config, context, block_tables[0]))
+            assert funcs is copy_funcs
+            assert input_block_tables == [new_block_table]
+            assert context["layer"].kv_cache[0] is new_cache
+            self.is_initialized = True
+
+    created_context = _Context()
+    state.model = SimpleNamespace(get_mamba_state_copy_funcs=lambda types: copy_funcs)
+    monkeypatch.setattr(
+        state_module,
+        "get_mamba_groups",
+        lambda config: [SimpleNamespace(mamba_type="gdn")],
+    )
+    monkeypatch.setattr(
+        state_module, "validate_mamba_state_copy_funcs", lambda groups, funcs: None
+    )
+    monkeypatch.setattr(
+        state_module.MambaSpecDecodeGPUContext,
+        "create",
+        lambda **_kwargs: created_context,
+    )
+
+    previous_group_ids = state._mamba_group_ids
+    previous_spec = state._mamba_spec
+    state.reset_kv_cache_state()
+
+    assert state._mamba_ctx is None
+    assert state._mamba_state_copy_funcs is None
+    assert state._aligned_metadata_ctx is None
+    assert state._aligned_metadata_groups is None
+    assert state._mamba_group_ids is previous_group_ids
+    assert state._mamba_spec is previous_spec
+    assert state.recoverssm._step is None
+
+    state.initialize_kv_cache(
+        kv_cache_config,
+        SimpleNamespace(
+            block_tables=[
+                SimpleNamespace(gpu=table)
+                for table in (unused_block_table, new_block_table)
+            ],
+            input_block_tables=[unused_block_table, new_block_table],
+        ),
+    )
+
+    assert state._mamba_ctx is created_context
+    assert initialized_with == [(kv_cache_config, forward_context, new_block_table)]
+
+
+def test_aligned_metadata_reuses_views_and_rebinds_with_the_cache() -> None:
+    state = object.__new__(MambaHybridModelState)
+    state._aligned_metadata_groups = None
+    state._aligned_metadata_ctx = None
+    state._aligned_metadata_builders = []
+    state._get_mamba_group_info = lambda _: ([1, 2], None)
+    builders = [SimpleNamespace(mamba_aligned_state_indices=None) for _ in range(2)]
+    groups = [
+        [SimpleNamespace(get_metadata_builder=Mock(return_value=builder))]
+        for builder in builders
+    ]
+    attn_groups = [[], *groups]
+    indices = torch.arange(6, dtype=torch.int32).reshape(2, 3, 1)
+    ctx = SimpleNamespace(
+        aligned_state_indices=indices,
+        compute_aligned_state_indices=Mock(),
+    )
+    state._mamba_ctx = ctx
+    seq_lens = torch.tensor([10, 20, 0], dtype=torch.int32)
+    for num_reqs in (3, 2):
+        state._prepare_aligned_state_indices(seq_lens, num_reqs, attn_groups, None, ())
+        if num_reqs == 3:
+            views = [builder.mamba_aligned_state_indices for builder in builders]
+        indices.add_(10)
+        for index, builder in enumerate(builders):
+            assert builder.mamba_aligned_state_indices is views[index]
+            torch.testing.assert_close(
+                builder.mamba_aligned_state_indices, indices[index]
+            )
+    for group in groups:
+        group[0].get_metadata_builder.assert_called_once_with(0)
+    assert ctx.compute_aligned_state_indices.call_count == 2
+
+    replacement = torch.full_like(indices, 42)
+    ctx = SimpleNamespace(
+        aligned_state_indices=replacement,
+        compute_aligned_state_indices=Mock(),
+    )
+    state._mamba_ctx = ctx
+    state._prepare_aligned_state_indices(seq_lens, 3, attn_groups, None, ())
+    for index, builder in enumerate(builders):
+        assert builder.mamba_aligned_state_indices is not views[index]
+        torch.testing.assert_close(
+            builder.mamba_aligned_state_indices, replacement[index]
+        )
+        torch.testing.assert_close(views[index], indices[index])
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
 @pytest.mark.parametrize(("num_sampled", "expected_value"), [(0, 1), (3, 3)])
 def test_postprocess_state_scalar_with_int32_mapping(

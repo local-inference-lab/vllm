@@ -5,6 +5,7 @@ import gc
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
+from weakref import ref
 
 import numpy as np
 import pytest
@@ -25,6 +26,7 @@ from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm.forward_context import MoEPrefillMetadata
 from vllm.lora.layers import LoRAMappingType
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.attention import Attention
@@ -145,6 +147,85 @@ def get_vllm_config():
         parallel_config=parallel_config,
     )
     return vllm_config
+
+
+@pytest.mark.parametrize("draft_tokens", [0, 1, 3, 5, 7])
+@pytest.mark.parametrize("prefill_tokens", [1, 2, 4, 16])
+def test_moe_prefill_metadata_uses_request_phase_with_graph_padding(
+    draft_tokens: int, prefill_tokens: int
+) -> None:
+    runner = object.__new__(GPUModelRunner)
+    runner._b12x_a4_prefill_enabled = True
+    decode_tokens = draft_tokens + 1
+    runner.input_batch = SimpleNamespace(
+        num_reqs=3,
+        num_computed_tokens_cpu=np.array([100, 50, 75]),
+        num_prompt_tokens=np.array([100, 100, 75]),
+    )
+    runner.query_start_loc = SimpleNamespace(
+        np=np.array(
+            [
+                0,
+                decode_tokens,
+                decode_tokens + prefill_tokens,
+                2 * decode_tokens + prefill_tokens,
+            ]
+        )
+    )
+    padded_tokens = 2 * decode_tokens + prefill_tokens + 8
+    assert runner._build_moe_prefill_metadata(padded_tokens) == MoEPrefillMetadata(
+        padded_tokens, ((decode_tokens, decode_tokens + prefill_tokens),)
+    )
+    runner._b12x_a4_prefill_enabled = False
+    assert runner._build_moe_prefill_metadata(padded_tokens) is None
+
+
+def test_moe_prefill_metadata_preserves_dcp_interleaving() -> None:
+    from tests.v1.attention.test_batch_reordering import (
+        MockInputBatch,
+        MockSchedulerOutput,
+    )
+    from vllm.v1.attention.backends.utils import (
+        reorder_batch_to_split_decodes_and_prefills,
+    )
+
+    requests = [(1, 50, 100), (6, 100, 100), (10, 50, 100), (6, 100, 100), (2, 0, 2)]
+    batch = MockInputBatch(
+        list(range(5)),
+        np.array([r[1] for r in requests]),
+        np.array([r[2] for r in requests]),
+    )
+    schedule = MockSchedulerOutput({i: r[0] for i, r in enumerate(requests)})
+    reorder_batch_to_split_decodes_and_prefills(batch, schedule, decode_threshold=1)
+    batch.num_reqs = len(batch.req_ids)
+    runner = object.__new__(GPUModelRunner)
+    runner._b12x_a4_prefill_enabled = True
+    runner.input_batch = batch
+    runner.query_start_loc = SimpleNamespace(
+        np=np.concatenate(
+            (
+                [0],
+                np.cumsum([schedule.num_scheduled_tokens[i] for i in batch.req_ids]),
+            )
+        )
+    )
+    assert runner._build_moe_prefill_metadata(32) == MoEPrefillMetadata(
+        32, ((0, 1), (7, 17), (23, 25))
+    )
+
+
+def test_moe_prefill_metadata_keeps_completion_rows_a16_after_prompt_boundary():
+    runner = object.__new__(GPUModelRunner)
+    runner._b12x_a4_prefill_enabled = True
+    runner.input_batch = SimpleNamespace(
+        num_reqs=2,
+        num_computed_tokens_cpu=np.array([98, 0]),
+        num_prompt_tokens=np.array([100, 3]),
+    )
+    runner.query_start_loc = SimpleNamespace(np=np.array([0, 8, 11]))
+    assert runner._build_moe_prefill_metadata(16) == MoEPrefillMetadata(
+        16, ((0, 2), (8, 11))
+    )
 
 
 @pytest.mark.parametrize("gc_initially_enabled", [True, False])
@@ -1989,3 +2070,281 @@ def test_mamba_cache_raises_when_max_num_seqs_exceeds_blocks():
 
         with pytest.raises(ValueError, match="max_num_seqs"):
             runner.initialize_kv_cache(kv_cache_config)
+
+
+@pytest.mark.parametrize("failure_stage", [None, "init", "prepare", "forward"])
+def test_glm_dcp_attention_profile_uses_single_request_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str | None,
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model_config = SimpleNamespace(
+        architecture="Glm5NextForConditionalGeneration"
+    )
+    runner.dcp_world_size = 4
+    runner.vllm_config = object()
+    runner.max_num_tokens = 4096
+    events: list[object] = []
+
+    def initialize(*, num_blocks):
+        assert num_blocks == 1
+        events.append("init-kv")
+        if failure_stage == "init":
+            raise RuntimeError("expected DCP profile failure")
+
+    def prepare():
+        events.append("prepare")
+        if failure_stage == "prepare":
+            raise RuntimeError("expected DCP profile failure")
+
+    runner._init_minimal_kv_cache_for_profiling = initialize
+
+    def dummy_run(*args, **kwargs):
+        events.append(("dummy-run", args, kwargs))
+        if failure_stage == "forward":
+            raise RuntimeError("expected DCP profile failure")
+        return torch.empty(1), torch.empty(1)
+
+    runner._dummy_run = dummy_run
+    runner._sync_device = lambda: events.append("sync")
+    runner._cleanup_profiling_kv_cache = lambda: events.append("cleanup")
+
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "set_current_vllm_config",
+        lambda _: nullcontext(),
+    )
+
+    if failure_stage is not None:
+        with pytest.raises(RuntimeError, match="expected DCP profile failure"):
+            runner.profile_glm_dcp_attention(prepare)
+    else:
+        runner.profile_glm_dcp_attention(prepare)
+
+    assert events[0] == "init-kv"
+    assert events[-1] == "cleanup"
+    if failure_stage == "init":
+        assert events == ["init-kv", "cleanup"]
+        return
+    assert events[1] == "prepare"
+    if failure_stage == "prepare":
+        assert events == ["init-kv", "prepare", "cleanup"]
+        return
+    assert events[2] == (
+        "dummy-run",
+        (4096,),
+        {
+            "force_attention": True,
+            "skip_eplb": True,
+            "is_profile": True,
+            "single_request_prefill": True,
+        },
+    )
+    if failure_stage is None:
+        assert events[-2] == "sync"
+
+
+def test_glm_dcp_attention_profile_skips_non_glm_and_dcp1():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model_config = SimpleNamespace(architecture="OtherArchitecture")
+    runner.dcp_world_size = 4
+    runner._init_minimal_kv_cache_for_profiling = Mock()
+    runner.profile_glm_dcp_attention()
+    runner._init_minimal_kv_cache_for_profiling.assert_not_called()
+
+    runner.model_config.architecture = "Glm5NextForConditionalGeneration"
+    runner.dcp_world_size = 1
+    runner.profile_glm_dcp_attention()
+    runner._init_minimal_kv_cache_for_profiling.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "DeepseekV4ForCausalLM",
+        "DeepseekV4ForConditionalGeneration",
+        "DeepseekV41ForCausalLM",
+    ],
+)
+@pytest.mark.parametrize(
+    ("init_fails", "dummy_run_fails"),
+    [(False, False), (False, True), (True, False)],
+)
+def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+    architecture: str,
+    init_fails: bool,
+    dummy_run_fails: bool,
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model_config = SimpleNamespace(architecture=architecture)
+    runner.vllm_config = object()
+    runner.max_num_tokens = 4096
+    events: list[object] = []
+
+    def init_kv(*, num_blocks=None):
+        events.append(("init-kv", num_blocks))
+        if init_fails:
+            raise RuntimeError("expected DeepSeek V4 KV initialization failure")
+
+    runner._init_minimal_kv_cache_for_profiling = init_kv
+
+    def dummy_run(*args, **kwargs):
+        events.append(("dummy-run", args, kwargs))
+        if dummy_run_fails:
+            raise RuntimeError("expected DeepSeek V4 profile failure")
+        return torch.empty(1), torch.empty(1)
+
+    runner._dummy_run = dummy_run
+    runner._sync_device = lambda: events.append("sync")
+    runner._cleanup_profiling_kv_cache = lambda: events.append("cleanup")
+
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "set_current_vllm_config",
+        lambda _: nullcontext(),
+    )
+
+    prepare = lambda: events.append("prepare")
+
+    if init_fails:
+        with pytest.raises(
+            RuntimeError, match="expected DeepSeek V4 KV initialization failure"
+        ):
+            runner._profile_deepseek_v4_attention(prepare)
+    elif dummy_run_fails:
+        with pytest.raises(RuntimeError, match="expected DeepSeek V4 profile failure"):
+            runner._profile_deepseek_v4_attention(prepare)
+    else:
+        runner._profile_deepseek_v4_attention(prepare)
+
+    assert events[0] == ("init-kv", 1)
+    if init_fails:
+        assert events == [("init-kv", 1), "cleanup"]
+    else:
+        assert events[1] == "prepare"
+        assert events[2] == (
+            "dummy-run",
+            (4096,),
+            {
+                "force_attention": True,
+                "skip_eplb": True,
+                "is_profile": True,
+                "single_request_prefill": True,
+            },
+        )
+    assert events[-1] == "cleanup"
+    if not init_fails and not dummy_run_fails:
+        assert events[-2] == "sync"
+
+
+def test_deepseek_v4_attention_profile_skips_other_architectures():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model_config = SimpleNamespace(architecture="OtherArchitecture")
+    runner._init_minimal_kv_cache_for_profiling = Mock()
+
+    runner._profile_deepseek_v4_attention()
+
+    runner._init_minimal_kv_cache_for_profiling.assert_not_called()
+
+
+def test_profile_run_releases_generic_outputs_before_deepseek_profile(
+    monkeypatch, workspace_init
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.supports_mm_inputs = False
+    runner.max_num_tokens = 4096
+    runner.is_pooling_model = False
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    events: list[object] = []
+    output_refs: list[ref] = []
+
+    class ProfileOutput:
+        pass
+
+    def dummy_run(*args, **kwargs):
+        events.append(("dummy-run", args, kwargs))
+        outputs = (ProfileOutput(), ProfileOutput())
+        output_refs.extend(ref(output) for output in outputs)
+        return outputs
+
+    def profile_attention(prepare_profile_state=None):
+        assert all(output_ref() is None for output_ref in output_refs)
+        events.append("profile-attention")
+
+    runner._dummy_run = dummy_run
+    runner._profile_deepseek_v4_attention = profile_attention
+    runner._sync_device = lambda: events.append("sync")
+    runner.encoder_cache = SimpleNamespace(
+        clear=lambda: events.append("clear-encoder-cache")
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=False),
+    )
+
+    runner.profile_run()
+
+    assert events == [
+        ("dummy-run", (4096,), {"is_profile": True}),
+        "sync",
+        "profile-attention",
+        "clear-encoder-cache",
+    ]
+
+
+class TestInitFp8KvScalesHybridModels:
+    """Verify init_fp8_kv_scales handles heterogeneous kv_caches entries.
+
+    Hybrid models (Mamba, DeltaNet) store per-layer state as a list of tensors
+    rather than a single tensor. init_fp8_kv_scales must iterate both forms.
+    """
+
+    @staticmethod
+    def _make_runner_stub(kv_caches):
+        runner = Mock(spec=GPUModelRunner)
+        runner.cache_config = SimpleNamespace(cache_dtype="fp8_e4m3")
+        runner.kv_caches = kv_caches
+        runner.compilation_config = SimpleNamespace(static_forward_context={})
+        runner.init_fp8_kv_scales = GPUModelRunner.init_fp8_kv_scales.__get__(
+            runner, GPUModelRunner
+        )
+        return runner
+
+    def test_zeroes_both_tensor_and_list_entries(self):
+        single_tensor = torch.ones(4, 8)
+        list_tensors = [torch.ones(2, 4), torch.ones(3, 6)]
+
+        runner = self._make_runner_stub([single_tensor, list_tensors])
+        runner.init_fp8_kv_scales()
+
+        assert (single_tensor == 0).all()
+        assert all((t == 0).all() for t in list_tensors)
+
+    def test_skips_none_entries(self):
+        tensor = torch.ones(4, 8)
+        runner = self._make_runner_stub([None, tensor, None])
+        runner.init_fp8_kv_scales()
+
+        assert (tensor == 0).all()
+
+    def test_noop_when_kv_cache_not_quantized(self):
+        tensor = torch.ones(4, 8)
+        runner = self._make_runner_stub([tensor])
+        runner.cache_config.cache_dtype = "auto"
+        runner.init_fp8_kv_scales()
+
+        assert (tensor == 1).all()
+
+    def test_mixed_none_tensor_and_list(self):
+        t1 = torch.ones(2, 2)
+        t2 = torch.ones(3, 3)
+        list_entry = [torch.ones(1, 1), torch.ones(1, 1)]
+
+        runner = self._make_runner_stub([None, t1, list_entry, None, t2])
+        runner.init_fp8_kv_scales()
+
+        assert (t1 == 0).all()
+        assert (t2 == 0).all()
+        assert all((t == 0).all() for t in list_entry)

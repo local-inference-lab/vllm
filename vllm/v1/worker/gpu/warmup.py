@@ -26,9 +26,22 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.request import Request
+from vllm.v1.sample.ops.topk_topp_sampler import warmup_top_k_top_p
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.sample.gumbel import warmup_processed_gumbel
 
 logger = init_logger(__name__)
+
+
+def warmup_prefill_shape(
+    *,
+    max_num_seqs: int,
+    max_num_batched_tokens: int,
+    decode_query_len: int,
+) -> tuple[int, int]:
+    """Prefill query length and request limit used by sampler warmup."""
+    prompt_len = decode_query_len + 1
+    return prompt_len, min(max_num_seqs, max_num_batched_tokens // prompt_len)
 
 
 def _reserved_block_count(
@@ -228,8 +241,8 @@ def warmup_kernels(
     We must call the provided worker's execute_model for pipeline parallel
     coordination.
     """
-    # Adaptive costs are calibrated during capture, after this warmup. Exercise
-    # fixed draft counts here, then restore the manager for capture and serving.
+    # Pre-capture warmup runs before adaptive costs are calibrated. Exercise
+    # fixed draft counts here, then restore the manager for serving.
     adaptive_verification = model_runner.adaptive_verification
     model_runner.adaptive_verification = None
     rejection_sampler = model_runner.rejection_sampler
@@ -255,18 +268,21 @@ def _warmup_kernels(
 ) -> None:
     if model_runner.vllm_config.is_mm_encoder_only:
         return
-
     num_spec_steps = model_runner.num_speculative_steps
     decode_query_len = model_runner.decode_query_len
     # Use decode_query_len + 1 tokens so the prefill batch's per-request query
     # length exceeds decode_query_len, preventing it from being misclassified as
     # a uniform decode batch.
-    prompt_len = decode_query_len + 1
+    prompt_len, num_reqs = warmup_prefill_shape(
+        max_num_seqs=model_runner.scheduler_config.max_num_seqs,
+        max_num_batched_tokens=model_runner.scheduler_config.max_num_batched_tokens,
+        decode_query_len=decode_query_len,
+    )
     prompt_token_ids = list(range(prompt_len))
     # Upper bound on the decode steps built in `decode_steps` below.
     num_decode_steps = 1
     if not model_runner.is_pooling_model:
-        num_decode_steps = 5 if num_spec_steps > 0 else 3
+        num_decode_steps = 3 if num_spec_steps > 0 else 2
     # Size the block allocation for the worst case: every request advancing
     # decode_query_len tokens on every decode step.
     decode_len = prompt_len + num_decode_steps * decode_query_len
@@ -449,15 +465,46 @@ def _warmup_kernels(
                 # Exercise the model paths that split a batch by whether each
                 # request received draft tokens.
                 decode_steps.append(([0, 1], [False, False]))
-        if num_reqs > 1:
-            decode_steps.append(([0], [use_spec_decode]))
-            if use_spec_decode:
-                decode_steps.append(([0], [False]))
-        elif use_spec_decode:
-            decode_steps.append(([0], [False]))
 
         for step_indices, step_spec_flags in decode_steps:
             _run_decode_step(step_indices, step_spec_flags)
+
+        # Replace the singleton tail with a fresh greedy request. Mixing greedy
+        # and feature-rich requests would still promote the whole logits batch
+        # to FP32. A one-token prefill exercises native-dtype sampling without
+        # repeating the full model warmup; its decode warms native rejection.
+        # Retire the old requests before reusing their slots and KV blocks.
+        greedy_prompt = [0]
+        greedy_block_counts = [block_count(1, s) for s in kv_cache_specs]
+        greedy_output = SchedulerOutput.make_empty()
+        greedy_output.finished_req_ids = set(req_ids)
+        req_ids = ["_warmup_greedy_"]
+        next_block_id = 1
+        greedy_output.scheduled_new_reqs = [
+            NewRequestData.from_request(
+                Request(
+                    req_ids[0],
+                    greedy_prompt,
+                    SamplingParams(temperature=0.0),
+                    None,
+                    mm_features=warmup_mm_features,
+                ),
+                block_ids=tuple(_alloc_blocks(n) for n in greedy_block_counts),
+                prefill_token_ids=greedy_prompt,
+            )
+        ]
+        greedy_output.num_scheduled_tokens = {req_ids[0]: 1}
+        greedy_output.total_num_scheduled_tokens = 1
+        greedy_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+        worker_execute_model(greedy_output)
+        worker_sample_tokens(None)
+
+        req_computed = [1]
+        req_blocks = [list(greedy_block_counts)]
+        if use_spec_decode:
+            _run_decode_step([0], [True])
+        # Keep a real singleton decode without drafts, not just a short prefill.
+        _run_decode_step([0], [False])
 
     # Clean up - process finish_req_ids.
     cleanup_output = SchedulerOutput.make_empty()
@@ -466,4 +513,18 @@ def _warmup_kernels(
     model_runner.kv_connector.set_disabled(False)
     if model_runner.kv_block_zeroer is not None:
         model_runner.kv_block_zeroer.zero_block_ids([0])
+    if model_runner.is_last_pp_rank and not model_runner.is_pooling_model:
+        warmup_processed_gumbel(
+            model_runner.model_config.get_vocab_size(),
+            model_runner.device,
+            use_fp64=model_runner.model_config.use_fp64_gumbel,
+        )
+        warmup_top_k_top_p(
+            model_runner.model_config.get_vocab_size(),
+            min(
+                model_runner.scheduler_config.max_num_batched_tokens,
+                model_runner.max_num_reqs * decode_query_len,
+            ),
+            model_runner.device,
+        )
     torch.accelerator.synchronize()
