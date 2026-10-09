@@ -279,8 +279,23 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
         if self.config.model_type == "glm_moe_dsa":
             enable_glm52_low_latency_gemm(self, vllm_config.model_config.dtype)
         self.set_moe_parameters()
+        self.checkpoint_weight_name_prefixes = self._checkpoint_weight_name_prefixes()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], self.config.hidden_size
+        )
+
+    def _checkpoint_weight_name_prefixes(self) -> tuple[str, ...]:
+        """The draft reads its MTP layers and the embedding, which a pipeline
+        stage without the target loads itself, not the whole checkpoint."""
+        first = self.config.num_hidden_layers
+        return (
+            *(
+                f"model.layers.{layer_idx}."
+                for layer_idx in range(
+                    first, first + self.config.num_nextn_predict_layers
+                )
+            ),
+            "model.embed_tokens.",
         )
 
     def set_moe_parameters(self):

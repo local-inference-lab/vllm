@@ -122,6 +122,7 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
         self._components = {}
         self._scale_parts = {}
         self._seen = set()
+        self._packed: tuple[torch.Tensor, torch.Tensor] | None = None
         for prefix in ("w13", "w2"):
             for component, dtype in (
                 ("weight", torch.uint8),
@@ -184,14 +185,31 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
                 or loaded_weight.dtype != torch.uint8
             ):
                 raise ValueError(f"Invalid NVFP4 weight shape or dtype: {weight_name}")
-            shape = (h, n // 2) if shard_id == "w2" else (n, h // 2)
-            local = torch.zeros(shape, dtype=torch.uint8, device=param.device)
+            if self._packed is None:
+                # Projections land directly in the layer's packed FC1 (up/gate
+                # rows) and FC2 weights. Per-expert device tensors fragment the
+                # caching allocator across a large model.
+                self._packed = (
+                    torch.zeros(
+                        (self.num_experts, 2 * n, h // 2),
+                        dtype=torch.uint8,
+                        device=param.device,
+                    ),
+                    torch.zeros(
+                        (self.num_experts, h, n // 2),
+                        dtype=torch.uint8,
+                        device=param.device,
+                    ),
+                )
+            w13, w2 = self._packed
             if shard_id == "w2":
+                local = w2[expert_id]
                 copy_weight(
                     local[:, : (last - first) // 2],
                     loaded_weight[:, first // 2 : last // 2],
                 )
             else:
+                local = w13[expert_id, :n] if shard_id == "w3" else w13[expert_id, n:]
                 copy_weight(local[: last - first], loaded_weight[first:last])
             values[field_name] = local
         elif field_name in ("weight_scale_2", "input_scale"):
@@ -294,10 +312,12 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
                 w13_scale_scratch=scratch[0],
                 w2_scale_scratch=scratch[1],
                 local_size=n,
+                packed=self._packed,
             )
         self._components.clear()
         self._scale_parts.clear()
         self._seen.clear()
+        self._packed = None
         packed = weights.packed
         layer_max = envs.VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE
         packed = replace(
