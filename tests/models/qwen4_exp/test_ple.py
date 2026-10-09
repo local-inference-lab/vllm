@@ -611,35 +611,6 @@ def test_ple_embedding_dtype_overrides_modelopt_exclusion() -> None:
     )
 
 
-def test_pinned_embedding_forward_finalizes_prefetched_output(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    embedding = Qwen4ExpPLEPinnedHostEmbedding.__new__(Qwen4ExpPLEPinnedHostEmbedding)
-    nn.Module.__init__(embedding)
-    embedding._prefetch_buffer = torch.empty(4, 2, 3, dtype=torch.float8_e4m3fn)
-    embedding._output_dim = 6
-    hidden_states = torch.zeros(2, 4, dtype=torch.bfloat16)
-    expected = torch.arange(12).reshape(2, 6).to(torch.float8_e4m3fn)
-
-    def finalize_prefetched(
-        prefetch_output: torch.Tensor,
-        output: torch.Tensor,
-    ) -> None:
-        assert prefetch_output is embedding._prefetch_buffer
-        output.copy_(expected)
-
-    monkeypatch.setattr(
-        embedding,
-        "_finalize_prefetch",
-        finalize_prefetched,
-    )
-
-    output = embedding(hidden_states)
-
-    assert output.dtype == embedding._prefetch_buffer.dtype
-    assert torch.equal(output, expected)
-
-
 def test_pinned_embedding_forward_requires_prior_start_prefetch() -> None:
     """Forward before any start_prefetch must fail loudly, not read garbage."""
     embedding = Qwen4ExpPLEPinnedHostEmbedding.__new__(Qwen4ExpPLEPinnedHostEmbedding)
@@ -838,6 +809,13 @@ def test_pinned_embedding_start_prefetch_allocates_lazily_and_feeds_forward(
     output = embedding(hidden_states)
 
     expected = loaded_weight[ngram_ids.cpu()].to(device="cuda:0").flatten(-2)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+    next_ids = torch.tensor([[0, 2], [3, 1]], device="cuda:0")
+    embedding.start_prefetch(hidden_states, next_ids)
+    assert embedding._prefetch_buffer is buffer
+    output = embedding(hidden_states)
+    expected = loaded_weight[next_ids.cpu()].to(device="cuda:0").flatten(-2)
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 

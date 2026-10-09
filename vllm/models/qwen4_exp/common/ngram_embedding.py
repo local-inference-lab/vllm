@@ -175,6 +175,10 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
         embedding_dtype: str | None = None,
     ) -> "Qwen4ExpPLEEmbeddingMethod":
         """Select the concrete PLE embedding format for a layer."""
+        if embedding_dtype not in (None, "bfloat16", "float8_e4m3fn"):
+            raise NotImplementedError(
+                f"PLE format {embedding_dtype!r} requires the b12x execution backend"
+            )
         if embedding_dtype == "float8_e4m3fn":
             return Qwen4ExpPLEFp8EmbeddingMethod()
         if quant_config is None:

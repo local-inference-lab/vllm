@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from importlib import import_module
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,6 +10,7 @@ import pytest
 import torch
 from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
 
+from vllm.config import ModelConfig, ParallelConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.models.config import (
     Qwen3_5ForConditionalGenerationConfig,
@@ -48,7 +50,8 @@ def _text_config(**kwargs) -> Qwen4ExpTextConfig:
     return Qwen4ExpTextConfig(**values)
 
 
-def test_qwen4_exp_mtp_returns_sample_and_multi_streams() -> None:
+@pytest.mark.parametrize("spec_step_idx", [0, 1, 2])
+def test_qwen4_exp_mtp_returns_sample_and_multi_streams(spec_step_idx: int) -> None:
     from vllm.models.qwen4_exp.nvidia.mtp import (
         Qwen4ExpMultiTokenPredictor,
     )
@@ -57,10 +60,16 @@ def test_qwen4_exp_mtp_returns_sample_and_multi_streams() -> None:
     torch.nn.Module.__init__(model)
     model.hc_count = 2
     model.hidden_size = 4
-    model.num_mtp_layers = 1
+    model.num_mtp_layers = 2
+    model._prefill_output_indices = None
     model.layers = [
         lambda **kwargs: (
             kwargs["hidden_states"],
+            kwargs["hidden_states"],
+            torch.zeros(kwargs["hidden_states"].shape[0], 2),
+        ),
+        lambda **kwargs: (
+            kwargs["hidden_states"] + 1,
             kwargs["hidden_states"],
             torch.zeros(kwargs["hidden_states"].shape[0], 2),
         ),
@@ -83,13 +92,43 @@ def test_qwen4_exp_mtp_returns_sample_and_multi_streams() -> None:
             input_ids=None,
             positions=torch.arange(2),
             intermediate_tensors={"hidden_states": multi_hidden},
+            spec_step_idx=spec_step_idx,
         )
 
+    expected_multi_hidden = multi_hidden + spec_step_idx % 2
     torch.testing.assert_close(
         sample_hidden,
-        multi_hidden.unflatten(-1, (2, 4)).mean(dim=-2),
+        expected_multi_hidden.unflatten(-1, (2, 4)).mean(dim=-2),
     )
-    assert returned_multi_hidden is multi_hidden
+    torch.testing.assert_close(returned_multi_hidden, expected_multi_hidden)
+
+
+def test_qwen4_exp_mtp_feedback_adds_embedding_to_each_stream() -> None:
+    """The standard path must retain global pre-norm and shared HC projection."""
+    from vllm.models.qwen4_exp.common.hyperconnection import GroupedGemmaRMSNorm
+    from vllm.models.qwen4_exp.nvidia.mtp import Qwen4ExpMultiTokenPredictor
+
+    model = object.__new__(Qwen4ExpMultiTokenPredictor)
+    torch.nn.Module.__init__(model)
+    model._use_b12x = False
+    model.hc_count = 2
+    model.hidden_size = 4
+    model.pre_fc_norm_embedding = GroupedGemmaRMSNorm(4, 1e-6, None, torch.float32)
+    model.pre_fc_norm_hidden = GroupedGemmaRMSNorm(8, 1e-6, None, torch.float32)
+    model.fc_embedding = torch.nn.Linear(4, 4, bias=False)
+    model.fc_hidden = torch.nn.Linear(4, 4, bias=False)
+    token_embedding = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    hidden_states = torch.arange(16, dtype=torch.float32).reshape(2, 8)
+
+    def normalize(value):
+        return value * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-6)
+
+    embedding = normalize(token_embedding) @ model.fc_embedding.weight.T
+    state = normalize(hidden_states).reshape(2, 2, 4) @ model.fc_hidden.weight.T
+    expected = (state + embedding[:, None]).flatten(-2)
+    torch.testing.assert_close(
+        model._prepare_feedback(token_embedding, hidden_states), expected
+    )
 
 
 @spawn_new_process_for_each_test
@@ -170,6 +209,7 @@ def test_qwen4_exp_rejects_pipeline_parallel_only_with_ple(ple_layer_ids) -> Non
 def test_qwen4_exp_model_state_prepares_ngram_context() -> None:
     model_state = object.__new__(Qwen4ExpModelState)
     model_state.uses_ngram_embedding = True
+    model_state.disk_embeddings = ()
     model_state.ngram_context_len = 3
     model_state.ngram_eos_token_id = 99
     model_state.ngram_context = torch.empty((8, 3), dtype=torch.int32)
@@ -227,6 +267,7 @@ def test_qwen4_exp_model_state_prepares_ngram_context() -> None:
 def test_qwen4_exp_model_state_prepares_stable_dummy_ngram_inputs() -> None:
     model_state = object.__new__(Qwen4ExpModelState)
     model_state.uses_ngram_embedding = True
+    model_state.disk_embeddings = ()
     model_state.ngram_eos_token_id = 99
     model_state.ngram_context = torch.empty((8, 3), dtype=torch.int32)
     model_state.ple_query_start_loc = torch.empty(9, dtype=torch.int32)
@@ -246,3 +287,35 @@ def test_qwen4_exp_model_state_prepares_stable_dummy_ngram_inputs() -> None:
     )
     assert second["query_start_loc"].data_ptr() == query_start_loc_ptr
     assert second["ngram_context"].data_ptr() == ngram_context_ptr
+
+
+@pytest.mark.parametrize(
+    ("model_type", "architecture"),
+    [
+        ("qwen4_exp", "Qwen4ExpForConditionalGeneration"),
+        ("qwen3_8_flash_next", "Qwen3_8FlashNextForConditionalGeneration"),
+    ],
+)
+def test_qwen_tp4_allows_dcp4_with_two_kv_heads(
+    tmp_path, monkeypatch, model_type: str, architecture: str
+) -> None:
+    """Qwen3.8 checkpoints declare either qwen4_exp or qwen3_8_flash_next and
+    load the same model. Both must pass the TP4/DCP4 gate with two KV heads."""
+    text_config = _text_config(num_attention_heads=16, num_key_value_heads=2).to_dict()
+    text_config["model_type"] = f"{model_type}_text"
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": model_type,
+                "architectures": [architecture],
+                "text_config": text_config,
+            }
+        )
+    )
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_count", lambda: 4)
+    model_config = ModelConfig(model=str(tmp_path), skip_tokenizer_init=True)
+    model_config.verify_with_parallel_config(
+        ParallelConfig(tensor_parallel_size=4, decode_context_parallel_size=4)
+    )
