@@ -345,10 +345,18 @@ class DeepseekV32Attention(MLAAttention):
         )
 
     def reserve_profile_scratch(self) -> None:
-        """Reserve backend prefill workspace before KV-cache memory profiling."""
-        reserve = getattr(self.impl, "reserve_full_ckv_workspace", None)
-        if reserve is not None:
-            reserve()
+        """Reserve prefill workspace before KV-cache memory profiling.
+
+        The indexer releases its workspace views before attention borrows the
+        same workspace, so the two reservations share one buffer.
+        """
+        for owner, name in (
+            (self.impl, "reserve_full_ckv_workspace"),
+            (getattr(self.indexer, "indexer_op", None), "reserve_key_gather_workspace"),
+        ):
+            reserve = getattr(owner, name, None)
+            if reserve is not None:
+                reserve()
 
     def forward(  # type: ignore[override]
         self,

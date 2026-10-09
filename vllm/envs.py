@@ -242,6 +242,7 @@ if TYPE_CHECKING:
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
     VLLM_DCP_Q_REPLICATE: bool = False
+    VLLM_DCP_INDEXER_KEY_GATHER: bool = False
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
@@ -1697,6 +1698,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Opt-in MLA DCP query replication: skip the decode query all-gather.
     "VLLM_DCP_Q_REPLICATE": lambda: bool(int(os.getenv("VLLM_DCP_Q_REPLICATE", "0"))),
+    # Eager B12X DSA prefill under DCP gathers each request's sharded index
+    # keys once into the reserved workspace and splits the query rows across
+    # tensor-parallel ranks, which then exchange only selected indices instead
+    # of per-shard candidates.
+    "VLLM_DCP_INDEXER_KEY_GATHER": lambda: bool(
+        int(os.getenv("VLLM_DCP_INDEXER_KEY_GATHER", "0"))
+    ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no
     # JIT'ing in the hot-path. However, this warmup increases the engine
