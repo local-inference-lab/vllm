@@ -25,7 +25,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
 def is_deferred_attention_layer(layer: torch.nn.Module) -> bool:
     """Whether an attention-like layer requires deferred post-load processing."""
-    return isinstance(layer, (AttentionLayerBase, MMEncoderAttention)) and callable(
+    return isinstance(layer, AttentionLayerBase | MMEncoderAttention) and callable(
         getattr(layer, "process_weights_after_loading", None)
     )
 

@@ -1,0 +1,2103 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Real-kernel memory and graph-lifetime regressions for V4.1 attention."""
+
+import gc
+import weakref
+from functools import partial
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+import torch
+from torch.multiprocessing.reductions import StorageWeakRef
+
+from vllm import envs
+from vllm.config import CUDAGraphMode
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Native b12x attention requires CUDA"
+)
+
+
+@pytest.fixture
+def native_workspace(monkeypatch):
+    from vllm.platforms import current_platform
+
+    capability = current_platform.get_device_capability()
+    if capability is None or capability.major != 12:
+        pytest.skip("Native b12x attention requires SM12x")
+    import vllm.v1.worker.workspace as workspace
+    from vllm.models.deepseek_v41.nvidia.b12x import attention
+
+    manager = workspace.WorkspaceManager(
+        torch.device("cuda", torch.accelerator.current_device_index())
+    )
+    monkeypatch.setattr(workspace, "_manager", manager)
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    monkeypatch.setattr(attention, "get_tensor_model_parallel_world_size", lambda: 1)
+    with workspace.use_workspace_lane(0):
+        yield attention, manager, workspace
+
+
+def test_indexer_loads_complete_projections_on_tp_rank(native_workspace, monkeypatch):
+    from vllm.distributed import parallel_state
+
+    attention, _, _ = native_workspace
+    monkeypatch.setattr(
+        parallel_state,
+        "get_tp_group",
+        lambda: SimpleNamespace(rank_in_group=3, world_size=4),
+    )
+    monkeypatch.setattr(attention, "get_tensor_model_parallel_world_size", lambda: 4)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                index_n_heads=32,
+                q_lora_rank=128,
+                hidden_size=256,
+            )
+        ),
+        quant_config=None,
+    )
+    indexer = attention.DeepseekV4Indexer(
+        config,
+        "model.layers.2.self_attn.indexer",
+        owns_k=False,
+        k_cache=None,
+        ratio=1,
+    )
+    assert indexer.heads == 32
+    for projection, shape in (
+        (indexer.wq_b, (4096, 128)),
+        (indexer.weights_proj, (32, 256)),
+    ):
+        assert isinstance(projection, attention.ReplicatedLinear)
+        assert projection.weight.shape == shape
+        source = torch.arange(projection.weight.numel(), dtype=torch.float32)
+        source = source.reshape(shape).to(projection.weight)
+        projection.weight.weight_loader(projection.weight, source)
+        torch.testing.assert_close(projection.weight, source, rtol=0, atol=0)
+
+
+def _layer(attention, layer_id=0, swa_page=32):
+    # Avoid checkpoint/model construction: exercise the real planning and
+    # attention methods with the same TP4 head geometry and serving capacity.
+    layer = attention.DeepseekV4Attention.__new__(attention.DeepseekV4Attention)
+    torch.nn.Module.__init__(layer)
+    layer.prefix = f"model.layers.{layer_id}.self_attn"
+    layer.layer_id = layer_id
+    layer.config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=64),
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=5, parallel_drafting=False
+        ),
+        compilation_config=SimpleNamespace(max_cudagraph_capture_size=128),
+    )
+    layer.capacity = 4096
+    layer.max_model_len = 1024
+    layer.n_local_heads = 16
+    layer.swa_width = layer.window_size = 128
+    layer.compress_ratio = 1
+    layer.is_draft = False
+    layer.is_ced_decoder = False
+    layer.is_index_source = True
+    layer.kv_source_layer_id = layer.index_source_layer_id = layer_id
+    layer.candidate_source_layer = 99
+    layer.topk_indices_buffer = None
+    layer.indexer = SimpleNamespace(
+        heads=32, k_cache=SimpleNamespace(prefix=layer.prefix + ".indexer.k_cache")
+    )
+    layer.swa_cache_layer = SimpleNamespace(
+        prefix=layer.prefix + ".swa_cache", block_size=swa_page
+    )
+    layer.compressor = None
+    layer._context = {layer.prefix: layer}
+    layer._index_plans = {}
+    layer._attention_plans = {}
+    layer._helper_plans = {}
+    layer.rotary_emb = SimpleNamespace(
+        cos_sin_cache=torch.cat(
+            (
+                torch.ones((4096, 32), device="cuda"),
+                torch.zeros((4096, 32), device="cuda"),
+            ),
+            dim=-1,
+        )
+    )
+    layer._l2pf_wo = layer._l2pf_ffn = None
+    layer._ready = False
+    return layer
+
+
+def _write_cache(kv, cache, slots, *, page_size, cache_kind, cache_format):
+    from b12x.attention.compressed_sparse_mla import api as mla
+    from b12x.preparation import PreparationSession, PreparedCall
+
+    plan = mla.plan_cache_writer(
+        mla.CacheWriterQuery(
+            max_rows=kv.shape[0],
+            page_size=page_size,
+            cache_kind=cache_kind,
+            cache_format=cache_format,
+            slot_dtype=str(slots.dtype).removeprefix("torch."),
+        ),
+        device=kv.device,
+    )
+    with PreparationSession(device=kv.device, autotune=False) as session:
+        session.prepare(
+            (
+                plan.request(
+                    name="test.cache_writer",
+                    prepare_call=lambda state: PreparedCall(
+                        run=lambda: state.run(kv, cache, slots)
+                    ),
+                ),
+            )
+        )
+        mla.write_cache(kv, cache, slots, plan=plan)
+
+
+def _write_index_keys(keys, *, index_k_cache, slot_mapping, page_size):
+    from b12x.attention.dsa_indexer import api as indexer
+    from b12x.preparation import PreparationSession, PreparedCall
+
+    plan = indexer.plan(
+        indexer.Caps(
+            device=keys.device,
+            num_q_heads=32,
+            max_q_rows=1,
+            max_page_table_width=1,
+            topk=512,
+            mode="decode",
+            cache_format="mxfp4",
+            page_size=page_size,
+        )
+    )
+    with PreparationSession(device=keys.device, autotune=False) as session:
+        session.prepare(
+            (
+                plan.request(
+                    name="test.index_writer",
+                    prepare_call=lambda state: PreparedCall(
+                        run=lambda: state.write_index_keys(
+                            keys, index_k_cache=index_k_cache, slot_mapping=slot_mapping
+                        )
+                    ),
+                ),
+            )
+        )
+        indexer.quantize_write_index_k_mxfp4(
+            plan, keys, index_k_cache=index_k_cache, slot_mapping=slot_mapping
+        )
+
+
+@pytest.mark.parametrize("swa_page", [32, 64, 128])
+def test_context_cache_write_preserves_page_boundaries_and_padding(
+    native_workspace, swa_page
+):
+    from b12x.attention._shared.mla.compressed_reference import (
+        pack_deepseek_v41_cache_reference,
+    )
+
+    attention, _, _ = native_workspace
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    torch.manual_seed(145)
+    layer = _layer(attention, swa_page=swa_page)
+    rows = 2 * swa_page + 3
+    layer.rotary_emb = SimpleNamespace(
+        cos_sin_cache=torch.cat(
+            (
+                torch.ones((rows, 32), device=device),
+                torch.zeros((rows, 32), device=device),
+            ),
+            dim=-1,
+        )
+    )
+    page_bytes = attention.mla.page_nbytes(
+        swa_page, cache_kind="swa", cache_format="deepseek_v41"
+    )
+    storage = torch.full((6, 113920), 0xA5, dtype=torch.uint8, device=device)
+    layer.swa_cache_layer.kv_cache = storage[:, :page_bytes]
+    expected = storage.clone()
+    logical = torch.arange(rows, device=device) + swa_page - 1
+    pages = torch.tensor([3, 1, 4, 2], device=device)
+    slots = pages[logical // swa_page] * swa_page + logical % swa_page
+    slots[-2:] = -1
+    positions = torch.arange(rows, device=device)
+    kv = torch.randn((rows, 512), device=device, dtype=torch.bfloat16)
+    records = pack_deepseek_v41_cache_reference(
+        kv, page_size=swa_page, cache_kind="swa"
+    ).view(-1, 528)
+    valid = slots >= 0
+    columns = (slots[valid] % swa_page)[:, None] * 528 + torch.arange(
+        528, device=device
+    )
+    expected[(slots[valid] // swa_page)[:, None], columns] = records[:rows][valid]
+
+    from b12x.preparation import PreparationSession, PreparedCall
+
+    layer._prepare(device)
+    table = layer.rotary_emb.cos_sin_cache
+    rope_plan = attention.rotary.plan(
+        attention.rotary.Query(
+            max_rows=rows,
+            heads=1,
+            dim=512,
+            ratio=1,
+            cos_sin_dtype=str(table.dtype).removeprefix("torch."),
+        ),
+        device=device,
+    )
+    writer = attention.mla.plan_cache_writer(
+        attention.mla.CacheWriterQuery(
+            max_rows=rows,
+            page_size=swa_page,
+            cache_kind="swa",
+            slot_dtype="int64",
+        ),
+        device=device,
+    )
+    layer._helper_plans = {"kv": rope_plan, "swa_cache_write": writer}
+    rotated = torch.empty_like(kv)
+    with PreparationSession(device=device, autotune=False) as session:
+        session.prepare(
+            (
+                rope_plan.request(
+                    name="test.kv_rope",
+                    prepare_call=lambda state: PreparedCall(
+                        run=lambda: state.run(kv, positions, table, out=rotated)
+                    ),
+                ),
+                writer.request(
+                    name="test.swa_write",
+                    prepare_call=lambda state: PreparedCall(
+                        run=lambda: state.run(
+                            rotated, layer.swa_cache_layer.kv_cache, slots
+                        )
+                    ),
+                ),
+            )
+        )
+        layer.insert_context_kv(kv, positions, slots)
+
+    torch.testing.assert_close(storage, expected, rtol=0, atol=0)
+
+
+def test_prepare_memory_is_metadata_not_capacity_activations(native_workspace):
+    attention, manager, _ = native_workspace
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    first = _layer(attention)
+    first._prepare(device)
+    manager.lock()
+    second = _layer(attention, 1)
+    before = torch.accelerator.memory_allocated(device)
+    second._prepare(device)
+    allocated = torch.accelerator.memory_allocated(device) - before
+    c = second.INDEX_CHUNK
+    metadata_bytes = 4 * (c * second._index_width + 1)
+    persistent_topk_bytes = 4 * second.capacity * 512
+    # A second layer must not own Q/O/inverse, indexer activations, or another
+    # copy of either mode's planned scratch. Allow CUDA allocator rounding.
+    assert allocated <= metadata_bytes + persistent_topk_bytes + 1024**2
+
+
+def test_index_preparation_reuses_reserved_workspace(native_workspace):
+    """Priming a 1M-context indexer must not duplicate its 1.63 GiB scratch."""
+    from b12x.preparation import PreparationSession
+
+    attention, manager, _ = native_workspace
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    layer = _layer(attention, 20)
+    layer.config.cache_config.block_size = 256
+    layer.max_model_len = 1 << 20
+    layer.candidate_source_layer = 20
+    layer._prepare(device)
+    cache = torch.zeros(
+        (1, attention.dsa_indexer.index_mxfp4_page_bytes(256)),
+        dtype=torch.uint8,
+        device=device,
+    )
+    layer.indexer.k_cache.kv_cache = cache
+    plan = layer._declare_index_plan("prefill", 256)
+    attention._scratch(plan)
+    manager.lock()
+    torch.accelerator.synchronize()
+    before = torch.accelerator.memory_allocated(device)
+    torch.accelerator.reset_peak_memory_stats(device)
+    with PreparationSession(device=device, autotune=False) as session:
+        session.prepare(
+            [
+                plan.request(
+                    name=layer._index_request_name("prefill", 256),
+                    prepare_call=layer._index_call("prefill", 256),
+                )
+            ]
+        )
+        torch.accelerator.synchronize()
+        peak = torch.accelerator.max_memory_allocated(device) - before
+        assert peak < 64 * 1024**2
+        torch.testing.assert_close(cache, torch.zeros_like(cache), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("projection_kind", ["linear", "dspark_context"])
+def test_block_linear_capture_retains_scratch_not_caller_activations(
+    native_workspace,
+    monkeypatch,
+    projection_kind,
+):
+    from vllm.models.deepseek_v41.nvidia.b12x import b12x_layers
+
+    _, manager, workspace = native_workspace
+    from b12x.preparation import PreparationSession
+
+    from vllm.utils.b12x import B12xWorkload
+
+    torch.manual_seed(89)
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    layer = torch.nn.Module()
+    layer.weight = torch.randn(256, 256, device=device).to(torch.float8_e4m3fn)
+    layer.weight_scale_inv = torch.ones(8, 8, device=device).to(torch.float8_e8m0fnu)
+    monkeypatch.setattr(b12x_layers, "_execution_capacities", lambda: (16,))
+    if projection_kind == "linear":
+        method = b12x_layers.B12xFP8LinearMethod(
+            SimpleNamespace(weight_block_size=[32, 32])
+        )
+        method.process_weights_after_loading(layer)
+        project = partial(method.apply, layer)
+        plans = layer.b12x_plans
+    else:
+        from vllm.models.deepseek_v41.nvidia.b12x import dspark
+
+        monkeypatch.setattr(dspark, "_execution_capacities", lambda: (16,))
+        method = dspark._ContextKVProjection(
+            SimpleNamespace(fused_wqa_wkv=layer, q_lora_rank=0), 16
+        )
+        project = method
+        plans = method.plans
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(8, 16),
+        fixed_token_counts=(8,),
+        output_dtype=torch.bfloat16,
+        max_tokens=16,
+        max_seqs=1,
+        max_model_len=16,
+    )
+    session = PreparationSession(device=device, autotune=False, compile_workers=2)
+    session.prepare(
+        tuple(
+            request
+            for unit in method.get_b12x_preparation_units(layer, workload)
+            for request in unit.requests
+        )
+    )
+    session.freeze()
+    manager.reserve_all(
+        *((spec.shape, spec.dtype) for spec in plans[0].scratch_specs())
+    )
+    manager.lock()
+    inputs = torch.randn(16, 256, dtype=torch.bfloat16, device=device)
+    outputs = torch.empty_like(inputs)
+    references: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def run(rows):
+        source = inputs[:rows] + 1
+        output = project(source)
+        references.extend((weakref.ref(source), weakref.ref(output)))
+        outputs[:rows].copy_(output)
+
+    pool = torch.cuda.graph_pool_handle()
+    graphs = {}
+    owners = []
+    try:
+        for rows in (16, 8):
+            run(rows)
+            torch.accelerator.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with (
+                session.capture(),
+                workspace.collect_cuda_graph_capture_resources() as resources,
+                torch.cuda.graph(graph, pool=pool),
+            ):
+                run(rows)
+            owners.append(resources)
+            graphs[rows] = graph
+            gc.collect()
+            assert all(reference() is None for reference in references)
+            assert resources
+
+        for rows in (8, 16, 8, 16):
+            inputs.normal_()
+            run(rows)
+            expected = outputs[:rows].clone()
+            outputs.fill_(float("nan"))
+            graphs[rows].replay()
+            torch.testing.assert_close(outputs[:rows], expected, rtol=0, atol=0)
+    finally:
+        for graph in graphs.values():
+            graph.reset()
+        session.close()
+
+
+@pytest.mark.parametrize("operation", ["pre", "post_pre"])
+@pytest.mark.parametrize("capture_kind", ["full", "breakable"])
+def test_mhc_capture_retains_scratch_not_caller_activations(
+    native_workspace, monkeypatch, operation, capture_kind
+):
+    """Intermediate MHC outputs must be reusable across shared-pool graphs."""
+    from b12x.preparation import PreparationSession
+
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+    from vllm.models.deepseek_v41.nvidia.b12x import b12x_layers
+    from vllm.utils.b12x import B12xWorkload, register_b12x_layer
+
+    _, manager, workspace = native_workspace
+    monkeypatch.setattr(b12x_layers, "_execution_capacities", lambda: (8, 16))
+    device = torch.device("cuda")
+    hidden = 5120
+    torch.manual_seed(146)
+    layer = torch.nn.Module()
+    for kind in ("attn", "ffn"):
+        setattr(layer, f"hc_{kind}_fn", torch.randn(24, hidden * 4, device=device) / 64)
+        setattr(layer, f"hc_{kind}_scale", torch.ones(3, device=device))
+        setattr(layer, f"hc_{kind}_base", torch.zeros(24, device=device))
+        setattr(
+            layer,
+            f"{kind}_norm",
+            SimpleNamespace(
+                weight=torch.ones(hidden, dtype=torch.bfloat16, device=device)
+            ),
+        )
+    layer.hc_attn_fn_broadcast = None
+    module = layer._b12x_mhc = b12x_layers.B12xMHC(
+        SimpleNamespace(
+            hidden_size=hidden,
+            rms_norm_eps=1e-20,
+            hc_eps=1e-6,
+            hc_sinkhorn_iters=20,
+            hc_mult=4,
+        )
+    )
+    name = f"test.mhc.capture.{operation}"
+    module.bind_layer_name(name)
+    register_b12x_layer(name, layer)
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(8, 16),
+        fixed_token_counts=(8,),
+        output_dtype=torch.bfloat16,
+        max_tokens=16,
+        max_seqs=1,
+        max_model_len=16,
+    )
+    session = PreparationSession(device=device, autotune=False, compile_workers=2)
+    session.prepare(
+        tuple(
+            request
+            for unit in module.get_b12x_preparation_units(layer, workload)
+            for request in unit.requests
+        )
+    )
+    session.freeze()
+    manager.reserve_all(
+        *(
+            (spec.shape, spec.dtype)
+            for plan in module._plans.values()
+            for spec in plan.scratch_specs()
+        )
+    )
+    manager.lock()
+    residual = torch.randn(16, 4, hidden, dtype=torch.bfloat16, device=device)
+    previous = torch.randn(16, hidden, dtype=torch.bfloat16, device=device)
+    pre = torch.full((16, 4), 0.25, device=device)
+    previous_post = pre.clone()
+    comb = torch.eye(4, device=device).expand(16, -1, -1).contiguous()
+    destinations = [
+        torch.empty_like(residual),
+        torch.empty_like(pre),
+        torch.empty_like(comb),
+        torch.empty_like(previous),
+        torch.empty_like(pre),
+    ]
+    references: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def run(rows):
+        kwargs = (
+            {}
+            if operation == "pre"
+            else dict(
+                previous_output=previous[:rows],
+                previous_post=previous_post[:rows],
+                previous_comb=comb[:rows],
+            )
+        )
+        values = module.pre(
+            residual[:rows],
+            layer.hc_attn_fn,
+            layer.hc_attn_scale,
+            layer.hc_attn_base,
+            layer.attn_norm.weight,
+            pre[:rows],
+            **kwargs,
+        )
+        capture = BreakableCUDAGraphCapture.current()
+        if capture is not None:
+            # The lagged outputs cross a segment boundary before consumption.
+            capture.add_eager(lambda: None)
+        for destination, value in zip(destinations, values, strict=True):
+            references.append(weakref.ref(value))
+            destination[:rows].copy_(value)
+
+    pool = torch.cuda.graph_pool_handle()
+    graphs, owners = {}, []
+    try:
+        for rows in (16, 8):
+            run(rows)
+            torch.accelerator.synchronize()
+            graph = (
+                torch.cuda.CUDAGraph()
+                if capture_kind == "full"
+                else BreakableCUDAGraphCapture(pool=pool)
+            )
+            graphs[rows] = graph
+            context = (
+                torch.cuda.graph(graph, pool=pool) if capture_kind == "full" else graph
+            )
+            with (
+                session.capture(),
+                workspace.collect_cuda_graph_capture_resources() as resources,
+                torch.cuda.stream(torch.cuda.Stream()),
+                context,
+            ):
+                run(rows)
+            torch.accelerator.synchronize()
+            owners.append(resources)
+            gc.collect()
+            assert all(reference() is None for reference in references)
+            assert resources
+
+        for rows in (8, 16, 8, 16):
+            residual.normal_()
+            previous.normal_()
+            run(rows)
+            expected = [output[:rows].clone() for output in destinations]
+            for output in destinations:
+                output.fill_(float("nan"))
+            graphs[rows].replay()
+            for output, reference in zip(destinations, expected, strict=True):
+                torch.testing.assert_close(output[:rows], reference, rtol=0, atol=0)
+    finally:
+        for graph in graphs.values():
+            graph.reset()
+        session.close()
+
+
+@pytest.mark.parametrize("draft_tokens", [5, 7])
+def test_parallel_draft_reservation_keeps_decode_split_parallelism(
+    native_workspace, draft_tokens
+):
+    from b12x.attention.compressed_sparse_mla import api as mla
+
+    attention, _, _ = native_workspace
+    layer = _layer(attention)
+    layer.config.scheduler_config.max_num_seqs = 32
+    layer.config.speculative_config.num_speculative_tokens = draft_tokens
+    layer.config.speculative_config.parallel_drafting = True
+    layer.config.compilation_config.max_cudagraph_capture_size = 32 * (draft_tokens + 1)
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    layer._prepare(device)
+    decode = layer._attention_declarations["decode"].query
+    prefill = layer._attention_declarations["extend"].query
+    assert decode.query_rows > 256
+    assert (
+        mla.split_chunks_for_contract(
+            rows=decode.query_rows,
+            width=decode.swa_width + decode.indexed_width,
+            decode_row_capacity=decode.decode_row_capacity,
+        )
+        == 54
+    )
+    assert (
+        mla.split_chunks_for_contract(
+            rows=prefill.query_rows,
+            width=prefill.swa_width + prefill.indexed_width,
+            decode_row_capacity=prefill.decode_row_capacity,
+        )
+        == 1
+    )
+
+
+def test_mhc_fixed_capacity_buckets_preserve_decode_policy(
+    native_workspace, monkeypatch
+):
+    from b12x.preparation import PreparationSession
+
+    from vllm.models.deepseek_v41.nvidia.b12x import b12x_layers
+    from vllm.utils.b12x import B12xWorkload, register_b12x_layer
+
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    hidden = 5120
+    monkeypatch.setattr(b12x_layers, "_execution_capacities", lambda: (64, 4096))
+    module = b12x_layers.B12xMHC(
+        SimpleNamespace(
+            hidden_size=hidden,
+            rms_norm_eps=1e-20,
+            hc_eps=1e-6,
+            hc_sinkhorn_iters=20,
+            hc_mult=4,
+        )
+    )
+    layer = torch.nn.Module()
+    layer._b12x_mhc = module
+    layer.hc_attn_fn = torch.randn((24, hidden * 4), device=device) / 64
+    layer.hc_ffn_fn = layer.hc_attn_fn.clone()
+    layer.hc_attn_fn_broadcast = None
+    layer.hc_attn_scale = layer.hc_ffn_scale = torch.ones(3, device=device)
+    layer.hc_attn_base = layer.hc_ffn_base = torch.zeros(24, device=device)
+    layer.attn_norm = layer.ffn_norm = SimpleNamespace(
+        weight=torch.ones(hidden, device=device, dtype=torch.bfloat16)
+    )
+    name = "test.v41.mhc"
+    register_b12x_layer(name, layer)
+    module.bind_layer_name(name)
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(6, 64, 4096),
+        fixed_token_counts=(6, 64),
+        output_dtype=torch.bfloat16,
+        max_tokens=4096,
+        max_seqs=4,
+        max_model_len=4096,
+    )
+    with PreparationSession(device=device, autotune=False) as session:
+        session.prepare(
+            tuple(
+                request
+                for unit in module.get_b12x_preparation_units(layer, workload)
+                for request in unit.requests
+            )
+        )
+        session.freeze()
+        for rows, capacity, backend in (
+            (6, 6, "native"),
+            (64, 64, "native"),
+            (65, 4096, "tf32_tma"),
+        ):
+            plan = module._plan_for("pre", rows)
+            assert plan.query.max_tokens == capacity
+            assert plan.prepared.selection.config.backend == backend
+            residual = torch.randn(
+                (rows, 4, hidden), device=device, dtype=torch.bfloat16
+            )
+            pre = torch.full((rows, 4), 0.25, device=device)
+            out, _, _, y, _ = module.pre(
+                residual,
+                layer.hc_attn_fn,
+                layer.hc_attn_scale,
+                layer.hc_attn_base,
+                layer.attn_norm.weight,
+                pre,
+            )
+            assert torch.equal(out, residual)
+            assert bool(torch.isfinite(y).all())
+
+
+def _v41_cache_operands(cache, kind, *, fp8):
+    """Decode native cache rows into attention operands and per-64 scales.
+
+    BF16 internals dequantize the native records exactly (unit scales). FP8
+    internals consume E4M3 operands; this independent reference follows
+    B12X's tests/_reference/v41_fp8.py. SWA pairs its E8M0 scales; indexed
+    NVFP4 uses a power-of-two scale that bounds four adjacent scale groups.
+    """
+    if kind == "swa":
+        rows = cache.reshape(-1, 528)
+        codes = rows[:, :512].contiguous().view(torch.float8_e4m3fn).double()
+        original = rows[:, 512:528].double()
+        exponent = original.reshape(-1, 8, 2).amax(-1).clamp_min(1) - 127
+        values = codes * torch.exp2(original - 127).repeat_interleave(32, dim=1)
+    else:
+        rows = cache.reshape(-1, 288)
+        packed = rows[:, :256].long()
+        codes = torch.stack((packed & 15, packed >> 4), -1).flatten(1)
+        lut = torch.tensor(
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+            dtype=torch.float64,
+            device=cache.device,
+        )
+        original = rows[:, 256:288].contiguous().view(torch.float8_e4m3fn).double()
+        values = lut[codes] * original.repeat_interleave(16, dim=1)
+        bound = original.reshape(-1, 8, 4).amax(-1) * (6 / 448)
+        exponent = torch.ceil(torch.log2(bound.clamp_min(2.0**-126)))
+    if not fp8:
+        return values.float(), torch.ones_like(exponent, dtype=torch.float32)
+    scales = torch.exp2(exponent)
+    codes = (values / scales.repeat_interleave(64, dim=1)).float()
+    return codes.to(torch.float8_e4m3fn).float(), scales.float()
+
+
+def _v41_prefill_reference(q, values, scales, valid, sink, *, fp8):
+    """Model BF16 Q/K and per-64-key probability/value products.
+
+    Prefill computes Q/K with BF16 operands. With FP8 internals, each output
+    group independently quantizes scaled probabilities to E4M3 before its
+    product with FP8 V; BF16 internals round probabilities to BF16 before the
+    product with dequantized BF16 V. Partial numerators remain FP32 until the
+    final LSE merge.
+    """
+    keys = (values * scales.repeat_interleave(64, dim=-1)).bfloat16().float()
+    logits = torch.einsum("rhd,rkd->rhk", q.float(), keys) * 512**-0.5
+    logits.masked_fill_(~valid[:, None], -torch.inf)
+    partials, lses = [], []
+    for first in range(0, values.shape[1], 64):
+        local = logits[:, :, first : first + 64]
+        maximum = local.amax(-1)
+        p = torch.exp(local - maximum[:, :, None])
+        p = torch.where(valid[:, None, first : first + 64], p, 0)
+        denominator = p.sum(-1)
+        if fp8:
+            groups = []
+            for group in range(8):
+                weighted = p * scales[:, None, first : first + 64, group]
+                pscale = weighted.abs().amax(-1, keepdim=True).clamp_min(1e-10) / 448
+                pq = (weighted / pscale).to(torch.float8_e4m3fn).float()
+                vq = values[:, first : first + 64, group * 64 : (group + 1) * 64]
+                groups.append(torch.einsum("rhk,rkd->rhd", pq, vq) * pscale)
+            numerator = torch.cat(groups, -1)
+        else:
+            pb = p.bfloat16().float()
+            numerator = torch.einsum("rhk,rkd->rhd", pb, keys[:, first : first + 64])
+        partials.append(numerator / denominator.clamp_min(1e-30)[..., None])
+        lses.append(
+            torch.where(denominator > 0, maximum + denominator.log(), -torch.inf)
+        )
+    lse = torch.stack(lses, -1)
+    maximum = torch.maximum(lse.amax(-1), sink.float()[None])
+    weights = torch.where(torch.isfinite(lse), torch.exp(lse - maximum[..., None]), 0)
+    denominator = weights.sum(-1) + torch.exp(sink.float()[None] - maximum)
+    output = (torch.stack(partials, -2) * weights[..., None]).sum(-2)
+    return (output / denominator.clamp_min(1e-30)[..., None]).bfloat16().float()
+
+
+@pytest.mark.parametrize("main_page,swa_page", [(64, 32), (128, 64), (256, 128)])
+@pytest.mark.parametrize(
+    "is_decode,rows,live_rows",
+    [
+        (True, 6, 6),
+        (True, 36, 36),
+        (True, 48, 6),
+        (False, 65, 65),
+        (False, 257, 257),
+        (False, 1025, 1025),
+    ],
+)
+def test_attention_shared_scratch_graph_replay(
+    native_workspace, monkeypatch, is_decode, rows, live_rows, main_page, swa_page
+):
+    attention, manager, workspace = native_workspace
+    from b12x.preparation import PreparationSession
+
+    from vllm.utils.b12x import B12xWorkload
+
+    # A TP4 rank must score all replicated heads without obtaining a TP group.
+    monkeypatch.setattr(attention, "get_tensor_model_parallel_world_size", lambda: 4)
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    torch.manual_seed(142)
+    layer = _layer(attention, swa_page=swa_page)
+    layer.rotary_emb = SimpleNamespace(cos_sin_cache=torch.empty(0, device=device))
+    layer.config.cache_config.block_size = main_page
+    layer.max_model_len = 4096
+    if rows == 36:
+        layer.config.speculative_config.parallel_drafting = True
+        layer.config.compilation_config.max_cudagraph_capture_size = 32
+    layer._prepare(device)
+    if rows == 36:
+        assert layer._attention_declarations["decode"].query.query_rows == 4 * (
+            1 + 2 * 5
+        )
+    length = 2048
+    positions = torch.full((rows,), -1, dtype=torch.int64, device=device)
+    positions[:live_rows] = torch.arange(
+        length - live_rows, length, dtype=torch.int64, device=device
+    )
+    starts = torch.tensor([0, live_rows], dtype=torch.int32, device=device)
+    reqs = torch.full((rows,), -1, dtype=torch.int32, device=device)
+    reqs[:live_rows] = 0
+    visible = torch.clamp(positions + 1, min=0).int()
+
+    def metadata(page):
+        return SimpleNamespace(
+            positions=positions,
+            req_id_per_token=reqs,
+            block_table=torch.arange(
+                1, length // page + 1, dtype=torch.int32, device=device
+            )[None],
+            query_start_loc=starts,
+            request_positions=positions[:1],
+            cache_lengths=visible,
+            is_decode=is_decode,
+            max_seq_len=length,
+            decoder=None,
+            # Encoder attention must ignore decoder-only replay metadata.
+            swa_replay_start=torch.full(
+                (1,), length + 1, dtype=torch.int64, device=device
+            ),
+        )
+
+    attn_metadata = {
+        layer.swa_cache_layer.prefix: metadata(swa_page),
+        layer.prefix: metadata(main_page),
+        layer.indexer.k_cache.prefix: metadata(main_page),
+    }
+    forward = SimpleNamespace(context=None)
+    monkeypatch.setattr(attention, "get_forward_context", lambda: forward.context)
+    kv = torch.randn((length, 512), device=device, dtype=torch.bfloat16)
+    for kind, page in (("swa", swa_page), ("indexed", main_page)):
+        cache = torch.empty(
+            (
+                length // page + 1,
+                attention.mla.page_nbytes(
+                    page, cache_kind=kind, cache_format="deepseek_v41"
+                ),
+            ),
+            device=device,
+            dtype=torch.uint8,
+        )
+        _write_cache(
+            kv,
+            cache,
+            torch.arange(length, device=device) + page,
+            page_size=page,
+            cache_kind=kind,
+            cache_format="deepseek_v41",
+        )
+        if kind == "swa":
+            layer.swa_cache_layer.kv_cache = cache
+        else:
+            layer.kv_cache = cache
+    layer.indexer.k_cache.kv_cache = torch.empty(
+        (
+            length // main_page + 1,
+            attention.dsa_indexer.index_mxfp4_page_bytes(main_page),
+        ),
+        dtype=torch.uint8,
+        device=device,
+    )
+    # Every query sees all three groups. A=e0, B=e0+e1, C=e1:
+    # (1,-.25) selects exactly A+B; (-.25,1) selects exactly B+C.
+    # The 512 selected scores are positive and all others are zero, so
+    # the native selector's unspecified BF16 cutoff tie order is irrelevant.
+    index_keys = torch.zeros((length, 128), dtype=torch.bfloat16, device=device)
+    index_keys[:512, 0] = 1
+    index_keys[256:768, 1] = 1
+    _write_index_keys(
+        index_keys,
+        index_k_cache=layer.indexer.k_cache.kv_cache,
+        slot_mapping=torch.arange(length, device=device) + main_page,
+        page_size=main_page,
+    )
+    layer.attn_sink = torch.zeros(layer.n_local_heads, device=device)
+    q = torch.randn(
+        (rows, layer.n_local_heads, 512), dtype=torch.bfloat16, device=device
+    )
+    iq = torch.zeros((rows, 32, 128), dtype=torch.bfloat16, device=device)
+    iq[..., 0], iq[..., 1] = 1, -0.25
+    weights = (torch.rand((rows, 32), dtype=torch.bfloat16, device=device) + 1) / 64
+    packed = torch.empty((rows, 32, 64), dtype=torch.uint8, device=device)
+    scales = torch.empty((rows, 32, 4), dtype=torch.uint8, device=device)
+    out = torch.empty_like(q)
+    workload = B12xWorkload(
+        stage="state",
+        token_counts=tuple(sorted({rows, 4 if is_decode else 64})),
+        fixed_token_counts=(),
+        output_dtype=torch.bfloat16,
+        max_tokens=max(rows, 64),
+        max_seqs=4,
+        max_model_len=layer.max_model_len,
+    )
+    session = PreparationSession(device=device, autotune=False)
+    units = layer.get_b12x_preparation_units(layer, workload)
+    requests = tuple(request for unit in units for request in unit.requests)
+    session.prepare(requests, autotune=False)
+    activation_refs: list[tuple[str, StorageWeakRef]] = []
+
+    def run():
+        # Like set_forward_context, every forward starts from a fresh context.
+        forward.context = SimpleNamespace(
+            cudagraph_runtime_mode=CUDAGraphMode.NONE, attn_metadata=attn_metadata
+        )
+        query = q.clone()
+        index_query = packed.clone(), scales.clone(), weights.clone()
+        activation_refs.extend(
+            (name, StorageWeakRef(tensor.untyped_storage()))
+            for name, tensor in zip(
+                ("query", "index_query", "index_scales", "index_weights"),
+                (query, *index_query),
+            )
+        )
+        mode = "decode" if is_decode else "prefill"
+        chunk = layer.DECODE_CHUNK if is_decode else layer.INDEX_CHUNK
+        for offset in range(0, rows, chunk):
+            end = min(offset + chunk, rows)
+            attention.dsa_indexer.quantize_q_mxfp4(
+                layer._index_plan(mode, end - offset),
+                iq[offset:end],
+                q_mxfp4=index_query[0][offset:end],
+                q_scales=index_query[1][offset:end],
+            )
+        layer.forward_mqa(query, None, positions, out, index_query=index_query)
+
+    run()
+    batched_output = out.clone()
+    # Index-score chunking must not change the full attention output. Reuse
+    # the plan and operands while exercising multiple scoring batches.
+    chunk_attribute = "DECODE_CHUNK" if is_decode else "INDEX_CHUNK"
+    setattr(layer, chunk_attribute, 4 if is_decode else 64)
+    run()
+    torch.testing.assert_close(out, batched_output, rtol=0, atol=0)
+    delattr(layer, chunk_attribute)
+    manager.lock()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with (
+        workspace.collect_cuda_graph_capture_resources() as resources,
+        session.capture(),
+        torch.cuda.graph(graph, stream=stream),
+    ):
+        run()
+
+    # Graph resources own scratch, not the per-layer query activations or the
+    # per-forward decode metadata: each replay rewrites it, so graphs of other
+    # shapes share its pool storage instead of pinning one copy per graph.
+    def poison_decode_metadata():
+        shared = getattr(forward.context, "_ds41_decode_metadata", {})
+        tensors = [tensor for entry in shared.values() for tensor in entry[2]]
+        for tensor in tensors:
+            tensor.fill_(-1)
+            activation_refs.append(
+                ("decode_metadata", StorageWeakRef(tensor.untyped_storage()))
+            )
+        return len(tensors)
+
+    assert bool(poison_decode_metadata()) == is_decode
+    forward.context = None
+    gc.collect()
+    retained = [name for name, reference in activation_refs if not reference.expired()]
+    assert not retained, f"Capture resources retained caller activations: {retained}"
+    # Changed queries exercise both selection and attention on replay, after
+    # all plan storage has been reused by another operation.
+    for step, seed in enumerate((143, 144)):
+        torch.manual_seed(seed)
+        q.normal_()
+        iq[..., 0], iq[..., 1] = (1, -0.25) if step == 0 else (-0.25, 1)
+        run()
+        expected = out.clone()
+        expected_topk = (
+            torch.arange(
+                256 * step, 256 * step + 512, dtype=torch.int32, device=device
+            )[None]
+            .expand(rows, -1)
+            .clone()
+        )
+        expected_topk[live_rows:] = -1
+        for plan in layer._index_plans.values():
+            for scratch in attention.dsa_indexer.scratch_specs(plan, device=device):
+                torch.empty(scratch.shape, dtype=scratch.dtype, device=device).fill_(
+                    0xA5
+                )
+        out.fill_(float("nan"))
+        layer.topk_indices_buffer[:rows].fill_(-1)
+        graph.replay()
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            layer.topk_indices_buffer[:rows], expected_topk, rtol=0, atol=0
+        )
+    # Keep the collector alive for all replays, as the production graph owner does.
+    graph.reset()
+    session.close()
+    del resources
+
+
+@torch.inference_mode()
+def test_output_projection_prepares_uncaptured_decode_sizes(native_workspace):
+    """Short eager prompts and variable decode batches need no runtime planning."""
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.preparation import PreparationSession
+
+    from vllm.utils.b12x import B12xWorkload
+
+    attention, manager, workspace = native_workspace
+    layer = _layer(attention)
+    layer.capacity = 64
+    layer.config.scheduler_config.max_num_seqs = 2
+    layer.config.speculative_config.num_speculative_tokens = 7
+    layer.config.speculative_config.parallel_drafting = True
+    layer.config.compilation_config.max_cudagraph_capture_size = 32
+    layer.n_local_groups = 2
+    layer.head_dim = 512
+    layer.rope_head_dim = 64
+    layer.o_lora_rank = 128
+    layer.hidden_size = 256
+    device = layer.rotary_emb.cos_sin_cache.device
+
+    def projection(n, k, value):
+        return SimpleNamespace(
+            weight=torch.full((n, k), value, dtype=torch.float8_e4m3fn, device=device),
+            weight_scale_inv=torch.full(
+                (n // 32, k // 32), 127, dtype=torch.uint8, device=device
+            ).view(torch.float8_e8m0fnu),
+        )
+
+    layer.wo_a = projection(256, 4096, 1 / 64)
+    layer.wo_b = projection(256, 256, 1 / 16)
+    layer._wo_projection_weights = None
+    layer._wo_plans = {}
+    layer.setup_wo_projection()
+    layer._declare_attention(device)
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(1, 2, 4, 8, 16, 32, 64),
+        fixed_token_counts=(1, 2, 4, 8, 16, 32),
+        output_dtype=torch.bfloat16,
+        max_tokens=64,
+        max_seqs=2,
+        max_model_len=1024,
+        speculative_tokens=7,
+    )
+    unit = layer._wo_preparation_unit(workload)
+    source = torch.full((32, 16, 512), 0.125, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(32, dtype=torch.int64, device=device)
+    graph = torch.cuda.CUDAGraph()
+    with PreparationSession(device=device, autotune=False) as session:
+        session.prepare(unit.requests)
+        for request in unit.requests:
+            manager.get_simultaneous(
+                *((spec.shape, spec.dtype) for spec in request.plan.scratch_specs())
+            )
+        manager.lock()
+        try:
+            with kernel_resolution_guard("WO decode shapes are prepared"):
+                for rows in (15, 7, 1, 29, 30, 32):
+                    output = layer._o_proj(source[:rows], positions[:rows])
+                    # Identity RoPE and power-of-two operands make both GEMMs exact.
+                    torch.testing.assert_close(
+                        output, torch.full_like(output, 128), rtol=0, atol=0
+                    )
+                with (
+                    workspace.collect_cuda_graph_capture_resources() as resources,
+                    session.capture(),
+                    torch.cuda.graph(graph),
+                ):
+                    output = layer._o_proj(source[:15], positions[:15])
+                source.neg_()
+                graph.replay()
+                torch.accelerator.synchronize(device)
+                torch.testing.assert_close(
+                    output, torch.full_like(output, -128), rtol=0, atol=0
+                )
+        finally:
+            graph.reset()
+            manager.unlock()
+    del resources
+
+
+@pytest.mark.parametrize("is_prefill", [False, True])
+def test_output_projection_capture_releases_caller_activations(
+    native_workspace, is_prefill
+):
+    """WO bindings may borrow inputs and results without pinning them per graph."""
+    from b12x.preparation import PreparationSession
+
+    from vllm.utils.b12x import B12xWorkload
+
+    attention, manager, workspace = native_workspace
+    device = torch.device("cuda")
+    torch.manual_seed(147)
+    layer = _layer(attention)
+    layer.capacity = 16
+    layer.n_local_groups = 2
+    layer.n_local_heads = 16
+    layer.head_dim = 512
+    layer.rope_head_dim = 64
+    layer.o_lora_rank = 1024
+    layer.hidden_size = 5120
+    layer._wo_plans = {}
+    angles = torch.randn(32, 32, device=device)
+    layer.rotary_emb = SimpleNamespace(
+        cos_sin_cache=torch.cat((angles.cos(), angles.sin()), dim=-1)
+    )
+    for name, shape in (("wo_a", (2048, 4096)), ("wo_b", (5120, 2048))):
+        setattr(
+            layer,
+            name,
+            SimpleNamespace(
+                weight=(torch.randn(shape, device=device) / 32).to(torch.float8_e4m3fn),
+                weight_scale_inv=torch.ones(
+                    shape[0] // 32, shape[1] // 32, device=device
+                ).to(torch.float8_e8m0fnu),
+            ),
+        )
+    layer.setup_wo_projection()
+    layer._declare_attention(device)
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(8, 16),
+        fixed_token_counts=(8,),
+        output_dtype=torch.bfloat16,
+        max_tokens=16,
+        max_seqs=1,
+        max_model_len=32,
+    )
+    session = PreparationSession(device=device, autotune=False, compile_workers=2)
+    session.prepare(layer._wo_preparation_unit(workload).requests)
+    session.freeze()
+    manager.reserve_all(
+        *(
+            (spec.shape, spec.dtype)
+            for plan in layer._wo_plans.values()
+            for spec in plan.scratch_specs()
+        )
+    )
+    manager.lock()
+    inputs = torch.randn(16, 16, 512, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(16, device=device)
+    output = torch.empty(16, 5120, dtype=torch.bfloat16, device=device)
+    references: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def run(rows):
+        source = inputs[:rows] + 1
+        result = layer._o_proj(source, positions[:rows], is_prefill=is_prefill)
+        references.extend((weakref.ref(source), weakref.ref(result)))
+        if result._base is not None:
+            references.append(weakref.ref(result._base))
+        output[:rows].copy_(result)
+
+    pool = torch.cuda.graph_pool_handle()
+    graphs, owners = {}, []
+    try:
+        for rows in (16, 8):
+            run(rows)
+            torch.accelerator.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            graphs[rows] = graph
+            with (
+                session.capture(),
+                workspace.collect_cuda_graph_capture_resources() as resources,
+                torch.cuda.graph(graph, pool=pool),
+            ):
+                run(rows)
+            owners.append(resources)
+            gc.collect()
+            assert all(reference() is None for reference in references)
+            assert resources
+
+        for rows in (8, 16, 8, 16):
+            inputs.normal_()
+            positions.copy_(torch.randperm(16, device=device))
+            run(rows)
+            expected = output[:rows].clone()
+            output.fill_(float("nan"))
+            graphs[rows].replay()
+            torch.testing.assert_close(output[:rows], expected, rtol=0, atol=0)
+    finally:
+        for graph in graphs.values():
+            graph.reset()
+        session.close()
+
+
+def test_output_projection_uses_fused_block32_path(native_workspace, monkeypatch):
+    from dataclasses import dataclass
+
+    import b12x.preparation as preparation
+
+    attention, _, _ = native_workspace
+    calls: dict[str, Any] = {}
+    plan = SimpleNamespace(scratch_specs=lambda: (), prepared=object())
+
+    @dataclass
+    class Binding:
+        output: torch.Tensor | None = None
+
+    def pack_weights(*args, **kwargs):
+        calls["pack"] = (args, kwargs)
+        return SimpleNamespace(hidden=256)
+
+    def bind_inv_rope(actual_plan, **kwargs):
+        assert actual_plan is plan
+        calls["bind"] = kwargs
+        return Binding()
+
+    def require_prepared(actual_plan, component, device):
+        assert actual_plan is plan and component == "gemm.wo_projection"
+        assert device.type == "cuda"
+
+    def run_inv_rope(*args, **kwargs):
+        calls["run"] = (args, kwargs)
+        assert kwargs["plan"] is plan
+        return kwargs["binding"].output.fill_(7).squeeze(-1)
+
+    monkeypatch.setattr(attention.wo_projection, "pack_weights", pack_weights)
+    monkeypatch.setattr(attention.wo_projection, "bind_inv_rope", bind_inv_rope)
+    monkeypatch.setattr(attention.wo_projection, "run_inv_rope", run_inv_rope)
+    monkeypatch.setattr(preparation, "require_prepared", require_prepared)
+    monkeypatch.setattr(
+        attention,
+        "current_stream",
+        lambda: SimpleNamespace(cuda_stream=123),
+    )
+    layer = attention.DeepseekV4Attention.__new__(attention.DeepseekV4Attention)
+    torch.nn.Module.__init__(layer)
+    layer.n_local_groups = 2
+    layer.n_local_heads = 4
+    layer.head_dim = 128
+    layer.rope_head_dim = 32
+    layer.o_lora_rank = 128
+    layer.hidden_size = 256
+    layer.rotary_emb = SimpleNamespace(cos_sin_cache=torch.empty((1, 64)))
+    layer.wo_a = SimpleNamespace(
+        weight=torch.empty((256, 256), dtype=torch.float8_e4m3fn, device="cuda"),
+        weight_scale_inv=torch.empty((8, 8), dtype=torch.float8_e8m0fnu, device="cuda"),
+    )
+    layer.wo_b = SimpleNamespace(
+        weight=torch.empty((256, 256), dtype=torch.float8_e4m3fn, device="cuda"),
+        weight_scale_inv=torch.empty((8, 8), dtype=torch.float8_e8m0fnu, device="cuda"),
+    )
+    layer._wo_projection_weights = None
+    layer._wo_plans = {3: plan}
+    layer._l2pf_wo = layer._l2pf_ffn = None
+
+    layer.setup_wo_projection()
+    output = layer._o_proj(
+        torch.empty((3, 4, 128), dtype=torch.bfloat16, device="cuda"),
+        torch.arange(3, device="cuda"),
+    )
+
+    assert calls["pack"][1] == {
+        "groups": 2,
+        "group_width": 256,
+        "rank": 128,
+        "hidden": 256,
+        "block_size": (32, 32),
+    }
+    assert calls["bind"]["heads_per_group"] == 2
+    assert calls["bind"]["nope_dim"] == 96
+    assert calls["bind"]["rope_dim"] == 32
+    assert calls["run"][1]["stream"] == 123
+    assert output.shape == (3, 256)
+    assert torch.count_nonzero(output != 7) == 0
+
+
+def test_model_post_load_packs_output_projections(native_workspace):
+    from vllm.models.deepseek_v41.nvidia import model
+
+    _, _, _ = native_workspace
+    calls = []
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            from vllm.models.deepseek_v41.nvidia.b12x.attention import (
+                DeepseekV41B12xAttention,
+            )
+
+            self._use_b12x = True
+            self.attn = DeepseekV41B12xAttention.__new__(DeepseekV41B12xAttention)
+            torch.nn.Module.__init__(self.attn)
+            self.attn.setup_wo_projection = lambda: calls.append("wo")
+
+        def finalize_mhc_broadcast_weights(self):
+            calls.append("mhc")
+
+    root = model.DeepseekV41LLMForCausalLM.__new__(model.DeepseekV41LLMForCausalLM)
+    torch.nn.Module.__init__(root)
+    root.model = Model()
+    root.process_weights_after_loading()
+
+    assert calls == ["mhc", "wo"]
+
+
+def test_dspark_post_load_packs_output_projections(
+    native_workspace,
+    monkeypatch,
+    default_vllm_config,
+    dist_init,
+):
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+    from vllm.models.deepseek_v41.nvidia.b12x import dspark
+
+    _, _, _ = native_workspace
+    calls = []
+
+    class Attention(torch.nn.Module):
+        def setup_wo_projection(self):
+            calls.append("wo")
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = Attention()
+            self.hc_mult = 1
+            self.hidden_size = 1
+            self.hc_attn_fn = torch.ones((1, 1))
+            self.hc_attn_fn_broadcast = None
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList((Layer(), Layer()))
+            self.context_capacity = 8
+            self._context_kv_projections = []
+
+    monkeypatch.setattr(
+        dspark,
+        "_ContextKVProjection",
+        lambda attention, capacity: (attention, capacity),
+    )
+    from vllm.models.deepseek_v41.nvidia.dspark import DSparkDeepseekV4ForCausalLM
+
+    root = DSparkDeepseekV4ForCausalLM.__new__(DSparkDeepseekV4ForCausalLM)
+    torch.nn.Module.__init__(root)
+    root._use_b12x = True
+    root.model = Model()
+    root.model.markov_head = torch.nn.Module()
+    root.model.markov_head.markov_w2 = ParallelLMHead(128, 128)
+    root.logits_processor = LogitsProcessor(128)
+    root.process_weights_after_loading()
+
+    assert calls == ["wo", "wo"]
+    assert len(root.model._context_kv_projections) == 2
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_index_visibility_crosses_old_capacity_cutoff(native_workspace, ratio, request):
+    """Source and reindex must retain winners beyond the former 64-state cap."""
+    from b12x.preparation import PreparationSession
+
+    attention, _, _ = native_workspace
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    layers = [_layer(attention, index) for index in (2, 20, 24)]
+    for layer in layers:
+        layer.config.cache_config.block_size = 256
+        layer.max_model_len = 1 << 20
+        layer.compress_ratio = ratio
+        layer.candidate_source_layer = 20
+        layer._prepare(device)
+    page = 256 // ratio
+    old_cutoff = (1 << 20) // 256 * 64
+    positions = torch.arange(
+        old_cutoff - 256, old_cutoff + 256, dtype=torch.int64, device=device
+    )
+    first_page = (old_cutoff - 256) // page
+    page_count = 512 // page
+    stride = 227840
+    high_pid = 2**31 // stride + 1
+    storage = torch.empty(
+        (high_pid + page_count, stride), dtype=torch.uint8, device=device
+    )
+    pool = storage[:, : attention.dsa_indexer.index_mxfp4_page_bytes(page)]
+    physical_pages = torch.arange(
+        high_pid, high_pid + page_count, dtype=torch.int32, device=device
+    )
+    table = torch.full((1, (1 << 20) // 256), -1, dtype=torch.int32, device=device)
+    table[:, first_page : first_page + page_count] = physical_pages
+    slots = (
+        physical_pages[positions // page - first_page].long() * page + positions % page
+    )
+    keys = torch.zeros((512, 128), dtype=torch.bfloat16, device=device)
+    keys[:, 0] = 1
+    _write_index_keys(keys, index_k_cache=pool, slot_mapping=slots, page_size=page)
+    heads = layers[0].indexer.heads
+    q = torch.zeros((1, heads, 128), dtype=torch.bfloat16, device=device)
+    q[..., 0] = 1
+    packed = torch.empty((1, heads, 64), dtype=torch.uint8, device=device)
+    scales = torch.empty((1, heads, 4), dtype=torch.uint8, device=device)
+    lengths = torch.tensor([old_cutoff + 256], dtype=torch.int32, device=device)
+    weights = torch.ones((1, heads), dtype=torch.bfloat16, device=device) / 32
+    session = PreparationSession(device=device, autotune=False)
+    request.addfinalizer(session.close)
+    declarations = []
+    for layer in layers:
+        layer.indexer.k_cache.kv_cache = pool
+        for mode in ("decode", "prefill"):
+            plan = layer._declare_index_plan(mode, 1)
+            layer._index_plans[mode, 1] = plan
+            declarations.append(
+                plan.request(
+                    name=layer._index_request_name(mode, 1),
+                    prepare_call=layer._index_call(mode, 1),
+                )
+            )
+    session.prepare(declarations)
+    session.freeze()
+    for mode in ("decode", "prefill"):
+        for layer in layers:
+            candidate_args = {}
+            if layer.layer_id == 20:
+                candidate_args = dict(
+                    candidate_output=layer._candidates[:1],
+                    candidate_output_lengths=layer._candidate_lens[:1],
+                )
+            elif layer.layer_id == 24:
+                candidate_args = dict(
+                    candidate_indices=layers[1]._candidates[:1],
+                    candidate_lengths=layers[1]._candidate_lens[:1],
+                )
+            plan = layer._index_plans[mode, 1]
+            attention.dsa_indexer.quantize_q_mxfp4(
+                plan, q, q_mxfp4=packed, q_scales=scales
+            )
+            binding = attention.dsa_indexer.bind(
+                plan,
+                scratch=attention._scratch(plan),
+                q_mxfp4=packed,
+                q_scales=scales,
+                query_weights=weights,
+                index_k_cache=pool,
+                page_table=table,
+                cache_lengths=lengths,
+                active_width=layer._active,
+                output_indices=layer.topk_indices_buffer[:1],
+                **candidate_args,
+            )
+            attention.dsa_indexer.run(binding)
+            torch.testing.assert_close(
+                layer.topk_indices_buffer[:1], positions.int()[None], atol=0, rtol=0
+            )
+
+
+@torch.inference_mode()
+def test_ced_global_preparation_preserves_full_row_cache_bytes(
+    native_workspace, monkeypatch, request
+):
+    from b12x.preparation import PreparationSession, PreparedCall
+
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+    from vllm.models.deepseek_v41.nvidia.b12x import b12x_layers
+    from vllm.models.deepseek_v41.nvidia.b12x.compressor import DeepseekCompressor
+    from vllm.utils.b12x import B12xWorkload
+
+    attention, _, _ = native_workspace
+    for module in (linear, parameter):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(b12x_layers, "_capacity", lambda: 256)
+    torch.manual_seed(712)
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    layer = _layer(attention, 20)
+    layer.capacity = 256
+    layer.is_ced_decoder = True
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=256, max_num_seqs=1),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(rms_norm_eps=1e-6)),
+    )
+    layer.compressor = DeepseekCompressor(config, 1, 128, 512).to(device)
+    layer.compressor.fused_wkv_wgate.weight.normal_(0, 0.1)
+    wk = linear.ReplicatedLinear(
+        512, 128, bias=False, return_bias=False, params_dtype=torch.bfloat16
+    ).to(device)
+    wk.quant_method = b12x_layers.B12xLinearMethod()
+    wk.weight.normal_(0, 0.1)
+    layer.indexer.wk = wk
+    layer.indexer.k_norm = b12x_layers.B12xRMSNorm(128).to(device)
+    angles = torch.randn((256, 32), device=device)
+    layer.rotary_emb = SimpleNamespace(
+        cos_sin_cache=torch.cat((angles.cos(), angles.sin()), dim=-1)
+    )
+    layer._prepare(device)
+    layer.kv_cache = torch.zeros(
+        (
+            5,
+            attention.mla.page_nbytes(
+                64, cache_kind="indexed", cache_format="deepseek_v41"
+            ),
+        ),
+        dtype=torch.uint8,
+        device=device,
+    )
+    layer.indexer.k_cache.kv_cache = torch.zeros(
+        (5, attention.dsa_indexer.index_mxfp4_page_bytes(64)),
+        dtype=torch.uint8,
+        device=device,
+    )
+    positions = torch.arange(256, device=device, dtype=torch.int64)
+    positions[192:] = -1
+    slots = torch.arange(256, device=device, dtype=torch.int64) + 64
+    slots[192:] = -1
+    full = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 192], device=device, dtype=torch.int32),
+        request_positions=torch.zeros(1, device=device, dtype=torch.int64),
+        live_counts=torch.tensor([192, 1], device=device, dtype=torch.int32),
+        slot_mapping=slots,
+        decoder=None,
+    )
+    context = SimpleNamespace(
+        attn_metadata={layer.prefix: full, layer.indexer.k_cache.prefix: full},
+        no_compile_layers={layer.prefix: layer},
+    )
+    monkeypatch.setattr(attention, "get_forward_context", lambda: context)
+    hidden = torch.randn((256, 128), device=device, dtype=torch.bfloat16)
+    workload = B12xWorkload(
+        stage="weights",
+        token_counts=(256,),
+        fixed_token_counts=(),
+        output_dtype=torch.bfloat16,
+        max_tokens=256,
+        max_seqs=1,
+        max_model_len=256,
+    )
+    wk.quant_method.process_weights_after_loading(wk)
+    units = (
+        *layer.compressor.get_b12x_preparation_units(layer.compressor, workload),
+        *wk.quant_method.get_b12x_preparation_units(wk, workload),
+        *layer.indexer.k_norm.get_b12x_preparation_units(
+            layer.indexer.k_norm, workload
+        ),
+    )
+    declarations = [item for unit in units for item in unit.requests]
+    table = layer.rotary_emb.cos_sin_cache
+    for role, dim in (("index_key", 128), ("latent", 512)):
+        plan = attention.rotary.plan(
+            attention.rotary.Query(
+                max_rows=256,
+                heads=1,
+                dim=dim,
+                ratio=1,
+                cos_sin_dtype="float32",
+            ),
+            device=device,
+        )
+        layer._helper_plans[role] = plan
+
+        def prepare_rotary(state, dim=dim):
+            source = torch.ones((1, dim), dtype=torch.bfloat16, device=device)
+            output = torch.empty_like(source)
+            pos = torch.zeros(1, dtype=torch.int64, device=device)
+            return PreparedCall(run=lambda: state.run(source, pos, table, out=output))
+
+        declarations.append(plan.request(name=role, prepare_call=prepare_rotary))
+    writer = attention.mla.plan_cache_writer(
+        attention.mla.CacheWriterQuery(
+            max_rows=256,
+            page_size=64,
+            cache_kind="indexed",
+            slot_dtype="int64",
+        ),
+        device=device,
+    )
+    layer._helper_plans["indexed_cache_write"] = writer
+
+    def prepare_writer(state):
+        source = torch.ones((1, 512), dtype=torch.bfloat16, device=device)
+        cache = torch.empty_like(layer.kv_cache[:1])
+        slots = torch.zeros(1, dtype=torch.int64, device=device)
+        return PreparedCall(run=lambda: state.run(source, cache, slots))
+
+    declarations.append(
+        writer.request(name="indexed_writer", prepare_call=prepare_writer)
+    )
+    index_plan = layer._declare_index_plan("prefill", 256)
+    layer._index_plans["prefill", 256] = index_plan
+    declarations.append(
+        index_plan.request(
+            name=layer._index_request_name("prefill", 256),
+            prepare_call=layer._index_call("prefill", 256),
+        )
+    )
+    session = PreparationSession(device=device, autotune=False)
+    request.addfinalizer(session.close)
+    session.prepare(declarations)
+    session.freeze()
+    # Original full-forward computation, with real compressor/projection/writers.
+    latent, emitted_slots = layer.compressor(hidden, full)
+    key = layer.indexer.k_norm(layer.indexer.wk(latent))
+    key = attention._rotated(
+        key, positions, table, plan=layer._helper_plan("index_key")
+    )
+    _write_index_keys(
+        key,
+        index_k_cache=layer.indexer.k_cache.kv_cache,
+        slot_mapping=slots,
+        page_size=64,
+    )
+    latent = attention._rotated(
+        latent, positions, table, plan=layer._helper_plan("latent")
+    )
+    _write_cache(
+        latent,
+        layer.kv_cache,
+        emitted_slots,
+        page_size=64,
+        cache_kind="indexed",
+        cache_format="deepseek_v41",
+    )
+    expected = (layer.kv_cache.clone(), layer.indexer.k_cache.kv_cache.clone())
+    # The decoder view intentionally lacks early rows. Global preparation must
+    # neither read this view nor leave the discarded encoder prefix unwritten.
+    full.decoder = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 128], device=device, dtype=torch.int32),
+        request_positions=torch.tensor([64], device=device, dtype=torch.int64),
+        live_counts=torch.tensor([128, 1], device=device, dtype=torch.int32),
+        slot_mapping=slots[64:192],
+    )
+    layer.kv_cache.zero_()
+    layer.indexer.k_cache.kv_cache.zero_()
+    layer.prepare_global_kv(positions, hidden)
+    torch.testing.assert_close(layer.kv_cache, expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(
+        layer.indexer.k_cache.kv_cache, expected[1], rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("main_page,swa_page", [(64, 32), (128, 64), (256, 128)])
+@torch.inference_mode()
+def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
+    native_workspace, monkeypatch, request, main_page, swa_page
+):
+    from contextlib import ExitStack
+
+    from b12x.preparation import PreparationSession
+
+    from vllm.utils.b12x import B12xWorkload
+
+    attention, manager, workspace = native_workspace
+    precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    request.addfinalizer(lambda: torch.set_float32_matmul_precision(precision))
+    torch.manual_seed(713)
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    layer = _layer(attention, 20, swa_page=swa_page)
+    layer.config.cache_config.block_size = main_page
+    layer.is_ced_decoder = True
+    layer._prepare(device)
+    # Only the tuner's own choice ("auto") may select FP8 internals.
+    fp8 = envs.VLLM_DS41_ATTENTION_COMPUTE == "auto"
+    rows, length, boundary = 128, 256, 128
+    positions = torch.arange(boundary, length, device=device, dtype=torch.int64)
+    reqs = torch.zeros(rows, device=device, dtype=torch.int32)
+    starts = torch.tensor([0, rows], device=device, dtype=torch.int32)
+    visible = (positions + 1).int()
+    replay_start = torch.tensor([boundary], device=device, dtype=torch.int64)
+
+    def metadata(page):
+        compact = SimpleNamespace(
+            positions=positions,
+            req_id_per_token=reqs,
+            block_table=torch.arange(
+                1, length // page + 1, device=device, dtype=torch.int32
+            )[None],
+            query_start_loc=starts,
+            request_positions=replay_start,
+            cache_lengths=visible,
+            is_decode=False,
+            max_seq_len=length,
+            swa_replay_start=replay_start,
+            decoder=None,
+        )
+        # Full input has different query anchors and must not be used here.
+        return SimpleNamespace(
+            positions=torch.arange(length, device=device, dtype=torch.int64),
+            decoder=compact,
+        )
+
+    context = SimpleNamespace(
+        attn_metadata={
+            layer.swa_cache_layer.prefix: metadata(swa_page),
+            layer.prefix: metadata(main_page),
+            layer.indexer.k_cache.prefix: metadata(main_page),
+        }
+    )
+    monkeypatch.setattr(attention, "get_forward_context", lambda: context)
+    kv = torch.randn((length, 512), device=device, dtype=torch.bfloat16)
+    for kind, page in (("swa", swa_page), ("indexed", main_page)):
+        cache = torch.zeros(
+            (
+                length // page + 1,
+                attention.mla.page_nbytes(
+                    page, cache_kind=kind, cache_format="deepseek_v41"
+                ),
+            ),
+            device=device,
+            dtype=torch.uint8,
+        )
+        _write_cache(
+            kv,
+            cache,
+            torch.arange(length, device=device) + page,
+            page_size=page,
+            cache_kind=kind,
+            cache_format="deepseek_v41",
+        )
+        if kind == "swa":
+            layer.swa_cache_layer.kv_cache = cache
+            swa_values, swa_scales = (
+                part[page : page + length].clone()
+                for part in _v41_cache_operands(cache, kind, fp8=fp8)
+            )
+            # NaN FP8 payloads in every old SWA row: reading below the
+            # replay boundary cannot accidentally look like a valid zero page.
+            cache[1 : 1 + boundary // page].fill_(0x7F)
+        else:
+            layer.kv_cache = cache
+            main_values, main_scales = (
+                part[page : page + length].clone()
+                for part in _v41_cache_operands(cache, kind, fp8=fp8)
+            )
+    layer.indexer.k_cache.kv_cache = torch.zeros(
+        (
+            length // main_page + 1,
+            attention.dsa_indexer.index_mxfp4_page_bytes(main_page),
+        ),
+        device=device,
+        dtype=torch.uint8,
+    )
+    keys = torch.zeros((length, 128), device=device, dtype=torch.bfloat16)
+    # Future keys score highest. Any missing causal mask is observable.
+    keys[:, 0] = torch.arange(1, length + 1, device=device)
+    _write_index_keys(
+        keys,
+        index_k_cache=layer.indexer.k_cache.kv_cache,
+        slot_mapping=torch.arange(length, device=device) + main_page,
+        page_size=main_page,
+    )
+    q = torch.randn((rows, 16, 512), device=device, dtype=torch.bfloat16)
+    heads = layer.indexer.heads
+    iq = torch.zeros((rows, heads, 128), device=device, dtype=torch.bfloat16)
+    iq[..., 0] = 1
+    packed = torch.empty((rows, heads, 64), device=device, dtype=torch.uint8)
+    scales = torch.empty((rows, heads, 4), device=device, dtype=torch.uint8)
+    weights = torch.full((rows, heads), 1 / 64, device=device, dtype=torch.bfloat16)
+    layer.attn_sink = torch.zeros(16, device=device)
+    out = torch.empty_like(q)
+
+    def run():
+        attention.dsa_indexer.quantize_q_mxfp4(
+            layer._index_plan("decode", min(rows, layer.DECODE_CHUNK)),
+            iq,
+            q_mxfp4=packed,
+            q_scales=scales,
+        )
+        layer.forward_mqa(
+            q, None, positions, out, index_query=(packed, scales, weights)
+        )
+
+    def oracle(live):
+        selected = layer.topk_indices_buffer[:live].long()
+        # Candidate order affects per-tile FP8 rounding. Verify its complete
+        # causal set independently before using that order in the numeric oracle.
+        columns = torch.arange(selected.shape[1], device=device)[None]
+        expected_ids = columns.expand_as(selected).clone()
+        expected_ids.masked_fill_(columns > positions[:live, None], length)
+        actual_ids = selected.masked_fill(selected < 0, length).sort(dim=1).values
+        torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
+        swa_logical = torch.arange(boundary, length, device=device)[None]
+        swa_valid = swa_logical <= positions[:live, None]
+        main_valid = (selected >= 0) & (selected <= positions[:live, None])
+        valid = torch.cat((swa_valid, main_valid), dim=1)
+        values = torch.cat(
+            (
+                swa_values[None, boundary:].expand(live, -1, -1),
+                main_values[selected.clamp_min(0)],
+            ),
+            dim=1,
+        ).masked_fill(~valid[..., None], 0)
+        scales = torch.cat(
+            (
+                swa_scales[None, boundary:].expand(live, -1, -1),
+                main_scales[selected.clamp_min(0)],
+            ),
+            dim=1,
+        ).masked_fill(~valid[..., None], 0)
+        return _v41_prefill_reference(
+            q[:live],
+            values,
+            scales,
+            valid,
+            layer.attn_sink,
+            fp8=fp8,
+        )
+
+    workload = B12xWorkload(
+        stage="state",
+        token_counts=(17, 65, 128),
+        fixed_token_counts=(),
+        output_dtype=torch.bfloat16,
+        max_tokens=128,
+        max_seqs=1,
+        max_model_len=layer.max_model_len,
+    )
+    session = PreparationSession(device=device, autotune=False)
+    owned = ExitStack()
+    request.addfinalizer(owned.close)
+    owned.callback(session.close)
+    units = layer.get_b12x_preparation_units(layer, workload)
+    prep_requests = tuple(pr for unit in units for pr in unit.requests)
+    result = session.prepare(prep_requests, autotune=False)
+    owned.callback(result.close)
+
+    run()
+    manager.lock()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    owned.callback(graph.reset)
+    resources = None
+    with session.capture():
+        try:
+            with (
+                workspace.collect_cuda_graph_capture_resources() as resources,
+                torch.cuda.graph(graph, stream=stream),
+            ):
+                run()
+            for live in (128, 65, 17):
+                positions.fill_(-1)
+                positions[:live] = torch.arange(
+                    boundary, boundary + live, device=device
+                )
+                reqs.fill_(-1)
+                reqs[:live] = 0
+                visible.copy_((positions + 1).clamp_min(0).int())
+                starts[1] = live
+                q.normal_()
+                # Eager execution also catches live-count specialization leaks.
+                run()
+                expected = oracle(live)
+                torch.testing.assert_close(
+                    out[:live].float(), expected, rtol=0.04, atol=0.025
+                )
+                out.fill_(float("nan"))
+                graph.replay()
+                torch.testing.assert_close(
+                    out[:live].float(), expected, rtol=0.04, atol=0.025
+                )
+                torch.testing.assert_close(
+                    out[live:], torch.zeros_like(out[live:]), rtol=0, atol=0
+                )
+                selected = layer.topk_indices_buffer[:live]
+                assert torch.all((selected < 0) | (selected <= positions[:live, None]))
+        finally:
+            graph.reset()
+            del resources
+
+
+@pytest.mark.parametrize("swa_page", [32, 64, 128])
+@torch.inference_mode()
+def test_ced_replay_window_high_page_stride_and_invalid_rows(
+    native_workspace, monkeypatch, swa_page, request
+):
+    from b12x.attention._shared.mla.compressed_reference import (
+        unpack_deepseek_v41_cache_reference,
+    )
+    from b12x.preparation import PreparationSession
+
+    from vllm.utils.b12x import B12xWorkload
+
+    attention, _, _ = native_workspace
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    layer = _layer(attention, 20, swa_page=swa_page)
+    layer.is_ced_decoder = True
+    layer.compress_ratio = 0
+    layer.indexer = None
+    layer._prepare(device)
+    stride = 227840
+    high_pid = 2**31 // stride + 1
+    storage = torch.empty((high_pid + 1, stride), device=device, dtype=torch.uint8)
+    cache = storage[
+        :,
+        : attention.mla.page_nbytes(
+            swa_page, cache_kind="swa", cache_format="deepseek_v41"
+        ),
+    ]
+    kv = torch.randn((1, 512), device=device, dtype=torch.bfloat16)
+    _write_cache(
+        kv,
+        cache,
+        torch.tensor([high_pid * swa_page], device=device),
+        page_size=swa_page,
+        cache_kind="swa",
+        cache_format="deepseek_v41",
+    )
+    layer.swa_cache_layer.kv_cache = cache
+    positions = torch.tensor([128, -1, 128], device=device, dtype=torch.int64)
+    metadata = SimpleNamespace(
+        positions=positions,
+        req_id_per_token=torch.tensor([0, 0, -1], device=device, dtype=torch.int32),
+        block_table=torch.tensor(
+            [[-1] * (128 // swa_page) + [high_pid]], device=device, dtype=torch.int32
+        ),
+        query_start_loc=torch.tensor([0, 1], device=device, dtype=torch.int32),
+        request_positions=positions[:1],
+        cache_lengths=torch.tensor([129, 99, 99], device=device, dtype=torch.int32),
+        is_decode=False,
+        max_seq_len=129,
+        decoder=None,
+        swa_replay_start=positions[:1],
+    )
+    monkeypatch.setattr(
+        attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={layer.swa_cache_layer.prefix: metadata}),
+    )
+    q = torch.randn((3, 16, 512), device=device, dtype=torch.bfloat16)
+    out = torch.empty_like(q)
+    layer.attn_sink = torch.zeros(16, device=device)
+    workload = B12xWorkload(
+        stage="state",
+        token_counts=(3,),
+        fixed_token_counts=(),
+        output_dtype=torch.bfloat16,
+        max_tokens=3,
+        max_seqs=1,
+        max_model_len=layer.max_model_len,
+    )
+    session = PreparationSession(device=device, autotune=False)
+    request.addfinalizer(session.close)
+    session.prepare(
+        tuple(
+            item
+            for unit in layer.get_b12x_preparation_units(layer, workload)
+            for item in unit.requests
+        )
+    )
+    session.freeze()
+    layer.forward_mqa(q, None, positions, out)
+    value = unpack_deepseek_v41_cache_reference(
+        cache[high_pid : high_pid + 1].contiguous(),
+        page_size=swa_page,
+        cache_kind="swa",
+    )[0]
+    score = torch.einsum("hd,d->h", q[0].float(), value) * 512**-0.5
+    expected = score.sigmoid()[:, None] * value
+    torch.testing.assert_close(out[0].float(), expected, rtol=0.04, atol=0.025)
+    torch.testing.assert_close(out[1:], torch.zeros_like(out[1:]), rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_global_preparation_dependency_survives_functionalization(
+    native_workspace, monkeypatch
+):
+    attention, _, _ = native_workspace
+    source = torch.arange(16, dtype=torch.float32, device="cuda").view(4, 4)
+    positions = torch.arange(4, device="cuda", dtype=torch.int64)
+    backing = torch.zeros((8, 4), device="cuda")
+
+    class CacheConsumer(torch.nn.Module):
+        prepare_global_kv = attention.DeepseekV4Attention.prepare_global_kv
+        forward = attention.DeepseekV4Attention.forward
+
+        def __init__(self):
+            super().__init__()
+            self.prefix = "functionalized_ced"
+            self.compressor = SimpleNamespace(state_cache=None)
+            self.kv_cache = backing[:4]
+            self.indexer = SimpleNamespace(
+                k_cache=SimpleNamespace(kv_cache=backing[4:])
+            )
+
+        def _prepare_global_kv(self, positions, hidden):
+            self.kv_cache.copy_(hidden * 2)
+            self.indexer.k_cache.kv_cache.copy_(hidden * 3)
+
+        def _forward(self, positions, hidden):
+            return self.kv_cache + self.indexer.k_cache.kv_cache
+
+    layer = CacheConsumer()
+    context = SimpleNamespace(no_compile_layers={layer.prefix: layer})
+    monkeypatch.setattr(attention, "get_forward_context", lambda: context)
+
+    def run(hidden):
+        ready = layer.prepare_global_kv(positions, hidden)
+        return layer(positions, hidden, global_kv_ready=ready)
+
+    compiled = torch.compile(run, backend="aot_eager", fullgraph=True)
+    for factor in (1, -2):
+        hidden = source * factor
+        output = compiled(hidden)
+        torch.testing.assert_close(output, hidden * 5)
+        # Preparation must remain visible to later consumers as well; mutable
+        # alias-list functionalization used to copy stale clones back here.
+        torch.testing.assert_close(backing, torch.cat((hidden * 2, hidden * 3)))
+
+
+@torch.inference_mode()
+def test_metadata_refresh_preserves_padded_graph_domain_and_addresses():
+    from vllm.models.deepseek_v41.nvidia.b12x.sparse_mla import (
+        DeepseekV41B12xMetadataBuilder,
+    )
+
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    builder = DeepseekV41B12xMetadataBuilder.__new__(DeepseekV41B12xMetadataBuilder)
+    builder.tokens, builder.requests = 4096, 4
+    builder.page, builder.ratio, builder.circular = 128, 1, False
+    builder.reorder_batch_threshold = 6
+    builder.starts = torch.empty(5, dtype=torch.int32, device=device)
+    builder.request_positions = torch.empty(4, dtype=torch.int64, device=device)
+    builder.counts = torch.empty(2, dtype=torch.int32, device=device)
+    for name, dtype in (
+        ("positions", torch.int64),
+        ("reqs", torch.int32),
+        ("slots", torch.int64),
+        ("lengths", torch.int32),
+    ):
+        setattr(builder, name, torch.empty(builder.tokens, dtype=dtype, device=device))
+    addresses = [
+        getattr(builder, name).data_ptr()
+        for name in ("positions", "reqs", "slots", "lengths")
+    ]
+    base_page = 2**31 // builder.page + 17
+    table = torch.zeros((2, 16), dtype=torch.int32, device=device)
+    table[0] = torch.arange(base_page, base_page + 16, dtype=torch.int32, device=device)
+    for live, padded in ((257, 320), (5, 10), (129, 160), (0, 5)):
+        seq = torch.tensor([1024, 0], dtype=torch.int32, device=device)
+        slots = torch.full((padded,), -1, dtype=torch.int64, device=device)
+        slots[:live] = 1
+        common = SimpleNamespace(
+            block_table_tensor=table,
+            query_start_loc=torch.tensor(
+                [0, live, live], dtype=torch.int32, device=device
+            ),
+            seq_lens=seq,
+            slot_mapping=slots,
+            num_reqs=2,
+            num_actual_tokens=padded,
+            max_query_len=live,
+            max_seq_len=2048,
+        )
+        builder.build(0, common)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            metadata = builder.build(0, common)
+        seq[0] += 7
+        graph.replay()
+        torch.accelerator.synchronize()
+        expected = torch.arange(1031 - live, 1031, dtype=torch.int64, device=device)
+        torch.testing.assert_close(metadata.positions[:live], expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            metadata.slot_mapping[:live],
+            base_page * builder.page + expected,
+            rtol=0,
+            atol=0,
+        )
+        assert bool((metadata.req_id_per_token[:live] == 0).all())
+        for tensor in (
+            metadata.positions,
+            metadata.req_id_per_token,
+            metadata.slot_mapping,
+        ):
+            assert bool((tensor[live:padded] == -1).all())
+        assert bool((metadata.cache_lengths[live:padded] == 0).all())
+        assert metadata.live_counts.tolist() == [padded, 2]
+        assert addresses == [
+            getattr(builder, name).data_ptr()
+            for name in ("positions", "reqs", "slots", "lengths")
+        ]

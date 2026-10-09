@@ -629,3 +629,29 @@ class TestMLAPrefillBackendConfig:
             mla_prefill_backend=MLAPrefillBackendEnum.TRTLLM_RAGGED,
         )
         assert config.mla_prefill_backend == MLAPrefillBackendEnum.TRTLLM_RAGGED
+
+
+@pytest.mark.parametrize("per_kind", [False, True])
+@pytest.mark.parametrize("explicit_prefill", [None, MLAPrefillBackendEnum.FLASH_ATTN])
+def test_b12x_defaults_prefill_and_preserves_explicit_override(
+    per_kind, explicit_prefill
+):
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.kv_cache_interface import KVCacheSpecKind
+
+    config = _make_vllm_config(mla_prefill_backend=explicit_prefill)
+    if per_kind:
+        config.attention_config.backend_per_kind = {
+            KVCacheSpecKind.MLA_ATTENTION.value: AttentionBackendEnum.B12X
+        }
+    else:
+        config.attention_config.backend = AttentionBackendEnum.B12X
+    selected = explicit_prefill or MLAPrefillBackendEnum.B12X
+    backend_cls = selected.get_class()
+    with (
+        patch("vllm.platforms.current_platform") as platform,
+        patch.object(backend_cls, "validate_configuration", return_value=[]),
+    ):
+        platform.is_cpu.return_value = False
+        platform.get_device_capability.return_value = DeviceCapability(12, 0)
+        assert get_mla_prefill_backend(config) is backend_cls

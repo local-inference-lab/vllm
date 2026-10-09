@@ -301,6 +301,92 @@ def test_v2_postprocess_indexes_block_tables_by_req_slot(conv_state_dim_first):
         torch.testing.assert_close(ssms[layer], ssm_ref[layer], rtol=0, atol=0)
 
 
+@_cuda_required
+def test_precopy_matches_qwen38_tp2_production_state_shape():
+    """Exercise every temporal-copy CTA and the full dim-first conv state."""
+    device = torch.device("cuda")
+    num_blocks = 6
+    conv_dim = 5120
+    conv_width = 6
+    ssm_shape = (24, 128, 128)
+
+    conv = torch.randn(
+        num_blocks,
+        conv_dim,
+        conv_width,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    ssm = torch.randn(num_blocks, *ssm_shape, dtype=torch.float32, device=device)
+    conv_pre = conv.clone()
+    ssm_pre = ssm.clone()
+
+    # Match the failing request's descending physical-page layout:
+    # conv reads col 0, temporal reads col 0 + token_bias, and both write col 1.
+    bt = torch.tensor([[5, 4, 3, 2, 1]], dtype=torch.int32, device=device)
+    src_col = torch.tensor([0], dtype=torch.int32, device=device)
+    dst_col = torch.tensor([1], dtype=torch.int32, device=device)
+    token_bias = torch.tensor([2], dtype=torch.int32, device=device)
+
+    state_base_addrs = torch.tensor(
+        [conv.data_ptr(), ssm.data_ptr()], dtype=torch.int64, device=device
+    )
+    state_block_strides = torch.tensor(
+        [
+            conv.stride(0) * conv.element_size(),
+            ssm.stride(0) * ssm.element_size(),
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    state_elem_sizes = torch.tensor(
+        [conv.element_size(), ssm.element_size()], dtype=torch.int32, device=device
+    )
+    state_inner_sizes = torch.tensor(
+        [1, ssm[0].numel()], dtype=torch.int64, device=device
+    )
+    state_conv_widths = torch.tensor([conv_width, 0], dtype=torch.int32, device=device)
+    state_group_indices = torch.zeros(2, dtype=torch.int32, device=device)
+    state_dim_row_count = torch.tensor([conv_dim, 0], dtype=torch.int32, device=device)
+    state_dim_row_stride = torch.tensor(
+        [conv.stride(1) * conv.element_size(), 0],
+        dtype=torch.int64,
+        device=device,
+    )
+    block_table_ptrs = torch.tensor([bt.data_ptr()], dtype=torch.int64, device=device)
+
+    precopy_mamba_align_fused_kernel[(1, 2, _TEMPORAL_TILES)](
+        dst_col,
+        src_col,
+        token_bias,
+        block_table_ptrs,
+        bt.stride(0),
+        state_base_addrs,
+        state_block_strides,
+        state_elem_sizes,
+        state_inner_sizes,
+        state_conv_widths,
+        state_group_indices,
+        state_dim_row_count,
+        state_dim_row_stride,
+        None,
+        1,
+        COPY_BLOCK_SIZE=1024,
+        CONV_STATE_DIM_FIRST=True,
+        HAS_IDX_MAPPING=False,
+        TEMPORAL_TILES=_TEMPORAL_TILES,
+    )
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(
+        conv[4, :, : conv_width - 2],
+        conv_pre[5, :, 2:],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(ssm[4], ssm_pre[3], rtol=0, atol=0)
+
+
 def test_ds_conv_copy_spec_reproduces_multi_accept_assert(monkeypatch):
     monkeypatch.setattr(
         layer_mamba_utils,

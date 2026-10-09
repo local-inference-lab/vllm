@@ -22,6 +22,82 @@ from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("input_columns", [1, 4])
+@pytest.mark.parametrize("has_accepted", [False, True])
+def test_b12x_gdn_metadata_staging_preserves_padding_on_replay(
+    monkeypatch, input_columns: int, has_accepted: bool
+) -> None:
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        _stage_b12x_gdn_metadata_kernel,
+    )
+
+    max_seqs, state_columns = 3, 4
+    query = torch.arange(8, device="cuda", dtype=torch.int32)[::2]
+    states = torch.arange(24, device="cuda", dtype=torch.int64).view(3, 8)
+    states = states[:, 1::2][:, :input_columns]
+    accepted = torch.arange(6, device="cuda", dtype=torch.int32)[::2] + 1
+    out_query = torch.empty(4, dtype=torch.int32, device="cuda")
+    out_states = torch.empty(3, 4, dtype=torch.int32, device="cuda")
+    out_accepted = torch.empty(3, dtype=torch.int32, device="cuda")
+    out_seqs = torch.empty(1, dtype=torch.int32, device="cuda")
+    out_tokens = torch.empty(1, dtype=torch.int32, device="cuda")
+
+    def stage(num_requests):
+        _stage_b12x_gdn_metadata_kernel[(1,)](
+            query,
+            states,
+            accepted if has_accepted else None,
+            out_query,
+            out_states,
+            out_accepted,
+            out_seqs,
+            out_tokens,
+            num_requests,
+            query.stride(0),
+            accepted.stride(0),
+            states.stride(0),
+            states.stride(1),
+            INPUT_COLUMNS=input_columns,
+            STATE_COLUMNS=state_columns,
+            MAX_SEQS=max_seqs,
+            HAS_ACCEPTED=has_accepted,
+            BLOCK=16,
+            num_warps=4,
+        )
+
+    stage(3)
+
+    def reject_resolution(*args, **kwargs):
+        pytest.fail("Changing request count must reuse the compiled staging kernel")
+
+    monkeypatch.setattr(
+        _stage_b12x_gdn_metadata_kernel, "_do_compile", reject_resolution
+    )
+    for num_requests in (0, 1, 3):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            stage(num_requests)
+        states.add_(100)
+        accepted.add_(1)
+        query.mul_(2)
+        for tensor in (out_query, out_states, out_accepted, out_seqs, out_tokens):
+            tensor.fill_(99)
+        graph.replay()
+        expected_query = torch.zeros_like(out_query)
+        expected_query[: num_requests + 1].copy_(query[: num_requests + 1])
+        expected_states = torch.zeros_like(out_states)
+        expected_states[:num_requests, :input_columns].copy_(states[:num_requests])
+        expected_accepted = torch.ones_like(out_accepted)
+        if has_accepted:
+            expected_accepted[:num_requests].copy_(accepted[:num_requests])
+        torch.testing.assert_close(out_query, expected_query, rtol=0, atol=0)
+        torch.testing.assert_close(out_states, expected_states, rtol=0, atol=0)
+        torch.testing.assert_close(out_accepted, expected_accepted, rtol=0, atol=0)
+        assert out_seqs.item() == num_requests
+        assert out_tokens.item() == query[num_requests].item()
+
+
 def reference_post_conv(
     conv_output: torch.Tensor,
     a: torch.Tensor,

@@ -58,6 +58,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.weight_transfer import copy_weight
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -238,18 +239,12 @@ def mamba_v2_sharded_weight_loader(
             # - take these many dims from the loaded weight.
             take = min(shard_size, full_dim - extra - loaded_skip)
 
-            # - always shard on dim 0
-            # - the ignore is for a mundane mypy error as it does not
-            #   seem to handle slices well.
-            # https://github.com/python/mypy/issues/2410
-            target_slice = param.data[boundary : (boundary + take), ...]
-            param.data[
-                boundary : (boundary + take), ...  # type: ignore[misc]
-            ] = loaded_weight[
-                loaded_start_idx : (
-                    loaded_start_idx + take
-                )  # type: ignore[misc]
-            ].view_as(target_slice)
+            copy_weight(
+                param.data[boundary : boundary + take],
+                loaded_weight[loaded_start_idx : loaded_start_idx + take].view_as(
+                    param.data[boundary : boundary + take]
+                ),
+            )
 
             # move indexing boundaries
             boundary += shard_size

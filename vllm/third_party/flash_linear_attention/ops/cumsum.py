@@ -63,7 +63,7 @@ def chunk_local_cumsum_scalar_kernel(
         p_s = tl.make_block_ptr(s + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
         p_o = tl.make_block_ptr(o + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     # [BT]
-    b_s = tl.load(p_s, boundary_check=(0,)).to(tl.float32)
+    b_s = tl.load(p_s, boundary_check=(0,), padding_option="zero").to(tl.float32)
     b_o = tl.cumsum(b_s, axis=0)
     if REVERSE:
         b_z = tl.sum(b_s, axis=0)
@@ -152,7 +152,7 @@ def chunk_local_cumsum_vector_kernel(
             (1, 0),
         )
     # [BT, BS]
-    b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
+    b_s = tl.load(p_s, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
     b_o = tl.dot(m_s, b_s, allow_tf32=False)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 

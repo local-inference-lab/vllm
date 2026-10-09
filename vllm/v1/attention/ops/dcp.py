@@ -26,12 +26,13 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     VllmTritonJitKernel,
     triton_scalar_specialization_rep,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import max_decode_query_len
 from vllm.v1.attention.ops.cp_common import (
     DirectCPWorkspace,
-    direct_cp_enabled,
     direct_cp_multicast_enabled,
+    direct_cp_peer_access_enabled,
 )
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
@@ -132,6 +133,7 @@ class CorrectAttnCPOutKernel(VllmTritonJitKernel["CorrectAttnCPOutKernel.Compile
         lse_idx,
         HEAD_DIM: tl.constexpr,
         N_ROUNDED: tl.constexpr,
+        BLOCK_N: tl.constexpr,
         IS_BASE_E: tl.constexpr,
     ):
         """Apply the all-gathered lses to correct each local rank's attention
@@ -155,14 +157,17 @@ class CorrectAttnCPOutKernel(VllmTritonJitKernel["CorrectAttnCPOutKernel.Compile
             lses_stride_H (int): Head stride of ``lses_ptr``
             lse_idx (int): Index of this rank's lse within the all-gathered tensor
             HEAD_DIM: Head dimension, as a constexpr
-            N_ROUNDED: Rank count rounded to a power of two, as a constexpr
+            N_ROUNDED: Number of all-gathered ranks, as a constexpr.
+            BLOCK_N: Rank vector width rounded to a power of two.
             IS_BASE_E: Whether the lses are natural-log based, as a constexpr
 
         """
         batch_idx = tl.program_id(axis=0).to(tl.int64)
         head_idx = tl.program_id(axis=1).to(tl.int64)
         d_offsets = tl.arange(0, HEAD_DIM)
-        num_n_offsets = tl.arange(0, N_ROUNDED)
+        # N_ROUNDED is the actual LSE rank extent in this launcher.
+        # Triton requires a power-of-two vector; masked lanes contribute -inf.
+        num_n_offsets = tl.arange(0, BLOCK_N)
 
         # shape = [N]
         lse_offsets = (
@@ -172,7 +177,11 @@ class CorrectAttnCPOutKernel(VllmTritonJitKernel["CorrectAttnCPOutKernel.Compile
         )
 
         # calc final lse
-        lse = tl.load(lses_ptr + lse_offsets).to(tl.float32)
+        lse = tl.load(
+            lses_ptr + lse_offsets,
+            mask=num_n_offsets < N_ROUNDED,
+            other=-float("inf"),
+        ).to(tl.float32)
         lse = tl.where((lse != lse) | (lse == float("inf")), -float("inf"), lse)
         lse_max = tl.max(lse, axis=0)
         lse_max = tl.where(lse_max == -float("inf"), 0, lse_max)
@@ -350,6 +359,7 @@ class CorrectAttnCPOutKernel(VllmTritonJitKernel["CorrectAttnCPOutKernel.Compile
             lses_stride_H=lses_stride_h,
             HEAD_DIM=head_dim,
             N_ROUNDED=n_rounded,
+            BLOCK_N=triton.next_power_of_2(n_rounded),
             IS_BASE_E=is_base_e,
             _runtime_launcher=None if self._warming else ctx.call_kernel,
             # CPTritonContext caches the non-constexpr positional prefix; derive
@@ -477,6 +487,7 @@ def cp_lse_ag_out_rs(
     is_lse_base_on_e=True,
     seq_lens: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
+    output_reduce_scatter: Callable[[torch.Tensor], torch.Tensor | None] | None = None,
 ):
     """cp_attn_out: [ B, H, D ]
     cp_attn_lse: [ B, H ]
@@ -490,7 +501,19 @@ def cp_lse_ag_out_rs(
         seq_lens=seq_lens,
         query_start_loc=query_start_loc,
     )
-    out = cp_group.reduce_scatter(out, dim=1)
+    reduced = output_reduce_scatter(out) if output_reduce_scatter is not None else None
+    if reduced is not None:
+        out = reduced
+    elif current_platform.is_cuda() and current_platform.is_device_capability_family(
+        120
+    ):
+        # Preserve the head-major collective output for the following MLA
+        # value GEMM. Its batch matrices are disjoint, avoiding cuBLAS's
+        # SM120/121 overlapping-stride read defect and a redundant transpose copy.
+        out = cp_group.reduce_scatter(out.transpose(0, 1).contiguous(), dim=0)
+        out = out.transpose(0, 1)
+    else:
+        out = cp_group.reduce_scatter(out, dim=1)
 
     if return_lse:
         cp_num_heads = lse.shape[1] // cp_group.world_size
@@ -1135,7 +1158,7 @@ def get_direct_dcp_a2a_workspace(
     dtype: torch.dtype,
     num_ubatches: int,
 ) -> DirectDCPA2AWorkspace | None:
-    if not direct_cp_enabled(
+    if not direct_cp_peer_access_enabled(
         group, dtype, envs.VLLM_USE_DIRECT_DCP_A2A, _A2A_SUPPORTED_DTYPES
     ):
         return None
@@ -1449,6 +1472,8 @@ class MLADCPManager:
     """Select and own layer-level collective implementations for MLA DCP."""
 
     _kv_gather: Callable[[torch.Tensor, torch.Tensor], object]
+    combine: DCPCombine
+    query_gather: Callable[[torch.Tensor], torch.Tensor] | None
 
     def __init__(
         self,
@@ -1462,6 +1487,10 @@ class MLADCPManager:
         padded_num_heads: int | None,
         is_lse_base_on_e: bool,
         use_pcp: bool,
+        query_gather_fallback: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        output_reduce_scatter: Callable[[torch.Tensor], torch.Tensor | None]
+        | None = None,
+        use_b12x: bool = False,
     ) -> None:
         parallel_config = vllm_config.parallel_config
         self.group = get_dcp_group()
@@ -1470,6 +1499,52 @@ class MLADCPManager:
         self.max_num_tokens = get_dcp_workspace_max_num_tokens(vllm_config)
         self.use_a2a = parallel_config.dcp_comm_backend == "a2a"
         self.padded_num_heads = padded_num_heads
+        self._query_gather_fallback = query_gather_fallback
+        self._output_reduce_scatter = output_reduce_scatter
+
+        self.b12x_transport = None
+        if use_b12x:
+            logger.info_once(
+                "B12X DCP configuration: device=%s, ranks=%d, a2a=%s, "
+                "microbatches=%d, padded_heads=%s, PCP=%s, query=%s, output=%s.",
+                self.device,
+                self.group.world_size,
+                self.use_a2a,
+                self.num_ubatches,
+                padded_num_heads,
+                use_pcp,
+                query_dtype,
+                output_dtype,
+            )
+        if (
+            use_b12x
+            and self.use_a2a
+            and not use_pcp
+            and self.num_ubatches == 1
+            and padded_num_heads is None
+        ):
+            from vllm.distributed.device_communicators.b12x_dcp import (
+                get_b12x_dcp_transport,
+            )
+
+            self.b12x_transport = get_b12x_dcp_transport(
+                self.group,
+                self.device,
+                self.max_num_tokens,
+                num_heads,
+                query_head_dim,
+                output_head_dim,
+                query_dtype,
+                output_dtype,
+            )
+        if self.b12x_transport is not None:
+            logger.info_once("Using prepared B12X PCIe DCP query and LSE exchange.")
+            self.combine = functools.partial(
+                self._b12x_combine,
+                is_lse_base_on_e=is_lse_base_on_e,
+            )
+            self.query_gather = self._b12x_query_gather
+            return
 
         self.combine = self._init_combine(
             num_heads,
@@ -1494,6 +1569,41 @@ class MLADCPManager:
                 query_head_dim,
                 query_dtype,
             )
+        )
+
+    def _b12x_query_gather(self, query: torch.Tensor) -> torch.Tensor:
+        transport = self.b12x_transport
+        assert transport is not None
+        if query.shape[0] <= transport.max_tokens:
+            return transport.gather(query)
+        return self._gather_query(query)
+
+    def _b12x_combine(
+        self,
+        partial_output: torch.Tensor,
+        partial_lse: torch.Tensor,
+        is_lse_base_on_e: bool,
+        seq_lens: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        transport = self.b12x_transport
+        assert transport is not None
+        if partial_output.shape[0] <= transport.max_tokens:
+            # B12X supplies zero output and -inf LSE for every empty local
+            # shard, including padded queries. Other backends must not opt in
+            # without satisfying that contract before the collective.
+            return transport.combine(
+                partial_output,
+                partial_lse,
+                is_lse_base_on_e=is_lse_base_on_e,
+            )
+        return dcp_a2a_lse_reduce(
+            partial_output,
+            partial_lse,
+            cp_group=self.group,
+            is_lse_base_on_e=is_lse_base_on_e,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
         )
 
     def _init_combine(
@@ -1530,6 +1640,13 @@ class MLADCPManager:
             if use_pcp
             else cp_lse_ag_out_rs
         )
+        if combine_fn is cp_lse_ag_out_rs and self._output_reduce_scatter is not None:
+            return functools.partial(
+                cp_lse_ag_out_rs,
+                cp_group=self.group,
+                is_lse_base_on_e=is_lse_base_on_e,
+                output_reduce_scatter=self._output_reduce_scatter,
+            )
         return functools.partial(
             combine_fn,
             cp_group=self.group,
@@ -1590,7 +1707,11 @@ class MLADCPManager:
         return self._gather_query
 
     def _gather_query(self, query: torch.Tensor) -> torch.Tensor:
-        query = self.group.all_gather(query, dim=1)
+        query = (
+            self.group.all_gather(query, dim=1)
+            if self._query_gather_fallback is None
+            else self._query_gather_fallback(query)
+        )
         if self.padded_num_heads is not None:
             query = reserve_query_head_storage(query, self.padded_num_heads)
         return query

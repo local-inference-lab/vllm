@@ -5,12 +5,25 @@
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 
 
+import os
+
 import numpy as np
 import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
+
+# ``causal_conv1d_update`` decode path.  For width-4 kernels with at most
+# ``_UPDATE_HOIST_MAX_SEQLEN`` tokens per sequence (single-token and
+# speculative decode) every token row is loaded before the token loop instead
+# of one dependent global load per token, and the channel tile shrinks so the
+# short launch fills more SMs.  The per-token arithmetic sequence is the
+# generic loop's, so outputs and the conv state are bitwise identical.
+# ``VLLM_CAUSAL_CONV1D_UPDATE_HOIST=0`` keeps the generic loop.
+_UPDATE_HOIST_ENABLED = os.getenv("VLLM_CAUSAL_CONV1D_UPDATE_HOIST", "1") != "0"
+_UPDATE_HOIST_MAX_SEQLEN = 8
+_UPDATE_HOIST_BLOCK_N = 64
 
 
 @triton.jit(do_not_specialize_on_alignment=["num_cache_lines"])
@@ -478,6 +491,27 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
+def _byte_ranges_overlap(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Conservatively test strided spans, allowing disjoint workspace views."""
+    if not a.numel() or not b.numel():
+        return False
+    if a.untyped_storage().data_ptr() != b.untyped_storage().data_ptr():
+        return False
+
+    def span(tensor):
+        start = tensor.storage_offset() * tensor.element_size()
+        stop = (
+            start
+            + (1 + sum((n - 1) * s for n, s in zip(tensor.shape, tensor.stride())))
+            * tensor.element_size()
+        )
+        return start, stop
+
+    a_start, a_stop = span(a)
+    b_start, b_stop = span(b)
+    return a_start < b_stop and b_start < a_stop
+
+
 def causal_conv1d_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -496,6 +530,7 @@ def causal_conv1d_fn(
     block_size_to_align=0,
     metadata=None,
     validate_data=False,
+    out: torch.Tensor | None = None,
 ):
     """Support varlen + continuous batching when x is 2D tensor.
 
@@ -546,7 +581,9 @@ def causal_conv1d_fn(
         The number of tokens already completed for each sequence
     block_size_to_align: int
         The block size to align the cached states to
-    out: same shape as `x`
+    out: Optional caller-owned output with the input shape, dtype and device.
+        Storage must be disjoint from inputs and state. Input and state dtypes
+        must match so the result does not require an output cast.
     """
     if isinstance(activation, bool) and activation:
         activation = "silu"
@@ -555,7 +592,24 @@ def causal_conv1d_fn(
     # Store original dtype to cast back at the end
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
-    out = torch.empty_like(x)
+    if out is None:
+        out = torch.empty_like(x)
+    elif (
+        out.shape != x.shape
+        or out.dtype != x.dtype
+        or out.dtype != original_x_dtype
+        or out.device != x.device
+    ):
+        raise ValueError(
+            "Convolution output must match input/state shape, dtype and device"
+        )
+    elif any(
+        source is not None and _byte_ranges_overlap(out, source)
+        for source in (x, weight, bias, conv_states)
+    ):
+        raise ValueError(
+            "Convolution output storage must be disjoint from inputs and state"
+        )
     if metadata is not None:
         nums_dict = metadata.nums_dict
         args = nums_dict
@@ -804,6 +858,8 @@ def _causal_conv1d_update_kernel(
     HAS_NULL_BLOCK: tl.constexpr,
     BLOCK_N: tl.constexpr,
     launch_pdl: tl.constexpr,
+    HOIST_X: tl.constexpr,
+    SEQLEN_MAX: tl.constexpr,
 ):
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
@@ -995,6 +1051,67 @@ def _causal_conv1d_update_kernel(
     # STEP 5: compute each token
     if launch_pdl:
         tl.extra.cuda.gdc_launch_dependents()
+
+    if HOIST_X and KERNEL_WIDTH == 4:
+        # Hoisted decode path: load every token row up front (one round trip
+        # instead of ``seqlen`` dependent ones), then run the unrolled token
+        # loop with exactly the generic loop's per-token arithmetic
+        # (bias -> col0*w0 -> col1*w1 -> col2*w2 -> x*w3 -> silu).
+        for t in tl.static_range(SEQLEN_MAX):
+            v = tl.load(
+                x_base_1d + t * stride_x_token,
+                mask=mask_x_1d & (t < seqlen),
+                other=0.0,
+            )
+            if t == 0:
+                xr0 = v
+            elif t == 1:
+                xr1 = v
+            elif t == 2:
+                xr2 = v
+            elif t == 3:
+                xr3 = v
+            elif t == 4:
+                xr4 = v
+            elif t == 5:
+                xr5 = v
+            elif t == 6:
+                xr6 = v
+            elif t == 7:
+                xr7 = v
+        for t in tl.static_range(SEQLEN_MAX):
+            if t == 0:
+                xr = xr0
+            elif t == 1:
+                xr = xr1
+            elif t == 2:
+                xr = xr2
+            elif t == 3:
+                xr = xr3
+            elif t == 4:
+                xr = xr4
+            elif t == 5:
+                xr = xr5
+            elif t == 6:
+                xr = xr6
+            else:
+                xr = xr7
+            if t < seqlen:
+                acc = acc_preload
+                acc += col0 * w_col0
+                acc += col1 * w_col1
+                acc += col2 * w_col2
+                acc += xr * w_col3
+                col0 = col1
+                col1 = col2
+                col2 = xr
+                if SILU_ACTIVATION:
+                    acc = acc / (1 + tl.exp(-acc))
+                o_ptrs = (
+                    o_ptr + o_offset + t * stride_o_token + (idx_feats * stride_o_dim)
+                )
+                tl.store(o_ptrs, acc, mask=mask_x_1d)
+        return
 
     for idx_token in tl.range(seqlen):
         acc = acc_preload
@@ -1228,6 +1345,9 @@ def causal_conv1d_update(
             triton.cdiv(dim, META["BLOCK_N"]),
         )
 
+    hoist_x = bool(
+        _UPDATE_HOIST_ENABLED and width == 4 and 1 <= seqlen <= _UPDATE_HOIST_MAX_SEQLEN
+    )
     _causal_conv1d_update_kernel[grid](
         # Pointers to matrices
         x,
@@ -1270,8 +1390,10 @@ def causal_conv1d_update(
         IS_SPEC_DECODING=num_accepted_tokens is not None,
         NP2_STATELEN=np2_statelen,
         HAS_NULL_BLOCK=null_block_id is not None,
-        BLOCK_N=256,
+        BLOCK_N=_UPDATE_HOIST_BLOCK_N if hoist_x else 256,
         launch_pdl=current_platform.is_arch_support_pdl(),
+        HOIST_X=hoist_x,
+        SEQLEN_MAX=int(seqlen),
     )
     if unsqueeze:
         out = out.squeeze(-1)

@@ -78,6 +78,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         non_causal_multi_token_decode: bool = False,
         allow_short_prefill_indexer_scoring_skip: bool = False,
         fuse_qkv_rmsnorm: bool = False,
+        attn_backend: type | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -130,6 +131,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
+            attn_backend=attn_backend,
             kv_b_proj=self.kv_b_proj,
             dcp_q_replicate=self.dcp_q_replicate,
             use_sparse=self.is_sparse,
@@ -219,6 +221,11 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         k_pe = k_pe.unsqueeze(1)
 
         q = q_proj_layer(q_proj_input)[0]
+        # Optional model-installed callback (e.g. GLM-5.3 L2 weight prefetch of
+        # o_proj while the indexer, rope and attention core run).
+        _hook = getattr(self, "_l2_prefetch_hook", None)
+        if _hook is not None:
+            _hook(hidden_states.shape[0])
         heads = self.num_heads
         if self.dcp_q_replicate:
             heads *= q_proj_layer.group_size

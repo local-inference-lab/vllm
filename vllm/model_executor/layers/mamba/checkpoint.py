@@ -78,6 +78,41 @@ class MambaPrefillCheckpointMetadata:
     # with the same spec can re-derive its own ``state_indices``.
     request_rows: torch.Tensor | None = None
     block_cols: torch.Tensor | None = None
+    checkpoint_indptr: torch.Tensor | None = None
+    checkpoint_query_indices: torch.Tensor | None = None
+
+    def select_prefill_rows(
+        self, num_decodes: int, num_prefills: int
+    ) -> "MambaPrefillCheckpointMetadata":
+        """Match a prefill kernel that excludes leading single-token decodes."""
+        end = num_decodes + num_prefills
+        if self.checkpoint_indptr is not None:
+            assert self.checkpoint_query_indices is not None
+            return replace(
+                self,
+                checkpoint_indptr=self.checkpoint_indptr[num_decodes : end + 1],
+                checkpoint_query_indices=(
+                    self.checkpoint_query_indices - num_decodes
+                    if num_decodes
+                    else self.checkpoint_query_indices
+                ),
+            )
+        return replace(
+            self,
+            checkpoint_offsets=self.checkpoint_offsets[num_decodes:end],
+            state_indices=self.state_indices[num_decodes:end],
+            offsets=self.offsets[num_decodes:end] if self.offsets is not None else None,
+            request_rows=(
+                self.request_rows[num_decodes:end]
+                if self.request_rows is not None
+                else None
+            ),
+            block_cols=(
+                self.block_cols[num_decodes:end]
+                if self.block_cols is not None
+                else None
+            ),
+        )
 
     def regather_state_indices(
         self, block_table: torch.Tensor
@@ -107,6 +142,8 @@ class MambaPrefillCheckpointBuilder:
             return None
         if self.kv_cache_spec.num_prefill_checkpoint_blocks == 0:
             return None
+        if self.kv_cache_spec.num_prefill_checkpoint_blocks > 1:
+            return self._build_packed(m, request_rows)
         cache_config = self.vllm_config.cache_config
         hash_block_size = cache_config.hash_block_size
         cache_hit_alignment_tokens = cache_config.cache_hit_alignment_tokens
@@ -152,6 +189,53 @@ class MambaPrefillCheckpointBuilder:
             offsets=checkpoint_offsets,
             request_rows=request_rows_tensor,
             block_cols=checkpoint_cols_tensor,
+        )
+
+    def _build_packed(
+        self, m: CommonAttentionMetadata, request_rows: list[int]
+    ) -> MambaPrefillCheckpointMetadata | None:
+        assert m.seq_lens_cpu_upper_bound is not None
+        seq_lens = m.seq_lens_cpu_upper_bound.tolist()
+        query_lens = m.query_start_loc_cpu.diff().tolist()
+        offsets: list[int] = []
+        cols: list[int] = []
+        rows: list[int] = []
+        query_indices: list[int] = []
+        indptr = [0]
+        for query_index, row in enumerate(request_rows):
+            query_start = seq_lens[row] - query_lens[row]
+            columns = self.kv_cache_spec.prefill_checkpoint_indices(
+                query_start, seq_lens[row]
+            )
+            cols.extend(columns)
+            offsets.extend(
+                (column + 1) * self.kv_cache_spec.block_size - query_start
+                for column in columns
+            )
+            rows.extend([row] * len(columns))
+            query_indices.extend([query_index] * len(columns))
+            indptr.append(len(offsets))
+        if not offsets:
+            return None
+        device = m.query_start_loc.device
+        rows_tensor = async_tensor_h2d(rows, dtype=torch.int64, device=device)
+        cols_tensor = async_tensor_h2d(cols, dtype=torch.int64, device=device)
+        return MambaPrefillCheckpointMetadata(
+            checkpoint_offsets=async_tensor_h2d(
+                offsets, dtype=torch.int32, device=device
+            ),
+            state_indices=_gather_checkpoint_state_indices(
+                m.block_table_tensor, rows_tensor, cols_tensor
+            ),
+            offsets=offsets,
+            request_rows=rows_tensor,
+            block_cols=cols_tensor,
+            checkpoint_indptr=async_tensor_h2d(
+                indptr, dtype=torch.int32, device=device
+            ),
+            checkpoint_query_indices=async_tensor_h2d(
+                query_indices, dtype=torch.int64, device=device
+            ),
         )
 
 

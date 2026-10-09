@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
 import torch.nn as nn
@@ -31,6 +31,7 @@ from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
+from vllm.utils.b12x import set_b12x_preparation_provider
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -54,6 +55,7 @@ from vllm.v1.kv_cache_interface import (
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
+    from vllm.v1.attention.backends.b12x import B12xPagedAttentionImpl
 
 logger = init_logger(__name__)
 
@@ -238,6 +240,10 @@ class Attention(nn.Module, AttentionLayerBase):
     3. Return the output tensor.
     """
 
+    # Subclasses with complete local KV must declare the same cache contract
+    # during backend selection and in get_kv_cache_spec().
+    dcp_replicated: ClassVar[bool] = False
+
     def __init__(
         self,
         num_heads: int,
@@ -357,6 +363,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 use_per_head_quant_scales=use_per_head_quant_scales,
                 attn_type=attn_type,
                 has_sliding_window=sliding_window is not None,
+                dcp_replicated=self.dcp_replicated,
             )
         else:
             self.attn_backend = attn_backend
@@ -416,6 +423,8 @@ class Attention(nn.Module, AttentionLayerBase):
             if block_n is not None:
                 extra_impl_args.setdefault("block_n", block_n)
 
+        if self.attn_backend.get_name() == "B12X":
+            extra_impl_args["head_size_v"] = self.head_size_v
         impl_cls = self.attn_backend.get_impl_cls()
         self.impl = impl_cls(  # type: ignore[assignment]  # impl_cls always returns an AttentionImpl subclass
             num_heads,
@@ -430,6 +439,12 @@ class Attention(nn.Module, AttentionLayerBase):
             kv_sharing_target_layer_name,
             **extra_impl_args,
         )
+        # The native paged provider is the implementation, while this layer
+        # remains the sole owner of real KV storage and quantization scales.
+        # Register only after both are constructed so declarations cannot
+        # observe a half-initialized owner.
+        if self.attn_backend.get_name() == "B12X":
+            set_b12x_preparation_provider(self, self.impl)
         self.backend = AttentionBackendEnum[self.attn_backend.get_name()]
         self.dtype = dtype
 
@@ -484,6 +499,22 @@ class Attention(nn.Module, AttentionLayerBase):
                 if is_per_head
                 else GroupShape.PER_TENSOR,
             )
+
+    def _uses_b12x_paged_preparation(self) -> bool:
+        return self.attn_backend.get_name() == "B12X"
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        if self._uses_b12x_paged_preparation():
+            # Plans hold views of the bound cache. Drop them before the base
+            # class publishes a replacement; the next preparation collection
+            # declares plans against the new cache.
+            cast("B12xPagedAttentionImpl", self.impl)._plans = {}
+        super().bind_kv_cache(kv_cache)
+
+    def unbind_kv_cache(self) -> None:
+        if self._uses_b12x_paged_preparation():
+            cast("B12xPagedAttentionImpl", self.impl)._plans = {}
+        super().unbind_kv_cache()
 
     def forward(
         self,
@@ -780,6 +811,11 @@ def unified_attention_with_output(
     del kv_cache_dummy_dep
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
+    # Optional model-installed callback (L2 weight prefetch windows); inside
+    # this opaque op so torch.compile never traces it.
+    prefetch = getattr(self, "_l2_prefetch_hook", None)
+    if prefetch is not None:
+        prefetch(query.shape[0])
 
     self.impl.forward(
         self,

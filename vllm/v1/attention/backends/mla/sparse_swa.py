@@ -454,14 +454,14 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             self.vllm_config.scheduler_config.max_num_batched_tokens
         )
 
-        # Handle MTP: adjust decode_threshold like the indexer does
+        # DSpark's target verifier consumes the bonus token plus K draft
+        # tokens. Its parallel drafter's own query shape does not change this
+        # target-side decode/prefill boundary.
         spec_config = self.vllm_config.speculative_config
         self.num_speculative_tokens = (
             spec_config.num_speculative_tokens if spec_config else 0
         )
-        # sparse_swa has no MQA-vs-dense-MHA routing, so multi-token queries take
-        # the prefill path and the decode/prefill split stays at the widest
-        # decode.
+        self.is_dspark = spec_config is not None and spec_config.use_dspark()
         self.decode_threshold = max_decode_query_len(self.vllm_config)
         self.reorder_batch_threshold = None
 
@@ -554,7 +554,6 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # so its per-token index list is wider than `window_size`. The kernel pads
         # the q-head count to B_TOPK. Pad to a kernel-supported width; the logical
         # SWA window remains unchanged when the padded matrix is built.
-        self.is_dspark = spec_config is not None and spec_config.use_dspark()
         self.noncausal_index_width = (
             get_dspark_swa_index_width(
                 self.window_size,
@@ -1003,7 +1002,9 @@ def _compute_image_visibility_kernel(
         left = tl.where(
             in_span, tl.minimum(pos - span_start, max_image_tokens - 1), left
         )
-        right = tl.where(in_span, tl.minimum(span_end - pos, max_image_tokens), right)
+        materialized_right = tl.maximum(seq_len - pos - 1, 0)
+        span_right = tl.minimum(span_end - pos, max_image_tokens)
+        right = tl.where(in_span, tl.minimum(span_right, materialized_right), right)
     tl.store(left_visible_ptr + token_idx, left)
     tl.store(right_visible_ptr + token_idx, right)
 

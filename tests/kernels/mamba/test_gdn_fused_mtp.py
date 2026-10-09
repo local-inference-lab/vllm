@@ -129,6 +129,7 @@ def _build_layer(
         "_forward_core_decode_spec_post_conv_fused_norm",
         "_forward_core_decode_spec_fused_norm",
         "_can_use_fused_gdn_mtp_decode",
+        "_can_use_b12x_gdn_decode",
         "_rms_norm_gated_cuda",
         "_forward_core_fused_norm",
         "_forward_core_fused_norm_packed",
@@ -261,6 +262,10 @@ def test_fused_model_path_matches_reference(
     output_gate_activation: str,
 ) -> None:
     """Fused MTP and its mixed/prefill/decode fallbacks match the reference."""
+    if expected_fused_calls and not hasattr(
+        torch.ops._C, "fused_gdn_decode_post_conv_mtp"
+    ):
+        pytest.skip("fused GDN decode MTP op is not built")
     torch.manual_seed(1)
     device = torch.device("cuda")
     vllm_config = _make_vllm_config()
@@ -278,6 +283,13 @@ def test_fused_model_path_matches_reference(
     batch = BatchSpec(seq_lens=seq_lens, query_lens=query_lens)
     common = create_common_attn_metadata(
         batch, BLOCK_SIZE, device, arange_block_indices=True
+    )
+    common.is_prefilling = torch.tensor(
+        [
+            draft < 0 and query_len > 1
+            for draft, query_len in zip(draft_tokens, query_lens)
+        ],
+        dtype=torch.bool,
     )
     common.block_table_tensor.add_(1)
     with set_current_vllm_config(vllm_config):

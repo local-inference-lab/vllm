@@ -71,6 +71,10 @@ class AttentionBackend(ABC):
     # Does attention's forward() include kv cache update?
     forward_includes_kv_cache_update: bool = True
 
+    # Whether metadata builders and kernels can execute a DCP-replicated cache
+    # group as a local DCP1 operation inside a larger DCP world.
+    supports_dcp_replicated: ClassVar[bool] = False
+
     @staticmethod
     def get_supported_kernel_block_sizes(
         kv_cache_spec: "KVCacheSpec | None" = None,
@@ -149,6 +153,15 @@ class AttentionBackend(ABC):
         (see: https://github.com/vllm-project/vllm/issues/42449)
         """
         return spec
+
+    @classmethod
+    def customize_hybrid_kv_cache_spec(
+        cls,
+        spec: "AttentionSpec",
+        vllm_config: "VllmConfig",
+    ) -> "AttentionSpec":
+        """Adjust the probe used to size attention against recurrent state."""
+        return cls.customize_spec(spec)
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
@@ -296,6 +309,7 @@ class AttentionBackend(ABC):
         use_adaptive_verification: bool = False,
         use_dcp: bool = False,
         use_rswa: bool = False,
+        use_dcp_replicated: bool = False,
     ) -> list[str]:
         invalid_reasons = []
         if not cls.supports_head_size(head_size):
@@ -344,6 +358,8 @@ class AttentionBackend(ABC):
             invalid_reasons.append("PCP not supported")
         if use_dcp and not cls.supports_dcp():
             invalid_reasons.append("DCP not supported")
+        if use_dcp_replicated and not cls.supports_dcp_replicated:
+            invalid_reasons.append("replicated DCP KV not supported")
         if (
             use_adaptive_verification
             and not cls.supports_device_cpu_query_lens_mismatch()
@@ -474,6 +490,9 @@ class CommonAttentionMetadata:
 
     _num_computed_tokens_cache: torch.Tensor | None = None
     _token_to_req_indices_cache: torch.Tensor | None = None
+
+    # True only when the selected graph excludes mixed/prefill kernels.
+    uniform_decode_graph: bool = False
 
     def batch_size(self) -> int:
         return self.seq_lens.shape[0]
@@ -1044,6 +1063,10 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
 
     hisparse_cache: "HiSparseCacheHandle | None" = None
     supports_pcp: bool = True
+
+    def uses_full_ckv_dcp(self, attn_metadata: T, num_tokens: int) -> bool:
+        """Whether this call attends a transient globally gathered DCP cache."""
+        return False
 
     @abstractmethod
     def __init__(

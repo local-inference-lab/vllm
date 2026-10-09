@@ -3,6 +3,7 @@
 """Unit tests for the sparse MLA backends and utilities."""
 
 import math
+import weakref
 from collections import deque
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
@@ -880,7 +881,7 @@ def _triton_convert_reference_impl(
 
 
 @pytest.mark.parametrize("block_size", [16, 64, 128])
-@pytest.mark.parametrize("num_topk_tokens", [128, 256, 512])
+@pytest.mark.parametrize("num_topk_tokens", [128, 256, 512, 2051])
 @pytest.mark.skipif(
     torch.cuda.get_device_capability() < (9, 0),
     reason="FlashMLASparseBackend requires CUDA 9.0 or higher",
@@ -1682,7 +1683,16 @@ def test_split_indexer_prefill_chunks_single_request_overflow():
 # Power-of-two, GLM's padded tile, and atomic fallback, with reused buffers.
 @pytest.mark.parametrize(
     "num_topk_tokens,reuse_buffers",
-    [(128, False), (2176, False), (2176, True), (4224, False), (4224, True)],
+    [
+        (128, False),
+        (384, False),
+        (2051, False),
+        (2051, True),
+        (2176, False),
+        (2176, True),
+        (4224, False),
+        (4224, True),
+    ],
 )
 def test_triton_convert_returns_valid_counts(num_topk_tokens: int, reuse_buffers: bool):
     """Test that return_valid_counts correctly counts non-negative indices."""
@@ -4123,7 +4133,8 @@ def test_hisparse_fp8_prefill_gather_uses_dedicated_stream(monkeypatch):
     assert ensure_args[1] == 4
 
 
-def test_sparse_impl_observes_repointed_indexer_buffer():
+@pytest.mark.parametrize("explicit_initial_buffer", [False, True])
+def test_sparse_impl_observes_repointed_indexer_buffer(explicit_initial_buffer):
     """The MTP proposer repoints the draft's indexer at the target model's buffer
     after the backend impl is built, so the impl must resolve the buffer per read.
     Snapshotting it in __init__ leaves the layer reading indices nothing writes."""
@@ -4131,13 +4142,16 @@ def test_sparse_impl_observes_repointed_indexer_buffer():
     own = torch.zeros(4, 8, dtype=torch.int32)
     target = torch.ones(4, 8, dtype=torch.int32)
     indexer = SimpleNamespace(topk_indices_buffer=own)
-    impl.init_topk_indices_buffer(indexer, None)
+    impl.init_topk_indices_buffer(indexer, own if explicit_initial_buffer else None)
 
     assert impl.topk_indices_buffer is own
 
     indexer.topk_indices_buffer = target
 
     assert impl.topk_indices_buffer is target
+    released = weakref.ref(own)
+    del own
+    assert released() is None
 
 
 def test_explicit_topk_buffer_supersedes_indexer():

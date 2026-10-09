@@ -144,3 +144,37 @@ def test_selected_backend_probe_failure_raises_value_error_with_cause():
             num_heads=32,
         )
     assert excinfo.value.__cause__ is exc
+
+
+@pytest.mark.parametrize("use_mla", [False, True])
+def test_b12x_selects_attention_geometry_under_one_backend_name(use_mla):
+    from vllm.utils.import_utils import resolve_obj_by_qualname
+
+    config = SELECTOR_CONFIG._replace(
+        head_size=576 if use_mla else 128,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="fp8",
+        block_size=64,
+        use_mla=use_mla,
+    )
+    with patch.object(
+        CudaPlatform, "get_device_capability", return_value=DeviceCapability(12, 0)
+    ):
+        path = CudaPlatform.get_attn_backend_cls(AttentionBackendEnum.B12X, config)
+    backend = resolve_obj_by_qualname(path)
+    assert backend.get_name() == "B12X"
+    assert backend.is_mla() == use_mla
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+def test_b12x_cache_layout_follows_attention_geometry(sparse):
+    from vllm.model_executor.layers.attention.mla_attention import (
+        _canonicalize_sparse_mla_kv_cache_dtype,
+    )
+    from vllm.v1.attention.backends.mla.b12x_mla import B12xMLABackend
+    from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseBackend
+
+    backend = B12xMLASparseBackend if sparse else B12xMLABackend
+    assert _canonicalize_sparse_mla_kv_cache_dtype(backend, "fp8") == (
+        "fp8_ds_mla" if sparse else "fp8"
+    )

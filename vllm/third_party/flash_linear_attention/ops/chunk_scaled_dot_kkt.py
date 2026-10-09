@@ -81,7 +81,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     p_beta = tl.make_block_ptr(
         beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
     )
-    b_beta = tl.load(p_beta, boundary_check=(0,))
+    b_beta = tl.load(p_beta, boundary_check=(0,), padding_option="zero")
 
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
@@ -93,7 +93,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
             (BT, BK),
             (1, 0),
         )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
         b_kb = b_k * b_beta[:, None]
         if CAST_DOT_TO_K_DTYPE:
             # RDNA: force operands to k's native dtype so WMMA is used.
@@ -104,7 +104,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
 
     if USE_G:
         p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-        b_g = tl.load(p_g, boundary_check=(0,))
+        b_g = tl.load(p_g, boundary_check=(0,), padding_option="zero")
         b_g_diff = b_g[:, None] - b_g[None, :]
         b_A = b_A * exp(b_g_diff)
 
