@@ -24,6 +24,7 @@ def test_low_rank_kda_caller_returns_projection_storage_directly() -> None:
     layer = object.__new__(KimiDecoderLayer)
     nn.Module.__init__(layer)
     layer.self_attn = _ReturningSharedKDA(projected)
+    layer.use_sequence_parallel = False
 
     output = layer._run_self_attn(torch.arange(4), hidden_states)
 

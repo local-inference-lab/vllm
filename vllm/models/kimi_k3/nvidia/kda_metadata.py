@@ -304,6 +304,8 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
     # builder, and KDA reads per-request offsets off device within a fixed k+1 window,
     # so one k+1 graph replays any 1..k+1 mix.
     _cudagraph_support = AttentionCGSupport.ALWAYS
+    supports_update_block_table = False
+    supports_kda_state_recovery = True
     mamba_aligned_state_indices: torch.Tensor | None = None
 
     def __init__(
@@ -732,6 +734,8 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
+            num_reqs=m.num_reqs,
+            seq_lens=m.seq_lens,
             checkpoint=checkpoint,
         )
 

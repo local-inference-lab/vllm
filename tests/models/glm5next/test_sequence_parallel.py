@@ -98,6 +98,7 @@ def test_dense_layer_mlp_follows_the_sequence_parallel_layout(
     vllm_config = SimpleNamespace(
         cache_config=None,
         quant_config=None,
+        attention_config=SimpleNamespace(backend=None),
         parallel_config=SimpleNamespace(
             use_sequence_parallel_moe=use_sequence_parallel_moe
         ),

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import TYPE_CHECKING, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
 import torch.nn as nn
@@ -32,6 +32,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     yarn_get_mscale,
 )
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v32.common.kernels import fused_norm_rope, fused_q
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_quantized_kv_cache
@@ -42,6 +43,7 @@ from vllm.v1.attention.ops.pcp import (
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
+    from vllm.v1.attention.backend import MLAAttentionImpl
     from vllm.v1.attention.backends.mla.index_group import (
         SparseMLAIndexGroupBuilder,
     )
@@ -49,6 +51,12 @@ if TYPE_CHECKING:
 
 class DeepseekV32Indexer(nn.Module):
     indexer_cache_cls = DeepseekV32IndexerCache
+    indexer_op_cls: ClassVar[type[nn.Module]] = SparseAttnIndexer
+
+    @staticmethod
+    def get_indexer_op_kwargs(vllm_config: VllmConfig) -> dict[str, Any]:
+        del vllm_config
+        return {}
 
     def __init__(
         self,
@@ -106,7 +114,7 @@ class DeepseekV32Indexer(nn.Module):
         )
 
         self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
-        self.indexer_op = SparseAttnIndexer(
+        self.indexer_op = type(self).indexer_op_cls(
             self.k_cache,
             self.quant_block_size,
             self.scale_fmt,
@@ -115,6 +123,51 @@ class DeepseekV32Indexer(nn.Module):
             self.max_model_len,
             self.max_total_seq_len,
             self.topk_indices_buffer,
+            **type(self).get_indexer_op_kwargs(vllm_config),
+        )
+
+    def run_indexer(
+        self,
+        hidden_states: torch.Tensor,
+        q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        k: torch.Tensor | None,
+        weights: torch.Tensor,
+        *,
+        use_pcp: bool,
+        pcp_shard_decode_requests: bool,
+        dense_mha_metadata_layer_name: str,
+        dcp_rank: int,
+        dcp_world_size: int,
+        cp_kv_cache_interleave_size: int,
+    ) -> torch.Tensor:
+        if not isinstance(q_quant, torch.Tensor):
+            q_values, q_scale = q_quant
+        else:
+            q_values, q_scale = q_quant, None
+        return sparse_attn_indexer(
+            hidden_states,
+            self.k_cache.prefix,
+            self.k_cache.kv_cache,
+            q_values,
+            q_scale,
+            k,
+            weights,
+            self.quant_block_size,
+            self.scale_fmt,
+            self.topk_tokens,
+            self.head_dim,
+            self.max_model_len,
+            self.max_total_seq_len,
+            self.topk_indices_buffer,
+            skip_k_cache_insert=not use_pcp,
+            use_pcp=use_pcp,
+            pcp_shard_decode_requests=pcp_shard_decode_requests,
+            dense_mha_metadata_layer_name=dense_mha_metadata_layer_name,
+            dcp_rank=dcp_rank,
+            dcp_world_size=dcp_world_size,
+            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            skip_topk_buffer_clear=True,
+            topk_backend=self.indexer_op.topk_backend,
         )
 
 
@@ -134,6 +187,8 @@ class DeepseekV32Attention(MLAAttention):
     ) -> None:
         quant_config = vllm_config.quant_config
         cache_config = vllm_config.cache_config
+
+        indexer_cls = type(self).indexer_cls
 
         hidden_size = config.hidden_size
         qk_nope_head_dim = config.qk_nope_head_dim
@@ -188,7 +243,7 @@ class DeepseekV32Attention(MLAAttention):
         )
         indexer = None
         if not skip_topk or is_mtp_layer:
-            indexer = type(self).indexer_cls(
+            indexer = indexer_cls(
                 vllm_config,
                 config,
                 hidden_size,
@@ -237,6 +292,7 @@ class DeepseekV32Attention(MLAAttention):
 
         fp8_attention = is_quantized_kv_cache(self.kv_cache_dtype)
         self._fp8_query = fp8_attention and self.impl.supports_quant_query_input
+        self._native_packed_kv_update = self.kv_cache_dtype == "nvfp4_ds_mla"
         self._fp8_kv_needs_view = fp8_attention and not self.kv_cache_dtype.endswith(
             "_ds_mla"
         )
@@ -269,6 +325,14 @@ class DeepseekV32Attention(MLAAttention):
             prefix=f"{prefix}.o_proj",
         )
 
+        # TP padding (GlmMoeDsaForCausalLM config) appends zero heads after the
+        # checkpoint heads: zero Q and KV-up rows and zero o_proj input
+        # columns, so padded heads contribute nothing to the output.
+        if getattr(config, "original_num_attention_heads", num_heads) != num_heads:
+            for linear in (self.q_b_proj, kv_b_proj, self.o_proj):
+                for param in linear.parameters():
+                    set_weight_attrs(param, {"allow_tp_padding": True})
+
         self.rotary_emb = get_rope(
             qk_rope_head_dim,
             max_position=max_position_embeddings,
@@ -294,6 +358,12 @@ class DeepseekV32Attention(MLAAttention):
             or cudagraph_runtime_mode == CUDAGraphMode.FULL
             or torch.cuda.is_current_stream_capturing()
         )
+
+    def reserve_profile_scratch(self) -> None:
+        """Reserve backend prefill workspace before KV-cache memory profiling."""
+        reserve = getattr(self.impl, "reserve_full_ckv_workspace", None)
+        if reserve is not None:
+            reserve()
 
     def forward(  # type: ignore[override]
         self,
@@ -365,16 +435,20 @@ class DeepseekV32Attention(MLAAttention):
             indexer_k_cache = None
             mla_slot = None
             indexer_slot = None
+        elif self._native_packed_kv_update:
+            # Keep the fused indexer-cache write, but let the sparse backend
+            # own the model-specific packed MLA record update below.
+            mla_kv_cache = None
+            mla_k_scale = None
         else:
             mla_kv_cache = None if hisparse_cache is not None else self.kv_cache
             mla_k_scale = self._k_scale
 
-        if self.use_pcp or hisparse_cache is None:
-            kv_c_out = torch.empty_like(kv_c)
-            k_pe_out = torch.empty_like(k_pe)
-        else:
-            kv_c_out = torch.empty_like(kv_c)
-            k_pe_out = torch.empty_like(k_pe)
+        separate_kv_update = (
+            self.use_pcp or self._native_packed_kv_update or hisparse_cache is not None
+        )
+        kv_c_out = torch.empty_like(kv_c) if separate_kv_update else None
+        k_pe_out = torch.empty_like(k_pe) if separate_kv_update else None
         q_c = fused_norm_rope(
             positions,
             q_c,
@@ -483,22 +557,11 @@ class DeepseekV32Attention(MLAAttention):
             assert index_weights_out is not None
             if self.use_pcp:
                 assert index_k is not None
-            sparse_attn_indexer(
+            self.indexer.run_indexer(
                 q_c,
-                self.indexer.k_cache.prefix,
-                self.indexer.k_cache.kv_cache,
                 index_q_fp8,
-                None,
                 index_k,
                 index_weights_out,
-                self.indexer.quant_block_size,
-                self.indexer.scale_fmt,
-                self.indexer.topk_tokens,
-                self.indexer.head_dim,
-                self.indexer.max_model_len,
-                self.indexer.max_total_seq_len,
-                self.topk_indices_buffer,
-                skip_k_cache_insert=not self.use_pcp,
                 use_pcp=self.use_pcp,
                 pcp_shard_decode_requests=self.pcp_shard_decode_requests,
                 dense_mha_metadata_layer_name=self._dense_mha_metadata_layer_name,
@@ -513,8 +576,6 @@ class DeepseekV32Attention(MLAAttention):
                 cp_kv_cache_interleave_size=(
                     self._vllm_config.parallel_config.cp_kv_cache_interleave_size
                 ),
-                skip_topk_buffer_clear=True,
-                topk_backend=self.indexer.indexer_op.topk_backend,
             )
         self.impl.record_logical_topk_ready()  # type: ignore[attr-defined]
 
@@ -527,18 +588,24 @@ class DeepseekV32Attention(MLAAttention):
         attn_metadata = cast("MLACommonMetadata", attn_metadata)
         self.impl.prepare_for_batch(attn_metadata)
 
-        if self.use_pcp:
+        if self.use_pcp or self._native_packed_kv_update:
             assert kv_c is not None and k_pe is not None
-            kv_for_cache, kpe_for_cache, cache_slot_mapping = (
-                maybe_gather_mla_latent_cache_inputs(
-                    kv_c,
-                    k_pe.unsqueeze(1),
-                    layer_slot_mapping,
-                    attn_metadata.num_decode_tokens,
-                    True,
-                    pcp_shard_decode_requests=self.pcp_shard_decode_requests,
+            if self.use_pcp:
+                kv_for_cache, kpe_for_cache, cache_slot_mapping = (
+                    maybe_gather_mla_latent_cache_inputs(
+                        kv_c,
+                        k_pe.unsqueeze(1),
+                        layer_slot_mapping,
+                        attn_metadata.num_decode_tokens,
+                        True,
+                        pcp_shard_decode_requests=self.pcp_shard_decode_requests,
+                    )
                 )
-            )
+            else:
+                kv_for_cache = kv_c
+                kpe_for_cache = k_pe.unsqueeze(1)
+                cache_slot_mapping = layer_slot_mapping
+            assert cache_slot_mapping is not None
             self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
                 kv_for_cache,
                 kpe_for_cache,
@@ -581,11 +648,20 @@ class DeepseekV32Attention(MLAAttention):
         else:
             mqa_q_arg = (ql_nope[:num_actual], mqa_q[:num_actual])
 
+        # A full-CKV prefill gathers the DCP-sharded cache instead, so its
+        # local query heads attend every token and need no LSE combine.
+        full_ckv_dcp = (
+            not self.use_pcp
+            and self.impl.dcp_world_size > 1
+            and cast("MLAAttentionImpl[Any]", self.impl).uses_full_ckv_dcp(
+                attn_metadata, num_actual
+            )
+        )
         if self.use_pcp and self.impl.dcp_world_size > self.impl.pcp_world_size:
             if isinstance(mqa_q_arg, tuple):
                 mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
             mqa_q_arg = get_tp_group().all_gather(mqa_q_arg, dim=1)
-        elif not self.use_pcp and self.impl.dcp_world_size > 1:
+        elif not self.use_pcp and self.impl.dcp_world_size > 1 and not full_ckv_dcp:
             assert self.dcp_manager is not None
             if isinstance(mqa_q_arg, tuple):
                 mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
@@ -595,7 +671,7 @@ class DeepseekV32Attention(MLAAttention):
             mqa_q_arg, kv_cache, attn_metadata, self
         )
 
-        if self.impl.dcp_world_size > 1:
+        if self.impl.dcp_world_size > 1 and not full_ckv_dcp:
             assert lse is not None and self.dcp_manager is not None
             seq_lens: torch.Tensor | None
             query_start_loc: torch.Tensor | None

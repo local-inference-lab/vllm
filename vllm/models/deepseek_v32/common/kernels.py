@@ -169,9 +169,9 @@ def _fused_norm_rope_kernel(
     INDEXER_CACHE_HEAD_TILE: tl.constexpr,
     # MLA KV cache (concat kv_c_normed + k_pe_roped, uses slot_mapping_ptr)
     mla_cache_ptr,
+    mla_cache_block_size,
     mla_cache_block_stride,
     mla_cache_entry_stride,
-    MLA_CACHE_BLOCK_SIZE: tl.constexpr,
     MLA_CACHE_FP8: tl.constexpr,
     mla_cache_scale_ptr,
     # fp8_ds_mla cache views (block-scaled fp8 NoPE + unquantized bf16 RoPE).
@@ -291,9 +291,8 @@ def _fused_norm_rope_kernel(
             slot_idx = tl.load(slot_mapping_ptr + tok_idx)
             if slot_idx < 0:
                 return
-            mla_block_size = MLA_CACHE_BLOCK_SIZE
-            mla_block_idx = slot_idx // mla_block_size
-            mla_block_off = slot_idx % mla_block_size
+            mla_block_idx = slot_idx // mla_cache_block_size
+            mla_block_off = slot_idx % mla_cache_block_size
 
             if MLA_CACHE_NVFP4:
                 # nvfp4_ds_mla layout (352 B/token, KV_DIM == 512):
@@ -360,8 +359,6 @@ def _fused_norm_rope_kernel(
                 )
                 kv_2d = tl.reshape(kv_c, (MLA_NUM_TILES, MLA_TILE_DIM))
                 tile_amax = tl.max(tl.abs(kv_2d), axis=1, keep_dims=True)
-                # scale = amax / FP8_MAX (fp8 e4m3 max), matching the reference
-                # concat_and_cache_ds_mla kernel; floored to FLT_MIN.
                 tile_scale = tl.maximum(tile_amax * (1.0 / FP8_MAX), 1e-4)
                 tile_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(tile_scale)))
                 kv_c_fp8 = tl.reshape((kv_2d / tile_scale).to(fp8_dtype), (KV_DIM,))
@@ -573,7 +570,6 @@ def fused_norm_rope(
             indexer_slot_mapping = slot_mapping
         idx_cache_scale_view = indexer_k_cache.view(torch.uint8).view(torch.float32)
         idx_cache_block_size = indexer_k_cache.shape[1]
-        idx_cache_stride = indexer_k_cache.shape[2]
         # The caller's cache reports whether its reader expects the shuffled
         # layout; see DeepseekV32IndexerCache.uses_shuffled_layout.
         idx_cache_shuffle = indexer_cache_shuffled
@@ -628,9 +624,9 @@ def fused_norm_rope(
     else:
         # Dummy cache values; a zero entry stride disables the cache write.
         mla_kv_cache = torch.empty(0, dtype=torch.bfloat16, device=device)
+        mla_block_size = 1
         mla_block_stride = 0
         mla_entry_stride = 0
-        mla_block_size = 1
         mla_k_scale = _dummy((1,), torch.float32, device)
 
     if q_c_out is None:
@@ -703,9 +699,9 @@ def fused_norm_rope(
         idx_cache_head_tile,
         # MLA KV cache (uses same slot_mapping)
         mla_kv_cache,
+        mla_block_size,
         mla_block_stride,
         mla_entry_stride,
-        mla_block_size,
         mla_cache_fp8,
         mla_k_scale,
         mla_ds_scale_view,

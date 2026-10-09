@@ -29,13 +29,34 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV32IndexerCache,
     yarn_get_mscale,
 )
-from vllm.model_executor.utils import maybe_disable_graph_partition
+from vllm.model_executor.utils import maybe_disable_graph_partition, set_weight_attrs
 from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.models.glm5next.sparse_indexer import SparseAttnIndexerKpool
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
 from vllm.utils.math_utils import cdiv, next_power_of_2
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
+
+from ..nvidia.pooled_indexer import Glm5NextIndexerScratch, Glm5NextPooledIndexer
+
+
+def use_b12x_attention(vllm_config: VllmConfig) -> bool:
+    return (
+        current_platform.is_cuda()
+        and vllm_config.attention_config.backend == AttentionBackendEnum.B12X
+    )
+
+
+def _select_sparse_backend(vllm_config: VllmConfig, attn_backend: type | None):
+    if attn_backend is None and use_b12x_attention(vllm_config):
+        from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
+            B12xGLM5NextMLASparseBackend,
+        )
+
+        return B12xGLM5NextMLASparseBackend
+    return attn_backend
+
 
 logger = init_logger(__name__)
 
@@ -437,6 +458,10 @@ class Glm5NextMLAAttention(nn.Module):
         topk_indices_buffer: torch.Tensor | None = None,
         input_size: int | None = None,
         skip_rope: bool | None = False,
+        pool_topk_indices_buffer: torch.Tensor | None = None,
+        is_mtp_layer: bool = False,
+        attn_backend: type | None = None,
+        indexer_scratch: Glm5NextIndexerScratch | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -541,9 +566,29 @@ class Glm5NextMLAAttention(nn.Module):
             self.rotary_emb = None
 
         self.is_v32 = config.index_topk is not None
+        self.indexer_rope_emb: RotaryEmbedding | None
+        self.indexer: Indexer | Glm5NextPooledIndexer | None
 
-        if self.is_v32:
-            self.indexer_rope_emb: RotaryEmbedding | None = get_rope(
+        if self.is_v32 and use_b12x_attention(vllm_config):
+            assert q_lora_rank is not None
+            attn_backend = _select_sparse_backend(vllm_config, attn_backend)
+            self.indexer_rope_emb = None
+            self.indexer = Glm5NextPooledIndexer(
+                vllm_config,
+                config,
+                hidden_size,
+                q_lora_rank,
+                quant_config,
+                cache_config,
+                topk_indices_buffer,
+                pool_topk_indices_buffer,
+                main_layer_name=f"{prefix}.attn",
+                prefix=f"{prefix}.indexer",
+                emit_physical_selection=not is_mtp_layer,
+                scratch=indexer_scratch,
+            )
+        elif self.is_v32:
+            self.indexer_rope_emb = get_rope(
                 qk_rope_head_dim,
                 max_position=max_position_embeddings,
                 rope_parameters=rope_parameters,
@@ -552,7 +597,7 @@ class Glm5NextMLAAttention(nn.Module):
             # The sparse indexer projects from the MLA q-lora rank, which is
             # always set for v32 MLA configs; narrow away the `int | None`.
             assert q_lora_rank is not None
-            self.indexer: Indexer | None = Indexer(
+            self.indexer = Indexer(
                 vllm_config,
                 config,
                 hidden_size,
@@ -587,6 +632,18 @@ class Glm5NextMLAAttention(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
         )
 
+        # TP padding (see Glm5NextForCausalLMConfig) appends zero heads after
+        # the checkpoint heads: zero Q and KV-up rows and zero o_proj input
+        # columns, so padded heads contribute nothing to the output.
+        if getattr(config, "original_num_attention_heads", num_heads) != num_heads:
+            for linear in (
+                self.q_b_proj if q_lora_rank is not None else self.q_proj,
+                self.kv_b_proj,
+                self.o_proj,
+            ):
+                for param in linear.parameters():
+                    set_weight_attrs(param, {"allow_tp_padding": True})
+
         self.mla_attn = MultiHeadLatentAttentionWrapper(
             self.hidden_size,
             self.num_local_heads,
@@ -600,6 +657,7 @@ class Glm5NextMLAAttention(nn.Module):
             cache_config,
             quant_config,
             prefix,
+            attn_backend=attn_backend,
             skip_topk=False,
             fuse_qkv_rmsnorm=True,
         )

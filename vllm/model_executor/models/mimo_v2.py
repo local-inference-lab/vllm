@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
+from copy import copy
 from itertools import islice
 
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
     CacheConfig,
@@ -19,6 +21,9 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+)
+from vllm.distributed.parallel_state import (
+    declare_b12x_fused_allreduce_rms_norm_sites,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -50,6 +55,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.utils import sequence_parallel_chunk
+from vllm.model_executor.weight_transfer import copy_weight, materialize_weight
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionType
@@ -233,6 +239,7 @@ class MiMoV2Attention(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         partial_rotary_factor: float = 1.0,
+        fused_qkv_chunks: int = 0,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -259,16 +266,38 @@ class MiMoV2Attention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=attention_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
-            v_head_size=self.v_head_dim,
+        # A fused-QKV checkpoint stores ``fused_qkv_chunks`` [Q | K | V]
+        # chunks; see _fused_qkv_kv_chunk_rows for the rank layout.
+        self.kv_chunk_rows = _fused_qkv_kv_chunk_rows(
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            self.v_head_dim,
+            tp_size,
+            fused_qkv_chunks,
         )
+        if self.kv_chunk_rows:
+            self.qkv_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [
+                    self.total_num_heads * self.head_dim,
+                    fused_qkv_chunks * self.kv_chunk_rows,
+                ],
+                bias=attention_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=attention_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+                v_head_size=self.v_head_dim,
+            )
 
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.v_head_dim,
@@ -296,14 +325,23 @@ class MiMoV2Attention(nn.Module):
         )
 
         sliding_window = sliding_window_size if sliding_window_size > -1 else None
+        if (
+            sliding_window is None
+            and cache_config is not None
+            and cache_config.sliding_window is not None
+        ):
+            # MiMo declares each layer's window explicitly. Do not let the
+            # model-wide SWA default turn a global layer into sliding attention.
+            cache_config = copy(cache_config)
+            cache_config.sliding_window = None
 
-        # Use DiffKV backend when V has a different head dim than K.
-        # Auto-pick FA-DiffKV when FA3/4 is usable on this device, else fall
-        # back to TRITON_ATTN_DIFFKV.  Users can force a choice via
-        # `--attention-backend <FLASH_ATTN_DIFFKV|TRITON_ATTN_DIFFKV>`.
+        # Honor B12X and DiffKV selections for unequal QK/V head dimensions.
         if self.v_head_dim != self.head_dim:
             requested = get_current_vllm_config().attention_config.backend
-            if requested is not None and requested.name.endswith("_DIFFKV"):
+            if requested is not None and (
+                requested == AttentionBackendEnum.B12X
+                or requested.name.endswith("_DIFFKV")
+            ):
                 backend_enum = requested
             else:
                 fa_backend = AttentionBackendEnum.FLASH_ATTN_DIFFKV.get_class()
@@ -317,8 +355,9 @@ class MiMoV2Attention(nn.Module):
                 else:
                     backend_enum = AttentionBackendEnum.TRITON_ATTN_DIFFKV
             attn_backend = backend_enum.get_class()
-            assert hasattr(attn_backend, "set_head_size_v")
-            attn_backend.set_head_size_v(self.v_head_dim)
+            if backend_enum != AttentionBackendEnum.B12X:
+                assert hasattr(attn_backend, "set_head_size_v")
+                attn_backend.set_head_size_v(self.v_head_dim)
             logger.info_once("Using %s for attention.", attn_backend.get_name())
         else:
             attn_backend = None
@@ -344,7 +383,9 @@ class MiMoV2Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        q, k, v = _split_qkv(
+            qkv, self.q_size, self.k_size, self.v_size, self.kv_chunk_rows
+        )
         q, k = self.rotary_emb(positions, q, k)
 
         # Apply v_scale before attention
@@ -376,6 +417,12 @@ class MiMoV2FlashDecoderLayer(nn.Module):
         # would otherwise fall back to it in Attention.
         cache_config = vllm_config.cache_config
         cache_config.sliding_window = None
+        fused_qkv_chunks = (
+            config.num_key_value_heads
+            if getattr(config, "attention_projection_layout", None) == "fused_qkv"
+            and getattr(quant_config, "weight_block_size", None)
+            else 0
+        )
 
         if self.is_compressed_softmax_layer():
             self.self_attn = MiMoV2Attention(
@@ -396,6 +443,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
+                fused_qkv_chunks=fused_qkv_chunks,
                 prefix=f"{prefix}.self_attn",
             )
         else:
@@ -414,6 +462,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
+                fused_qkv_chunks=fused_qkv_chunks,
                 prefix=f"{prefix}.self_attn",
             )
 
@@ -492,6 +541,54 @@ def _requantize_fp8(
     return w_rank[:rows_rank], s_rank
 
 
+def _fused_qkv_kv_chunk_rows(
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    v_head_dim: int,
+    tp_size: int,
+    checkpoint_tp_size: int,
+    block: int = 128,
+) -> int:
+    """Rows per checkpoint chunk of a rank's ``K | V`` fused-QKV section.
+
+    Returns 0 when the de-interleaved ``[Q | K | V]`` rank layout is exact:
+    a rank owns at most one checkpoint chunk, or every chunk's Q, K and V
+    rows span whole FP8 scale blocks, so the layout is a block permutation.
+
+    Otherwise, when a rank owns several chunks whose K and V rows share a
+    scale block (MiMo global layers: 192 K + 128 V rows), the rank keeps each
+    chunk's K and V rows together, zero-padded to whole blocks, so every row
+    keeps its checkpoint scale:
+
+        [Q_1 | ... | Q_g | K_1 V_1 pad | ... | K_g V_g pad]
+
+    and this returns the padded ``K | V`` rows per chunk.
+    """
+    if checkpoint_tp_size <= tp_size or checkpoint_tp_size % tp_size:
+        return 0
+    q_rows = num_heads // checkpoint_tp_size * head_dim
+    k_rows = num_kv_heads // checkpoint_tp_size * head_dim
+    v_rows = num_kv_heads // checkpoint_tp_size * v_head_dim
+    if q_rows % block or (k_rows % block == 0 and v_rows % block == 0):
+        return 0
+    return cdiv(k_rows + v_rows, block) * block
+
+
+def _split_qkv(
+    qkv: torch.Tensor, q_size: int, k_size: int, v_size: int, kv_chunk_rows: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split a rank's fused QKV output (see _fused_qkv_kv_chunk_rows)."""
+    if not kv_chunk_rows:
+        return qkv.split([q_size, k_size, v_size], dim=-1)
+    q, kv = qkv.split([q_size, qkv.shape[-1] - q_size], dim=-1)
+    kv = kv.unflatten(-1, (-1, kv_chunk_rows))
+    k_rows, v_rows = k_size // kv.shape[-2], v_size // kv.shape[-2]
+    k = kv[..., :k_rows].flatten(-2)
+    v = kv[..., k_rows : k_rows + v_rows].flatten(-2)
+    return q, k, v
+
+
 def _shard_fp8_qkv_proj(
     w_full: torch.Tensor,
     s_full: torch.Tensor,
@@ -503,6 +600,7 @@ def _shard_fp8_qkv_proj(
     tp_size: int,
     ckpt_tp: int,
     block: int = 128,
+    kv_chunk_rows: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Shard the fp8 qkv_proj weights for ``tp_rank``.
 
@@ -597,6 +695,50 @@ def _shard_fp8_qkv_proj(
             s_full.chunk(ckpt_tp, dim=0)[tp_rank],
         )
 
+    if ckpt_tp % tp_size == 0 and per_chunk_scales:
+        groups_per_rank = ckpt_tp // tp_size
+        q_rows_per_group = (num_heads // ckpt_tp) * head_dim
+        k_rows_per_group = (num_kv_heads // ckpt_tp) * head_dim
+        v_rows_per_group = (num_kv_heads // ckpt_tp) * v_head_dim
+        rows_per_group = q_rows_per_group + k_rows_per_group + v_rows_per_group
+        scale_rows_per_group = (rows_per_group + block - 1) // block
+        assert w_full.shape[0] == rows_per_group * ckpt_tp
+        groups = range(tp_rank * groups_per_rank, (tp_rank + 1) * groups_per_rank)
+        q_end = q_rows_per_group
+        k_end = q_end + k_rows_per_group
+        if kv_chunk_rows or all(
+            n % block == 0
+            for n in (q_rows_per_group, k_rows_per_group, v_rows_per_group)
+        ):
+            # Exact: every row keeps its checkpoint FP8 value and block scale.
+            def rows(g: int, start: int, stop: int) -> torch.Tensor:
+                base = g * rows_per_group
+                return materialize_weight(w_full[base + start : base + stop])
+
+            def scales(g: int, start: int, stop: int) -> torch.Tensor:
+                base = g * scale_rows_per_group
+                return materialize_weight(
+                    s_full[base + start // block : base + cdiv(stop, block)]
+                )
+
+            if kv_chunk_rows:
+                pad = kv_chunk_rows - (rows_per_group - q_end)
+                weights = [rows(g, 0, q_end) for g in groups]
+                for g in groups:
+                    kv = rows(g, q_end, rows_per_group).view(torch.uint8)
+                    zeros = kv.new_zeros((pad, kv.shape[1]))  # FP8 +0.0
+                    weights.append(torch.cat([kv, zeros]).view(w_full.dtype))
+                scale_rows = [scales(g, 0, q_end) for g in groups]
+                scale_rows += [scales(g, q_end, rows_per_group) for g in groups]
+            else:
+                segments = ((0, q_end), (q_end, k_end), (k_end, rows_per_group))
+                weights = [rows(g, *seg) for seg in segments for g in groups]
+                scale_rows = [scales(g, *seg) for seg in segments for g in groups]
+            return (
+                torch.cat([w.view(torch.uint8) for w in weights]).view(w_full.dtype),
+                torch.cat(scale_rows),
+            )
+
     # Gather this rank's Q, K and V rows from the chunks that hold them.
     q_heads_per_chunk = num_heads // ckpt_tp
     kv_heads_per_chunk = num_kv_heads // ckpt_tp
@@ -629,7 +771,95 @@ def _shard_fp8_qkv_proj(
     grouped = w_full[index].to(torch.float32) * s_full[
         scale_index[index]
     ].repeat_interleave(block, dim=1)
-    return _requantize_fp8(grouped, index.numel(), block, w_full.dtype)
+    if kv_chunk_rows:
+        groups_per_rank = ckpt_tp // tp_size
+        q_rows = len(q_head_ids) * head_dim
+        k_rows = len(kv_head_ids) * head_dim
+        q, k, v = grouped.split([q_rows, k_rows, len(kv_head_ids) * v_head_dim])
+        k = k.reshape(groups_per_rank, -1, grouped.shape[1])
+        v = v.reshape(groups_per_rank, -1, grouped.shape[1])
+        padding = grouped.new_zeros(
+            groups_per_rank, kv_chunk_rows - k.shape[1] - v.shape[1], grouped.shape[1]
+        )
+        grouped = torch.cat([q, torch.cat([k, v, padding], dim=1).flatten(0, 1)])
+    return _requantize_fp8(grouped, grouped.shape[0], block, w_full.dtype)
+
+
+_L2_PREFETCH_WINDOW_BYTES = 20 * 1000 * 1000
+
+
+def _in_full_decode_capture() -> bool:
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    return torch.cuda.is_current_stream_capturing() and not (
+        is_forward_context_available()
+        and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+    )
+
+
+def _install_l2_prefetch_windows(
+    layer: "MiMoV2FlashDecoderLayer", nxt: "MiMoV2FlashDecoderLayer | None"
+) -> None:
+    """Prefetch upcoming decode weights into L2 while device memory idles.
+
+    Window A (attention op): this layer's o_proj, router and post-attention
+    norm. Window C (end of the MoE op, before its all-reduce): the next layer's
+    input norm and qkv projection; the last layer rejoins the side stream.
+    Prefetches are issued only inside FULL CUDA-graph decode captures and are
+    cache hints: numerics are unchanged.
+    """
+    from vllm.models.glm5next.nvidia import l2_prefetch
+
+    plans: dict[str, l2_prefetch.L2PrefetchPlan | None] = {}
+
+    def build() -> None:
+        device = layer.post_attention_layernorm.weight.device
+        small = 16
+        segments = l2_prefetch.segments_of(layer.self_attn.o_proj, "o_proj.")
+        if layer.is_layer_sparse:
+            segments += l2_prefetch.segments_of(
+                layer.mlp.gate, "gate.", min_bytes=small
+            )
+        segments += l2_prefetch.segments_of(
+            layer.post_attention_layernorm, "post_norm.", min_bytes=small
+        )
+        plans["a"] = l2_prefetch.make_plan(segments, _L2_PREFETCH_WINDOW_BYTES, device)[
+            0
+        ]
+        plans["c"] = None
+        if nxt is not None:
+            segments = l2_prefetch.segments_of(
+                nxt.input_layernorm, "next.input_norm.", min_bytes=small
+            ) + l2_prefetch.segments_of(nxt.self_attn.qkv_proj, "next.qkv_proj.")
+            plans["c"] = l2_prefetch.make_plan(
+                segments, _L2_PREFETCH_WINDOW_BYTES, device
+            )[0]
+        l2_prefetch.L2Prefetcher.get(device)
+
+    def window(name: str, final: bool):
+        def hook(num_tokens: int) -> None:
+            if not plans:
+                if torch.cuda.is_current_stream_capturing():
+                    return
+                build()
+            if not _in_full_decode_capture():
+                return
+            device = layer.post_attention_layernorm.weight.device
+            prefetcher = l2_prefetch.L2Prefetcher.get(device)
+            prefetcher.issue(plans[name], num_tokens)
+            if final:
+                prefetcher.join()
+
+        return hook
+
+    object.__setattr__(layer.self_attn.attn, "_l2_prefetch_hook", window("a", False))
+    if layer.is_layer_sparse:
+        object.__setattr__(
+            layer.mlp.experts,
+            "_l2_prefetch_post_experts_hook",
+            window("c", nxt is None),
+        )
 
 
 @support_torch_compile
@@ -645,6 +875,7 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
         self.quant_config = quant_config
         self.vocab_size = config.vocab_size
         self.num_redundant_experts = eplb_config.num_redundant_experts
+        self._pending_fp8_qkv_proj: dict[str, dict[str, torch.Tensor]] = {}
 
         if get_pp_group().is_first_rank or (
             config.tie_word_embeddings and get_pp_group().is_last_rank
@@ -666,6 +897,10 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
+        if envs.VLLM_MIMO_L2_PREFETCH:
+            layers = list(islice(self.layers, self.start_layer, self.end_layer))
+            for layer, nxt in zip(layers, [*layers[1:], None]):
+                _install_l2_prefetch_windows(layer, nxt)
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
@@ -674,6 +909,29 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             self.norm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
         else:
             self.norm = PPMissingLayer()
+        self._declare_fused_allreduce_rms_norm_sites()
+
+    def _declare_fused_allreduce_rms_norm_sites(self) -> None:
+        # Each post-attention norm follows the o_proj all-reduce, and each later
+        # layer's input norm follows the previous layer's MLP/MoE all-reduce.
+        norms = []
+        layers = islice(self.layers, self.start_layer, self.end_layer)
+        for i, layer in enumerate(layers):
+            norms.append(
+                (
+                    f"layers.{layer.layer_id}.post_attention_layernorm",
+                    layer.post_attention_layernorm,
+                )
+            )
+            if i > 0:
+                norms.append(
+                    (f"layers.{layer.layer_id}.input_layernorm", layer.input_layernorm)
+                )
+        if isinstance(self.norm, RMSNorm):
+            norms.append(("norm", self.norm))
+        declare_b12x_fused_allreduce_rms_norm_sites(
+            self, norms, self.config.hidden_size, "mimo_v2"
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -854,7 +1112,7 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
                 head_start = tp_rank * heads_per_rank
                 narrow_weight = loaded_weight.narrow(0, head_start, heads_per_rank)
 
-                param.data.copy_(narrow_weight)
+                copy_weight(param.data, narrow_weight)
                 loaded_params.add(name)
             else:
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -916,8 +1174,8 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             v_head_dim=attn.v_head_dim,
             tp_rank=tp_rank,
             tp_size=tp_size,
-            # The fused qkv_proj is pre-sharded for this many ranks.
             ckpt_tp=self.config.num_key_value_heads,
+            kv_chunk_rows=getattr(attn, "kv_chunk_rows", 0),
         )
         sharded = {"weight": w_rank, "weight_scale_inv": s_rank}
         for kind, tensor in sharded.items():

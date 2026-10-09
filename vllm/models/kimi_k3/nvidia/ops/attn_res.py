@@ -178,7 +178,14 @@ def attn_res(
     block_write_idx: int,
     eps: float,
     output_norm_eps: float,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Mix residual sources into fresh or caller-owned activation storage.
+
+    Output may alias delta, whose row is read before it is written. An output
+    view of blocks must lie outside the active sources and block_write_idx.
+    The caller must not overwrite a committed residual block.
+    """
     num_tokens, hidden_size = prefix.shape
     assert prefix.stride(-1) == 1
     assert delta is None or delta.stride(-1) == 1
@@ -186,6 +193,11 @@ def attn_res(
     assert norm_weight.stride(-1) == 1
     assert qk_weight.stride(-1) == 1
     assert output_norm_weight is None or output_norm_weight.stride(-1) == 1
+    if output is not None:
+        assert output.shape == prefix.shape
+        assert output.device == prefix.device
+        assert output.dtype == prefix.dtype
+        assert output.stride(-1) == 1
     # The native kernel covers every Kimi-K3 AttnRes variant on dense SM100
     # inputs. The op is only compiled under CUDA >= 13, so a device check alone
     # is not enough to know it exists.
@@ -198,6 +210,7 @@ def attn_res(
         and -1 <= block_write_idx < blocks.shape[1]
         and current_platform.is_device_capability_family(100)
         and hasattr(torch.ops._C, "kimi_k3_attn_res")
+        and output is None
     ):
         return ops.kimi_k3_attn_res(
             prefix,
@@ -211,7 +224,8 @@ def attn_res(
             eps,
             output_norm_eps,
         )
-    output = prefix.new_empty(prefix.shape)
+    if output is None:
+        output = prefix.new_empty(prefix.shape)
     # Tuned on GB300: source tiling helps decode, while one-source tiles scale
     # better for prefill.
     # Keep get_attn_res_triton_warmup_profiles in sync with these fallbacks.

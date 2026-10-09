@@ -12,6 +12,7 @@ import math
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Literal
 
 import numpy as np
@@ -22,14 +23,19 @@ from PIL import Image
 from transformers import BatchFeature, TensorType
 from transformers.processing_utils import ProcessorMixin
 
+from vllm.multimodal.audio import MelSpectrogram as _TorchMelSpectrogram
+from vllm.multimodal.audio import resample_sinc
+
 try:
     import torchaudio
     from torchaudio.transforms import MelSpectrogram as _MelSpectrogram
 
     _HAS_TORCHAUDIO = True
 except ImportError:
+    # Same features without torchaudio: plain-PyTorch ports of its
+    # MelSpectrogram and Resample (vllm.multimodal.audio).
     torchaudio = None  # type: ignore[assignment]
-    _MelSpectrogram = None  # type: ignore[assignment,misc]
+    _MelSpectrogram = _TorchMelSpectrogram  # type: ignore[assignment,misc]
     _HAS_TORCHAUDIO = False
 
 logger = logging.getLogger(__name__)
@@ -365,11 +371,6 @@ class MiMoVLProcessor:
     @property
     def mel_spectrogram(self) -> Any:
         if self._mel_spectrogram is None:
-            if _MelSpectrogram is None:
-                raise RuntimeError(
-                    "torchaudio is required for audio. "
-                    "Install with: pip install torchaudio"
-                )
             self._mel_spectrogram = _MelSpectrogram(**self._mel_spec_kwargs)
         return self._mel_spectrogram
 
@@ -427,8 +428,16 @@ class MiMoVLProcessor:
             if original_sr not in self._resamplers:
                 if len(self._resamplers) >= self._resamplers_max:
                     self._resamplers.popitem(last=False)
-                self._resamplers[original_sr] = torchaudio.transforms.Resample(
-                    orig_freq=original_sr, new_freq=self.audio_sampling_rate
+                self._resamplers[original_sr] = (
+                    torchaudio.transforms.Resample(
+                        orig_freq=original_sr, new_freq=self.audio_sampling_rate
+                    )
+                    if _HAS_TORCHAUDIO
+                    else partial(
+                        resample_sinc,
+                        orig_freq=int(original_sr),
+                        new_freq=int(self.audio_sampling_rate),
+                    )
                 )
             self._resamplers.move_to_end(original_sr)
             waveform = self._resamplers[original_sr](waveform)

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 from vllm.utils.math_utils import round_up
@@ -8,7 +8,7 @@ from vllm.utils.math_utils import round_up
 if TYPE_CHECKING:
     from transformers import PreTrainedConfig
 
-    from vllm.config import CacheConfig, ModelConfig, VllmConfig
+    from vllm.config import CacheConfig, ModelConfig, ParallelConfig, VllmConfig
     from vllm.config.cache import MambaDType
 
 
@@ -22,6 +22,12 @@ class VerifyAndUpdateConfig:
 
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+        return
+
+    @staticmethod
+    def update_model_config_for_parallelism(
+        model_config: "ModelConfig", parallel_config: "ParallelConfig"
+    ) -> None:
         return
 
 
@@ -38,6 +44,86 @@ class DeepseekV32ForCausalLM(VerifyAndUpdateConfig):
         if cache_config.cache_dtype == "bfloat16":
             cache_config.cache_dtype = "auto"
             logger.info("Using bfloat16 kv-cache for DeepSeekV3.2")
+
+
+def _pad_glm_moe_dsa_for_parallelism(
+    model_config: "ModelConfig", parallel_config: "ParallelConfig"
+) -> None:
+    """Pad GLM-5.3 (744B) axes that the tensor-parallel size does not divide.
+
+    The 64 MLA heads and the 2048-channel experts (routed and shared) need
+    physical padding at TP6: heads 64 -> 66 and expert channels
+    2048 -> 2112 (352 per rank, whole 32-channel B12X W4A16 tiles).
+    The checkpoint sizes stay as ``original_*`` attributes; the loaders zero
+    the padded tails, so padded heads and channels contribute nothing.
+    Divisible TP sizes are exact no-ops.
+    """
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return
+    text_config: Any = model_config.hf_text_config
+    model_type = getattr(
+        text_config,
+        "mtp_target_model_type",
+        getattr(text_config, "model_type", None),
+    )
+    if model_type != "glm_moe_dsa":
+        return
+    tp_size = parallel_config.tensor_parallel_size
+
+    def logical(name: str) -> int:
+        return getattr(text_config, f"original_{name}", getattr(text_config, name))
+
+    heads = logical("num_attention_heads")
+    kv_heads = logical("num_key_value_heads")
+    expert_width = logical("moe_intermediate_size")
+    padded_heads = heads if heads % tp_size == 0 else round_up(heads, tp_size)
+    padded_width = (
+        expert_width
+        if expert_width % tp_size == 0
+        else round_up(expert_width, tp_size * _GLM_DSA_EXPERT_LOCAL_ALIGNMENT)
+    )
+    if (padded_heads, padded_width) == (
+        text_config.num_attention_heads,
+        text_config.moe_intermediate_size,
+    ):
+        return
+    if kv_heads != heads:
+        raise ValueError(
+            "GLM-5.3 TP padding expects num_key_value_heads == "
+            f"num_attention_heads for MLA, got {kv_heads} and {heads}."
+        )
+    if padded_width != expert_width and parallel_config.enable_expert_parallel:
+        raise ValueError(
+            f"GLM-5.3 at tensor_parallel_size={tp_size} pads the expert width "
+            f"({expert_width}) for tensor parallelism; expert parallelism is "
+            "not supported with that padding."
+        )
+    if text_config.intermediate_size % tp_size:
+        raise ValueError(
+            f"GLM-5.3 dense MLP width ({text_config.intermediate_size}) is not "
+            f"divisible by tensor_parallel_size={tp_size}."
+        )
+    text_config.original_num_attention_heads = heads
+    text_config.num_attention_heads = padded_heads
+    text_config.original_num_key_value_heads = kv_heads
+    text_config.num_key_value_heads = padded_heads
+    text_config.original_moe_intermediate_size = expert_width
+    text_config.moe_intermediate_size = padded_width
+    model_config.model_arch_config = model_config.get_model_arch_config()
+    logger.warning(
+        "Padded GLM-5.3 for TP%d: MLA heads %d -> %d, expert width %d -> %d.",
+        tp_size,
+        heads,
+        padded_heads,
+        expert_width,
+        padded_width,
+    )
+
+
+# B12X W4A16 expert kernels take whole 32-channel tiles per rank (FC2 K32).
+_GLM_DSA_EXPERT_LOCAL_ALIGNMENT = 32
 
 
 class GlmMoeDsaForCausalLM(VerifyAndUpdateConfig):
@@ -68,6 +154,27 @@ class GlmMoeDsaForCausalLM(VerifyAndUpdateConfig):
         vllm_config.parallel_config.set_dcp_defaults(
             comm_backend="a2a", q_replicate=True
         )
+        if vllm_config.model_config is not None:
+            _pad_glm_moe_dsa_for_parallelism(
+                vllm_config.model_config, vllm_config.parallel_config
+            )
+
+    @staticmethod
+    def update_model_config_for_parallelism(
+        model_config: "ModelConfig", parallel_config: "ParallelConfig"
+    ) -> None:
+        _pad_glm_moe_dsa_for_parallelism(model_config, parallel_config)
+
+
+class GlmMoeDsaMTPConfig(VerifyAndUpdateConfig):
+    """The GLM-5.3 (744B) MTP draft pads like its target (DeepSeek-V3.2 MTP
+    drafts are unaffected)."""
+
+    @staticmethod
+    def update_model_config_for_parallelism(
+        model_config: "ModelConfig", parallel_config: "ParallelConfig"
+    ) -> None:
+        _pad_glm_moe_dsa_for_parallelism(model_config, parallel_config)
 
 
 class Ernie4_5_VLMoeForConditionalGenerationConfig(VerifyAndUpdateConfig):
@@ -411,6 +518,250 @@ class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
                 )
 
 
+class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+        from vllm.platforms import current_platform
+
+        if not (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+        ):
+            DeepseekV4ForCausalLMConfig.verify_and_update_model_config(model_config)
+            return
+        for cfg in (
+            model_config.hf_config,
+            model_config.hf_text_config,
+            model_config.model_arch_config,
+        ):
+            quant_config = getattr(cfg, "quantization_config", None)
+            if (
+                isinstance(quant_config, dict)
+                and quant_config.get("quant_method") == "fp8"
+            ):
+                quant_config["quant_method"] = "deepseek_v41_fp8"
+        # DeepSeek's reference head computes FP32 logits; a BF16 head rounds
+        # them to steps of up to 1/8. An explicit head_dtype override wins.
+        if getattr(model_config.hf_config, "head_dtype", None) is None:
+            model_config.hf_config.head_dtype = "float32"
+
+    @staticmethod
+    def update_model_config_for_parallelism(
+        model_config: "ModelConfig", parallel_config: "ParallelConfig"
+    ) -> None:
+        from vllm.platforms import current_platform
+
+        if not (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+        ):
+            return
+        text_config = model_config.hf_text_config
+        tp_size = parallel_config.tensor_parallel_size
+        original_heads = getattr(
+            text_config, "original_num_attention_heads", text_config.num_attention_heads
+        )
+        original_groups = getattr(
+            text_config, "original_o_groups", text_config.o_groups
+        )
+        if original_heads % original_groups:
+            raise ValueError(
+                "DeepSeek V4.1 attention heads must be divisible by output groups."
+            )
+
+        padded_groups = round_up(original_groups, tp_size)
+        if padded_groups == original_groups:
+            return
+        padded_heads = padded_groups * (original_heads // original_groups)
+
+        seen: set[int] = set()
+        for config in (
+            model_config.hf_config,
+            model_config.hf_text_config,
+            model_config.model_arch_config,
+        ):
+            if id(config) in seen:
+                continue
+            seen.add(id(config))
+            config_with_originals: Any = config
+            if hasattr(config, "num_attention_heads"):
+                config_with_originals.original_num_attention_heads = original_heads
+                config.num_attention_heads = padded_heads
+            if hasattr(config, "o_groups"):
+                config_with_originals.original_o_groups = original_groups
+                config.o_groups = padded_groups
+
+        model_config.model_arch_config = model_config.get_model_arch_config()
+        logger.warning(
+            "Padded DeepSeek V4.1 attention for TP%d: heads %d -> %d, "
+            "output groups %d -> %d.",
+            tp_size,
+            original_heads,
+            padded_heads,
+            original_groups,
+            padded_groups,
+        )
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        from vllm.platforms import current_platform
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        if not (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+        ):
+            return
+        backend = AttentionBackendEnum.B12X
+        if vllm_config.attention_config.backend not in (None, backend):
+            raise ValueError("DeepSeek V4.1 requires B12X.")
+        vllm_config.attention_config.backend = backend
+
+
+class Glm5NextForCausalLMConfig(VerifyAndUpdateConfig):
+    """Pad GLM-5.3 axes that the tensor-parallel size does not divide.
+
+    GLM-5.3 is dimensioned in powers of two, so TP3 needs physical padding:
+    MLA heads 64 -> 72 (whole groups of eight local heads), KDA heads
+    64 -> 66 and the shared-expert width 2048 -> 2112. The checkpoint sizes
+    stay available as ``original_*`` attributes; the model loads them into the
+    padded layouts with zero tails, so padded heads and channels contribute
+    nothing. Routed experts are not padded and need expert parallelism. The
+    vocabulary needs no config change: ``VocabParallelEmbedding`` already pads
+    its storage to a multiple of the TP size. Divisible TP sizes are no-ops.
+    """
+
+    _MLA_LOCAL_HEAD_ALIGNMENT = 8
+    _SHARED_EXPERT_LOCAL_ALIGNMENT = 64
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        # Hybrid KDA state sizing runs before verify_with_parallel_config and
+        # reads the KDA head count, so pad here as well. The hook is idempotent.
+        if vllm_config.model_config is not None:
+            Glm5NextForCausalLMConfig.update_model_config_for_parallelism(
+                vllm_config.model_config, vllm_config.parallel_config
+            )
+
+    @staticmethod
+    def update_model_config_for_parallelism(
+        model_config: "ModelConfig", parallel_config: "ParallelConfig"
+    ) -> None:
+        from vllm.platforms import current_platform
+
+        # Only the NVIDIA GLM-5.3 implementation loads padded layouts.
+        if not current_platform.is_cuda():
+            return
+        cls = Glm5NextForCausalLMConfig
+        text_config: Any = model_config.hf_text_config
+        tp_size = parallel_config.tensor_parallel_size
+
+        def logical(name: str) -> int:
+            return getattr(text_config, f"original_{name}", getattr(text_config, name))
+
+        # The vision tower is built even with --language-model-only; when TP
+        # cannot shard its heads, run it data-parallel (replicated) instead.
+        vision_config = getattr(model_config.hf_config, "vision_config", None)
+        multimodal_config = getattr(model_config, "multimodal_config", None)
+        if (
+            vision_config is not None
+            and multimodal_config is not None
+            and multimodal_config.mm_encoder_tp_mode != "data"
+            and vision_config.num_heads % tp_size
+        ):
+            logger.warning(
+                "The GLM-5.3 vision tower (%d heads) cannot be sharded across "
+                "TP%d; switching mm_encoder_tp_mode from %r to 'data'.",
+                vision_config.num_heads,
+                tp_size,
+                multimodal_config.mm_encoder_tp_mode,
+            )
+            multimodal_config.mm_encoder_tp_mode = "data"
+
+        heads = logical("num_attention_heads")
+        kv_heads = logical("num_key_value_heads")
+        kda_heads = logical("linear_num_heads")
+        n_shared_experts = getattr(text_config, "n_shared_experts", None)
+        shared_size = getattr(
+            text_config,
+            "original_shared_expert_intermediate_size",
+            text_config.moe_intermediate_size * n_shared_experts
+            if n_shared_experts
+            else None,
+        )
+
+        padded_heads = (
+            heads
+            if heads % tp_size == 0
+            else round_up(heads, tp_size * cls._MLA_LOCAL_HEAD_ALIGNMENT)
+        )
+        padded_kda_heads = round_up(kda_heads, tp_size)
+        padded_shared_size = shared_size
+        if shared_size is not None and shared_size % tp_size:
+            padded_shared_size = round_up(
+                shared_size, tp_size * cls._SHARED_EXPERT_LOCAL_ALIGNMENT
+            )
+        if (padded_heads, padded_kda_heads, padded_shared_size) == (
+            heads,
+            kda_heads,
+            shared_size,
+        ):
+            return
+
+        if kv_heads != heads:
+            raise ValueError(
+                "GLM-5.3 TP padding expects num_key_value_heads == "
+                f"num_attention_heads for MLA, got {kv_heads} and {heads}."
+            )
+        if (
+            text_config.n_routed_experts is not None
+            and text_config.moe_intermediate_size % tp_size
+            and not parallel_config.enable_expert_parallel
+        ):
+            raise ValueError(
+                f"GLM-5.3 at tensor_parallel_size={tp_size} requires "
+                "--enable-expert-parallel: the routed-expert width "
+                f"({text_config.moe_intermediate_size}) is not divisible by "
+                f"{tp_size} and routed experts are not padded."
+            )
+        if "dense" in text_config.mlp_layer_types and (
+            text_config.intermediate_size % tp_size
+        ):
+            raise ValueError(
+                f"GLM-5.3 dense MLP width ({text_config.intermediate_size}) is "
+                f"not divisible by tensor_parallel_size={tp_size}."
+            )
+        text_config.original_num_attention_heads = heads
+        text_config.num_attention_heads = padded_heads
+        text_config.original_num_key_value_heads = kv_heads
+        text_config.num_key_value_heads = padded_heads
+        text_config.original_linear_num_heads = kda_heads
+        text_config.linear_num_heads = padded_kda_heads
+        linear_attn_config = getattr(text_config, "linear_attn_config", None)
+        if isinstance(linear_attn_config, dict):
+            text_config.linear_attn_config = {
+                **linear_attn_config,
+                "num_heads": padded_kda_heads,
+                "original_num_heads": kda_heads,
+            }
+        if shared_size is not None:
+            text_config.original_shared_expert_intermediate_size = shared_size
+            text_config.shared_expert_intermediate_size = padded_shared_size
+
+        model_config.model_arch_config = model_config.get_model_arch_config()
+        logger.warning(
+            "Padded GLM-5.3 for TP%d: MLA heads %d -> %d, KDA heads %d -> %d, "
+            "shared-expert width %s -> %s.",
+            tp_size,
+            heads,
+            padded_heads,
+            kda_heads,
+            padded_kda_heads,
+            shared_size,
+            padded_shared_size,
+        )
+
+
 class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
     """Route MXFP4-checkpointed Kimi-K3 MoE experts to the MXFP4 interface.
 
@@ -429,6 +780,35 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
     """
 
     @staticmethod
+    def update_model_config_for_parallelism(
+        model_config: "ModelConfig", parallel_config: "ParallelConfig"
+    ) -> None:
+        if model_config.quantization != "exl3":
+            return
+        tp_size = parallel_config.tensor_parallel_size
+        if not 2 <= tp_size <= 24 or parallel_config.enable_expert_parallel:
+            raise ValueError("Kimi EXL3 requires TP in 2..24 without EP")
+        text = model_config.hf_text_config
+        original_heads = getattr(
+            text, "original_num_attention_heads", text.num_attention_heads
+        )
+        if not isinstance(original_heads, int) or original_heads <= 0:
+            raise ValueError("Kimi EXL3 requires a positive checkpoint head count")
+        text.original_num_attention_heads = original_heads
+        text.num_attention_heads = round_up(original_heads, tp_size)
+        if text.linear_attn_config is not None:
+            kda = dict(text.linear_attn_config)
+            original_kda_heads = kda.get("original_num_heads", kda["num_heads"])
+            if not isinstance(original_kda_heads, int) or original_kda_heads <= 0:
+                raise ValueError(
+                    "Kimi EXL3 requires a positive checkpoint KDA head count"
+                )
+            kda["original_num_heads"] = original_kda_heads
+            kda["num_heads"] = round_up(original_kda_heads, tp_size)
+            text.linear_attn_config = kda
+        model_config.model_arch_config = model_config.get_model_arch_config()
+
+    @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
         for cfg in (
             model_config.hf_config,
@@ -442,6 +822,48 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
                 and quant_config.get("format") == "mxfp4-pack-quantized"
             ):
                 quant_config["quant_method"] = "mxfp4"
+
+
+class Qwen3DSparkConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def update_model_config_for_parallelism(
+        model_config: "ModelConfig", parallel_config: "ParallelConfig"
+    ) -> None:
+        text = model_config.hf_text_config
+        heads = getattr(text, "original_num_attention_heads", text.num_attention_heads)
+        kv_heads = getattr(
+            text, "original_num_key_value_heads", text.num_key_value_heads
+        )
+        if heads % kv_heads:
+            raise ValueError("DSpark query heads must form complete KV groups")
+        tp = parallel_config.tensor_parallel_size
+        # Preserve the checkpoint's GQA grouping, including supported KV replication.
+        compatible = heads % tp == 0 and (kv_heads % tp == 0 or tp % kv_heads == 0)
+        text.original_num_attention_heads = heads
+        text.original_num_key_value_heads = kv_heads
+        if getattr(text, "head_dim", None) is None:
+            text.head_dim = text.hidden_size // heads
+        text.num_key_value_heads = kv_heads if compatible else round_up(kv_heads, tp)
+        text.num_attention_heads = (
+            heads if compatible else (text.num_key_value_heads * (heads // kv_heads))
+        )
+        model_config.model_arch_config = model_config.get_model_arch_config()
+
+
+class KimiK3MLADraftConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def update_model_config_for_parallelism(
+        model_config: "ModelConfig", parallel_config: "ParallelConfig"
+    ) -> None:
+        text = model_config.hf_text_config
+        original = getattr(
+            text, "original_num_attention_heads", text.num_attention_heads
+        )
+        text.original_num_attention_heads = original
+        text.num_attention_heads = round_up(
+            original, parallel_config.tensor_parallel_size
+        )
+        model_config.model_arch_config = model_config.get_model_arch_config()
 
 
 class GptOssForCausalLMConfig(VerifyAndUpdateConfig):
@@ -911,6 +1333,10 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
     """Apply the Qwen3.5 hybrid-cache contract to Qwen4Exp."""
 
     @staticmethod
+    def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+        model_config.hf_text_config.supports_full_tp_dcp_with_kv_gather = True
+
+    @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         Qwen3_5ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
         text_config = vllm_config.model_config.hf_text_config
@@ -936,7 +1362,7 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
             )
         multimodal_config = vllm_config.model_config.multimodal_config
         if multimodal_config is not None and multimodal_config.language_model_only:
-            _strip_qwen4_exp_mrope(vllm_config.model_config)
+            _strip_qwen4_exp_target_and_draft_mrope(vllm_config)
         spec_config = vllm_config.speculative_config
         if spec_config is not None and spec_config.method not in {
             "mtp",
@@ -954,7 +1380,7 @@ class Qwen4ExpForCausalLMConfig(Qwen4ExpForConditionalGenerationConfig):
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
 
-        _strip_qwen4_exp_mrope(vllm_config.model_config)
+        _strip_qwen4_exp_target_and_draft_mrope(vllm_config)
 
 
 class Qwen4ExpMTPConfig(Qwen4ExpForConditionalGenerationConfig):
@@ -966,6 +1392,30 @@ class Qwen4ExpMTPConfig(Qwen4ExpForConditionalGenerationConfig):
         if hasattr(vllm_config.model_config.hf_config, "vision_config"):
             return
         _strip_qwen4_exp_mrope(vllm_config.model_config)
+
+
+def _strip_qwen4_exp_target_and_draft_mrope(
+    vllm_config: "VllmConfig",
+) -> None:
+    """Keep a text target and its native draft on the same position contract."""
+    model_config = vllm_config.model_config
+    _strip_qwen4_exp_mrope(model_config)
+
+    spec_config = vllm_config.speculative_config
+    draft_model_config = (
+        getattr(spec_config, "draft_model_config", None)
+        if spec_config is not None
+        else None
+    )
+    if draft_model_config is None or draft_model_config is model_config:
+        return
+    _strip_qwen4_exp_mrope(draft_model_config)
+    draft_model_config.model_arch_config = draft_model_config.get_model_arch_config()
+
+
+Qwen3_8FlashNextForConditionalGenerationConfig = Qwen4ExpForConditionalGenerationConfig
+Qwen3_8FlashNextForCausalLMConfig = Qwen4ExpForCausalLMConfig
+Qwen3_8FlashNextMTPConfig = Qwen4ExpMTPConfig
 
 
 class ColQwen3_5Config(Qwen3_5ForConditionalGenerationConfig):
@@ -1055,7 +1505,9 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColQwen3_5": ColQwen3_5Config,
     "DeepseekV4ForCausalLM": DeepseekV4ForCausalLMConfig,
     "DeepseekV4ForConditionalGeneration": DeepseekV4ForCausalLMConfig,
-    "DeepseekV41ForCausalLM": DeepseekV4ForCausalLMConfig,
+    "DeepseekV41ForCausalLM": DeepseekV41ForCausalLMConfig,
+    "DSparkV41DraftModel": DeepseekV41ForCausalLMConfig,
+    "DFlash2KimiK3Model": KimiK3MLADraftConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
     "DiffusionGemmaForBlockDiffusion": DiffusionGemmaModelForBlockDiffusionConfig,  # noqa: E501
     "EmbeddingGemma2Model": EmbeddingGemma2ModelConfig,
@@ -1065,7 +1517,11 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Gemma4ForCausalLM": Gemma4Config,
     "Gemma4ForConditionalGeneration": Gemma4Config,
     "Gemma4UnifiedForConditionalGeneration": Gemma4Config,
+    "Glm5NextForCausalLM": Glm5NextForCausalLMConfig,
+    "Glm5NextForConditionalGeneration": Glm5NextForCausalLMConfig,
+    "Glm5NextMTPModel": Glm5NextForCausalLMConfig,
     "GlmMoeDsaForCausalLM": GlmMoeDsaForCausalLM,
+    "DeepseekV32MTPModel": GlmMoeDsaMTPConfig,
     "GptOssForCausalLM": GptOssForCausalLMConfig,
     "LongcatFlashNgramForCausalLM": LongcatFlashNgramForCausalLMConfig,
     "GteModel": SnowflakeGteNewModelConfig,
@@ -1077,6 +1533,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "JinaVLForRanking": JinaVLForSequenceClassificationConfig,
     "KimiK3ForConditionalGeneration": KimiK3ForConditionalGenerationConfig,
     "KimiK3MTPModel": KimiK3ForConditionalGenerationConfig,
+    "K3DSparkModel": KimiK3MLADraftConfig,
     "LlamaBidirectionalForSequenceClassification": LlamaBidirectionalConfig,
     "LlamaBidirectionalModel": LlamaBidirectionalConfig,
     "LlamaNemotronVLForSequenceClassification": LlamaNemotronVLConfig,
@@ -1089,6 +1546,8 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "NomicBertModel": NomicBertModelConfig,
     "Qwen2ForProcessRewardModel": Qwen2ForProcessRewardModelConfig,
     "Qwen2ForRewardModel": Qwen2ForRewardModelConfig,
+    "Qwen3DSparkModel": Qwen3DSparkConfig,
+    "Qwen3OmniDSparkModel": Qwen3DSparkConfig,
     "Qwen3ForSequenceClassification": Qwen3ForSequenceClassificationConfig,
     "Qwen3VLForSequenceClassification": Qwen3VLForSequenceClassificationConfig,
     "Qwen3_5ForCausalLM": Qwen3_5ForCausalLMConfig,
@@ -1098,6 +1557,11 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Qwen4ExpForCausalLM": Qwen4ExpForCausalLMConfig,
     "Qwen4ExpForConditionalGeneration": (Qwen4ExpForConditionalGenerationConfig),
     "Qwen4ExpMTP": Qwen4ExpMTPConfig,
+    "Qwen3_8FlashNextForCausalLM": Qwen3_8FlashNextForCausalLMConfig,
+    "Qwen3_8FlashNextForConditionalGeneration": (
+        Qwen3_8FlashNextForConditionalGenerationConfig
+    ),
+    "Qwen3_8FlashNextMTP": Qwen3_8FlashNextMTPConfig,
     "UnlimitedOCRForCausalLM": UnlimitedOCRForCausalLMConfig,
     "VoyageQwen3BidirectionalEmbedModel": VoyageQwen3BidirectionalEmbedModelConfig,
     "XLMRobertaModel": JinaRobertaModelConfig,

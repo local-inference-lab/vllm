@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterable
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -24,20 +25,27 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
-from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
 from vllm.models.glm5next.nvidia.ops.fused_eh_norm import fused_eh_norm
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from ..nvidia.glm53_fp8_dense import enable_glm53_fp8_dense
+from ..nvidia.glm53_low_latency_gemm import enable_glm53_low_latency_gemm
+from ..nvidia.mtp_draft_head import QuantizedDraftHead, make_quantized_draft_head
+from ..nvidia.pooled_indexer import Glm5NextPooledIndexer
 from .model import (
+    GLM5NEXT_PACKED_MODULES_MAPPING,
     Glm5NextDecoderLayer,
-    Glm5NextMLAAttention,
     Glm5NextMoE,
     _fused_shared_expert_name,
     _num_fused_shared_experts,
     _try_load_fp8_attn_proj,
     _try_load_fp8_indexer_wk,
+    _try_load_mxfp8_bf16_attn_proj,
     get_spec_layer_idx_from_weight_name,
+    host_embedding_if_requested,
+    use_b12x_attention,
 )
 
 
@@ -47,32 +55,37 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         assert vllm_config.speculative_config is not None
         config = vllm_config.speculative_config.draft_model_config.hf_text_config
         self.config = config
+        quant_config = vllm_config.quant_config
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
 
-        # Reserve room for the incomplete pool tail and align the sparse MLA
-        # buffer width to BLOCK_N=128.
         topk_tokens = config.index_topk
-        assert topk_tokens is not None
-        kpool = config.index_kpool
-        assert kpool is not None
+        kpool = getattr(config, "index_kpool", 1) or 1
         buffer_width = topk_tokens + (kpool - 1 if kpool > 1 else 0)
-        sparse_topk_block_n = 128
-        buffer_width = (
-            (buffer_width + sparse_topk_block_n - 1) // sparse_topk_block_n
-        ) * sparse_topk_block_n
+        if not use_b12x_attention(vllm_config):
+            buffer_width = ((buffer_width + 127) // 128) * 128
         topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
             buffer_width,
             dtype=torch.int32,
             device=current_platform.device_type,
         )
+        pool_topk_indices_buffer = None
+        if use_b12x_attention(vllm_config):
+            pool_topk_indices_buffer = torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                topk_tokens // kpool,
+                dtype=torch.int32,
+                device=current_platform.device_type,
+            )
         self.shared_head = SharedHead(
             config=config,
             prefix=prefix,
-            defer_lm_head=True,
+            quant_config=quant_config,
+            defer_lm_head=not envs.VLLM_MTP_NVFP4_LM_HEAD,
+            lm_head_quantization="nvfp4" if envs.VLLM_MTP_NVFP4_LM_HEAD else None,
         )
         # MTP layers sit past the base model's hidden layers; parse the index
         # from the prefix (e.g. "...layers.32") so the decoder builds an MLA
@@ -84,6 +97,7 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
             layer_idx=layer_idx,
             prefix=prefix,
             topk_indices_buffer=topk_indices_buffer,
+            pool_topk_indices_buffer=pool_topk_indices_buffer,
             is_mtp_layer=True,
         )
 
@@ -94,9 +108,9 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         previous_hidden_states: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_index: int = 0,
+        output_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
-        # Fused: zero pos-0 embeds + enorm(embeds) + hnorm(prev) + cat -> [N, 2H].
         eh_input = fused_eh_norm(
             positions,
             inputs_embeds,
@@ -110,7 +124,10 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         # its all-reduce, so no collective is needed here. The post-norm result
         # feeds both draft logits and the next recycled hidden state.
         hidden_states, residual, _, _ = self.mtp_block(
-            positions=positions, hidden_states=hidden_states, residual=None
+            positions=positions,
+            hidden_states=hidden_states,
+            residual=None,
+            output_indices=output_indices,
         )
         hidden_states, _ = self.shared_head.norm(hidden_states, residual=residual)
         return hidden_states, hidden_states
@@ -138,28 +155,74 @@ class Glm5NextMultiTokenPredictor(nn.Module):
             config.hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
+        host_embedding_if_requested(self.embed_tokens)
         # Plain list for the per-propose lookup: ModuleDict[str(...)] builds a
         # string and hashes it on every draft step.
         self._mtp_layers = list(self.layers.values())
-        self._mtp_mla_attns = []
-        for layer in self._mtp_layers:
-            self_attn = layer.mtp_block.self_attn
-            assert isinstance(self_attn, Glm5NextMLAAttention)
-            self._mtp_mla_attns.append(self_attn.mla_attn)
+        self._prefill_output_indices: torch.Tensor | None = None
+        self.quantized_draft_head: QuantizedDraftHead | None = None
         self.logits_processor = LogitsProcessor(config.vocab_size)
+
+    def prepare_draft_lm_head(self, source_head: nn.Module) -> None:
+        """Resolve the draft-only head after its weights have loaded.
+
+        A runtime-quantized MTP head already owns its packed vocabulary
+        projection and must not be quantized again from that packed tensor.
+        Otherwise, create the GLM-specific copy selected by
+        ``VLLM_GLM53_MTP_DRAFT_HEAD`` from an unquantized target head.
+        """
+        if getattr(source_head, "runtime_lm_head_quantization", None) in (
+            "nvfp4",
+            "mxfp8",
+        ):
+            self.quantized_draft_head = None
+            return
+        self.quantized_draft_head = make_quantized_draft_head(source_head)
+        for layer in getattr(self, "_mtp_layers", ()):
+            self.logits_processor.prepare_b12x_vocab_projection(layer.shared_head.head)
+
+    def update_max_model_len(self, max_model_len: int) -> None:
+        for module in self.modules():
+            if isinstance(module, Glm5NextPooledIndexer):
+                module.update_max_model_len(max_model_len)
 
     def set_skip_topk(self, skip: bool):
         # index_share_for_mtp_iteration: step 0 computes top-k, steps 1+ reuse.
-        for mla_attn in self._mtp_mla_attns:
-            mla_attn.skip_topk = skip
+        for layer in self.layers.values():
+            self_attn = getattr(layer.mtp_block, "self_attn", None)
+            mla_attn = getattr(self_attn, "mla_attn", None)
+            if mla_attn is not None and hasattr(mla_attn, "skip_topk"):
+                mla_attn.skip_topk = skip
 
     def compact_topk_indices(self, slot_ids: torch.Tensor):
         """Gather the top-k index rows at ``slot_ids`` to the front of the buffer."""
         num_slots = slot_ids.numel()
-        for mla_attn in self._mtp_mla_attns:
-            topk_indices_buffer = mla_attn.topk_indices_buffer
-            assert topk_indices_buffer is not None
-            topk_indices_buffer[:num_slots] = topk_indices_buffer[slot_ids]
+        for layer in self.layers.values():
+            self_attn = getattr(layer.mtp_block, "self_attn", None)
+            mla_attn = getattr(self_attn, "mla_attn", None)
+            if mla_attn is not None and hasattr(mla_attn, "topk_indices_buffer"):
+                topk_indices_buffer = mla_attn.topk_indices_buffer
+                topk_indices_buffer[:num_slots] = topk_indices_buffer[slot_ids]
+
+    def snapshot_qsa_interval_starts(self) -> None:
+        for layer in self.layers.values():
+            self_attn = getattr(layer.mtp_block, "self_attn", None)
+            indexer = getattr(self_attn, "indexer", None)
+            snapshot = getattr(indexer, "snapshot_speculative_interval_starts", None)
+            if snapshot is not None:
+                snapshot()
+
+    def restore_qsa_interval_starts(self) -> None:
+        for layer in self.layers.values():
+            self_attn = getattr(layer.mtp_block, "self_attn", None)
+            indexer = getattr(self_attn, "indexer", None)
+            restore = getattr(indexer, "restore_speculative_interval_starts", None)
+            if restore is not None:
+                restore()
+
+    def set_prefill_output_indices(self, output_indices: torch.Tensor | None) -> None:
+        """Select request-tail outputs after populating all MTP attention caches."""
+        self._prefill_output_indices = output_indices
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -181,6 +244,7 @@ class Glm5NextMultiTokenPredictor(nn.Module):
             previous_hidden_states,
             inputs_embeds,
             current_step_idx,
+            self._prefill_output_indices,
         )
 
     def compute_logits(
@@ -193,7 +257,8 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         # hidden_states is already post-final-norm (produced in the layer
         # forward and recycled as-is); apply the LM head only, without a
         # second RMSNorm.
-        return self.logits_processor(mtp_layer.shared_head.head, hidden_states)
+        head = self.quantized_draft_head or mtp_layer.shared_head.head
+        return self.logits_processor(head, hidden_states)
 
     def get_top_tokens(
         self,
@@ -208,23 +273,70 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         # step. Tie-breaking matches the full argmax (shards are contiguous
         # and rank-ordered, so the lowest-rank winner is the lowest global
         # index), so greedy draft tokens are unchanged.
-        return self.logits_processor.get_top_tokens(
-            mtp_layer.shared_head.head, hidden_states
-        )
+        head = self.quantized_draft_head or mtp_layer.shared_head.head
+        return self.logits_processor.get_top_tokens(head, hidden_states)
 
 
 class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+    packed_modules_mapping = GLM5NEXT_PACKED_MODULES_MAPPING
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.language_model.": "model.",
+            "language_model.model.": "model.",
+        }
+    )
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_text_config
         self.quant_config = vllm_config.quant_config
+        self.has_own_lm_head = envs.VLLM_MTP_NVFP4_LM_HEAD
+        if (
+            self.has_own_lm_head
+            and envs.is_set("VLLM_MTP_NVFP4_LM_HEAD")
+            and self.config.tie_word_embeddings
+        ):
+            raise ValueError("NVFP4 draft head requires untied word embeddings")
         self.model = Glm5NextMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        # TP3-only decode GEMM selection; both are no-ops at other TP sizes.
+        enable_glm53_low_latency_gemm(self.model, vllm_config.model_config.dtype)
+        enable_glm53_fp8_dense(self.model, draft=True)
+        head = self.model._mtp_layers[0].shared_head.head
+        self.has_own_lm_head = (
+            getattr(head, "runtime_lm_head_quantization", None) == "nvfp4"
+        )
+        self.checkpoint_weight_name_prefixes = self._checkpoint_weight_name_prefixes()
+        if self.has_own_lm_head:
+            self.lm_head = head
         self.set_moe_parameters()
         self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
             self.model.layers.values(), Glm5NextMoE, "mtp_block.mlp"
         )
+
+    def _checkpoint_weight_name_prefixes(self) -> tuple[str, ...]:
+        prefixes = tuple(
+            prefix
+            for layer_idx in range(
+                self.config.num_hidden_layers,
+                self.config.num_hidden_layers + self.config.num_nextn_predict_layers,
+            )
+            for prefix in (
+                f"model.language_model.layers.{layer_idx}.",
+                f"language_model.model.layers.{layer_idx}.",
+                f"model.layers.{layer_idx}.",
+                f"layers.{layer_idx}.",
+            )
+        )
+        if self.has_own_lm_head:
+            prefixes += (
+                "lm_head.",
+                "model.lm_head.",
+                "model.language_model.lm_head.",
+                "language_model.lm_head.",
+            )
+        return prefixes
 
     def set_moe_parameters(self):
         self.num_moe_layers = self.config.num_nextn_predict_layers
@@ -242,6 +354,84 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def update_max_model_len(self, max_model_len: int) -> None:
+        self.model.update_max_model_len(max_model_len)
+
+    def prepare_draft_lm_head(self, source_head: nn.Module) -> None:
+        """Create a draft-only quantized copy of the shared target head."""
+        self.model.prepare_draft_lm_head(source_head)
+
+    def share_target_indexer_storage(self, target: nn.Module) -> bool:
+        """Reuse temporary indexer storage under serial target/MTP execution.
+
+        The V2 loader calls this before profiling or graph capture, without
+        pipeline parallelism or overlapped microbatches. One MTP layer consumes
+        its selections before target execution resumes. KV views, pool tails
+        and model parameters retain independent ownership.
+        """
+        if self.model.num_mtp_layers != 1:
+            return False
+        targets = [
+            module
+            for module in target.modules()
+            if isinstance(module, Glm5NextPooledIndexer)
+        ]
+        drafts = [
+            module
+            for module in self.model.modules()
+            if isinstance(module, Glm5NextPooledIndexer)
+        ]
+        if not targets or len(drafts) != 1:
+            return False
+        source, draft = targets[0], drafts[0]
+        geometry = (
+            "max_tokens",
+            "max_seqs",
+            "max_model_len",
+            "block_size",
+            "dcp_world_size",
+            "dcp_rank",
+            "pool_interleave",
+        )
+        if any(getattr(source, key) != getattr(draft, key) for key in geometry):
+            return False
+        names = ("topk_indices_buffer", "pool_topk_indices_buffer")
+        for module in targets:
+            if module.scratch is not source.scratch or any(
+                getattr(module, name) is not getattr(source, name) for name in names
+            ):
+                return False
+        for name in names:
+            src, dst = getattr(source, name), getattr(draft, name)
+            if (src.shape, src.dtype, src.device) != (dst.shape, dst.dtype, dst.device):
+                return False
+        if any(
+            (src.shape, src.dtype, src.device) != (dst.shape, dst.dtype, dst.device)
+            for (_, src), (_, dst) in zip(
+                source.scratch.named_buffers(),
+                draft.scratch.named_buffers(),
+                strict=True,
+            )
+        ):
+            return False
+
+        replacements = {
+            id(getattr(draft, name)): getattr(source, name) for name in names
+        }
+        # The native indexer holds 512 pool IDs; MLA consumes 2051 token IDs.
+        # Rebind by identity, not by attribute name, including non-Module impls.
+        for module in self.model.modules():
+            for owner in (module, getattr(module, "impl", None)):
+                if owner is None:
+                    continue
+                for name in names:
+                    value = getattr(owner, name, None)
+                    replacement = replacements.get(id(value))
+                    if replacement is not None:
+                        setattr(owner, name, replacement)
+        draft.scratch = source.scratch
+        return True
 
     def forward(
         self,
@@ -320,7 +510,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
-        _pending_wk_fp8: dict = {}
+        pending_attn_weights: dict = {}
         # GLM-5.3-Flash NoPE checkpoints omit the RoPE rows from
         # ``kv_a_proj_with_mqa``; the FP8-to-BF16 path pads them for the model.
         kv_a_pad_size = 0
@@ -335,6 +525,19 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             # prefix to match.
             if name.startswith("model.language_model."):
                 name = name.replace("model.language_model.", "model.", 1)
+            if name in (
+                "lm_head.weight",
+                "model.lm_head.weight",
+                "language_model.lm_head.weight",
+            ):
+                if self.has_own_lm_head:
+                    for layer_idx in self.model.layers:
+                        head_name = f"model.layers.{layer_idx}.shared_head.head.weight"
+                        if head_name not in loaded_params:
+                            param = params_dict[head_name]
+                            param.weight_loader(param, loaded_weight)
+                            loaded_params.add(head_name)
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue
@@ -343,23 +546,24 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 name = _fused_shared_expert_name(name, self.config.n_routed_experts)
 
             if _try_load_fp8_indexer_wk(
+                name, loaded_weight, pending_attn_weights, params_dict, loaded_params
+            ):
+                continue
+
+            if _try_load_mxfp8_bf16_attn_proj(
                 name,
                 loaded_weight,
-                _pending_wk_fp8,
+                pending_attn_weights,
                 params_dict,
                 loaded_params,
             ):
                 continue
 
-            # FP8 checkpoint: dequantize the BF16-kept MLA projections
-            # (q_a_proj / kv_a_proj_with_mqa / o_proj) to BF16, mirroring the
-            # target model. The model holds fused_qkv_a_proj / o_proj in BF16,
-            # so the checkpoint's block-FP8 weight + weight_scale_inv for these
-            # has no param home and would KeyError without this dequant.
+            # Dequantize legacy block-FP8 projections kept in BF16.
             if _try_load_fp8_attn_proj(
                 name,
                 loaded_weight,
-                _pending_wk_fp8,
+                pending_attn_weights,
                 params_dict,
                 loaded_params,
                 kv_a_pad_size,
@@ -372,9 +576,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
                 name_mapped = name.replace(weight_name, param_name)
-                if (
-                    param_name == "fused_qkv_a_proj"
-                ) and name_mapped not in params_dict:
+                if name_mapped not in params_dict:
                     continue
                 else:
                     name = name_mapped
@@ -429,6 +631,8 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
         loaded_layers: set[int] = set()
         for param_name in loaded_params:
+            if param_name.endswith(".shared_head.head.weight"):
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, param_name)
             if spec_layer is not None:
                 loaded_layers.add(spec_layer)
@@ -436,6 +640,13 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             self.model.mtp_start_layer_idx,
             self.model.mtp_start_layer_idx + self.model.num_mtp_layers,
         ):
+            if self.has_own_lm_head:
+                head_name = f"model.layers.{layer_idx}.shared_head.head.weight"
+                if head_name not in loaded_params:
+                    raise ValueError(
+                        f"NVFP4 MTP head {layer_idx} requires an unquantized "
+                        "draft head or target lm_head.weight in the checkpoint."
+                    )
             if layer_idx not in loaded_layers:
                 raise ValueError(
                     f"MTP speculative decoding layer {layer_idx} weights "

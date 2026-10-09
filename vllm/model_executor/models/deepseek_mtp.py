@@ -56,6 +56,7 @@ class SharedHead(nn.Module):
         quant_config: QuantizationConfig | None = None,
         *,
         defer_lm_head: bool = False,
+        lm_head_quantization: typing.Literal["mxfp8", "nvfp4"] | None = None,
     ) -> None:
         super().__init__()
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -67,6 +68,7 @@ class SharedHead(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "head"),
+                lm_head_quantization=lm_head_quantization,
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

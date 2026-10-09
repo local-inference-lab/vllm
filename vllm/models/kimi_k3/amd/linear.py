@@ -679,7 +679,7 @@ class KimiDecoderLayer(nn.Module):
         prefix_sum = hidden_states
         attention_quant_key = (
             self.self_attn.get_input_quant_key()
-            if isinstance(self.self_attn, (KimiK3DeltaAttention, KimiMLAAttention))
+            if isinstance(self.self_attn, KimiK3DeltaAttention | KimiMLAAttention)
             else None
         )
         hidden_states = _apply_attn_res(

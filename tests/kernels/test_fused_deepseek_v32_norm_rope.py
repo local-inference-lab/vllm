@@ -1022,7 +1022,7 @@ def test_fused_q_triton_supports_large_token_count():
 def test_fused_eh_norm(num_tokens: int, cfg: ModelConfig):
     torch.manual_seed(4)
     dev = "cuda"
-    # Mix in a position-0 token to exercise the embeds-zeroing branch.
+    # Position zero contributes no token embedding to MTP.
     pos = torch.arange(num_tokens, device=dev, dtype=torch.int64)
     pos[0] = 0
     embeds = torch.randn(num_tokens, cfg.hidden, device=dev, dtype=torch.bfloat16)
@@ -1036,3 +1036,168 @@ def test_fused_eh_norm(num_tokens: int, cfg: ModelConfig):
     ref = torch.cat([rms_norm(masked, ew), rms_norm(prev, hw)], dim=-1)
     assert out.shape == (num_tokens, 2 * cfg.hidden)
     assert_bf16(out, ref, "eh_norm")
+
+
+@pytest.mark.parametrize("cfg", MODEL_CONFIGS, ids=MODEL_IDS)
+def test_fused_norm_rope_writes_strided_indexer_cache_pages(cfg: ModelConfig):
+    """BLHNC indexer pages must retain their physical block stride."""
+    torch.manual_seed(7)
+    dev = "cuda"
+    num_tokens = 3
+    block_size = 64
+    num_layers = 3
+    target_layer = 1
+    idx_row = cfg.index_head_dim + cfg.index_head_dim // 128 * 4
+    sentinel = 0xA5
+
+    pos = torch.arange(num_tokens, device=dev, dtype=torch.int64)
+    q_c = torch.randn(num_tokens, cfg.q_lora, device=dev, dtype=torch.bfloat16)
+    kv_c = torch.randn(num_tokens, cfg.kv_lora, device=dev, dtype=torch.bfloat16)
+    k_pe = torch.randn(num_tokens, cfg.rope_dim, device=dev, dtype=torch.bfloat16)
+    qw = torch.randn(cfg.q_lora, device=dev, dtype=torch.bfloat16)
+    kvw = torch.randn(cfg.kv_lora, device=dev, dtype=torch.bfloat16)
+    index_k = torch.randn(
+        num_tokens, cfg.index_head_dim, device=dev, dtype=torch.bfloat16
+    )
+    index_w = torch.randn(cfg.index_head_dim, device=dev, dtype=torch.float32)
+    index_b = torch.randn(cfg.index_head_dim, device=dev, dtype=torch.float32)
+    mla_cos_sin = make_cos_sin(8192, cfg.rope_dim, dev)
+    index_cos_sin = make_cos_sin(8192, cfg.rope_dim, dev)
+    storage = torch.full(
+        (2, num_layers, block_size, idx_row),
+        sentinel,
+        device=dev,
+        dtype=torch.uint8,
+    )
+    index_cache = storage[:, target_layer]
+    slot_mapping = torch.tensor([0, block_size, block_size + 1], device=dev)
+    topk = torch.empty((num_tokens, 2048), device=dev, dtype=torch.int32)
+
+    K.fused_norm_rope(
+        pos,
+        q_c,
+        qw,
+        EPS,
+        kv_c,
+        kvw,
+        EPS,
+        k_pe,
+        mla_cos_sin,
+        index_k,
+        index_w,
+        index_b,
+        EPS,
+        index_cos_sin,
+        topk,
+        slot_mapping=slot_mapping,
+        indexer_k_cache=index_cache,
+        has_indexer=True,
+        index_rope_interleave=True,
+    )
+
+    index_ref = rope(
+        layer_norm(index_k, index_w, index_b),
+        pos,
+        index_cos_sin,
+        interleave=True,
+    )
+    quant_ref, scale_ref = ue8m0_quant(index_ref)
+    page0 = index_cache[0].flatten()
+    page1 = index_cache[1].flatten()
+    torch.testing.assert_close(
+        page0[: cfg.index_head_dim].view(FP8), quant_ref[0], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        page1[: 2 * cfg.index_head_dim].view(FP8).view(2, cfg.index_head_dim),
+        quant_ref[1:],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        page0[block_size * cfg.index_head_dim :].view(torch.float32)[0],
+        scale_ref[0],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        page1[block_size * cfg.index_head_dim :].view(torch.float32)[:2],
+        scale_ref[1:],
+        rtol=0,
+        atol=0,
+    )
+    assert torch.all(storage[:, 0] == sentinel)
+    assert torch.all(storage[:, 2] == sentinel)
+
+
+@pytest.mark.parametrize("cfg", MODEL_CONFIGS, ids=MODEL_IDS)
+def test_fused_norm_rope_writes_strided_mla_cache_pages(cfg: ModelConfig):
+    """BLHNC MLA pages use logical block size and physical block stride."""
+    torch.manual_seed(8)
+    dev = "cuda"
+    num_tokens = 3
+    block_size = 64
+    num_layers = 3
+    target_layer = 1
+    record_bytes = 656
+    sentinel = 0xA5
+
+    pos = torch.arange(num_tokens, device=dev, dtype=torch.int64)
+    q_c = torch.randn(num_tokens, cfg.q_lora, device=dev, dtype=torch.bfloat16)
+    kv_c = torch.randn(num_tokens, cfg.kv_lora, device=dev, dtype=torch.bfloat16)
+    k_pe = torch.randn(num_tokens, cfg.rope_dim, device=dev, dtype=torch.bfloat16)
+    qw = torch.randn(cfg.q_lora, device=dev, dtype=torch.bfloat16)
+    kvw = torch.randn(cfg.kv_lora, device=dev, dtype=torch.bfloat16)
+    mla_cos_sin = make_cos_sin(8192, cfg.rope_dim, dev)
+    storage = torch.full(
+        (3, num_layers, block_size, record_bytes),
+        sentinel,
+        device=dev,
+        dtype=torch.uint8,
+    )
+    mla_cache = storage[:, target_layer]
+    slot_mapping = torch.tensor([0, block_size, 2 * block_size + 1], device=dev)
+    topk = torch.empty((num_tokens, 2048), device=dev, dtype=torch.int32)
+
+    K.fused_norm_rope(
+        pos,
+        q_c,
+        qw,
+        EPS,
+        kv_c,
+        kvw,
+        EPS,
+        k_pe,
+        mla_cos_sin,
+        None,
+        None,
+        None,
+        EPS,
+        None,
+        topk,
+        slot_mapping=slot_mapping,
+        mla_kv_cache=mla_cache,
+        mla_kv_cache_dtype="fp8_ds_mla",
+        has_indexer=False,
+    )
+
+    kv_ref = rms_norm(kv_c, kvw).reshape(num_tokens, 4, 128)
+    scale_ref = torch.clamp(kv_ref.abs().amax(dim=-1) / FP8_MAX, min=1e-4)
+    scale_ref = torch.exp2(torch.ceil(torch.log2(scale_ref)))
+    quant_ref = (
+        (kv_ref / scale_ref.unsqueeze(-1)).to(FP8).reshape(num_tokens, cfg.kv_lora)
+    )
+    rope_ref = rope(k_pe.float(), pos, mla_cos_sin, interleave=True).to(torch.bfloat16)
+    expected = torch.empty((num_tokens, record_bytes), device=dev, dtype=torch.uint8)
+    expected[:, : cfg.kv_lora].copy_(quant_ref.view(torch.uint8))
+    expected[:, cfg.kv_lora : cfg.kv_lora + 16].copy_(
+        scale_ref.contiguous().view(torch.uint8).reshape(num_tokens, 16)
+    )
+    expected[:, cfg.kv_lora + 16 :].copy_(
+        rope_ref.contiguous().view(torch.uint8).reshape(num_tokens, 128)
+    )
+
+    torch.testing.assert_close(mla_cache[0, 0], expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(mla_cache[1, 0], expected[1], rtol=0, atol=0)
+    torch.testing.assert_close(mla_cache[2, 1], expected[2], rtol=0, atol=0)
+    assert torch.all(storage[:, 0] == sentinel)
+    assert torch.all(storage[:, 2] == sentinel)

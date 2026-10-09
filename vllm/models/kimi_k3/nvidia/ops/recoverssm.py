@@ -283,8 +283,12 @@ def _prepare_commit_plan_kernel(
             tl.int32
         )
         final_num_computed = num_computed + commit_len
+        # The committed state belongs to the block holding the last committed
+        # token. A window ending exactly on a boundary stays in that block; the
+        # next block may still be unallocated.
         final_state_col = tl.minimum(
-            final_num_computed // mamba_block_size, block_table_width - 1
+            tl.maximum(final_num_computed - 1, 0) // mamba_block_size,
+            block_table_width - 1,
         )
         final_state_idx = tl.load(
             block_table_ptr
@@ -1009,7 +1013,13 @@ class KDARecoverSSMCommitContext:
             num_warps=4,
         )
 
+        self._commit_recurrent_state(state_indices, batch, block_table is not None)
+
+    def _commit_recurrent_state(
+        self, state_indices: torch.Tensor, batch: int, align_mode: bool
+    ) -> None:
         state_ref = self.checkpoints[0]
+        num_layers = len(self.checkpoints)
         _, num_heads, value_dim, key_dim = state_ref.shape
         block_k = triton.next_power_of_2(key_dim)
         block_v = min(triton.next_power_of_2(value_dim), 32)
@@ -1058,7 +1068,7 @@ class KDARecoverSSMCommitContext:
             BV=block_v,
             NUM_HEADS=num_heads,
             USE_LOWER_BOUND=self.lower_bound is not None,
-            ALIGN_MODE=block_table is not None,
+            ALIGN_MODE=align_mode,
             num_warps=4,
             num_stages=2,
         )

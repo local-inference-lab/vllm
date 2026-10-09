@@ -810,6 +810,9 @@ def supports_pp(model: object) -> TypeIs[SupportsPP]: ...
 def supports_pp(
     model: type[object] | object,
 ) -> bool | TypeIs[type[SupportsPP]] | TypeIs[SupportsPP]:
+    if getattr(model, "supports_pp", None) is False:
+        return False
+
     supports_attributes = _supports_pp_attributes(model)
     supports_inspect = _supports_pp_inspect(model)
 

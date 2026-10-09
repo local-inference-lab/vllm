@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""MiMo-V2 vision window attention has to apply the per-head sink logits."""
+"""MiMo-V2 checkpoint loading and vision window attention."""
+
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,6 +17,25 @@ WINDOW = 8
 SEQ_LENS = [5, 37]
 
 
+@pytest.mark.skip_global_cleanup
+def test_omni_configures_dflash_auxiliary_layers():
+    from vllm.model_executor.models.interfaces import supports_eagle3
+    from vllm.model_executor.models.mimo_v2 import MiMoV2FlashForCausalLM, MiMoV2Model
+    from vllm.model_executor.models.mimo_v2_omni import MiMoV2OmniForCausalLM
+
+    model = MiMoV2OmniForCausalLM.__new__(MiMoV2OmniForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.language_model = MiMoV2FlashForCausalLM.__new__(MiMoV2FlashForCausalLM)
+    torch.nn.Module.__init__(model.language_model)
+    backbone = MiMoV2Model.__new__(MiMoV2Model)
+    torch.nn.Module.__init__(backbone)
+    model.language_model.model = backbone
+
+    assert supports_eagle3(model)
+    model.set_aux_hidden_state_layers((1, 16, 32, 48, 70))
+    assert backbone.aux_hidden_state_layers == (1, 16, 32, 48, 70)
+
+
 @pytest.fixture
 def vision_attn_env(dist_init):
     default_dtype = torch.get_default_dtype()
@@ -24,7 +45,7 @@ def vision_attn_env(dist_init):
 
 
 def _reference(q, k, v, cu_seqlens, sinks, scale):
-    """Dense windowed softmax with the sink added to each sequence's key 0."""
+    """Dense windowed softmax with an extra zero-valued sink per head."""
     groups = q.shape[1] // k.shape[1]
     out = torch.empty_like(q, dtype=torch.float32)
     for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
@@ -32,11 +53,12 @@ def _reference(q, k, v, cu_seqlens, sinks, scale):
         ks = k[start:end].float().repeat_interleave(groups, dim=1)
         vs = v[start:end].float().repeat_interleave(groups, dim=1)
         scores = torch.einsum("qhd,khd->hqk", qs, ks) * scale
-        scores[..., 0] += sinks.float().view(-1, 1)
         pos = torch.arange(end - start, device=q.device)
         outside = (pos.view(-1, 1) - pos.view(1, -1)).abs() > WINDOW
         scores.masked_fill_(outside, -torch.inf)
-        out[start:end] = torch.einsum("hqk,khd->qhd", scores.softmax(-1), vs)
+        sink_logits = sinks.float().view(-1, 1, 1).expand(-1, end - start, 1)
+        probabilities = torch.cat((scores, sink_logits), dim=-1).softmax(-1)[..., :-1]
+        out[start:end] = torch.einsum("hqk,khd->qhd", probabilities, vs)
     return out
 
 
@@ -74,3 +96,157 @@ def test_window_attention_applies_sinks(vision_attn_env, num_kv_heads):
     # bf16 attention lands at ~2e-3 here; dropping the sinks lands at ~1e-1.
     error = ((out.float() - ref).norm() / ref.norm()).item()
     assert error < 1e-2, f"sink-corrected output is off by {error:.2e}"
+
+
+@pytest.mark.parametrize("num_kv_heads", [4, 8])
+@pytest.mark.parametrize("tp_rank", [0, 1])
+@pytest.mark.parametrize("metadata_only", [False, True])
+def test_fp8_qkv_merges_training_shards(num_kv_heads, tp_rank, metadata_only):
+    from vllm.model_executor.models.mimo_v2 import _shard_fp8_qkv_proj
+    from vllm.model_executor.weight_transfer import weight_transfer
+
+    checkpoint_tp = 4
+    q_rows, k_rows, v_rows = 16 * 192, num_kv_heads // 4 * 192, num_kv_heads // 4 * 128
+    rows = q_rows + k_rows + v_rows
+    scale_rows = (rows + 127) // 128
+    shards = []
+    for group in range(checkpoint_tp):
+        shards.append(
+            torch.cat(
+                [
+                    torch.full((count, 128), 2.0 ** (group + kind))
+                    for kind, count in enumerate((q_rows, k_rows, v_rows))
+                ]
+            )
+        )
+    weight = torch.cat(shards).to(torch.float8_e4m3fn)
+    scale = (2.0 ** (torch.arange(checkpoint_tp * scale_rows) % 4)).view(-1, 1)
+    shards = [
+        shard * group_scale.repeat_interleave(128, 0)[:rows]
+        for shard, group_scale in zip(shards, scale.chunk(checkpoint_tp))
+    ]
+
+    class Reader:
+        def __init__(self):
+            self.sources = {}
+
+        def source(self, tensor):
+            if not metadata_only:
+                return tensor
+            source = torch.empty_like(tensor, device="meta")
+            self.sources[source.untyped_storage()._cdata] = tensor
+            return source
+
+        def materialize(self, source):
+            if not source.is_meta:
+                return source.clone()
+            tensor = self.sources[source.untyped_storage()._cdata]
+            return tensor.as_strided(
+                source.shape, source.stride(), source.storage_offset()
+            ).clone()
+
+    reader = Reader()
+    with weight_transfer(reader):
+        actual_weight, actual_scale = _shard_fp8_qkv_proj(
+            reader.source(weight),
+            reader.source(scale),
+            num_heads=64,
+            num_kv_heads=num_kv_heads,
+            head_dim=192,
+            v_head_dim=128,
+            tp_rank=tp_rank,
+            tp_size=2,
+            checkpoint_tp_size=checkpoint_tp,
+        )
+    actual = actual_weight.float() * actual_scale.repeat_interleave(128, 0)
+    rank_shards = [
+        shard.split((q_rows, k_rows, v_rows))
+        for shard in shards[tp_rank * 2 : (tp_rank + 1) * 2]
+    ]
+    expected = torch.cat([part for parts in zip(*rank_shards) for part in parts])
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("scale_first", [False, True])
+def test_fp8_qkv_loads_across_interleaved_modules(monkeypatch, scale_first):
+    from vllm.model_executor.models import mimo_v2
+
+    monkeypatch.setattr(mimo_v2, "get_tensor_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(mimo_v2, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(mimo_v2.MiMoV2Model, "get_expert_mapping", lambda self: [])
+    model = mimo_v2.MiMoV2FlashForCausalLM.__new__(mimo_v2.MiMoV2FlashForCausalLM)
+    torch.nn.Module.__init__(model)
+    backbone = mimo_v2.MiMoV2Model.__new__(mimo_v2.MiMoV2Model)
+    torch.nn.Module.__init__(backbone)
+    backbone.config = SimpleNamespace(num_key_value_heads=2)
+    backbone._pending_fp8_qkv_proj = {}
+    model.model = backbone
+    model.lm_head = torch.nn.Linear(4, 2, bias=False)
+    layer = torch.nn.Module()
+    backbone.layers = torch.nn.ModuleList([layer])
+    attn = layer.self_attn = torch.nn.Module()
+    attn.total_num_heads, attn.total_num_kv_heads = 4, 2
+    attn.head_dim = attn.v_head_dim = 2
+    proj = attn.qkv_proj = torch.nn.Module()
+    proj.weight = torch.nn.Parameter(
+        torch.zeros(8, 4).to(torch.float8_e4m3fn), requires_grad=False
+    )
+    proj.weight_scale_inv = torch.nn.Parameter(torch.zeros(1, 1), requires_grad=False)
+    prefix = "model.layers.0.self_attn.qkv_proj"
+    weight = torch.arange(64).reshape(16, 4).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[0.5], [2.0]])
+    pair = [(f"{prefix}.weight", weight), (f"{prefix}.weight_scale_inv", scale)]
+    if scale_first:
+        pair.reverse()
+
+    loaded = model.load_weights(
+        [pair[0], ("lm_head.weight", torch.ones(2, 4)), pair[1]]
+    )
+
+    assert loaded == {
+        f"{prefix}.weight",
+        f"{prefix}.weight_scale_inv",
+        "lm_head.weight",
+    }
+    torch.testing.assert_close(proj.weight.float(), weight[8:].float())
+    torch.testing.assert_close(proj.weight_scale_inv, scale[1:])
+    assert not backbone._pending_fp8_qkv_proj
+
+
+def _mimo_processor():
+    from vllm.transformers_utils.processors.mimo_v2_omni import MiMoVLProcessor
+
+    return MiMoVLProcessor(
+        tokenizer=None,
+        patch_size=16,
+        image_min_pixels=8192,
+        image_max_pixels=8388608,
+        video_min_pixels=8192,
+        video_max_pixels=8388608,
+        video_total_max_pixels=268435456,
+        fps=1.0,
+    )
+
+
+def test_audio_features_without_torchaudio(monkeypatch):
+    """Audio preprocessing works without torchaudio and matches it."""
+    import vllm.transformers_utils.processors.mimo_v2_omni as processor_module
+    from vllm.multimodal.audio import MelSpectrogram
+
+    wave = torch.randn(32000, generator=torch.Generator().manual_seed(7))
+    audio = (wave, 16000)  # resampled to 24 kHz inside the processor
+
+    reference = None
+    if processor_module._HAS_TORCHAUDIO:
+        reference = _mimo_processor().preprocess_audio(audio)
+
+    monkeypatch.setattr(processor_module, "_MelSpectrogram", MelSpectrogram)
+    monkeypatch.setattr(processor_module, "_HAS_TORCHAUDIO", False)
+    spec, token_len = _mimo_processor().preprocess_audio(audio)
+
+    # 48000 samples at 24 kHz, hop 240: 201 frames of 128 log-mel bins.
+    assert spec.shape == (201, 128)
+    assert token_len == 13
+    if reference is not None:
+        assert torch.equal(spec, reference[0])
+        assert token_len == reference[1]

@@ -148,6 +148,7 @@ class ROCmLatentMoERunner(MoERunner):
             self.moe_config.hidden_dim_unpadded
             if self._quant_method.has_unpadded_output
             else 0,
+            self._quant_method.output_dtype,
         )
 
         shared_output, fused_output = cast(tuple[torch.Tensor, torch.Tensor], result)
