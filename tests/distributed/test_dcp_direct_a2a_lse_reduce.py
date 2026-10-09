@@ -141,6 +141,95 @@ class _FakeProcessGroup:
 
 
 class TestDirectDCPGating:
+    def test_a2a_factory_falls_back_without_p2p(self, monkeypatch):
+        monkeypatch.delenv("VLLM_USE_DIRECT_DCP_A2A", raising=False)
+        monkeypatch.setattr(dcp, "direct_cp_peer_access_enabled", lambda *args: False)
+        dcp.get_direct_dcp_a2a_workspace.cache_clear()
+
+        assert (
+            dcp.get_direct_dcp_a2a_workspace(
+                _FakeGroupCoordinator(),
+                torch.device("cpu"),
+                16,
+                2,
+                32,
+                torch.bfloat16,
+                1,
+            )
+            is None
+        )
+
+    def test_auto_a2a_requires_all_pairs_p2p(self, monkeypatch):
+        monkeypatch.delenv("VLLM_USE_DIRECT_DCP_A2A", raising=False)
+        monkeypatch.setattr(cp_common, "direct_cp_enabled", lambda *args: True)
+        monkeypatch.setattr(cp_common, "_cuda_p2p_spans_group", lambda group: False)
+
+        assert not cp_common.direct_cp_peer_access_enabled(
+            _FakeGroupCoordinator(), torch.bfloat16, None
+        )
+
+    def test_forced_a2a_preserves_explicit_override(self, monkeypatch):
+        monkeypatch.setattr(
+            cp_common,
+            "_cuda_p2p_spans_group",
+            lambda group: pytest.fail("forced mode should bypass the automatic probe"),
+        )
+
+        assert cp_common.direct_cp_peer_access_enabled(
+            _FakeGroupCoordinator(), torch.bfloat16, True
+        )
+
+    @pytest.mark.parametrize("p2p_available", [False, True])
+    def test_p2p_probe_checks_both_directions(self, monkeypatch, p2p_available):
+        group = MagicMock(world_size=2, local_rank=2, cpu_group=object())
+        cp_common._cuda_p2p_spans_group.cache_clear()
+        monkeypatch.setenv("VLLM_SKIP_P2P_CHECK", "0")
+        monkeypatch.setattr(cp_common.current_platform, "is_cuda", lambda: True)
+
+        def gather_local_ranks(output, value, *, group):
+            assert value == 2
+            output[:] = [2, 3]
+
+        monkeypatch.setattr(torch.distributed, "all_gather_object", gather_local_ranks)
+        peer_checks = MagicMock(
+            side_effect=lambda src, dst: p2p_available or (src, dst) != (3, 2)
+        )
+        monkeypatch.setattr(cp_common, "gpu_p2p_access_check", peer_checks)
+
+        assert cp_common._cuda_p2p_spans_group(group) is p2p_available
+        if p2p_available:
+            assert peer_checks.call_count == 2
+        else:
+            assert peer_checks.call_args.args == (3, 2)
+
+    def test_p2p_probe_trusts_the_driver_by_default(self, monkeypatch):
+        """VLLM_SKIP_P2P_CHECK (default on) skips the IPC probe, which can
+        hang on PCIe hosts, as it does for the custom all-reduce."""
+        group = MagicMock(world_size=2, local_rank=0, cpu_group=object())
+        cp_common._cuda_p2p_spans_group.cache_clear()
+        monkeypatch.delenv("VLLM_SKIP_P2P_CHECK", raising=False)
+        monkeypatch.setattr(cp_common.current_platform, "is_cuda", lambda: True)
+        monkeypatch.setattr(
+            cp_common.current_platform,
+            "logical_device_id_to_visible_device_id",
+            lambda device: device + 4,
+        )
+
+        def gather_local_ranks(output, value, *, group):
+            output[:] = [0, 1]
+
+        monkeypatch.setattr(torch.distributed, "all_gather_object", gather_local_ranks)
+        monkeypatch.setattr(
+            cp_common,
+            "gpu_p2p_access_check",
+            lambda *args: pytest.fail("the driver report should replace the probe"),
+        )
+        peers = MagicMock(return_value=True)
+        monkeypatch.setattr(torch.cuda, "can_device_access_peer", peers)
+
+        assert cp_common._cuda_p2p_spans_group(group)
+        assert sorted(call.args for call in peers.call_args_list) == [(4, 5), (5, 4)]
+
     def test_env_disabled_returns_none(self, monkeypatch):
         monkeypatch.setenv("VLLM_USE_DIRECT_DCP_A2A", "0")
         dcp.get_direct_dcp_a2a_workspace.cache_clear()
@@ -337,8 +426,8 @@ def test_mla_dcp_manager_selects_direct_backends(monkeypatch):
 
     group = MagicMock(world_size=2)
     monkeypatch.setattr(dcp_manager, "get_dcp_group", lambda: group)
-    direct_a2a = MagicMock()
-    direct_query = MagicMock()
+    direct_a2a = MagicMock(max_num_tokens=4)
+    direct_query = MagicMock(max_num_tokens=4)
     direct_kv = MagicMock()
     monkeypatch.setattr(
         dcp_manager, "get_direct_dcp_a2a_workspace", MagicMock(return_value=direct_a2a)
@@ -368,7 +457,9 @@ def test_mla_dcp_manager_selects_direct_backends(monkeypatch):
     )
     workspace = torch.empty(96, 8)
 
-    assert manager.query_gather == direct_query.gather
+    query = torch.empty(1, 2, 8)
+    assert manager.query_gather(query) is direct_query.gather.return_value
+    direct_query.gather.assert_called_once_with(query)
     manager.init_kv_gather(workspace, 64)
     gathered_kv, local_kv = torch.empty(4, 8), torch.empty(2, 8)
     manager.kv_gather(gathered_kv, local_kv)
@@ -385,9 +476,9 @@ def test_mla_dcp_manager_selects_direct_backends(monkeypatch):
     direct_a2a.lse_reduce.assert_called_once_with(
         output,
         lse,
-        seq_lens=seq_lens,
-        query_start_loc=query_start_loc,
-        is_lse_base_on_e=False,
+        False,
+        seq_lens,
+        query_start_loc,
     )
 
 
@@ -480,6 +571,96 @@ def test_dcp_workspace_covers_decode_width(
     assert dcp.get_dcp_workspace_max_num_tokens(config) == expected
 
 
+@pytest.mark.parametrize("direct_capacity", [None, 4])
+@pytest.mark.parametrize("rows", [2, 8])
+def test_mla_query_scratch_fallback_preserves_direct_transport_priority(
+    monkeypatch, direct_capacity, rows
+):
+    group = MagicMock(world_size=2)
+    direct = (
+        None if direct_capacity is None else MagicMock(max_num_tokens=direct_capacity)
+    )
+    fallback = MagicMock(return_value=torch.empty((rows, 4, 8)))
+    monkeypatch.setattr(dcp, "get_dcp_group", lambda: group)
+    monkeypatch.setattr(dcp, "get_direct_dcp_q_gather_workspace", lambda *args: direct)
+    manager = dcp.MLADCPManager(
+        vllm_config=_manager_config(dcp_comm_backend="ag_rs"),
+        device=torch.device("cpu"),
+        num_heads=2,
+        query_head_dim=8,
+        output_head_dim=4,
+        query_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        padded_num_heads=None,
+        is_lse_base_on_e=True,
+        use_pcp=False,
+        query_gather_fallback=fallback,
+    )
+    query = torch.empty((rows, 2, 8), dtype=torch.bfloat16)
+    actual = manager.query_gather(query)
+    if direct is not None and rows <= direct_capacity:
+        direct.gather.assert_called_once_with(query)
+        fallback.assert_not_called()
+        assert actual is direct.gather.return_value
+    else:
+        fallback.assert_called_once_with(query)
+        assert actual is fallback.return_value
+    group.all_gather.assert_not_called()
+
+
+@pytest.mark.parametrize("ubatches", [1, 2])
+def test_mla_dcp_b12x_is_serial_and_capacity_bounded(monkeypatch, ubatches):
+    from vllm.distributed.device_communicators import b12x_dcp
+
+    config = _manager_config()
+    config.parallel_config.num_ubatches = ubatches
+    group = MagicMock(world_size=2)
+    monkeypatch.setattr(dcp, "get_dcp_group", lambda: group)
+    for name in ("get_direct_dcp_a2a_workspace", "get_direct_dcp_q_gather_workspace"):
+        monkeypatch.setattr(dcp, name, MagicMock(return_value=None))
+    transport = MagicMock(max_tokens=4)
+    factory = MagicMock(return_value=transport)
+    monkeypatch.setattr(b12x_dcp, "get_b12x_dcp_transport", factory)
+    fallback = MagicMock()
+    monkeypatch.setattr(dcp, "dcp_a2a_lse_reduce", fallback)
+    manager = dcp.MLADCPManager(
+        vllm_config=config,
+        device=torch.device("cpu"),
+        num_heads=2,
+        query_head_dim=576,
+        output_head_dim=512,
+        query_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        padded_num_heads=None,
+        is_lse_base_on_e=True,
+        use_pcp=False,
+        use_b12x=True,
+    )
+    if ubatches != 1:
+        factory.assert_not_called()
+        assert manager.b12x_transport is None
+        return
+    query = torch.zeros(4, 2, 576)
+    partial, lse = torch.zeros(4, 4, 512), torch.zeros(4, 4)
+    assert manager.query_gather(query) is transport.gather.return_value
+    assert manager.combine(partial, lse) is transport.combine.return_value
+    transport.gather.assert_called_once_with(query)
+    transport.combine.assert_called_once_with(partial, lse, is_lse_base_on_e=True)
+    query = torch.zeros(5, 2, 576)
+    partial, lse = torch.zeros(5, 4, 512), torch.zeros(5, 4)
+    assert manager.query_gather(query) is group.all_gather.return_value
+    assert manager.combine(partial, lse) is fallback.return_value
+    group.all_gather.assert_called_once_with(query, dim=1)
+    fallback.assert_called_once_with(
+        partial,
+        lse,
+        cp_group=group,
+        is_lse_base_on_e=True,
+        seq_lens=None,
+        query_start_loc=None,
+    )
+
+
 def test_mla_dcp_manager_selects_pcp_combine(monkeypatch):
     import vllm.v1.attention.ops.dcp as dcp_manager
 
@@ -502,6 +683,33 @@ def test_mla_dcp_manager_selects_pcp_combine(monkeypatch):
     assert manager.query_gather is None
 
 
+@pytest.mark.parametrize(
+    "backend,use_pcp", [("ag_rs", False), ("ag_rs", True), ("a2a", False)]
+)
+def test_mla_output_workspace_hook_only_applies_to_head_reduce_scatter(
+    monkeypatch, backend, use_pcp
+):
+    monkeypatch.setattr(dcp, "get_dcp_group", lambda: MagicMock(world_size=2))
+    monkeypatch.setattr(dcp, "get_direct_dcp_q_gather_workspace", lambda *args: None)
+    monkeypatch.setattr(dcp, "get_direct_dcp_a2a_workspace", lambda *args: None)
+    callback = MagicMock()
+    manager = dcp.MLADCPManager(
+        vllm_config=_manager_config(dcp_comm_backend=backend),
+        device=torch.device("cpu"),
+        num_heads=2,
+        query_head_dim=8,
+        output_head_dim=4,
+        query_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        padded_num_heads=None,
+        is_lse_base_on_e=True,
+        use_pcp=use_pcp,
+        output_reduce_scatter=callback,
+    )
+    expected = callback if backend == "ag_rs" and not use_pcp else None
+    assert manager.combine.keywords.get("output_reduce_scatter") is expected
+
+
 def test_dcp_chunk_workspace_alignment_covers_interleave():
     from vllm.model_executor.layers.attention.mla_attention import (
         align_mla_chunked_context_workspace_size,
@@ -522,6 +730,7 @@ def test_dcp_chunk_workspace_alignment_covers_interleave():
 def test_sparse_mla_builder_initializes_dcp_manager(monkeypatch):
     import vllm.model_executor.layers.attention.sparse_mla_attention as sparse_mla
 
+    monkeypatch.setattr(sparse_mla, "PIN_MEMORY", False)
     monkeypatch.setattr(
         sparse_mla.AttentionMetadataBuilder,
         "__init__",
@@ -544,7 +753,7 @@ def test_sparse_mla_builder_initializes_dcp_manager(monkeypatch):
     config = MagicMock()
     config.model_config.dtype = torch.bfloat16
     config.model_config.max_model_len = 64
-    config.model_config.hf_config.index_topk = 8
+    config.model_config.hf_text_config.index_topk = 8
     config.scheduler_config.max_num_batched_tokens = 64
     config.scheduler_config.max_num_seqs = 2
     config.cache_config.block_size = 4
@@ -574,7 +783,7 @@ def test_sparse_mla_workspace_preserves_non_dcp_size():
 
     config = MagicMock()
     config.model_config.max_model_len = 1
-    config.model_config.hf_config.index_topk = 7
+    config.model_config.hf_text_config.index_topk = 7
     config.scheduler_config.max_num_seqs = 3
     config.cache_config.block_size = 4
     config.parallel_config.decode_context_parallel_size = 1

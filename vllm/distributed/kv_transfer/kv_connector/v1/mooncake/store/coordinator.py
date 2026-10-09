@@ -16,12 +16,14 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     SingleTypeKVCacheManager,
+    resolve_sparse_retention_inputs,
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
@@ -167,6 +169,10 @@ class MooncakeStoreCoordinator:
         self.eagle_group_ids = {
             gid for g in attention_groups if g.use_eagle for gid in g.group_ids
         }
+        self.lookup_drops_eagle_block = any(
+            group.use_eagle and group.manager_cls.drops_eagle_block
+            for group in attention_groups
+        )
 
     def find_longest_cache_hit(
         self,
@@ -297,13 +303,21 @@ class MooncakeStoreCoordinator:
             manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
             assert manager_cls is not None
             use_eagle = g_idx in self.eagle_group_ids
-            reachable_boundaries = (
+            reachable_boundaries: Sequence[int] = (
                 () if num_prompt_tokens is None else (num_prompt_tokens - 1,)
+            )
+            use_eagle, reachable_boundaries = resolve_sparse_retention_inputs(
+                spec,
+                use_eagle,
+                self.lookup_drops_eagle_block,
+                reachable_boundaries,
+                lookup_alignment_tokens=mask_alignment,
+                state_materialization_alignment_tokens=self.lcm_block_size,
             )
             mask = manager_cls.reachable_block_mask(
                 start_block=start_chunk,
                 end_block=end_chunk,
-                alignment_tokens=self.lcm_block_size,
+                alignment_tokens=mask_alignment,
                 kv_cache_spec=spec,
                 use_eagle=use_eagle,
                 retention_interval=retention_interval,
@@ -390,10 +404,10 @@ class MooncakeStoreCoordinator:
                     apply_eagle and group_eagle and idx not in eagle_verified
                 )
                 _max_length = curr_hit_length
-                # No eagle peek margin for a recurrent (Mamba) group: its finder
-                # never drops a block, so a widened bound would match past the
-                # attention-verified hit and resume from speculative state (#43559).
-                if drop_eagle_block and not isinstance(spec, MambaSpec):
+                # Only managers whose finder drops a block receive a peek
+                # margin. Otherwise a widened bound can resume past the
+                # attention-verified hit (#43559).
+                if drop_eagle_block and manager_cls.drops_eagle_block:
                     eagle_margin = (
                         self.hash_block_size
                         if self.enable_partial_hash_hits
@@ -456,8 +470,8 @@ def partial_hash_hits_enabled(
     hash_block_size: int,
     dcp_world_size: int = 1,
 ) -> bool:
-    """Match core's DCP-aware Mamba partial-hit condition."""
-    return any(
+    """Match core partial hash lookup across Mamba and attention groups."""
+    has_partial_mamba_group = any(
         isinstance(spec := _unwrap_spec(g.kv_cache_spec), MambaSpec)
         and spec.mamba_cache_mode == "align"
         and (
@@ -466,3 +480,32 @@ def partial_hash_hits_enabled(
         )
         for g in kv_cache_groups
     )
+    has_mamba_align_group = any(
+        isinstance(spec := _unwrap_spec(g.kv_cache_spec), MambaSpec)
+        and spec.mamba_cache_mode == "align"
+        for g in kv_cache_groups
+    )
+    has_partial_attention_group = has_mamba_align_group and any(
+        isinstance(
+            spec := _unwrap_spec(g.kv_cache_spec),
+            FullAttentionSpec | SlidingWindowSpec,
+        )
+        and spec.block_size > hash_block_size
+        and (manager := KVCacheSpecRegistry.get_manager_class(spec)) is not None
+        and manager.supports_fine_grained_hash_lookup
+        for g in kv_cache_groups
+    )
+    if not (has_partial_mamba_group or has_partial_attention_group):
+        return False
+
+    for group in kv_cache_groups:
+        spec = _unwrap_spec(group.kv_cache_spec)
+        manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
+        if manager_cls is None:
+            return False
+        if (
+            not manager_cls.supports_fine_grained_hash_lookup
+            and spec.block_size != hash_block_size
+        ):
+            return False
+    return True

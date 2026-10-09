@@ -38,6 +38,7 @@ from vllm.multimodal.inputs import (
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
+from vllm.v1.core.boundary_checkpoint import BoundaryCheckpointCache
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -76,6 +77,155 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_full_boundary_hit_preserves_async_speculative_decode_token_count():
+    """Sampling saved logits must not advance the processed-token frontier."""
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_v2_model_runner=True,
+        async_scheduling=True,
+        num_speculative_tokens=3,
+        speculative_method="ngram_gpu",
+    )
+    manager = scheduler.kv_cache_manager
+    manager.boundary_checkpoints = BoundaryCheckpointCache(manager.block_pool)
+    producer, repeat = create_requests(
+        num_requests=2,
+        num_tokens=32,
+        same_prompt=True,
+        req_ids=["producer", "repeat"],
+    )
+    manager.get_computed_blocks(producer)
+    assert manager.allocate_slots(producer, 32) is not None
+    manager.publish_boundary_checkpoint(producer, 32, kind="prompt")
+    manager.free(producer)
+    scheduler.add_request(repeat)
+
+    logits_step = scheduler.schedule()
+    assert logits_step.boundary_logits_only
+    assert logits_step.num_scheduled_tokens == {"repeat": 1}
+    assert repeat.num_computed_tokens == 32
+    assert repeat.num_output_placeholders == 1
+    decode_step = scheduler.schedule()
+    assert not decode_step.boundary_logits_only
+    assert decode_step.num_scheduled_tokens == {"repeat": 4}
+
+
+@pytest.mark.parametrize("admission_blocker", [None, "capacity", "allocation", "pause"])
+@pytest.mark.parametrize(
+    "fairness_options",
+    [
+        {},
+        {"prefill_compute_share": 0.4},
+        {"prefill_compute_share": "auto"},
+        {
+            "prefill_compute_share": 0.4,
+            "max_parallel_prefills": 4,
+            "prefill_policy": "round-robin",
+        },
+        {
+            "prefill_compute_share": "auto",
+            "max_parallel_prefills": 4,
+            "prefill_policy": "decode-aware",
+        },
+    ],
+)
+def test_full_boundary_hit_is_admitted_while_another_request_decodes(
+    admission_blocker, fairness_options, monkeypatch
+):
+    """A saved-logits hit needs one isolated step, not an empty running queue."""
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_v2_model_runner=True,
+        async_scheduling=True,
+        num_speculative_tokens=3,
+        speculative_method="ngram_gpu",
+        **fairness_options,
+    )
+    manager = scheduler.kv_cache_manager
+    manager.boundary_checkpoints = BoundaryCheckpointCache(manager.block_pool)
+    producer, first, second = create_requests(
+        num_requests=3,
+        num_tokens=32,
+        same_prompt=True,
+        req_ids=["producer", "first", "second"],
+    )
+    manager.get_computed_blocks(producer)
+    assert manager.allocate_slots(producer, 32) is not None
+    manager.publish_boundary_checkpoint(producer, 32, kind="prompt")
+    manager.free(producer)
+    scheduler.add_request(first)
+    assert scheduler.schedule().boundary_logits_only
+    scheduler.add_request(second)
+
+    discovery_step = scheduler.schedule()
+    assert discovery_step.num_scheduled_tokens == {"first": 4}
+    assert second.boundary_checkpoint is not None
+    if admission_blocker is not None:
+        with monkeypatch.context() as patch:
+            if admission_blocker == "capacity":
+                patch.setattr(scheduler, "max_num_running_reqs", 1)
+                patch.setattr(scheduler, "max_num_active_reqs", 1)
+            elif admission_blocker == "allocation":
+                allocate = manager.allocate_slots
+
+                def allocate_without_waiter(request, *args, **kwargs):
+                    if request is second:
+                        return None
+                    return allocate(request, *args, **kwargs)
+
+                patch.setattr(manager, "allocate_slots", allocate_without_waiter)
+            else:
+                scheduler.set_pause_state(PauseState.PAUSED_NEW)
+            blocked_step = scheduler.schedule()
+            assert not blocked_step.boundary_logits_only
+            assert blocked_step.num_scheduled_tokens == {"first": 4}
+            assert second.status == RequestStatus.WAITING
+        scheduler.set_pause_state(PauseState.UNPAUSED)
+    admission_step = scheduler.schedule()
+    assert admission_step.boundary_logits_only
+    assert admission_step.num_scheduled_tokens == {"second": 1}
+    assert first in scheduler.running and second in scheduler.running
+    assert second.num_computed_tokens == 32
+    assert second.num_output_placeholders == 1
+    decode_step = scheduler.schedule()
+    assert not decode_step.boundary_logits_only
+    assert decode_step.num_scheduled_tokens == {"first": 4, "second": 4}
+
+
+@pytest.mark.parametrize("imported_tokens", [0, 32])
+def test_boundary_restore_preserves_external_cache_attribution(imported_tokens: int):
+    """Imported snapshots count as external hits; later GPU reuse stays local."""
+    scheduler = create_scheduler(enable_prefix_caching=True, use_v2_model_runner=True)
+    manager = scheduler.kv_cache_manager
+    manager.boundary_checkpoints = BoundaryCheckpointCache(manager.block_pool)
+    producer, repeat = create_requests(
+        num_requests=2,
+        num_tokens=32,
+        same_prompt=True,
+        req_ids=["producer", "repeat"],
+    )
+    manager.get_computed_blocks(producer)
+    assert manager.allocate_slots(producer, 32) is not None
+    manager.publish_boundary_checkpoint(producer, 32, kind="prompt")
+    manager.free(producer)
+    scheduler.connector = Mock()
+    scheduler.connector.poll_boundary_checkpoint.return_value = True
+    scheduler.connector.boundary_checkpoint_external_tokens.return_value = (
+        imported_tokens
+    )
+    scheduler.connector.get_num_new_matched_tokens.return_value = (0, False)
+    scheduler.add_request(repeat)
+
+    output = scheduler.schedule()
+
+    assert output.boundary_logits_only
+    assert output.num_scheduled_tokens == {"repeat": 1}
+    assert repeat.num_computed_tokens == 32
+    assert repeat.prefill_stats.num_computed_tokens == 0
+    assert repeat.prefill_stats.num_external_cached_tokens == imported_tokens
+    assert repeat.prefill_stats.num_local_cached_tokens == 32 - imported_tokens
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():
@@ -343,8 +493,9 @@ def test_schedule_multimodal_requests():
         assert len(encoder_input) == 1
 
 
-def test_async_scheduling_pp_allows_rescheduling_with_output_placeholders():
+def test_async_scheduling_pp_allows_rescheduling_with_output_placeholders(monkeypatch):
     """Async scheduling + PP: allow multi-step in-flight scheduling per request."""
+    monkeypatch.setattr("vllm.platforms.current_platform.device_count", lambda: 2)
     scheduler = create_scheduler(async_scheduling=True, pipeline_parallel_size=2)
     (req,) = create_requests(num_requests=1, num_tokens=8)
     scheduler.add_request(req)
@@ -506,11 +657,10 @@ def test_encoder_only_prompt_longer_than_budget_is_chunked():
 
 @pytest.mark.parametrize("has_running", [True, False])
 def test_schedule_prefills_gating(has_running: bool):
-    """DP prefill-balancing gate: when `throttle_prefills` is True, a new
-    WAITING (prefill) request is deferred ONLY if this rank has running work to
-    protect. With no running requests, the prefill is admitted regardless (so a
-    throttled step is never wasted as a dummy), and running/decode requests are
-    unaffected. Once the cadence allows prefills again, the request is admitted.
+    """When `throttle_prefills` is True, a new waiting prefill request is
+    deferred only if this engine has running decode work to protect. With no
+    running request, the prefill is admitted so a throttled step is not wasted.
+    Once the cadence allows prefills again, the request is admitted.
     """
     scheduler = create_scheduler(max_num_seqs=16, max_num_batched_tokens=8192)
 
@@ -550,6 +700,36 @@ def test_schedule_prefills_gating(has_running: bool):
     # No running work to protect (or cadence now open): the prefill is admitted.
     assert "new0" in output.num_scheduled_tokens
     assert any(r.req_id == "new0" for r in output.scheduled_new_reqs)
+
+
+def test_throttle_prefills_admits_work_when_decode_is_temporarily_ineligible():
+    """Prefill runs instead of an empty step while async decode waits for its
+    pipeline-parallel scheduling slot.
+    """
+    scheduler = create_scheduler(max_num_seqs=16, max_num_batched_tokens=8192)
+
+    (decode_req,) = create_requests(num_requests=1, num_tokens=8, req_ids=["decode"])
+    scheduler.add_request(decode_req)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=["decode"],
+            req_id_to_index={"decode": 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    decode_req.next_decode_eligible_step = scheduler.current_step + 2
+
+    (prefill_req,) = create_requests(num_requests=1, num_tokens=8, req_ids=["prefill"])
+    scheduler.add_request(prefill_req)
+    output = scheduler.schedule(throttle_prefills=True)
+
+    assert "decode" not in output.num_scheduled_tokens
+    assert "prefill" in output.num_scheduled_tokens
 
 
 def _setup_remote_kv_resume(num_prompt_tokens: int, matched_tokens: int):
@@ -630,10 +810,11 @@ def test_throttle_prefills_defers_remote_kv_resume_with_local_prefill():
 
 
 def test_throttle_defers_inflight_prefill_chunk():
-    """DP prefill balancing throttles ALL prefill compute on a throttled step,
-    not just new admissions: an in-progress (chunked) prefill already in the
-    running queue is also deferred, so the step runs decode-only, while a
-    separate decode keeps being scheduled."""
+    """A throttled step defers all prefill compute, not just new admissions.
+
+    An in-progress chunked prefill in the running queue is deferred so the step
+    runs decode-only while a separate decode request remains scheduled.
+    """
     scheduler = create_scheduler(
         max_num_seqs=16, max_num_batched_tokens=50, enable_chunked_prefill=True
     )
@@ -1843,6 +2024,70 @@ def test_draft_slots_budgeted_per_scheduled_request(tmp_path, monkeypatch):
     assert scheduler.schedule().num_scheduled_tokens == {"0": 10, "1": 4}
 
 
+@pytest.mark.parametrize(
+    ("num_requests", "num_tokens", "expected"),
+    [
+        (2, 8, {"0": 8, "1": 8}),
+        (5, 1, {"0": 1, "1": 1, "2": 1, "3": 1}),
+    ],
+)
+def test_dspark_uses_separate_draft_input_budget(
+    tmp_path, monkeypatch, num_requests, num_tokens, expected
+):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    (tmp_path / "config.json").write_text(
+        '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
+    )
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        max_num_seqs=16,
+        max_num_batched_tokens=16,
+        num_speculative_tokens=4,
+        parallel_drafting=True,
+        skip_tokenizer_init=True,
+    )
+    speculative_config = scheduler.vllm_config.speculative_config
+    assert speculative_config is not None
+    speculative_config.method = "dspark"
+
+    for request in create_requests(num_requests=num_requests, num_tokens=num_tokens):
+        scheduler.add_request(request)
+
+    assert scheduler.schedule().num_scheduled_tokens == expected
+
+
+@pytest.mark.parametrize(
+    ("num_requests", "num_tokens", "expected"),
+    [
+        (2, 10, {"0": 10, "1": 10}),
+        (3, 1, {"0": 1, "1": 1}),
+    ],
+)
+def test_dflash_uses_separate_query_input_budget(
+    tmp_path, monkeypatch, num_requests, num_tokens, expected
+):
+    """DFlash target and query forwards share their input buffer sequentially."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    (tmp_path / "config.json").write_text(
+        '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
+    )
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        max_num_seqs=16,
+        max_num_batched_tokens=20,
+        num_speculative_tokens=7,
+        skip_tokenizer_init=True,
+    )
+    speculative_config = scheduler.vllm_config.speculative_config
+    assert speculative_config is not None
+    speculative_config.method = "dflash"
+
+    for request in create_requests(num_requests=num_requests, num_tokens=num_tokens):
+        scheduler.add_request(request)
+
+    assert scheduler.schedule().num_scheduled_tokens == expected
+
+
 # Note - these test cases mirror some of those in test_rejection_sampler.py
 @pytest.mark.parametrize(
     "spec_tokens,output_tokens,expected,expected_per_req",
@@ -1965,6 +2210,10 @@ def test_schedule_spec_decoding_stats(
         assert stats.num_draft_tokens == expected[1]
         assert stats.num_accepted_tokens == expected[2]
         assert stats.num_accepted_tokens_per_pos == expected[3]
+        assert stats.num_draft_tokens_per_pos == [
+            sum(len(tokens) > pos for tokens in spec_tokens)
+            for pos in range(num_spec_tokens)
+        ]
 
     # Per-request accumulator: the same acceptance, bucketed by accepted draft
     # count (j) on each request rather than summed across the batch. The
@@ -2032,9 +2281,52 @@ def test_per_request_spec_decode_detailed_records_per_step():
     assert payload["num_spec_steps"] == 3
 
 
+def test_adaptive_verified_depth_drives_spec_decode_metrics():
+    scheduler = create_scheduler(
+        num_speculative_tokens=3,
+        per_request_spec_decode_metrics="detailed",
+    )
+    [req] = create_requests(num_requests=1, num_tokens=1)
+    scheduler.add_request(req)
+    req_id = req.request_id
+
+    def _model_output(sampled, verified=None):
+        return ModelRunnerOutput(
+            req_ids=[req_id],
+            req_id_to_index={req_id: 0},
+            sampled_token_ids=sampled,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            num_verified_draft_tokens=verified,
+        )
+
+    scheduler.update_from_output(scheduler.schedule(), _model_output([[0]]))
+    scheduler.update_draft_token_ids(DraftTokenIds([req_id], [[1, 2, 3]]))
+    output = scheduler.schedule()
+    engine_core_outputs = scheduler.update_from_output(
+        output,
+        _model_output([[1, 4]], verified=[2]),
+    )
+
+    stats = engine_core_outputs[0].scheduler_stats.spec_decoding_stats
+    assert stats.num_drafts == 1
+    assert stats.num_draft_tokens == 2
+    assert stats.num_accepted_tokens == 1
+    assert stats.num_accepted_tokens_per_pos == [1, 0, 0]
+    assert stats.num_draft_tokens_per_pos == [1, 1, 0]
+
+    payload = scheduler.requests[req_id].spec_decode_metrics.to_dict()
+    assert payload["num_spec_steps"] == 1
+    assert payload["num_draft_tokens"] == 2
+    assert payload["draft_acceptance_rate"] == 0.5
+    assert payload["per_step_drafted"] == [2]
+    assert req.num_computed_tokens == 3
+
+
 def test_per_request_spec_decode_subtracts_invalid_drafts():
     # Grammar-invalidated drafts (num_invalid_spec_tokens, set by structured
-    # output) are excluded from the proposed count, mirroring the aggregate.
+    # output) are excluded from the verified count, mirroring the aggregate.
     scheduler = create_scheduler(
         num_speculative_tokens=3,
         per_request_spec_decode_metrics="summary",
@@ -4181,8 +4473,10 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.encoder_cache_mismatch_reqs = set()
     scheduler.vllm_config = Mock()
     scheduler.return_sampling_mask = False
+    scheduler.acceptance_length_controller = None
     scheduler.recompute_kv_load_failures = False
     scheduler.defer_block_free = False
+    scheduler.acceptance_length_controller = None
     scheduler.make_stats = Mock(return_value=None)
     scheduler.max_model_len = 128
 
@@ -4599,6 +4893,7 @@ def test_mamba_align_eagle_schedules_encoder_at_boundary():
     )
     scheduler.need_mamba_block_aligned_split = True
     scheduler.use_eagle = True
+    scheduler.drop_last_prefix_cache_block = True
     scheduler.num_prefill_lookahead = 1
     scheduler.max_num_encoder_input_tokens = 2048
     scheduler.encoder_cache_manager = EncoderCacheManager(cache_size=2048)
@@ -5652,7 +5947,95 @@ def test_abort_request_finished_recving():
     assert not scheduler.finished_recving_kv_req_ids
 
 
+def test_ignore_late_finished_recving_after_abort_cleanup():
+    """A late receive completion must not revive or crash a cleaned request."""
+    scheduler = create_scheduler(use_kv_connector=True)
+
+    # add a single request
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+
+    # abort after recv completed but before the scheduler promotes the request
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.finished_recving_kv_req_ids.add(request.request_id)
+    scheduler.finish_requests((request.request_id,), RequestStatus.FINISHED_ABORTED)
+
+    assert request.request_id not in scheduler.requests
+
+    # a late worker callback should be ignored rather than crashing
+    scheduler_output = scheduler.schedule()
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        kv_connector_output=KVConnectorOutput(finished_recving={request.request_id}),
+    )
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    assert request.request_id not in scheduler.requests
+    assert not scheduler.finished_recving_kv_req_ids
+
+
+def test_ignore_late_finished_sending_after_request_cleanup():
+    """A late send completion must not crash after request cleanup."""
+    scheduler = create_scheduler(use_kv_connector=True)
+
+    # add and finish a single request so it is fully removed
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+    scheduler.finish_requests((request.request_id,), RequestStatus.FINISHED_ABORTED)
+
+    assert request.request_id not in scheduler.requests
+
+    # a stale async send completion should also be ignored
+    scheduler_output = scheduler.schedule()
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        kv_connector_output=KVConnectorOutput(finished_sending={request.request_id}),
+    )
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    assert request.request_id not in scheduler.requests
+
+
+def test_same_step_recv_and_send_completion_after_abort():
+    """Dual completion frees an aborted request once without crashing."""
+    scheduler = create_scheduler(use_kv_connector=True)
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.finish_requests((request.request_id,), RequestStatus.FINISHED_ABORTED)
+
+    assert request.request_id in scheduler.requests
+
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            finished_recving={request.request_id},
+            finished_sending={request.request_id},
+        )
+    )
+
+    assert request.request_id not in scheduler.requests
+    assert not scheduler.finished_recving_kv_req_ids
+
+
+@pytest.mark.parametrize("direction", ["finished_recving", "finished_sending"])
+def test_unexpected_kv_completion_does_not_free_active_request(direction):
+    """An out-of-order completion must not delete an active request."""
+    scheduler = create_scheduler(use_kv_connector=True)
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(**{direction: {request.request_id}})
+    )
+
+    assert scheduler.requests[request.request_id] is request
+    assert not scheduler.finished_recving_kv_req_ids
+
+
 def test_delayed_kv_connector_free_keeps_scheduler_active():
+    """A delayed send keeps the scheduler active until blocks are freed."""
     scheduler = create_scheduler(use_kv_connector=True)
     queued_request, request = create_requests(
         num_requests=2, req_ids=["queued", "finished"]
@@ -7528,7 +7911,8 @@ def test_diffusion_scheduler_defers_a_read_with_every_step_in_flight():
 
 
 @pytest.mark.usefixtures("diffusion_model_runner")
-def test_diffusion_read_deferral_keeps_a_longer_pp_wait():
+def test_diffusion_read_deferral_keeps_a_longer_pp_wait(monkeypatch):
+    monkeypatch.setattr("vllm.platforms.current_platform.device_count", lambda: 3)
     scheduler = _diffusion_scheduler(pipeline_parallel_size=3, use_v2_model_runner=True)
     read = _diffusion_request(
         "read", {"diffusion_read_only": True, "diffusion_max_steps": 1}

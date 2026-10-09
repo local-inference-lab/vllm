@@ -35,6 +35,7 @@ def _replay_scheduler(
     *,
     long_prefill_token_threshold: int = 0,
     use_kv_connector: MockKVConfig | None = None,
+    cache_encoder_swa: bool = False,
 ) -> Scheduler:
     """A hybrid layout: one prefix-cacheable full-attention group and one
     replayed sliding-window group."""
@@ -71,6 +72,17 @@ def _replay_scheduler(
             ),
         ],
     )
+    if cache_encoder_swa:
+        kv_cache_config.kv_cache_groups.append(
+            KVCacheGroupSpec(
+                ["encoder_swa"],
+                dataclasses.replace(
+                    kv_cache_config.kv_cache_groups[SWA].kv_cache_spec,
+                    bounded_replay=False,
+                ),
+            )
+        )
+        kv_cache_config.prefix_cache_retention_interval = 0
     scheduler = Scheduler(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
@@ -356,3 +368,56 @@ def test_kv_load_zeroing_respects_loaded_groups(is_async, loads_window):
             assert not new_ids & zeroed
         else:
             assert new_ids <= zeroed
+
+
+@pytest.mark.parametrize("prompt_tokens,expected_hit", [(32, 0), (64, 32), (100, 64)])
+def test_mixed_replay_admission_keeps_encoder_window_and_uncached_decoder_tail(
+    prompt_tokens, expected_hit
+):
+    scheduler = _replay_scheduler(cache_encoder_swa=True)
+    first, second = create_requests(
+        num_requests=2,
+        num_tokens=prompt_tokens,
+        same_prompt=True,
+        block_size=BLOCK_SIZE,
+    )
+    _prefill(scheduler, first)
+    scheduler.add_request(second)
+    out = scheduler.schedule()
+    new_req = _new_req_data(out, second)
+    assert new_req.num_computed_tokens == expected_hit
+    assert new_req.replay_start == expected_hit
+    assert out.num_scheduled_tokens[second.request_id] == prompt_tokens - expected_hit
+    blocks = scheduler.kv_cache_manager.get_blocks(second.request_id).blocks
+    # The first query reads its retained encoder window. Decoder pages are
+    # private; replay_start masks any allocated slots below the admitted hit.
+    encoder = blocks[2]
+    if expected_hit:
+        first_needed = max(0, expected_hit - WINDOW + 1) // BLOCK_SIZE
+        assert all(not block.is_null for block in encoder[first_needed:])
+    first_blocks = scheduler.kv_cache_manager.get_blocks(first.request_id).blocks
+    first_private = {block.block_id for block in first_blocks[SWA] if not block.is_null}
+    assert first_private.isdisjoint(
+        block.block_id for block in blocks[SWA] if not block.is_null
+    )
+    assert all(block.block_hash is None for block in blocks[SWA])
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+def test_mixed_remote_hit_reserves_uncached_tail_without_second_rewind(is_async):
+    scheduler = _replay_scheduler(
+        cache_encoder_swa=True,
+        use_kv_connector=MockKVConfig(matched_tokens=96, is_async=is_async),
+    )
+    request = create_requests(num_requests=1, num_tokens=100, block_size=BLOCK_SIZE)[0]
+    scheduler.add_request(request)
+    out = scheduler.schedule()
+    if is_async:
+        scheduler.update_from_output(
+            out, create_model_runner_output([], finished_recving={request.request_id})
+        )
+        out = scheduler.schedule()
+    new_req = _new_req_data(out, request)
+    assert new_req.num_computed_tokens == 64
+    assert new_req.replay_start == 64
+    assert out.num_scheduled_tokens[request.request_id] == 36

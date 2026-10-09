@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.multimodal.utils import strip_covered_mm_data
+from vllm.v1.core.sched.compute_fairness import ComputeServiceClass
 
 if TYPE_CHECKING:
     import numpy as np
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.v1.core.boundary_checkpoint import BoundaryCheckpoint
     from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
     from vllm.v1.request import Request
 else:
@@ -35,6 +37,7 @@ else:
     PoolingParams = object
     SamplingParams = object
     Request = object
+    BoundaryCheckpoint = object
 
 
 @dataclass
@@ -54,6 +57,10 @@ class NewRequestData:
     prefill_token_ids: list[int] | None = None
     # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
     replay_start: int = 0
+    boundary_checkpoint: BoundaryCheckpoint | None = None
+    boundary_checkpoint_blocks: tuple[tuple[int, ...], ...] | None = None
+    recurrent_instruction_boundary: int | None = None
+    recurrent_prefill_tail_boundary: int | None = None
 
     @classmethod
     def from_request(
@@ -80,6 +87,10 @@ class NewRequestData:
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
             replay_start=request.replay_start,
+            boundary_checkpoint=request.boundary_checkpoint,
+            boundary_checkpoint_blocks=request.boundary_checkpoint_blocks,
+            recurrent_instruction_boundary=request.recurrent_instruction_boundary,
+            recurrent_prefill_tail_boundary=request.recurrent_prefill_tail_boundary,
         )
 
     @property
@@ -266,6 +277,8 @@ class SchedulerOutput:
     free_encoder_mm_hashes: list[str]
 
     scheduled_encoder_input_stats: ScheduledEncoderInputStats | None = None
+    # This batch samples saved final hidden states without a target forward.
+    boundary_logits_only: bool = False
 
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.
@@ -312,7 +325,16 @@ class SchedulerOutput:
 
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
-    num_spec_tokens_to_schedule: int = 0
+    num_spec_tokens_to_schedule: int | None = None
+
+    # Explicit model-execution class used by adaptive compute fairness.
+    # None identifies a transfer-only or otherwise empty model step.
+    compute_service_class: ComputeServiceClass | None = None
+    # Auto mode tracks every executor completion boundary so transfer-only
+    # work cannot be charged to the following decode or local prefill.
+    compute_timing_enabled: bool = False
+    compute_contention: bool = False
+    compute_service_tokens: int = 0
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
@@ -327,6 +349,12 @@ class SchedulerOutput:
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
         )
+
+    def resolve_num_spec_tokens_to_schedule(self, default: int) -> int:
+        """Resolve the speculative depth for real and synthetic outputs."""
+        if self.num_spec_tokens_to_schedule is None:
+            return default
+        return self.num_spec_tokens_to_schedule
 
 
 @dataclass

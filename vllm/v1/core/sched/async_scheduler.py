@@ -26,22 +26,26 @@ class AsyncScheduler(Scheduler):
         super()._update_after_schedule(scheduler_output)
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
         # Use the latest num of scheduled draft tokens in next step as placeholder.
-        self._spec_token_placeholders = [
-            -1
-        ] * scheduler_output.num_spec_tokens_to_schedule
+        self._spec_token_placeholders = [-1] * (
+            scheduler_output.resolve_num_spec_tokens_to_schedule(self.num_spec_tokens)
+        )
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
             if request.is_prefill_chunk:
                 continue
 
-            scheduler_output.pending_structured_output_tokens |= (
-                request.use_structured_output and request.num_output_placeholders > 0
-            )
             # The request will generate num_sampled_tokens_per_step new tokens
             # plus num_spec_tokens in this scheduling step. Diffusion has no AR
             # bonus token (num_sampled_tokens_per_step == 0) — only the canvas
             # (spec) tokens.
             cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
+            scheduler_output.pending_structured_output_tokens |= (
+                request.use_structured_output
+                and (
+                    request.num_output_placeholders > 0
+                    or self._needs_draft_backfill(cur_num_spec_tokens)
+                )
+            )
             request.num_output_placeholders += (
                 self.num_sampled_tokens_per_step + cur_num_spec_tokens
             )
@@ -55,6 +59,23 @@ class AsyncScheduler(Scheduler):
                 request.next_decode_eligible_step = (
                     self.current_step + self.decode_stagger
                 )
+
+    def _needs_draft_backfill(self, num_scheduled_spec_tokens: int) -> bool:
+        """Whether a structured-output request's drafts must be handed back
+        before its grammar bitmask is built.
+
+        This scheduler only holds -1 placeholders for the drafts; the V2 model
+        runner verifies its own copy. A request that skipped the previous step
+        (a prefill turn, an isolated saved-logits step) has no output in
+        flight, but its placeholders still need the back-fill that deferred
+        sampling performs, or its bitmask rows past the first draft would
+        allow every token.
+        """
+        return (
+            num_scheduled_spec_tokens > 0
+            and self.use_v2_model_runner
+            and self.num_sampled_tokens_per_step > 0
+        )
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False

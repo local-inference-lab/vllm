@@ -1,17 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from functools import cached_property
 from typing import Any
 
 import torch
 
-from vllm.config import VllmConfig
+from vllm.config import KVTransferConfig, VllmConfig
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
     KVConnectorRole,
     SupportsHMA,
+    SupportsVmmSafeTransfers,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -50,7 +51,21 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 
-class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
+class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransfers):
+    @classmethod
+    def supports_aligned_hybrid_transfer(cls, config: "VllmConfig") -> bool:
+        # Boundary captures and padded QSA page refs serve align-mode hits.
+        return True
+
+    @classmethod
+    def supports_vmm_safe_transfer_config(
+        cls, kv_transfer_config: KVTransferConfig
+    ) -> bool:
+        # CPU copies pin host storage, not GPU cache pages. Tiered or external
+        # storage implementations may retain GPU page registrations.
+        extra = kv_transfer_config.kv_connector_extra_config or {}
+        return extra.get("spec_name", "CPUOffloadingSpec") == "CPUOffloadingSpec"
+
     @cached_property
     def _bounding_group_ids(self) -> tuple[int, ...]:
         """Prefix-cacheable groups this connector does not offload.
@@ -98,6 +113,10 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector_worker = OffloadingConnectorWorker(
                 spec, vllm_config, kv_cache_config
             )
+
+    def bind_boundary_capture_releaser(self, releaser: "Callable[[int], None]") -> None:
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.bind_boundary_capture_releaser(releaser)
 
     def shutdown(self) -> None:
         if self.connector_worker is not None:

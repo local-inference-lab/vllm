@@ -39,6 +39,36 @@ from vllm.v1.request import Request
 pytestmark = pytest.mark.cpu_test
 
 
+def test_circular_state_stays_private_until_request_release():
+    spec = CircularBufferSpec(
+        block_size=1,
+        num_kv_heads=1,
+        head_size=1026,
+        state_content_bytes=4104,
+        dtype=torch.float32,
+    )
+    pool = BlockPool(num_gpu_blocks=3, enable_caching=True, hash_block_size=32)
+    manager = CircularBufferManager(
+        spec,
+        block_pool=pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=32,
+    )
+    first = manager.allocate_new_blocks("a", 1, 1)[0]
+    second = manager.allocate_new_blocks("b", 1, 1)[0]
+    assert first.block_id != second.block_id
+    manager.remove_skipped_blocks("a", 10000)
+    assert manager.allocate_new_blocks("a", 10001, 10001) == []
+    assert manager.req_to_blocks["a"] == [first]
+    assert first.ref_cnt == 1
+    manager.free("a")
+    assert first.ref_cnt == 0
+    assert second.ref_cnt == 1
+    replacement = manager.allocate_new_blocks("c", 20000, 20000)
+    assert replacement == [first]
+
+
 def test_external_computed_blocks_do_not_corrupt_free_pool():
     block_size = 4
     spec = FullAttentionSpec(

@@ -101,15 +101,37 @@ def test_kv_connector(
 def _build_config(
     *,
     kv_connector: str | None,
+    kv_connector_extra_config: dict | None = None,
     enable_sleep_mode: bool = False,
     enable_cumem_allocator: bool = False,
+    model_type: str | None = None,
+    recurrent_checkpoint_policy: str | None = None,
+    decode_context_parallel_size: int = 1,
 ) -> VllmConfig:
-    """Build a VllmConfig that exercises _verify_kv_transfer_compat without
-    requiring a real model (avoids HF downloads in CI)."""
+    """Build a model-free config for KV-transfer compatibility checks.
+
+    Args:
+        kv_connector: KV connector name, or None to disable KV transfer.
+        kv_connector_extra_config: Optional connector-specific configuration.
+        enable_sleep_mode: Whether sleep mode is enabled.
+        enable_cumem_allocator: Whether the cuMem allocator is enabled.
+        model_type: Optional Hugging Face model type.
+
+    Returns:
+        A VllmConfig suitable for exercising KV-transfer compatibility checks.
+
+    Raises:
+        ValueError: If the requested KV-transfer configuration is incompatible.
+
+    """
     from types import SimpleNamespace
 
     kv_transfer_config = (
-        KVTransferConfig(kv_connector=kv_connector, kv_role="kv_both")
+        KVTransferConfig(
+            kv_connector=kv_connector,
+            kv_role="kv_both",
+            kv_connector_extra_config=kv_connector_extra_config or {},
+        )
         if kv_connector is not None
         else None
     )
@@ -118,9 +140,70 @@ def _build_config(
     cfg.model_config = SimpleNamespace(
         enable_sleep_mode=enable_sleep_mode,
         enable_cumem_allocator=(enable_cumem_allocator or enable_sleep_mode),
+        hf_text_config=SimpleNamespace(model_type=model_type),
     )
+    if recurrent_checkpoint_policy is not None:
+        cfg.cache_config = SimpleNamespace(
+            recurrent_checkpoint_policy=recurrent_checkpoint_policy
+        )
+        cfg.parallel_config = SimpleNamespace(
+            decode_context_parallel_size=decode_context_parallel_size
+        )
     cfg._verify_kv_transfer_compat()
     return cfg
+
+
+@pytest.mark.parametrize("supports_atomic_checkpoints", [False, True])
+def test_qwen_qsa_requires_atomic_checkpoint_connector(
+    monkeypatch, supports_atomic_checkpoints
+):
+    class _StubConnector:
+        @classmethod
+        def supports_request_boundary_checkpoints(cls, config):
+            del config
+            return supports_atomic_checkpoints
+
+    monkeypatch.setattr(
+        KVConnectorFactory,
+        "get_connector_class",
+        lambda config: _StubConnector,
+    )
+
+    if supports_atomic_checkpoints:
+        _build_config(kv_connector="stub", model_type="qwen3_8_flash_next_text")
+    else:
+        with pytest.raises(ValueError, match="atomic request-boundary"):
+            _build_config(kv_connector="stub", model_type="qwen3_8_flash_next_text")
+
+
+@pytest.mark.parametrize(
+    ("kv_connector", "policy", "dcp", "allowed"),
+    [
+        ("SimpleCPUOffloadConnector", "aligned", 1, True),
+        ("OffloadingConnector", "aligned", 1, True),
+        ("SimpleCPUOffloadConnector", "auto", 1, False),
+        ("SimpleCPUOffloadConnector", "request_boundaries", 1, False),
+        ("SimpleCPUOffloadConnector", "aligned", 2, False),
+        ("LMCacheMPConnector", "aligned", 1, False),
+        ("NixlConnector", "aligned", 1, False),
+    ],
+)
+def test_qwen_aligned_retention_needs_an_aligned_hybrid_connector(
+    kv_connector, policy, dcp, allowed
+):
+    """CACHE_MODE=native (SimpleCPU, aligned) must boot Qwen; other
+    connectors and DCP keep the atomic checkpoint requirement."""
+    build = lambda: _build_config(  # noqa: E731
+        kv_connector=kv_connector,
+        model_type="qwen3_8_flash_next_text",
+        recurrent_checkpoint_policy=policy,
+        decode_context_parallel_size=dcp,
+    )
+    if allowed:
+        build()
+    else:
+        with pytest.raises(ValueError, match="atomic request-boundary"):
+            build()
 
 
 @pytest.mark.parametrize(
@@ -135,6 +218,81 @@ def test_kv_connector_rejects_expandable_segments(monkeypatch, kv_connector):
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     with pytest.raises(ValueError, match="expandable_segments"):
         _build_config(kv_connector=kv_connector)
+
+
+@pytest.mark.parametrize(
+    "cuda_conf,alloc_conf,rejected",
+    [
+        (None, "expandable_segments:True", True),
+        (None, "max_split_size_mb:64, expandable_segments : True", True),
+        ("expandable_segments : True", None, True),
+        ("expandable_segments:True", "expandable_segments:False", True),
+        ("expandable_segments:False", "expandable_segments:True", False),
+        ("", "expandable_segments:True", False),
+        (None, "expandable_segments:False", False),
+    ],
+)
+def test_kv_connector_allocator_aliases_follow_cuda_precedence(
+    monkeypatch, cuda_conf, alloc_conf, rejected
+):
+    """Unsafe connectors reject the allocator configuration CUDA actually uses."""
+    for name, value in (
+        ("PYTORCH_CUDA_ALLOC_CONF", cuda_conf),
+        ("PYTORCH_ALLOC_CONF", alloc_conf),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    if rejected:
+        with pytest.raises(ValueError, match="expandable_segments"):
+            _build_config(kv_connector="SomeOOTConnector")
+    else:
+        _build_config(kv_connector="SomeOOTConnector")
+
+
+@pytest.mark.parametrize("spec_name", [None, "CPUOffloadingSpec"])
+def test_cpu_offload_allows_expandable_segments(monkeypatch, spec_name):
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    _build_config(
+        kv_connector="OffloadingConnector",
+        kv_connector_extra_config={} if spec_name is None else {"spec_name": spec_name},
+    )
+
+
+@pytest.mark.parametrize("spec_name", ["TieringOffloadingSpec", "ExternalSpec"])
+def test_nonlocal_offload_rejects_expandable_segments(monkeypatch, spec_name):
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    with pytest.raises(ValueError, match="expandable_segments"):
+        _build_config(
+            kv_connector="OffloadingConnector",
+            kv_connector_extra_config={"spec_name": spec_name},
+        )
+
+
+def test_lmcache_mp_engine_driven_allows_expandable_segments(monkeypatch):
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    _build_config(
+        kv_connector="LMCacheMPConnector",
+        kv_connector_extra_config={
+            "lmcache.mp.mp_transfer_mode": "engine_driven",
+        },
+    )
+
+
+@pytest.mark.parametrize("transfer_mode", [None, "auto", "lmcache_driven"])
+def test_lmcache_mp_non_engine_driven_rejects_expandable_segments(
+    monkeypatch, transfer_mode
+):
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    extra_config = (
+        {} if transfer_mode is None else {"lmcache.mp.mp_transfer_mode": transfer_mode}
+    )
+    with pytest.raises(ValueError, match="expandable_segments"):
+        _build_config(
+            kv_connector="LMCacheMPConnector",
+            kv_connector_extra_config=extra_config,
+        )
 
 
 def test_kv_connector_allows_expandable_segments_with_sleep_mode(monkeypatch):

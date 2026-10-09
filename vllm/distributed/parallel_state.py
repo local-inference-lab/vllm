@@ -195,6 +195,72 @@ def resume_device_comms() -> None:
     _apply_to_device_comms(lambda comm: comm.resume())
 
 
+def register_b12x_collective_describer(owner, describe, *, group=None) -> bool:
+    """Attach exact native collective metadata to an existing TP communicator.
+
+    This never constructs a process group or a transport.  A producer may be
+    loaded on a non-native configuration; in that case it simply has no native
+    preparation obligation.
+    """
+    if group is None:
+        try:
+            group = get_tp_group()
+        except AssertionError:
+            return False
+    communicator = getattr(group, "device_communicator", None)
+    native = getattr(communicator, "b12x_ar_comm", None)
+    # Descriptor registration is an opt-in for the concrete native PCIe
+    # transport only.  A similarly shaped third-party communicator must not
+    # acquire b12x preparation obligations.
+    from vllm.distributed.device_communicators.b12x_pcie_all_reduce import (
+        B12xPcieAllReduce,
+    )
+
+    if not isinstance(native, B12xPcieAllReduce) or native.disabled:
+        return False
+    native.register_describer(owner, describe)
+    return True
+
+
+def declare_b12x_fused_allreduce_rms_norm_sites(
+    owner, norms, hidden_size: int, name_prefix: str, *, group=None
+) -> int:
+    """Declare a model's TP all-reduce -> residual-add RMSNorm pairs.
+
+    The ``allreduce_rms`` fusion pass rewrites these pairs into
+    ``b12x_fused_allreduce_add_rms_norm``, whose fused kernel only runs for
+    declared (shape, norm weight, epsilon) plans; an undeclared call falls back
+    to all-reduce, a copy, and a separate RMSNorm.  ``norms`` is an iterable of
+    ``(name, RMSNorm)`` for norms whose input is a TP all-reduce output.
+    Returns the number of declared sites (0 without the native transport).
+    """
+    norms = list(norms)
+    if not norms:
+        return 0
+
+    def describe(requirements):
+        from vllm.distributed.device_communicators.b12x_pcie_all_reduce import (
+            B12xPcieInvocation,
+        )
+
+        return tuple(
+            B12xPcieInvocation(
+                name=f"{name_prefix}.{name}.fused_ar_norm.m{rows}",
+                operation="all_reduce_fused_add_rms_norm",
+                shape=(rows, hidden_size),
+                dtype=requirements.output_dtype,
+                norm_weight=norm.weight,
+                epsilon=float(norm.variance_epsilon),
+            )
+            for name, norm in norms
+            for rows in requirements.token_counts
+        )
+
+    if not register_b12x_collective_describer(owner, describe, group=group):
+        return 0
+    return len(norms)
+
+
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
@@ -679,6 +745,7 @@ class GroupCoordinator:
 
         # only cuda/rocm uses this function,
         # so we don't abstract it into the base class
+        maybe_b12x_context = nullcontext()
         maybe_ca_context = nullcontext()
         maybe_fi_pcie_ipc_context: AbstractContextManager[Any] = nullcontext()
         maybe_aiter_ar_context = nullcontext()
@@ -694,6 +761,9 @@ class GroupCoordinator:
                 self.device_communicator,
                 (CudaCommunicator, XpuCommunicator),
             )
+            b12x_ar_comm = getattr(self.device_communicator, "b12x_ar_comm", None)
+            if b12x_ar_comm is not None:
+                maybe_b12x_context = b12x_ar_comm.capture(stream=stream)
             ca_comm = self.device_communicator.ca_comm
             if ca_comm is not None:
                 maybe_ca_context = ca_comm.capture()  # type: ignore
@@ -715,6 +785,7 @@ class GroupCoordinator:
 
         with (
             torch.cuda.stream(stream),
+            maybe_b12x_context,
             maybe_ca_context,
             maybe_fi_pcie_ipc_context,
             maybe_aiter_ar_context,
@@ -743,6 +814,17 @@ class GroupCoordinator:
             return torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
         else:
             return self._all_reduce_out_place(input_)
+
+    def all_reduce_in_place(self, input_: torch.Tensor) -> torch.Tensor:
+        """All-reduce storage whose rank-local contents have no other consumer."""
+        if self.world_size == 1:
+            return input_
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        reduce_in_place = getattr(self.device_communicator, "all_reduce_in_place", None)
+        if reduce_in_place is None:
+            raise NotImplementedError("The device communicator cannot reduce in place")
+        return reduce_in_place(input_)
 
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         if self.device_communicator is None:

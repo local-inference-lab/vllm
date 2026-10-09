@@ -15,13 +15,17 @@ import pytest
 import torch
 
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
+    SlidingWindowSpec,
     is_mamba_prefill_checkpoint_valid,
 )
 from vllm.v1.request import Request
@@ -132,13 +136,19 @@ def _split(
     partial_hit: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
     max_num_scheduled_tokens: int = 16384,
+    allow_speculative_checkpoints: bool = False,
+    retention_interval: int | None = None,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     if use_eagle_block_drop is None:
         use_eagle_block_drop = use_eagle
     stub = SimpleNamespace(
         block_size=MAMBA_BLOCK_SIZE,
-        cache_config=SimpleNamespace(block_size=MAMBA_BLOCK_SIZE),
+        cache_config=SimpleNamespace(
+            block_size=MAMBA_BLOCK_SIZE,
+            prefix_cache_retention_interval=retention_interval,
+        ),
+        use_eagle=use_eagle,
         use_eagle_block_drop=use_eagle_block_drop,
         max_num_scheduled_tokens=max_num_scheduled_tokens,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
@@ -155,7 +165,7 @@ def _split(
 
 
 @pytest.mark.parametrize(
-    ("prompt_len", "num_new_tokens", "use_eagle", "expected"),
+    ("prompt_len", "num_new_tokens", "use_eagle_block_drop", "expected"),
     [
         (2002, 2002, False, 2002),
         (3602, 2000, False, MAMBA_BLOCK_SIZE),
@@ -166,18 +176,27 @@ def _split(
     ],
 )
 def test_internal_checkpoint_split(
-    prompt_len: int, num_new_tokens: int, use_eagle: bool, expected: int
+    prompt_len: int,
+    num_new_tokens: int,
+    use_eagle_block_drop: bool,
+    expected: int,
 ) -> None:
     (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
     assert (
         _split(
             request,
             num_new_tokens,
-            use_eagle=use_eagle,
+            use_eagle_block_drop=use_eagle_block_drop,
             num_prefill_checkpoint_blocks=1,
         )
         == expected
     )
+    if not use_eagle_block_drop:
+        manager = _make_hybrid_kv_cache_manager(num_prefill_checkpoint_blocks=1)
+        assert manager.allocate_slots(request, expected) is not None
+        mamba_manager = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
+        blocks = mamba_manager.req_to_blocks[request.request_id]
+        assert all(not block.is_null for block in blocks)  # checkpoint + running state
 
 
 def test_partial_checkpoint_resume_stops_at_mamba_block_boundary() -> None:
@@ -221,6 +240,181 @@ def test_disabling_eagle_block_drop_keeps_the_trailing_cache_boundary() -> None:
 
     assert with_drop == MAMBA_BLOCK_SIZE
     assert without_drop == 2 * MAMBA_BLOCK_SIZE
+
+
+def test_dflash_checkpoint_keeps_intermediate_chunks_aligned_and_joins_prompt_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DFlash reserves unaligned draft slots but can checkpoint the prompt tail.
+
+    Intermediate chunks still end on the recurrent cache grid. Once a chunk
+    reaches the prompt end, the internal checkpoint preserves the crossed
+    boundary and the scheduler need not emit a one-token target forward.
+    """
+    block_size = 16
+    prompt_len = 32321
+    (request,) = create_requests(1, num_tokens=prompt_len, block_size=block_size)
+    # Model a resumed request whose replay range extends one token past the
+    # prompt. This is the case in which prefill_end alone would floor 17 to 16.
+    request.append_output_token_ids([1, 2])
+    monkeypatch.setattr(sys.modules[__name__], "MAMBA_BLOCK_SIZE", block_size)
+
+    request.num_computed_tokens = 0
+    assert (
+        _split(
+            request,
+            4089,
+            use_eagle_block_drop=False,
+            use_eagle=True,
+            num_prefill_checkpoint_blocks=1,
+            allow_speculative_checkpoints=True,
+        )
+        == 4080
+    )
+
+    request.num_computed_tokens = 32304
+    assert (
+        _split(
+            request,
+            17,
+            use_eagle_block_drop=False,
+            use_eagle=True,
+            num_prefill_checkpoint_blocks=1,
+            allow_speculative_checkpoints=True,
+        )
+        == 17
+    )
+
+
+def test_dflash_fragmented_budget_stops_at_external_retention_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DFlash target chunk cannot jump over an externally retained state.
+
+    Seven parallel draft queries leave 4089 target slots in a 4096-token input
+    budget. The first target step therefore ends at 3584. The next step must
+    stop after 512 tokens so the recurrent state at token 4096 is materialized
+    for an external cache connector.
+    """
+    block_size = 512
+    (request,) = create_requests(1, num_tokens=16384, block_size=ATTN_BLOCK_SIZE)
+    monkeypatch.setattr(sys.modules[__name__], "MAMBA_BLOCK_SIZE", block_size)
+
+    assert (
+        _split(
+            request,
+            4089,
+            use_eagle=True,
+            num_prefill_checkpoint_blocks=1,
+            allow_speculative_checkpoints=True,
+            retention_interval=4096,
+        )
+        == 3584
+    )
+    request.num_computed_tokens = 3584
+    assert (
+        _split(
+            request,
+            4089,
+            use_eagle=True,
+            num_prefill_checkpoint_blocks=1,
+            allow_speculative_checkpoints=True,
+            retention_interval=4096,
+        )
+        == 512
+    )
+
+
+def test_glm_mtp_checkpoint_joins_unaligned_prompt_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Target GDN checkpointing does not add an MTP target-only tail step.
+
+    GLM-5.3 MTP stores draft MLA KV independently from the target GDN state.
+    The EAGLE cache-group policy remains responsible for dropping and replaying
+    the lookahead-dependent draft tail during prefix-cache lookup.
+    """
+    block_size = 512
+    prompt_len = 32320
+    (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
+    monkeypatch.setattr(sys.modules[__name__], "MAMBA_BLOCK_SIZE", block_size)
+
+    request.num_computed_tokens = 7 * 4096
+    assert (
+        _split(
+            request,
+            prompt_len - request.num_computed_tokens,
+            use_eagle_block_drop=True,
+            num_prefill_checkpoint_blocks=1,
+            allow_speculative_checkpoints=True,
+        )
+        == 3648
+    )
+
+
+def test_dflash_does_not_back_off_last_cache_position() -> None:
+    """DFlash/DSpark never write target blocks, so the split must not back
+    off the last prefix-cache position by a mamba block.
+
+    Regression for #53477: the old `use_eagle` back-off made prompts shorter
+    than two mamba blocks skip the final block-aligned chunk, so the mamba
+    recurrent state was never materialized at a block boundary and the next
+    turn's prefix-cache lookup recomputed the whole context.
+    """
+    (request,) = create_requests(1, num_tokens=PROMPT_LEN, block_size=ATTN_BLOCK_SIZE)
+    assert (
+        _split(
+            request,
+            PROMPT_LEN,
+            use_eagle_block_drop=False,
+            use_eagle=True,
+        )
+        == MAMBA_BLOCK_SIZE
+    )
+    assert _split(request, PROMPT_LEN, use_eagle_block_drop=True) == PROMPT_LEN
+
+
+def test_sliding_window_group_tolerates_finer_alignment() -> None:
+    """A coordinator alignment finer than a sliding-window group's block size
+    must fall back to block-aligned hits instead of crashing the EngineCore.
+
+    Regression for #53505: with a hybrid mamba target configured with a
+    `prefix_match_unit` finer than the draft model's sliding-window block,
+    `alignment_tokens % block_size != 0` used to hit an assert and kill all
+    in-flight requests.
+    """
+    block_size = 560
+    spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=4 * block_size,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=100, enable_caching=True, hash_block_size=block_size
+    )
+    manager = SlidingWindowManager(
+        spec,
+        block_pool=block_pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=block_size,
+        needs_kv_cache_zeroing=False,
+        max_admission_blocks_per_request=10**9,
+    )
+    block_hashes = [BlockHash(str(i).encode()) for i in range(4)]
+    computed_blocks, hit_length = manager.find_longest_cache_hit(
+        block_hashes=block_hashes,
+        max_length=4 * block_size,
+        kv_cache_group_ids=[0],
+        block_pool=block_pool,
+        kv_cache_spec=spec,
+        drop_eagle_block=False,
+        alignment_tokens=16,
+    )
+    assert computed_blocks == ([],)
+    assert hit_length == 0
 
 
 def _run_chunked_prefill(
@@ -341,14 +535,14 @@ def test_poisoning_is_block_size_independent(
 @pytest.mark.parametrize("partial_hit", [False, True])
 @pytest.mark.parametrize("resume_at", [331, 1599, 1601, 2531, 3011])
 @pytest.mark.parametrize(
-    ("num_prefill_checkpoint_blocks", "use_eagle"),
+    ("num_prefill_checkpoint_blocks", "use_eagle_block_drop"),
     [(0, True), (1, False)],
 )
 def test_unaligned_resume_never_runs_past_its_block(
     partial_hit: bool,
     resume_at: int,
     num_prefill_checkpoint_blocks: int,
-    use_eagle: bool,
+    use_eagle_block_drop: bool,
 ) -> None:
     """A prefill resuming mid-block must re-align before crossing a boundary.
 
@@ -362,7 +556,7 @@ def test_unaligned_resume_never_runs_past_its_block(
     # last hash boundary: eagle matches a unit past its candidate and drops it,
     # so nothing proves that last boundary.
     tail_stop = prompt_len // ATTN_BLOCK_SIZE * ATTN_BLOCK_SIZE
-    if use_eagle:
+    if use_eagle_block_drop:
         tail_stop -= ATTN_BLOCK_SIZE
 
     pos, ends = resume_at, []
@@ -371,7 +565,7 @@ def test_unaligned_resume_never_runs_past_its_block(
         num_new = _split(
             request,
             prompt_len - pos,
-            use_eagle=use_eagle,
+            use_eagle_block_drop=use_eagle_block_drop,
             partial_hit=partial_hit,
             num_prefill_checkpoint_blocks=num_prefill_checkpoint_blocks,
         )

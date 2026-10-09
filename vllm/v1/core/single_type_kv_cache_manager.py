@@ -11,6 +11,7 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
     BlockHashList,
     BlockHashListWithBlockSize,
     BlockHashWithGroupId,
@@ -48,12 +49,87 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def reachable_hit_positions(
+    boundary_tokens: int,
+    alignment_tokens: int,
+    use_eagle: bool,
+) -> tuple[int, ...]:
+    """Token positions a cache hit can land on for one reachable boundary.
+
+    A lookup floors the boundary to ``alignment_tokens``. Under EAGLE an
+    attention finder removes its lookahead block and re-floors to the
+    alignment. The result is either the aligned boundary or one alignment unit
+    below it, depending on the finder's block size. Sparse-retention masks must
+    treat both as reachable.
+
+    Expressing the back-off in tokens rather than blocks is what makes this
+    correct when a group's block size differs from the alignment: one block is
+    the right step only when they are equal.
+    """
+    aligned = boundary_tokens // alignment_tokens * alignment_tokens
+    if not use_eagle:
+        return (aligned,)
+    return (aligned, max(aligned - alignment_tokens, 0))
+
+
+def resolve_sparse_retention_inputs(
+    kv_cache_spec: KVCacheSpec,
+    use_eagle: bool,
+    lookup_drops_eagle_block: bool,
+    reachable_boundaries: Sequence[int],
+    *,
+    lookup_alignment_tokens: int,
+    state_materialization_alignment_tokens: int,
+) -> tuple[bool, tuple[int, ...]]:
+    """Resolve the mask's EAGLE flag and retained token boundaries.
+
+    Lookup alignment can be finer than the scheduler alignment used to
+    materialize recurrent states. Keep both sets of Mamba positions so a
+    missing fine state does not displace a usable scheduler-aligned fallback.
+    """
+    boundaries = tuple(reachable_boundaries)
+    if isinstance(kv_cache_spec, MambaSpec):
+        alignments = dict.fromkeys(
+            (lookup_alignment_tokens, state_materialization_alignment_tokens)
+        )
+        positions = tuple(
+            dict.fromkeys(
+                position
+                for boundary in boundaries
+                for alignment in alignments
+                for position in reachable_hit_positions(
+                    boundary, alignment, use_eagle or lookup_drops_eagle_block
+                )
+            )
+        )
+        # Each alignment's EAGLE predecessor is already included. The mask
+        # must not apply another lookup-sized drop to materialized positions.
+        return False, positions
+    if not lookup_drops_eagle_block:
+        return use_eagle, boundaries
+    if isinstance(kv_cache_spec, SlidingWindowSpec):
+        alignments = dict.fromkeys(
+            (lookup_alignment_tokens, state_materialization_alignment_tokens)
+        )
+        boundaries = tuple(
+            dict.fromkeys(
+                position
+                for boundary in boundaries
+                for alignment in alignments
+                for position in reachable_hit_positions(boundary, alignment, True)
+                if position > 0
+            )
+        )
+    return use_eagle, boundaries
+
+
 class SingleTypeKVCacheManager(ABC):
     """An abstract base class for a manager that handle the kv cache management
     logic of one specific type of attention layer.
     """
 
     supports_fine_grained_hash_lookup: ClassVar[bool] = False
+    drops_eagle_block: ClassVar[bool] = False
 
     # Keep this group's longer prefix until external cache lookup completes.
     retains_longer_hit: bool = False
@@ -111,8 +187,9 @@ class SingleTypeKVCacheManager(ABC):
         self.block_size = kv_cache_spec.block_size * self.dcp_world_size
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
-        self.enable_caching = enable_caching
+        self.enable_caching = enable_caching and kv_cache_spec.prefix_cacheable
         self.max_admission_blocks_per_request = max_admission_blocks_per_request
+        self.prefix_replay_tokens = kv_cache_spec.prefix_replay_tokens
         # Record newly allocated block ids only when worker-side zeroing will
         # consume them and this manager holds a spec type that gets zeroed.
         self._record_new_block_ids = (
@@ -132,18 +209,25 @@ class SingleTypeKVCacheManager(ABC):
         # This is only used to track the RUNNING requests, we do not track the
         # data for preempted ones.
         self.num_cached_block: dict[str, int] = {}
+        self.cache_internal_attention_anchors = False
+        self._attention_anchor_tokens: dict[str, int] = {}
 
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
 
-        # Whether this group's prefix-cache hits drop the EAGLE/MTP lookahead
-        # block. Only consulted by managers whose hit logic is sparse within an
-        # aligned segment (SWA). Initialized lazily by the coordinator after
+        # Whether THIS group's own prefix-cache lookup drops the EAGLE/MTP
+        # lookahead block. Initialized lazily by the coordinator after
         # determining the attention groups.
         self.use_eagle = False
         # ``CacheConfig.enable_mamba_shared_prefix_checkpoint``, narrowed and set
         # by ``KVCacheManager``; only an EAGLE Mamba "align" group ever gets it.
         self.shared_prefix_checkpoint = False
+
+        # Whether an attention-group lookup applies that drop. Sparse retention
+        # must account for it because the coordinator reconciles every group to
+        # one hit length. Set by the coordinator.
+        self.lookup_drops_eagle_block = False
+
         # Partial-hit copy-on-write bookkeeping. Populated only by fine-grained
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
@@ -174,6 +258,16 @@ class SingleTypeKVCacheManager(ABC):
             len(new_computed_blocks) > 0
             and num_local_computed_tokens % self.block_size != 0
         )
+
+    def prepare_boundary_replay(self, request_id: str, num_tokens: int) -> None:
+        """Protect a full tail page whose last row will be replayed by MTP."""
+        assert num_tokens > 0 and num_tokens % self.block_size == 0
+        block_idx = num_tokens // self.block_size - 1
+        self._partial_hit_reqs[request_id] = (
+            block_idx,
+            self.req_to_blocks[request_id][block_idx],
+        )
+        self.num_cached_block[request_id] = block_idx
 
     def get_num_blocks_to_allocate(
         self,
@@ -454,6 +548,95 @@ class SingleTypeKVCacheManager(ABC):
         """Finalize a producer partial tail when its request finishes."""
         return None
 
+    def _cache_partial_tail_block(
+        self,
+        request: Request,
+        num_tokens: int,
+    ) -> BlockHashWithGroupId | None:
+        """Index append-only attention at prompt and retained replay anchors.
+
+        A divergent continuation cannot authenticate a hash beyond its shared
+        prefix. Publish the bounded replay anchors retained by sparse groups,
+        so an interior recurrent checkpoint has a matching attention entry.
+        """
+        hash_block_size = self.block_pool.hash_block_size
+        prompt_tail = request.num_prompt_tokens // hash_block_size * hash_block_size
+        boundaries = {prompt_tail}
+        if self.cache_hit_alignment_tokens < self.block_size:
+            reachable_boundaries = [request.num_prompt_tokens - 1]
+            if request.shared_prefix_boundary:
+                reachable_boundaries.append(request.shared_prefix_boundary)
+            for boundary in reachable_boundaries:
+                for alignment in {
+                    self.cache_hit_alignment_tokens,
+                    self.scheduler_block_size,
+                }:
+                    boundaries.update(
+                        reachable_hit_positions(
+                            boundary,
+                            alignment,
+                            self.use_eagle or self.lookup_drops_eagle_block,
+                        )
+                    )
+        blocks = self.req_to_blocks[request.request_id]
+        prompt_hash = None
+        # Publish the longest entry first: partial-tail promotion removes the
+        # shorter primary hash before shorter aliases can be attached to it.
+        for boundary_tokens in sorted(boundaries, reverse=True):
+            if not 0 < boundary_tokens <= num_tokens:
+                continue
+            if boundary_tokens % self.block_size == 0:
+                continue
+            block_idx = boundary_tokens // self.block_size
+            if block_idx >= len(blocks):
+                continue
+            cached_hash = self.block_pool.cache_partial_block(
+                request=request,
+                block=blocks[block_idx],
+                num_tokens=boundary_tokens,
+                kv_cache_group_id=self.kv_cache_group_id,
+                block_size=self.block_size,
+            )
+            if boundary_tokens == prompt_tail:
+                prompt_hash = cached_hash
+        return prompt_hash
+
+    def _cache_internal_attention_anchors(
+        self,
+        request: Request,
+        num_tokens: int,
+        num_cached_blocks_before: int,
+        retention_interval: int | None,
+    ) -> None:
+        """Authenticate internal recurrent checkpoints without copying attention."""
+        if not self.cache_internal_attention_anchors or retention_interval == 0:
+            return
+        interval = max(self.cache_hit_alignment_tokens, retention_interval or 0)
+        if interval >= self.block_size:
+            return
+        end = num_tokens // interval * interval
+        previous = self._attention_anchor_tokens.get(
+            request.request_id, num_cached_blocks_before * self.block_size
+        )
+        if end <= previous:
+            return
+        # A partial-to-full promotion removes the block's shorter aliases.
+        # Re-index only the advanced physical block and the appended suffix,
+        # never the full context on each decode iteration.
+        start = previous // self.block_size * self.block_size
+        first = (start // interval + 1) * interval
+        blocks = self.req_to_blocks[request.request_id]
+        for position in reversed(range(first, end + 1, interval)):
+            if position % self.block_size:
+                self.block_pool.cache_partial_block(
+                    request=request,
+                    block=blocks[position // self.block_size],
+                    num_tokens=position,
+                    kv_cache_group_id=self.kv_cache_group_id,
+                    block_size=self.block_size,
+                )
+        self._attention_anchor_tokens[request.request_id] = end
+
     def _apply_cow(
         self,
         request_id: str,
@@ -481,8 +664,9 @@ class SingleTypeKVCacheManager(ABC):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        alignment_tokens: int | None = None,
         *,
-        replay_boundaries: Sequence[int],
+        replay_boundaries: Sequence[int] | None = None,
     ) -> None:
         """Cache the blocks for the request.
 
@@ -496,29 +680,57 @@ class SingleTypeKVCacheManager(ABC):
                 a tail once per that-sized segment. Only SWA acts on it.
             replay_boundaries: Positions a later request replaying this prompt
                 can resume at, from ``get_replay_boundaries``.
+            alignment_tokens: Cache-hit alignment. Defaults to the scheduler
+                block size for non-hybrid coordinators.
 
         """
-        if not self.kv_cache_spec.prefix_cacheable:
+        if not self.enable_caching:
             return
+
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
         num_full_blocks = num_tokens // self.block_size
 
         if num_cached_blocks >= num_full_blocks:
             return
 
-        # Token boundaries whose reachable tail must be retained under sparse
-        # retention: every position a replaying sibling can resume at (see
-        # ``get_replay_boundaries``) and any detected shared-prefix junction.
-        reachable_boundaries = [*replay_boundaries]
+        mask_alignment_tokens = (
+            self.cache_hit_alignment_tokens
+            if alignment_tokens is None
+            else alignment_tokens
+        )
+
+        # Coordinator boundaries already include alignment and EAGLE back-off.
+        # Resolve raw direct-call and shared-prefix positions separately.
+        reachable_boundaries: tuple[int, ...] = (
+            ()
+            if replay_boundaries is not None
+            else (
+                max(0, request.num_prompt_tokens - max(1, self.prefix_replay_tokens)),
+            )
+        )
         if request.shared_prefix_boundary:
-            reachable_boundaries.append(request.shared_prefix_boundary)
+            reachable_boundaries = (
+                *reachable_boundaries,
+                request.shared_prefix_boundary,
+            )
+
+        retention_use_eagle, reachable_boundaries = resolve_sparse_retention_inputs(
+            self.kv_cache_spec,
+            self.use_eagle,
+            self.lookup_drops_eagle_block,
+            reachable_boundaries,
+            lookup_alignment_tokens=mask_alignment_tokens,
+            state_materialization_alignment_tokens=self.scheduler_block_size,
+        )
+        if replay_boundaries is not None:
+            reachable_boundaries = (*replay_boundaries, *reachable_boundaries)
 
         block_mask = self.reachable_block_mask(
             start_block=num_cached_blocks,
             end_block=num_full_blocks,
-            alignment_tokens=self.cache_hit_alignment_tokens,
+            alignment_tokens=mask_alignment_tokens,
             kv_cache_spec=self.kv_cache_spec,
-            use_eagle=self.use_eagle,
+            use_eagle=retention_use_eagle,
             retention_interval=retention_interval,
             reachable_boundaries=reachable_boundaries,
             dcp_world_size=self.dcp_world_size,
@@ -534,6 +746,18 @@ class SingleTypeKVCacheManager(ABC):
         )
 
         self.num_cached_block[request.request_id] = num_full_blocks
+
+    def _expand_reachable_boundaries(self, boundaries: Sequence[int]) -> list[int]:
+        """Use the retention mask's replay positions for scheduler checkpoints."""
+        _, positions = resolve_sparse_retention_inputs(
+            self.kv_cache_spec,
+            self.use_eagle,
+            self.lookup_drops_eagle_block,
+            boundaries,
+            lookup_alignment_tokens=self.cache_hit_alignment_tokens,
+            state_materialization_alignment_tokens=self.scheduler_block_size,
+        )
+        return list(positions)
 
     @classmethod
     def reachable_block_mask(
@@ -578,6 +802,7 @@ class SingleTypeKVCacheManager(ABC):
         # Default to [] in case a request is freed (aborted) before alloc.
         req_blocks = self.req_to_blocks.pop(request_id, [])
         self.num_cached_block.pop(request_id, None)
+        self._attention_anchor_tokens.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
         return req_blocks
 
@@ -743,9 +968,18 @@ class SingleTypeKVCacheManager(ABC):
     def new_step_starts(self) -> None:
         return None
 
+    def release_boundary_capture(self, block_id: int) -> None:
+        """Drop a frozen-capture pin. Only Mamba managers own capture blocks."""
+        return None
+
+    def release_all_boundary_captures(self) -> None:
+        """Release every frozen-capture pin (cache reset). No-op by default."""
+        return None
+
 
 class FullAttentionManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
+    drops_eagle_block: ClassVar[bool] = True
 
     @classmethod
     def find_longest_cache_hit(
@@ -767,7 +1001,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             "and chunked local attention groups"
         )
         block_size = kv_cache_spec.block_size
-        if dcp_world_size > 1:
+        if dcp_world_size > 1 and kv_cache_spec.dcp_sharded:
             # DCP shards each block's KV across ranks; hashes must be viewed at
             # the sharded block size.
             block_size *= dcp_world_size
@@ -819,16 +1053,42 @@ class FullAttentionManager(SingleTypeKVCacheManager):
                 max_length // alignment_tokens,
                 len(block_hashes),
             )
-            for fine_idx in range(max_partial_idx - 1, first_partial_idx - 1, -1):
-                cached_tail = block_pool.get_cached_block(
-                    block_hashes[fine_idx], kv_cache_group_ids
+            # A block's KV is append-only, so a fully cached block also covers
+            # every interior boundary below ``max_length`` (e.g. a re-query at
+            # a rewound length inside the block); the tail is then a partial
+            # hit that the consumer CoW-redirects.
+            partial_block_idx = len(computed_blocks[0])
+            if (
+                max_partial_idx > first_partial_idx
+                and (partial_block_idx + 1) * scale_factor <= len(block_hashes)
+                and (
+                    cached_full := block_pool.get_cached_block(
+                        full_block_hashes[partial_block_idx], kv_cache_group_ids
+                    )
                 )
-                if not cached_tail:
-                    continue
-                for computed, cached in zip(computed_blocks, cached_tail):
+            ):
+                for computed, cached in zip(computed_blocks, cached_full):
                     computed.append(cached)
-                hit_length = (fine_idx + 1) * alignment_tokens
-                break
+                hit_length = max_partial_idx * alignment_tokens
+            else:
+                # A published partial tail also covers earlier boundaries in
+                # this page. Its chained hash must match the request before we
+                # can rewind it, just as for a cached full page above.
+                lookup_end = (
+                    min(first_partial_idx + scale_factor - 1, len(block_hashes))
+                    if max_partial_idx > first_partial_idx
+                    else first_partial_idx
+                )
+                for fine_idx in range(lookup_end - 1, first_partial_idx - 1, -1):
+                    cached_tail = block_pool.get_cached_block(
+                        block_hashes[fine_idx], kv_cache_group_ids
+                    )
+                    if not cached_tail:
+                        continue
+                    for computed, cached in zip(computed_blocks, cached_tail):
+                        computed.append(cached)
+                    hit_length = min(fine_idx + 1, max_partial_idx) * alignment_tokens
+                    break
 
         # Eagle needs the tokens right before the generation point recomputed:
         # drop one hash unit when fine-grained (the tail block's KV is
@@ -850,55 +1110,24 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        alignment_tokens: int | None = None,
         *,
-        replay_boundaries: Sequence[int],
+        replay_boundaries: Sequence[int] | None = None,
     ) -> None:
+        num_cached_before = self.num_cached_block.get(request.request_id, 0)
         super().cache_blocks(
             request,
             num_tokens,
             retention_interval=retention_interval,
             replay_boundaries=replay_boundaries,
+            alignment_tokens=alignment_tokens,
         )
         hash_block_size = self.block_pool.hash_block_size
         if self.block_size == hash_block_size:
             return
         self._cache_partial_tail_block(request, num_tokens)
-
-    def _cache_partial_tail_block(
-        self,
-        request: Request,
-        num_tokens: int,
-    ) -> None:
-        """Cache the prompt tail when it ends inside a cache block.
-
-        Only the final prompt hash boundary is registered as a partial
-        prefix-cache entry; intermediate hash boundaries inside the same cache
-        block are intentionally skipped.
-        """
-        hash_block_size = self.block_pool.hash_block_size
-        # A resend matches at most `prompt_len - 1` tokens, but EAGLE lookups
-        # read the whole prompt before dropping a hash unit.
-        token_limit = (
-            request.num_prompt_tokens
-            if self.use_eagle
-            else request.num_prompt_tokens - 1
-        )
-        boundary_tokens = token_limit // hash_block_size * hash_block_size
-        if boundary_tokens == 0 or boundary_tokens > num_tokens:
-            return
-        if boundary_tokens % self.block_size == 0:
-            return
-
-        blocks = self.req_to_blocks[request.request_id]
-        block_idx = boundary_tokens // self.block_size
-        if block_idx >= len(blocks):
-            return
-        self.block_pool.cache_partial_block(
-            request=request,
-            block=blocks[block_idx],
-            num_tokens=boundary_tokens,
-            kv_cache_group_id=self.kv_cache_group_id,
-            block_size=self.block_size,
+        self._cache_internal_attention_anchors(
+            request, num_tokens, num_cached_before, retention_interval
         )
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
@@ -959,6 +1188,9 @@ class RSWAManager(FullAttentionManager):
 
 
 class SlidingWindowManager(SingleTypeKVCacheManager):
+    drops_eagle_block: ClassVar[bool] = True
+    supports_fine_grained_hash_lookup: ClassVar[bool] = True
+
     def __init__(self, kv_cache_spec: SlidingWindowSpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
         self.sliding_window = kv_cache_spec.sliding_window
@@ -996,11 +1228,12 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         assert isinstance(kv_cache_spec, SlidingWindowSpec), (
             "SlidingWindowManager can only be used for sliding window groups"
         )
-        assert dcp_world_size == 1, "DCP not support sliding window attn now."
-        assert pcp_world_size == 1, "PCP not support sliding window attn now."
-        # Sliding-window cache hits must stay at the group's physical block
-        # granularity. resolve_block_hashes() converts finer-grained hashes to
-        # that view when the hybrid-cache alignment is smaller than block_size.
+        assert dcp_world_size == 1 or not kv_cache_spec.dcp_sharded, (
+            "DCP only supports sliding-window KV when it is replicated."
+        )
+        assert pcp_world_size == 1 or not kv_cache_spec.dcp_sharded, (
+            "PCP only supports sliding-window KV when it is replicated."
+        )
         block_hashes = resolve_block_hashes(
             block_hashes,
             block_pool.hash_block_size,
@@ -1008,6 +1241,24 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             supports_fine_grained_hash_lookup=cls.supports_fine_grained_hash_lookup,
             alignment_tokens=alignment_tokens,
         )
+        if (
+            alignment_tokens < kv_cache_spec.block_size
+            and kv_cache_spec.block_size % alignment_tokens == 0
+        ):
+            # Fine-grained mode (alignment_tokens == hash_block_size <
+            # block_size): resolve_block_hashes kept the raw hash-granularity
+            # list so hits can land on boundaries inside a cache block.
+            assert isinstance(block_hashes, Sequence)
+            return cls._find_longest_fine_grained_cache_hit(
+                block_hashes=block_hashes,
+                max_length=max_length,
+                kv_cache_group_ids=kv_cache_group_ids,
+                block_pool=block_pool,
+                kv_cache_spec=kv_cache_spec,
+                drop_eagle_block=drop_eagle_block,
+                alignment_tokens=alignment_tokens,
+            )
+        assert alignment_tokens % kv_cache_spec.block_size == 0
 
         # The number of contiguous blocks needed for a prefix cache hit.
         sliding_window_contiguous_blocks = cls._contiguous_blocks_for_hit(
@@ -1079,6 +1330,180 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         return computed_blocks, hit_length
 
     @classmethod
+    def _fine_grained_need_tokens(
+        cls, window_size: int, alignment_tokens: int, use_eagle: bool
+    ) -> int:
+        """Cached tokens a fine-grained hit ending at a hash boundary needs
+        before that boundary: the sliding window of the next token, plus one
+        hash unit when EAGLE rewinds the hit by that unit (the rewound window
+        starts one unit earlier, so the cached run must reach one unit further
+        back)."""
+        return window_size - 1 + (alignment_tokens if use_eagle else 0)
+
+    @classmethod
+    def _find_longest_fine_grained_cache_hit(
+        cls,
+        block_hashes: Sequence[BlockHash],
+        max_length: int,
+        kv_cache_group_ids: list[int],
+        block_pool: BlockPool,
+        kv_cache_spec: SlidingWindowSpec,
+        drop_eagle_block: bool,
+        alignment_tokens: int,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        """Fine-grained (partial) hit search for sliding window layers.
+
+        Candidates are hash boundaries, probed high-to-low. Boundary ``L``
+        hits when the cache block ending at ``L`` is cached (a full block when
+        ``L`` is block-aligned, else a partial entry keyed by the hash at
+        ``L``) and every full block covering the window before ``L`` is cached
+        too. As in ``FullAttentionManager``, EAGLE rewinds the hit by one hash
+        unit: the required run is one unit longer so the rewound window stays
+        covered, and blocks past the rewound length are trimmed. Blocks before
+        the window are null, as in the block-aligned path.
+        """
+        block_size = kv_cache_spec.block_size
+        num_groups = len(kv_cache_group_ids)
+        scale_factor = block_size // alignment_tokens
+        full_block_hashes = BlockHashListWithBlockSize(
+            block_hashes, alignment_tokens, block_size
+        )
+        need_tokens = cls._fine_grained_need_tokens(
+            kv_cache_spec.sliding_window, alignment_tokens, drop_eagle_block
+        )
+        max_units = min(max_length // alignment_tokens, len(block_hashes))
+        # Per tail block: the highest registered boundary found so far and how
+        # far down the block has been scanned. A block's KV is append-only, so
+        # an entry registered at a higher boundary of the same block covers
+        # every lower boundary (the tail is then a partial hit, CoW-redirected
+        # by the consumer); this is what lets a re-query at a rewound length
+        # land inside a block whose only entry sits further along.
+        tail_found: dict[int, list[KVCacheBlock] | None] = {}
+        tail_scanned_to: dict[int, int] = {}
+        for unit_idx in range(max_units - 1, -1, -1):
+            hit_tokens = (unit_idx + 1) * alignment_tokens
+            tail_block_idx = (hit_tokens - 1) // block_size
+            tail_blocks = tail_found.get(tail_block_idx)
+            if tail_blocks is None:
+                top_unit = min((tail_block_idx + 1) * scale_factor, len(block_hashes))
+                scan_from = tail_scanned_to.get(tail_block_idx, top_unit) - 1
+                for probe_unit in range(scan_from, unit_idx - 1, -1):
+                    probe_tokens = (probe_unit + 1) * alignment_tokens
+                    probe_hash = (
+                        full_block_hashes[tail_block_idx]
+                        if probe_tokens % block_size == 0
+                        else block_hashes[probe_unit]
+                    )
+                    tail_blocks = block_pool.get_cached_block(
+                        probe_hash, kv_cache_group_ids
+                    )
+                    if tail_blocks:
+                        tail_found[tail_block_idx] = tail_blocks
+                        break
+                tail_scanned_to[tail_block_idx] = unit_idx
+            if not tail_blocks:
+                continue
+            first_block_idx = max(0, (hit_tokens - need_tokens) // block_size)
+            run: list[list[KVCacheBlock]] = [[] for _ in range(num_groups)]
+            for block_idx in range(first_block_idx, tail_block_idx):
+                cached = block_pool.get_cached_block(
+                    full_block_hashes[block_idx], kv_cache_group_ids
+                )
+                if not cached:
+                    break
+                for per_group, block in zip(run, cached):
+                    per_group.append(block)
+            else:
+                hit_length = hit_tokens
+                if drop_eagle_block:
+                    hit_length -= alignment_tokens
+                num_blocks = cdiv(hit_length, block_size)
+                computed_blocks = tuple(
+                    [block_pool.null_block] * first_block_idx + per_group + [tail]
+                    for per_group, tail in zip(run, tail_blocks)
+                )
+                for computed in computed_blocks:
+                    del computed[num_blocks:]
+                return computed_blocks, hit_length
+        return tuple([] for _ in range(num_groups)), 0
+
+    def cache_blocks(
+        self,
+        request: Request,
+        num_tokens: int,
+        retention_interval: int | None = None,
+        alignment_tokens: int | None = None,
+        *,
+        replay_boundaries: Sequence[int] | None = None,
+    ) -> None:
+        if not self.enable_caching:
+            return
+        num_cached_before = self.num_cached_block.get(request.request_id, 0)
+        super().cache_blocks(
+            request,
+            num_tokens,
+            retention_interval=retention_interval,
+            alignment_tokens=alignment_tokens,
+            replay_boundaries=replay_boundaries,
+        )
+        hit_alignment = (
+            self.cache_hit_alignment_tokens
+            if alignment_tokens is None
+            else alignment_tokens
+        )
+        if hit_alignment < self.block_size:
+            self._cache_partial_tail_block(request, num_tokens)
+            self._cache_internal_attention_anchors(
+                request, num_tokens, num_cached_before, retention_interval
+            )
+
+    @classmethod
+    def _fine_grained_reachable_block_mask(
+        cls,
+        start_block: int,
+        end_block: int,
+        alignment_tokens: int,
+        kv_cache_spec: SlidingWindowSpec,
+        use_eagle: bool,
+        retention_interval: int | None,
+        reachable_boundaries: Sequence[int],
+    ) -> list[bool] | None:
+        """Retention mask when hits align to hash units inside a block.
+
+        A hit at hash boundary ``B`` needs the full blocks covering
+        ``[B - need_tokens, B)``; the tail block itself is registered as a
+        partial entry separately. Segment boundaries (``retention_interval``
+        > 0) and reachable boundaries keep exactly those blocks; ``None``
+        retention caches every block.
+        """
+        if retention_interval is None:
+            return None
+        block_size = kv_cache_spec.block_size
+        need_tokens = cls._fine_grained_need_tokens(
+            kv_cache_spec.sliding_window, alignment_tokens, use_eagle
+        )
+        mask = [False] * (end_block - start_block)
+
+        def keep_tail(boundary_tokens: int) -> None:
+            first = max(0, (boundary_tokens - need_tokens) // block_size)
+            last = cdiv(boundary_tokens, block_size)  # exclusive
+            for i in range(max(first, start_block), min(last, end_block)):
+                mask[i - start_block] = True
+
+        if retention_interval > 0:
+            segment = retention_interval
+            if need_tokens + block_size >= segment:
+                # Every block lies in some segment tail; keep them all.
+                return None
+            first_segment = (start_block * block_size) // segment * segment
+            last_token = end_block * block_size + need_tokens
+            for boundary in range(first_segment + segment, last_token + 1, segment):
+                keep_tail(boundary)
+        for boundary_tokens in reachable_boundaries:
+            keep_tail(boundary_tokens // alignment_tokens * alignment_tokens)
+        return mask
+
+    @classmethod
     def reachable_block_mask(
         cls,
         start_block: int,
@@ -1095,6 +1520,19 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         if alignment_tokens is None:
             # Fast path: when the coordinator imposes no alignment constraint.
             return None
+        if (
+            alignment_tokens < kv_cache_spec.block_size
+            and kv_cache_spec.block_size % alignment_tokens == 0
+        ):
+            return cls._fine_grained_reachable_block_mask(
+                start_block,
+                end_block,
+                alignment_tokens,
+                kv_cache_spec,
+                use_eagle,
+                retention_interval,
+                reachable_boundaries,
+            )
         block_size = kv_cache_spec.block_size * dcp_world_size
         if alignment_tokens % block_size != 0:
             # The mask is block-granular, so a sub-block alignment cannot be
@@ -1210,6 +1648,7 @@ class CircularBufferManager(FullAttentionManager):
     """Claims the ring's single block per request; prefix caching disabled."""
 
     supports_fine_grained_hash_lookup: ClassVar[bool] = False
+    drops_eagle_block: ClassVar[bool] = False
 
     def _claim_ring_block(
         self, request_id: str, record_for_zeroing: bool = True
@@ -1270,8 +1709,9 @@ class CircularBufferManager(FullAttentionManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        alignment_tokens: int | None = None,
         *,
-        replay_boundaries: Sequence[int],
+        replay_boundaries: Sequence[int] | None = None,
     ) -> None:
         return
 
@@ -1478,6 +1918,18 @@ class MambaManager(SingleTypeKVCacheManager):
             self.mamba_cache_mode == "align"
             and kv_cache_spec.num_prefill_checkpoint_blocks > 0
         )
+        # Frozen boundary capture is align-mode only; MambaSpec carries the
+        # enablement decision (align + OffloadingConnector + kv_offloading).
+        # The bookkeeping exists for every mamba manager: the cache-manager
+        # release paths consult it unconditionally.
+        self.boundary_capture = (
+            kv_cache_spec.boundary_capture and self.mamba_cache_mode == "align"
+        )
+        # Recorded crossings (promoted at the next schedule pass) and the
+        # manager pins on promoted capture blocks (released on store ack):
+        # dedicated single-writer blocks holding state@B.
+        self._pending_captures: dict[str, list[tuple[Request, KVCacheBlock, int]]] = {}
+        self._capture_pinned: dict[int, KVCacheBlock] = {}
         # Mamba checkpoints follow Eagle's global replay boundary.
         self.drop_eagle_checkpoint_block = False
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
@@ -1496,6 +1948,113 @@ class MambaManager(SingleTypeKVCacheManager):
             # connector; a request that finishes first hands off this table
             # source directly.
             self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
+            self._packed_prefill_checkpoint_reqs: set[str] = set()
+
+    def release_boundary_capture(self, block_id: int) -> None:
+        """Drop the manager pin on a frozen capture block once its store job
+        completed (or the connector dropped the offer). Safe against
+        in-flight DMA races: the connector fences block reuse for pending
+        store jobs, and the copy rail already retained the endpoints until
+        the copy step was processed."""
+        block = self._capture_pinned.pop(block_id, None)
+        if block is not None:
+            self.block_pool.free_blocks([block])
+
+    def release_all_boundary_captures(self) -> None:
+        """Release every capture pin and pending record (cache reset)."""
+        blocks = list(self._capture_pinned.values())
+        self._capture_pinned.clear()
+        for entries in self._pending_captures.values():
+            blocks.extend(column for _, column, _ in entries)
+        self._pending_captures.clear()
+        self.block_pool.free_blocks(blocks)
+
+    def _record_boundary_capture(
+        self, request: Request, column_block: KVCacheBlock, boundary: int
+    ) -> None:
+        """Remember that the step scheduled right now will write state at
+        ``boundary`` into ``column_block``. Promoted (copy + offer) at the
+        start of the next schedule pass, before the column can advance."""
+        # Invariant (connector-aligned-builder ownership): a capture boundary
+        # is a state-block multiple, so the offload chunk grid claims it.
+        assert boundary % self.block_size == 0
+        # Hold the column against retirement until promotion (next pass).
+        self.block_pool.touch([column_block])
+        self._pending_captures.setdefault(request.request_id, []).append(
+            (request, column_block, boundary)
+        )
+
+    def _promote_boundary_captures(self) -> None:
+        """Turn recorded crossings into frozen capture blocks.
+
+        Runs at the start of the schedule pass after the producing step was
+        dispatched. The producing forward has completed (or is queued ahead of
+        everything on the worker's compute stream), so:
+        - the copy rail (``kv_cache_block_copies``, executed in the next
+          worker step after zeroing and BEFORE ``preprocess_state``'s precopy
+          and the forward) reads the column exactly at state@boundary;
+        - the connector offer ships with the same scheduler output, and the
+          store DMA is submitted one further step later, chained behind the
+          copy on the transfer stream.
+        The capture block is a dedicated pool block: never in a request's
+        column table, so precopy/postprocess/spec relocation cannot touch it,
+        and it is hashed at the boundary so local hits can resume past the
+        last live column too.
+        """
+        pending, self._pending_captures = self._pending_captures, {}
+        for req_id, entries in pending.items():
+            req_blocks = self.req_to_blocks.get(req_id, [])
+            for request, column_block, boundary in entries:
+                column_idx = boundary // self.block_size - 1
+                if (
+                    column_block.is_null
+                    or column_block.block_hash is None
+                    or column_block.block_hash_num_tokens != boundary
+                    or column_idx >= len(req_blocks)
+                    or req_blocks[column_idx] is not column_block
+                ):
+                    # The column was retired, re-hashed, CoW-moved, or the
+                    # producing step was rewound before committing state@B.
+                    # (Never gate on request.num_computed_tokens here: under
+                    # async scheduling it is an optimistic mirror that lags
+                    # the dispatched step.)
+                    self.block_pool.free_blocks([column_block])
+                    continue
+                try:
+                    capture_block = self.block_pool.get_new_blocks(1)[0]
+                except ValueError:
+                    # Pool pressure: skip the capture. The boundary is simply
+                    # not stored; hits fall back to recompute (correct, slower).
+                    self.block_pool.free_blocks([column_block])
+                    continue
+                # Ref plan (I4): the capture block keeps its allocation ref
+                # as a manager pin until the store DMA ack releases it
+                # (release_boundary_capture); it can then never be re-allocated
+                # as a copy destination, a live column, or zero-filled while
+                # its own content is still owed to the CPU tier. `touch` adds
+                # the copy-rail ref on each endpoint (released when the copy
+                # step is processed by take_kv_cache_block_copies /
+                # _free_cow_retained_blocks); the record-time ref on the
+                # column is dropped here.
+                self.block_pool.touch([column_block, capture_block])
+                self._pending_cow_copies.append((column_block, capture_block))
+                self._capture_pinned[capture_block.block_id] = capture_block
+                block_hash = self.block_pool.cache_partial_block(
+                    request=request,
+                    block=capture_block,
+                    num_tokens=boundary,
+                    kv_cache_group_id=self.kv_cache_group_id,
+                    block_size=self.block_size,
+                    replace_existing_hashes=True,
+                )
+                if block_hash is not None:
+                    # Content lands with the copy at the start of this step's
+                    # execution; defer same-step local hits (CoW precedent).
+                    self.cached_blocks_this_step.add(block_hash)
+                self._pending_boundary_state_offloads.append(
+                    (req_id, self.kv_cache_group_id, capture_block, boundary)
+                )
+                self.block_pool.free_blocks([column_block])
 
     @classmethod
     def find_longest_cache_hit(
@@ -1609,9 +2168,11 @@ class MambaManager(SingleTypeKVCacheManager):
         mask = [False] * (end_block - start_block)
 
         # (1) Segment-boundary states. A Mamba hit needs exactly the single
-        # state block ending on the boundary (no window, and draft models have
-        # no mamba layers, so no eagle shift). Block ``i`` ends at token
-        # ``(i + 1) * block_size``.
+        # state block ending on the boundary (no window). Segment tails get no
+        # EAGLE shift: under the EAGLE drop the fixed point settles on the next
+        # lower tail, costing at most one segment of hit length, unlike the
+        # reachable boundaries below where the unshifted state is the only one.
+        # Block ``i`` ends at token ``(i + 1) * block_size``.
         segment_tokens = None if retention_interval == 0 else retention_interval
         if segment_tokens is not None:
             per_segment = segment_tokens // block_size
@@ -1627,12 +2188,15 @@ class MambaManager(SingleTypeKVCacheManager):
         # (2) Reachable-boundary states: the replay boundary (``num_prompt - 1``,
         # capped by ``get_computed_blocks``) and any shared-prefix junction, both
         # of which segments would otherwise skip under sparse retention. A Mamba
-        # hit needs exactly the single state block ending on the boundary.
+        # hit needs exactly the single state block ending on the reachable
+        # position, so retain one block per position rather than a run.
         for boundary_tokens in reachable_boundaries:
-            aligned = boundary_tokens // alignment_tokens * alignment_tokens
-            boundary_block = aligned // block_size - 1
-            if start_block <= boundary_block < end_block:
-                mask[boundary_block - start_block] = True
+            for position in reachable_hit_positions(
+                boundary_tokens, alignment_tokens, use_eagle
+            ):
+                boundary_block = position // block_size - 1
+                if start_block <= boundary_block < end_block:
+                    mask[boundary_block - start_block] = True
 
         return mask
 
@@ -1770,6 +2334,19 @@ class MambaManager(SingleTypeKVCacheManager):
             # mamba layers.
             num_tokens = num_tokens_main_model
 
+            if (
+                apply_admission_cap
+                and self.kv_cache_spec.num_prefill_checkpoint_blocks > 1
+            ):
+                # Admission can inspect the whole prompt. Active recurrent
+                # memory is bounded by one scheduled query, not prompt length.
+                num_tokens = min(
+                    num_tokens,
+                    total_computed_tokens
+                    + (self.kv_cache_spec.num_prefill_checkpoint_blocks + 1)
+                    * self.block_size,
+                )
+
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
             num_required_blocks = (
@@ -1786,6 +2363,21 @@ class MambaManager(SingleTypeKVCacheManager):
                 )
                 or request_id in self._partial_hit_reqs
             )
+            packed_checkpoints = self.kv_cache_spec.prefill_checkpoint_indices(
+                total_computed_tokens, num_tokens
+            )
+            if not apply_admission_cap:
+                self._packed_prefill_checkpoint_reqs.discard(request_id)
+            if packed_checkpoints and not has_partial_hit:
+                if not apply_admission_cap:
+                    self._packed_prefill_checkpoint_reqs.add(request_id)
+                    self._checkpoints.pop(request_id, None)
+                # Existing private speculative slots remain at their logical
+                # positions. Prefill can materialize them as checkpoints while
+                # appending the final running state and future scratch slots.
+                return max(num_new_blocks, 0) + self._get_num_evictable_blocks(
+                    new_computed_blocks
+                )
             if has_partial_hit:
                 num_new_blocks = max(num_new_blocks, 0) + 1
             # Keyed on the chunk end like the worker's
@@ -1879,6 +2471,15 @@ class MambaManager(SingleTypeKVCacheManager):
                     # When a new request hits the prefix cache, the last block
                     # saves the hit state.
                     self.last_state_block_idx[request_id] = prev_block_len - 1
+
+                if request_id in self._packed_prefill_checkpoint_reqs:
+                    assert not has_partial_hit
+                    new_blocks = self.block_pool.get_new_blocks(
+                        num_required_blocks - len(req_blocks)
+                    )
+                    req_blocks.extend(new_blocks)
+                    self._allocated_block_reqs.add(request_id)
+                    return new_blocks
 
                 num_skipped_blocks = (
                     num_required_blocks - self.num_speculative_blocks - 1
@@ -1989,6 +2590,7 @@ class MambaManager(SingleTypeKVCacheManager):
             self.last_state_block_idx.pop(request_id, None)
             self._num_retired_blocks.pop(request_id, None)
             self._checkpoints.pop(request_id, None)
+            self._packed_prefill_checkpoint_reqs.discard(request_id)
             self._producer_partial_tail_reqs.pop(request_id, None)
             # An offer is only guaranteed to hold committed bytes until the end
             # of the pass that made it. This request's blocks are going back to
@@ -2000,6 +2602,14 @@ class MambaManager(SingleTypeKVCacheManager):
                 for entry in self._pending_boundary_state_offloads
                 if entry[0] != request_id
             ]
+            # Recorded-but-not-yet-promoted crossings can never ship a copy
+            # now that the column table is going away: drop them along with
+            # the record-time pin on each column. (Already-promoted captures
+            # are pool-owned pins held for the store ack, not for this
+            # request, and stay pinned.)
+            dropped = self._pending_captures.pop(request_id, ())
+            if dropped:
+                self.block_pool.free_blocks([col for _, col, _ in dropped])
         return super().pop_blocks_for_free(request_id)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
@@ -2014,15 +2624,22 @@ class MambaManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        alignment_tokens: int | None = None,
         *,
-        replay_boundaries: Sequence[int],
+        replay_boundaries: Sequence[int] | None = None,
     ) -> None:
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
+        if request.use_boundary_checkpoints:
+            # Keep transient running/rollback blocks private. Boundary bundles
+            # publish their own immutable state copies after GPU completion.
+            self.num_cached_block[request.request_id] = num_tokens // self.block_size
+            return
         super().cache_blocks(
             request,
             num_tokens,
             retention_interval=retention_interval,
             replay_boundaries=replay_boundaries,
+            alignment_tokens=alignment_tokens,
         )
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if self.mamba_cache_mode == "align":
@@ -2044,6 +2661,33 @@ class MambaManager(SingleTypeKVCacheManager):
                 self.cached_blocks_this_step.add(block.block_hash)
                 if self.mamba_cache_mode == "align":
                     assert block.block_hash_num_tokens is not None
+                    if self.boundary_capture:
+                        # Frozen capture: the step scheduled right now is the
+                        # producer for this boundary only when the chunk ends
+                        # exactly at it and this is the last (live) column the
+                        # forward writes. Offer the live column never; the
+                        # dedicated capture block is the sole store source.
+                        # The producing step is the one that COMPUTES the
+                        # boundary, i.e. its dispatched chunk still has the
+                        # boundary ahead of it (nct < boundary). When the
+                        # mirror already sits at the boundary, the crossing
+                        # was produced by an EARLIER step (connector-load
+                        # delay: the producing allocate ran with
+                        # delay_cache_blocks and cache_blocks only catches
+                        # up now). Promoting that record copies the column
+                        # AFTER the later step's forward advanced it past
+                        # the boundary -- state@prompt_final stored under
+                        # key@boundary, the original mislabel defect.
+                        # Reject: the boundary simply keeps no capture and
+                        # hits fall back to recompute (correct, slower).
+                        if (
+                            idx == num_cached_blocks_after - 1
+                            and num_tokens % self.block_size == 0
+                            and block.block_hash_num_tokens == num_tokens
+                            and request.num_computed_tokens < num_tokens
+                        ):
+                            self._record_boundary_capture(request, block, num_tokens)
+                        continue
                     # Offer every retained boundary with its exact block.
                     # The connector filters against its save window, which may
                     # extend past the original prompt during resumed prefill.
@@ -2058,12 +2702,18 @@ class MambaManager(SingleTypeKVCacheManager):
 
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()
+        if self.boundary_capture:
+            # Promote last step's crossings before this pass allocates for the
+            # new step: the recorded live column still holds state@B until the
+            # producing forward's successor retires it, and the copy rail ships
+            # with this step's output.
+            self._promote_boundary_captures()
 
     def _cache_partial_tail_block(
         self,
         request: Request,
         num_tokens: int,
-        retention_interval: int | None,
+        retention_interval: int | None = None,
     ) -> BlockHashWithGroupId | None:
         hash_block_size = self.block_pool.hash_block_size
         # Re-key the reserved block at its exported checkpoint boundary.
@@ -2192,8 +2842,9 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        alignment_tokens: int | None = None,
         *,
-        replay_boundaries: Sequence[int],
+        replay_boundaries: Sequence[int] | None = None,
     ) -> None:
         # We do not cache blocks for cross-attention to be shared between
         # requests, so this method is not relevant.
@@ -2350,14 +3001,16 @@ class HiSparseSourceManager(FullAttentionManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        alignment_tokens: int | None = None,
         *,
-        replay_boundaries: Sequence[int],
+        replay_boundaries: Sequence[int] | None = None,
     ) -> None:
         assert self.coordinator is not None
         self.coordinator.publish_when_ready(
             request,
             num_tokens,
             retention_interval,
+            alignment_tokens=alignment_tokens,
             replay_boundaries=replay_boundaries,
         )
 
@@ -2366,13 +3019,15 @@ class HiSparseSourceManager(FullAttentionManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        alignment_tokens: int | None = None,
         *,
-        replay_boundaries: Sequence[int],
+        replay_boundaries: Sequence[int] | None = None,
     ) -> None:
         super().cache_blocks(
             request,
             num_tokens,
             retention_interval=retention_interval,
+            alignment_tokens=alignment_tokens,
             replay_boundaries=replay_boundaries,
         )
 
@@ -2387,13 +3042,20 @@ class _HiSparseAuxiliaryManager(SingleTypeKVCacheManager):
 
     coordinator: "HiSparseCoordinator | None" = None
 
+    def __init__(self, kv_cache_spec: KVCacheSpec, **kwargs) -> None:
+        super().__init__(kv_cache_spec, **kwargs)
+        # Never prefix-cached, but the per-step ``cache_blocks`` hook is where
+        # residency work runs, so stay opted in regardless of prefix caching.
+        self.enable_caching = True
+
     def cache_blocks(
         self,
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        alignment_tokens: int | None = None,
         *,
-        replay_boundaries: Sequence[int],
+        replay_boundaries: Sequence[int] | None = None,
     ) -> None:
         return None
 

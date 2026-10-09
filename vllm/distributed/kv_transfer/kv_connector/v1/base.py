@@ -55,7 +55,7 @@ from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
 
 if TYPE_CHECKING:
-    from vllm.config import VllmConfig
+    from vllm.config import KVTransferConfig, VllmConfig
     from vllm.distributed.kv_events import KVCacheEvent, KVConnectorKVEvents
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
         KVConnectorPromMetrics,
@@ -65,9 +65,11 @@ if TYPE_CHECKING:
     )
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.boundary_checkpoint import BoundaryCheckpoint
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
+    from vllm.v1.worker.gpu.boundary_checkpoint import BoundaryCheckpointState
 
 # s_tensor_list, d_tensor_list, s_indices, d_indices, direction
 CopyBlocksOp = Callable[
@@ -133,6 +135,32 @@ def supports_hma(connector: Any) -> bool:
         return issubclass(connector, SupportsHMA)
     else:
         return isinstance(connector, SupportsHMA)
+
+
+class SupportsVmmSafeTransfers(ABC):
+    """Declare configurations that do not retain GPU physical-page registrations.
+
+    A qualifying transport accesses GPU buffers through virtual addresses at
+    transfer time, without RDMA, GPUDirect or GDS page registrations.
+    """
+
+    @classmethod
+    @abstractmethod
+    def supports_vmm_safe_transfer_config(
+        cls, kv_transfer_config: "KVTransferConfig"
+    ) -> bool:
+        """Return whether this exact connector configuration is VMM-safe."""
+        raise NotImplementedError
+
+
+def supports_vmm_safe_transfers(
+    connector: Any, kv_transfer_config: "KVTransferConfig"
+) -> bool:
+    """Evaluate a connector's explicit CUDA VMM transfer contract."""
+    connector_cls = connector if isinstance(connector, type) else type(connector)
+    return issubclass(
+        connector_cls, SupportsVmmSafeTransfers
+    ) and connector_cls.supports_vmm_safe_transfer_config(kv_transfer_config)
 
 
 class KVConnectorRole(enum.Enum):
@@ -477,6 +505,58 @@ class KVConnectorBase_V1(ABC):
         self._kv_cache_manager = kv_cache_manager
         self.bind_gpu_block_pool(kv_cache_manager.block_pool)
 
+    def bind_boundary_capture_releaser(self, releaser: Callable[[int], None]) -> None:
+        """Bind the cache manager's capture-pin releaser.
+
+        A connector whose boundary stores source frozen capture blocks must
+        release the manager pin when a store job completes or the offer is
+        dropped. Connectors that never source capture blocks ignore it (the
+        manager's pin dict stays empty, so a missed release cannot leak).
+        """
+        return None
+
+    @classmethod
+    def supports_request_boundary_checkpoints(cls, config: "VllmConfig") -> bool:
+        """Whether configuration selects a complete external checkpoint adapter."""
+        return False
+
+    @classmethod
+    def supports_aligned_hybrid_transfer(cls, config: "VllmConfig") -> bool:
+        """Whether aligned retention transfers hybrid recurrent state correctly.
+
+        Qwen QSA models may use such a connector with
+        ``--recurrent-checkpoint-policy aligned`` instead of an atomic
+        request-boundary checkpoint adapter.
+        """
+        return False
+
+    def bind_boundary_checkpoint_cache(self, manager: "KVCacheManager") -> None:
+        """Bind the scheduler allocator for atomic external checkpoint imports.
+
+        A connector advertising request-boundary support must implement the
+        all-rank transfer contract. Ordinary aligned connectors do not use it.
+        """
+        if manager.boundary_checkpoints is not None:
+            raise NotImplementedError("Connector cannot transfer recurrent checkpoints")
+
+    def bind_boundary_checkpoint_state(self, state: "BoundaryCheckpointState") -> None:
+        """Bind worker-owned physical pages and their address-free byte layout."""
+        raise NotImplementedError("Connector cannot transfer recurrent checkpoints")
+
+    def boundary_checkpoint_external_tokens(self, request: "Request") -> int:
+        """Attribute an admitted imported bundle to external, not GPU-cache hits."""
+        return 0
+
+    def store_boundary_checkpoint(
+        self, request: "Request", checkpoint: "BoundaryCheckpoint"
+    ) -> None:
+        """Optionally retain and asynchronously store an already committed bundle.
+
+        The connector must acquire independent source pins before returning
+        and release them only after every worker's D2H operation completes.
+        """
+        return
+
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         """Bind the GPU block pool to the connector for per-GPU block status tracking.
         For example, inc/dec ref counts, or iterate over the prefix cache blocks.
@@ -496,6 +576,16 @@ class KVConnectorBase_V1(ABC):
         every transfer group.
         """
         return self._kv_cache_config.prefix_cacheable_group_ids
+
+    def poll_boundary_checkpoint(self, request: "Request") -> bool:
+        """Return False while an atomic external checkpoint import is pending.
+
+        A True result permits ordinary local lookup. It is not a hit claim;
+        imported bundles must first be published by the allocator after all
+        worker copies complete. Cancellation must retain destinations until
+        every submitted copy drains.
+        """
+        return True
 
     @abstractmethod
     def get_num_new_matched_tokens(

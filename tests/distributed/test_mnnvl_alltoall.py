@@ -555,18 +555,21 @@ def test_args_cpu_workspace_allocation(monkeypatch):
     )
     monkeypatch.setattr(mk.current_platform, "is_cpu", lambda: True)
 
-    workspace13, workspace2, output, specialized = kernel._allocate_buffers(
-        torch.float32,
-        torch.device("cpu"),
-        2,
-        2,
-        3,
-        3,
-        1,
-        1,
-        1,
-        None,
-        MoEActivation.SILU,
+    workspace13, workspace2, output, specialized, shared_workspace = (
+        kernel._allocate_buffers(
+            torch.float32,
+            torch.float32,
+            torch.device("cpu"),
+            2,
+            2,
+            3,
+            3,
+            1,
+            1,
+            1,
+            None,
+            MoEActivation.SILU,
+        )
     )
     assert workspace13.numel() == workspace2.numel() == 0
     assert output.shape == (2, 3)

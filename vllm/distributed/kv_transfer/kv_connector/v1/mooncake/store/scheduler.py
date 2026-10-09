@@ -421,6 +421,7 @@ class MooncakeStoreScheduler:
             meta.add_request(req_meta)
         self._finished_partial_tail_metas.clear()
 
+        self._apply_current_save_block_ids(meta, scheduler_output)
         self._reference_save_blocks(meta)
         return meta
 

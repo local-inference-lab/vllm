@@ -14,11 +14,26 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     return get_tp_group().all_reduce(input_)
 
 
+def tensor_model_parallel_all_reduce_in_place(input_: torch.Tensor) -> torch.Tensor:
+    """Reduce consumed storage without allocating a second output tensor."""
+    return get_tp_group().all_reduce_in_place(input_)
+
+
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:
     """All-gather the input tensor across model parallel group."""
     return get_tp_group().all_gather(input_, dim)
+
+
+def tensor_model_parallel_all_gatherv(
+    input_: torch.Tensor, sizes: list[int], dim: int = 0
+) -> torch.Tensor:
+    """Gather variable-length tensor slices across the model-parallel group."""
+    tp_group = get_tp_group()
+    if tp_group.world_size == 1:
+        return input_
+    return tp_group.all_gatherv(input_, dim=dim, sizes=sizes)
 
 
 def tensor_model_parallel_reduce_scatter(

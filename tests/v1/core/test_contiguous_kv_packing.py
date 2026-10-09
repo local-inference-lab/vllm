@@ -75,6 +75,7 @@ def _mixed_page_groups(n_mla=3, n_idx=3, n_swa=5):
 
 def _mock_vllm_config(layout: str | None):
     config = MagicMock()
+    config.use_request_boundary_checkpoints = False
     config.cache_config = CacheConfig()
     config.cache_config.num_gpu_blocks_override = None
     config.cache_config.kv_cache_layout = layout
@@ -494,6 +495,15 @@ class TestDensePacking:
             list(g2),
         ]
 
+    def test_glm53_split_env_does_not_pad_other_mla_models(self, monkeypatch):
+        groups, _, _ = _mixed_page_groups()
+        expected = _expected_bytes_per_block(groups)
+        assert expected % (64 * 132) != 0
+
+        monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "512")
+
+        assert _get_kv_cache_bytes_per_block(groups) == expected
+
     def test_layers_within_a_group_are_dense(self):
         groups, _, _ = _mixed_page_groups()
         pages = _pages(groups)
@@ -742,3 +752,234 @@ class TestSWABoundedReplayGrouping:
         for single in manager.coordinator.single_type_managers:
             cached = single.num_cached_block.get(request.request_id, 0)
             assert cached == (2 if single.kv_cache_spec.prefix_cacheable else 0)
+
+
+@pytest.mark.parametrize("draft_head_size", [128, 192])
+def test_layout_resolution_handles_target_and_draft_page_sizes(
+    monkeypatch, draft_head_size
+):
+    from vllm import envs
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
+    monkeypatch.setattr(envs, "VLLM_KV_CACHE_LAYOUT", None)
+    config = _mock_vllm_config(None)
+    config.kv_transfer_config = None
+    target = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=192,
+        head_size_v=128,
+        dtype=torch.bfloat16,
+    )
+    draft = replace(target, head_size=draft_head_size)
+    layout = resolve_kv_cache_layout(config, [["LBHNC", "BLHNC"]], [target, draft])
+    expected = KVCacheLayout.BLHNC if draft_head_size != 192 else KVCacheLayout.LBHNC
+    assert layout == expected
+    groups = [
+        KVCacheGroupSpec(layer_names=["target"], kv_cache_spec=target),
+        KVCacheGroupSpec(layer_names=["draft"], kv_cache_spec=draft),
+    ]
+    cache = get_kv_cache_config_from_groups(config, groups, MEMORY)
+    views = _bind(cache, layout.name)
+    views["target"][0].fill_(1)
+    views["draft"][1].fill_(2)
+    assert (views["target"][0] == 1).all()
+    assert (views["draft"][1] == 2).all()
+
+
+def test_layout_resolution_keeps_block_compact_layout_for_one_mixed_group(
+    monkeypatch,
+):
+    """B12X DSA declares only LBNHC; its MLA and indexer pages share one group."""
+    from vllm import envs
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
+    monkeypatch.setattr(envs, "VLLM_KV_CACHE_LAYOUT", None)
+    config = _mock_vllm_config(None)
+    config.kv_transfer_config = None
+    specs = {"mla.0": _mla(512), "mla.1": _mla(512), "idx.0": _mla(128)}
+    layout = resolve_kv_cache_layout(config, [["LBNHC"]], list(specs.values()))
+    assert layout == KVCacheLayout.LBNHC
+    cache = get_kv_cache_config_from_groups(config, [_uniform_group(specs)], MEMORY)
+    views = _bind(cache, layout.name)
+    views["mla.0"][0].fill_(1)
+    views["idx.0"][0].fill_(2)
+    assert (views["mla.0"][0] == 1).all()
+    assert (views["idx.0"][0] == 2).all()
+
+
+def test_v41_mixed_cache_pages_preserve_request_partial_states(monkeypatch):
+    from vllm import envs
+    from vllm.models.deepseek_v41.nvidia.b12x.compressor import (
+        CompressorBackend,
+        CompressorStateCache,
+    )
+    from vllm.models.deepseek_v41.nvidia.b12x.sparse_mla import DeepseekV41B12xBackend
+    from vllm.v1.attention.backends.utils import (
+        get_supported_kv_cache_layouts,
+        resolve_kv_cache_layout,
+    )
+
+    monkeypatch.setattr(envs, "VLLM_KV_CACHE_LAYOUT", None)
+    vllm_config = _mock_vllm_config(None)
+    vllm_config.kv_transfer_config = None
+    vllm_config.compilation_config.static_forward_context = {}
+    vllm_config.speculative_config = None
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
+    vllm_config.scheduler_config.max_num_batched_tokens = 1024
+    vllm_config.max_in_flight_tokens = 1024
+    vllm_config.model_config.max_model_len = 32768
+    vllm_config.parallel_config.decode_context_parallel_size = 1
+    vllm_config.parallel_config.prefill_context_parallel_size = 1
+    partial = CompressorStateCache(vllm_config, "partial.0")
+    partial_spec = partial.get_kv_cache_spec(vllm_config)
+    specs = {
+        "swa": SlidingWindowMLASpec(
+            block_size=32,
+            num_kv_heads=1,
+            head_size=512,
+            state_content_bytes=528,
+            dtype=torch.uint8,
+            sliding_window=128,
+            alignment=None,
+        ),
+        "index": MLAAttentionSpec(
+            block_size=256,
+            num_kv_heads=1,
+            head_size=68,
+            state_content_bytes=68,
+            dtype=torch.uint8,
+            alignment=None,
+        ),
+        "main2": MLAAttentionSpec(
+            block_size=256,
+            num_kv_heads=1,
+            head_size=512,
+            state_content_bytes=288,
+            dtype=torch.uint8,
+            tokens_per_state=2,
+            alignment=None,
+        ),
+        "main1": MLAAttentionSpec(
+            block_size=256,
+            num_kv_heads=1,
+            head_size=512,
+            state_content_bytes=288,
+            dtype=torch.uint8,
+            alignment=None,
+        ),
+    }
+    supported = get_supported_kv_cache_layouts(
+        [DeepseekV41B12xBackend, CompressorBackend]
+    )
+    # Profiling resolves the backend preference before the full specs arrive.
+    layout = resolve_kv_cache_layout(vllm_config, [[item.name for item in supported]])
+    # Exercise the real group planner, not prebuilt groups that bypass its
+    # logical-block-size requirements.
+    groups = get_kv_cache_groups(
+        vllm_config,
+        {
+            **specs,
+            "partial.0": partial_spec,
+            "partial.1": partial_spec,
+        },
+    )
+    config = get_kv_cache_config_from_groups(vllm_config, groups, MEMORY)
+    views = _bind(config, layout.name)
+    blocks = {
+        name: group_id + 1
+        for group_id, group in enumerate(groups)
+        for name in group.layer_names
+    }
+    for view in views.values():
+        assert view.data_ptr() % 16 == 0
+        assert view.stride(0) * view.element_size() % 16 == 0
+    partial.bind_kv_cache(views["partial.0"])
+    partial_block = blocks["partial.0"]
+    partial.kv_cache[partial_block].fill_(4)
+    views["partial.1"][blocks["partial.1"]].fill_(5)
+    # Components sharing a block table coexist; independent groups own
+    # distinct block IDs. Ring rows must also retain independent values.
+    partial.kv_cache[partial_block, 1024:2048].fill_(7)
+    views["swa"][blocks["swa"]].fill_(17)
+    views["index"][blocks["index"]].fill_(23)
+    views["main2"][blocks["main2"]].fill_(31)
+    assert (partial.kv_cache[partial_block, :1024] == 4).all()
+    assert (partial.kv_cache[partial_block, 1024:2048] == 7).all()
+    assert (partial.kv_cache[partial_block, 2048:] == 4).all()
+    assert (views["partial.1"][blocks["partial.1"]] == 5).all()
+    assert (views["swa"][blocks["swa"]] == 17).all()
+    assert (views["index"][blocks["index"]] == 23).all()
+
+
+@pytest.mark.parametrize("swa_size", [None, 32, 64, 128])
+def test_v41_full_context_packs_shared_global_cache_without_page_inflation(swa_size):
+    from types import SimpleNamespace
+
+    from vllm.models.deepseek_v41.nvidia.b12x.attention import (
+        DeepseekV4Attention,
+        _Cache,
+    )
+    from vllm.models.deepseek_v41.nvidia.b12x.compressor import CompressorStateCache
+    from vllm.v1.core.kv_cache_utils import _max_memory_usage_bytes_from_groups
+
+    config = _mock_vllm_config("BLHNC")
+    config.cache_config.block_size = 256
+    config.cache_config.swa_block_size = swa_size
+    config.kv_transfer_config = None
+    config.compilation_config.static_forward_context = {}
+    config.speculative_config = None
+    config.scheduler_config.disable_hybrid_kv_cache_manager = False
+    config.scheduler_config.max_num_batched_tokens = 4096
+    config.max_in_flight_tokens = 8192
+    config.model_config.max_model_len = 1048576
+    config.parallel_config.decode_context_parallel_size = 1
+    config.parallel_config.prefill_context_parallel_size = 1
+    specs = {}
+    global_names: list[str] = []
+    for layer in range(43):
+        prefix = f"model.layers.{layer}.self_attn"
+        swa = _Cache(
+            config, prefix + ".swa_cache", kind="swa", window=128, draft=layer >= 40
+        )
+        specs[swa.prefix] = swa.get_kv_cache_spec(config)
+        assert specs[swa.prefix].block_size == (128 if swa_size is None else swa_size)
+        if layer not in (2, 8, 14, 20):
+            continue
+        ratio = 1 if layer == 20 else 2
+        specs[prefix] = DeepseekV4Attention.get_kv_cache_spec(
+            SimpleNamespace(is_kv_source=True, compress_ratio=ratio), config
+        )
+        index = _Cache(config, prefix + ".indexer.k_cache", kind="index", ratio=ratio)
+        specs[index.prefix] = index.get_kv_cache_spec(config)
+        global_names.extend((prefix, index.prefix))
+        if ratio == 2:
+            state = CompressorStateCache(config, prefix + ".compressor.state_cache")
+            specs[state.prefix] = state.get_kv_cache_spec(config)
+
+    groups = get_kv_cache_groups(config, specs)
+    # Global payload is 890 MiB at 1M. Allow bounded in-flight SWA/partial-state
+    # storage, but not the former 11.20 GiB largest-page allocation inflation.
+    required = _max_memory_usage_bytes_from_groups(config, groups)
+    assert required < 2 * 1024**3
+    global_groups = [
+        group for group in groups if set(group.layer_names).intersection(global_names)
+    ]
+    charged_global_bytes = sum(
+        _get_kv_cache_bytes_per_block(groups)
+        * (
+            (1048576 + group.kv_cache_spec.block_size - 1)
+            // group.kv_cache_spec.block_size
+        )
+        for group in global_groups
+    )
+    assert charged_global_bytes == 890 * 1024**2
+
+    allocation = get_kv_cache_config_from_groups(config, groups, MEMORY)
+    views = _bind(allocation, "BLHNC")
+    # All components of the shared global history coexist in one logical
+    # block; filling any component must not overwrite another component.
+    for value, name in enumerate(global_names, 1):
+        views[name][1].fill_(value)
+    for value, name in enumerate(global_names, 1):
+        assert (views[name][1] == value).all()

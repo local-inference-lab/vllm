@@ -40,7 +40,8 @@ class _PendingPublication:
     num_computed_tokens: int
     num_pages: int
     retention_interval: int | None
-    replay_boundaries: Sequence[int]
+    replay_boundaries: Sequence[int] | None
+    alignment_tokens: int | None = None
     detached_blocks: list[KVCacheBlock] | None = None
     num_cached_blocks: int = 0
 
@@ -490,7 +491,8 @@ class HiSparseCoordinator:
         num_computed_tokens: int,
         retention_interval: int | None,
         *,
-        replay_boundaries: Sequence[int],
+        replay_boundaries: Sequence[int] | None,
+        alignment_tokens: int | None = None,
     ) -> None:
         """Publish host-source hashes of the pages that are already durable."""
         manager = self.host_manager
@@ -503,6 +505,7 @@ class HiSparseCoordinator:
             num_pages=num_computed_tokens // manager.block_size,
             retention_interval=retention_interval,
             replay_boundaries=replay_boundaries,
+            alignment_tokens=alignment_tokens,
         )
         self._publish_host_blocks_if_ready(request_id)
 
@@ -529,6 +532,7 @@ class HiSparseCoordinator:
             num_tokens,
             retention_interval=publication.retention_interval,
             replay_boundaries=publication.replay_boundaries,
+            alignment_tokens=publication.alignment_tokens,
         )
         self._record_copies(request_id, num_tokens)
         if state.ready_prefix_pages >= publication.num_pages:
