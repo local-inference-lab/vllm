@@ -190,6 +190,12 @@ class ParserEngineToolAdapter(ToolParser):
     def skip_reasoning_parsing(self, value: bool) -> None:
         self._parser_engine.skip_reasoning_parsing = value
 
+    @property
+    def drops_whitespace_only_content(self) -> bool:
+        # Non-streaming output must match what streaming emits for the grammar.
+        config = self._parser_engine.parser_engine_config
+        return config.drop_whitespace_only_content_before_tools
+
     def adjust_request(
         self,
         request: ChatCompletionRequest | ResponsesRequest,

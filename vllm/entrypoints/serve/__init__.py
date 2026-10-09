@@ -50,6 +50,10 @@ def register_vllm_dev_api_routers(app: FastAPI):
 
     attach_cache_router(app)
 
+    from .dev.fairness.api_router import attach_router as attach_fairness_router
+
+    attach_fairness_router(app)
+
     from .dev.rpc.api_router import attach_router as attach_rpc_router
 
     attach_rpc_router(app)

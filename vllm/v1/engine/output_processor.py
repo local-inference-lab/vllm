@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -62,6 +63,8 @@ class RequestOutputCollector:
         self.request_id = request_id
         self.output: RequestOutput | PoolingRequestOutput | Exception | None = None
         self.ready = asyncio.Event()
+        # Wall-clock creation time; the request's inputs are processed by then.
+        self.created = time.time()
 
         self._input_stream_task: asyncio.Task | None = None
 

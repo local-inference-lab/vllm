@@ -15,9 +15,16 @@ models because:
      "ValueError: Unexpected tool call id ...".
 """
 
-import pytest
+import copy
 
-from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+import pytest
+from pydantic import ValidationError
+
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionRequest,
+    ChatCompletionToolsParam,
+)
+from vllm.exceptions import VLLMValidationError
 
 
 def _make_tool_call(tc_id: str, name: str, args: str) -> dict:
@@ -148,3 +155,226 @@ def test_multiple_tool_calls_materialised(num_tool_calls: int):
     # Verify after model_dump_json too
     _ = req.model_dump_json()
     assert len(assistant_msg.get("tool_calls", [])) == num_tool_calls
+
+
+@pytest.mark.parametrize("location", ["tool", "function"])
+@pytest.mark.parametrize("namespace", ["inventory", {"name": "inventory"}])
+@pytest.mark.parametrize("iterator", [False, True])
+@pytest.mark.parametrize("tools_collection", [list, tuple, iter])
+def test_namespaces_survive_definitions_choices_and_history(
+    location, namespace, iterator, tools_collection
+):
+    def qualify(item, value):
+        target = item if location == "tool" else item["function"]
+        target["namespace"] = value
+        return item
+
+    tools = [
+        qualify({"type": "function", "function": {"name": "lookup"}}, namespace),
+        qualify({"type": "function", "function": {"name": "lookup"}}, "billing"),
+    ]
+    calls = [qualify(_make_tool_call("call_1", "lookup", "{}"), namespace)]
+    payload = {
+        "model": "DeepSeek-V4.1-Flash",
+        "tools": tools,
+        "tool_choice": qualify(
+            {"type": "function", "function": {"name": "lookup"}}, namespace
+        ),
+        "messages": [
+            {"role": "user", "content": "Look up stock."},
+            {"role": "assistant", "content": None, "tool_calls": calls},
+        ],
+    }
+    original = copy.deepcopy(payload)
+    payload["tools"] = tools_collection(tools)
+    if iterator:
+        payload["messages"][1]["tool_calls"] = iter(calls)
+    request = ChatCompletionRequest.model_validate(payload)
+    assert [tool.function.name for tool in request.tools] == [
+        "inventory::lookup",
+        "billing::lookup",
+    ]
+    assert request.tool_choice.function.name == "inventory::lookup"
+    assert request.messages[1]["tool_calls"][0]["function"]["name"] == (
+        "inventory::lookup"
+    )
+    serialized = request.model_dump_json()
+    assert request.model_dump_json() == serialized
+    restored = ChatCompletionRequest.model_validate_json(serialized)
+    assert restored.model_dump_json() == serialized
+    if not iterator and tools_collection is list:
+        assert payload == original
+    assert tools == original["tools"]
+    assert calls == original["messages"][1]["tool_calls"]
+
+
+def test_namespace_description_is_preserved_exactly_once():
+    tool = {
+        "type": "function",
+        "namespace": {"name": "inventory", "description": "Stock operations."},
+        "function": {
+            "name": "inventory::lookup",
+            "description": "Find a SKU.",
+            "strict": True,
+        },
+    }
+    original = copy.deepcopy(tool)
+    parsed = ChatCompletionToolsParam.model_validate(tool)
+    assert parsed.function.name == "inventory::lookup"
+    assert parsed.function.description == "Stock operations.\nFind a SKU."
+    assert parsed.function.strict is True
+    assert tool == original
+    assert ChatCompletionToolsParam.model_validate(
+        parsed.model_dump()
+    ).model_dump() == (parsed.model_dump())
+
+
+@pytest.mark.parametrize("collection", [list, tuple])
+def test_iterable_history_preserves_namespaced_tool_identity(collection):
+    call = _make_tool_call("call_history", "lookup", "{}")
+    call["namespace"] = "inventory"
+    messages = [{"role": "assistant", "content": None, "tool_calls": [call]}]
+    original = copy.deepcopy(messages)
+    request = ChatCompletionRequest.model_validate(
+        {"model": "test-model", "messages": collection(messages)}
+    )
+    assert request.messages[0]["tool_calls"][0]["function"]["name"] == (
+        "inventory::lookup"
+    )
+    serialized = request.model_dump_json()
+    restored = ChatCompletionRequest.model_validate_json(serialized)
+    assert restored.messages[0]["tool_calls"][0]["function"]["name"] == (
+        "inventory::lookup"
+    )
+    assert request.model_dump_json() == serialized
+    assert messages == original
+
+
+@pytest.mark.parametrize("messages", ["text", b"text", bytearray(b"text"), {}])
+def test_invalid_history_collection_remains_a_client_error(messages):
+    with pytest.raises(ValidationError) as error:
+        ChatCompletionRequest.model_validate(
+            {"model": "test-model", "messages": messages}
+        )
+    assert any(item["loc"] == ("messages",) for item in error.value.errors())
+
+
+@pytest.mark.parametrize("tool_calls", [1, False, 1.5])
+def test_invalid_tool_calls_shape_reports_the_field(tool_calls):
+    with pytest.raises(ValidationError) as error:
+        _make_request(
+            [{"role": "assistant", "content": None, "tool_calls": tool_calls}]
+        )
+    assert any("tool_calls" in item["loc"] for item in error.value.errors())
+
+
+@pytest.mark.parametrize(
+    "outer, inner, expected",
+    [
+        (None, "Stock operations.", "Stock operations.\nFind a SKU."),
+        ("Outer description.", "Inner description.", "Outer description.\nFind a SKU."),
+        ("", "Inner description.", "Find a SKU."),
+    ],
+)
+def test_consistent_namespaces_preserve_first_non_null_description(
+    outer, inner, expected
+):
+    tool = {
+        "type": "function",
+        "namespace": {"name": "inventory", "description": outer},
+        "function": {
+            "name": "lookup",
+            "namespace": {"name": "inventory", "description": inner},
+            "description": "Find a SKU.",
+        },
+    }
+    original = copy.deepcopy(tool)
+    parsed = ChatCompletionToolsParam.model_validate(tool)
+    assert parsed.function.name == "inventory::lookup"
+    assert parsed.function.description == expected
+    assert tool == original
+    assert ChatCompletionToolsParam.model_validate(parsed.model_dump()) == parsed
+
+
+@pytest.mark.parametrize("tool_choice", ["none", "auto", "required"])
+@pytest.mark.parametrize(
+    "namespace, name",
+    [
+        ("inventory", "billing::lookup"),
+        ("a::b", "lookup"),
+        ("", "lookup"),
+        ({}, "lookup"),
+        ({"name": 7}, "lookup"),
+        (False, "lookup"),
+        ("inventory", "inventory::x::lookup"),
+        ("inventory", "inventory::"),
+    ],
+)
+def test_invalid_namespaces_are_client_errors(namespace, name, tool_choice):
+    with pytest.raises(ValidationError, match="[Nn]amespace"):
+        ChatCompletionRequest.model_validate(
+            {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "namespace": namespace,
+                        "function": {"name": name},
+                    }
+                ],
+                "tool_choice": tool_choice,
+            }
+        )
+
+
+def test_conflicting_namespace_locations_are_rejected():
+    with pytest.raises(ValidationError, match="Conflicting tool namespaces"):
+        ChatCompletionToolsParam.model_validate(
+            {
+                "type": "function",
+                "namespace": "inventory",
+                "function": {"name": "lookup", "namespace": "billing"},
+            }
+        )
+
+
+def test_consistent_namespace_locations_do_not_duplicate_the_prefix():
+    parsed = ChatCompletionToolsParam.model_validate(
+        {
+            "type": "function",
+            "namespace": {"name": "inventory"},
+            "function": {"name": "inventory::lookup", "namespace": "inventory"},
+        }
+    )
+    assert parsed.function.name == "inventory::lookup"
+
+
+def test_conflicting_history_namespace_is_not_silently_dropped():
+    call = _make_tool_call("call_a", "inventory::lookup", "{}")
+    call["namespace"] = "billing"
+    with pytest.raises(ValidationError, match="Conflicting tool namespaces"):
+        _make_request([{"role": "assistant", "content": None, "tool_calls": [call]}])
+
+
+def test_bare_choice_cannot_select_a_namespaced_tool():
+    with pytest.raises(VLLMValidationError, match="does not match"):
+        ChatCompletionRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "lookup"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "namespace": "inventory",
+                        "function": {"name": "lookup"},
+                    }
+                ],
+                "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+            }
+        )
+
+
+def test_plain_and_already_qualified_names_keep_their_spelling():
+    for name in ("lookup", "inventory::lookup", "opaque::legacy::name"):
+        tool = {"type": "function", "function": {"name": name}}
+        assert ChatCompletionToolsParam.model_validate(tool).function.name == name

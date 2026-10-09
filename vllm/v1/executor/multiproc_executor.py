@@ -19,6 +19,7 @@ from functools import partial
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from multiprocessing.synchronize import Lock as LockType
+from multiprocessing.util import Finalize
 from threading import Thread
 from typing import Any, cast
 
@@ -28,7 +29,11 @@ import torch
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import destroy_distributed_environment, destroy_model_parallel
-from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
+from vllm.distributed.device_communicators.shm_broadcast import (
+    LONG_WAIT_TIME_LOG_MSG,
+    Handle,
+    MessageQueue,
+)
 from vllm.distributed.ec_transfer.ec_connector.utils import ECOutputAggregator
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.distributed.parallel_state import (
@@ -75,6 +80,116 @@ from vllm.v1.worker.worker_base import WorkerWrapperBase
 logger = init_logger(__name__)
 
 
+# How long a gather parks on one queue's notification before checking every
+# other queue it waits on again.
+RESPONSE_WAIT_SLICE_MS = 50
+
+
+def _check_response(rank: int, status: Any, result: Any) -> Any:
+    if status != WorkerProc.ResponseStatus.SUCCESS:
+        raise RuntimeError(
+            f"Worker {rank} failed with error '{result}', please check the"
+            " stack trace above for the root cause"
+        )
+    return result
+
+
+def _gather_responses(
+    response_mqs: Sequence[MessageQueue],
+    ranks: Sequence[int],
+    deadline: float | None,
+    method: str,
+    watched: Sequence[tuple[int, MessageQueue]] = (),
+    held: dict[int, deque[tuple[Any, Any]]] | None = None,
+) -> list[Any]:
+    """Collect one reply per queue, failing as soon as any rank reports one.
+
+    Reading the queues in rank order let a failure on one rank sit unread
+    while an earlier rank waited forever, for example in a collective the
+    failed rank would never join: TP1's CUDA graph capture fails, TP0 hangs
+    in the next all-reduce, and the engine waits on TP0 with TP1's error in
+    its queue. ``watched`` are the other ranks of a single-rank RPC such as
+    ``execute_model``: they reply only when they fail, and the output rank is
+    then blocked in a collective the failed rank has left, so a failure from
+    one of them ends the wait with its error.
+
+    A success from a watched rank answers a later RPC that rank has already
+    run: with the batch queue, the engine sends a collective RPC such as
+    ``wait_for_boundary_checkpoint_copies`` before it has gathered the replies
+    of earlier single-rank RPCs. Such a reply is kept in ``held``, per rank in
+    arrival order, and the gather of the RPC it answers takes it first.
+
+    Every queue is checked without consuming anything, and a reply is read
+    only once it has arrived, then with the RPC's own deadline. Between checks
+    the gather waits on the oldest pending queue the way a blocking read does:
+    spinning while replies are frequent, otherwise parked on its notification
+    for at most RESPONSE_WAIT_SLICE_MS.
+    """
+    if held is None:
+        held = {}
+
+    def remaining() -> float | None:
+        if deadline is None:
+            return None
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError(f"RPC call to {method} timed out.")
+        return left
+
+    if len(response_mqs) == 1 and not watched:
+        if replies := held.get(ranks[0]):
+            status, result = replies.popleft()
+        else:
+            try:
+                status, result = response_mqs[0].dequeue(timeout=remaining())
+            except TimeoutError as e:
+                raise TimeoutError(f"RPC call to {method} timed out.") from e
+        return [_check_response(ranks[0], status, result)]
+
+    responses: list[Any] = [None] * len(response_mqs)
+    pending = list(range(len(response_mqs)))
+    # A blocking read logs the long-wait message every interval; the waits
+    # here are sliced, so log it the same way, since operators watch for it.
+    started, warnings = time.monotonic(), 0
+    interval = envs.VLLM_RINGBUFFER_WARNING_INTERVAL
+    while pending:
+        progressed = False
+        for index in list(pending):
+            if replies := held.get(ranks[index]):
+                status, result = replies.popleft()
+            else:
+                # ready() never consumes, so a reply is only read once it has
+                # arrived, and then with the RPC's own deadline.
+                if not response_mqs[index].ready():
+                    continue
+                try:
+                    status, result = response_mqs[index].dequeue(timeout=remaining())
+                except TimeoutError as e:
+                    raise TimeoutError(f"RPC call to {method} timed out.") from e
+            responses[index] = _check_response(ranks[index], status, result)
+            pending.remove(index)
+            progressed = True
+        for rank, mq in watched:
+            if not mq.ready():
+                continue
+            try:
+                status, result = mq.dequeue(timeout=remaining())
+            except TimeoutError as e:
+                raise TimeoutError(f"RPC call to {method} timed out.") from e
+            _check_response(rank, status, result)
+            held.setdefault(rank, deque()).append((status, result))
+        if pending and not progressed:
+            left = remaining()  # raises once the deadline has passed
+            if time.monotonic() - started >= interval * (warnings + 1):
+                warnings += 1
+                logger.info(LONG_WAIT_TIME_LOG_MSG, interval)
+            wait_ms = RESPONSE_WAIT_SLICE_MS
+            if left is not None:
+                wait_ms = max(1, min(wait_ms, int(left * 1000)))
+            response_mqs[pending[0]].wait_for_message(wait_ms)
+    return responses
+
+
 class FutureWrapper(Future):
     def __init__(
         self,
@@ -115,10 +230,22 @@ class MultiprocExecutor(Executor):
         self.monitor_workers = monitor_workers
         super().__init__(vllm_config)
 
-    def _init_executor(self) -> None:
+    def _register_exit_shutdown(self) -> None:
+        """Shut the workers down when this process exits, however it exits."""
         # Call self.shutdown at exit to clean up
         # and ensure workers will be terminated.
         self._finalizer = weakref.finalize(self, self.shutdown)
+        # Workers are not daemons (their startup compilers may fork), so the
+        # multiprocessing exit handler joins them. If this process exits
+        # without shutting the executor down, e.g. an EngineCore whose
+        # startup failed after the workers started, that join waits forever
+        # on workers that are waiting for this process. Finalizers with an
+        # exit priority run before the join; the weakref finalizer above only
+        # runs at interpreter exit, which a multiprocessing child skips.
+        Finalize(self, self.shutdown, exitpriority=0)
+
+    def _init_executor(self) -> None:
+        self._register_exit_shutdown()
         self.is_failed = False
         self.failure_callback: FailureCallback | None = None
 
@@ -249,6 +376,8 @@ class MultiprocExecutor(Executor):
                 response_mq.wait_until_ready()
 
             self.futures_queue = deque[FutureWrapper]()
+            # Replies gathered ahead of the RPC they answer, by rank.
+            self.held_replies: dict[int, deque[tuple[Any, Any]]] = {}
 
             self._post_init_executor()
 
@@ -426,25 +555,23 @@ class MultiprocExecutor(Executor):
         self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
 
         response_mqs: Sequence[MessageQueue] = self.response_mqs
+        ranks: Sequence[int] = range(len(response_mqs))
+        watched: Sequence[tuple[int, MessageQueue]] = ()
         if output_rank is not None:
+            # The other ranks reply only if they fail; watch them so a failure
+            # does not wait out the RPC timeout behind the output rank.
+            watched = [
+                (rank, mq)
+                for rank, mq in enumerate(response_mqs)
+                if rank != output_rank
+            ]
             response_mqs = (response_mqs[output_rank],)
+            ranks = (output_rank,)
 
         def get_response():
-            responses = []
-            for mq in response_mqs:
-                dequeue_timeout = (
-                    None if deadline is None else max(0.0, deadline - time.monotonic())
-                )
-                try:
-                    status, result = mq.dequeue(timeout=dequeue_timeout)
-                except TimeoutError as e:
-                    raise TimeoutError(f"RPC call to {method} timed out.") from e
-                if status != WorkerProc.ResponseStatus.SUCCESS:
-                    raise RuntimeError(
-                        f"Worker failed with error '{result}', please check the"
-                        " stack trace above for the root cause"
-                    )
-                responses.append(result)
+            responses = _gather_responses(
+                response_mqs, ranks, deadline, str(method), watched, self.held_replies
+            )
             return responses[0] if output_rank is not None else responses
 
         future = FutureWrapper(
@@ -744,7 +871,9 @@ class WorkerProc:
             target=WorkerProc.worker_main,
             kwargs=process_kwargs,
             name=f"VllmWorker-{rank}",
-            daemon=True,
+            # Worker-owned startup compilers may use child processes. The
+            # executor and death pipe already own worker lifetime and cleanup.
+            daemon=False,
         )
 
         # Apply NUMA binding if configured
@@ -1061,9 +1190,11 @@ class WorkerProc:
                 e.add_note(traceback.format_exc())
             logger.exception("WorkerProc hit an exception.")
             # enqueue_output converts the exception to a FAILURE response
-            # containing its string representation before transport.
-            if output_rank is None or self.rank == output_rank:
-                self.handle_output(e)
+            # containing its string representation before transport. A rank
+            # that does not own the reply sends it too: its peers may be
+            # blocked in a collective it has left, so the output rank would
+            # never answer, and the executor watches every rank for this.
+            self.handle_output(e)
 
     @staticmethod
     def setup_proc_title_and_log_prefix(enable_ep: bool) -> None:

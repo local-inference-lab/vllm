@@ -65,6 +65,11 @@ class ToolParser:
     default_tool_strict_level: ToolStrictLevel | None = None
     engine_based_streaming: bool = False
 
+    @property
+    def drops_whitespace_only_content(self) -> bool:
+        """Whether whitespace-only content before tool calls becomes None."""
+        return True
+
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         if (

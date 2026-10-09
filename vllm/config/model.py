@@ -92,6 +92,7 @@ TokenizerMode = Literal[
     "mistral",
     "deepseek_v32",
     "deepseek_v4",
+    "deepseek_v41",
     "inkling",
     "kimi_k3",
     "cohere",
@@ -1386,16 +1387,19 @@ class ModelConfig:
                 "awq_marlin",
                 "inc",
                 "moe_wna16",
+                "exl3",
                 "modelopt",
                 "modelopt_fp4",
                 "modelopt_mxfp8",
                 "mxfp8",
                 "modelopt_mixed",
+                "mxfp4_csf",
                 # Ensure heavy backends are probed last to avoid unnecessary
                 # imports during override detection (e.g., MXFP4 imports Triton)
                 "mxfp4",
                 "gpt_oss_mxfp4",
                 "deepseek_v4_fp8",
+                "deepseek_v41_fp8",
                 "humming",
             ]
             # if the user specifies humming, we should always use humming
@@ -1503,6 +1507,19 @@ class ModelConfig:
         if cls is not None:
             cls.verify_and_update_model_config(self)
 
+    def _update_model_config_for_parallelism(
+        self, parallel_config: ParallelConfig
+    ) -> None:
+        architecture = self.architecture
+        if architecture is None:
+            return
+
+        from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+
+        config = MODELS_CONFIG_MAP.get(architecture)
+        if config is not None:
+            config.update_model_config_for_parallelism(self, parallel_config)
+
     def verify_dual_chunk_attention_config(
         self,
         load_config: LoadConfig,
@@ -1530,6 +1547,7 @@ class ModelConfig:
         self,
         parallel_config: ParallelConfig,
     ) -> None:
+        self._update_model_config_for_parallelism(parallel_config)
         total_num_attention_heads = self.model_arch_config.total_num_attention_heads
         tensor_parallel_size = parallel_config.tensor_parallel_size
         if total_num_attention_heads % tensor_parallel_size != 0:
@@ -1554,7 +1572,15 @@ class ModelConfig:
         decode_context_parallel_size = parallel_config.decode_context_parallel_size
         if decode_context_parallel_size > 1 and not self.use_mla:
             total_num_kv_heads = self.get_total_num_kv_heads()
-            if tensor_parallel_size <= total_num_kv_heads:
+            supports_full_tp_dcp = bool(
+                getattr(
+                    self.hf_text_config,
+                    "supports_full_tp_dcp_with_kv_gather",
+                    False,
+                )
+                and decode_context_parallel_size == tensor_parallel_size
+            )
+            if tensor_parallel_size <= total_num_kv_heads and not supports_full_tp_dcp:
                 raise ValueError(
                     "Decode context parallelism for GQA/MQA requires "
                     f"`--tensor-parallel-size` ({tensor_parallel_size}) to be "
@@ -1564,7 +1590,7 @@ class ModelConfig:
                 )
 
             max_dcp_size = tensor_parallel_size // total_num_kv_heads
-            if decode_context_parallel_size > max_dcp_size:
+            if decode_context_parallel_size > max_dcp_size and not supports_full_tp_dcp:
                 raise ValueError(
                     "`--decode-context-parallel-size` "
                     f"({decode_context_parallel_size}) exceeds the maximum "
@@ -2046,8 +2072,12 @@ class ModelConfig:
 
         # Bidirectional DeepSeek variants (is_causal=False, used by some
         # embedding models) must use the non-MLA attention path, since the
-        # MLA kernels only support causal attention.
-        if not getattr(self.hf_text_config, "is_causal", True):
+        # ordinary MLA path only supports causal attention. Kimi-K3 DFlash2
+        # supplies a separate non-causal block-query implementation.
+        if (
+            not getattr(self.hf_text_config, "is_causal", True)
+            and "DFlash2KimiK3Model" not in self.architectures
+        ):
             return False
         return self.is_deepseek_mla
 

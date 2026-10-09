@@ -1216,6 +1216,19 @@ def launch_core_engines(
     # API servers and engine core. Returns a single queue since we only support
     # DP=1 for this data flow.
     tensor_queue: Queue | None = None
+    if parallel_config.data_parallel_mode == "independent":
+        if offline_mode:
+            raise ValueError(
+                "Independent data parallelism does not support offline SPMD."
+            )
+        logger.info(
+            "Launching %d independent replicas with execution TP=%d, PP=%d, "
+            "PCP=%d, DP=1 per replica; load statistics only across replicas.",
+            dp_size,
+            parallel_config.tensor_parallel_size,
+            parallel_config.pipeline_parallel_size,
+            parallel_config.prefill_context_parallel_size,
+        )
     multimodal_config = vllm_config.model_config.multimodal_config
     if multimodal_config is not None and multimodal_config.mm_tensor_ipc == "torch_shm":
         tensor_queue = get_mp_context().Queue()
@@ -1231,7 +1244,7 @@ def launch_core_engines(
     if run_coordinator:
         coordinator = DPCoordinator(
             parallel_config,
-            enable_wave_coordination=vllm_config.model_config.is_moe,
+            enable_wave_coordination=vllm_config.uses_coordinated_dp,
             logging_config=vllm_config.logging_config,
         )
 
@@ -1352,7 +1365,7 @@ def launch_core_engines(
             handshake_socket,
             engines_to_handshake,
             parallel_config,
-            dp_size > 1 and vllm_config.model_config.is_moe,
+            vllm_config.uses_coordinated_dp,
             vllm_config.cache_config,
             launch,
         )

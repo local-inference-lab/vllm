@@ -75,6 +75,7 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine.stall_diagnostics import EngineLoopWatchdog
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -149,7 +150,8 @@ class EngineCore:
             self._eep_scale_up_before_kv_init()
 
         # Setup KV Caches and update CacheConfig after profiling.
-        kv_cache_config = self._initialize_kv_caches(vllm_config)
+        with self.model_executor.b12x_warmup_control():
+            kv_cache_config = self._initialize_kv_caches(vllm_config)
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
         # Setup scheduler.
@@ -214,11 +216,20 @@ class EngineCore:
         # to eliminate pipeline bubbles.
         self.batch_queue_size = vllm_config.max_concurrent_batches
         self.batch_queue: (
-            deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
+            deque[
+                tuple[
+                    Future[ModelRunnerOutput],
+                    SchedulerOutput,
+                    Future[Any],
+                    float | None,
+                ]
+            ]
+            | None
         ) = None
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
+        self._last_model_completion_time: float | None = None
 
         self.is_mm_encoder_only = vllm_config.is_mm_encoder_only
         self.is_pooling_model = vllm_config.model_config.runner_type == "pooling"
@@ -637,9 +648,71 @@ class EngineCore:
             eco.scheduler_stats.iteration_details = iteration_details
 
     def _should_throttle_prefills(self) -> bool:
-        """Whether to defer new prefills this step (DP prefill balancing).
-        Overridden by the DP engine core; never throttles otherwise."""
-        return False
+        """Defer prefills on non-cadence steps in a non-DP engine.
+
+        ``Scheduler.current_step`` counts completed scheduling decisions. A
+        value divisible by the configured interval therefore releases prefill
+        work on the next decision, including the first decision after startup.
+        The data-parallel engine overrides this method with a counter that is
+        synchronized across DP ranks.
+        """
+        interval = self.vllm_config.scheduler_config.prefill_schedule_interval
+        if interval <= 1:
+            return False
+        current_step = getattr(self.scheduler, "current_step", None)
+        if (
+            not isinstance(current_step, int)
+            or isinstance(current_step, bool)
+            or current_step < 0
+        ):
+            raise RuntimeError(
+                "prefill_schedule_interval greater than one requires "
+                "scheduler.current_step to be a non-negative integer that "
+                "advances once per schedule() call"
+            )
+        return current_step % interval != 0
+
+    def _execute_model(
+        self, scheduler_output: SchedulerOutput
+    ) -> tuple[Future[Any], float | None]:
+        started_at = (
+            time.perf_counter() if scheduler_output.compute_timing_enabled else None
+        )
+        future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        return future, started_at
+
+    def _record_compute_time(
+        self,
+        scheduler_output: SchedulerOutput,
+        started_at: float | None,
+    ) -> None:
+        if started_at is None:
+            return
+        completed_at = time.perf_counter()
+
+        # Multiple batches can already be queued on the executor when this
+        # batch is dispatched. Attribute only the wall-clock interval this
+        # completion adds after the previous batch, rather than charging the
+        # same executor queue residency to every in-flight batch.
+        previous_completion = self._last_model_completion_time
+        service_started_at = started_at
+        if previous_completion is not None:
+            service_started_at = max(service_started_at, previous_completion)
+        elapsed_seconds = max(completed_at - service_started_at, 0.0)
+        self._last_model_completion_time = (
+            completed_at
+            if previous_completion is None
+            else max(completed_at, previous_completion)
+        )
+        service_class = scheduler_output.compute_service_class
+        if service_class is None:
+            return
+        self.scheduler.record_compute_time(
+            service_class,
+            elapsed_seconds,
+            contended=scheduler_output.compute_contention,
+            scheduled_tokens=scheduler_output.compute_service_tokens,
+        )
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
@@ -652,7 +725,7 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-        future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        future, execution_timing = self._execute_model(scheduler_output)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
@@ -661,9 +734,11 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+            self._record_compute_time(scheduler_output, execution_timing)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
+        self._wait_for_boundary_checkpoint_copies(model_output)
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
@@ -680,6 +755,17 @@ class EngineCore:
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
+
+    def _wait_for_boundary_checkpoint_copies(
+        self, model_output: ModelRunnerOutput
+    ) -> None:
+        if model_output.boundary_checkpoint_tokens is not None:
+            # Bounded like execute_model: a wedged copy stream ends the engine
+            # instead of stalling the step loop forever.
+            self.model_executor.collective_rpc(
+                "wait_for_boundary_checkpoint_copies",
+                timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+            )
 
     def step_with_batch_queue(
         self,
@@ -707,12 +793,11 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
+        deferred_execution_timing = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
             with self.log_error_detail(scheduler_output):
-                exec_future = self.model_executor.execute_model(
-                    scheduler_output, non_block=True
-                )
+                exec_future, execution_timing = self._execute_model(scheduler_output)
             if not self.is_mm_encoder_only:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
@@ -733,16 +818,26 @@ class EngineCore:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
+                    deferred_execution_timing = execution_timing
 
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
-                batch_queue.appendleft((future, scheduler_output, exec_future))
+                batch_queue.appendleft(
+                    (future, scheduler_output, exec_future, execution_timing)
+                )
                 if len(batch_queue) < self.batch_queue_size and (
                     model_executed or self.scheduler.has_requests()
                 ):
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
                     return None, model_executed
+            elif not batch_queue:
+                # Only this step's drafts are outstanding (no prior output is in
+                # flight), so hand them back and sample now.
+                self._sample_deferred_batch(
+                    deferred_scheduler_output, exec_future, deferred_execution_timing
+                )
+                return None, model_executed
 
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should
@@ -751,12 +846,22 @@ class EngineCore:
             return None, False
 
         # Block until the next result is available.
-        future, scheduler_output, exec_model_fut = batch_queue.pop()
+        future, scheduler_output, exec_model_fut, execution_timing = batch_queue.pop()
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
             model_output = future.result()
+            if execution_timing is None:
+                successor_timing = (
+                    batch_queue[-1][3] if batch_queue else deferred_execution_timing
+                )
+                if successor_timing is not None:
+                    # A timed successor was dispatched before this untimed
+                    # batch completed. Exclude that queue residency without
+                    # timing transfers or uncontended execution on their own.
+                    self._last_model_completion_time = time.perf_counter()
+            self._record_compute_time(scheduler_output, execution_timing)
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
@@ -765,6 +870,7 @@ class EngineCore:
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
+        self._wait_for_boundary_checkpoint_copies(model_output)
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
@@ -775,26 +881,38 @@ class EngineCore:
         # in a field and do it immediately once step_with_batch_queue is
         # re-called. The latter slightly favors TTFT over TPOT/throughput.
         if deferred_scheduler_output:
-            # When draft tokens are used with structured output, validate them
-            # before computing the grammar bitmask for the deferred request.
-            if self.check_for_draft_tokens:
-                draft_token_ids = self.model_executor.take_draft_token_ids()
-                if draft_token_ids is not None:
-                    # Update the draft token ids in the scheduler output to
-                    # filter out the invalid spec tokens, which will be padded
-                    # with -1 and skipped by the grammar bitmask computation.
-                    self.scheduler.update_draft_token_ids_in_output(
-                        draft_token_ids, deferred_scheduler_output
-                    )
-            # We now have the tokens needed to compute the bitmask for the
-            # deferred request. Get the bitmask and call sample tokens.
-            grammar_output = self.scheduler.get_grammar_bitmask(
-                deferred_scheduler_output
+            self._sample_deferred_batch(
+                deferred_scheduler_output, exec_future, deferred_execution_timing
             )
-            future = self.model_executor.sample_tokens(grammar_output, non_block=True)
-            batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
         return engine_core_outputs, model_executed
+
+    def _sample_deferred_batch(
+        self,
+        scheduler_output: SchedulerOutput,
+        exec_future: Future[Any],
+        execution_timing: float | None,
+    ) -> None:
+        """Back-fill the step's drafts, build its bitmask and queue sampling."""
+        assert self.batch_queue is not None
+        # When draft tokens are used with structured output, validate them
+        # before computing the grammar bitmask for the deferred request.
+        if self.check_for_draft_tokens:
+            draft_token_ids = self.model_executor.take_draft_token_ids()
+            if draft_token_ids is not None:
+                # Update the draft token ids in the scheduler output to
+                # filter out the invalid spec tokens, which will be padded
+                # with -1 and skipped by the grammar bitmask computation.
+                self.scheduler.update_draft_token_ids_in_output(
+                    draft_token_ids, scheduler_output
+                )
+        # We now have the tokens needed to compute the bitmask for the
+        # deferred request. Get the bitmask and call sample tokens.
+        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        future = self.model_executor.sample_tokens(grammar_output, non_block=True)
+        self.batch_queue.appendleft(
+            (future, scheduler_output, exec_future, execution_timing)
+        )
 
     def _process_aborts_queue(self):
         if not self.aborts_queue.empty():
@@ -859,6 +977,22 @@ class EngineCore:
         return self.scheduler.reset_prefix_cache(
             reset_running_requests, reset_connector
         )
+
+    def get_prefill_fairness(self) -> dict[str, Any]:
+        return self.scheduler.get_prefill_fairness()
+
+    def set_prefill_fairness(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Apply a fairness policy atomically between scheduler steps."""
+        try:
+            updated = self.scheduler.set_prefill_fairness(config)
+        except (TypeError, ValueError) as exc:
+            return {
+                "applied": False,
+                "reason": "invalid",
+                "message": str(exc),
+                "config": self.scheduler.get_prefill_fairness(),
+            }
+        return {"applied": True, "config": updated}
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
@@ -1131,6 +1265,15 @@ class EngineCoreProc(EngineCore):
     ):
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
         self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
+        # Monotonic time at which the input thread queued each ADD request
+        # that the loop has not handled yet.
+        self._add_received: dict[str, float] = {}
+        self._stall_warning_s = envs.VLLM_REQUEST_STALL_WARNING_S
+        self._loop_watchdog = (
+            EngineLoopWatchdog(self._stall_warning_s)
+            if self._stall_warning_s > 0
+            else None
+        )
         executor_fail_callback = lambda: self.input_queue.put_nowait(
             (EngineCoreRequestType.EXECUTOR_FAILED, b"")
         )
@@ -1455,12 +1598,12 @@ class EngineCoreProc(EngineCore):
             signal.signal(signal.SIGINT, signal_handler)
 
             parallel_config.data_parallel_index = dp_rank
-            if data_parallel and vllm_config.model_config.is_moe:
+            if vllm_config.uses_coordinated_dp:
                 # Set data parallel rank for this engine process.
                 parallel_config.data_parallel_rank = dp_rank
                 engine_core = DPEngineCoreProc(*args, **kwargs)
             else:
-                # Non-MoE DP ranks are completely independent, so treat like DP=1.
+                # Independent replicas execute with DP=1, including MoE layers.
                 # Note that parallel_config.data_parallel_index will still reflect
                 # the original DP rank.
                 parallel_config.reconfigure_for_independent_dp_rank()
@@ -1528,6 +1671,12 @@ class EngineCoreProc(EngineCore):
         """Returns true if shutdown has not been requested."""
         return self.shutdown_state == EngineShutdownState.RUNNING
 
+    def shutdown(self):
+        # Teardown is not a loop step; do not report it as a stalled one.
+        if self._loop_watchdog is not None:
+            self._loop_watchdog.stop()
+        super().shutdown()
+
     @fault_tolerant_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
@@ -1569,6 +1718,8 @@ class EngineCoreProc(EngineCore):
                     logger.debug("EngineCore waiting for work.")
                     waited = True
             block = self.process_input_queue_block
+            if block and self._loop_watchdog is not None:
+                self._loop_watchdog.idle()
             try:
                 req = self.input_queue.get(block=block)
                 self._handle_client_request(*req)
@@ -1587,6 +1738,8 @@ class EngineCoreProc(EngineCore):
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
+        if self._loop_watchdog is not None:
+            self._loop_watchdog.busy("engine step")
         # Step the engine core.
         outputs, model_executed = self.step_fn()
         # Put EngineCoreOutputs into the output queue.
@@ -1660,10 +1813,28 @@ class EngineCoreProc(EngineCore):
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
         """Dispatch request from client."""
+        if self._loop_watchdog is not None:
+            self._loop_watchdog.busy(
+                f"{request[2]} utility call"
+                if request_type == EngineCoreRequestType.UTILITY
+                else f"{request_type.name} client request"
+            )
         if request_type == EngineCoreRequestType.WAKEUP:
             return
         elif request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
+            received = self._add_received.pop(req.request_id, None)
+            if (
+                received is not None
+                and self._stall_warning_s > 0
+                and (waited := time.monotonic() - received) > self._stall_warning_s
+            ):
+                logger.warning(
+                    "Request %s waited %.1f s in the engine-core input queue "
+                    "before the scheduler received it",
+                    req.request_id,
+                    waited,
+                )
             if self._reject_add_in_shutdown(req):
                 return
             self.add_request(req, request_wave)
@@ -1912,6 +2083,8 @@ class EngineCoreProc(EngineCore):
                             # aborting in the scheduler is idempotent.
                             self.aborts_queue.put_nowait(request)
 
+                    if request_type == EngineCoreRequestType.ADD:
+                        self._add_received[request[0].request_id] = time.monotonic()
                     # Push to input queue for core busy loop.
                     self.input_queue.put_nowait((request_type, request))
 

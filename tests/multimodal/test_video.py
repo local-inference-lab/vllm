@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 import numpy.typing as npt
+import pybase64 as base64
 import pytest
 import torch
 from transformers import AutoVideoProcessor, Qwen3VLVideoProcessor
@@ -18,6 +19,7 @@ from transformers.video_utils import VideoMetadata
 
 from vllm.assets.base import get_vllm_public_assets
 from vllm.models.minimax_m3.common.mm_preprocess import MiniMaxM3VideoBackend
+from vllm.multimodal.media import MediaConnector
 from vllm.multimodal.video import (
     PYNVVIDEOCODEC_VIDEO_BACKEND,
     VIDEO_LOADER_REGISTRY,
@@ -759,6 +761,76 @@ def test_qwen3_vl_unknown_source_fps_matches_hf(
     assert (
         Qwen3VLVideoBackend.compute_frames_index_to_sample(source, target) == hf_indices
     )
+
+
+def test_glm5next_raw_video_uses_fps_interval_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    from vllm.transformers_utils.processors.glm5next import (
+        glm_sample_frame_indices,
+    )
+
+    for processor_name in ("Glm5NextVideoProcessor", "Glm5nextVideoProcessor"):
+        assert get_video_loader_backend_for_processor(processor_name) == "glm5next"
+
+    (tmp_path / "processor_config.json").write_text(
+        '{"processor_class":"Glm5NextProcessor",'
+        '"video_processor":{"video_processor_type":"Glm5NextVideoProcessor"}}'
+    )
+    (tmp_path / "config.json").write_text('{"model_type":"glm5_next"}')
+    processor_name = get_video_processor_cls_name_from_config(str(tmp_path))
+    assert processor_name == "Glm5NextVideoProcessor"
+
+    total_frames, fps = 60, 10
+    video_bytes = b"encoded-glm-video"
+    expected = glm_sample_frame_indices(total_frames, float(fps), 6.0)
+
+    def fake_decode_video(
+        backend,
+        loader_cls,
+        data,
+        target,
+        sampling_kwargs,
+        backend_kwargs,
+        *,
+        frame_recovery,
+    ):
+        assert backend == "opencv"
+        assert loader_cls is Glm5NextVideoBackend
+        assert data == video_bytes
+        assert not backend_kwargs
+        assert frame_recovery is False
+        source = VideoSourceMetadata(total_frames, float(fps), 6.0)
+        indices = loader_cls.compute_frames_index_to_sample(
+            source,
+            target,
+            **sampling_kwargs,
+        )
+        frames = np.zeros((len(indices), 1, 1, 3), dtype=np.uint8)
+        return frames, source, indices, indices
+
+    monkeypatch.setattr("vllm.multimodal.video.decode_video", fake_decode_video)
+
+    frames_from_bytes, metadata_from_bytes = Glm5NextVideoBackend.load_bytes(
+        video_bytes
+    )
+    data_url = "data:video/mp4;base64," + base64.b64encode(video_bytes).decode()
+    wrapped = MediaConnector().fetch_video(
+        data_url,
+        video_processor=processor_name,
+    )
+    frames_from_url, metadata_from_url = wrapped
+
+    assert wrapped.original_bytes == video_bytes
+    assert len(frames_from_bytes) == len(expected)
+    assert len(frames_from_url) == len(expected)
+    assert metadata_from_bytes == metadata_from_url
+    assert metadata_from_url["frames_indices"] == expected
+    assert metadata_from_url["total_num_frames"] == total_frames
+    assert metadata_from_url["fps"] == pytest.approx(float(fps))
+    assert metadata_from_url["duration"] == pytest.approx(6.0)
+    assert metadata_from_url["do_sample_frames"] is False
 
 
 @pytest.mark.parametrize(

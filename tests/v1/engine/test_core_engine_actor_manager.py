@@ -209,7 +209,13 @@ def ray_context():
         project_root = str(Path(__file__).resolve().parents[3])
         ray.init(
             num_cpus=2,
-            runtime_env={"env_vars": {"PYTHONPATH": project_root}},
+            runtime_env={
+                "env_vars": {
+                    "PYTHONPATH": os.pathsep.join(
+                        filter(None, (project_root, os.environ.get("PYTHONPATH")))
+                    )
+                }
+            },
             log_to_driver=False,
         )
         started_ray = True
@@ -270,7 +276,13 @@ def ray_context_dp2():
         project_root = str(Path(__file__).resolve().parents[3])
         ray.init(
             num_cpus=4,
-            runtime_env={"env_vars": {"PYTHONPATH": project_root}},
+            runtime_env={
+                "env_vars": {
+                    "PYTHONPATH": os.pathsep.join(
+                        filter(None, (project_root, os.environ.get("PYTHONPATH")))
+                    )
+                }
+            },
             log_to_driver=False,
         )
         started_ray = True
@@ -290,6 +302,7 @@ def _make_vllm_config_ray_dp_multinode() -> SimpleNamespace:
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
             data_parallel_size=2,
+            data_parallel_mode="auto",
             data_parallel_size_local=1,
             data_parallel_rank=0,
             data_parallel_rank_local=None,
@@ -303,6 +316,7 @@ def _make_vllm_config_ray_dp_multinode() -> SimpleNamespace:
         model_config=SimpleNamespace(multimodal_config=None, is_moe=False),
         cache_config=SimpleNamespace(),
         needs_dp_coordinator=False,
+        uses_coordinated_dp=False,
         kv_transfer_config=None,
         # ``_apply_dp_identity_suffix`` reads and rewrites this.
         instance_id="vllm-ray-dp-regression-test",
@@ -423,12 +437,19 @@ def ray_2gpu_node(monkeypatch: pytest.MonkeyPatch):
 
     Resource maps and placement groups are real. Without the dashboard any
     ``ray.util.state.list_nodes()`` call fails, the production condition this
-    path must survive. Only the platform device key is patched ("" on CPU).
+    path must survive. Virtual GPU resources are independent of host device
+    visibility; the platform device key is patched to "GPU" on CPU hosts.
     """
+    from ray._private.accelerators import get_accelerator_manager_for_resource
     from ray._private.state import available_resources_per_node
 
     if ray.is_initialized():
         ray.shutdown()
+    monkeypatch.setattr(
+        get_accelerator_manager_for_resource("GPU"),
+        "get_current_process_visible_accelerator_ids",
+        staticmethod(lambda: None),
+    )
     ray.init(num_cpus=4, num_gpus=2, include_dashboard=False, log_to_driver=False)
     monkeypatch.setattr("vllm.v1.engine.utils.current_platform.ray_device_key", "GPU")
 

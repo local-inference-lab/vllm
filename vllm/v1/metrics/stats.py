@@ -254,6 +254,13 @@ class SchedulerStats:
 
     perf_stats: PerfStats | None = None
 
+    decode_compute_seconds: float = 0.0
+    prefill_compute_seconds: float = 0.0
+    prefill_compute_share: float = 0.0
+    decode_compute_pressure: float = 1.0
+    prefill_compute_pressure: float = 1.0
+    local_prefill_backlog_tokens: int = 0
+
 
 @dataclass
 class RequestStateStats:
@@ -345,9 +352,9 @@ class RequestSpecDecodeMetrics:
     """Per-output-sequence speculative-decoding statistics accumulator.
 
     Accumulates, over one sequence's verify steps, a histogram of accepted
-    draft-token counts (``j``, draft-only) and the total number of proposed
+    draft-token counts (``j``, draft-only) and the total number of verified
     draft tokens. When ``detailed`` is requested it also records the ordered
-    per-step accepted/proposed sequences (``summary`` omits them). Tracked per
+    per-step accepted/verified sequences (``summary`` omits them). Tracked per
     engine ``Request`` (one per sampled sequence, so ``n > 1`` yields one per
     child), surfaced via ``EngineCoreOutput`` and the response
     ``metrics.speculative_decoding`` for single-sequence requests (see
@@ -358,11 +365,12 @@ class RequestSpecDecodeMetrics:
             also the histogram's upper bound.
         histogram: Dense counts indexed by accepted draft tokens ``j``
             (length ``num_spec_tokens + 1``).
-        num_draft_tokens: Total proposed draft tokens, after the
-            grammar-invalidated (``num_invalid_spec_tokens``) adjustment.
+        num_draft_tokens: Total target-verified draft tokens, after the
+            grammar-invalidated (``num_invalid_spec_tokens``) adjustment and
+            adaptive verification selection.
         per_step_accepted: Ordered accepted-draft count per verify step
             (``detailed`` only; empty otherwise).
-        per_step_drafted: Ordered proposed-draft count per verify step
+        per_step_drafted: Ordered verified-draft count per verify step
             (``detailed`` only; empty otherwise).
     """
 

@@ -198,6 +198,12 @@ class EngineCoreClient(ABC):
     ) -> bool:
         raise NotImplementedError
 
+    def get_prefill_fairness(self) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def set_prefill_fairness(self, config: dict[str, Any]) -> dict[str, Any]:
+        raise NotImplementedError
+
     def reset_encoder_cache(self) -> None:
         raise NotImplementedError
 
@@ -295,6 +301,14 @@ class EngineCoreClient(ABC):
     async def reset_prefix_cache_async(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
+        raise NotImplementedError
+
+    async def get_prefill_fairness_async(self) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def set_prefill_fairness_async(
+        self, config: dict[str, Any]
+    ) -> dict[str, Any]:
         raise NotImplementedError
 
     async def reset_encoder_cache_async(self) -> None:
@@ -426,6 +440,12 @@ class InprocClient(EngineCoreClient):
             reset_running_requests, reset_connector
         )
 
+    def get_prefill_fairness(self) -> dict[str, Any]:
+        return self.engine_core.get_prefill_fairness()
+
+    def set_prefill_fairness(self, config: dict[str, Any]) -> dict[str, Any]:
+        return self.engine_core.set_prefill_fairness(config)
+
     def reset_encoder_cache(self) -> None:
         self.engine_core.reset_encoder_cache()
 
@@ -505,6 +525,10 @@ class BackgroundResources:
     # Set if any of the engines are dead. Here so that the output
     # processing threads can access it without holding a ref to the client.
     engine_dead: bool = False
+    # Set only when an engine died on its own (it reported its death or its
+    # process exited with a failure status), not by an orderly shutdown, so
+    # the server can exit with a failure status that restart policies act on.
+    engine_failed: bool = False
 
     def __call__(self):
         """Clean up background resources."""
@@ -570,6 +594,7 @@ class BackgroundResources:
     def validate_alive(self, frames: Sequence[zmq.Frame]):
         if len(frames) == 1 and (frames[0].buffer == EngineCoreProc.ENGINE_CORE_DEAD):
             self.engine_dead = True
+            self.engine_failed = True
             raise EngineDeadError()
 
 
@@ -814,6 +839,11 @@ class MPClient(EngineCoreClient):
             if not _self or not _self._finalizer.alive or _self.resources.engine_dead:
                 return
             _self.resources.engine_dead = True
+            # A signal to the whole process group (Ctrl-C, a supervisor's
+            # killpg) also ends the engine, cleanly and with status 0.
+            _self.resources.engine_failed = (
+                getattr(engine_manager, "failed_proc_name", None) is not None
+            )
             logger.warning_once(
                 "[shutdown] MPClient: engine core exited unexpectedly; starting cleanup"
             )
@@ -1051,6 +1081,12 @@ class SyncMPClient(MPClient):
         return self.call_utility(
             "reset_prefix_cache", reset_running_requests, reset_connector
         )
+
+    def get_prefill_fairness(self) -> dict[str, Any]:
+        return self.call_utility("get_prefill_fairness")
+
+    def set_prefill_fairness(self, config: dict[str, Any]) -> dict[str, Any]:
+        return self.call_utility("set_prefill_fairness", config)
 
     def reset_encoder_cache(self) -> None:
         self.call_utility("reset_encoder_cache")
@@ -1339,6 +1375,14 @@ class AsyncMPClient(MPClient):
                 "reset_prefix_cache", reset_running_requests, reset_connector
             )
         )
+
+    async def get_prefill_fairness_async(self) -> dict[str, Any]:
+        return await self.call_utility_async("get_prefill_fairness")
+
+    async def set_prefill_fairness_async(
+        self, config: dict[str, Any]
+    ) -> dict[str, Any]:
+        return await self.call_utility_async("set_prefill_fairness", config)
 
     async def reset_encoder_cache_async(self) -> None:
         await self.call_utility_async("reset_encoder_cache")

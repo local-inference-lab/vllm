@@ -8,6 +8,7 @@ import pytest
 
 from vllm.config.cache import CacheConfig
 from vllm.config.scheduler import SchedulerConfig
+from vllm.config.speculative import SpeculativeConfig, SpeculativeMethod
 from vllm.config.utils import (
     get_attr_docs,
     get_hash_factors,
@@ -290,9 +291,38 @@ def test_scheduler_config_hash_includes_max_num_seqs():
     assert larger_batch_hash != base_hash
 
 
+def test_speculative_config_hash_includes_graph_shape():
+    def config(
+        method: SpeculativeMethod, num_speculative_tokens: int
+    ) -> SpeculativeConfig:
+        return SpeculativeConfig(
+            method=method,
+            num_speculative_tokens=num_speculative_tokens,
+            prompt_lookup_max=num_speculative_tokens,
+        )
+
+    assert config("ngram", 1).compute_hash() != config("ngram", 3).compute_hash()
+    assert config("ngram", 3).compute_hash() != config("ngram_gpu", 3).compute_hash()
+
+
 def test_cache_config_hash_ignores_prefix_cache_retention_interval():
     base_hash = CacheConfig().compute_hash()
     assert CacheConfig(prefix_cache_retention_interval=64).compute_hash() == base_hash
+
+
+def test_swa_page_sizes_have_distinct_compile_cache_hashes():
+    configs = (
+        CacheConfig(swa_block_size=32),
+        CacheConfig(swa_block_size=64),
+        CacheConfig(swa_block_size=128),
+    )
+    assert len({config.compute_hash() for config in configs}) == 3
+
+
+@pytest.mark.parametrize("block_size", [0, -32, 16, 96, 256])
+def test_swa_page_size_rejects_unsupported_kernel_geometry(block_size):
+    with pytest.raises(ValueError, match="swa_block_size"):
+        CacheConfig(swa_block_size=block_size)
 
 
 def test_envs_compile_factors_relocation_invariant(tmp_path):

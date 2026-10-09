@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 
 from pydantic import Field, field_validator
 
+import vllm.envs as envs
 from vllm.config.utils import config, get_hash_factors, hash_factors
 from vllm.logger import init_logger
 
@@ -281,6 +282,8 @@ class KernelConfig:
 
     enable_rocm_segmented_attn_autotune: bool = False
     """If True, autotune ROCm segmented attention during kernel warmup on RDNA GPUs."""
+    enable_b12x_autotune: bool = True
+    """Search uncached b12x choices at startup; mandatory preparation always runs."""
 
     # TODO(roberto): Remove after registered CuTeDSL warmups are migrated
     # to the shared JIT warmup infrastructure.
@@ -291,8 +294,17 @@ class KernelConfig:
     enable_jit_warmup: bool = True
     """If True, run JIT compile warmup during kernel warmup."""
 
-    moe_backend: MoEBackend = "auto"
-    """Backend for MoE expert computation kernels. Available options:
+    enable_bf16x3_router_gemm: bool = False
+    """If True, use the experimental SM100 BF16x3 CuteDSL router GEMM."""
+
+    moe_backend: MoEBackend = Field(
+        default_factory=lambda: envs.VLLM_DEFAULT_MOE_BACKEND,
+        validate_default=True,
+    )
+    """Backend for MoE expert computation kernels. Defaults to
+    `VLLM_DEFAULT_MOE_BACKEND`, or "auto" when the variable is unset.
+    Explicit configuration takes precedence over the deployment default.
+    Available options:
 
     - "auto": Automatically select the best backend based on model and hardware
     - "triton": Use Triton-based fused MoE kernels
@@ -309,7 +321,7 @@ class KernelConfig:
       load); requires Blackwell, expert parallelism, and NVSHMEM
     - "flashinfer_b12x": Use FlashInfer CuteDSL fused MoE for SM12x
       (RTX Pro 6000 / DGX Spark)
-    - "b12x": Use b12x FP4 MoE kernels on SM12x
+    - "b12x": Use b12x FP4 and MXFP8 MoE kernels on SM12x
     - "flashinfer_moe_ep_mega_deep_gemm": Use the FlashInfer moe_ep
       expert-parallel mega-MoE with the DeepGEMM megakernel, which consumes an
       MXFP4 checkpoint verbatim (Blackwell, requires expert parallel;
@@ -414,6 +426,7 @@ class KernelConfig:
             "enable_jit_warmup",
             "enable_flashinfer_autotune",
             "enable_rocm_segmented_attn_autotune",
+            "enable_b12x_autotune",
             "ir_op_priority",  # handled separately below
         }
         if self.linear_backend_per_quant is None:

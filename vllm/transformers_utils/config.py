@@ -95,10 +95,12 @@ _CONFIG_REGISTRY: dict[str, type[PreTrainedConfig]] = LazyConfigDict(
     deepseek_vl_v2="DeepseekVLV2Config",
     deepseek_v32="DeepseekV3Config",
     deepseek_v4="DeepseekV4Config",
+    deepseek_v41="DeepseekV41Config",
     dots3_note="Dots3NoteConfig",
     k3_dspark="K3DSparkConfig",
     funaudiochat="FunAudioChatConfig",
     granite4_vision="Granite4VisionConfig",
+    glm53_dspark="Glm53DSparkConfig",
     hyperclovax="HyperCLOVAXConfig",
     hy_v3="HYV3Config",
     hy_v4="HYV4Config",
@@ -134,13 +136,14 @@ _CONFIG_REGISTRY: dict[str, type[PreTrainedConfig]] = LazyConfigDict(
     qianfan_ocr="QianfanOCRConfig",
     qwen3_asr="Qwen3ASRConfig",
     qwen3_next="Qwen3NextConfig",
+    qwen3_8_flash_next="Qwen3_8FlashNextConfig",
+    qwen3_8_flash_next_text="Qwen3_8FlashNextTextConfig",
     qwen3_5="Qwen3_5Config",
     qwen3_5_text="Qwen3_5TextConfig",
     qwen3_5_moe="Qwen3_5MoeConfig",
     qwen3_5_moe_text="Qwen3_5MoeTextConfig",
     lfm2_moe="Lfm2MoeConfig",
     **{"unlimited-ocr": "UnlimitedOCRConfig"},
-    **{"deepseek_v41": "DeepseekV41Config"},
     inkling_mm_model="InklingMMConfig",
     inkling_model="InklingModelConfig",
 )
@@ -964,6 +967,16 @@ def get_config(
                     ),
                     scale_fmt,
                 )
+
+    if config.model_type in {
+        "qwen4_exp",
+        "qwen4_exp_text",
+        "qwen3_8_flash_next",
+        "qwen3_8_flash_next_text",
+    }:
+        from vllm.models.qwen4_exp.config import resolve_ple_embedding_dtype
+
+        resolve_ple_embedding_dtype(config, config_dict, model, revision)
 
     if hf_overrides_kw:
         logger.debug("Overriding HF config with %s", hf_overrides_kw)

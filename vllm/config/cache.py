@@ -61,6 +61,7 @@ CacheDType = Literal[
 
 MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["align", "none"]
+RecurrentCheckpointPolicy = Literal["auto", "aligned", "request_boundaries"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
@@ -70,10 +71,19 @@ class CacheConfig:
     """Configuration for the KV cache."""
 
     DEFAULT_BLOCK_SIZE: ClassVar[int] = 16
+    DEFAULT_DS41_BLOCK_SIZE: ClassVar[int] = 256
+    DEFAULT_DS41_SWA_BLOCK_SIZE: ClassVar[int] = 128
 
     block_size: int = Field(default=None, gt=0)  # type: ignore[assignment]
     """Size of a contiguous cache block in number of tokens.
     Accepts None (meaning "use default"). After construction, always int."""
+    swa_block_size: Literal[32, 64, 128] | None = None
+    """Tokens per sliding-window cache page for native DeepSeek V4.1 B12X.
+    None uses 128 tokens, paired with the native 256-token main-page default.
+    Use --block-size 128 --swa-block-size 64 to retain 128/64 geometry.
+    Independent of the logical attention window and
+    the main/index cache's block_size. Requires a server restart; supported
+    values are 32, 64 and 128. Other models do not support this override."""
     user_specified_block_size: bool = field(default=False, init=False)
     """Whether block_size was explicitly provided. Derived automatically."""
     kv_cache_layout: str | None = field(default=None, init=False)
@@ -128,6 +138,7 @@ class CacheConfig:
     to fp8.
     "nvfp4_4over6" uses the NVFP4 layout and selects between max/6 and max/4
     scales per 16 values by minimizing squared reconstruction error.
+    "nvfp4_ds_mla" uses the model-specific packed sparse-MLA record.
     """
     is_attention_free: bool = False
     """Whether the model is attention-free. This is primarily set in
@@ -163,6 +174,15 @@ class CacheConfig:
     retain periodic checkpoints at the specified interval, which must be a
     multiple of the scheduler block size. ``None`` retains checkpoints densely.
     Applies only to sliding-window and Mamba cache groups."""
+    recurrent_checkpoint_policy: RecurrentCheckpointPolicy = "auto"
+    """Retention policy for reusable recurrent state. ``request_boundaries``
+    retains a verified leading chat-instruction prefix, one prefill checkpoint
+    before the final chunk of a long prompt, the completed prompt,
+    and the committed response endpoint, disabling arbitrary intermediate
+    checkpoints. ``aligned`` preserves block-aligned retention. ``auto`` selects
+    request boundaries for supported configurations and aligned retention
+    otherwise. Temporary speculative rollback state is independent of this
+    policy."""
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
@@ -204,8 +224,13 @@ class CacheConfig:
     """ReplaySSM logical history length B for Mamba2. Triton uses B physical
     rows and FlashInfer uses B+T, where T is the target verification length.
     Kimi-K3 speculative decode does not use B. Default 16."""
-    use_replayssm: bool = False
-    """Use the ReplaySSM Mamba2 decode kernel: cache recent SSM inputs and skip
+    use_replayssm: bool | None = None
+    """Enable checkpoint recovery. None selects B12X recovery automatically for
+    supported GLM-5.3 speculative decoding, including atomic request-boundary
+    external caching. False (--no-use-replayssm) retains full speculative states.
+    Other models remain opt-in.
+
+    For Mamba2, use the ReplaySSM decode kernel: cache recent SSM inputs and skip
     the per-step full-state store, writing the checkpoint back only on flush.
     Requires mamba_cache_mode 'none' or 'align' (prefix caching) and the Triton
     or FlashInfer mamba backend. Mamba2 speculative decode requires FlashInfer
@@ -213,7 +238,7 @@ class CacheConfig:
     mamba_block_size is a multiple of replayssm_buffer_len, but this is not
     required."""
     use_kda_recoverssm: bool = field(default=False, init=False)
-    """Whether Kimi-K3 KDA uses RecoverSSM speculative decode."""
+    """Whether Kimi-K3 or GLM-5.3 KDA uses speculative state recovery."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
@@ -294,6 +319,7 @@ class CacheConfig:
             "enable_prefix_caching",
             "prefix_caching_hash_algo",
             "prefix_cache_retention_interval",
+            "recurrent_checkpoint_policy",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "prefix_match_unit",
             "enable_mamba_shared_prefix_checkpoint",

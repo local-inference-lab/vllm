@@ -17,6 +17,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, get_args
 
+import regex as re
 import torch
 from pydantic import ConfigDict, Field, model_validator
 
@@ -70,6 +71,60 @@ else:
     KVCacheConfig = Any
 
 logger = init_logger(__name__)
+
+
+def _glm_kda_recovery_unavailable(config: "VllmConfig") -> str | None:
+    """Describe why GLM cannot use the native checkpoint/record contract."""
+    from vllm.platforms import current_platform
+
+    cache = config.cache_config
+    model = config.model_config
+    spec = config.speculative_config
+    if model is None or model.architecture not in (
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+    ):
+        return "requires a GLM-5.3 target"
+    if (
+        spec is None
+        or spec.method not in ("mtp", "dflash")
+        or not (1 <= config.num_speculative_tokens <= 7)
+    ):
+        return "requires MTP or DFlash with 1 to 7 draft tokens"
+    if (
+        model.dtype != torch.bfloat16
+        or model.hf_text_config.linear_head_dim != 128
+        or cache.mamba_ssm_cache_dtype not in ("auto", "float32")
+    ):
+        return "requires BF16 activations, 128-wide heads and FP32 recurrent state"
+    if config.mamba_config.enable_stochastic_rounding:
+        return "does not support stochastic recurrent-state rounding"
+    if cache.mamba_cache_mode not in ("none", "align"):
+        return "requires none or align Mamba cache mode"
+    if not config.use_v2_model_runner:
+        return "requires Model Runner V2"
+    if config.parallel_config.pipeline_parallel_size != 1:
+        return "requires pipeline_parallel_size=1"
+    if config.mamba_config.backend != MambaBackendEnum.TRITON:
+        return "requires the triton Mamba metadata backend"
+    if (
+        config.kv_transfer_config is not None
+        and config.kv_transfer_config.is_kv_transfer_instance
+        and not config.use_request_boundary_checkpoints
+    ):
+        return "requires an atomic request-boundary external-cache connector"
+    if not current_platform.is_cuda():
+        return "requires CUDA"
+    capability = current_platform.get_device_capability()
+    if capability is None or capability.major != 12:
+        return "requires an SM12x GPU"
+    from vllm.utils.b12x import get_b12x_gdn_decode
+
+    api = get_b12x_gdn_decode()
+    if api is None or not hasattr(api, "bind_kda_commit") or not api.is_supported():
+        return "requires B12X speculative KDA verification and commit support"
+    return None
+
 
 # TODO(rocm): These models are either unsupported by MRV2 or slower with
 # MRV2 on AMD GPUs.
@@ -175,7 +230,7 @@ def enable_act_fusion(cfg: "VllmConfig") -> bool:
 
 
 def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
-    """Enable if TP > 1 and Hopper/Blackwell and flashinfer installed."""
+    """Enable when a supported fused all-reduce RMSNorm backend is active."""
     from vllm.platforms import current_platform
     from vllm.utils.flashinfer import has_flashinfer
 
@@ -190,14 +245,13 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
             rocm_aiter_ops.is_enabled() and cfg.parallel_config.tensor_parallel_size > 1
         )
 
-    return (
-        cfg.parallel_config.tensor_parallel_size > 1
-        and current_platform.is_cuda()
-        and has_flashinfer()
-        and (
-            current_platform.is_device_capability_family(100)
-            or current_platform.is_device_capability(90)
-        )
+    if cfg.parallel_config.tensor_parallel_size <= 1 or not current_platform.is_cuda():
+        return False
+    if envs.VLLM_ENABLE_PCIE_ALLREDUCE:
+        return envs.VLLM_PCIE_ALLREDUCE_BACKEND == "b12x"
+    return has_flashinfer() and (
+        current_platform.is_device_capability_family(100)
+        or current_platform.is_device_capability(90)
     )
 
 
@@ -580,6 +634,96 @@ class VllmConfig:
         return bool(mm_config and mm_config.mm_encoder_only)
 
     @property
+    def use_request_boundary_checkpoints(self) -> bool:
+        """Whether this runner has a complete recurrent boundary-state adapter."""
+        from vllm.platforms import current_platform
+
+        cache = self.cache_config
+        model = self.model_config
+        parallel = self.parallel_config
+        return (
+            cache.recurrent_checkpoint_policy in ("auto", "request_boundaries")
+            and cache.enable_prefix_caching
+            and cache.mamba_cache_mode == "align"
+            and (
+                cache.kv_cache_layout is None
+                or cache.get_resolved_kv_cache_layout().is_block_outermost
+            )
+            and self.use_v2_model_runner
+            and current_platform.is_cuda()
+            and model is not None
+            and not model.enable_sleep_mode
+            and not self.aux_output_config.enable_return_routed_experts
+            and self.lora_config is None
+            and model.hf_text_config.model_type
+            in (
+                "qwen3_8_flash_next_text",
+                "qwen3_8_flash_next",
+                "qwen4_exp_text",
+                "qwen4_exp",
+                "glm5_next_text",
+                "glm5_next",
+            )
+            and (
+                self.speculative_config is None
+                or (
+                    (
+                        self.speculative_config.method == "mtp"
+                        or (
+                            self.speculative_config.method == "dflash"
+                            and model.hf_text_config.model_type
+                            in ("glm5_next_text", "glm5_next")
+                        )
+                    )
+                    and not self.speculative_config.uses_dynamic_speculative_decoding()
+                )
+            )
+            and parallel.pipeline_parallel_size == 1
+            and parallel.effective_data_parallel_size == 1
+            and (
+                parallel.decode_context_parallel_size == 1
+                or model.hf_text_config.model_type
+                in (
+                    "qwen3_8_flash_next_text",
+                    "qwen3_8_flash_next",
+                    "qwen4_exp_text",
+                    "qwen4_exp",
+                    "glm5_next_text",
+                    "glm5_next",
+                )
+            )
+            and parallel.prefill_context_parallel_size == 1
+            and (
+                model.hf_text_config.model_type
+                not in (
+                    "qwen4_exp",
+                    "qwen4_exp_text",
+                    "qwen3_8_flash_next",
+                    "qwen3_8_flash_next_text",
+                )
+                or self.kernel_config.linear_backend == "b12x"
+                or self.kernel_config.moe_backend == "b12x"
+            )
+            and self.external_boundary_checkpoint_adapter_available
+            and cache.kv_offloading_size is None
+        )
+
+    @property
+    def external_boundary_checkpoint_adapter_available(self) -> bool:
+        """Require an explicit atomic target/draft adapter for external storage.
+
+        Aligned connectors must not enable request-boundary retention merely
+        because they can transfer ordinary KV chunks. Worker initialization
+        additionally validates the negotiated server protocol and byte layout.
+        """
+        if self.kv_transfer_config is None:
+            return True
+        from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+        connector = KVConnectorFactory.get_connector_class(self.kv_transfer_config)
+        return connector.supports_request_boundary_checkpoints(self)
+
+    @property
     def max_concurrent_batches(self) -> int:
         # PP requires PP-size concurrent batches to fill the pipeline.
         # Async scheduling requires 2 concurrent batches to overlap.
@@ -870,24 +1014,28 @@ class VllmConfig:
         return enabled
 
     @property
+    def uses_coordinated_dp(self) -> bool:
+        """Whether model execution requires communication across DP replicas."""
+        return self.parallel_config.effective_data_parallel_size > 1 and (
+            self.model_config is None or self.model_config.is_moe
+        )
+
+    @property
     def needs_dp_coordinator(self) -> bool:
         """Determine if the DPCoordinator process is needed.
 
         The DPCoordinator is needed in two cases:
-        1. For MoE models with DP > 1: to handle wave coordination
+        1. For coordinated MoE models with DP > 1: to handle wave coordination
            (even in external LB mode, since wave coordination runs in the coordinator)
-        2. For non-MoE models in internal/hybrid LB mode: to collect and publish
+        2. For replicas in internal/hybrid LB mode: to collect and publish
            queue stats for load balancing across DP ranks
 
         Returns:
             True if DPCoordinator process is needed, False otherwise.
 
         """
-        # For non-MoE models, only need coordinator in internal/hybrid LB mode
-        # (for stats collection).
         return self.parallel_config.data_parallel_size > 1 and (
-            self.model_config is None
-            or self.model_config.is_moe
+            self.uses_coordinated_dp
             or not self.parallel_config.data_parallel_external_lb
         )
 
@@ -1090,7 +1238,7 @@ class VllmConfig:
         if (
             speculative_config is None
             or not speculative_config.uses_dynamic_speculative_decoding()
-            or self.parallel_config.data_parallel_size <= 1
+            or self.parallel_config.effective_data_parallel_size <= 1
         ):
             return
 
@@ -1098,11 +1246,13 @@ class VllmConfig:
             "Dynamic speculative decoding is not supported with data "
             "parallelism because data-parallel ranks can select different "
             "speculative-token counts, causing DP divergence and deadlocks. "
-            "Disabling num_speculative_tokens_per_batch_size and falling back "
-            "to static num_speculative_tokens=%d.",
+            "Disabling dynamic speculative decoding and falling back to "
+            "static num_speculative_tokens=%d.",
             speculative_config.num_speculative_tokens,
         )
         speculative_config.num_speculative_tokens_per_batch_size = None
+        speculative_config.adaptive_speculative_tokens_window = None
+        speculative_config.adaptive_speculative_tokens_initial = None
 
     def _normalize_piecewise_cudagraph_mode(
         self, *, breakable_cudagraph_enabled: bool
@@ -1229,6 +1379,40 @@ class VllmConfig:
         ):
             return
 
+        model_type = getattr(
+            getattr(self.model_config, "hf_text_config", None), "model_type", None
+        )
+        if model_type in (
+            "qwen3_8_flash_next_text",
+            "qwen3_8_flash_next",
+            "qwen4_exp_text",
+            "qwen4_exp",
+        ):
+            from vllm.distributed.kv_transfer.kv_connector.factory import (
+                KVConnectorFactory,
+            )
+
+            connector = KVConnectorFactory.get_connector_class(self.kv_transfer_config)
+            # Explicit aligned retention bypasses request-boundary checkpoints;
+            # it is correct only with connectors that move hybrid state at
+            # aligned boundaries, and only validated without DCP.
+            cache_config = getattr(self, "cache_config", None)
+            parallel_config = getattr(self, "parallel_config", None)
+            aligned = (
+                getattr(cache_config, "recurrent_checkpoint_policy", None) == "aligned"
+                and getattr(parallel_config, "decode_context_parallel_size", None) == 1
+                and connector.supports_aligned_hybrid_transfer(self)
+            )
+            if not aligned and not connector.supports_request_boundary_checkpoints(
+                self
+            ):
+                raise ValueError(
+                    "Qwen QSA KV transfer requires an atomic request-boundary "
+                    "checkpoint connector, or --recurrent-checkpoint-policy "
+                    "aligned without DCP and a connector that transfers aligned "
+                    "hybrid state (SimpleCPUOffloadConnector, OffloadingConnector)"
+                )
+
         # PyTorch's expandable_segments allocator uses CUDA VMM, which can
         # remap a virtual address range to different physical pages over the
         # engine's lifetime. KV connectors that pin KV cache memory (e.g.
@@ -1236,24 +1420,41 @@ class VllmConfig:
         # registrations pointing at stale physical pages after any remap,
         # producing RDMA failures like IBV_WC_REM_ACCESS_ERR /
         # NIXL_ERR_REMOTE_DISCONNECT at the first inter-node KV transfer.
-        # We can't enumerate every in-tree and out-of-tree connector that
-        # pins memory, so we conservatively reject the combination whenever
-        # any KV connector is configured.
+        # Unknown transports remain rejected unless the connector explicitly
+        # declares a configuration that does not retain GPU page registrations.
         #
         # CuMem allocator is exempt: CuMemAllocator.use_memory_pool toggles
         # expandable_segments off around its pool (see #40812), so the KV
         # cache allocated within that context lands on stable physical pages
         # even when the env var is set.
-        if "expandable_segments:True" not in os.environ.get(
-            "PYTORCH_CUDA_ALLOC_CONF", ""
+        allocator_config = os.environ.get(
+            "PYTORCH_CUDA_ALLOC_CONF", os.environ.get("PYTORCH_ALLOC_CONF", "")
+        )
+        if not re.search(
+            r"(?:^|,)\s*expandable_segments\s*:\s*True\s*(?:,|$)", allocator_config
         ):
             return
         if self.model_config is not None and (self.model_config.enable_cumem_allocator):
             return
+        if self._connector_supports_vmm_safe_transfers():
+            return
+
+        # Engine-driven LMCache MP transport does not pin or register KV
+        # addresses; GPU gather/scatter remains in the vLLM worker.
+        if (
+            self.kv_transfer_config.kv_connector
+            in ("LMCacheMPConnector", "LMCacheRecurrentCheckpointConnector")
+            and self.kv_transfer_config.kv_connector_extra_config.get(
+                "lmcache.mp.mp_transfer_mode"
+            )
+            == "engine_driven"
+        ):
+            return
 
         raise ValueError(
             f"KV connector {self.kv_transfer_config.kv_connector} is "
-            "incompatible with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
+            "incompatible with expandable_segments:True in PYTORCH_CUDA_ALLOC_CONF "
+            "or PYTORCH_ALLOC_CONF "
             "unless enable_cumem_allocator is also enabled. PyTorch's CUDA VMM "
             "allocator can remap KV cache virtual addresses to different "
             "physical pages, invalidating any pinned/registered KV memory "
@@ -1261,8 +1462,27 @@ class VllmConfig:
             "unset expandable_segments:True or enable the cumem allocator "
             "(sleep mode does this automatically and also "
             "routes KV allocations through CuMemAllocator's pool, where "
-            "expandable_segments is automatically disabled)."
+            "expandable_segments is automatically disabled), or use a connector "
+            "that declares SupportsVmmSafeTransfers."
         )
+
+    def _connector_supports_vmm_safe_transfers(self) -> bool:
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory,
+        )
+        from vllm.distributed.kv_transfer.kv_connector.v1 import (
+            supports_vmm_safe_transfers,
+        )
+
+        if self.kv_transfer_config is None:
+            return False
+        try:
+            connector_cls = KVConnectorFactory.get_connector_class(
+                self.kv_transfer_config
+            )
+        except (AttributeError, ImportError, TypeError, ValueError):
+            return False
+        return supports_vmm_safe_transfers(connector_cls, self.kv_transfer_config)
 
     def _verify_sampling_replay_config(self) -> None:
         model_config = self.model_config
@@ -1436,7 +1656,9 @@ class VllmConfig:
             if not model_has_engram_layers(model_config):
                 return
             self.engram_config = EngramConfig()
-        self.engram_config.verify_model_config(model_config)
+        self.engram_config.verify_model_config(
+            model_config, tp_size=self.parallel_config.tensor_parallel_size
+        )
         self.engram_config.resolve_dp_shared_memory(self.parallel_config)
         self.engram_config.verify_parallel_config(self.parallel_config)
         logger.info_once("Resolved Engram configuration: %s", str(self.engram_config))
@@ -1477,6 +1699,15 @@ class VllmConfig:
         # Models may have supplied their own DCP defaults above; anything still
         # unset falls back to the stock ones.
         self.parallel_config.set_dcp_defaults()
+
+        if (
+            self.scheduler_config.prefill_compute_share is not None
+            and self.parallel_config.effective_data_parallel_size > 1
+        ):
+            raise ValueError(
+                "prefill_compute_share does not yet support data parallelism; all DP "
+                "ranks must make one synchronized fairness decision"
+            )
 
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
@@ -1675,9 +1906,7 @@ class VllmConfig:
 
         if self.parallel_config.disable_nccl_for_dp_synchronization is None:
             if self.scheduler_config.async_scheduling:
-                if self.parallel_config.data_parallel_size > 1 and (
-                    self.model_config is None or self.model_config.is_moe
-                ):
+                if self.uses_coordinated_dp:
                     logger.info_once(
                         "Disabling NCCL for DP synchronization "
                         "when using async scheduling.",
@@ -2110,9 +2339,7 @@ class VllmConfig:
 
         # Do this after all the updates to compilation_config.mode
         effective_dp_size = (
-            self.parallel_config.data_parallel_size
-            if self.model_config is None or self.model_config.is_moe
-            else 1
+            self.parallel_config.data_parallel_size if self.uses_coordinated_dp else 1
         )
         self.compilation_config.set_splitting_ops_for_v1(
             all2all_backend=self.parallel_config.all2all_backend,
@@ -3357,6 +3584,49 @@ class VllmConfig:
         return self
 
     @model_validator(mode="after")
+    def validate_swa_block_size(self) -> "VllmConfig":
+        model_config = self.model_config
+        if model_config is None:
+            return self
+        speculative = self.speculative_config
+        if speculative is not None and model_config is speculative.draft_model_config:
+            model_config = speculative.target_model_config
+        cache_config = self.cache_config
+        if model_config.architecture != "DeepseekV41ForCausalLM":
+            if cache_config.swa_block_size is not None:
+                raise ValueError(
+                    "--swa-block-size is only supported by native DeepSeek V4.1 B12X"
+                )
+            return self
+        # Resolve before model construction: cache layers retain their page sizes.
+        if not cache_config.user_specified_block_size:
+            cache_config.block_size = CacheConfig.DEFAULT_DS41_BLOCK_SIZE
+        swa_block_size = (
+            cache_config.swa_block_size or CacheConfig.DEFAULT_DS41_SWA_BLOCK_SIZE
+        )
+        prefix_unit = cache_config.prefix_match_unit
+        if (
+            cache_config.enable_prefix_caching
+            and prefix_unit is not None
+            and swa_block_size % prefix_unit != 0
+        ):
+            raise ValueError(
+                f"SWA block size ({swa_block_size}) must be divisible by "
+                f"--prefix-match-unit ({prefix_unit})"
+            )
+        if (cache_config.block_size, swa_block_size) not in ((128, 64), (256, 128)):
+            logger.warning_once(
+                "DeepSeek V4.1 cache geometry is %d/%d (main/SWA). "
+                "This is outside the recommended 256/128 and 128/64 layouts "
+                "and may waste KV cache capacity. Consider --block-size 256 "
+                "--swa-block-size 128, or --block-size 128 --swa-block-size 64. "
+                "The configured sizes are preserved.",
+                cache_config.block_size,
+                swa_block_size,
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_mamba_block_size(self) -> "VllmConfig":
         if self.model_config is None:
             return self
@@ -3372,6 +3642,16 @@ class VllmConfig:
 
     @model_validator(mode="after")
     def validate_mamba_cached_kernel(self) -> "VllmConfig":
+        if self.cache_config.use_replayssm is None:
+            self.cache_config.use_replayssm = (
+                _glm_kda_recovery_unavailable(self) is None
+            )
+            if self.cache_config.use_replayssm:
+                logger.info(
+                    "GLM speculative KDA uses B12X checkpoint recovery with FP32 "
+                    "recurrent state. Use --no-use-replayssm to retain full "
+                    "speculative states."
+                )
         if not self.cache_config.use_replayssm:
             self.cache_config.use_kda_recoverssm = False
             return self
@@ -3379,6 +3659,8 @@ class VllmConfig:
         kda_architectures = (
             "KimiLinearForCausalLM",
             "KimiK3ForConditionalGeneration",
+            "Glm5NextForCausalLM",
+            "Glm5NextForConditionalGeneration",
         )
         is_kda_model = (
             self.model_config is not None
@@ -3390,6 +3672,14 @@ class VllmConfig:
         use_mamba_replayssm_spec = (
             self.num_speculative_tokens > 0 and not self.cache_config.use_kda_recoverssm
         )
+
+        if self.model_config is not None and self.model_config.architecture in (
+            "Glm5NextForCausalLM",
+            "Glm5NextForConditionalGeneration",
+        ):
+            reason = _glm_kda_recovery_unavailable(self)
+            if reason is not None:
+                raise ValueError(f"GLM KDA recovery {reason}")
 
         if self.model_config is not None and not self.model_config.supports_replayssm:
             raise ValueError(
@@ -3460,10 +3750,18 @@ class VllmConfig:
         if (
             self.kv_transfer_config is not None
             and self.kv_transfer_config.is_kv_transfer_instance
+            and not (
+                self.cache_config.use_kda_recoverssm
+                and self.model_config is not None
+                and self.model_config.architecture
+                in ("Glm5NextForCausalLM", "Glm5NextForConditionalGeneration")
+                and self.use_request_boundary_checkpoints
+            )
         ):
             raise ValueError(
                 "--use-replayssm is incompatible with KV connectors "
-                "(P/D disaggregation, KV cache offload)"
+                "except GLM KDA recovery with an atomic request-boundary "
+                "checkpoint connector"
             )
         return self
 

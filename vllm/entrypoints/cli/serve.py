@@ -45,6 +45,33 @@ Search by using: `--help=<ConfigGroup>` to explore options by section (e.g.,
 """
 
 
+def resolve_rust_frontend_path(args: argparse.Namespace) -> str | None:
+    if not envs.VLLM_USE_RUST_FRONTEND:
+        return None
+    path = envs.VLLM_RUST_FRONTEND_PATH
+    if path is None:
+        return None
+    from vllm.transformers_utils.config import get_config
+
+    overrides = getattr(args, "hf_overrides", None)
+    config = get_config(
+        getattr(args, "hf_config_path", None) or args.model,
+        trust_remote_code=getattr(args, "trust_remote_code", False),
+        revision=getattr(args, "revision", None),
+        code_revision=getattr(args, "code_revision", None),
+        config_format=getattr(args, "config_format", "auto"),
+        hf_overrides_kw=overrides if isinstance(overrides, dict) else None,
+        hf_overrides_fn=overrides if callable(overrides) else None,
+        token=getattr(args, "hf_token", None),
+    )
+    if config.model_type == "deepseek_v41":
+        logger.info_once(
+            "Using the Python frontend for the published DeepSeek V4.1 encoding."
+        )
+        return None
+    return path
+
+
 class ServeSubcommand(CLISubcommand):
     """The `serve` subcommand for the vLLM CLI."""
 
@@ -52,6 +79,11 @@ class ServeSubcommand(CLISubcommand):
 
     @staticmethod
     def cmd(args: argparse.Namespace) -> None:
+        if args.headless and args.data_parallel_mode == "independent":
+            raise ValueError(
+                "Independent data parallelism requires a local frontend; "
+                "--headless is unsupported."
+            )
         # If model is specified in CLI (as positional arg), it takes precedence
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
@@ -62,9 +94,7 @@ class ServeSubcommand(CLISubcommand):
             uvloop.run(serve_grpc(args))
             return
 
-        rust_frontend_path = (
-            envs.VLLM_RUST_FRONTEND_PATH if envs.VLLM_USE_RUST_FRONTEND else None
-        )
+        rust_frontend_path = resolve_rust_frontend_path(args)
 
         if args.headless:
             if args.api_server_count is not None and args.api_server_count > 0:
@@ -268,9 +298,7 @@ def run_headless(args: argparse.Namespace):
 
 def run_multi_api_server(args: argparse.Namespace):
     assert not args.headless
-    rust_frontend_path = (
-        envs.VLLM_RUST_FRONTEND_PATH if envs.VLLM_USE_RUST_FRONTEND else None
-    )
+    rust_frontend_path = resolve_rust_frontend_path(args)
     num_api_servers: int = args.api_server_count
     assert num_api_servers > 0
 

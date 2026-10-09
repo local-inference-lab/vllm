@@ -6,6 +6,7 @@ import copy
 import dataclasses
 import functools
 import json
+import math
 import os
 import sys
 import warnings
@@ -77,6 +78,7 @@ from vllm.config.cache import (
     MambaCacheMode,
     MambaDType,
     PrefixCachingHashAlgo,
+    RecurrentCheckpointPolicy,
 )
 from vllm.config.device import Device
 from vllm.config.kernel import (
@@ -109,11 +111,19 @@ from vllm.config.observability import DetailedTraceModules
 from vllm.config.parallel import (
     All2AllBackend,
     DataParallelBackend,
+    DataParallelMode,
     DCPCommBackend,
     DistributedExecutorBackend,
     ExpertPlacementStrategy,
 )
-from vllm.config.scheduler import SchedulerPolicy
+from vllm.config.scheduler import (
+    DecodeRefillTarget,
+    MaxParallelPrefills,
+    PrefillComputeHalfLife,
+    PrefillComputeShare,
+    PrefillPolicy,
+    SchedulerPolicy,
+)
 from vllm.config.utils import get_field
 from vllm.config.vllm import OptimizationLevel, PerformanceMode
 from vllm.config.watermarking import WatermarkConfig
@@ -176,6 +186,58 @@ def optional_type(return_type: Callable[[str], T]) -> Callable[[str], T | None]:
         return parse_type(return_type)(val)
 
     return _optional_type
+
+
+def prefill_compute_share_type(value: str) -> PrefillComputeShare:
+    """Parse a fixed prefill share or automatic compute sharing."""
+    if value == "auto":
+        return "auto"
+    try:
+        share = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "prefill compute share must be 'auto' or a number between zero and one"
+        ) from exc
+    if not 0.0 < share < 1.0:
+        raise argparse.ArgumentTypeError(
+            "prefill compute share must be strictly between zero and one"
+        )
+    return share
+
+
+def prefill_compute_half_life_type(value: str) -> PrefillComputeHalfLife:
+    """Parse an automatic compute-share half-life in seconds or a preset."""
+    if value == "smooth":
+        return "smooth"
+    if value == "responsive":
+        return "responsive"
+    try:
+        half_life = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "prefill compute half-life must be 'smooth', 'responsive', or a "
+            "positive number of seconds"
+        ) from exc
+    if half_life <= 0.0 or not math.isfinite(half_life):
+        raise argparse.ArgumentTypeError(
+            "prefill compute half-life must be a finite number greater than zero"
+        )
+    return half_life
+
+
+def positive_int_or_auto_type(value: str) -> int | Literal["auto"]:
+    """Parse ``auto`` or a strictly positive integer."""
+    if value == "auto":
+        return "auto"
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "value must be 'auto' or a positive integer"
+        ) from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be 'auto' or a positive integer")
+    return parsed
 
 
 def union_dict_and_str(val: str) -> str | dict[str, str] | None:
@@ -529,6 +591,7 @@ class EngineArgs:
     dcp_kv_cache_interleave_size: int = ParallelConfig.dcp_kv_cache_interleave_size
     cp_kv_cache_interleave_size: int | None = None
     data_parallel_size: int = ParallelConfig.data_parallel_size
+    data_parallel_mode: DataParallelMode = ParallelConfig.data_parallel_mode
     data_parallel_rank: int | None = None
     data_parallel_start_rank: int | None = None
     data_parallel_size_local: int | None = None
@@ -543,7 +606,7 @@ class EngineArgs:
         ParallelConfig.enable_batch_sharded_sampling
     )
     enable_ep_weight_filter: bool = ParallelConfig.enable_ep_weight_filter
-    moe_backend: MoEBackend = KernelConfig.moe_backend
+    moe_backend: MoEBackend | None = None
     linear_backend: LinearBackend = KernelConfig.linear_backend
     sparse_indexer_topk_backend: SparseIndexerTopkBackend = (
         KernelConfig.sparse_indexer_topk_backend
@@ -570,12 +633,16 @@ class EngineArgs:
         ParallelConfig.max_parallel_loading_workers
     )
     block_size: int | None = None
+    swa_block_size: Literal[32, 64, 128] | None = CacheConfig.swa_block_size
     enable_prefix_caching: bool | None = None
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
     prefix_cache_retention_interval: int | None = get_field(
         CacheConfig, "prefix_cache_retention_interval"
+    )
+    recurrent_checkpoint_policy: RecurrentCheckpointPolicy = (
+        CacheConfig.recurrent_checkpoint_policy
     )
     disable_sliding_window: bool = ModelConfig.disable_sliding_window
     disable_cascade_attn: bool = ModelConfig.disable_cascade_attn
@@ -689,6 +756,18 @@ class EngineArgs:
 
     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
     prefill_schedule_interval: int = SchedulerConfig.prefill_schedule_interval
+    prefill_compute_share: PrefillComputeShare | None = (
+        SchedulerConfig.prefill_compute_share
+    )
+    prefill_compute_half_life: PrefillComputeHalfLife | None = (
+        SchedulerConfig.prefill_compute_half_life
+    )
+    max_num_prefill_tokens_per_step: int = (
+        SchedulerConfig.max_num_prefill_tokens_per_step
+    )
+    max_parallel_prefills: MaxParallelPrefills = SchedulerConfig.max_parallel_prefills
+    prefill_policy: PrefillPolicy = SchedulerConfig.prefill_policy
+    decode_refill_target: DecodeRefillTarget = SchedulerConfig.decode_refill_target
 
     watermark: float = SchedulerConfig.watermark
 
@@ -744,9 +823,10 @@ class EngineArgs:
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
     compilation_config: CompilationConfig = get_field(VllmConfig, "compilation_config")
     attention_config: AttentionConfig = get_field(VllmConfig, "attention_config")
-    engram_config: EngramConfig | None = VllmConfig.engram_config
+    engram_config: EngramConfig | None = get_field(VllmConfig, "engram_config")
     mamba_config: MambaConfig = get_field(VllmConfig, "mamba_config")
     kernel_config: KernelConfig = get_field(VllmConfig, "kernel_config")
+    enable_bf16x3_router_gemm: bool | None = None
     enable_flashinfer_autotune: bool = get_field(
         KernelConfig, "enable_flashinfer_autotune"
     )
@@ -794,7 +874,7 @@ class EngineArgs:
         CacheConfig.enable_mamba_shared_prefix_checkpoint
     )
     replayssm_buffer_len: int = CacheConfig.replayssm_buffer_len
-    use_replayssm: bool = CacheConfig.use_replayssm
+    use_replayssm: bool | None = CacheConfig.use_replayssm
 
     mamba_backend: MambaBackendEnum = MambaBackendEnum.TRITON
     mamba_ssu_algorithm: MambaSSUAlgorithm | None = None
@@ -840,12 +920,13 @@ class EngineArgs:
 
     fail_on_environ_validation: bool = False
     gdn_prefill_backend: (
-        Literal["flashinfer", "triton", "cutedsl", "aiter_flydsl"] | None
+        Literal["flashinfer", "triton", "cutedsl", "aiter_flydsl", "b12x"] | None
     ) = None
     kda_prefill_backend: (
-        Literal["auto", "triton", "flashkda", "flashinfer", "fused"] | None
+        Literal["auto", "triton", "flashkda", "flashinfer", "fused", "b12x"] | None
     ) = None
     kda_decode_backend: Literal["auto", "native", "flashinfer", "triton"] | None = None
+    gdn_decode_kernel: Literal["b12x", "cuda", "triton"] | None = None
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -1198,6 +1279,9 @@ class EngineArgs:
             "--data-parallel-size", "-dp", **parallel_kwargs["data_parallel_size"]
         )
         parallel_group.add_argument(
+            "--data-parallel-mode", **parallel_kwargs["data_parallel_mode"]
+        )
+        parallel_group.add_argument(
             "--data-parallel-rank",
             "-dpn",
             type=int,
@@ -1337,6 +1421,12 @@ class EngineArgs:
             description=CacheConfig.__doc__,
         )
         cache_group.add_argument("--block-size", **cache_kwargs["block_size"])
+        swa_kwargs = cache_kwargs["swa_block_size"].copy()
+        # argparse checks choices after optional_type converts "None" to None.
+        swa_kwargs["choices"] = [
+            None if value == "None" else value for value in swa_kwargs["choices"]
+        ]
+        cache_group.add_argument("--swa-block-size", **swa_kwargs)
         cache_group.add_argument(
             "--gpu-memory-utilization",
             "--device-memory-utilization",
@@ -1363,6 +1453,10 @@ class EngineArgs:
         cache_group.add_argument(
             "--prefix-cache-retention-interval",
             **cache_kwargs["prefix_cache_retention_interval"],
+        )
+        cache_group.add_argument(
+            "--recurrent-checkpoint-policy",
+            **cache_kwargs["recurrent_checkpoint_policy"],
         )
         cache_group.add_argument(
             "--kv-cache-dtype-skip-layers", **cache_kwargs["kv_cache_dtype_skip_layers"]
@@ -1750,6 +1844,38 @@ class EngineArgs:
             "--prefill-schedule-interval",
             **scheduler_kwargs["prefill_schedule_interval"],
         )
+        prefill_compute_share_kwargs = scheduler_kwargs["prefill_compute_share"]
+        prefill_compute_share_kwargs.pop("choices", None)
+        prefill_compute_share_kwargs["type"] = prefill_compute_share_type
+        scheduler_group.add_argument(
+            "--prefill-compute-share", **prefill_compute_share_kwargs
+        )
+        prefill_compute_half_life_kwargs = scheduler_kwargs["prefill_compute_half_life"]
+        prefill_compute_half_life_kwargs.pop("choices", None)
+        prefill_compute_half_life_kwargs["type"] = prefill_compute_half_life_type
+        scheduler_group.add_argument(
+            "--prefill-compute-half-life", **prefill_compute_half_life_kwargs
+        )
+        scheduler_group.add_argument(
+            "--max-num-prefill-tokens-per-step",
+            **scheduler_kwargs["max_num_prefill_tokens_per_step"],
+        )
+        max_parallel_prefills_kwargs = scheduler_kwargs["max_parallel_prefills"]
+        max_parallel_prefills_kwargs.pop("choices", None)
+        max_parallel_prefills_kwargs["type"] = positive_int_or_auto_type
+        scheduler_group.add_argument(
+            "--max-parallel-prefills", **max_parallel_prefills_kwargs
+        )
+        scheduler_group.add_argument(
+            "--prefill-policy",
+            **scheduler_kwargs["prefill_policy"],
+        )
+        decode_refill_target_kwargs = scheduler_kwargs["decode_refill_target"]
+        decode_refill_target_kwargs.pop("choices", None)
+        decode_refill_target_kwargs["type"] = positive_int_or_auto_type
+        scheduler_group.add_argument(
+            "--decode-refill-target", **decode_refill_target_kwargs
+        )
         scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
             **scheduler_kwargs["disable_hybrid_kv_cache_manager"],
@@ -1782,11 +1908,17 @@ class EngineArgs:
             description=KernelConfig.__doc__,
         )
         kernel_group.add_argument("--ir-op-priority", **kernel_kwargs["ir_op_priority"])
+        bf16x3_kwargs = kernel_kwargs["enable_bf16x3_router_gemm"]
+        bf16x3_kwargs["default"] = None
+        kernel_group.add_argument("--enable-bf16x3-router-gemm", **bf16x3_kwargs)
         kernel_group.add_argument(
             "--enable-flashinfer-autotune",
             **kernel_kwargs["enable_flashinfer_autotune"],
         )
         moe_backend_kwargs = kernel_kwargs["moe_backend"]
+        # Omission preserves nested configuration and its deployment default;
+        # an explicit "auto" must still override a pinned deployment backend.
+        moe_backend_kwargs["default"] = None
         moe_backend_kwargs["type"] = lambda s: s.lower().replace("-", "_")
         kernel_group.add_argument("--moe-backend", **moe_backend_kwargs)
         linear_backend_kwargs = kernel_kwargs["linear_backend"]
@@ -1892,14 +2024,27 @@ class EngineArgs:
         parser.add_argument(
             "--gdn-prefill-backend",
             dest="gdn_prefill_backend",
-            choices=["flashinfer", "triton", "cutedsl", "aiter_flydsl"],
+            choices=["flashinfer", "triton", "cutedsl", "aiter_flydsl", "b12x"],
             default=None,
-            help="Select GDN prefill backend.",
+            help=(
+                "Select GDN prefill backend. Selecting b12x also selects b12x "
+                "decode; conflicting explicit GDN selections are rejected."
+            ),
+        )
+        parser.add_argument(
+            "--gdn-decode-kernel",
+            dest="gdn_decode_kernel",
+            choices=["b12x", "cuda", "triton"],
+            default=None,
+            help=(
+                "Select GDN decode kernel. Selecting b12x also selects b12x "
+                "prefill; conflicting explicit GDN selections are rejected."
+            ),
         )
         parser.add_argument(
             "--kda-prefill-backend",
             dest="kda_prefill_backend",
-            choices=["auto", "triton", "flashkda", "flashinfer", "fused"],
+            choices=["auto", "triton", "flashkda", "flashinfer", "fused", "b12x"],
             default=None,
             help="Select KDA prefill backend. 'flashkda' is CUDA-only and "
             "'fused' is ROCm-only; 'auto' picks a supported backend.",
@@ -2197,6 +2342,11 @@ class EngineArgs:
         logging_config = self.create_logging_config()
         configure_logging_if_needed(logging_config)
 
+        if headless and self.data_parallel_mode == "independent":
+            raise ValueError(
+                "Independent data parallelism requires a local frontend; "
+                "headless mode is unsupported."
+            )
         current_platform.pre_register_and_update()
 
         device_config = DeviceConfig(device=cast(Device, current_platform.device_type))
@@ -2247,6 +2397,7 @@ class EngineArgs:
 
         cache_config = CacheConfig(
             block_size=self.block_size,  # type: ignore[arg-type]
+            swa_block_size=self.swa_block_size,
             gpu_memory_utilization=self.gpu_memory_utilization,
             kv_cache_memory_bytes=self.kv_cache_memory_bytes,
             cache_dtype=resolved_cache_dtype,  # type: ignore[arg-type]
@@ -2256,6 +2407,7 @@ class EngineArgs:
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             prefix_cache_retention_interval=self.prefix_cache_retention_interval,
+            recurrent_checkpoint_policy=self.recurrent_checkpoint_policy,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
             swa_bounded_replay=self.swa_bounded_replay,
@@ -2386,6 +2538,17 @@ class EngineArgs:
                 self.data_parallel_size_local = max(
                     local_world_size // world_size_within_dp, 1
                 )
+        if self.data_parallel_mode == "independent" and (
+            self.data_parallel_rank is not None
+            or self.data_parallel_start_rank is not None
+            or self.data_parallel_hybrid_lb
+            or self.data_parallel_external_lb
+            or self.data_parallel_multi_port_external_lb
+        ):
+            raise ValueError(
+                "Independent data parallelism requires internal load balancing "
+                "with all replicas launched locally."
+            )
         data_parallel_external_lb = (
             self.data_parallel_external_lb or self.data_parallel_rank is not None
         )
@@ -2513,6 +2676,7 @@ class EngineArgs:
             tensor_parallel_size=self.tensor_parallel_size,
             prefill_context_parallel_size=self.prefill_context_parallel_size,
             data_parallel_size=self.data_parallel_size,
+            data_parallel_mode=self.data_parallel_mode,
             data_parallel_rank=self.data_parallel_rank or 0,
             data_parallel_external_lb=data_parallel_external_lb,
             data_parallel_size_local=data_parallel_size_local,
@@ -2617,6 +2781,12 @@ class EngineArgs:
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
             prefill_schedule_interval=self.prefill_schedule_interval,
+            prefill_compute_share=self.prefill_compute_share,
+            prefill_compute_half_life=self.prefill_compute_half_life,
+            max_num_prefill_tokens_per_step=(self.max_num_prefill_tokens_per_step),
+            max_parallel_prefills=self.max_parallel_prefills,
+            prefill_policy=self.prefill_policy,
+            decode_refill_target=self.decode_refill_target,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
@@ -2735,7 +2905,9 @@ class EngineArgs:
                     "are mutually exclusive"
                 )
             kernel_config.enable_flashinfer_autotune = self.enable_flashinfer_autotune
-        if self.moe_backend != "auto":
+        if self.enable_bf16x3_router_gemm is not None:
+            kernel_config.enable_bf16x3_router_gemm = self.enable_bf16x3_router_gemm
+        if self.moe_backend is not None:
             kernel_config.moe_backend = self.moe_backend
         if self.linear_backend != "auto":
             kernel_config.linear_backend = self.linear_backend
@@ -2800,6 +2972,8 @@ class EngineArgs:
 
         if self.gdn_prefill_backend is not None:
             self.additional_config["gdn_prefill_backend"] = self.gdn_prefill_backend
+        if self.gdn_decode_kernel is not None:
+            self.additional_config["gdn_decode_kernel"] = self.gdn_decode_kernel
         if self.kda_prefill_backend is not None:
             if (
                 self.kda_prefill_backend == "flashkda"
@@ -2826,7 +3000,7 @@ class EngineArgs:
             offload_config=offload_config,
             attention_config=attention_config,
             aux_output_config=self.aux_output_config,
-            engram_config=self.engram_config,
+            engram_config=copy.deepcopy(self.engram_config),
             mamba_config=mamba_config,
             kernel_config=kernel_config,
             lora_config=lora_config,

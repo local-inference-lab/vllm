@@ -3,7 +3,7 @@
 
 from collections.abc import Callable
 from dataclasses import InitVar
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, cast
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, Self, cast
 
 from pydantic import Field, field_validator
 
@@ -19,6 +19,14 @@ logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
 SchedulerPolicy = Literal["fcfs", "priority"]
+PrefillComputeShare = Annotated[float, Field(gt=0.0, lt=1.0)] | Literal["auto"]
+PrefillComputeHalfLife = (
+    Annotated[float, Field(gt=0.0, allow_inf_nan=False)]
+    | Literal["smooth", "responsive"]
+)
+MaxParallelPrefills = Annotated[int, Field(ge=1)] | Literal["auto"]
+PrefillPolicy = Literal["round-robin", "decode-aware"]
+DecodeRefillTarget = Annotated[int, Field(ge=1)] | Literal["auto"]
 
 
 @config
@@ -201,9 +209,59 @@ class SchedulerConfig:
     (the default) disables the watermark."""
 
     prefill_schedule_interval: int = Field(default=1, ge=1)
-    """For data-parallel deployments, only admit new prefill requests
-    once every N engine steps, aligned across DP ranks, to better balance
-    per-step forward-pass times."""
+    """Schedule prefill work once every N engine steps while decode requests
+    are running. Data-parallel engines align the cadence across DP ranks."""
+
+    prefill_compute_share: PrefillComputeShare | None = None
+    """Target fraction of contended model-execution time assigned to prefill.
+
+    ``auto`` balances observed decode delay against local-prefill slowdown.
+    Numeric values must be strictly between zero and one. When unset, scheduling
+    behavior is unchanged.
+    """
+
+    prefill_compute_half_life: PrefillComputeHalfLife | None = None
+    """Response half-life in seconds for automatic prefill compute sharing.
+
+    ``smooth`` selects 2 seconds and ``responsive`` selects 0.5 seconds. When
+    omitted in auto mode, ``smooth`` is used. This setting is invalid outside
+    auto mode.
+    """
+
+    max_num_prefill_tokens_per_step: int = Field(default=0, ge=0)
+    """Maximum local prefill tokens in a contended compute-share step.
+
+    Zero keeps the normal batched-token budget. Decode-only and uncontended
+    prefill steps are unchanged.
+    """
+
+    max_parallel_prefills: MaxParallelPrefills = 1
+    """Maximum local prefills that may share one model step.
+
+    ``auto`` enables fair round-robin service for at most four prefills and
+    caps that count by ``max_num_seqs``. The scheduler's normal token budget
+    limits actual work, so this remains independent of cache block size and
+    ``max_num_batched_tokens``. A lone prefill retains the full token budget
+    and unused shares are redistributed within the step. ``1`` preserves
+    legacy behavior.
+    """
+
+    prefill_policy: PrefillPolicy = "round-robin"
+    """Select prefills when parallel prefill service is enabled.
+
+    ``round-robin`` gives every queued prefill bounded progress.
+    ``decode-aware`` reserves one parallel lane for the prefill nearest to
+    decode while runnable decode occupancy is below the effective parallel
+    prefill count; remaining lanes continue round-robin service.
+    """
+
+    decode_refill_target: DecodeRefillTarget = "auto"
+    """Runnable decode count maintained by ``decode-aware`` prefill selection.
+
+    ``auto`` uses the effective parallel-prefill count. An explicit value is
+    useful for workload qualification; it must not exceed ``max_num_seqs``.
+    This setting is ignored by ``round-robin`` when left at ``auto``.
+    """
 
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
@@ -290,7 +348,64 @@ class SchedulerConfig:
         return None if value is None else handler(value)
 
     def __post_init__(self, max_model_len: int, is_encoder_decoder: bool) -> None:
+        if (
+            self.prefill_compute_half_life is not None
+            and self.prefill_compute_share != "auto"
+        ):
+            raise ValueError(
+                "prefill_compute_half_life requires prefill_compute_share='auto'"
+            )
+        if (
+            self.prefill_compute_share is not None
+            and self.prefill_schedule_interval > 1
+        ):
+            raise ValueError(
+                "prefill_compute_share cannot be combined with "
+                "prefill_schedule_interval greater than one"
+            )
+        if (
+            self.max_num_prefill_tokens_per_step > 0
+            and self.prefill_compute_share is None
+        ):
+            raise ValueError(
+                "max_num_prefill_tokens_per_step requires prefill_compute_share"
+            )
+        if self.max_num_prefill_tokens_per_step > self.max_num_batched_tokens:
+            raise ValueError(
+                "max_num_prefill_tokens_per_step cannot exceed max_num_batched_tokens"
+            )
+        if (
+            isinstance(self.max_parallel_prefills, int)
+            and self.max_parallel_prefills > self.max_num_seqs
+        ):
+            raise ValueError("max_parallel_prefills cannot exceed max_num_seqs")
+        interleaving_enabled = self.max_parallel_prefills != 1
+        if not interleaving_enabled and self.prefill_policy != "round-robin":
+            raise ValueError(
+                "prefill_policy requires max_parallel_prefills greater than one"
+            )
+        if (
+            isinstance(self.decode_refill_target, int)
+            and self.decode_refill_target > self.max_num_seqs
+        ):
+            raise ValueError("decode_refill_target cannot exceed max_num_seqs")
+        if (
+            self.prefill_policy != "decode-aware"
+            and self.decode_refill_target != "auto"
+        ):
+            raise ValueError(
+                "decode_refill_target requires prefill_policy='decode-aware'"
+            )
+        if interleaving_enabled and not self.enable_chunked_prefill:
+            raise ValueError(
+                "prefill interleaving requires enable_chunked_prefill=True"
+            )
+
         if is_encoder_decoder:
+            if interleaving_enabled:
+                raise ValueError(
+                    "prefill interleaving does not support encoder-decoder models"
+                )
             # Chunked prefill should be disabled for encoder-decoder models.
             self.disable_chunked_mm_input = True
             self.enable_chunked_prefill = False

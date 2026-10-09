@@ -267,7 +267,7 @@ def test_gdn_decode_kernel_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("VLLM_GDN_DECODE_KERNEL", raising=False)
     assert env_func() == "cuda"
 
-    for value in ("cuda", "triton"):
+    for value in ("b12x", "cuda", "triton"):
         monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", value)
         assert env_func() == value
 
@@ -275,6 +275,23 @@ def test_gdn_decode_kernel_env(monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", value)
         with pytest.raises(ValueError, match="VLLM_GDN_DECODE_KERNEL"):
             env_func()
+
+
+def test_b12x_moe_fp4_layer_max_input_scale_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_name = "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE"
+    env_func = environment_variables[env_name]
+    monkeypatch.delenv(env_name, raising=False)
+    assert env_func() == "0"
+
+    for value in ("0", "1", "all", "w13", "w2"):
+        monkeypatch.setenv(env_name, value)
+        assert env_func() == value
+
+    monkeypatch.setenv(env_name, "invalid")
+    with pytest.raises(ValueError, match=env_name):
+        env_func()
 
 
 class TestEnvListWithChoices:

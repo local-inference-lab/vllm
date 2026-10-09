@@ -239,6 +239,98 @@ def test_sampling_replay_config(config, message):
             VllmConfig._verify_sampling_replay_config(config)
 
 
+@pytest.mark.parametrize("swa_size,prefix_unit", [(None, 256), (32, 64), (128, 96)])
+def test_swa_page_size_rejects_incompatible_prefix_matching(swa_size, prefix_unit):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architecture="DeepseekV41ForCausalLM"),
+        speculative_config=None,
+        cache_config=CacheConfig(
+            swa_block_size=swa_size, prefix_match_unit=prefix_unit
+        ),
+    )
+    with pytest.raises(ValueError, match="must be divisible by --prefix-match-unit"):
+        VllmConfig.validate_swa_block_size(config)
+    config.cache_config.prefix_match_unit = 32
+    VllmConfig.validate_swa_block_size(config)
+
+
+def test_swa_page_size_is_scoped_to_v41_target_and_draft():
+    target = SimpleNamespace(architecture="DeepseekV41ForCausalLM")
+    draft = SimpleNamespace(architecture="DSparkDeepseekV4ForCausalLM")
+    config = SimpleNamespace(
+        model_config=draft,
+        speculative_config=SimpleNamespace(
+            target_model_config=target, draft_model_config=draft
+        ),
+        cache_config=CacheConfig(swa_block_size=128, prefix_match_unit=32),
+    )
+    VllmConfig.validate_swa_block_size(config)
+    target.architecture = "DeepseekV4ForCausalLM"
+    with pytest.raises(ValueError, match="only supported by native DeepSeek V4.1"):
+        VllmConfig.validate_swa_block_size(config)
+    config.cache_config.swa_block_size = None
+    VllmConfig.validate_swa_block_size(config)
+
+
+@pytest.mark.parametrize(
+    "main,swa,expected,warning",
+    [
+        (None, None, (256, 128), False),
+        (256, 128, (256, 128), False),
+        (128, 64, (128, 64), False),
+        (128, None, (128, 128), True),
+        (128, 128, (128, 128), True),
+        (256, 64, (256, 64), True),
+        (256, 32, (256, 32), True),
+    ],
+)
+def test_swa_geometry_defaults_and_capacity_warning(main, swa, expected, warning):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architecture="DeepseekV41ForCausalLM"),
+        speculative_config=None,
+        cache_config=CacheConfig(
+            block_size=main, swa_block_size=swa, prefix_match_unit=32
+        ),
+    )
+    with patch.object(vllm_config_module.logger, "warning_once") as warn:
+        VllmConfig.validate_swa_block_size(config)
+    assert config.cache_config.block_size == expected[0]
+    assert (config.cache_config.swa_block_size or 128) == expected[1]
+    assert config.cache_config.swa_block_size == swa
+    assert config.cache_config.user_specified_block_size == (main is not None)
+    if warning:
+        warn.assert_called_once()
+        message, *sizes = warn.call_args.args
+        assert tuple(sizes) == expected
+        assert "--block-size 256 --swa-block-size 128" in message
+        assert "--block-size 128 --swa-block-size 64" in message
+    else:
+        warn.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "configured,expected",
+    [(None, "auto"), ("b12x", "b12x"), ("FLASHINFER-CUTLASS", "flashinfer_cutlass")],
+)
+def test_moe_backend_deployment_default(monkeypatch, configured, expected):
+    monkeypatch.delenv("VLLM_DEFAULT_MOE_BACKEND", raising=False)
+    if configured is not None:
+        monkeypatch.setenv("VLLM_DEFAULT_MOE_BACKEND", configured)
+    assert KernelConfig().moe_backend == expected
+
+
+@pytest.mark.parametrize("backend", ["auto", "b12x", "flashinfer_cutlass"])
+def test_explicit_moe_backend_overrides_deployment_default(monkeypatch, backend):
+    monkeypatch.setenv("VLLM_DEFAULT_MOE_BACKEND", "b12x")
+    assert KernelConfig(moe_backend=backend).moe_backend == backend
+
+
+def test_invalid_moe_backend_deployment_default_fails_validation(monkeypatch):
+    monkeypatch.setenv("VLLM_DEFAULT_MOE_BACKEND", "not_a_backend")
+    with pytest.raises(ValidationError, match="moe_backend"):
+        KernelConfig()
+
+
 def test_kda_recoverssm_derivation_is_revalidated():
     config = SimpleNamespace(
         cache_config=SimpleNamespace(
@@ -1934,6 +2026,151 @@ def test_nnodes_within_dp_rejects_uneven_internal_lb(nnodes):
 
     with pytest.raises(ValueError, match="Invalid data parallel configuration"):
         _ = parallel_config.nnodes_within_dp
+
+
+@pytest.mark.parametrize(
+    "mode, is_moe, coordinated",
+    [
+        ("auto", True, True),
+        ("auto", False, False),
+        ("independent", True, False),
+        ("independent", False, False),
+    ],
+)
+def test_independent_dp_keeps_load_balancing_without_wave_coordination(
+    mode, is_moe, coordinated
+):
+    config = object.__new__(VllmConfig)
+    config.parallel_config = ParallelConfig(
+        data_parallel_size=4,
+        data_parallel_size_local=4,
+        data_parallel_mode=mode,
+        distributed_executor_backend="mp",
+    )
+    config.model_config = SimpleNamespace(is_moe=is_moe)
+    assert config.uses_coordinated_dp is coordinated
+    assert config.needs_dp_coordinator
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_independent_moe_preserves_tp_partition_and_replica_identity(monkeypatch, rank):
+    from copy import deepcopy
+
+    import torch
+
+    from vllm.model_executor.layers.fused_moe import config as moe_config
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+    parent = ParallelConfig(
+        tensor_parallel_size=2,
+        data_parallel_size=4,
+        data_parallel_size_local=4,
+        data_parallel_mode="independent",
+        assigned_physical_gpu_ids=list(range(8)),
+    )
+    child = deepcopy(parent)
+    child.data_parallel_index = child.data_parallel_rank_local = rank
+    child.reconfigure_for_independent_dp_rank()
+    assert parent.data_parallel_size == 4
+    assert child.data_parallel_index == child.data_parallel_rank_local == rank
+    assert child.assigned_physical_gpu_ids == list(range(8))
+    assert child.elastic_ep_max_dp_size == 1
+    monkeypatch.setattr(moe_config, "get_tensor_model_parallel_rank", lambda: 0)
+    # Accessing a cross-replica DP group would fail without distributed init.
+    parallel = moe_config.FusedMoEParallelConfig.make(
+        tp_size_=child.tensor_parallel_size,
+        dp_size_=child.data_parallel_size,
+        pcp_size_=1,
+        sp_size_=1,
+        vllm_parallel_config=child,
+    )
+    experts = moe_config.FusedMoEConfig(
+        num_experts=8,
+        experts_per_token=2,
+        hidden_dim=128,
+        intermediate_size=640,
+        num_local_experts=8,
+        num_logical_experts=8,
+        activation=MoEActivation.SILU,
+        device="cpu",
+        routing_method=moe_config.RoutingMethodType.Default,
+        moe_parallel_config=parallel,
+        in_dtype=torch.bfloat16,
+    )
+    assert experts.intermediate_size_per_partition == 320
+    assert experts.dp_size == 1
+    assert parallel.tp_size == 2
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"data_parallel_backend": "ray"},
+        {"distributed_executor_backend": "ray"},
+        {"distributed_executor_backend": "external_launcher"},
+        {"nnodes": 2},
+        {"data_parallel_size_local": 0},
+        {"data_parallel_size_local": 2},
+        {"data_parallel_external_lb": True},
+        {"data_parallel_hybrid_lb": True},
+        {"data_parallel_rank": 1},
+        {"enable_elastic_ep": True},
+    ],
+)
+def test_independent_dp_rejects_unsupported_deployment(options):
+    kwargs = dict(
+        data_parallel_size=4,
+        data_parallel_size_local=4,
+        data_parallel_mode="independent",
+    )
+    with pytest.raises(ValueError, match="Independent data parallelism"):
+        ParallelConfig(**(kwargs | options))
+
+
+def test_independent_dp_rejects_offline_spmd(monkeypatch):
+    monkeypatch.setenv("VLLM_DP_SIZE", "4")
+    with pytest.raises(ValueError, match="offline SPMD"):
+        ParallelConfig(data_parallel_mode="independent")
+
+
+@pytest.mark.parametrize("option", ["embedding_across_dp", "dp_shared_memory"])
+def test_independent_dp_rejects_cross_replica_engram(option):
+    parallel = ParallelConfig(
+        data_parallel_size=4,
+        data_parallel_size_local=4,
+        data_parallel_mode="independent",
+    )
+    with pytest.raises(ValueError, match="Independent data parallelism"):
+        EngramConfig(cpu_offload=True, **{option: True}).verify_parallel_config(
+            parallel
+        )
+
+
+@pytest.mark.parametrize("mode", ["auto", "independent"])
+def test_independent_dp_preserves_dynamic_speculation(mode):
+    config = object.__new__(VllmConfig)
+    config.parallel_config = ParallelConfig(
+        data_parallel_size=4,
+        data_parallel_size_local=4,
+        data_parallel_mode=mode,
+        distributed_executor_backend="mp",
+    )
+    schedule = [(1, 4, 3)]
+    config.speculative_config = SimpleNamespace(
+        uses_dynamic_speculative_decoding=lambda: True,
+        num_speculative_tokens=3,
+        num_speculative_tokens_per_batch_size=schedule,
+        adaptive_speculative_tokens_window=32,
+        adaptive_speculative_tokens_initial=2,
+    )
+    config._maybe_disable_dynamic_sd_for_data_parallel()
+    spec = config.speculative_config
+    assert spec.num_speculative_tokens_per_batch_size == (
+        schedule if mode == "independent" else None
+    )
+    assert spec.adaptive_speculative_tokens_window == (
+        32 if mode == "independent" else None
+    )
 
 
 def test_draft_model_enables_async_scheduling_by_default():
@@ -3903,6 +4140,28 @@ def test_watermarking_forces_model_runner_v2(monkeypatch):
         "Watermarking requires Model Runner V2 and overrides "
         "VLLM_USE_V2_MODEL_RUNNER=0."
     )
+
+
+@pytest.mark.parametrize("cost_scale", [0.0, -1.0])
+def test_adaptive_verification_cost_scale_must_be_positive(cost_scale):
+    with pytest.raises(ValidationError):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            adaptive_verification_cost_scale=cost_scale,
+        )
+
+
+def test_adaptive_verification_cost_scale_requires_adaptive_dspark():
+    with pytest.raises(
+        ValueError,
+        match="requires DSpark adaptive verification",
+    ):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            adaptive_verification_cost_scale=2.0,
+        )
 
 
 @patch("vllm.config.speculative.ModelConfig")

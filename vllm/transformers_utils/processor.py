@@ -168,11 +168,15 @@ def get_video_processor_cls_name_from_config(
     config_file = [
         "video_preprocessor_config.json",
         "preprocessor_config.json",
+        "processor_config.json",
     ]
     for file in config_file:
         config = get_hf_file_to_dict(file, processor_name, revision=revision)
         if config and "video_processor_type" in config:
             return config["video_processor_type"]
+        video_config = config.get("video_processor") if config else None
+        if isinstance(video_config, dict) and "video_processor_type" in video_config:
+            return video_config["video_processor_type"]
 
     # Some models ship no explicit ``video_processor_type`` in their
     # preprocessor config. Fall back to transformers' ``model_type`` -> video

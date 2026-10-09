@@ -46,8 +46,15 @@ if TYPE_CHECKING:
     NO_COLOR: bool = False
     FORCE_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
+    VLLM_REQUEST_STALL_WARNING_S: float = 60.0
+    VLLM_LOG_REQUEST_TIMELINE: bool = False
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
+    VLLM_GLM53_MTP_DRAFT_HEAD: Literal["bf16", "nvfp4"] = "bf16"
+    VLLM_DFLASH_VOCAB_PARALLEL_DRAFT: bool = False
+    VLLM_GLM53_VISION_MXFP8: bool = False
+    VLLM_GLM53_EMBED_HOST: bool = False
+    VLLM_SHARE_PYNCCL_COMMS: bool = False
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -59,6 +66,10 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE: int = 0
+    VLLM_MLA_PREFILL_DCP_OVERLAP: bool = False
+    VLLM_MLA_PREFILL_DCP_FP8_TRANSPORT: bool = False
+    VLLM_KIMI_L2_PREFETCH: bool = False
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -130,7 +141,7 @@ if TYPE_CHECKING:
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_USE_HW_AGNOSTIC: bool = False
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
-    VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
+    VLLM_GDN_DECODE_KERNEL: Literal["b12x", "cuda", "triton"] = "cuda"
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP4_EMULATION_DEQUANT_AT_LOAD: bool = False
@@ -170,7 +181,10 @@ if TYPE_CHECKING:
     VLLM_RUST_FRONTEND_PATH: str | None = "auto"
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
+    VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S: float = 60.0
+    VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS: bool = False
     VLLM_MLA_DISABLE: bool = False
+    VLLM_K3_DENSE_MLA_PARTIAL_DTYPE: Literal["bf16", "fp32"] = "bf16"
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -194,6 +208,37 @@ if TYPE_CHECKING:
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
+    VLLM_B12X_ACTIVATION_MODE_A16_M: int = 0
+    VLLM_B12X_BF16_GEMV: bool = False
+    VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE: Literal["0", "1", "all", "w13", "w2"] = "0"
+    VLLM_B12X_CSF_SCALE_PREFETCH: bool = True
+    VLLM_DEFAULT_MOE_BACKEND: str = "auto"
+    VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
+    VLLM_B12X_NVFP4_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
+    VLLM_B12X_MXFP8_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
+    VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES: int = 2_000_000_000
+    VLLM_MXFP8_LM_HEAD: bool = False
+    VLLM_LM_HEAD_A16: bool = True
+    VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = True
+    VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
+    VLLM_MTP_NVFP4_LM_HEAD: bool = True
+    VLLM_DS41_MARKOV_NVFP4: bool = False
+    VLLM_DS41_DRAFT_NVFP4_HEAD: bool = False
+    VLLM_DS41_ATTENTION_COMPUTE: Literal["bf16", "reference", "auto"] = "bf16"
+    VLLM_DS41_ENGRAM_OVERLAP: bool = True
+    VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
+    VLLM_QWEN3_8_FLASH_NEXT_HC_TP: bool = True
+    VLLM_MIMO_L2_PREFETCH: bool = False
+    VLLM_B12X_MLA_CKV_GATHER: bool = False
+    VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
+    VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
+    VLLM_B12X_PAGED_DECODE: Literal["auto", "0", "1"] = "auto"
+    VLLM_PLE_CPU_OFFLOAD: bool = True
+    VLLM_PLE_TABLE_MEMORY: Literal["ram", "disk", "shared"] | None = None
+    VLLM_PLE_SHARED_TABLE_DIR: str = "/dev/shm/vllm-ple"
+    VLLM_PLE_SHARED_TABLE_ROLE: Literal["auto", "populate", "attach"] = "auto"
+    VLLM_PLE_SHARED_TABLE_LOCK_TIMEOUT_S: float = 3600.0
+    VLLM_PLE_SHARED_TABLE_IDENTITY: str | None = None
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
@@ -216,6 +261,22 @@ if TYPE_CHECKING:
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
     VLLM_ENABLE_GEMM_RS: bool = False
+    VLLM_KIMI_SHARD_QKV_A: bool = False
+    VLLM_KIMI_SHARD_AUXILIARY_PROJECTIONS: bool = False
+    VLLM_KIMI_ALIGNED_DECODE_PROJECTIONS: bool = False
+    VLLM_KIMI_KDA_PROJECTION_STREAM_TOKEN_THRESHOLD: int = 0
+    VLLM_K3_KV_GROUP_SIZE: int = 0
+    VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
+    VLLM_DSPARK_COMPACT_ROPE: bool = False
+    VLLM_DFLASH_AUX_MXFP8_STREAMING: bool = False
+    VLLM_DFLASH_AUX_BF16_STAGING: bool = False
+    VLLM_DFLASH_COMPACT_ROPE: bool = False
+    VLLM_DFLASH_SHARD_AUX_PROJECTION: bool = False
+    VLLM_DSPARK_SHARD_MARKOV_HEAD: bool = False
+    VLLM_DSPARK_REPLICATE_MARKOV_W1: bool = False
+    VLLM_KIMI_K3_B12X_DSPARK_ARGMAX: bool = False
+    VLLM_DCP_SHARD_DRAFT: str | None = None
+    VLLM_USE_B12X_DCP_A2A: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
@@ -223,6 +284,16 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE: bool = False
+    VLLM_ENABLE_PCIE_ALLREDUCE: bool = False
+    VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x"] = "b12x"
+    VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "84KB"
+    VLLM_ENABLE_ROCE_ALLREDUCE: bool = False
+    VLLM_ROCE_ALLREDUCE_MAX_SIZE: str = "2MB"
+    VLLM_ROCE_ALLGATHER_MAX_SIZE: str = "16MB"
+    VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
+    VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE: str = "off"
+    VLLM_PCIE_DMA_MIN_BYTES: str = "6MB"
+    VLLM_PCIE_DMA_FP8: str | None = None
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -610,6 +681,9 @@ def _resolve_rust_cli_path() -> str | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Cache hints for immutable Kimi dense weights during TP reductions.
+    # Opt in only after measuring the served topology; prefill is unchanged.
+    "VLLM_KIMI_L2_PREFETCH": lambda: os.getenv("VLLM_KIMI_L2_PREFETCH", "0") == "1",
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]
@@ -863,6 +937,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if (val := float(os.getenv("VLLM_LOG_STATS_INTERVAL", "10."))) > 0.0
         else 10.0
     ),
+    # Warn when a request takes longer than this many seconds to get from
+    # rendering to the engine core, waits that long in the engine-core input
+    # queue, or leaves its final output unread by the client that long; also
+    # warn, with the loop's stack, when one engine-core loop iteration runs
+    # that long. 0 disables these warnings.
+    "VLLM_REQUEST_STALL_WARNING_S": lambda: max(
+        0.0, float(os.getenv("VLLM_REQUEST_STALL_WARNING_S", "60"))
+    ),
+    # If set, the API server logs one line per request with the time each
+    # stage took: rendering, input processing, engine submission, first and
+    # final output, and the client reading the final output.
+    "VLLM_LOG_REQUEST_TIMELINE": lambda: (
+        os.getenv("VLLM_LOG_REQUEST_TIMELINE", "0").lower() in ("1", "true")
+    ),
     # Trace function calls
     # If set to 1, vllm will trace function calls
     # Useful for debugging
@@ -874,6 +962,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
         bool(int(os.environ["VLLM_USE_FLASHINFER_SAMPLER"]))
         if "VLLM_USE_FLASHINFER_SAMPLER" in os.environ
         else True
+    ),
+    # Storage and compute format for the independent GLM-5.3 MTP proposal head.
+    # The target vocabulary head and verifier remain BF16 in every mode.
+    "VLLM_GLM53_MTP_DRAFT_HEAD": env_with_choices(
+        "VLLM_GLM53_MTP_DRAFT_HEAD",
+        "bf16",
+        ["bf16", "nvfp4"],
+        case_sensitive=False,
+    ),
+    # Sample probabilistic DFlash drafts per vocab shard (exact: same draws and
+    # verification outcomes) instead of all-gathering the draft logits.
+    "VLLM_DFLASH_VOCAB_PARALLEL_DRAFT": lambda: (
+        os.getenv("VLLM_DFLASH_VOCAB_PARALLEL_DRAFT", "0") == "1"
+    ),
+    # Quantize the GLM-5.3 vision tower's linear layers to MXFP8 while loading
+    # its BF16 weights. Convolutions and norms stay BF16.
+    "VLLM_GLM53_VISION_MXFP8": lambda: bool(
+        int(os.getenv("VLLM_GLM53_VISION_MXFP8", "0"))
+    ),
+    # Keep the GLM-5.3 input embedding table in pinned host RAM; the GPU reads
+    # the rows of the current tokens through a UVA view.
+    "VLLM_GLM53_EMBED_HOST": lambda: bool(int(os.getenv("VLLM_GLM53_EMBED_HOST", "0"))),
+    # Groups over the same ranks share one PyNCCL communicator.
+    "VLLM_SHARE_PYNCCL_COMMS": lambda: bool(
+        int(os.getenv("VLLM_SHARE_PYNCCL_COMMS", "0"))
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
@@ -1098,6 +1211,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
     ),
+    # Gathered MLA context rows; zero retains automatic workspace sizing.
+    "VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE": lambda: int(
+        os.getenv("VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE", "0")
+    ),
+    # Prefetch the following MLA context chunk while attention consumes the
+    # preceding chunk. Requires DCP with the standard NCCL KV gather transport.
+    "VLLM_MLA_PREFILL_DCP_OVERLAP": lambda: bool(
+        int(os.getenv("VLLM_MLA_PREFILL_DCP_OVERLAP", "0"))
+    ),
+    # Transfer existing E4M3 KV bytes and each rank's scale before upconversion.
+    # Requires overlapped DCP prefill and BF16 attention inputs.
+    "VLLM_MLA_PREFILL_DCP_FP8_TRANSPORT": lambda: bool(
+        int(os.getenv("VLLM_MLA_PREFILL_DCP_FP8_TRANSPORT", "0"))
+    ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.
     # Raise it for long-context deployments, where step cost is dominated by
@@ -1225,13 +1352,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": lambda: bool(
         int(os.getenv("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", "1"))
     ),
-    # Select the GDN MTP decode implementation. "cuda" uses the fused decode
-    # kernel where supported and falls back to "triton" otherwise; setting it
-    # explicitly to "cuda" raises when unsupported.
+    # Select the GDN decode implementation. "b12x" also selects b12x GDN prefill;
+    # conflicting explicit prefill overrides are rejected. "cuda" uses the fused
+    # decode kernel where supported and falls back to "triton" otherwise.
+    # Setting "cuda" explicitly raises when unsupported.
     "VLLM_GDN_DECODE_KERNEL": env_with_choices(
         "VLLM_GDN_DECODE_KERNEL",
         "cuda",
-        ["cuda", "triton"],
+        ["b12x", "cuda", "triton"],
         case_sensitive=False,
     ),
     # Disable pynccl (using torch.distributed instead)
@@ -1478,8 +1606,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE": lambda: int(
         os.getenv("VLLM_V1_OUTPUT_PROC_CHUNK_SIZE", "128")
     ),
+    # Seconds an external checkpoint restore may wait for GPU capacity before
+    # its request recomputes the prompt instead. 0 recomputes immediately.
+    "VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S": lambda: max(
+        0.0, float(os.getenv("VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S", "60"))
+    ),
+    # Let a scheduling step with no runnable decode use the full
+    # max_num_batched_tokens for prefill instead of max_num_scheduled_tokens,
+    # which only exists to keep decode streams moving.
+    "VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS": lambda: (
+        os.getenv("VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS", "0") == "1"
+    ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
+    # Keep dense MLA split partials in FP32 until the merge when requested.
+    "VLLM_K3_DENSE_MLA_PARTIAL_DTYPE": env_with_choices(
+        "VLLM_K3_DENSE_MLA_PARTIAL_DTYPE", "bf16", ["bf16", "fp32"]
+    ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
     # it allows ray to schedule multiple actors on a single GPU,
@@ -1669,14 +1812,199 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # attention/shared-expert projections, DeepSeek-V4.1 ``wo_b``). All TP
     # ranks must belong to one NVLink domain.
     "VLLM_ENABLE_GEMM_RS": lambda: bool(int(os.getenv("VLLM_ENABLE_GEMM_RS", "0"))),
+    # Shard Kimi-K3 MLA latent projection weights and gather their outputs.
+    "VLLM_USE_B12X_DCP_A2A": lambda: bool(int(os.getenv("VLLM_USE_B12X_DCP_A2A", "0"))),
+    "VLLM_KIMI_SHARD_QKV_A": lambda: bool(int(os.getenv("VLLM_KIMI_SHARD_QKV_A", "0"))),
+    # Shard Kimi router and latent MoE weights when token rows are replicated.
+    "VLLM_KIMI_SHARD_AUXILIARY_PROJECTIONS": lambda: bool(
+        int(os.getenv("VLLM_KIMI_SHARD_AUXILIARY_PROJECTIONS", "0"))
+    ),
+    # Align BF16 auxiliary GEMMs with EXL3 expert shards for multi-row decode,
+    # preserving prefill.
+    "VLLM_KIMI_ALIGNED_DECODE_PROJECTIONS": lambda: bool(
+        int(os.getenv("VLLM_KIMI_ALIGNED_DECODE_PROJECTIONS", "0"))
+    ),
+    # Overlap split Kimi MXFP8 Q/K/V with BF16 gate/factor/beta projections
+    # during CUDA graph capture. Zero preserves sequential dispatch.
+    "VLLM_KIMI_KDA_PROJECTION_STREAM_TOKEN_THRESHOLD": lambda: int(
+        os.getenv("VLLM_KIMI_KDA_PROJECTION_STREAM_TOKEN_THRESHOLD", "0")
+    ),
+    # Bound physical group width for Kimi's recurrent target and MLA draft pool.
+    "VLLM_K3_KV_GROUP_SIZE": lambda: int(os.getenv("VLLM_K3_KV_GROUP_SIZE", "0")),
+    # Keep a bounded draft-only MLA tail; target verification retains full KV.
+    "VLLM_DSPARK_DRAFT_KV_WINDOW": lambda: int(
+        os.getenv("VLLM_DSPARK_DRAFT_KV_WINDOW", "0")
+    ),
+    # Stage DFlash auxiliary inputs in MXFP8 and use B12X for its FC only.
+    "VLLM_DFLASH_AUX_MXFP8_STREAMING": lambda: bool(
+        int(os.getenv("VLLM_DFLASH_AUX_MXFP8_STREAMING", "0"))
+    ),
+    "VLLM_DFLASH_AUX_BF16_STAGING": lambda: bool(
+        int(os.getenv("VLLM_DFLASH_AUX_BF16_STAGING", "0"))
+    ),
+    # Keep only the unscaled rotary rows consumed by a DFlash forward.
+    "VLLM_DFLASH_COMPACT_ROPE": lambda: bool(
+        int(os.getenv("VLLM_DFLASH_COMPACT_ROPE", "0"))
+    ),
+    # Partition DFlash auxiliary FC output rows and gather complete activations.
+    "VLLM_DFLASH_SHARD_AUX_PROJECTION": lambda: bool(
+        int(os.getenv("VLLM_DFLASH_SHARD_AUX_PROJECTION", "0"))
+    ),
+    # Materialize only the FP32 rotary rows used by one draft forward.
+    "VLLM_DSPARK_COMPACT_ROPE": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_COMPACT_ROPE", "0"))
+    ),
+    "VLLM_DSPARK_SHARD_MARKOV_HEAD": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", "0"))
+    ),
+    "VLLM_DSPARK_REPLICATE_MARKOV_W1": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_REPLICATE_MARKOV_W1", "0"))
+    ),
+    # Exact distributed greedy selection without gathering vocabulary logits.
+    "VLLM_KIMI_K3_B12X_DSPARK_ARGMAX": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_B12X_DSPARK_ARGMAX", "0"))
+    ),
+    # Kimi DSpark defaults to replicated draft KV within a DCP group.
+    "VLLM_DCP_SHARD_DRAFT": lambda: os.getenv("VLLM_DCP_SHARD_DRAFT"),
     # Allow use of FlashInfer FP8 block-scale GEMM for linear layers.
     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).
     "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": lambda: bool(
         int(os.getenv("VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER", "1"))
     ),
+    # Deployment default; explicit kernel configuration or CLI selection wins.
+    "VLLM_DEFAULT_MOE_BACKEND": lambda: os.getenv("VLLM_DEFAULT_MOE_BACKEND", "auto"),
     # Force b12x FP4 MoE to use BF16 activations.
     "VLLM_B12X_MOE_FP4_FORCE_A16": lambda: bool(
         int(os.getenv("VLLM_B12X_MOE_FP4_FORCE_A16", "0"))
+    ),
+    # Force NVFP4 dense and MoE A16 at M <= cutoff, including small prefills.
+    # Zero disables the cutoff; larger M retains its configured precision.
+    "VLLM_B12X_ACTIVATION_MODE_A16_M": lambda: int(
+        os.getenv("VLLM_B12X_ACTIVATION_MODE_A16_M", "0")
+    ),
+    # Opt-in: under --linear-backend b12x, serve decode-sized (<= 8 row) BF16
+    # linears through b12x gemm.bf16_gemv plans autotuned against cuBLAS.
+    "VLLM_B12X_BF16_GEMV": lambda: os.getenv("VLLM_B12X_BF16_GEMV", "0") == "1",
+    # Select layer-wide activation scales for b12x NVFP4 MoE projections.
+    "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE": env_with_choices(
+        "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE",
+        "0",
+        ["0", "1", "all", "w13", "w2"],
+    ),
+    # Expand the next NVFP4-CSF layer's expert scales on a side stream while its
+    # attention runs, instead of before its MoE (eager prefill calls only).
+    "VLLM_B12X_CSF_SCALE_PREFETCH": lambda: bool(
+        int(os.getenv("VLLM_B12X_CSF_SCALE_PREFETCH", "1"))
+    ),
+    # Dense activation precision; recipe overrides take precedence.
+    "VLLM_B12X_DENSE_ACTIVATION_MODE": env_with_choices(
+        "VLLM_B12X_DENSE_ACTIVATION_MODE", "auto", ["auto", "a16", "quantized"]
+    ),
+    "VLLM_B12X_NVFP4_ACTIVATION_MODE": env_with_choices(
+        "VLLM_B12X_NVFP4_ACTIVATION_MODE", None, ["auto", "a16", "quantized"]
+    ),
+    "VLLM_B12X_MXFP8_ACTIVATION_MODE": env_with_choices(
+        "VLLM_B12X_MXFP8_ACTIVATION_MODE", None, ["auto", "a16", "quantized"]
+    ),
+    # Maximum caller-owned scratch available to one block-scaled GEMM.
+    "VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES", "2000000000")
+    ),
+    # Quantize eligible unquantized LM heads on b12x only when explicitly enabled.
+    "VLLM_MXFP8_LM_HEAD": lambda: bool(int(os.getenv("VLLM_MXFP8_LM_HEAD", "0"))),
+    # Preserve BF16 activations in runtime-quantized NVFP4/MXFP8 LM heads.
+    "VLLM_LM_HEAD_A16": lambda: bool(int(os.getenv("VLLM_LM_HEAD_A16", "1"))),
+    "VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT": lambda: bool(
+        int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT", "1"))
+    ),
+    # Reuse uniform speculative metadata in the shared GDN/KDA backend.
+    "VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH": lambda: bool(
+        int(os.getenv("VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH", "1"))
+    ),
+    "VLLM_MTP_NVFP4_LM_HEAD": lambda: bool(
+        int(os.getenv("VLLM_MTP_NVFP4_LM_HEAD", "1"))
+    ),
+    # Quantize the DeepSeek V4.1 DSpark Markov transition head to NVFP4 (fits
+    # the GB10 L2; draft graph 3.57 -> 3.0 ms). Off until its effect on
+    # acceptance is measured.
+    "VLLM_DS41_MARKOV_NVFP4": lambda: bool(
+        int(os.getenv("VLLM_DS41_MARKOV_NVFP4", "0"))
+    ),
+    # Give the DeepSeek V4.1 DSpark drafter its own NVFP4 vocabulary head.
+    "VLLM_DS41_DRAFT_NVFP4_HEAD": lambda: bool(
+        int(os.getenv("VLLM_DS41_DRAFT_NVFP4_HEAD", "0"))
+    ),
+    # Arithmetic of the DeepSeek V4.1 b12x sparse attention. "bf16" computes
+    # like DeepSeek's reference sparse_attn (BF16 Q, KV dequantized to BF16,
+    # BF16 P, FP32 accumulation) with split-K decode; "reference" also runs
+    # decode rows single-pass, which reproduces the reference kernel's
+    # tile-ordered softmax bit for bit at some low-concurrency decode speed;
+    # "auto" lets the b12x tuner pick FP8 internals (Q and P quantized, KV
+    # re-encoded; about 3% relative error) or BF16 per plan.
+    "VLLM_DS41_ATTENTION_COMPUTE": env_with_choices(
+        "VLLM_DS41_ATTENTION_COMPUTE",
+        "bf16",
+        ["bf16", "reference", "auto"],
+    ),
+    # Read DeepSeek V4.1 disk Engram rows while the target graph starts.
+    "VLLM_DS41_ENGRAM_OVERLAP": lambda: bool(
+        int(os.getenv("VLLM_DS41_ENGRAM_OVERLAP", "1"))
+    ),
+    # Overlap independent small-batch projections in Qwen3.8-Flash-Next graphs.
+    "VLLM_QWEN3_8_FLASH_NEXT_OVERLAP": lambda: bool(
+        int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_OVERLAP", "1"))
+    ),
+    # Shard BF16 HyperConnection projections with FP32 down-projection outputs.
+    "VLLM_QWEN3_8_FLASH_NEXT_HC_TP": lambda: bool(
+        int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_HC_TP", "1"))
+    ),
+    # MiMo-V2: prefetch upcoming decode weights into L2 on a side stream
+    # during FULL CUDA-graph decode (cache hints only; numerics unchanged).
+    "VLLM_MIMO_L2_PREFETCH": lambda: os.getenv("VLLM_MIMO_L2_PREFETCH", "0") == "1",
+    # Gather DCP-sharded native cache records (GLM5Next C4, GLM-5.2/5.3 DSA)
+    # before B12X sparse-MLA prefill. This avoids query replication plus the
+    # per-rank LSE combine and is opt-in.
+    "VLLM_B12X_MLA_CKV_GATHER": lambda: (
+        os.getenv("VLLM_B12X_MLA_CKV_GATHER", "0").lower() in ("1", "true", "yes", "on")
+    ),
+    "VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS", "16")
+    ),
+    "VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS", "524288")
+    ),
+    # B12X attention decode/verify through b12x.attention.paged_decode:
+    # "auto" for layers with unequal Q/K and V head dims and for non-causal
+    # FP8-KV layers, "1" for every supported layer, "0" never.
+    "VLLM_B12X_PAGED_DECODE": env_with_choices(
+        "VLLM_B12X_PAGED_DECODE", "auto", ["auto", "0", "1"]
+    ),
+    # Qwen3.8-Flash-Next PLE offload policy, resolved by vLLM for b12x.
+    # "shared" keeps one host-RAM table per host in VLLM_PLE_SHARED_TABLE_DIR
+    # for every process serving the same checkpoint, such as TP1 replicas.
+    "VLLM_PLE_CPU_OFFLOAD": lambda: bool(int(os.getenv("VLLM_PLE_CPU_OFFLOAD", "1"))),
+    "VLLM_PLE_TABLE_MEMORY": env_with_choices(
+        "VLLM_PLE_TABLE_MEMORY",
+        None,
+        ["ram", "disk", "shared"],
+    ),
+    # tmpfs directory of the shared PLE tables.
+    "VLLM_PLE_SHARED_TABLE_DIR": lambda: os.getenv(
+        "VLLM_PLE_SHARED_TABLE_DIR", "/dev/shm/vllm-ple"
+    ),
+    # "auto" attaches to a complete table or populates it, "attach" requires
+    # one, "populate" always rewrites it.
+    "VLLM_PLE_SHARED_TABLE_ROLE": env_with_choices(
+        "VLLM_PLE_SHARED_TABLE_ROLE", "auto", ["auto", "populate", "attach"]
+    ),
+    # Seconds to wait while another process populates the shared table.
+    "VLLM_PLE_SHARED_TABLE_LOCK_TIMEOUT_S": lambda: float(
+        os.getenv("VLLM_PLE_SHARED_TABLE_LOCK_TIMEOUT_S", "3600")
+    ),
+    # Checkpoint identity in the shared table key, for example a content hash
+    # supplied by a launcher; derived from the checkpoint location when unset.
+    "VLLM_PLE_SHARED_TABLE_IDENTITY": lambda: os.getenv(
+        "VLLM_PLE_SHARED_TABLE_IDENTITY"
     ),
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(
@@ -1944,6 +2272,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC", "0"))
     ),
+    # Enable the B12X all-reduce implementation for PCIe-connected GPUs.
+    "VLLM_ENABLE_PCIE_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_PCIE_ALLREDUCE", "0"))
+    ),
+    "VLLM_PCIE_ALLREDUCE_BACKEND": env_with_choices(
+        "VLLM_PCIE_ALLREDUCE_BACKEND", "b12x", ["b12x"]
+    ),
+    # Maximum input sizes dispatched to the low-latency one-shot kernels.
+    # Enable the b12x one-shot RoCE all-reduce for multi-node TP (DGX Spark).
+    "VLLM_ENABLE_ROCE_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_ROCE_ALLREDUCE", "0"))
+    ),
+    "VLLM_ROCE_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+        "VLLM_ROCE_ALLREDUCE_MAX_SIZE", "2MB"
+    ),
+    # Largest per-rank shard routed to the RoCE all-gather
+    # (e.g. logits [rows, vocab/tp]).
+    "VLLM_ROCE_ALLGATHER_MAX_SIZE": lambda: os.getenv(
+        "VLLM_ROCE_ALLGATHER_MAX_SIZE", "16MB"
+    ),
+    "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+        "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "84KB"
+    ),
+    "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE": lambda: os.getenv(
+        "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE", "84KB"
+    ),
+    # Largest input size for the lossless BF16 two-shot. Set a byte size to
+    # opt in; "off" keeps inputs above the one-shot ceiling on the fallback.
+    "VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+        "VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE", "off"
+    ),
+    # Minimum input size for the DMA ring. Set to "off" to keep large
+    # all-reduces on the normal fallback backend.
+    "VLLM_PCIE_DMA_MIN_BYTES": lambda: os.getenv("VLLM_PCIE_DMA_MIN_BYTES", "6MB"),
+    # Optional B12X DMA wire codec. Unset uses lossless transport.
+    "VLLM_PCIE_DMA_FP8": lambda: os.getenv("VLLM_PCIE_DMA_FP8"),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(
         int(os.getenv("VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", "0"))
@@ -2364,6 +2728,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOGGING_CONFIG_PATH",
         "VLLM_LOGGING_COLOR",
         "VLLM_LOG_STATS_INTERVAL",
+        "VLLM_REQUEST_STALL_WARNING_S",
+        "VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S",
+        "VLLM_LOG_REQUEST_TIMELINE",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",

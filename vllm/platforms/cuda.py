@@ -184,7 +184,19 @@ def _backend_cls_path(backend_cls: type[AttentionBackend]) -> str:
     return f"{module}.{qualname}"
 
 
-def _get_attn_backend_class(backend: AttentionBackendEnum) -> type[AttentionBackend]:
+def _get_attn_backend_class(
+    backend: AttentionBackendEnum,
+    config: AttentionSelectorConfig,
+) -> type[AttentionBackend]:
+    if (
+        backend == AttentionBackendEnum.B12X
+        and not backend.is_overridden()
+        and config.use_mla
+        and not config.use_sparse
+    ):
+        from vllm.v1.attention.backends.mla.b12x_mla import B12xMLABackend
+
+        return B12xMLABackend
     return backend.get_class()
 
 
@@ -395,7 +407,7 @@ class CudaPlatformBase(Platform):
         )
         for priority, backend in enumerate(backend_priorities):
             try:
-                backend_class = _get_attn_backend_class(backend)
+                backend_class = _get_attn_backend_class(backend, attn_selector_config)
                 invalid_reasons_i = backend_class.validate_configuration(
                     device_capability=device_capability,
                     **attn_selector_config._asdict(),
@@ -447,7 +459,9 @@ class CudaPlatformBase(Platform):
         # First try checking just the selected backend, if there is one.
         if selected_backend is not None:
             try:
-                backend_class = _get_attn_backend_class(selected_backend)
+                backend_class = _get_attn_backend_class(
+                    selected_backend, attn_selector_config
+                )
                 invalid_reasons = backend_class.validate_configuration(
                     device_capability=device_capability,
                     **attn_selector_config._asdict(),
@@ -998,9 +1012,18 @@ class NvmlCudaPlatform(CudaPlatformBase):
     @classmethod
     @with_nvml_context
     def log_warnings(cls):
-        device_ids: int = pynvml.nvmlDeviceGetCount()
-        if device_ids > 1:
-            device_names = [cls._get_physical_device_name(i) for i in range(device_ids)]
+        device_ids = (
+            torch.cuda._parse_visible_devices()
+            if cls.device_control_env_var in os.environ
+            else range(pynvml.nvmlDeviceGetCount())
+        )
+        if len(device_ids) > 1:
+            device_names = [
+                cls._get_physical_device_name(
+                    cls.device_control_id_to_physical_device_id(str(device_id))
+                )
+                for device_id in device_ids
+            ]
             if (
                 len(set(device_names)) > 1
                 and os.environ.get("CUDA_DEVICE_ORDER") != "PCI_BUS_ID"

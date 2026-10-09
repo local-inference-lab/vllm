@@ -43,6 +43,15 @@ class TokensInput(_InputOptions):
     """Char-level (start, end) offsets per token, propagated from the
     renderer's TokensPrompt when offsets were computed."""
 
+    recurrent_instruction_boundary: NotRequired[int]
+    """Exclusive token offset after leading system or developer messages.
+
+    The OpenAI chat renderer sets this internal marker only when rendering the
+    instruction-only conversation produces an exact prefix of the complete
+    prompt. Recurrent cache implementations can retain state at this semantic
+    boundary without inferring message structure from token IDs.
+    """
+
 
 def tokens_input(
     prompt_token_ids: list[int],

@@ -36,6 +36,7 @@ _NUMACTL_CPUSET_PATTERN = re.compile(r"^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$")
 ExpertPlacementStrategy = Literal["linear", "round_robin"]
 DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
+DataParallelMode = Literal["auto", "independent"]
 EPLBPolicyOption = Literal["default"]
 DCPCommBackend = Literal["ag_rs", "a2a"]
 EPLBCommunicatorBackend = Literal[
@@ -145,7 +146,13 @@ class ParallelConfig:
     the process world size but does not increase the KV-cache shard count."""
     data_parallel_size: int = Field(default=1, ge=1)
     """Number of data parallel groups. MoE layers will be sharded according to
-    the product of the tensor, prefill-context, and data parallel sizes."""
+    the product of the tensor, prefill-context, and data parallel sizes unless
+    data_parallel_mode is independent."""
+    data_parallel_mode: DataParallelMode = "auto"
+    """Execution mode for data parallel replicas. auto shares MoE experts across
+    DP ranks; independent replicates the complete model within each TP group.
+    Independent mode supports single-host multiprocessing with internal load
+    balancing through the online serving or AsyncLLM APIs."""
     data_parallel_size_local: int = Field(default=1, ge=0)
     """Number of local data parallel groups. A value of 0 is a sentinel used by
     the engine-args layer to signal that data parallelism was specified
@@ -763,13 +770,13 @@ class ParallelConfig:
             )
             and self.enable_expert_parallel
             and self.tensor_parallel_size > 1
-            and self.data_parallel_size > 1
+            and self.effective_data_parallel_size > 1
         )
 
     @property
     def use_all2all(self) -> bool:
         return (
-            self.data_parallel_size > 1
+            self.effective_data_parallel_size > 1
             or self.use_sequence_parallel_moe
             or (self.enable_expert_parallel and self.prefill_context_parallel_size > 1)
         )
@@ -783,7 +790,7 @@ class ParallelConfig:
                 "nixl_ep",
             )
             and self.enable_expert_parallel
-            and self.data_parallel_size > 1
+            and self.effective_data_parallel_size > 1
         )
 
     @property
@@ -933,6 +940,35 @@ class ParallelConfig:
             * self.prefill_context_parallel_size
         )
 
+        if self.data_parallel_mode == "independent":
+            if (
+                self.nnodes != 1
+                or self.data_parallel_backend != "mp"
+                or self.distributed_executor_backend not in (None, "mp", "uni")
+                or self.data_parallel_external_lb
+                or self.data_parallel_hybrid_lb
+                or self.data_parallel_rank != 0
+                or self.data_parallel_size_local
+                not in (
+                    (0, 1)
+                    if self.data_parallel_size == 1
+                    else (self.data_parallel_size,)
+                )
+                or self.enable_elastic_ep
+            ):
+                raise ValueError(
+                    "Independent data parallelism requires single-host local "
+                    "multiprocessing with internal load balancing and no elastic EP."
+                )
+            if envs.VLLM_DP_SIZE > 1 or "VLLM_DP_RANK_LOCAL" in os.environ:
+                raise ValueError(
+                    "Independent data parallelism does not support offline SPMD."
+                )
+            if self.distributed_executor_backend is None:
+                self.distributed_executor_backend = (
+                    "mp" if self.world_size > 1 else "uni"
+                )
+
         if self.distributed_executor_backend == "external_launcher":
             logger.info("Using external launcher for distributed inference.")
             self.world_size *= self.data_parallel_size
@@ -961,7 +997,11 @@ class ParallelConfig:
                         "--eplb-config.use_async=false."
                     )
 
-        if self.data_parallel_size > 1 or self.data_parallel_size_local == 0:
+        if (
+            self.data_parallel_size > 1
+            or self.data_parallel_size_local == 0
+            or self.data_parallel_mode == "independent"
+        ):
             # Data parallel was specified in the engine args.
             if self.distributed_executor_backend == "external_launcher":
                 # For external launcher,
@@ -1154,13 +1194,22 @@ class ParallelConfig:
 
         return self
 
+    @property
+    def effective_data_parallel_size(self) -> int:
+        """DP size after applying the independent execution mode."""
+        return (
+            1 if self.data_parallel_mode == "independent" else self.data_parallel_size
+        )
+
     def reconfigure_for_independent_dp_rank(self) -> None:
-        """Reconfigure for a single independent non-MoE DP rank."""
+        """Reconfigure execution while preserving routing and GPU placement."""
         # Capture these before changing DP fields.
         nnodes = self.nnodes_within_dp
         node_rank = self.node_rank_within_dp
         self.data_parallel_size = 1
         self.data_parallel_size_local = 1
         self.data_parallel_rank = 0
+        if self.data_parallel_mode == "independent":
+            self.elastic_ep_max_dp_size = 1
         self.nnodes = nnodes
         self.node_rank = node_rank
