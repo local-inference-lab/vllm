@@ -11,7 +11,7 @@ STABLE_TORCH_LIBRARY(_flashkda_C, m) {
       "float lower_bound, "
       "Tensor? initial_state=None, Tensor(b!)? final_state=None, "
       "Tensor? cu_seqlens=None, Tensor(d!)? checkpoint_state=None, "
-      "Tensor? checkpoint_offsets=None) -> ()");
+      "Tensor? checkpoint_offsets=None, Tensor? checkpoint_indptr=None) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_flashkda_C, CompositeExplicitAutograd, m) {

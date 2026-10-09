@@ -1,0 +1,69 @@
+diff --git a/csrc/smxx/fwd_kernel2.cuh b/csrc/smxx/fwd_kernel2.cuh
+index 612ee0a..e418855 100644
+--- a/csrc/smxx/fwd_kernel2.cuh
++++ b/csrc/smxx/fwd_kernel2.cuh
+@@ -6,6 +6,25 @@
+ 
+ #include "cutlass/arch/reg_reconfig.h"
+ 
++__device__ __forceinline__ void copy_cta_workspace(
++    void const* source, uint64_t* barrier, void* destination, int32_t bytes
++) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
++    // Both shared addresses belong to this CTA. The cluster-addressed bulk
++    // copy uses a device syscall on SM120 and reserves a large context stack.
++    uint32_t dst = cute::cast_smem_ptr_to_uint(destination);
++    uint32_t mbar = cute::cast_smem_ptr_to_uint(barrier);
++    asm volatile(
++        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
++        "[%0], [%1], %2, [%3];\n"
++        :
++        : "r"(dst), "l"(source), "r"(bytes), "r"(mbar)
++        : "memory");
++#else
++    cute::SM90_BULK_COPY_G2S::copy(source, barrier, destination, bytes);
++#endif
++}
++
+ // On sm_12x ptxas drops setmaxnreg with a performance warning, because the
+ // bulk copies become extern calls. K2's ~98 KB of smem only fits one block
+ // per SM there anyway, so launch one block and skip the reallocation.
+@@ -444,32 +463,32 @@ _flash_kda_fwd_recurrence(
+             // K1 stores byte images of its swizzled shared-memory tensors.
+             // K2 uses the same layouts, so raw bulk copies restore them
+             // directly without tensor-map coordinate work or repacking.
+-            cute::SM90_BULK_COPY_G2S::copy(
++            copy_cta_workspace(
+                 ws_kd + int64_t(ws_idx) * (CHUNK * D),
+                 reinterpret_cast<uint64_t*>(tma_barrier),
+                 shared_storage.input[stage].k_decayed.begin(),
+                 int32_t(CHUNK * D * sizeof(BF16)));
+-            cute::SM90_BULK_COPY_G2S::copy(
++            copy_cta_workspace(
+                 ws_qd + int64_t(ws_idx) * (CHUNK * D),
+                 reinterpret_cast<uint64_t*>(tma_barrier),
+                 shared_storage.input[stage].q_decayed.begin(),
+                 int32_t(CHUNK * D * sizeof(BF16)));
+-            cute::SM90_BULK_COPY_G2S::copy(
++            copy_cta_workspace(
+                 ws_kr + int64_t(ws_idx) * (CHUNK * D),
+                 reinterpret_cast<uint64_t*>(tma_barrier),
+                 shared_storage.input[stage].k_restored.begin(),
+                 int32_t(CHUNK * D * sizeof(BF16)));
+-            cute::SM90_BULK_COPY_G2S::copy(
++            copy_cta_workspace(
+                 ws_gt + int64_t(ws_idx) * D,
+                 reinterpret_cast<uint64_t*>(tma_barrier),
+                 shared_storage.input[stage].g_total.begin(),
+                 int32_t(D * sizeof(float)));
+-            cute::SM90_BULK_COPY_G2S::copy(
++            copy_cta_workspace(
+                 ws_inv + int64_t(ws_idx) * (CHUNK * CHUNK),
+                 reinterpret_cast<uint64_t*>(tma_barrier),
+                 shared_storage.input[stage].INV.begin(),
+                 int32_t(CHUNK * CHUNK * sizeof(BF16)));
+-            cute::SM90_BULK_COPY_G2S::copy(
++            copy_cta_workspace(
+                 ws_mqk + int64_t(ws_idx) * (CHUNK * CHUNK),
+                 reinterpret_cast<uint64_t*>(tma_barrier),
+                 shared_storage.input[stage].Mqk.begin(),

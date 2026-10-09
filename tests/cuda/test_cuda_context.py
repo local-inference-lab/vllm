@@ -192,5 +192,57 @@ def test_has_device_capability_comparisons(monkeypatch):
         NvmlCudaPlatform.get_device_capability.cache_clear()
 
 
+@pytest.mark.parametrize(
+    "visible_devices, expected",
+    [
+        ("6,7", [6, 7]),
+        ("GPU-six,GPU-seven", [6, 7]),
+        ("6,7,-1,2", [6, 7]),
+        ("6", []),
+        ("", []),
+        ("-1", []),
+        (None, [0, 1]),
+    ],
+)
+def test_device_order_warning_respects_visibility(
+    monkeypatch, caplog, visible_devices, expected
+):
+    from vllm.platforms.cuda import NvmlCudaPlatform, pynvml
+
+    monkeypatch.setattr(pynvml, "nvmlInit", lambda: None)
+    monkeypatch.setattr(pynvml, "nvmlShutdown", lambda: None)
+    monkeypatch.delenv("CUDA_DEVICE_ORDER", raising=False)
+    if visible_devices is None:
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible_devices)
+
+    def count_devices():
+        assert visible_devices is None, "restricted visibility must not enumerate GPUs"
+        return 2
+
+    monkeypatch.setattr(pynvml, "nvmlDeviceGetCount", count_devices)
+    monkeypatch.setattr(
+        pynvml,
+        "nvmlDeviceGetHandleByUUID",
+        lambda uuid: {"GPU-six": 6, "GPU-seven": 7}[uuid],
+    )
+    monkeypatch.setattr(pynvml, "nvmlDeviceGetIndex", lambda handle: handle)
+    queried = []
+
+    def device_name(_cls, index):
+        assert index in expected, f"queried an unselected GPU: {index}"
+        queried.append(index)
+        return f"device-{index}"
+
+    monkeypatch.setattr(
+        NvmlCudaPlatform, "_get_physical_device_name", classmethod(device_name)
+    )
+    NvmlCudaPlatform.log_warnings()
+
+    assert queried == expected
+    assert ("Detected different devices" in caplog.text) == bool(expected)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

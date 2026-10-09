@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _get_cmake_bin() -> str:
     cmake = shutil.which("cmake")
@@ -80,3 +82,46 @@ endif()
     )
 
     subprocess.run([_get_cmake_bin(), "-P", script], check=True)
+
+
+@pytest.mark.parametrize("conflicting", [False, True])
+def test_flashkda_patch_reconfiguration_preserves_source_contract(
+    tmp_path: Path, conflicting: bool
+) -> None:
+    """A managed source patch is repeatable; incompatible sources are unchanged."""
+    source = tmp_path / "managed source"
+    source.mkdir()
+    header = source / "api.h"
+    before = "int checkpoint_count = 0;\n"
+    after = "int checkpoint_count = 16;\n"
+    original = "int checkpoint_count = 7;\n" if conflicting else before
+    header.write_text(original)
+    patch = tmp_path / "checkpoint.patch"
+    patch.write_text(
+        "diff --git a/api.h b/api.h\n"
+        "--- a/api.h\n+++ b/api.h\n@@ -1 +1 @@\n"
+        f"-{before}+{after}"
+    )
+    helper = (
+        Path(__file__).parents[1]
+        / "cmake/external_projects/apply_flashkda_checkpoint_patch.cmake"
+    )
+    for _ in range(2):
+        result = subprocess.run(
+            [
+                _get_cmake_bin(),
+                f"-DSOURCE_DIR={source}",
+                f"-DPATCH_FILE={patch}",
+                "-P",
+                str(helper),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if conflicting:
+            assert result.returncode != 0
+            assert "do not match the pinned" in result.stderr
+            assert header.read_text() == original
+        else:
+            assert result.returncode == 0, result.stderr
+            assert header.read_text() == after
