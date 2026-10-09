@@ -422,7 +422,7 @@ def checkpoint_mamba_states_kernel(
         return
     _copy_mamba_state_block(
         state_idx,
-        batch_idx,
+        req_idx,
         src_col,
         0,
         token_bias,

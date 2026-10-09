@@ -16,6 +16,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     get_temporal_copy_spec,
 )
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.boundary_checkpoint import NUM_BOUNDARY_CHECKPOINT_SLOTS
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -278,7 +279,7 @@ def test_aligned_state_indices_graph_replay_masks_padding_and_refreshes_blocks(
     ctx = SimpleNamespace(
         is_initialized=True,
         aligned_state_indices=indices,
-        block_table_ptrs=torch.tensor(
+        aligned_index_block_table_ptrs=torch.tensor(
             [_reinterpret_u64_as_i64(table.data_ptr()) for table in tables],
             dtype=torch.int64,
             device="cuda",
@@ -313,7 +314,7 @@ def test_aligned_state_indices_graph_replay_masks_padding_and_refreshes_blocks(
                     + torch.arange(num_state_slots)
                     + table_delta
                     if lengths[row] > 0
-                    else -1
+                    else NULL_BLOCK_ID
                 )
         torch.testing.assert_close(
             indices.cpu(), expected.to(torch.int32), rtol=0, atol=0
@@ -552,7 +553,7 @@ def test_discovers_heterogeneous_mamba_uniform_group() -> None:
     )
 
     funcs_by_type = {
-        MambaAttentionBackendEnum.GDN_ATTN: _COPY_FUNCS,
+        MambaAttentionBackendEnum.GDN_ATTN: _DEFAULT_COPY_FUNCS,
         MambaAttentionBackendEnum.SHORT_CONV: (get_conv_copy_spec,),
     }
     buffers = MambaCopyBuffers.create(
@@ -589,11 +590,11 @@ def test_resolves_legacy_single_type_mamba_copy_api() -> None:
     class LegacyModel:
         @classmethod
         def get_mamba_state_copy_func(cls):
-            return _COPY_FUNCS
+            return _DEFAULT_COPY_FUNCS
 
     funcs_by_type = resolve_mamba_state_copy_funcs(LegacyModel(), kv_cache_config)
 
-    assert funcs_by_type == {MambaAttentionBackendEnum.MAMBA2: _COPY_FUNCS}
+    assert funcs_by_type == {MambaAttentionBackendEnum.MAMBA2: _DEFAULT_COPY_FUNCS}
 
 
 def test_populates_heterogeneous_mamba_metadata_with_group_association() -> None:
@@ -607,7 +608,7 @@ def test_populates_heterogeneous_mamba_metadata_with_group_association() -> None
         ],
     )
     funcs_by_type = {
-        MambaAttentionBackendEnum.GDN_ATTN: _COPY_FUNCS,
+        MambaAttentionBackendEnum.GDN_ATTN: _DEFAULT_COPY_FUNCS,
         MambaAttentionBackendEnum.SHORT_CONV: (get_conv_copy_spec,),
     }
     device = torch.device("cpu")
@@ -665,7 +666,7 @@ def test_heterogeneous_copy_capacity_is_checked_before_writes() -> None:
         ],
     )
     funcs_by_type = {
-        MambaAttentionBackendEnum.GDN_ATTN: _COPY_FUNCS,
+        MambaAttentionBackendEnum.GDN_ATTN: _DEFAULT_COPY_FUNCS,
         MambaAttentionBackendEnum.SHORT_CONV: (get_conv_copy_spec,),
     }
     buffers = MambaCopyBuffers.create(
@@ -1183,14 +1184,19 @@ def test_boundary_checkpoint_copies_only_selected_committed_states(
     def t(values):
         return torch.tensor(values, device=device, dtype=torch.int32)
 
-    tables = t([[1, 2, 3, 4, 5, 6], [14, 15, 16, 17, 18, 19]])
-    ctx.initialize_from_forward_context(config, context, _COPY_FUNCS, [tables])
+    tables = t([[7, 8, 9, 10, 11, 12]] * cfg.max_num_reqs)
+    tables[3] = t([1, 2, 3, 4, 5, 6])
+    tables[1] = t([14, 15, 16, 17, 18, 19])
+    idx = t([3, 1])
+    batch_tables = tables[idx.long()]
+    ctx.initialize_from_forward_context(
+        config, context, _COPY_FUNCS, [tables], [batch_tables]
+    )
     destinations = torch.zeros(
         (8, NUM_BOUNDARY_CHECKPOINT_SLOTS, 1), device=device, dtype=torch.int32
     )
     destinations[3, :2, 0] = t([20, 21])
     destinations[1, :2, 0] = t([22, 23])
-    idx = t([3, 1])
     states = t([0, 1, 0, 0, 0, 0, 0, 0])
     capture = torch.zeros(
         (2, NUM_BOUNDARY_CHECKPOINT_SLOTS), device=device, dtype=torch.int32
