@@ -43,6 +43,7 @@ def test_uniform_spec_metadata_gpu_preserves_live_values_and_graph_storage(
     capacity = 32
     builder = GDNAttentionMetadataBuilder.__new__(GDNAttentionMetadataBuilder)
     builder.num_spec = window - 1
+    builder.state_index_columns = window
     builder._reuse_spec_decode_inputs = True
     source = torch.arange(
         capacity * (window + 3), dtype=torch.int32, device=device
@@ -88,7 +89,12 @@ def test_uniform_spec_metadata_gpu_preserves_live_values_and_graph_storage(
             return owner.update_block_table(metadata, source, source)
         return metadata
 
-    addresses = tuple(getattr(owner, field).data_ptr() for field in fields)
+    addresses = tuple(
+        getattr(
+            owner if field == "spec_state_indices_tensor" else builder, field
+        ).data_ptr()
+        for field in fields
+    )
     build_metadata()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -440,7 +446,9 @@ def test_uniform_spec_decode_reuses_metadata_with_new_accepted_states(
     other = _create_gdn_builder(3, full_cuda_graph=True)
     other.vllm_config.cache_config.mamba_cache_mode = "align"
     other.mamba_aligned_state_indices = source.clone() + 32
-    captured_other = other.build_for_cudagraph_capture(common)
+    captured_other = other.update_block_table(
+        reference, common.block_table_tensor, None
+    )
     pointer = reference.spec_state_indices_tensor.data_ptr()
     for count in (4, 2, 1):
         accepted.fill_(count)
@@ -456,7 +464,7 @@ def test_uniform_spec_decode_reuses_metadata_with_new_accepted_states(
         torch.testing.assert_close(captured_other.num_accepted_tokens, accepted)
         assert (
             updated.num_accepted_tokens.data_ptr()
-            == other.num_accepted_tokens.data_ptr()
+            == builder.num_accepted_tokens.data_ptr()
         )
 
 
@@ -511,7 +519,10 @@ def test_uniform_graph_skips_only_unused_b12x_mixed_worklists(
         is_prefilling=torch.zeros(2, dtype=torch.bool),
         uniform_decode_graph=uniform_graph,
     )
-    captured = [builder.build_for_cudagraph_capture(common) for builder in builders]
+    captured = [builders[0].build_for_cudagraph_capture(common)]
+    captured.append(
+        builders[1].update_block_table(captured[0], common.block_table_tensor, None)
+    )
     drafts = torch.full((2,), 3, dtype=torch.int32)
     for values in ([1, 4], [3, 2]):
         accepted = torch.tensor(values, dtype=torch.int32)
@@ -1070,7 +1081,7 @@ def test_gdn_decode_reuses_runner_buffers_across_groups_and_padded_steps() -> No
     )
 
 
-def test_gdn_spec_update_uses_current_builders_graph_buffers() -> None:
+def test_gdn_spec_update_keeps_group_states_and_shared_batch_buffers() -> None:
     builder_a = _create_gdn_builder(
         num_speculative_tokens=2,
         full_cuda_graph=True,
@@ -1108,17 +1119,17 @@ def test_gdn_spec_update_uses_current_builders_graph_buffers() -> None:
     assert metadata_b.spec_sequence_masks is not None
     assert (
         metadata_b.spec_sequence_masks.data_ptr()
-        == builder_b.spec_sequence_masks.data_ptr()
+        == builder_a.spec_sequence_masks.data_ptr()
     )
     assert metadata_b.spec_query_start_loc is not None
     assert (
         metadata_b.spec_query_start_loc.data_ptr()
-        == builder_b.spec_query_start_loc.data_ptr()
+        == builder_a.spec_query_start_loc.data_ptr()
     )
     assert metadata_b.num_accepted_tokens is not None
     assert (
         metadata_b.num_accepted_tokens.data_ptr()
-        == builder_b.num_accepted_tokens.data_ptr()
+        == builder_a.num_accepted_tokens.data_ptr()
     )
     torch.testing.assert_close(
         metadata_b.spec_state_indices_tensor,
@@ -1138,86 +1149,92 @@ def test_gdn_spec_update_uses_current_builders_graph_buffers() -> None:
     )
 
 
+@pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda", 0)])
+@pytest.mark.parametrize("rebind_group", [False, True])
 def test_uniform_spec_fastpath_shares_graph_buffers_with_generic_path(
-    monkeypatch,
+    monkeypatch, device, rebind_group
 ) -> None:
-    """A graph captured from a uniform batch must stay valid for a padded one.
-
-    Full-cudagraph capture for a token count that is a whole number of spec
-    windows builds a uniform batch, so the fast path builds it. At run time a
-    batch with fewer live requests pads up to the same graph with a padded
-    request row, which is not uniform, so the generic path builds it. Both
-    builds must hand the layers the builder-owned graph buffers, or the replay
-    reads whichever buffers were captured while the other path fills different
-    ones.
-    """
+    """Captured GDN inputs stay live as four requests shrink to three and back."""
+    if device.type == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
     monkeypatch.setenv("VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH", "1")
-    builder = _create_gdn_builder(num_speculative_tokens=2, full_cuda_graph=True)
-    builder.vllm_config.cache_config.mamba_cache_mode = "align"
-    builder.mamba_aligned_state_indices = torch.tensor(
-        [[101, 102, 103, 104], [201, 202, 203, 204]], dtype=torch.int32
-    )
+    builder = _create_gdn_builder(3, full_cuda_graph=True, device=device)
+    other = _create_gdn_builder(3, full_cuda_graph=True, device=device)
+    for index, owner in enumerate((builder, other)):
+        owner.vllm_config.cache_config.mamba_cache_mode = "align"
+        owner.gdn_prefill_backend = "b12x"
+        owner.mamba_aligned_state_indices = torch.arange(
+            16, dtype=torch.int32, device=device
+        ).view(4, 4) + 100 * (index + 1)
 
-    # Capture: two uniform spec requests, 3 tokens each.
-    uniform = create_common_attn_metadata(
-        BatchSpec(seq_lens=[40, 30], query_lens=[3, 3]), BLOCK_SIZE, DEVICE
-    ).replace(is_prefilling=torch.zeros(2, dtype=torch.bool))
+    def common(query_lens):
+        return create_common_attn_metadata(
+            BatchSpec(
+                seq_lens=[100 if length else 0 for length in query_lens],
+                query_lens=query_lens,
+            ),
+            BLOCK_SIZE,
+            device,
+        ).replace(
+            is_prefilling=torch.zeros(4, dtype=torch.bool),
+            uniform_decode_graph=True,
+            num_actual_tokens=16,
+        )
+
+    uniform = common([4, 4, 4, 4])
     captured = builder.build_for_cudagraph_capture(uniform)
-    assert captured.is_uniform_spec_decode
-
-    # Replay: one live spec request plus one padded request row (draft -1),
-    # padded to the same two-row graph.
-    padded = create_common_attn_metadata(
-        BatchSpec(seq_lens=[40, 0], query_lens=[3, 0]), BLOCK_SIZE, DEVICE
-    ).replace(is_prefilling=torch.zeros(2, dtype=torch.bool))
-    replayed = builder.build(
-        0,
-        padded,
-        torch.tensor([2, 1], dtype=torch.int32),
-        torch.tensor([2, -1], dtype=torch.int32),
-    )
-    assert not replayed.is_uniform_spec_decode
-    assert replayed.num_spec_decodes == 1
-
-    for field in (
+    if rebind_group:
+        captured = other.update_block_table(captured, uniform.block_table_tensor, None)
+    fields = (
         "spec_state_indices_tensor",
-        "spec_sequence_masks",
         "spec_query_start_loc",
-        "spec_token_indx",
         "num_accepted_tokens",
-    ):
-        captured_tensor = getattr(captured, field)
-        replayed_tensor = getattr(replayed, field)
-        assert captured_tensor is not None and replayed_tensor is not None
-        assert captured_tensor.data_ptr() == replayed_tensor.data_ptr(), field
-        graph_buffer = {
-            "spec_state_indices_tensor": builder.spec_state_indices_tensor,
-            "spec_sequence_masks": builder.spec_sequence_masks,
-            "spec_query_start_loc": builder.spec_query_start_loc,
-            "spec_token_indx": builder.spec_token_indx,
-            "num_accepted_tokens": builder.num_accepted_tokens,
-        }[field]
-        assert captured_tensor.data_ptr() == graph_buffer.data_ptr(), field
+        "spec_sequence_masks",
+        "spec_token_indx",
+    )
+    inputs = [getattr(captured, field) for field in fields]
+    outputs = [torch.empty_like(tensor) for tensor in inputs]
+    graph = None
+    if device.type == "cuda":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for output, tensor in zip(outputs, inputs):
+                output.copy_(tensor)
 
-    # A second group's builder reusing the uniform build must likewise land in
-    # its own graph buffers, with its own group's state indices.
-    other = _create_gdn_builder(num_speculative_tokens=2, full_cuda_graph=True)
-    other.vllm_config.cache_config.mamba_cache_mode = "align"
-    other.mamba_aligned_state_indices = builder.mamba_aligned_state_indices + 10
-    reused = other.update_block_table(
-        captured, uniform.block_table_tensor, torch.zeros(6, dtype=torch.int64)
-    )
-    assert (
-        reused.spec_state_indices_tensor.data_ptr()
-        == other.spec_state_indices_tensor.data_ptr()
-    )
-    assert reused.num_accepted_tokens.data_ptr() == other.num_accepted_tokens.data_ptr()
-    assert (
-        reused.spec_query_start_loc.data_ptr() == other.spec_query_start_loc.data_ptr()
-    )
-    torch.testing.assert_close(
-        reused.spec_state_indices_tensor, other.mamba_aligned_state_indices[:, :3]
-    )
+    for lengths, accepted in (
+        ([4, 4, 4, 0], [3, 2, 4, 1]),
+        ([4, 4, 4, 4], [2, 4, 1, 3]),
+    ):
+        metadata = common(lengths)
+        for owner in (builder, other):
+            owner.mamba_aligned_state_indices.add_(20)
+        replayed = builder.build(
+            0,
+            metadata,
+            torch.tensor(accepted, dtype=torch.int32, device=device),
+            torch.tensor([3 if length else -1 for length in lengths]),
+        )
+        if rebind_group:
+            replayed = other.update_block_table(
+                replayed, metadata.block_table_tensor, None
+            )
+        if graph is not None:
+            allocations = torch.accelerator.memory_stats()["allocation.all.allocated"]
+            graph.replay()
+            torch.accelerator.synchronize()
+            assert (
+                torch.accelerator.memory_stats()["allocation.all.allocated"]
+                == allocations
+            )
+        else:
+            for output, tensor in zip(outputs, inputs):
+                output.copy_(tensor)
+        for field, tensor, output in zip(fields, inputs, outputs):
+            expected = getattr(replayed, field)
+            if field == "spec_token_indx":
+                output = output[: expected.numel()]
+            torch.testing.assert_close(output, expected, atol=0, rtol=0)
+            assert tensor.data_ptr() == expected.data_ptr(), field
 
 
 def test_gdn_mixed_spec_update_selects_group_specific_state_indices() -> None:

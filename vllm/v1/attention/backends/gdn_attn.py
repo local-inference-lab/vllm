@@ -912,14 +912,20 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         assert metadata.seq_lens is not None
         if (
             metadata.is_uniform_spec_decode
-            and metadata.b12x_mixed is None
             and self._reuse_spec_decode_inputs
             and self.mamba_aligned_state_indices is not None
         ):
-            assert metadata.num_accepted_tokens is not None
-            return self._build_uniform_spec_decode(
-                metadata, metadata.num_accepted_tokens
+            state_indices = self.spec_state_indices_tensor[: metadata.num_reqs]
+            state_indices.copy_(
+                self.mamba_aligned_state_indices[
+                    : metadata.num_reqs, : self.state_index_columns
+                ],
+                non_blocking=True,
             )
+            # Uniform and padded replay share the first group's batch tensors.
+            metadata = replace(metadata, spec_state_indices_tensor=state_indices)
+            if metadata.b12x_mixed is None:
+                return metadata
         mixed = None
         if metadata.b12x_mixed is not None:
             mixed = self._b12x_mixed
@@ -943,7 +949,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         ):
             assert metadata.num_accepted_tokens is not None
             return replace(
-                self._build_uniform_spec_decode(metadata, metadata.num_accepted_tokens),
+                metadata,
                 b12x_mixed=mixed,
                 b12x_prefill_live_counts=prefill_live_counts,
             )
