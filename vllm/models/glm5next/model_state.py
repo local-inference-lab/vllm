@@ -221,6 +221,10 @@ class Glm5NextModelState(MambaHybridModelState):
             )
         return accepted
 
+    @property
+    def requires_draft_decode_metadata_refresh(self) -> bool:
+        return self.uses_pooled_selector
+
     def prepare_draft_attn_metadata(
         self,
         *,

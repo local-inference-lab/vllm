@@ -961,6 +961,7 @@ def test_multi_step_decode_replays_captured_graph_as_expected(
         query_start_loc=torch.arange(3),
     )
     speculator.idx_mapping = torch.arange(2)
+    speculator.model_state = SimpleNamespace()
     generate_draft = Mock()
     speculator._generate_draft = generate_draft
     run_fullgraph = Mock()
@@ -973,7 +974,9 @@ def test_multi_step_decode_replays_captured_graph_as_expected(
 
     getattr(speculator, method_name)(
         num_reqs=2,
-        skip_attn=True,
+        skip_attn=not (
+            method_name == "_fused_multi_step_decode" and cg_mode == CUDAGraphMode.FULL
+        ),
         batch_desc=batch_desc,
         seq_lens_cpu_upper_bound=None,
         num_tokens_across_dp=None,

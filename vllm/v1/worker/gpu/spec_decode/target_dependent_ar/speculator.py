@@ -670,6 +670,17 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         idx_mapping = self.idx_mapping[:num_reqs]
 
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
+            if not skip_attn and getattr(
+                self.model_state, "requires_draft_decode_metadata_refresh", False
+            ):
+                # Stateful draft builders own copies of the request metadata.
+                self._build_uniform_attn_metadata(
+                    num_reqs=num_reqs,
+                    batch_desc=batch_desc,
+                    num_query_per_req=1,
+                    seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                    step=1,
+                )
             assert self.decode_cudagraph_manager is not None
             self.decode_cudagraph_manager.run_fullgraph(batch_desc)
             return
@@ -728,7 +739,11 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
                     positions,
                     num_tokens_padded,
                 )
-                self._update_draft_decode_metadata(attn_metadata, num_reqs)
+                if step > 1 or not getattr(
+                    self.model_state, "requires_draft_decode_metadata_refresh", False
+                ):
+                    # The first lookahead retains the target's accepted prefix.
+                    self._update_draft_decode_metadata(attn_metadata, num_reqs)
 
             self.current_draft_step.fill_(step)
             self._generate_draft(

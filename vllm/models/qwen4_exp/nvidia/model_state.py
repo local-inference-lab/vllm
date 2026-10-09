@@ -285,6 +285,10 @@ class Qwen4ExpModelState(MambaHybridModelState):
             )
         return accepted
 
+    @property
+    def requires_draft_decode_metadata_refresh(self) -> bool:
+        return self.uses_qsa
+
     def prepare_draft_attn_metadata(
         self,
         *,

@@ -278,6 +278,66 @@ def test_glm5next_draft_metadata_preserves_first_step_acceptance() -> None:
     )
 
 
+def test_glm5next_full_draft_replay_refreshes_selector_slots() -> None:
+    from tests.v1.attention.test_b12x_sparse_mla_api import (
+        _bare_glm_selector_metadata_builder,
+    )
+    from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
+        TargetDependentARSpeculator,
+    )
+
+    state = _bare_model_state()
+    builder = _bare_glm_selector_metadata_builder()
+    slots, _, accepted, _ = builder._stage_glm_next_selector_metadata(
+        num_reqs=4,
+        for_cudagraph_capture=True,
+        selector_state_slot_ids=None,
+        selector_state_is_fresh=None,
+        selector_num_accepted_tokens=None,
+        selector_is_prefilling=None,
+    )
+    assert slots is not None and accepted is not None
+    pointers = slots.data_ptr(), accepted.data_ptr()
+    idx_mapping = torch.tensor([5, 1], dtype=torch.int32)
+
+    def refresh_metadata(*, num_reqs, batch_desc, step, **_):
+        metadata = state.prepare_draft_attn_metadata(
+            idx_mapping=idx_mapping,
+            num_reqs=num_reqs,
+            num_reqs_padded=batch_desc.num_tokens,
+            draft_index=step,
+        )
+        assert metadata is not None
+        builder._stage_glm_next_selector_metadata(
+            num_reqs=batch_desc.num_tokens,
+            for_cudagraph_capture=False,
+            **metadata.get_extra_attn_kwargs(builder, batch_desc.num_tokens),
+        )
+
+    replays = []
+    speculator = SimpleNamespace(
+        model_state=state,
+        input_buffers=SimpleNamespace(
+            positions=torch.zeros(2, dtype=torch.int64),
+            query_start_loc=torch.arange(3, dtype=torch.int32),
+        ),
+        idx_mapping=idx_mapping,
+        _build_uniform_attn_metadata=Mock(side_effect=refresh_metadata),
+        decode_cudagraph_manager=SimpleNamespace(
+            run_fullgraph=lambda _: replays.append((slots.tolist(), accepted.tolist()))
+        ),
+    )
+    batch_desc = SimpleNamespace(cg_mode=CUDAGraphMode.FULL, num_tokens=4)
+    for mapping, expected_accepted in (([5, 1], [4, 2]), ([1, 5], [2, 4])):
+        idx_mapping.copy_(torch.tensor(mapping, dtype=torch.int32))
+        TargetDependentARSpeculator._fused_multi_step_decode(
+            speculator, 2, False, batch_desc, None, torch.tensor([32, 64]), 5
+        )
+        assert replays[-1] == ([*mapping, -1, -1], [*expected_accepted, 1, 1])
+        assert (slots.data_ptr(), accepted.data_ptr()) == pointers
+    assert len(replays) == 2
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
 def test_glm5next_postprocess_commits_selector_before_mamba_alignment_reset() -> None:
     class ResetAcceptedTokens:

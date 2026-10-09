@@ -1352,7 +1352,13 @@ def test_non_qsa_draft_metadata_is_a_noop_at_step_zero() -> None:
     )
 
 
-def test_qsa_mtp_metadata_preserves_previous_acceptance_until_first_lookahead() -> None:
+def test_qsa_mtp_metadata_preserves_previous_acceptance_until_first_lookahead(
+    monkeypatch,
+) -> None:
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+    from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+    from vllm.v1.worker.utils import AttentionGroup
+
     state = _bare_qwen_model_state_for_draft_metadata()
     state.qsa_state_is_fresh_gpu = torch.zeros(8, dtype=torch.bool)
     state.qsa_committed_num_accepted_tokens_gpu[3] = 2
@@ -1451,6 +1457,86 @@ def test_qsa_mtp_metadata_preserves_previous_acceptance_until_first_lookahead() 
         later_lookahead_metadata.qsa_num_accepted_tokens,
         torch.ones(4, dtype=torch.int32),
     )
+    assert torch.equal(
+        reused_target_metadata.qsa_num_accepted_tokens,
+        previous_accepted,
+    )
+
+    # Replay retains builder-owned addresses across request-slot permutations.
+    spec = MTPSpeculator.__new__(MTPSpeculator)
+    spec.model_state = state
+    spec.current_draft_step = torch.tensor(0)
+    spec.idx_mapping = idx_mapping
+    spec.arange_np = np.arange(5, dtype=np.int32)
+    spec.max_model_len = spec.draft_max_seq_len = 32
+    spec.dcp_size = 1
+    spec.draft_is_prefilling = torch.zeros(4, dtype=torch.bool)
+    spec.input_buffers = SimpleNamespace(
+        positions=torch.arange(4),
+        query_start_loc=common.query_start_loc,
+        seq_lens=common.seq_lens,
+    )
+    spec.block_tables = SimpleNamespace(
+        cp_size=1,
+        input_block_tables=[common.block_table_tensor],
+        slot_mappings=common.slot_mapping.unsqueeze(0),
+        compute_slot_mappings=lambda *args: None,
+    )
+    kv_spec = FullAttentionSpec(
+        block_size=4, num_kv_heads=1, head_size=256, dtype=torch.bfloat16
+    )
+    group = AttentionGroup(Qwen4ExpQSABackend, ["draft"], kv_spec, 0, [draft_builder])
+    spec.attn_groups = [[group]]
+    spec.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=kv_spec)]
+    )
+    monkeypatch.setattr(
+        CommonAttentionMetadata,
+        "token_to_req_indices",
+        lambda self, buffer: common._token_to_req_indices_cache,
+    )
+    observed: list[tuple[list[int], list[bool], list[int]]] = []
+
+    def observe(*args):
+        observed.append(
+            (
+                first_lookahead_metadata.qsa_state_slot_ids.tolist(),
+                first_lookahead_metadata.qsa_state_is_fresh.tolist(),
+                first_lookahead_metadata.qsa_num_accepted_tokens.tolist(),
+            )
+        )
+
+    spec._generate_draft = observe
+    spec.decode_cudagraph_manager = SimpleNamespace(
+        run_fullgraph=lambda desc: spec._generate_fused_drafts(
+            4,
+            4,
+            {"draft": first_lookahead_metadata},
+            None,
+            None,
+            CUDAGraphMode.NONE,
+            3,
+        )
+    )
+    draft_builder._capture_state_slot_ids.copy_(torch.arange(4))
+    draft_builder._capture_state_is_fresh.fill_(True)
+    for slots, accepted in [([7, 3], [2, 3]), ([3, 7], [4, 1])]:
+        idx_mapping[:2] = torch.tensor(slots, dtype=torch.int32)
+        state.qsa_committed_num_accepted_tokens_gpu[slots] = torch.tensor(
+            accepted, dtype=torch.int32
+        )
+        spec._fused_multi_step_decode(
+            2,
+            False,
+            BatchExecutionDescriptor(CUDAGraphMode.FULL, 4, 4),
+            None,
+            torch.tensor([1, 1]),
+            3,
+        )
+        assert observed[-2:] == [
+            (slots + [2, 3], [False, False, True, True], accepted + [1, 1]),
+            (slots + [2, 3], [False, False, True, True], [1, 1, 1, 1]),
+        ]
     assert torch.equal(
         reused_target_metadata.qsa_num_accepted_tokens,
         previous_accepted,

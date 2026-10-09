@@ -1808,12 +1808,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
             ba, _ = self.in_proj_ba(hidden_states)
 
-        use_fused_gdn_spec_decode = (
-            self.enable_fused_gdn_spec_decode
+        use_fused_gdn_decode = (
+            (self.enable_fused_gdn_spec_decode or self.gdn_decode_kernel == "b12x")
             and hidden_states.dtype == torch.bfloat16
             and self.norm.weight.dtype in (torch.bfloat16, torch.float32)
         )
-        if use_fused_gdn_spec_decode:
+        if use_fused_gdn_decode:
             core_attn_out = torch.zeros(
                 (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
                 dtype=hidden_states.dtype,
