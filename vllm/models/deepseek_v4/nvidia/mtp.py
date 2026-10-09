@@ -29,7 +29,6 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
-    mhc_post_tilelang,
 )
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -47,6 +46,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import get_spec_layer_idx_from_weight_name
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.weight_transfer import copy_weight, flush_weight_transfers
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -184,6 +184,7 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
                 )
             inputs_embeds = sp_shard(inputs_embeds)
             previous_hidden_states = sp_shard(previous_hidden_states)
+            input_ids = sp_shard(input_ids)
         hidden_states = self.h_proj(previous_hidden_states) + self.e_proj(
             inputs_embeds
         ).unsqueeze(-2)
@@ -205,7 +206,9 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
             input_ids=input_ids,
             mega_gate_metadata=mega_gate_metadata,
         )
-        hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+        hidden_states = self.mtp_block.mhc_post(
+            hidden_states, residual, post_mix, res_mix
+        )
         if self.mtp_block.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
         # Return the flat pre-hc_head residual so it can be re-fed as the
@@ -493,7 +496,7 @@ class DeepSeekV4MTP(nn.Module):
                 elif "attn_sink" in name:
                     narrow_weight = loaded_weight[head_rank_start:head_rank_end]
                     n = narrow_weight.shape[0]
-                    params_dict[name][:n].copy_(narrow_weight)
+                    copy_weight(params_dict[name][:n], narrow_weight)
                     loaded_params.add(name)
                     continue
                 else:
@@ -538,7 +541,10 @@ class DeepSeekV4MTP(nn.Module):
             layer.mtp_block.ffn.finalize_mega_moe_weights()
 
     def process_weights_after_loading(self) -> None:
+        flush_weight_transfers()
         self.finalize_mega_moe_weights()
+        for layer in self.model.layers.values():
+            layer.mtp_block.process_b12x_weights_after_loading()
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
         """Rewrite the weight name to match the format of the original model.

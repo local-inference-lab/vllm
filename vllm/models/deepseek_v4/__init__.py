@@ -38,14 +38,14 @@ elif current_platform.is_cpu():
         DeepseekV4ForConditionalGeneration,
     )
 else:
-    from .common.vl_model import (  # type: ignore[assignment]
-        DeepseekV4ForConditionalGeneration,
-    )
     from .nvidia.dspark import (  # type: ignore[assignment]
         DSparkDeepseekV4ForCausalLM,
     )
     from .nvidia.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
     from .nvidia.mtp import DeepSeekV4MTP  # type: ignore[assignment]
+    from .nvidia.vl_model import (  # type: ignore[assignment]
+        DeepseekV4ForConditionalGeneration,
+    )
 
 __all__ = [
     "DSparkDeepseekV4ForCausalLM",

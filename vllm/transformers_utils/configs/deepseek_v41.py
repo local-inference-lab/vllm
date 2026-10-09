@@ -12,7 +12,7 @@ class DeepseekV41Config(PreTrainedConfig):
     tower under ``vision_config``. The vLLM model code (ported from
     ``deepseek_v4``) reads flat attributes, so both sub-configs are flattened
     onto the top level here: text fields are exposed as-is, vision fields
-    with the ``vision_*`` naming used by ``deepseek_v41.common.vision``.
+    with the ``vision_*`` attributes consumed by the vision encoder.
     """
 
     model_type = "deepseek_v41"
@@ -37,9 +37,10 @@ class DeepseekV41Config(PreTrainedConfig):
             # Don't clobber PreTrainedConfig properties (e.g. is_encoder_decoder).
             if isinstance(getattr(type(self), key, None), property):
                 continue
-            setattr(self, key, value)
+            kwargs.setdefault(key, value)
 
         super().__init__(**kwargs)
+        self.vision_config = vision_config
         if rope_scaling is not None:
             self.rope_parameters = rope_scaling
 

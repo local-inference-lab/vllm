@@ -84,6 +84,7 @@ from vllm.models.deepseek_v4.nvidia.model import (
 )
 from vllm.models.deepseek_v41.attention import DeepseekV4Attention
 from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
+from vllm.models.deepseek_v41.nvidia.b12x import is_enabled as use_b12x
 from vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn import (
     DeepseekV4MegaAttnAttention,
 )
@@ -117,6 +118,8 @@ from .ops.mhc import (
 
 if typing.TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+
+    from .b12x.engram import EngramLayout as B12xEngramLayout
 
 logger = init_logger(__name__)
 
@@ -202,6 +205,15 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     attention where the topology allows it, and everything else keeps the
     FlashMLA path.
     """
+    if use_b12x():
+        if vllm_config.attention_config.backend not in (
+            None,
+            AttentionBackendEnum.B12X,
+        ):
+            raise ValueError("DeepSeek V4.1 on SM120 requires B12X")
+        from .b12x.attention import DeepseekV41B12xAttention
+
+        return DeepseekV41B12xAttention
     backend = vllm_config.attention_config.backend
     device_capability = current_platform.get_device_capability()
     if backend in (
@@ -243,6 +255,8 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
 
 
 def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
+    if use_b12x():
+        return False
     parallel_config = vllm_config.parallel_config
     moe_needs_token_sharded_input = (
         vllm_config.kernel_config.moe_backend in MEGA_MOE_BACKENDS
@@ -287,12 +301,28 @@ class DeepseekV4DecoderLayer(nn.Module):
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
         candidate_block_buffer: torch.Tensor | None = None,
-        engram_layout: EngramLayout | None = None,
+        engram_layout: "EngramLayout | B12xEngramLayout | None" = None,
         engram_prefetch_stream: torch.cuda.Stream | None = None,
         run_gemm_rs: bool = False,
         mhc_stream: torch.cuda.Stream | None = None,
         fuse_mhc_all_reduce: bool = False,
     ):
+        if use_b12x():
+            from .b12x.engram import EngramLayout as B12xEngramLayout
+            from .b12x.runtime import initialize_decoder_layer
+
+            assert engram_layout is None or isinstance(engram_layout, B12xEngramLayout)
+
+            initialize_decoder_layer(
+                self,
+                vllm_config,
+                prefix,
+                topk_indices_buffer,
+                aux_stream_list,
+                candidate_block_buffer,
+                engram_layout,
+            )
+            return
         super().__init__()
 
         config = vllm_config.model_config.hf_config
@@ -303,6 +333,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         self.engram: Engram | None = None
         if engram_layout is not None:
+            assert isinstance(engram_layout, EngramLayout)
             layer_id = extract_layer_index(prefix)
             if layer_id in engram_layout.layer_ids:
                 self.engram = Engram(
@@ -463,6 +494,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         engram_hashes: torch.Tensor | None = None,
         engram_mask: torch.Tensor | None = None,
         *,
+        ced_indices: torch.Tensor | None = None,
         capture_previous_aux: bool = False,
         mega_gate_metadata: MegaGateRoutingMetadata | None = None,
     ) -> tuple[
@@ -473,6 +505,22 @@ class DeepseekV4DecoderLayer(nn.Module):
         torch.Tensor,
         torch.Tensor | None,
     ]:
+        if getattr(self, "_use_b12x", False):
+            from .b12x.runtime import forward_decoder_layer
+
+            return forward_decoder_layer(
+                self,
+                x,
+                positions,
+                input_ids,
+                pre_mix,
+                post_mix,
+                res_mix,
+                residual,
+                engram_hashes,
+                engram_mask,
+                ced_indices,
+            )
         previous_aux: torch.Tensor | None = None
         mhc_stream = self.mhc_stream
         if mhc_stream is not None and (
@@ -623,9 +671,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             torch.cuda.current_stream().wait_stream(mhc_stream)
         return x, residual, post_mix, res_mix, ffn_pre, previous_aux
 
+    def build_l2_prefetch(self, nxt: "DeepseekV4DecoderLayer | None") -> str:
+        from .b12x.runtime import build_layer_prefetch
+
+        return build_layer_prefetch(self, nxt)
+
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        if use_b12x():
+            from .b12x.runtime import initialize_model
+
+            initialize_model(self, vllm_config=vllm_config, prefix=prefix)
+            return
         super().__init__()
 
         config = vllm_config.model_config.hf_config
@@ -872,7 +930,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
+        ced_indices: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        if getattr(self, "_use_b12x", False):
+            from .b12x.runtime import forward_model
+
+            return forward_model(
+                self,
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                lookback_token_ids,
+                ced_indices,
+            )
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1229,6 +1300,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 # Vision weights are loaded by the outer multimodal wrapper.
                 logger.warning_once("Skipping non-text weight: %s", name)
                 continue
+            if getattr(self, "_use_b12x", False) and ".engram.embed_tokens." in name:
+                if is_pp_missing_parameter(name, self):
+                    continue
+                module_name, _, leaf = name.rpartition(".")
+                embedding = self.get_submodule(module_name)
+                loaded_params.update(
+                    f"{module_name}.{loaded}"
+                    for loaded in embedding.load_weights(((leaf, loaded_weight),))
+                )
+                continue
             if pad_shared_expert and ".shared_experts." in name:
                 loaded_weight = self._pad_shared_expert_weight(
                     self.quant_config, name, loaded_weight
@@ -1379,6 +1460,21 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             else:
                 layer.hc_attn_fn_broadcast.copy_(broadcast)
 
+    def prepare_disk_engram(self, input_ids, query_start_loc, lookback_token_ids):
+        from .b12x.runtime import prepare_disk_engram
+
+        return prepare_disk_engram(self, input_ids, query_start_loc, lookback_token_ids)
+
+    def prepare_dummy_engram(self, num_tokens):
+        from .b12x.runtime import prepare_dummy_engram
+
+        return prepare_dummy_engram(self, num_tokens)
+
+    def _build_l2_prefetch(self):
+        from .b12x.runtime import build_model_prefetch
+
+        return build_model_prefetch(self)
+
 
 def _linear_scale_param_name(vllm_config: VllmConfig, expert_dtype: str) -> str:
     """Parameter name the linear quant method registers for weight scales.
@@ -1387,6 +1483,8 @@ def _linear_scale_param_name(vllm_config: VllmConfig, expert_dtype: str) -> str:
     layers through ModelOptLinearMethod, which registers ``weight_scale``;
     block-FP8 linear layers register ``weight_scale_inv``.
     """
+    if use_b12x():
+        return "weight_scale_inv"
     use_mxfp8 = (
         getattr(vllm_config.quant_config, "weight_block_size", None) == [32, 32]
         and expert_dtype == "fp4"
@@ -1549,7 +1647,7 @@ class DeepseekV41LLMForCausalLM(
                 continue
             if not isinstance(layer, DeepseekV4DecoderLayer):
                 continue
-            if isinstance(layer.ffn, DeepseekV4MoE):
+            if isinstance(layer.ffn, DeepseekV4MoEBase):
                 example_moe = layer.ffn
                 self.moe_mlp_layers.append(layer.ffn)
                 self.moe_layers.append(layer.ffn.experts)
@@ -1575,6 +1673,10 @@ class DeepseekV41LLMForCausalLM(
 
     @staticmethod
     def get_model_state_cls():
+        if use_b12x():
+            from .b12x.model_state import DeepseekV41ModelState as B12xModelState
+
+            return B12xModelState
         from .model_state import DeepseekV41ModelState
 
         return DeepseekV41ModelState
@@ -1597,7 +1699,17 @@ class DeepseekV41LLMForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
+        ced_indices: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        if getattr(self.model, "_use_b12x", False):
+            return self.model(
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                lookback_token_ids=lookback_token_ids,
+                ced_indices=ced_indices,
+            )
         hidden_states = self.model(
             input_ids,
             positions,
@@ -1614,6 +1726,10 @@ class DeepseekV41LLMForCausalLM(
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if getattr(self.model, "_use_b12x", False):
+            return AutoWeightsLoader(self).load_weights(
+                weights, mapper=self.hf_to_vllm_mapper
+            )
         loader = AutoWeightsLoader(self)
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self.process_weights_after_loading()
@@ -1634,8 +1750,24 @@ class DeepseekV41LLMForCausalLM(
         return loaded_params
 
     def process_weights_after_loading(self) -> None:
+        if getattr(self.model, "_use_b12x", False):
+            from .b12x.runtime import prepare_model_weights
+
+            prepare_model_weights(self)
+            return
         self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
+
+    @property
+    def requires_accepted_token_lookback(self) -> bool:
+        return getattr(self.model, "_use_b12x", False)
+
+    def checkpoint_file_weight_filter(self, name: str) -> bool:
+        return (
+            getattr(self.model, "file_backed_engram", False)
+            and re.fullmatch(r"layers\.\d+\.engram\.embed\.(?:weight|scale)", name)
+            is not None
+        )

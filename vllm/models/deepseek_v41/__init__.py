@@ -6,12 +6,22 @@ from vllm.platforms import current_platform
 
 from .quant_config import DeepseekV4FP8Config
 
-if current_platform.is_rocm():
-    from .amd.dspark import DSparkDeepseekV4ForCausalLM
-    from .amd.vl_model import DeepseekV41ForCausalLM
-else:
-    from .nvidia.dspark import DSparkDeepseekV4ForCausalLM
-    from .nvidia.vl_model import DeepseekV41ForCausalLM
+
+def __getattr__(name):
+    if name not in ("DeepseekV41ForCausalLM", "DSparkDeepseekV4ForCausalLM"):
+        raise AttributeError(name)
+    if current_platform.is_rocm():
+        from .amd.dspark import DSparkDeepseekV4ForCausalLM
+        from .amd.vl_model import DeepseekV41ForCausalLM
+    else:
+        from .nvidia.dspark import DSparkDeepseekV4ForCausalLM
+        from .nvidia.vl_model import DeepseekV41ForCausalLM
+    return (
+        DeepseekV41ForCausalLM
+        if name == "DeepseekV41ForCausalLM"
+        else DSparkDeepseekV4ForCausalLM
+    )
+
 
 __all__ = [
     "DSparkDeepseekV4ForCausalLM",

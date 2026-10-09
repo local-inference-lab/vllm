@@ -16,6 +16,34 @@ from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import fp8_einsum, get_tma_aligned_size
 
 
+def bf16_o_proj(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    wo_a: nn.Module,
+    wo_b: nn.Module,
+    *,
+    n_groups: int,
+    nope_dim: int,
+    o_lora_rank: int,
+) -> torch.Tensor:
+    """Inverse interleaved RoPE followed by unquantized grouped BF16 projection."""
+    cos, sin = cos_sin_cache[positions].chunk(2, dim=-1)
+    cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+    pairs = o[..., nope_dim:].float().unflatten(-1, (-1, 2))
+    even, odd = pairs.unbind(-1)
+    rotated = (
+        torch.stack((even * cos + odd * sin, odd * cos - even * sin), dim=-1)
+        .flatten(-2)
+        .to(o.dtype)
+    )
+    values = torch.cat((o[..., :nope_dim], rotated), dim=-1)
+    grouped = values.reshape(o.shape[0], n_groups, -1).transpose(0, 1)
+    weight = wo_a.weight.reshape(n_groups, o_lora_rank, -1)
+    projected = torch.bmm(grouped, weight.transpose(1, 2)).transpose(0, 1)
+    return wo_b(projected.flatten(1))
+
+
 def compute_fp8_einsum_recipe(
     block_size: int = 128,
 ) -> tuple[tuple[int, int, int], bool]:

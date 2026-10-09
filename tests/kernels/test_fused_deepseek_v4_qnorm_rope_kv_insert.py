@@ -12,7 +12,8 @@ We compare against:
     `dequantize_and_gather_k_cache` for KV
 
 The kernel is imported via
-`torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`.
+`torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert` and writes Q
+into a caller-owned output tensor.
 """
 
 import pytest
@@ -174,6 +175,75 @@ def _call_fused(
     )
 
 
+def _call_fused_out(
+    q_in,
+    q_out,
+    kv,
+    k_cache,
+    slot_mapping,
+    positions,
+    cos_sin_cache,
+    eps,
+    bs,
+):
+    torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert.out(
+        q_in,
+        kv,
+        q_out,
+        k_cache,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        eps,
+        bs,
+    )
+    return q_out
+
+
+def _call_q_insert_mode(
+    q,
+    kv,
+    cache,
+    slot_mapping,
+    positions,
+    cos_sin_cache,
+    padded_heads,
+    eps,
+    block_size,
+    *flags,
+    use_out,
+):
+    op = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert
+    if not use_out:
+        return op(
+            q,
+            kv,
+            cache,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            padded_heads,
+            eps,
+            block_size,
+            *flags,
+        )
+    shape = (q.shape[0], padded_heads, q.shape[2]) if padded_heads else (0,)
+    output = q.new_empty(shape)
+    op.out(
+        q,
+        kv,
+        output,
+        cache,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        eps,
+        block_size,
+        *flags,
+    )
+    return output
+
+
 def _as_stored_fp8(t: torch.Tensor) -> torch.Tensor:
     """Reinterpret a float8_e4m3fn-typed kernel output under the real (FNUZ on
     gfx942) encoding the kernel actually wrote, without touching the bytes."""
@@ -328,6 +398,41 @@ def test_q_path_without_qnorm_matches_rope_only_reference(num_tokens: int):
         atol=rope_atol,
     )
     assert q_out[:, n_heads:].count_nonzero().item() == 0
+
+
+def test_quant_insert_writes_caller_owned_q_out():
+    torch.manual_seed(4)
+    device = "cuda"
+    dtype = torch.bfloat16
+    eps = 1e-6
+    num_tokens = 17
+    n_heads = 8
+    padded_heads = 16
+    block_size = 16
+
+    q = torch.randn(num_tokens, n_heads, HEAD_DIM, dtype=dtype, device=device)
+    kv = torch.randn(num_tokens, HEAD_DIM, dtype=dtype, device=device)
+    positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    cos_sin_cache = make_cos_sin_cache(4096, ROPE_DIM, torch.float32, device)
+    k_cache = torch.zeros(2, block_size * HEAD_BYTES, dtype=torch.uint8, device=device)
+    slot_mapping = torch.full((num_tokens,), -1, dtype=torch.int64, device=device)
+    q_out = torch.full(
+        (num_tokens, padded_heads, HEAD_DIM),
+        -123.0,
+        dtype=dtype,
+        device=device,
+    )
+
+    returned = _call_fused_out(
+        q, q_out, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, block_size
+    )
+
+    assert returned.data_ptr() == q_out.data_ptr()
+    q_ref = apply_rope_gptj_last_k(
+        rmsnorm_no_weight(q, eps), positions, cos_sin_cache
+    ).to(dtype)
+    torch.testing.assert_close(q_out[:, :n_heads], q_ref, rtol=1e-2, atol=1e-2)
+    assert q_out[:, n_heads:padded_heads].abs().max().item() == 0.0
 
 
 # ── Test 2: KV path round-trip byte/value parity ─────────────────────────────
@@ -541,8 +646,9 @@ NUM_Q_CHUNKS = HEAD_DIM // Q_CHUNK  # 32
 
 @pytest.mark.parametrize("num_tokens", [1, 17, 2048])
 @pytest.mark.parametrize("n_heads,q_head_padded", [(16, 64), (64, 128), (64, 0)])
+@pytest.mark.parametrize("use_out", [False, True])
 def test_q_interleaved_pads_without_rope(
-    num_tokens: int, n_heads: int, q_head_padded: int
+    num_tokens: int, n_heads: int, q_head_padded: int, use_out: bool
 ):
     """``is_q_interleaved`` with no norm or RoPE only zero-pads Q.
 
@@ -567,7 +673,7 @@ def test_q_interleaved_pads_without_rope(
         num_blocks, block_size * V41_HEAD_BYTES, dtype=torch.uint8, device=device
     )
 
-    q_out = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+    q_out = _call_q_insert_mode(
         q,
         kv,
         k_cache,
@@ -581,6 +687,7 @@ def test_q_interleaved_pads_without_rope(
         True,  # kv_mxfp8
         False,  # apply_q_rope
         True,  # is_q_interleaved
+        use_out=use_out,
     )
 
     # The KV half is unaffected by the Q mode: it must still be inserted.
@@ -597,7 +704,8 @@ def test_q_interleaved_pads_without_rope(
 
 
 @pytest.mark.parametrize("n_heads", [8, 16, 32])
-def test_q_interleaved_survives_graph_replay(n_heads: int):
+@pytest.mark.parametrize("use_out", [False, True])
+def test_q_interleaved_survives_graph_replay(n_heads: int, use_out: bool):
     """A captured fused insert refills its padded Q buffer on every replay.
 
     The op allocates ``q_out`` itself, so the tensor a capture hands back has
@@ -621,7 +729,7 @@ def test_q_interleaved_survives_graph_replay(n_heads: int):
     )
 
     def prepare():
-        return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+        return _call_q_insert_mode(
             q,
             kv,
             k_cache,
@@ -635,6 +743,7 @@ def test_q_interleaved_survives_graph_replay(n_heads: int):
             True,  # kv_mxfp8
             False,  # apply_q_rope
             True,  # is_q_interleaved
+            use_out=use_out,
         )
 
     # Capture takes its warmup on a side stream.
@@ -661,8 +770,9 @@ def test_q_interleaved_survives_graph_replay(n_heads: int):
 @pytest.mark.parametrize("n_heads", [16, 64])
 @pytest.mark.parametrize("apply_q_norm", [False, True])
 @pytest.mark.parametrize("apply_q_rope", [False, True])
+@pytest.mark.parametrize("use_out", [False, True])
 def test_q_interleaved_is_orthogonal_to_norm_and_rope(
-    n_heads: int, apply_q_norm: bool, apply_q_rope: bool
+    n_heads: int, apply_q_norm: bool, apply_q_rope: bool, use_out: bool
 ):
     """The Q layout composes with whatever norm and RoPE it is given.
 
@@ -689,7 +799,7 @@ def test_q_interleaved_is_orthogonal_to_norm_and_rope(
         cache = torch.zeros(
             num_blocks, block_size * V41_HEAD_BYTES, dtype=torch.uint8, device=device
         )
-        out = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+        out = _call_q_insert_mode(
             q_in,
             kv,
             cache,
@@ -703,6 +813,7 @@ def test_q_interleaved_is_orthogonal_to_norm_and_rope(
             True,  # kv_mxfp8
             apply_q_rope,
             is_q_interleaved,
+            use_out=use_out,
         )
         return out, cache
 

@@ -133,7 +133,9 @@ class DeepseekV4ForConditionalGeneration(
             self.image_pad: nn.Parameter | None = None
             if image_enabled:
                 self.vision = DeepseekV4ViT(config)
-                self.aligner = DeepseekV4Aligner(config)
+                self.aligner = DeepseekV4Aligner(
+                    config, prefix=maybe_prefix(prefix, "aligner")
+                )
                 for name in (
                     "image_start",
                     "image_end",
@@ -325,13 +327,21 @@ class DeepseekV4ForConditionalGeneration(
         child_finalizes = getattr(
             self.language_model, "finalizes_weights_during_load", True
         )
-        mapped = self.hf_to_vllm_mapper.apply(weights)
-        if child_finalizes:
-            # A child which finalizes inside load_weights must see all of its
-            # weights in one contiguous delegation from AutoWeightsLoader.
-            mapped = iter(sorted(mapped, key=lambda x: x[0]))
         loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(mapped)
+        loaded_params: set[str] = set()
+
+        def language_weights():
+            for name, weight in self.hf_to_vllm_mapper.apply(weights):
+                if name.startswith("language_model."):
+                    yield name.removeprefix("language_model."), weight
+                else:
+                    loaded_params.update(loader.load_weights([(name, weight)]))
+
+        # Stream GPU tensors while delegating the text weights in one call.
+        loaded_params.update(
+            f"language_model.{name}"
+            for name in self.language_model.load_weights(language_weights())
+        )
         self._weights_finalized = child_finalizes
         return loaded_params
 

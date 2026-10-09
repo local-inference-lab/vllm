@@ -56,6 +56,7 @@ from .model import (
     DeepseekV41LLMForCausalLM,
     _linear_scale_param_name,
     _make_deepseek_v4_weights_mapper,
+    use_b12x,
 )
 
 
@@ -153,10 +154,20 @@ class DeepseekV41ForCausalLM(
 
         # The tower is always built; _mark_tower_model stubs it out
         # (StageMissingLayer, weights skipped) when the image limit is 0.
+        self._use_b12x = use_b12x()
+        vision_cls: type[nn.Module] = DeepseekV4ViT
+        aligner_cls: type[nn.Module] = DeepseekV4Aligner
+        if self._use_b12x:
+            from .b12x.vision import DeepseekV4Aligner as B12xAligner
+            from .b12x.vision import DeepseekV4ViT as B12xViT
+
+            vision_cls, aligner_cls = B12xViT, B12xAligner
         with self._mark_tower_model(vllm_config, {"image"}):
-            self.use_data_parallel = is_vit_use_data_parallel(config.vision_n_heads)
-            self.vision = DeepseekV4ViT(config)
-            self.aligner = DeepseekV4Aligner(config)
+            self.use_data_parallel = self._use_b12x or is_vit_use_data_parallel(
+                config.vision_n_heads
+            )
+            self.vision = vision_cls(config)
+            self.aligner = aligner_cls(config)
             self.image_start = nn.Parameter(
                 torch.empty(config.hidden_size, dtype=torch.float32)
             )
@@ -166,8 +177,9 @@ class DeepseekV41ForCausalLM(
             self.image_newline = nn.Parameter(
                 torch.empty(config.hidden_size, dtype=torch.float32)
             )
-            self.vision.to(dtype=model_config.dtype)
-            self.aligner.to(dtype=model_config.dtype)
+            if not self._use_b12x:
+                self.vision.to(dtype=model_config.dtype)
+                self.aligner.to(dtype=model_config.dtype)
 
         with self._mark_language_model(vllm_config):
             self.language_model = DeepseekV41LLMForCausalLM(
@@ -190,6 +202,14 @@ class DeepseekV41ForCausalLM(
             expert_dtype, _linear_scale_param_name(vllm_config, expert_dtype)
         )
 
+    def get_encoder_cudagraph_config(self):
+        if getattr(self, "_use_b12x", False):
+            raise ValueError(
+                "cudagraph_mm_encoder requires packed vision inputs, which the "
+                "DeepSeek V4.1 B12X encoder does not support."
+            )
+        return super().get_encoder_cudagraph_config()
+
     def _parse_and_validate_image_input(
         self, **kwargs: object
     ) -> DeepseekV4VLImagePixelInputs | None:
@@ -208,6 +228,9 @@ class DeepseekV41ForCausalLM(
         self,
         image_input: DeepseekV4VLImagePixelInputs,
     ) -> tuple[torch.Tensor, ...]:
+        run_vision = run_dp_sharded_vision_tower
+        if getattr(self, "_use_b12x", False):
+            from .b12x.vision import run_dp_sharded_vision_tower as run_vision
         patches = image_input.patches.to(self.aligner.w1.weight.dtype)
         vit_grid = image_input.vit_grid.tolist()
 
@@ -215,9 +238,7 @@ class DeepseekV41ForCausalLM(
         if self.use_data_parallel and get_tensor_model_parallel_world_size() > 1:
             # Data-parallel ViT: shard images across TP ranks and all-gather
             # the per-image embeddings (weights are replicated on every rank).
-            image_embeds_list = run_dp_sharded_vision_tower(
-                self.vision, self.aligner, patches, vit_grid
-            )
+            image_embeds_list = run_vision(self.vision, self.aligner, patches, vit_grid)
         else:
             image_embeds_list = []
             vit_offset = 0
@@ -274,6 +295,10 @@ class DeepseekV41ForCausalLM(
 
     @staticmethod
     def get_model_state_cls():
+        if use_b12x():
+            from .b12x.model_state import DeepseekV41ModelState as B12xModelState
+
+            return B12xModelState
         from .model_state import DeepseekV41ModelState
 
         return DeepseekV41ModelState
@@ -293,6 +318,7 @@ class DeepseekV41ForCausalLM(
         intermediate_tensors=None,
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
+        ced_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         return self.language_model(
@@ -301,6 +327,7 @@ class DeepseekV41ForCausalLM(
             intermediate_tensors,
             inputs_embeds,
             lookback_token_ids=lookback_token_ids,
+            ced_indices=ced_indices,
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
@@ -322,6 +349,10 @@ class DeepseekV41ForCausalLM(
         # contiguous block (AutoWeightsLoader delegates per contiguous group,
         # and the child's load_weights finalizes fused expert weights, which
         # must not run on a partially loaded model).
+        if getattr(self, "_use_b12x", False):
+            return AutoWeightsLoader(self).load_weights(
+                weights, mapper=self.hf_to_vllm_mapper
+            )
         mapped = sorted(self.hf_to_vllm_mapper.apply(weights), key=lambda x: x[0])
         loader = AutoWeightsLoader(self)
         loaded_params = loader.load_weights(mapped)
@@ -336,3 +367,10 @@ class DeepseekV41ForCausalLM(
         if getattr(self, "_weights_finalized", False):
             return
         self.language_model.process_weights_after_loading()
+
+    @property
+    def requires_accepted_token_lookback(self) -> bool:
+        return self.language_model.requires_accepted_token_lookback
+
+    def checkpoint_file_weight_filter(self, name: str) -> bool:
+        return self.language_model.checkpoint_file_weight_filter(name)

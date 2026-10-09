@@ -11,6 +11,8 @@ import copy
 import json
 from typing import Any, Dict, List, Optional, Union
 
+from vllm.utils.tool_names import normalize_tool_namespace
+
 bos_token: str = "<｜begin▁of▁sentence｜>"
 eos_token: str = "<｜end▁of▁sentence｜>"
 thinking_start_token: str = "<think>"
@@ -55,8 +57,8 @@ def to_json(value: Any) -> str:
 
 
 def tools_from_openai_format(tools):
-    """Extract function definitions from OpenAI-format tool list."""
-    return [tool["function"] for tool in tools]
+    """Extract function definitions with namespace-qualified identities."""
+    return [normalize_tool_namespace(tool)["function"] for tool in tools]
 
 
 def tool_calls_from_openai_format(tool_calls):
@@ -66,7 +68,7 @@ def tool_calls_from_openai_format(tool_calls):
             "name": tool_call["function"]["name"],
             "arguments": tool_call["function"]["arguments"],
         }
-        for tool_call in tool_calls
+        for tool_call in map(normalize_tool_namespace, tool_calls)
     ]
 
 
@@ -292,7 +294,7 @@ def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
 
 def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
     """
-    Find the index of the last user/developer message.
+    Find the index of the last user message.
 
     V4.1 supports mid-conversation system messages, which count as user
     messages for the purposes of the assistant generation header.
@@ -300,7 +302,7 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
     last_user_index = -1
     for idx in range(len(messages) - 1, -1, -1):
         role = messages[idx].get("role")
-        if role in ["user", "developer"] or (role == "system" and idx > 0):
+        if role == "user" or (role == "system" and idx > 0):
             last_user_index = idx
             break
     return last_user_index
@@ -361,21 +363,6 @@ def render_message(
             prompt += "\n\n" + response_format_template.format(
                 schema=to_json(response_format)
             )
-
-    elif role == "developer":
-        assert content, f"Invalid message for role `{role}`: {msg}"
-
-        content_developer = USER_SP_TOKEN
-        content_developer += content
-
-        if tools:
-            content_developer += "\n\n" + render_tools(tools)
-        if response_format:
-            content_developer += "\n\n" + response_format_template.format(
-                schema=to_json(response_format)
-            )
-
-        prompt += user_msg_template.format(content=content_developer)
 
     elif role == "user":
         prompt += USER_SP_TOKEN
@@ -492,9 +479,7 @@ def render_message(
             )
             prompt += task_sp_token
 
-    elif messages[index].get("role") in ["user", "developer"] or (
-        messages[index].get("role") == "system" and index > 0
-    ):
+    elif role == "user" or (role == "system" and index > 0):
         # Normal generation: append Assistant + thinking token
         # (mid-conversation system messages also trigger the assistant header)
         prompt += ASSISTANT_SP_TOKEN
@@ -525,7 +510,6 @@ def _drop_thinking_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, An
             msg = copy.copy(msg)
             msg.pop("reasoning_content", None)
             result.append(msg)
-        # developer and other roles before last_user_idx are dropped
 
     return result
 

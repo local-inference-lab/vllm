@@ -15,6 +15,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     deepgemm_post_process_weight_scale_block,
 )
+from vllm.model_executor.models.utils import WeightsMapper
 from vllm.models.deepseek_v4.nvidia.dspark import DSparkDeepseekV4ForCausalLM
 from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4ForCausalLM,
@@ -25,6 +26,9 @@ from vllm.models.deepseek_v4.nvidia.model import (
 )
 from vllm.models.deepseek_v4.nvidia.mtp import DeepSeekV4MTP
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
+from vllm.models.deepseek_v4.nvidia.vl_model import (
+    DeepseekV4ForConditionalGeneration,
+)
 from vllm.models.deepseek_v41.common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
 from vllm.models.deepseek_v41.nvidia.model import DeepseekV4MoE as DeepseekV41MoE
 from vllm.platforms import current_platform
@@ -884,33 +888,102 @@ def test_deepseek_v4_mega_moe_stages_shared_scale_tma_layout(shared_block_m):
 
 def test_deepseek_v4_pwal_hook_finalizes_mega_moe_and_mhc_broadcast():
     """The loader invokes the model-level PWAL hook for every load format,
-    so it must finalize megamoe + mhc broadcast weights to cover dummy
-    load, which skips load_weights()."""
+    so it must finalize derived MegaMoE, mHC, and B12x weights."""
     calls = []
     stub = SimpleNamespace(
         model=SimpleNamespace(
             finalize_mega_moe_weights=lambda: calls.append("mega_moe"),
             finalize_mhc_broadcast_weights=lambda: calls.append("mhc"),
+            process_b12x_weights_after_loading=lambda: calls.append("b12x"),
         )
     )
 
     DeepseekV4ForCausalLM.process_weights_after_loading(stub)
 
-    assert calls == ["mega_moe", "mhc"]
+    assert calls == ["mega_moe", "mhc", "b12x"]
+
+
+def test_deepseek_v4_vision_loads_interleaved_weights_before_finalizing():
+    finalized = []
+
+    class LanguageModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = torch.nn.Parameter(torch.zeros(1))
+            self.last = torch.nn.Parameter(torch.zeros(1))
+
+        def load_weights(self, weights):
+            raise AssertionError(
+                "Language-model finalization must wait for all weights"
+            )
+
+        def process_weights_after_loading(self):
+            assert self.first.item() == 1 and self.last.item() == 3
+            finalized.append(True)
+
+    model = DeepseekV4ForConditionalGeneration.__new__(
+        DeepseekV4ForConditionalGeneration
+    )
+    torch.nn.Module.__init__(model)
+    model.language_model = LanguageModel()
+    model.image_start = torch.nn.Parameter(torch.zeros(1))
+    model.hf_to_vllm_mapper = WeightsMapper()
+
+    def weights():
+        yield "language_model.first", torch.tensor([1.0])
+        assert model.language_model.first.item() == 1
+        yield "image_start", torch.tensor([2.0])
+        assert model.image_start.item() == 2
+        assert not finalized
+        yield "language_model.last", torch.tensor([3.0])
+
+    with torch.no_grad():
+        loaded = model.load_weights(weights())
+        model.process_weights_after_loading()
+
+    assert loaded == {"language_model.first", "image_start", "language_model.last"}
+    assert finalized == [True]
 
 
 def test_deepseek_v4_drafter_pwal_hooks_finalize_mega_moe():
-    """MTP/DSpark drafters load as their own top-level models, so each needs
-    its own PWAL hook now that the megamoe forward no longer finalizes
-    weights lazily on first use."""
+    """MTP and DSpark top-level loaders finalize derived backend weights."""
     calls = []
-    mtp = SimpleNamespace(finalize_mega_moe_weights=lambda: calls.append("mtp"))
+    mtp_block = SimpleNamespace(
+        process_b12x_weights_after_loading=lambda: calls.append("mtp_b12x")
+    )
+    mtp = SimpleNamespace(
+        finalize_mega_moe_weights=lambda: calls.append("mtp"),
+        model=SimpleNamespace(layers={0: SimpleNamespace(mtp_block=mtp_block)}),
+    )
     DeepSeekV4MTP.process_weights_after_loading(mtp)
 
-    dspark = SimpleNamespace(_finalize_moe=lambda: calls.append("dspark"))
+    dspark = SimpleNamespace(
+        _finalize_moe=lambda: calls.append("dspark"),
+        logits_processor=SimpleNamespace(
+            prepare_b12x_vocab_projection=lambda head: calls.append(head)
+        ),
+        model=SimpleNamespace(
+            markov_head=SimpleNamespace(markov_w2="dspark_markov"),
+            finalize_mhc_broadcast_weights=lambda: calls.append("dspark_mhc"),
+            layers=[
+                SimpleNamespace(
+                    process_b12x_weights_after_loading=lambda: calls.append(
+                        "dspark_b12x"
+                    )
+                )
+            ],
+        ),
+    )
     DSparkDeepseekV4ForCausalLM.process_weights_after_loading(dspark)
 
-    assert calls == ["mtp", "dspark"]
+    assert calls == [
+        "mtp",
+        "mtp_b12x",
+        "dspark_markov",
+        "dspark",
+        "dspark_mhc",
+        "dspark_b12x",
+    ]
 
 
 @pytest.mark.skipif(

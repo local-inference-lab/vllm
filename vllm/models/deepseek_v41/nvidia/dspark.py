@@ -60,6 +60,7 @@ from .model import (
     make_deepseek_v4_expert_params_mapping,
     maybe_init_gemm_rs,
     prepare_mega_gate_routing_metadata,
+    use_b12x,
 )
 
 logger = init_logger(__name__)
@@ -71,6 +72,11 @@ _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 
 class DSparkDeepseekV4Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        if use_b12x():
+            from .b12x.dspark import initialize_model
+
+            initialize_model(self, vllm_config=vllm_config, prefix=prefix)
+            return
         super().__init__()
         assert vllm_config.speculative_config is not None
         config = vllm_config.speculative_config.draft_model_config.hf_config
@@ -184,6 +190,12 @@ class DSparkDeepseekV4Model(nn.Module):
         place draft layers in different groups). ``None`` (or a ``None`` entry)
         runs the projection to reserve workspace but writes nothing (profiling).
         """
+        if getattr(self, "_use_b12x", False):
+            from .b12x.dspark import precompute_and_store_context_kv
+
+            return precompute_and_store_context_kv(
+                self, main_x, context_positions, context_slot_mappings
+            )
         for i, layer in enumerate(self.layers):
             slot_mapping = (
                 None if context_slot_mappings is None else context_slot_mappings[i]
@@ -204,6 +216,10 @@ class DSparkDeepseekV4Model(nn.Module):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if getattr(self, "_use_b12x", False):
+            from .b12x.dspark import forward_model
+
+            return forward_model(self, input_ids, positions, inputs_embeds)
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
         full_num_tokens = positions.shape[0]
@@ -284,8 +300,14 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     has_own_lm_head = False
     # Full-vocab draft: draft ids are target ids, no remapping needed.
     draft_id_to_target_id = None
+    checkpoint_weight_name_prefixes: tuple[str, ...] = ("mtp.",)
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        if use_b12x():
+            from .b12x.dspark import initialize_causal_lm
+
+            initialize_causal_lm(self, vllm_config=vllm_config, prefix=prefix)
+            return
         super().__init__()
         assert vllm_config.speculative_config is not None
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
@@ -492,7 +514,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
         if self.model.confidence_head is not None and not loaded_confidence_head:
             self.model.confidence_head = None
-        self.process_weights_after_loading()
+        if self.has_own_lm_head and "lm_head.weight" not in loaded_params:
+            raise RuntimeError("The DSpark NVFP4 draft head was not loaded")
+        if not getattr(self, "_use_b12x", False):
+            self.process_weights_after_loading()
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
@@ -501,6 +526,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             layer.ffn.finalize_mega_moe_weights()
 
     def process_weights_after_loading(self) -> None:
+        if getattr(self, "_use_b12x", False):
+            from .b12x.dspark import prepare_weights
+
+            prepare_weights(self)
+            return
         self._finalize_moe()
 
     def _remap_dspark_name(self, name: str) -> str | None:
@@ -508,6 +538,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
         Returns None for non-mtp weights (owned by the target model).
         """
+        if name == "head.weight":
+            return "lm_head.weight" if self.has_own_lm_head else None
         m = re.match(r"mtp\.(\d+)\.(.*)", name)
         if m is None:
             return None
@@ -537,3 +569,28 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         ):
             return f"model.{rest}"
         return f"model.layers.{stage}.{rest}"
+
+    def capture_context_preparation(
+        self,
+        vllm_config,
+        hidden_states,
+        positions,
+        slot_mappings,
+        layer_group_idx,
+        max_decode_tokens,
+    ):
+        if not getattr(self, "_use_b12x", False):
+            return None
+        from .b12x.dspark import DSparkContextCudaGraphs
+
+        context = DSparkContextCudaGraphs(
+            self,
+            vllm_config,
+            hidden_states,
+            positions,
+            slot_mappings,
+            layer_group_idx,
+            max_decode_tokens,
+        )
+        context.capture()
+        return context

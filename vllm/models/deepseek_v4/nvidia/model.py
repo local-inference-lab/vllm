@@ -74,6 +74,7 @@ from vllm.model_executor.models.utils import (
     spec_decode_needs_target_embed,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.weight_transfer import copy_weight, flush_weight_transfers
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -81,6 +82,11 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.nvidia.b12x import (
+    B12xMHCResidual,
+    DeepseekV4B12xAttention,
+    b12x_dsv4_is_supported,
+)
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
@@ -89,6 +95,7 @@ from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.utils.b12x import set_b12x_preparation_provider
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
@@ -356,7 +363,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                     f"{weight_name}: parameter shard {tuple(expert_data.shape)} "
                     f"vs checkpoint {tuple(loaded_weight.shape)}"
                 )
-            expert_data.copy_(loaded_weight)
+            copy_weight(expert_data, loaded_weight)
             loaded_any = True
 
         if return_success:
@@ -664,11 +671,13 @@ class DeepseekV4MoE(nn.Module):
         prefix: str = "",
         use_sequence_parallel: bool = False,
         *,
-        num_hash_layers: int,
+        num_hash_layers: int | None = None,
         reduce_results: bool = True,
         n_routed_experts: int | None = None,
         n_activated_experts: int | None = None,
-        image_sentinel_lo: int = IMAGE_SENTINEL_BASE_ID,
+        gate: nn.Module | None = None,
+        image_sentinel_lo: int | None = None,
+        image_sentinel_count: int = 5,
     ):
         super().__init__()
 
@@ -720,12 +729,21 @@ class DeepseekV4MoE(nn.Module):
                 f"{moe_backend} for this checkpoint."
             )
 
-        self.gate = GateLinear(
-            input_size=config.hidden_size,
-            output_size=self.n_routed_experts,
-            bias=False,
-            out_dtype=torch.float32,
-            prefix=f"{prefix}.gate",
+        self.gate = (
+            gate
+            if gate is not None
+            else GateLinear(
+                input_size=config.hidden_size,
+                output_size=self.n_routed_experts,
+                bias=False,
+                out_dtype=torch.float32,
+                params_dtype=(
+                    torch.float32
+                    if getattr(config, "router_dtype", None) == "float32"
+                    else None
+                ),
+                prefix=f"{prefix}.gate",
+            )
         )
 
         self.gate.e_score_correction_bias = None
@@ -734,8 +752,15 @@ class DeepseekV4MoE(nn.Module):
         # Image tokens borrow five consecutive reserved in-vocab ids starting
         # at IMAGE_SENTINEL_BASE_ID; 0 disables vision routing (text model).
         self.image_sentinel_lo = (
-            image_sentinel_lo if getattr(config, "vision_n_layers", 0) > 0 else 0
+            image_sentinel_lo
+            if image_sentinel_lo is not None
+            else IMAGE_SENTINEL_BASE_ID
+            if getattr(config, "vision_n_layers", 0) > 0
+            else 0
         )
+        self.image_sentinel_count = image_sentinel_count
+        if num_hash_layers is None:
+            num_hash_layers = getattr(config, "num_hash_layers", 0)
         is_hash_moe = extract_layer_index(prefix) < num_hash_layers
         self.hash_indices_dtype = (
             torch.int64 if self.use_native_mega_moe else torch.int32
@@ -754,7 +779,7 @@ class DeepseekV4MoE(nn.Module):
                 requires_grad=False,
             )
         if getattr(config, "topk_method", None) == "noaux_tc" and (
-            not is_hash_moe or getattr(config, "vision_n_layers", 0) > 0
+            not is_hash_moe or self.image_sentinel_lo > 0
         ):
             # Vision checkpoints ship a gate bias on hash layers too (it is
             # unused for routing there; image tokens use bias_vl instead).
@@ -853,21 +878,11 @@ class DeepseekV4MoE(nn.Module):
         prefix: str,
     ) -> None:
         parallel_config = vllm_config.parallel_config
-        ep_group = get_ep_group()
-        ep_size = ep_group.world_size
-        ep_rank = ep_group.rank_in_group
-
         eplb_config = parallel_config.eplb_config
         self.n_redundant_experts = eplb_config.num_redundant_experts
         self.n_shared_experts = config.n_shared_experts or 0
         self.n_logical_experts = self.n_routed_experts
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
-        self.n_local_physical_experts = self.n_physical_experts // ep_size
-        self.n_local_experts = self.n_local_physical_experts
-        self.experts_start_idx = ep_rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        self.physical_expert_start = self.experts_start_idx
-        self.physical_expert_end = self.experts_end_idx
 
         self.experts = FusedMoEFactory(
             reduce_results=self.reduce_results,
@@ -886,12 +901,15 @@ class DeepseekV4MoE(nn.Module):
             hash_indices_table=self.gate.tid2eid,
             bias_vl=getattr(self.gate, "bias_vl", None),
             image_sentinel_lo=self.image_sentinel_lo,
+            image_sentinel_count=self.image_sentinel_count,
             swiglu_limit=self.swiglu_limit,
             router_logits_dtype=torch.float32,
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=eplb_config.num_redundant_experts,
             is_sequence_parallel=self.use_sequence_parallel,
         )
+        self.n_local_physical_experts = self.experts.routed_experts.local_num_experts
+        self.n_local_experts = self.n_local_physical_experts
 
     def forward(
         self,
@@ -1001,7 +1019,7 @@ class DeepseekV4MoE(nn.Module):
             input_ids=input_ids,
         )
 
-        return final_hidden_states.view(org_shape)
+        return final_hidden_states.to(hidden_states.dtype).view(org_shape)
 
     def finalize_mega_moe_weights(self) -> None:
         if self.use_native_mega_moe:
@@ -1031,6 +1049,15 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
         if device_capability is not None and device_capability.major == 12:
             return DeepseekV4FlashInferSM120Attention
         return DeepseekV4FlashInferMLAAttention
+    if backend == AttentionBackendEnum.B12X:
+        if device_capability is None or (
+            device_capability.major,
+            device_capability.minor,
+        ) not in ((12, 0), (12, 1)):
+            raise ValueError("B12X attention requires an SM120 or SM121 GPU.")
+        if not b12x_dsv4_is_supported():
+            raise ValueError("B12X attention requires a supported b12x installation.")
+        return DeepseekV4B12xAttention
     if backend in (
         AttentionBackendEnum.FLASHMLA_SPARSE,
         AttentionBackendEnum.FLASHMLA_SPARSE_DSV4,
@@ -1138,7 +1165,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             requires_grad=False,
         )
 
-        if vllm_config.kernel_config.enable_jit_warmup:
+        if vllm_config.kernel_config.enable_jit_warmup and not isinstance(
+            self.attn, DeepseekV4B12xAttention
+        ):
             from vllm.model_executor.kernels.mhc.tilelang_kernels import (
                 _HC_PRENORM_GEMM_TILELANG_KERNEL,
                 _MHC_FUSED_TILELANG_KERNEL,
@@ -1185,6 +1214,98 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hc_mult=self.hc_mult,
             )
 
+        self._b12x_mhc = (
+            B12xMHCResidual(
+                hidden_size=self.hidden_size,
+                hc_mult=self.hc_mult,
+                rms_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+                sinkhorn_iters=self.hc_sinkhorn_iters,
+            )
+            if isinstance(self.attn, DeepseekV4B12xAttention)
+            else None
+        )
+        if self._b12x_mhc is not None:
+            self.register_buffer(
+                "hc_ffn_fn_bf16",
+                torch.empty_like(self.hc_ffn_fn, dtype=torch.bfloat16),
+                persistent=False,
+            )
+        else:
+            self.hc_ffn_fn_bf16 = None
+
+    def process_b12x_weights_after_loading(self) -> None:
+        if isinstance(self.attn, DeepseekV4B12xAttention):
+            self.attn.setup_b12x_wo_projection()
+        if self._b12x_mhc is not None:
+            assert self.hc_ffn_fn_bf16 is not None
+            self.hc_ffn_fn_bf16.copy_(self.hc_ffn_fn.detach().to(torch.bfloat16))
+            # This hook runs only after model.finalize_mhc_broadcast_weights().
+            # It therefore captures the published first-layer broadcast tensor
+            # and the exact loaded attention/FFN operands for this decoder.
+            set_b12x_preparation_provider(self, self._b12x_mhc)
+
+    @property
+    def uses_b12x_mhc(self) -> bool:
+        return self._b12x_mhc is not None
+
+    def _mhc_post_pre(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        res_mix: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        *,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
+        hc_fn_bf16: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._b12x_mhc is not None:
+            return self._b12x_mhc.run_post_pre(
+                x,
+                residual,
+                post_mix,
+                res_mix,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+                hc_fn_bf16=hc_fn_bf16,
+            )
+        return mhc_fused_post_pre_tilelang(
+            x,
+            residual,
+            post_mix,
+            res_mix,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_eps,
+            self.hc_post_alpha,
+            self.hc_sinkhorn_iters,
+            n_splits=1,
+            tile_n=1,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
+
+    def mhc_post(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        res_mix: torch.Tensor,
+    ) -> torch.Tensor:
+        if self._b12x_mhc is not None:
+            return self._b12x_mhc.run_post(x, residual, post_mix, res_mix)
+        return mhc_post_tilelang(x, residual, post_mix, res_mix)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1198,23 +1319,32 @@ class DeepseekV4DecoderLayer(nn.Module):
         attn_norm_weight = self.attn_norm.weight.data
         attn_norm_eps = self.attn_norm.variance_epsilon
         if residual is None:
-            # Run standalone mhc_pre on first layer
             if x.dim() == 2:
                 assert self.hc_attn_fn_broadcast is not None
-                residual, post_mix, res_mix, x = mhc_pre_broadcast_tilelang(
-                    x,
-                    self.hc_attn_fn,
-                    self.hc_attn_scale,
-                    self.hc_attn_base,
-                    self.rms_norm_eps,
-                    self.hc_eps,
-                    self.hc_eps,
-                    self.hc_post_alpha,
-                    self.hc_sinkhorn_iters,
-                    norm_weight=attn_norm_weight,
-                    norm_eps=attn_norm_eps,
-                    fn_broadcast=self.hc_attn_fn_broadcast,
-                )
+                if self._b12x_mhc is not None:
+                    residual, post_mix, res_mix, x = self._b12x_mhc.run_pre(
+                        x,
+                        self.hc_attn_fn_broadcast,
+                        self.hc_attn_scale,
+                        self.hc_attn_base,
+                        norm_weight=attn_norm_weight,
+                        norm_eps=attn_norm_eps,
+                    )
+                else:
+                    residual, post_mix, res_mix, x = mhc_pre_broadcast_tilelang(
+                        x,
+                        self.hc_attn_fn,
+                        self.hc_attn_scale,
+                        self.hc_attn_base,
+                        self.rms_norm_eps,
+                        self.hc_eps,
+                        self.hc_eps,
+                        self.hc_post_alpha,
+                        self.hc_sinkhorn_iters,
+                        norm_weight=attn_norm_weight,
+                        norm_eps=attn_norm_eps,
+                        fn_broadcast=self.hc_attn_fn_broadcast,
+                    )
             else:
                 residual = x
                 post_mix, res_mix, x = mhc_pre_tilelang(
@@ -1231,7 +1361,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                     norm_eps=attn_norm_eps,
                 )
         else:
-            residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
+            assert post_mix is not None
+            assert res_mix is not None
+            residual, post_mix, res_mix, x = self._mhc_post_pre(
                 x,
                 residual,
                 post_mix,
@@ -1239,13 +1371,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_attn_fn,
                 self.hc_attn_scale,
                 self.hc_attn_base,
-                self.rms_norm_eps,
-                self.hc_eps,
-                self.hc_eps,
-                self.hc_post_alpha,
-                self.hc_sinkhorn_iters,
-                n_splits=1,
-                tile_n=1,
                 norm_weight=attn_norm_weight,
                 norm_eps=attn_norm_eps,
             )
@@ -1259,7 +1384,10 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         ffn_norm_weight = self.ffn_norm.weight.data
         ffn_norm_eps = self.ffn_norm.variance_epsilon
-        residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
+        assert residual is not None
+        assert post_mix is not None
+        assert res_mix is not None
+        residual, post_mix, res_mix, x = self._mhc_post_pre(
             x,
             residual,
             post_mix,
@@ -1267,15 +1395,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-            self.hc_eps,
-            self.hc_post_alpha,
-            self.hc_sinkhorn_iters,
-            n_splits=1,
-            tile_n=1,
             norm_weight=ffn_norm_weight,
             norm_eps=ffn_norm_eps,
+            hc_fn_bf16=self.hc_ffn_fn_bf16,
         )
 
         x = self.ffn(x, input_ids, mega_gate_metadata)
@@ -1479,9 +1601,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the aux hidden state for draft models
-                aux_recon = mhc_post_tilelang(
-                    hidden_states, residual, post_mix, res_mix
-                )
+                aux_recon = layer.mhc_post(hidden_states, residual, post_mix, res_mix)
                 aux_hidden_state = aux_recon.mean(dim=1)
                 if self.use_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
@@ -1492,7 +1612,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if self.end_layer in self.aux_hidden_state_layers:
                 hidden_states = final_aux_recon
             else:
-                hidden_states = mhc_post_tilelang(
+                hidden_states = layer.mhc_post(
                     hidden_states, residual, post_mix, res_mix
                 )
 
@@ -1625,7 +1745,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         continue
                     narrow_weight = loaded_weight[head_rank_start:head_rank_end]
                     n = narrow_weight.shape[0]
-                    params_dict[name][:n].copy_(narrow_weight)
+                    copy_weight(params_dict[name][:n], narrow_weight)
                     loaded_params.add(name)
                     continue
                 else:
@@ -1705,6 +1825,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 layer.hc_attn_fn_broadcast = broadcast
             else:
                 layer.hc_attn_fn_broadcast.copy_(broadcast)
+
+    def process_b12x_weights_after_loading(self) -> None:
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            layer.process_b12x_weights_after_loading()
 
 
 def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
@@ -1900,8 +2024,10 @@ class DeepseekV4ForCausalLM(
         return loaded_params
 
     def process_weights_after_loading(self) -> None:
+        flush_weight_transfers()
         self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
+        self.model.process_b12x_weights_after_loading()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
