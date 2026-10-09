@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-841",
+  "category": "fix",
+  "summary": "Bound InstantTensor staging and retain deferred checkpoint tensor ownership",
+  "models": ["Kimi-K3"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Limits temporary checkpoint loading memory and preserves tensors retained by deferred layer processing.",
+    "CPU staging does not place inference weights on the CPU."
+  ],
+  "pull_requests": [841],
+  "requires": []
+}

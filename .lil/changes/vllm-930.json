@@ -1,0 +1,21 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-930",
+  "category": "fix",
+  "summary": "The CUDA graph memory estimate counts the memory every captured graph keeps",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required. With --kv-cache-memory-bytes the estimate is not used and nothing changes.",
+  "details": [
+    "When --gpu-memory-utilization sizes the KV cache, vLLM captures a few CUDA graphs to estimate the memory of all of them. Each sample was read before torch.cuda.graph() emptied the allocator cache, so memory cached by the eager warmup was subtracted from the graph's own memory. DeepSeek-V4.1 graphs that each kept a private buffer before vLLM #918 were estimated at 1.8 GiB while they used 5.3 GiB, and the oversized KV cache could run out of memory after startup.",
+    "Samples are now read with the cache emptied, count the memory a graph keeps, and include the smallest graph. A graph that keeps memory now shrinks the KV cache instead of running out of memory later. For current models the KV cache is expected to change by at most about 0.1 GiB per GPU; startup profiles one more graph."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    930
+  ],
+  "requires": []
+}

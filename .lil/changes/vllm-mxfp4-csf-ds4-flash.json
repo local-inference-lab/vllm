@@ -1,0 +1,24 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-mxfp4-csf-ds4-flash",
+  "category": "feature",
+  "summary": "Load lossless MXFP4-CSF checkpoints of DeepSeek-V4-Flash and DeepSeek-V4-Flash-Vision-Exp",
+  "models": [
+    "DeepSeek-V4-Flash",
+    "DeepSeek-V4-Flash-Vision-Exp"
+  ],
+  "compatibility": "Opt-in: serve a deepseek_v4_flash MXFP4-CSF serving directory with --quantization mxfp4_csf --load-format mxfp4_csf. Original checkpoints and their launch flags are unchanged.",
+  "details": [
+    "The deepseek_v4_flash family reads the compressed scales of 256 routed MXFP4 experts in each of the 43 target layers by DeepSeek's native tensor names, at TP1, TP2, TP4 or TP8.",
+    "Routed experts use MXFP8 activations like the native B12X MXFP4 path unless VLLM_B12X_MOE_FP4_FORCE_A16=1 requests BF16.",
+    "Attention, dense and shared-expert weights keep the source block-FP8 configuration. MTP/DSpark draft experts, the vision tower, the aligner and the image embeddings load unchanged.",
+    "Expert-parallel execution, including MegaMoE, is rejected because those experts would bypass the compressed-scale reader."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    971
+  ],
+  "requires": []
+}

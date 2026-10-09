@@ -725,13 +725,73 @@ steps:
   - tests/kernels/quantization/test_block_fp8.py
   - tests/quantization/reference_mxfp4.py
   - tests/quantization/test_auto_round.py
+  - tests/distributed/test_b12x_pcie_all_reduce.py
+  - tests/distributed/test_b12x_tp2_startup_oracle.py
+  - tests/distributed/test_shared_pynccl.py
+  - tests/models/deepseek_v32/test_fused_allreduce_sites.py
+  - tests/models/deepseek_v32/test_glm53_tp_padding.py
+  - tests/models/qwen4_exp/test_b12x_config.py
+  - tests/models/qwen4_exp/test_b12x_model.py
+  - tests/models/qwen4_exp/test_b12x_qsa.py
+  - tests/models/qwen4_exp/test_b12x_weight_loading.py
+  - tests/models/qwen4_exp/test_ple_shared_table.py
+  - tests/models/test_deepseek_v4_1_attention.py
+  - tests/models/test_deepseek_v4_1_ced_model.py
+  - tests/models/test_deepseek_v4_1_compressor.py
+  - tests/models/test_deepseek_v4_1_engram.py
+  - tests/models/test_deepseek_v4_1_prepared_projections.py
+  - tests/models/test_deepseek_v4_1_rmsnorm.py
+  - tests/models/test_deepseek_v4_1_vision.py
+  - tests/models/test_deepseek_v4_dspark_context_kv.py
+  - tests/models/test_deepseek_v4_vision.py
+  - tests/models/test_dflash2_mla.py
+  - tests/models/test_glm53_dspark.py
+  - tests/models/test_glm5next_indexer_storage.py
+  - tests/models/test_glm5next_kda_gate_stream.py
+  - tests/models/test_glm5next_l2_prefetch_persist.py
+  - tests/models/test_glm5next_model.py
+  - tests/models/test_glm5next_model_state.py
+  - tests/models/test_glm5next_pooled_indexer.py
+  - tests/models/test_qwen3_dflash_streaming.py
+  - tests/models/test_qwen3_dspark_tp_padding.py
   commands:
-  - uv pip install --system b12x==1.3.0
+  - uv pip install --system "flashinfer-python[b12x]==0.7.1"
   - pytest -v -s model_executor/kernels/test_b12x_linear.py
       model_executor/test_b12x_warmup.py
       kernels/quantization/test_block_fp8.py
       kernels/moe/test_b12x.py
       quantization/test_auto_round.py -k b12x
+
+  - B12X_QSA_GPU_TEST=1 B12X_GLM53_GPU_TEST=1 pytest -v -s
+      distributed/test_b12x_pcie_all_reduce.py
+      distributed/test_b12x_tp2_startup_oracle.py
+      distributed/test_shared_pynccl.py
+      models/deepseek_v32/test_fused_allreduce_sites.py
+      models/deepseek_v32/test_glm53_tp_padding.py
+      models/qwen4_exp/test_b12x_config.py
+      models/qwen4_exp/test_b12x_model.py
+      models/qwen4_exp/test_b12x_qsa.py
+      models/qwen4_exp/test_b12x_weight_loading.py
+      models/qwen4_exp/test_ple_shared_table.py
+      models/test_deepseek_v4_1_attention.py
+      models/test_deepseek_v4_1_ced_model.py
+      models/test_deepseek_v4_1_compressor.py
+      models/test_deepseek_v4_1_engram.py
+      models/test_deepseek_v4_1_prepared_projections.py
+      models/test_deepseek_v4_1_rmsnorm.py
+      models/test_deepseek_v4_1_vision.py
+      models/test_deepseek_v4_dspark_context_kv.py
+      models/test_deepseek_v4_vision.py
+      models/test_dflash2_mla.py
+      models/test_glm53_dspark.py
+      models/test_glm5next_indexer_storage.py
+      models/test_glm5next_kda_gate_stream.py
+      models/test_glm5next_l2_prefetch_persist.py
+      models/test_glm5next_model.py
+      models/test_glm5next_model_state.py
+      models/test_glm5next_pooled_indexer.py
+      models/test_qwen3_dflash_streaming.py
+      models/test_qwen3_dspark_tp_padding.py
 
 - label: ":nvidia: (H100) Helion Kernels Shard %N"
   key: kernels-helion-test

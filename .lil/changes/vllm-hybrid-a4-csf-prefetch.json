@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-hybrid-a4-csf-prefetch",
+  "category": "fix",
+  "summary": "Select hybrid MoE precision by request phase and prefetch CSF scales only for consumers that need expansion",
+  "models": ["GLM-5.3-Flash"],
+  "compatibility": "Hybrid prefill remains disabled by default. Enable it with B12X_W4A16_A4_PREFILL=1 and a FlashInfer build exposing semantic A4 selection and uses_expanded_nvfp4_scales. B12X_W4A16_A4_PREFILL_MIN_TOKENS is removed; VLLM_B12X_ACTIVATION_MODE_A16_M continues to apply outside hybrid MoE.",
+  "details": [
+    "Prefill rows use calibrated A4 independently of row count; decode and speculative verification rows retain A16.",
+    "CSF prefetch queries the following layer's prepared kernel for each semantic row range, including uncalibrated A16 fallback and exact decode variants.",
+    "Pending side-stream expansion events are still waited on before shared scratch reuse. CUDA graph capture and replay retain A16."
+  ],
+  "pull_requests": [970, 977],
+  "authors": ["voipmonitor", "lukealonso"]
+}

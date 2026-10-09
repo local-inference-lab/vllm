@@ -1,0 +1,24 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-956-csf-preparation",
+  "category": "compatibility",
+  "summary": "Own CSF file loading and pass raw scale planes to B12X preparation",
+  "models": [
+    "Kimi-K3",
+    "DeepSeek-V4.1-Flash",
+    "GLM-5.3-Flash",
+    "Qwen3.8-Flash-Next"
+  ],
+  "compatibility": "Install the paired vLLM/B12X CSF preparation changes. Canonical CSF checkpoint files and launch commands remain compatible.",
+  "details": [
+    "vLLM owns CSF manifests, model inventories, shard lifetimes, TP slicing and expert assembly.",
+    "The quantization method supplies CsfScalePlanes to the standard B12X prepare_weights API; vLLM does not construct kernel-specific GPU scale batches.",
+    "Canonical checkpoint schemas, native tensor precision and launch flags are unchanged."
+  ],
+  "pull_requests": [
+    956
+  ],
+  "requires": [
+    "b12x-450-csf-preparation"
+  ]
+}

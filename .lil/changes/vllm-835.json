@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-835",
+  "category": "performance",
+  "summary": "Reduce CPU preparation for Qwen MTP CUDA graphs",
+  "models": ["Qwen3.8-Flash-Next"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Uniform speculative decode skips unused B12X mixed-prefill worklists while keeping live recurrent state and acceptance inputs.",
+    "Mixed batches and prefill retain complete metadata staging. No precision, quantization or all-reduce setting changes."
+  ],
+  "pull_requests": [835],
+  "evidence": ["https://github.com/local-inference-lab/vllm/pull/835"]
+}

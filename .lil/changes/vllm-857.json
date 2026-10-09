@@ -1,0 +1,21 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-857",
+  "category": "fix",
+  "summary": "Preserve Kimi EXL3 KDA checkpoint formats and padded TP heads",
+  "models": [
+    "Kimi-K3"
+  ],
+  "compatibility": "Preserves default projection behavior for other quantization configurations. TP9 EXL3 serving and CUDA graph qualification are pending.",
+  "details": [
+    "Keeps serialized MXFP8 Q/K/V separate from BF16 gate, factor and beta projections.",
+    "Loads partial TP head shards with zero-filled tails, including recurrent state and convolution decode weights.",
+    "Preserves source-aligned EXL3 expert extents and adds checkpoint mappings for split projections."
+  ],
+  "pull_requests": [
+    857
+  ],
+  "requires": [
+    "vllm-909"
+  ]
+}

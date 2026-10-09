@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-upstream-55033",
+  "category": "fix",
+  "summary": "Exclude Qwen QSA scratch cache from Simple CPU offload",
+  "models": ["Qwen3.8-Flash-Next"],
+  "compatibility": "Applies only when SimpleCPUOffloadConnector is enabled. The regular OffloadingConnector remains unqualified for this model.",
+  "details": [
+    "The optional Simple CPU KV connector excludes non-prefix-cacheable QSA ring blocks from lazy target sizing, external load selection, and eager stores.",
+    "The change preserves the original author and code from vllm-project/vllm#55033."
+  ],
+  "pull_requests": [],
+  "authors": ["Zhewen Li"],
+  "evidence": ["https://github.com/vllm-project/vllm/pull/55033"],
+  "requires": []
+}

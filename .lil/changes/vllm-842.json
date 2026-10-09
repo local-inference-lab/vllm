@@ -1,0 +1,21 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-842",
+  "category": "fix",
+  "summary": "Preserve Kimi MLA gate precision and BF16 prefill with FP8 cache storage",
+  "models": [
+    "Kimi-K3"
+  ],
+  "compatibility": "Preserves default projection behavior for other quantization configurations. TP9 EXL3 serving and CUDA graph qualification are pending.",
+  "details": [
+    "Keeps BF16 output gates separate from serialized quantized Q/KV projections.",
+    "Loads checkpoint-absent padded head tails for both full-rank and latent Q projections.",
+    "Allows NoPE BF16 prefill attention with FP8 KV storage without forcing FP8 Q/K/V."
+  ],
+  "pull_requests": [
+    842
+  ],
+  "requires": [
+    "vllm-857"
+  ]
+}

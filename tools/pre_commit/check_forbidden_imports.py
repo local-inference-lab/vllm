@@ -58,6 +58,13 @@ CHECK_IMPORTS = {
             "vllm/distributed/device_communicators/shm_object_storage.py",
             "vllm/distributed/weight_transfer/ipc_engine.py",
             "vllm/distributed/weight_transfer/clients.py",
+            # Preparation metadata is exchanged among trusted workers.
+            "vllm/v1/worker/b12x_startup.py",
+            "vllm/v1/worker/worker_base.py",
+            "vllm/v1/executor/abstract.py",
+            "tests/v1/executor/test_b12x_startup.py",
+            # Checks that shared Engram descriptors survive worker serialization.
+            "tests/models/test_deepseek_v4_1_engram.py",
             "vllm/model_executor/model_loader/weight_cache/protocol.py",
             "tests/distributed/test_shm_broadcast.py",
             "tests/distributed/test_weight_transfer.py",

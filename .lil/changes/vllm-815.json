@@ -1,0 +1,17 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-815",
+  "category": "fix",
+  "summary": "Separate CUDA graph caches by speculative method and draft depth",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "Speculative configurations with different execution graph shapes no longer reuse an incompatible compiled cache entry."
+  ],
+  "pull_requests": [
+    815
+  ],
+  "requires": []
+}

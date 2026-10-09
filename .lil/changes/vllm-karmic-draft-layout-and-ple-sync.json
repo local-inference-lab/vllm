@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-karmic-draft-layout-and-ple-sync",
+  "category": "compatibility",
+  "summary": "Preserve serving workspace contracts with checkpoint-aware PLE and pooled draft loading",
+  "models": ["Qwen3.8-Flash-Next", "GLM-5.3-Flash", "MiMo-V2.6"],
+  "compatibility": "Explicit PLE placement and draft-loader settings are retained. No user action required.",
+  "details": [
+    "Infer omitted Qwen PLE storage dtype from checkpoint headers while retaining explicit CPU-offload policy.",
+    "Retain the independently owned MXFP8 context projection alongside pooled DFlash weight transfer and draft subfolder support.",
+    "Preserve canonical mixed-page KV layouts and noncausal paged draft attention, including MiMo loaders and launchers."
+  ],
+  "pull_requests": [798],
+  "authors": ["lukealonso"]
+}

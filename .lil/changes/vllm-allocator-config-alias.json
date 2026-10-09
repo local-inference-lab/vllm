@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-allocator-config-alias",
+  "category": "fix",
+  "summary": "Honor allocator configuration aliases during weight loading",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "Use PYTORCH_ALLOC_CONF when PYTORCH_CUDA_ALLOC_CONF is unset, preserving the CUDA allocator alias precedence.",
+    "Respect whitespace around allocator options and restore the configured classic allocator split limit."
+  ],
+  "pull_requests": [
+    980,
+    981
+  ]
+}

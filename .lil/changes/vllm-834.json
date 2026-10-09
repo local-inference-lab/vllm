@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-834",
+  "category": "fix",
+  "summary": "Preserve the target CuMem allocator setting for speculative drafts",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "MTP can use native CPU KV offload with expandable segments when the target enables the CuMem allocator.",
+    "Connector safety checks remain enabled; this does not qualify generic Qwen CPU offload."
+  ],
+  "pull_requests": [834],
+  "evidence": ["https://github.com/local-inference-lab/vllm/pull/834"]
+}

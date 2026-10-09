@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-hybrid-prefetch-readiness",
+  "category": "fix",
+  "summary": "Prefetch CSF scales for prepared hybrid kernels that consume ready expanded scales",
+  "models": ["GLM-5.3-Flash"],
+  "compatibility": "Hybrid prefill remains disabled by default. Enabling it requires FlashInfer's uses_expanded_nvfp4_scales interface to declare the scales_expanded readiness parameter.",
+  "details": [
+    "Prefetch queries prospective scale readiness for each semantic range in the following layer.",
+    "Binding receives readiness only after waiting for the matching prefetch event; compressed consumers remain eligible when expansion is unnecessary.",
+    "Scale storage selection does not alter scheduler-based A4 prefill and A16 verification precision."
+  ],
+  "pull_requests": [970, 977],
+  "authors": ["voipmonitor", "lukealonso"]
+}

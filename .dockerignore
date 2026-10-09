@@ -5,7 +5,14 @@
 /wheel-export/
 dist
 vllm/*.so
+vllm/**/*.so
 vllm/vllm-rs
+
+# Generated FlashAttention packages come from the build or verified wheel.
+vllm/vllm_flash_attn/*
+!vllm/vllm_flash_attn/.gitkeep
+!vllm/vllm_flash_attn/__init__.py
+!vllm/vllm_flash_attn/flash_attn_interface.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

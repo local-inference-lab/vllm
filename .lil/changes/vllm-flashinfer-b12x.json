@@ -1,0 +1,17 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-flashinfer-b12x",
+  "category": "compatibility",
+  "summary": "B12X now comes from FlashInfer 0.7.1, which carries it as flashinfer/experimental/b12x with the same b12x import package",
+  "models": [
+    "all"
+  ],
+  "compatibility": "The container installs FlashInfer 0.7.1 and no separate b12x wheel: both own the b12x namespace, so a standalone b12x package must not be installed next to it.",
+  "details": [
+    "The standalone B12X repository is archived; its code continues in FlashInfer, whose wheel also installs the top-level b12x package that vLLM imports.",
+    "The vllm[b12x] extra now installs flashinfer-python[b12x]==0.7.1 (the pinned CuTe DSL) instead of b12x==1.3.0."
+  ],
+  "authors": [
+    "voipmonitor"
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-926-ring-writes",
+  "category": "fix",
+  "summary": "Write the DeepSeek-V4.1 compressor state ring during decode",
+  "models": [
+    "DeepSeek-V4.1-Flash"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "Circular-buffer KV groups take a worker slot mapping into their ring block, so DeepSeek-V4.1 writes its compressor partial-state ring for every real row and decode no longer drifts from the model as generation lengthens.",
+    "Corrects vllm-926: mapping ring positions alone left circular groups without a slot mapping, so the ring was still never written."
+  ],
+  "pull_requests": [
+    926
+  ],
+  "requires": []
+}

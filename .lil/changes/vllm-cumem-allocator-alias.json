@@ -1,0 +1,17 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-cumem-allocator-alias",
+  "category": "fix",
+  "summary": "Honor effective allocator configuration while CuMem pools are active",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "Read PYTORCH_ALLOC_CONF when PYTORCH_CUDA_ALLOC_CONF is unset, preserving CUDA-specific precedence and recognizing whitespace around expandable_segments.",
+    "Disable expandable segments before CuMem pool entry and restore the setting on normal and exceptional exit."
+  ],
+  "authors": [
+    "Luke Alonso"
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-926",
+  "category": "fix",
+  "summary": "Keep DeepSeek-V4.1 compressor state across decode steps past the ring size",
+  "models": [
+    "DeepSeek-V4.1-Flash"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "Circular-buffer KV groups map every position into their one block, so the compressor state ring is written past its first 8–16 tokens and decode no longer drifts from the model as generation lengthens."
+  ],
+  "pull_requests": [
+    926
+  ],
+  "requires": []
+}

@@ -1,0 +1,13 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-glm53-fp8-modelopt-head",
+  "category": "fix",
+  "summary": "Enable optional GLM TP3 FP8 heads for unquantized ModelOpt shards",
+  "models": ["GLM-5.3-Flash"],
+  "compatibility": "The opt-in FP8 decode path accepts both unquantized head method classes while preserving BF16 shape checks and explicit runtime head quantization.",
+  "details": [
+    "ModelOpt mixed-precision checkpoints assign an unquantized linear method to a BF16 LM head that is absent from the quantized-layer manifest.",
+    "The FP8 wrapper preserves the original method for weight processing and BF16 fallback. Runtime MXFP8 and NVFP4 heads remain excluded."
+  ],
+  "pull_requests": [889]
+}

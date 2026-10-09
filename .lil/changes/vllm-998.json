@@ -1,0 +1,18 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-998",
+  "category": "performance",
+  "summary": "GLM-5.3 (744B) prefill with decode context parallelism runs 1.4x faster at DCP2, 1.7x at DCP3 and 2.5x at DCP6",
+  "models": ["GLM-5.3"],
+  "compatibility": "Opt-in: set VLLM_B12X_MLA_CKV_GATHER=1 and VLLM_DCP_INDEXER_KEY_GATHER=1 for GLM-5.2/5.3 DSA launches with decode context parallelism. DCP1, decode and GLM-5.3-Flash are unchanged.",
+  "details": [
+    "Pure prefill batches gather each request's native 656-byte cache records from every DCP rank and attend their local query heads over the complete cache, instead of gathering the DCP group's queries and merging LSE-weighted partial outputs (the GLM-5.3-Flash full-CKV path, ported from joninco's dev/jovian-judgement). Batches whose summed context exceeds VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS (524,288) keep the query exchange.",
+    "The B12X DSA indexer gathers each request's index keys once per indexer layer and splits the prefill rows across the tensor-parallel ranks, which exchange only the selected indices instead of every shard's top-k candidates and scores.",
+    "Captured graphs, speculative verification, decode rows and mixed decode batches keep their existing exchanges. The gathered-cache workspace fits within the shared workspace that the model already reserves, and its selection kernels compile before serving.",
+    "GLM-5.3-NVFP4-CSF at TP6 on 6x RTX PRO 6000 (MTP3), prefill tok/s at 8K / 32K / 64K / 128K: DCP2 4,064 / 4,093 / 4,035 / 3,889 -> 5,906 / 5,867 / 5,775 / 5,550; DCP3 3,355 / 3,235 / 3,348 / 3,293 -> 5,872 / 5,809 / 5,719 / 5,444; DCP6 (ag_rs) 2,171 / 2,175 / 2,182 / 2,174 -> 5,898 / 5,520 / 5,710 / 5,396. Decode steps/s and KV capacity unchanged.",
+    "A 1,015K-token prompt at DCP6 prefills in 360 s (CKV gather up to 524K context); VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS=1048576 lowers that to 329 s at 11,902 fewer KV tokens (0.9%). Needle retrieval 3/3 at 421,762 (DCP2), 662,630 (DCP3) and 1,010,918 (DCP6) tokens."
+  ],
+  "authors": ["joninco", "voipmonitor"],
+  "pull_requests": [998],
+  "requires": ["vllm-994"]
+}

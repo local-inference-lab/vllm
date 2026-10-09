@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-kimi-x4t-experts",
+  "category": "feature",
+  "summary": "Load lossless Kimi-K3 X4T experts with native dense precision.",
+  "models": [
+    "Kimi-K3"
+  ],
+  "compatibility": "Requires B12X X4T checkpoint support, --quantization kimi_x4t and --load-format exact_mxfp4. Native MXFP4 and DS4.1 source precision are unchanged.",
+  "pull_requests": [
+    949
+  ],
+  "authors": [
+    "voipmonitor"
+  ]
+}

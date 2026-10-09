@@ -1,0 +1,17 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-b12x-mxfp8-logical-output-tail",
+  "category": "fix",
+  "summary": "Pad MXFP8 projection storage for non-N8 tensor-parallel shards",
+  "models": [
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "B12X MXFP8 projections preserve their logical output dimensions and bias values while aligning physical packed storage to eight columns.",
+  "details": [
+    "Zero weight rows use neutral E8M0 scales; callers receive a view excluding the storage tail.",
+    "GLM TP3 fused KDA projections with 8598 output columns prepare and execute using 8600 storage columns."
+  ],
+  "pull_requests": [
+    889
+  ]
+}

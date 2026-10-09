@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+ARG BASE_IMAGE=vllm-node-eugr-20260712:latest
+FROM ${BASE_IMAGE}
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends liburing-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*

@@ -1,0 +1,21 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-989-native-architecture",
+  "category": "compatibility",
+  "summary": "Enable opt-in DFlash split-KV draft attention on SM120-family GPUs",
+  "models": ["GLM-5.3-Flash"],
+  "compatibility": "Set VLLM_GLM53_DFLASH_ATTN=1 to enable the kernel; compilation requires a CUDA toolkit supporting the device's native architecture.",
+  "details": [
+    "The capability gate accepts CUDA compute capability 12.x. Compilation targets the detected device architecture, including sm_121a on GB10; attention math and the default disabled setting are unchanged.",
+    "The 40-test GB10 pass cited in vllm-989 was reported for the originating PR 673. The PR 989 GB10 report passed graph replay and three contract/dispatch tests; its 36 numerical comparisons were blocked by unsupported PTX in the FlashAttention 2 reference.",
+    "On SM120, all 40 draft-attention tests pass, including 36 numerical comparisons against FlashAttention 2, CUDA graph replay, and boundary/dispatch checks. Validation used PyTorch 2.14.0a0 from NGC 26.08 and CUDA nvcc 13.4.59.",
+    "GB10 validation has not been independently repeated for this integration."
+  ],
+  "authors": ["original-el8", "voipmonitor"],
+  "pull_requests": [989],
+  "requires": ["vllm-989"],
+  "evidence": [
+    "https://github.com/local-inference-lab/vllm/pull/673",
+    "https://github.com/local-inference-lab/vllm/pull/989#issuecomment-6013366146"
+  ]
+}

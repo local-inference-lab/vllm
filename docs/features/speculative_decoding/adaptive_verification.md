@@ -32,6 +32,32 @@ vllm serve deepseek-ai/DeepSeek-V4-Flash-DSpark \
 
 Set `enable_adaptive_verification: false` to verify the full block for every request.
 
+To make the cost model trim more or less aggressively, set
+`adaptive_verification_cost_scale` in the speculative config. It scales only
+the incremental target cost of verifying draft rows; the target pass needed to
+sample the bonus token is unchanged. The default is `1.0`.
+
+```json
+{
+  "method": "dspark",
+  "num_speculative_tokens": 7,
+  "enable_adaptive_verification": true,
+  "adaptive_verification_cost_scale": 2.0
+}
+```
+
+Values above `1.0` trim more aggressively, while values between `0.0` and
+`1.0` retain more drafts. Tune against output-token throughput at the intended
+concurrency and context-length distribution. With debug logging enabled, each
+step logs the selected and scheduled draft-row counts along with the modeled
+utility for the selected and full budgets.
+
+The periodic speculative-decoding log reports mean verification depth and
+per-position verification coverage. Acceptance is computed against drafts the
+target model actually verified; positions not verified during the reporting
+interval appear as `-----`. The corresponding Prometheus denominator is
+`vllm:spec_decode_num_draft_tokens_per_pos_total`.
+
 ## Requirements and limitations
 
 - The attention backend must tolerate device-decided query lengths, since the CPU lengths only bound them from above. Backends that plan off the CPU lengths are excluded by the attention selector, and rejected at startup for models that hard-wire their backend.

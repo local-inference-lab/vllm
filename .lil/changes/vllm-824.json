@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-824",
+  "category": "fix",
+  "summary": "Preserve the GLM KDA gate when a decode output aliases it",
+  "models": ["GLM-5.3-Flash"],
+  "compatibility": "No configuration change is required. Non-overlapping KDA outputs retain the allocation-free path.",
+  "details": [
+    "When B12X rejects an output overlapping the read-only gate, vLLM binds a disjoint caller-owned output and copies the result back after recurrence.",
+    "Other B12X binding errors still propagate without a fallback."
+  ],
+  "pull_requests": [824],
+  "authors": ["Local Inference Lab"],
+  "evidence": ["https://github.com/local-inference-lab/vllm/pull/824"],
+  "requires": []
+}

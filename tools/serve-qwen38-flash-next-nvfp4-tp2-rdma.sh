@@ -1,0 +1,429 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2029
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+VLLM_ROOT="${VLLM_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
+B12X_ROOT="${B12X_ROOT:-/home/luke/projects/b12x}"
+SPARK_ROOT="${SPARK_ROOT:-/home/luke/projects/spark-vllm-docker}"
+CLUSTER_LAUNCHER="${CLUSTER_LAUNCHER:-${SPARK_ROOT}/launch-cluster.sh}"
+
+HEAD_IP="${HEAD_IP:-192.168.42.223}"
+WORKER_IP="${WORKER_IP:-192.168.42.110}"
+ETH_IF="${ETH_IF:-enP7s7}"
+IB_IF="${IB_IF:-rocep1s0f0,roceP2p1s0f0}"
+HEAD_IB_IF="${HEAD_IB_IF:-${IB_IF}}"
+WORKER_IB_IF="${WORKER_IB_IF:-${IB_IF}}"
+NCCL_IB_MERGE_NICS="${NCCL_IB_MERGE_NICS:-1}"
+MASTER_PORT="${MASTER_PORT:-29638}"
+TP_SIZE="${TP_SIZE:-2}"
+B12X_COMPILE_CACHE_DIR="${B12X_COMPILE_CACHE_DIR:-${HOME}/.cache/b12x/compile/qwen38-tp${TP_SIZE}}"
+CONTAINER_NAME="${CONTAINER_NAME:-vllm_qwen38_flash_next_tp${TP_SIZE}}"
+IMAGE_NAME="${IMAGE_NAME:-vllm-node-eugr-20260712-io-uring:latest}"
+SECCOMP_PROFILE="${SECCOMP_PROFILE:-${SCRIPT_DIR}/seccomp/spark-io-uring.json}"
+CONTAINER_MEMORY_GB="${CONTAINER_MEMORY_GB:-108}"
+CONTAINER_MEMORY_SWAP_GB="${CONTAINER_MEMORY_SWAP_GB:-112}"
+
+PYTHON_BIN="${PYTHON_BIN:-${VLLM_ROOT}/.venv/bin/python}"
+VLLM_BIN="${VLLM_BIN:-${VLLM_ROOT}/.venv/bin/vllm}"
+DEFAULT_MODEL_PATH=/data/models/Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD
+MODEL_PATH="${MODEL_PATH:-${DEFAULT_MODEL_PATH}}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD}"
+LOAD_FORMAT="${LOAD_FORMAT:-b12x}"
+PORT="${PORT:-8000}"
+default_max_model_len=65536
+default_kv_cache_memory_bytes=1610612736
+if [[ "${TP_SIZE}" == 2 ]]; then
+  default_max_model_len=262144
+  default_kv_cache_memory_bytes=34359738368
+fi
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-${default_max_model_len}}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
+KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-${default_kv_cache_memory_bytes}}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
+NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-3}"
+ALLREDUCE="${ALLREDUCE:-rocenante}"
+ROCE_ALLREDUCE_MAX_SIZE="${ROCE_ALLREDUCE_MAX_SIZE:-2MB}"
+ROCE_ALLGATHER_MAX_SIZE="${ROCE_ALLGATHER_MAX_SIZE:-16MB}"
+NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
+COMPILATION_CONFIG="${VLLM_QWEN38_COMPILATION_CONFIG:-}"
+if [[ -z "${COMPILATION_CONFIG}" ]]; then
+  COMPILATION_CONFIG='{"pass_config":{"fuse_act_quant":true}}'
+fi
+
+sync_code=0
+sync_model=0
+check_only=0
+detach=0
+vllm_args=()
+
+usage() {
+  cat <<EOF
+Usage: $0 [launcher options] [-- vLLM options]
+
+Launch Qwen 3.8 Flash Next with TP_SIZE=1 on the local Spark or TP_SIZE=2
+(default) across tachyon and luxon. TP=2 uses the management LAN for bootstrap
+and both RoCE interfaces through the ConnectX-7 switch. ALLREDUCE=rocenante
+(default) routes supported TP=2 collectives through b12x one-shot RoCE;
+ALLREDUCE=nccl keeps the existing NCCL path. TP=1 uses neither transport.
+
+Launcher options:
+  --sync-code   For TP=2, mirror local vllm/ and b12x/ to the worker.
+  --sync-model  For TP=2, rsync MODEL_PATH to the worker.
+  --check       Validate the selected topology without launching.
+  --detach      Run the head rank in the background; use docker logs to follow it.
+  -h, --help    Show this help.
+
+Environment overrides include TP_SIZE (1 or 2), ALLREDUCE, MODEL_PATH, LOAD_FORMAT,
+MAX_MODEL_LEN, KV_CACHE_MEMORY_BYTES, GPU_MEMORY_UTILIZATION, B12X_COMPILE_CACHE_DIR,
+HEAD_IP,
+WORKER_IP, ETH_IF,
+IB_IF, HEAD_IB_IF, WORKER_IB_IF, NCCL_IB_MERGE_NICS,
+ROCE_ALLREDUCE_MAX_SIZE, ROCE_ALLGATHER_MAX_SIZE, IMAGE_NAME, SECCOMP_PROFILE, and
+CONTAINER_MEMORY_GB.
+EOF
+}
+
+while (($#)); do
+  case "$1" in
+    --sync-code)
+      sync_code=1
+      shift
+      ;;
+    --sync-model)
+      sync_model=1
+      shift
+      ;;
+    --check)
+      check_only=1
+      shift
+      ;;
+    --detach)
+      detach=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      vllm_args=("$@")
+      break
+      ;;
+    *)
+      echo "Unknown launcher option: $1" >&2
+      echo "Put additional vLLM arguments after --." >&2
+      exit 2
+      ;;
+  esac
+done
+
+case "${TP_SIZE}" in
+  1|2) ;;
+  *)
+    echo "TP_SIZE must be 1 or 2; got '${TP_SIZE}'" >&2
+    exit 2
+    ;;
+esac
+
+case "${ALLREDUCE}" in
+  rocenante|nccl) ;;
+  *)
+    echo "ALLREDUCE must be rocenante or nccl; got '${ALLREDUCE}'" >&2
+    exit 2
+    ;;
+esac
+
+
+case "${NCCL_DEBUG}" in
+  VERSION|WARN|INFO|TRACE) ;;
+  *)
+    echo "Invalid NCCL_DEBUG level: ${NCCL_DEBUG}" >&2
+    exit 2
+    ;;
+esac
+
+for path in \
+  "${VLLM_ROOT}" \
+  "${B12X_ROOT}" \
+  "${B12X_COMPILE_CACHE_DIR}" \
+  "${MODEL_PATH}" \
+  "${SECCOMP_PROFILE}" \
+  "${CLUSTER_LAUNCHER}"; do
+  if [[ "${path}" == *[[:space:]]* ]]; then
+    echo "Spark bind-mount paths cannot contain whitespace: ${path}" >&2
+    exit 2
+  fi
+done
+
+if [[ "${LOAD_FORMAT}" == b12x && ! -f "${SECCOMP_PROFILE}" ]]; then
+  echo "b12x loader seccomp profile not found: ${SECCOMP_PROFILE}" >&2
+  exit 1
+fi
+
+if [[ ! -x "${CLUSTER_LAUNCHER}" ]]; then
+  echo "Spark cluster launcher is not executable: ${CLUSTER_LAUNCHER}" >&2
+  exit 1
+fi
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  echo "Python interpreter is not executable: ${PYTHON_BIN}" >&2
+  exit 1
+fi
+if [[ ! -x "${VLLM_BIN}" ]]; then
+  echo "vLLM CLI is not executable: ${VLLM_BIN}" >&2
+  exit 1
+fi
+if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
+  echo "Local model config not found: ${MODEL_PATH}/config.json" >&2
+  exit 1
+fi
+if [[ ! -f "${VLLM_ROOT}/vllm/__init__.py" ]]; then
+  echo "Local vLLM source tree not found under ${VLLM_ROOT}" >&2
+  exit 1
+fi
+if [[ ! -f "${B12X_ROOT}/b12x/__init__.py" ]]; then
+  echo "Local b12x source tree not found under ${B12X_ROOT}" >&2
+  exit 1
+fi
+
+ssh_opts=(
+  -o BatchMode=yes
+  -o ConnectTimeout=5
+  -o StrictHostKeyChecking=no
+)
+
+if ((TP_SIZE == 2)); then
+  if ! ssh "${ssh_opts[@]}" "${WORKER_IP}" true; then
+    echo "Passwordless SSH to worker ${WORKER_IP} failed." >&2
+    exit 1
+  fi
+
+  if ((sync_code)); then
+    echo "Mirroring vLLM runtime source to ${WORKER_IP}..."
+    rsync -a --delete \
+      --exclude='__pycache__/' \
+      --exclude='*.py[co]' \
+      "${VLLM_ROOT}/vllm/" \
+      "${WORKER_IP}:${VLLM_ROOT}/vllm/"
+    echo "Mirroring b12x runtime source to ${WORKER_IP}..."
+    rsync -a --delete \
+      --exclude='__pycache__/' \
+      --exclude='*.py[co]' \
+      "${B12X_ROOT}/b12x/" \
+      "${WORKER_IP}:${B12X_ROOT}/b12x/"
+  fi
+
+  if ((sync_model)); then
+    printf -v remote_model_parent '%q' "$(dirname -- "${MODEL_PATH}")"
+    remote_prepare_model="mkdir -p -- ${remote_model_parent} 2>/dev/null"
+    remote_prepare_model+=" || sudo -n install -d"
+    remote_prepare_model+=" -o \$(id -un) -g \$(id -gn)"
+    remote_prepare_model+=" -- ${remote_model_parent}"
+    ssh "${ssh_opts[@]}" "${WORKER_IP}" \
+      "${remote_prepare_model}"
+    echo "Rsyncing the model to ${WORKER_IP}:${MODEL_PATH}..."
+    rsync -a --partial --info=progress2 \
+      "${MODEL_PATH}/" \
+      "${WORKER_IP}:${MODEL_PATH}/"
+  fi
+
+  remote_files=(
+    "${PYTHON_BIN}"
+    "${VLLM_BIN}"
+    "${VLLM_ROOT}/vllm/__init__.py"
+    "${B12X_ROOT}/b12x/__init__.py"
+    "${MODEL_PATH}/config.json"
+  )
+  for path in "${remote_files[@]}"; do
+    printf -v remote_path '%q' "${path}"
+    if ! ssh "${ssh_opts[@]}" "${WORKER_IP}" "test -e ${remote_path}"; then
+      echo "Required worker path is missing: ${WORKER_IP}:${path}" >&2
+      if [[ "${path}" == "${MODEL_PATH}/config.json" ]]; then
+        echo "Rerun with --sync-model to transfer the model first." >&2
+      else
+        echo "Rerun with --sync-code after preparing the worker venv." >&2
+      fi
+      exit 1
+    fi
+  done
+
+  runtime_digest() {
+    LC_ALL=C find \
+      "${VLLM_ROOT}/vllm" \
+      "${B12X_ROOT}/b12x" \
+      \( -type f -o -type l \) \
+      ! -path '*/__pycache__/*' \
+      ! -name '*.py[co]' \
+      -print0 \
+      | sort -z \
+      | xargs -0 -r sha256sum \
+      | sha256sum \
+      | cut -d' ' -f1
+  }
+
+  printf -v remote_vllm '%q' "${VLLM_ROOT}/vllm"
+  printf -v remote_b12x '%q' "${B12X_ROOT}/b12x"
+  remote_digest_command="LC_ALL=C find ${remote_vllm} ${remote_b12x} \
+    \\( -type f -o -type l \\) \
+    ! -path '*/__pycache__/*' ! -name '*.py[co]' -print0 \
+    | sort -z | xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1"
+
+  local_digest="$(runtime_digest)"
+  worker_digest="$(
+    ssh "${ssh_opts[@]}" "${WORKER_IP}" "${remote_digest_command}"
+  )"
+  if [[ "${local_digest}" != "${worker_digest}" ]]; then
+    echo "vLLM/b12x runtime source differs on ${WORKER_IP}." >&2
+    echo "Rerun with --sync-code so both TP ranks execute identical code." >&2
+    exit 1
+  fi
+elif ((sync_code || sync_model)); then
+  echo "TP_SIZE=1 uses local code and model; ignoring sync options."
+fi
+
+if ! docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
+  echo "Docker image is missing locally: ${IMAGE_NAME}" >&2
+  exit 1
+fi
+if ((TP_SIZE == 2)); then
+  if ! ssh "${ssh_opts[@]}" "${WORKER_IP}" \
+    "docker image inspect ${IMAGE_NAME} >/dev/null 2>&1"; then
+    echo "Docker image is missing on ${WORKER_IP}: ${IMAGE_NAME}" >&2
+    exit 1
+  fi
+fi
+
+mkdir -p -- "${B12X_COMPILE_CACHE_DIR}"
+if ((TP_SIZE == 2)); then
+  printf -v remote_cache_dir '%q' "${B12X_COMPILE_CACHE_DIR}"
+  ssh "${ssh_opts[@]}" "${WORKER_IP}" "mkdir -p -- ${remote_cache_dir}"
+fi
+
+mount_args="-v ${VLLM_ROOT}:${VLLM_ROOT}"
+mount_args+=" -v ${B12X_ROOT}:${B12X_ROOT}"
+mount_args+=" -v ${B12X_COMPILE_CACHE_DIR}:${B12X_COMPILE_CACHE_DIR}"
+mount_args+=" -v ${MODEL_PATH}:${MODEL_PATH}:ro"
+if [[ "${LOAD_FORMAT}" == b12x ]]; then
+  if ((TP_SIZE == 2)); then
+    printf -v remote_seccomp_dir '%q' "$(dirname -- "${SECCOMP_PROFILE}")"
+    ssh "${ssh_opts[@]}" "${WORKER_IP}" "mkdir -p -- ${remote_seccomp_dir}"
+    rsync -a "${SECCOMP_PROFILE}" "${WORKER_IP}:${SECCOMP_PROFILE}"
+  fi
+  mount_args+=" --security-opt seccomp=${SECCOMP_PROFILE}"
+fi
+if [[ -n "${VLLM_SPARK_EXTRA_DOCKER_ARGS:-}" ]]; then
+  mount_args+=" ${VLLM_SPARK_EXTRA_DOCKER_ARGS}"
+fi
+export VLLM_SPARK_EXTRA_DOCKER_ARGS="${mount_args}"
+
+cluster_args=(
+  -t "${IMAGE_NAME}"
+  --name "${CONTAINER_NAME}"
+  --nccl-debug "${NCCL_DEBUG}"
+  --non-privileged
+  --mem-limit-gb "${CONTAINER_MEMORY_GB}"
+  --mem-swap-limit-gb "${CONTAINER_MEMORY_SWAP_GB}"
+  --env "PYTHONPATH=${VLLM_ROOT}:${B12X_ROOT}"
+  --env "B12X_COMPILE_CACHE_DIR=${B12X_COMPILE_CACHE_DIR}"
+  --env "CUDA_HOME=/usr/local/cuda"
+  --env "TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas"
+  --env "CUDA_VISIBLE_DEVICES=0"
+  --env "CUTE_DSL_ARCH=sm_121a"
+  --env "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+  --env "SAFETENSORS_FAST_GPU=1"
+  --env "OMP_NUM_THREADS=16"
+  --env "VLLM_WORKER_MULTIPROC_METHOD=spawn"
+  --env "HF_HUB_OFFLINE=1"
+  --env "TRANSFORMERS_OFFLINE=1"
+  --env "VLLM_PLUGINS="
+  --env "VLLM_SSM_CONV_STATE_LAYOUT=DS"
+  --env "VLLM_USE_AOT_COMPILE=1"
+  --env "VLLM_USE_MEGA_AOT_ARTIFACT=1"
+  --env "VLLM_USE_V2_MODEL_RUNNER=1"
+  --env "VLLM_ENABLE_PCIE_ALLREDUCE=0"
+  --env "NCCL_NET_PLUGIN=none"
+  --env "NCCL_IB_GID_INDEX=3"
+  --env "NCCL_IB_TC=${NCCL_IB_TC:-106}"
+  --env "B12X_ROCE_TRAFFIC_CLASS=${B12X_ROCE_TRAFFIC_CLASS:-${NCCL_IB_TC:-106}}"
+  --env "NCCL_IB_MERGE_NICS=${NCCL_IB_MERGE_NICS}"
+)
+if ((TP_SIZE == 1)); then
+  cluster_args=(--solo "${cluster_args[@]}")
+else
+  cluster_args=(
+    --nodes "${HEAD_IP},${WORKER_IP}"
+    --eth-if "${ETH_IF}"
+    --ib-if "${IB_IF}"
+    --node-ib-if "${HEAD_IP}=${HEAD_IB_IF}"
+    --node-ib-if "${WORKER_IP}=${WORKER_IB_IF}"
+    --master-port "${MASTER_PORT}"
+    --no-ray
+    "${cluster_args[@]}"
+  )
+fi
+
+allreduce_args=()
+if ((TP_SIZE == 2)) && [[ "${ALLREDUCE}" == rocenante ]]; then
+  cluster_args+=(
+    --env "VLLM_ENABLE_ROCE_ALLREDUCE=1"
+    --env "VLLM_ROCE_ALLREDUCE_MAX_SIZE=${ROCE_ALLREDUCE_MAX_SIZE}"
+    --env "VLLM_ROCE_ALLGATHER_MAX_SIZE=${ROCE_ALLGATHER_MAX_SIZE}"
+    --env "B12X_ROCE_CACHE_DIR=/root/.cache/vllm/b12x-roce"
+  )
+else
+  cluster_args+=(--env "VLLM_ENABLE_ROCE_ALLREDUCE=0")
+  allreduce_args+=(--disable-custom-all-reduce)
+fi
+
+if ((check_only)); then
+  exec "${CLUSTER_LAUNCHER}" "${cluster_args[@]}" --check-config
+fi
+if ((detach)); then
+  cluster_args+=(-d)
+fi
+
+speculative_config=$(printf \
+  '{"method":"mtp","num_speculative_tokens":%s}' \
+  "${NUM_SPECULATIVE_TOKENS}")
+
+vllm_command=(
+  "${VLLM_BIN}" serve "${MODEL_PATH}"
+  --served-model-name "${SERVED_MODEL_NAME}"
+  --host 0.0.0.0
+  --port "${PORT}"
+  --trust-remote-code
+  --tensor-parallel-size "${TP_SIZE}"
+  --pipeline-parallel-size 1
+  "${allreduce_args[@]}"
+  --mamba-cache-mode align
+  --enable-prefix-caching
+  --enable-chunked-prefill
+  --dtype bfloat16
+  --kv-cache-dtype fp8
+  --quantization modelopt_mixed
+  --block-size 16
+  --load-format "${LOAD_FORMAT}"
+  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
+  --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}"
+  --max-model-len "${MAX_MODEL_LEN}"
+  --max-num-seqs "${MAX_NUM_SEQS}"
+  --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
+  --speculative-config "${speculative_config}"
+  --gdn-decode-kernel b12x
+  --linear-backend b12x
+  --moe-backend b12x
+  --no-enable-flashinfer-autotune
+  --mm-encoder-tp-mode data
+  --mm-processor-cache-gb 0
+  --limit-mm-per-prompt '{"image":1}'
+  --reasoning-parser qwen3
+  --tool-call-parser qwen3_xml
+  --enable-auto-tool-choice
+  --compilation-config "${COMPILATION_CONFIG}"
+)
+vllm_command+=("${vllm_args[@]}")
+
+exec "${CLUSTER_LAUNCHER}" "${cluster_args[@]}" exec "${vllm_command[@]}"

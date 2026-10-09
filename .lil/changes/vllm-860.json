@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-860",
+  "category": "fix",
+  "summary": "Stop speculative decoding from corrupting GLM-5.3 recurrent state at cache block boundaries",
+  "models": ["GLM-5.3-Flash", "Kimi-K3"],
+  "compatibility": "No user action required.",
+  "details": [
+    "With MTP or DFlash and prefix caching, a speculative step that ended exactly on a recurrent block boundary could skip the state commit, producing off-topic text, loops or multilingual garbage from that point.",
+    "Later requests that reused such a conversation from the prefix cache no longer start from a damaged state."
+  ],
+  "pull_requests": [860],
+  "evidence": ["https://github.com/local-inference-lab/vllm/pull/860"]
+}

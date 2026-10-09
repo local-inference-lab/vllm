@@ -1,0 +1,21 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-nvfp4-moe-unloaded-input-scales",
+  "category": "fix",
+  "summary": "MoE layers without stored activation scales no longer enable the NVFP4-activation prefill from uninitialized memory",
+  "models": [
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "GLM-5.3-Flash checkpoints keep the MTP layer's routed experts weight-only (W4A16_NVFP4) without input scales. Their scale parameters were uninitialized, so with B12X_W4A16_A4_PREFILL_MIN_TOKENS set the draft layer could prefill with NVFP4 activations under a garbage global scale. They now start at zero, which the A4 prefill treats as absent: the draft layer stays W4A16.",
+    "MTP acceptance after a 13.4K-token prompt was unchanged in the measured case; the fix removes the dependence on uninitialized memory."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    976
+  ],
+  "requires": []
+}

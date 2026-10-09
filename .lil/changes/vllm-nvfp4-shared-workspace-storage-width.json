@@ -1,0 +1,17 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-nvfp4-shared-workspace-storage-width",
+  "category": "fix",
+  "summary": "Reserve NVFP4 routed workspace using packed activation width",
+  "models": [
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "Shared-expert scratch reservations retain logical output width when routed NVFP4 activations pack two values per byte. Backends that defer activation quantization retain their unpacked workspace geometry.",
+  "details": [
+    "FlashInfer CUTLASS, CuTeDSL and TRTLLM modular NVFP4 experts receive the same packed K used after input preparation.",
+    "Routed and shared scratch remain disjoint views from one simultaneous arena reservation."
+  ],
+  "pull_requests": [
+    976
+  ]
+}

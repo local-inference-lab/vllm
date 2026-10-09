@@ -1,0 +1,29 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-998-ckv-selection",
+  "category": "performance",
+  "summary": "Reserve GLM DSA DCP cache-gather scratch while retaining sharded index selection",
+  "models": [
+    "GLM-5.2",
+    "GLM-5.3"
+  ],
+  "compatibility": "VLLM_B12X_MLA_CKV_GATHER remains disabled by default. The DSA indexer retains sharded scoring and candidate merging; VLLM_DCP_INDEXER_KEY_GATHER is not implemented in this runtime.",
+  "details": [
+    "With VLLM_B12X_MLA_CKV_GATHER=1, eligible pure eager GLM DSA prefill gathers native cache records and attends local query heads over the complete cache. Captured execution, speculative verification, mixed decode batches and batches above the configured CKV token cap retain query gathering and the LSE output merge.",
+    "The cache receive buffer shares the pre-reserved per-lane attention workspace. CKV selection remapping and masking kernels compile during profiling; ineligible decode batches reject cache gathering before querying stream-capture state.",
+    "The index-key gather described by vllm-998 is excluded because its context-sized temporary buffers are allocated outside memory profiling and the prepared workspace. The combined CKV/index-key performance figures in that beta fragment do not characterize this selective implementation.",
+    "B12X sparse metadata consumes the runner-provided host sequence-length bounds for host arithmetic and rejects missing bounds explicitly. It does not synthesize a device-to-host copy during capture or decode."
+  ],
+  "authors": [
+    "joninco",
+    "voipmonitor",
+    "lukealonso"
+  ],
+  "pull_requests": [
+    998
+  ],
+  "requires": [
+    "vllm-998",
+    "vllm-994"
+  ]
+}

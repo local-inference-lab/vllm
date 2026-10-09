@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-karmic-gdn-metadata-fusion",
+  "category": "performance",
+  "summary": "Fuse recurrent metadata copies across cache groups",
+  "models": ["Qwen3.8-Flash-Next"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Retain captured buffer addresses while copying worklists and refreshing recurrent-state indices in one GPU launch.",
+    "Mixed batches use the fused refresh; uniform decode graphs retain the separate metadata-elision optimization."
+  ],
+  "authors": ["lukealonso"],
+  "pull_requests": [],
+  "requires": []
+}
