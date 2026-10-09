@@ -336,18 +336,22 @@ def test_composed_override_is_picklable():
 
 def _make_mtp_speculative_config(
     override: bool | None,
-    checkpoint_value: bool,
+    checkpoint_value: bool | None,
     enable_cumem_allocator: bool = False,
+    nested: bool = False,
 ) -> SpeculativeConfig:
-    draft_hf_config = _make_hf_config(
-        architectures=["Qwen4ExpMTP"],
-        model_type="qwen4_exp_mtp",
-        n_predict=1,
-        index_share_for_mtp_iteration=checkpoint_value,
-    )
+    from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
+
+    text_config = Qwen4ExpTextConfig(mtp_num_hidden_layers=1)
+    if checkpoint_value is not None:
+        text_config.index_share_for_mtp_iteration = checkpoint_value
+    draft_hf_config = Qwen4ExpConfig(text_config=text_config) if nested else text_config
+    draft_hf_config.architectures = ["Qwen4ExpForCausalLM"]
+    draft_hf_config = SpeculativeConfig.hf_config_override(draft_hf_config)
     draft_model_config = MagicMock(
         model="draft",
         hf_config=draft_hf_config,
+        hf_text_config=draft_hf_config.get_text_config(),
         architectures=draft_hf_config.architectures,
         max_model_len=128,
     )
@@ -385,16 +389,34 @@ def test_mtp_draft_inherits_cumem_allocator_permission(enabled):
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize(
     ("override", "checkpoint_value", "expected"),
-    [(None, True, True), (False, True, False), (True, False, True)],
+    [
+        (None, None, False),
+        (None, False, False),
+        (None, True, True),
+        (False, True, False),
+        (True, False, True),
+        (True, None, True),
+    ],
 )
 def test_mtp_index_share_override(
-    override: bool | None, checkpoint_value: bool, expected: bool
+    override: bool | None, checkpoint_value: bool | None, expected: bool, nested: bool
 ):
-    speculative_config = _make_mtp_speculative_config(override, checkpoint_value)
+    speculative_config = _make_mtp_speculative_config(
+        override, checkpoint_value, nested=nested
+    )
     assert (
         speculative_config.draft_model_config.hf_config.index_share_for_mtp_iteration
+        is expected
+    )
+    assert (
+        getattr(
+            speculative_config.draft_model_config.hf_text_config,
+            "index_share_for_mtp_iteration",
+            False,
+        )
         is expected
     )
 

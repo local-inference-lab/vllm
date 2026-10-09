@@ -1713,6 +1713,9 @@ class SpeculativeConfig:
             self.draft_model_config.hf_config.index_share_for_mtp_iteration = (
                 self.index_share_for_mtp_iteration
             )
+            self.draft_model_config.hf_text_config.index_share_for_mtp_iteration = (
+                self.index_share_for_mtp_iteration
+            )
 
         if (
             self.method != "dspark"
