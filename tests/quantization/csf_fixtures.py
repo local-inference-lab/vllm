@@ -57,12 +57,21 @@ def matrix(rows, channels, *, group_size, seed):
     return source, torch.from_numpy(logical.copy())
 
 
-def decode_planes(planes, rows, columns, group_size):
-    """Reconstruct CPU scale bytes independently of B12X preparation."""
+def decode_planes(source, rows, columns, group_size):
+    """Reconstruct CPU scale bytes independently of B12X preparation.
+
+    ``source`` is a loader-built ``CsfSource`` in the checkpoint ``"csf"``
+    encoding: component 0 stacks one fixed slab grid per segment, component 1
+    concatenates every segment's exception words, and ``starts`` delimits
+    adjacent segments -- expert ``i`` owns ``fixed[i]`` and the word slice
+    ``words[starts[i]:starts[i+1]]`` (empty when the two entries are equal).
+    """
+    selectors = (columns + 7) // 8 if group_size == 32 else columns // 2
+    fixed, words = source.components
+    starts = source.starts.tolist()
     result = []
-    for fixed, exceptions in zip(planes.fixed, planes.exceptions, strict=True):
-        selectors = (columns + 7) // 8 if group_size == 32 else columns // 2
-        slabs = fixed.numpy().reshape(rows // 16, 16 * (1 + selectors))
+    for segment in range(source.segments):
+        slabs = fixed[segment].numpy().reshape(rows // 16, 16 * (1 + selectors))
         packed = slabs[:, 16:].reshape(rows, selectors)
         if group_size == 32:
             offsets = np.unpackbits(packed, axis=1, bitorder="little")[:, :columns]
@@ -71,7 +80,7 @@ def decode_planes(planes, rows, columns, group_size):
                 rows, columns
             )
         logical = (slabs[:, :16].reshape(rows, 1) + offsets).astype(np.uint8)
-        words = exceptions.numpy()
-        logical.flat[words & 0xFFFFFF] = (words >> 24).astype(np.uint8)
+        exceptions = words[starts[segment] : starts[segment + 1]].numpy()
+        logical.flat[exceptions & 0xFFFFFF] = (exceptions >> 24).astype(np.uint8)
         result.append(torch.from_numpy(logical.copy()))
     return torch.stack(result)
