@@ -531,6 +531,63 @@ def test_modelopt_nvfp4_leaves_excluded_parallel_lm_head_unquantized():
     assert isinstance(method, UnquantizedLinearMethod)
 
 
+@pytest.mark.parametrize("quant_method", ["NVFP4", "W4A16_NVFP4"])
+@pytest.mark.parametrize("excluded_shards", [0, 4, 5])
+@pytest.mark.parametrize("exclude_fused", [False, True])
+def test_modelopt_glm_kda_wildcards_select_checkpoint_precision(
+    quant_method, excluded_shards, exclude_fused
+):
+    """GLM's BF16 KDA shards must remain BF16 after projection fusion."""
+    from vllm.model_executor.layers.linear import LinearBase
+
+    projections = ["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj"]
+    ignore = ["*.self_attn.in_proj_qkvbfg_a"]
+    ignore += [f"*.self_attn.{name}" for name in projections[:excluded_shards]]
+    if exclude_fused:
+        ignore.append("*.self_attn.in_proj_qkvgfab")
+    config = ModelOptNvFp4Config(
+        quant_method=quant_method,
+        is_checkpoint_nvfp4_serialized=True,
+        exclude_modules=ignore,
+    )
+    config.packed_modules_mapping = {"in_proj_qkvgfab": projections}
+    layer = MagicMock(spec=LinearBase)
+    prefix = "language_model.model.layers.0.self_attn.in_proj_qkvgfab"
+
+    if excluded_shards == 4 and not exclude_fused:
+        with pytest.raises(ValueError, match="some but not all shards"):
+            config.get_quant_method(layer, prefix)
+    else:
+        method = config.get_quant_method(layer, prefix)
+        if excluded_shards == 5 or exclude_fused:
+            assert isinstance(method, UnquantizedLinearMethod)
+        else:
+            assert isinstance(method, ModelOptLinearMethod)
+            assert method.spec.weight is kNvfp4Static
+
+
+def test_modelopt_fused_exclusions_combine_exact_and_wildcard_matches():
+    config = ModelOptNvFp4Config(
+        is_checkpoint_nvfp4_serialized=True,
+        exclude_modules=[
+            "model.layers.0.mlp.gate_proj",
+            "*.mlp.up_proj",
+        ],
+    )
+    config.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+
+    assert config.is_layer_excluded("model.layers.0.mlp.gate_up_proj")
+
+
+def test_modelopt_preserves_legacy_individual_expert_exclusion():
+    config = ModelOptNvFp4Config(
+        is_checkpoint_nvfp4_serialized=True,
+        exclude_modules=["model.layers.0.mlp.experts.0.gate_proj"],
+    )
+
+    assert config.is_layer_excluded("model.layers.0.mlp.experts")
+
+
 def test_modelopt_mixed_precision_quantizes_parallel_lm_head():
     config = _mixed_precision_config(
         {"lm_head": {"quant_algo": "NVFP4", "group_size": 16}}

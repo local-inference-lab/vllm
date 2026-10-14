@@ -4,7 +4,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -191,7 +190,16 @@ class ModelOptQuantConfigBase(QuantizationConfig):
         if len(self.exclude_modules) == 0:
             return False
 
-        # First check exact matching with fused layer support
+        # Match wildcards against both fused names and their constituent projections.
+        if is_layer_skipped(
+            prefix,
+            self.exclude_modules,
+            self.packed_modules_mapping,
+            match_mode="glob",
+        ):
+            return True
+
+        # Preserve legacy exclusions that name individual expert projections.
         if is_layer_skipped(prefix, self.exclude_modules, self.packed_modules_mapping):
             return True
 
@@ -209,11 +217,6 @@ class ModelOptQuantConfigBase(QuantizationConfig):
                     and exclude_module in prefix.removeprefix("language_model.")
                 )
             ):
-                return True
-
-        # modelopt exclude modules are not simple strings, they are wildcards
-        for wildcard_pattern in self.exclude_modules:
-            if fnmatch(prefix, wildcard_pattern):
                 return True
 
         return False
