@@ -9,5 +9,5 @@
     "BF16 attention projections retain their checkpoint precision after fusion without edits to the model config.",
     "Fused projections with partially excluded shards are rejected as incompatible."
   ],
-  "authors": ["original-el8"]
+  "pull_requests": [1026]
 }
