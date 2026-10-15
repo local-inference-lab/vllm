@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-prefill-step-accounting",
+  "category": "fix",
+  "summary": "Prefill token counters and throughput logs now report completed engine steps while long prompts are still being processed.",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Existing prompt and local-compute counters advance before first output, without adding the same computed prompt again when prefill finishes.",
+    "Cache credits keep their existing once-only timing; decode counters and per-request token usage remain unchanged.",
+    "Actual recomputation and replay of generated context count as physical prefill work."
+  ],
+  "authors": ["ktsaou"],
+  "requires": []
+}

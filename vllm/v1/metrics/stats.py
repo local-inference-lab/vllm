@@ -198,6 +198,8 @@ class SchedulerStats:
     kv_cache_usage: float = 0.0
     iteration_details: SchedulerIterationDetails | None = None
 
+    num_computed_prefill_tokens: int = 0
+
     prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)
     connector_prefix_cache_stats: PrefixCacheStats | None = None
 

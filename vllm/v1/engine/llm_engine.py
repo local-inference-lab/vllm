@@ -341,8 +341,7 @@ class LLMEngine:
                     iteration_stats=iteration_stats,
                     mm_cache_stats=self.renderer.stat_mm_cache(),
                 )
-                if outputs.outputs:
-                    self.do_log_stats_with_interval()
+                self.do_log_stats_with_interval()
 
         return processed_outputs.request_outputs
 

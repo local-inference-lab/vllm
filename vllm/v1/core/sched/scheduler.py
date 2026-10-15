@@ -2461,8 +2461,23 @@ class Scheduler(SchedulerInterface):
         # 3. If some tokens (e.g. spec tokens) are rejected later, the number of
         #    computed tokens will be adjusted in update_from_output.
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        scheduler_output.num_computed_prefill_tokens = 0
+        track_prefill = (
+            self.log_stats
+            and not scheduler_output.boundary_logits_only
+            and not self.is_mm_encoder_only
+        )
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
+            if track_prefill:
+                start = request.num_computed_tokens
+                context_end = request.num_tokens
+                # Replay of previously generated context is also prefill work.
+                # The last known token alone is decode, as are spec placeholders.
+                if start < request.num_prompt_tokens or start < context_end - 1:
+                    scheduler_output.num_computed_prefill_tokens += min(
+                        num_scheduled_token, max(context_end - start, 0)
+                    )
             if not scheduler_output.boundary_logits_only:
                 request.num_computed_tokens += num_scheduled_token
             request.num_in_flight_tokens += num_scheduled_token
@@ -3333,6 +3348,9 @@ class Scheduler(SchedulerInterface):
                 perf_stats,
             )
         ) is not None:
+            stats.num_computed_prefill_tokens = (
+                scheduler_output.num_computed_prefill_tokens
+            )
             # Return stats to only one of the front-ends.
             if (eco := next(iter(engine_core_outputs.values()), None)) is None:
                 # We must return the stats even if there are no request

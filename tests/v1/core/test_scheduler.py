@@ -65,6 +65,148 @@ from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 pytestmark = pytest.mark.cpu_test
 
 
+@pytest.mark.parametrize(
+    "prompt,generated,start,scheduled,expected",
+    [
+        (40, 0, 0, 16, 16),
+        (40, 0, 16, 16, 16),
+        (40, 0, 32, 16, 8),
+        (40, 0, 39, 4, 1),  # Last prompt token plus speculative placeholders.
+        (40, 1, 40, 4, 0),
+        (40, 4, 43, 4, 0),
+        (40, 4, 48, 4, 0),  # Async placeholders beyond known context.
+        (40, 20, 0, 16, 16),  # Recompute after preemption.
+        (40, 20, 40, 16, 16),  # Replay of previously generated context.
+        (40, 20, 56, 8, 4),
+        (40, 20, 59, 4, 0),
+        (1, 0, 0, 4, 1),
+    ],
+)
+def test_prefill_work_snapshot_excludes_decode_and_speculative_placeholders(
+    prompt, generated, start, scheduled, expected
+):
+    scheduler = create_scheduler()
+    request = create_requests(num_requests=1, num_tokens=prompt)[0]
+    request.append_output_token_ids([1] * generated)
+    request.num_computed_tokens = start
+    scheduler.requests[request.request_id] = request
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {request.request_id: scheduled}
+    output.total_num_scheduled_tokens = scheduled
+    scheduler._update_after_schedule(output)
+    assert output.num_computed_prefill_tokens == expected
+    # Later async scheduling or preemption cannot change the earlier snapshot.
+    request.num_computed_tokens = 0
+    assert output.num_computed_prefill_tokens == expected
+
+
+@pytest.mark.parametrize("mode", ["saved_logits", "encoder_only", "no_stats"])
+def test_no_target_prefill_is_not_counted(mode):
+    scheduler = create_scheduler()
+    request = create_requests(num_requests=1, num_tokens=40)[0]
+    scheduler.requests[request.request_id] = request
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {request.request_id: 16}
+    output.total_num_scheduled_tokens = 16
+    output.boundary_logits_only = mode == "saved_logits"
+    scheduler.is_mm_encoder_only = mode == "encoder_only"
+    scheduler.log_stats = mode != "no_stats"
+    scheduler._update_after_schedule(output)
+    assert output.num_computed_prefill_tokens == 0
+
+
+def test_partial_prefill_reports_completed_compute_before_first_output():
+    scheduler = create_scheduler(max_num_batched_tokens=16)
+    request = create_requests(num_requests=1, num_tokens=40)[0]
+    scheduler.add_request(request)
+    counts = []
+    for tokens in ([], [], [1]):
+        step = scheduler.schedule()
+        assert scheduler.make_stats().num_computed_prefill_tokens == 0
+        completed = _model_output(scheduler, step, [tokens])[0]
+        counts.append(completed.scheduler_stats.num_computed_prefill_tokens)
+        if not tokens:
+            assert not completed.outputs
+        else:
+            assert completed.outputs[0].prefill_stats.num_prompt_tokens == 40
+            assert completed.outputs[0].prefill_stats.num_computed_tokens == 40
+    assert counts == [16, 16, 8]
+
+
+def test_completed_prefill_work_survives_request_abort():
+    scheduler = create_scheduler(max_num_batched_tokens=16)
+    request = create_requests(num_requests=1, num_tokens=40)[0]
+    scheduler.add_request(request)
+    step = scheduler.schedule()
+    scheduler.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED)
+    outputs = _model_output(scheduler, step, [[]])
+    stats = [out.scheduler_stats for out in outputs.values() if out.scheduler_stats]
+    assert len(stats) == 1
+    assert stats[0].num_computed_prefill_tokens == 16
+
+
+def test_async_prefill_work_survives_preemption_and_is_sent_to_one_frontend():
+    scheduler = create_scheduler(max_num_batched_tokens=16, async_scheduling=True)
+    request = create_requests(num_requests=1, num_tokens=40)[0]
+    scheduler.add_request(request)
+    steps = [scheduler.schedule(), scheduler.schedule()]
+    scheduler.running.remove(request)
+    scheduler._preempt_request(request, 0.0)
+    counts = []
+    for step in steps:
+        outputs = _model_output(scheduler, step, [[]])
+        stats = [out.scheduler_stats for out in outputs.values() if out.scheduler_stats]
+        assert len(stats) == 1
+        counts.append(stats[0].num_computed_prefill_tokens)
+    assert counts == [16, 16]
+    assert request.num_computed_tokens == 0
+
+
+def test_multi_frontend_prefill_compute_is_published_once():
+    scheduler = create_scheduler(max_num_batched_tokens=32)
+    requests = create_requests(num_requests=2, num_tokens=10)
+    for index, request in enumerate(requests):
+        request.client_index = index
+        scheduler.add_request(request)
+    step = scheduler.schedule()
+    outputs = _model_output(scheduler, step, [[1], [1]])
+    assert set(outputs) == {0, 1}
+    stats = [out.scheduler_stats for out in outputs.values() if out.scheduler_stats]
+    assert len(stats) == 1
+    assert stats[0].num_computed_prefill_tokens == 20
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+def test_external_cache_transfer_is_excluded_from_completed_prefill_work(is_async):
+    scheduler = create_scheduler(
+        max_num_batched_tokens=16,
+        use_kv_connector=mock_kv(matched_tokens=32, is_async=is_async),
+    )
+    request = create_requests(num_requests=1, num_tokens=80)[0]
+    scheduler.add_request(request)
+    if is_async:
+        transfer = scheduler.schedule()
+        assert transfer.num_computed_prefill_tokens == 0
+        result = ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            sampled_token_ids=[],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=KVConnectorOutput(
+                finished_recving={request.request_id}
+            ),
+        )
+        completed = scheduler.update_from_output(transfer, result)[0]
+        assert completed.scheduler_stats.num_computed_prefill_tokens == 0
+    step = scheduler.schedule()
+    completed = _model_output(scheduler, step, [[]])[0]
+    assert not completed.outputs
+    assert completed.scheduler_stats.num_computed_prefill_tokens == 16
+    assert request.prefill_stats.num_external_cached_tokens == 32
+
+
 def test_full_boundary_hit_preserves_async_speculative_decode_token_count():
     """Sampling saved logits must not advance the processed-token frontier."""
     scheduler = create_scheduler(
@@ -2178,7 +2320,7 @@ def test_no_spec_tokens_scheduled_for_prefill_chunks():
 def _model_output(scheduler, output, sampled):
     """Feed `sampled` (per-request list) back to the scheduler."""
     req_ids = list(output.num_scheduled_tokens.keys())
-    scheduler.update_from_output(
+    return scheduler.update_from_output(
         output,
         ModelRunnerOutput(
             req_ids=req_ids,
