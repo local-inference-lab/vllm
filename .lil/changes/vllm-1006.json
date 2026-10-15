@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-1006",
+  "category": "fix",
+  "summary": "GLM-5.3 (744B) with decode context parallelism prefills a 1M-token prompt at 92% GPU memory instead of running out of memory",
+  "models": ["GLM-5.3"],
+  "compatibility": "No user action required. Applies to GLM-5.3 DSA launches with DCP > 1 and VLLM_DCP_INDEXER_KEY_GATHER=1, which the GLM-5.3 presets derive at DCP > 1.",
+  "details": [
+    "The DSA indexer's key gather (gathered index keys, exchanged shards, scores and the restored selection) borrows the workspace that vLLM reserves before sizing the KV cache, sized at startup for the longest request and the largest prefill step. It used to allocate these context-sized buffers per request outside that budget, so a 1M-token prompt at TP8 DCP2 and 92% GPU memory failed with CUDA out of memory.",
+    "The indexer is done with the workspace before attention borrows it for the gathered compressed KV cache, so both share one buffer: at TP8 DCP2 the key-gather reservation (1,044 MiB) fits inside the existing 1,412 MiB workspace and the KV cache keeps 1,217,792 tokens.",
+    "GLM-5.3-NVFP4-CSF at TP8 DCP2 (MTP3), 92% GPU memory without a fixed KV size: a 1,048,448-token prompt completes in 197 s, followed by 64 concurrent 8K prompts and 4 minutes of 1K-96K prompts with at least 607 MiB free per GPU. Prefill speed is unchanged (8K / 32K / 128K: 7,822 / 7,526 / 7,467 -> 7,815 / 7,515 / 7,488 tok/s)."
+  ],
+  "authors": ["voipmonitor"],
+  "pull_requests": [1006],
+  "requires": ["vllm-998"]
+}
