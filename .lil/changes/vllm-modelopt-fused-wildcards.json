@@ -1,0 +1,13 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-modelopt-fused-wildcards",
+  "category": "fix",
+  "summary": "Honor ModelOpt wildcard precision exclusions for fused projections, including GLM-5.3-Flash KDA attention.",
+  "models": ["all"],
+  "compatibility": "No user action required.",
+  "details": [
+    "BF16 attention projections retain their checkpoint precision after fusion without edits to the model config.",
+    "Fused projections with partially excluded shards are rejected as incompatible."
+  ],
+  "pull_requests": [1026]
+}
