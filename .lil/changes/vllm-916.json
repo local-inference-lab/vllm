@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-916",
+  "category": "feature",
+  "summary": "Opt-in GPU stall watchdog; RoCEnante health checked on every rank",
+  "models": ["all"],
+  "compatibility": "No user action required: the watchdog is off unless VLLM_GPU_STALL_DUMP_SECONDS is set. Its cuda-gdb section needs ptrace permission (SYS_PTRACE or --privileged in a container); without it the dump keeps the Python stacks and RoCEnante state.",
+  "details": [
+    "With VLLM_GPU_STALL_DUMP_SECONDS set, every rank writes one dump under $VLLM_CACHE_ROOT/gpu_stall/ when a step's GPU work, or the step call itself on the host, stays unfinished that long, or when a RoCEnante wait on that rank times out: the RoCEnante protocol snapshot, every Python thread's stack, and the running kernels with the SASS at their PC via cuda-gdb.",
+    "The RoCEnante fail-stop check now covers every live communicator on every rank, so a peer's timeout names the missing rank in that rank's log instead of going unread when the output rank's own GPU stopped."
+  ],
+  "pull_requests": [916],
+  "authors": ["tobymao"],
+  "requires": ["b12x-438"]
+}

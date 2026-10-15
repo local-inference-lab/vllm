@@ -20,15 +20,21 @@ Contract with the runtime (``b12x.comm.roce.API_VERSION`` ==
 - Failures are fail-stop, never a fallback: a wait that times out freezes the
   runtime, later launches do nothing, and ``check_health`` (called by the
   worker after each step's host synchronization) raises so the step's output
-  never leaves the worker.  Peers starve on the stalled rank and raise too.
+  never leaves the worker.  Only the output rank synchronizes on a step, so
+  that raise cannot happen when the output rank's own GPU is the one that
+  stopped: its peers time out and poison with nobody reading it.  The GPU
+  stall watchdog (``VLLM_GPU_STALL_DUMP_SECONDS``) polls every rank's
+  ``poisoned`` state and ``snapshot`` for that case.
 - The runtime orders collectives across streams with an event and requires a
   single stream inside a CUDA graph capture, which is how vLLM captures.
 """
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Sequence
 from contextlib import contextmanager
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -52,6 +58,16 @@ logger = init_logger(__name__)
 
 REQUIRED_B12X_ROCE_API_VERSION = 1
 
+# Every initialized communicator of this process (only a TP group builds one),
+# for the per-step health check and the stall watchdog, which then need not
+# know which group owns it.
+LIVE_COMMUNICATORS: weakref.WeakSet[B12xRoceAllReduce] = weakref.WeakSet()
+
+
+def live_roce_communicators() -> list[B12xRoceAllReduce]:
+    """The RoCEnante communicators of this process that are carrying traffic."""
+    return [comm for comm in list(LIVE_COMMUNICATORS) if not comm.disabled]
+
 
 class B12xRoceAllReduce:
     """Route eligible tensor-parallel all-reduces to ``b12x.comm.roce``."""
@@ -72,7 +88,8 @@ class B12xRoceAllReduce:
         self.device = device
         self.rank = dist.get_rank(group=group)
         self.world_size = dist.get_world_size(group=group)
-        self._runtime = None
+        # b12x.comm.roce.AllReduce and its plan once initialized; b12x is untyped.
+        self._runtime: Any = None
         self._announced = False
         self._announced_gather = False
         self.global_ranks = tuple(
@@ -83,7 +100,7 @@ class B12xRoceAllReduce:
         )
         if len(self.global_ranks) != self.world_size:
             raise ValueError("RoCE global ranks must match the process group")
-        self._plan = None
+        self._plan: Any = None
 
         if device_group is None:
             logger.warning("RoCEnante requires a CUDA process group.")
@@ -102,6 +119,7 @@ class B12xRoceAllReduce:
         if verdict is not None:
             logger.warning("RoCEnante disabled on every rank: %s", verdict)
             return
+        assert limits is not None  # the vote passed, so this rank parsed them
         max_size, max_gather = limits
 
         from b12x.comm import roce
@@ -120,6 +138,7 @@ class B12xRoceAllReduce:
             logger.warning("RoCEnante initialization failed: %s", exc)
             return
         self.disabled = False
+        LIVE_COMMUNICATORS.add(self)
         register_b12x_unit_provider(self)
         if self.rank == 0:
             logger.info(
@@ -263,6 +282,29 @@ class B12xRoceAllReduce:
         """
         if not self.disabled and self._runtime is not None:
             self._runtime.check_health()
+
+    @property
+    def name(self) -> str:
+        """The group, named by its global ranks."""
+        return "ranks " + "-".join(map(str, self.global_ranks))
+
+    @property
+    def poisoned(self) -> bool:
+        """True once a wait on this rank timed out or its proxy failed."""
+        return (
+            not self.disabled and self._runtime is not None and self._runtime.poisoned
+        )
+
+    def snapshot(self) -> dict[str, Any]:
+        """The runtime's protocol state from host memory, safe while wedged."""
+        if self.disabled or self._runtime is None:
+            return {}
+        # b12x#438 added snapshot() without an API version bump; an older b12x
+        # still gets a dump, without the protocol state.
+        snapshot = getattr(self._runtime, "snapshot", None)
+        if snapshot is None:
+            return {"snapshot": "unavailable in this b12x"}
+        return snapshot()
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         return not self.disabled and self._runtime.should_allreduce(inp)
