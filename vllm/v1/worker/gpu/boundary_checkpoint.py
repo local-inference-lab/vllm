@@ -222,7 +222,7 @@ def _copy_auxiliary_state_kernel(
         tl.store(destination + start + x, data, start + x < size)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["block", "slot"])
 def _restore_auxiliary_state_kernel(
     metadata_ptr,
     pool_ptr,

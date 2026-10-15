@@ -129,7 +129,7 @@ def is_model_fused_shared_expert_compatible(
     return enabled_count > 0 and disabled_count == 0
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["topk_numel"])
 def _count_expert_num_tokens(
     topk_ids_ptr,
     expert_num_tokens_ptr,
