@@ -480,6 +480,12 @@ Supported models:
 
 Flags: `--tool-call-parser qwen3_xml`
 
+The parser preserves tool-call XML inside Markdown code fences opened with
+backticks or tildes as literal text in the corresponding content or reasoning
+channel. Tool calls outside these fences remain eligible for parsing, including
+a call immediately after a fenced example. To quote a complete tool-call example,
+place it inside a code fence; arbitrary inline quoting is not supported.
+
 ### Olmo 3 Models (`olmo3`)
 
 Olmo 3 models output tool calls in a format that is very similar to the one expected by the `pythonic` parser (see below), with a few differences. Each tool call is a pythonic string, but the parallel tool calls are newline-delimited, and the calls are wrapped within XML tags as `<function_calls>..</function_calls>`. In addition, the parser also allows JSON boolean and null literals (`true`, `false`, and `null`) in addition to the pythonic ones (`True`, `False`, and `None`).
