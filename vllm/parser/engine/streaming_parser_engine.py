@@ -163,6 +163,14 @@ class StreamingParserEngine:
             for (state, terminal), tr in config.transitions.items()
             if state in self._TOOL_STATES and tr.next_state not in self._TOOL_STATES
         )
+        # Headers that open a call with no wrapper before them — qwen3's
+        # ``<function=`` fallback. Only credible at the start of a line.
+        self._bare_tool_headers: frozenset[str] = frozenset(
+            terminal
+            for (state, terminal), tr in config.transitions.items()
+            if state in (ParserState.CONTENT, ParserState.REASONING)
+            and tr.next_state == ParserState.TOOL_NAME
+        )
 
         self._reasoning_markup_terminals: frozenset[str] = (
             self._compute_reasoning_markup_terminals()
@@ -210,6 +218,10 @@ class StreamingParserEngine:
         self._scanner.reset()
         self._lexer.reset()
         self._message_header_buffer = ""
+        self._pending_tool_start: tuple[str, str, int] | None = None
+        self._tool_preamble_buffer = ""
+        self._reset_marker_guard()
+        self._tool_preamble_token_count = 0
         self._message_header_token_count = 0
         self._in_skipped_tool_span = False
         self._reset_args_state()
@@ -288,6 +300,8 @@ class StreamingParserEngine:
         events = self._process_scanner_items(self._scanner.flush_pending())
 
         events.extend(self._process_lex_tokens(self._lexer.flush()))
+
+        events.extend(self._confirm_tool_preamble())
 
         if self._args_buffer:
             events.append(
@@ -397,8 +411,28 @@ class StreamingParserEngine:
         return markers
 
     def _on_terminal(
-        self, terminal: str, value: str, token_count: int = 0
+        self,
+        terminal: str,
+        value: str,
+        token_count: int = 0,
+        *,
+        confirmed_tool_start: bool = False,
     ) -> list[SemanticEvent]:
+        if self._pending_tool_start is not None:
+            next_transition = self.config.transitions.get(
+                (ParserState.TOOL_PREAMBLE, terminal)
+            )
+            if next_transition is not None and next_transition.next_state in (
+                ParserState.TOOL_NAME,
+                ParserState.CONTENT,
+            ):
+                events = self._confirm_tool_preamble()
+                events.extend(self._on_terminal(terminal, value, token_count))
+                return events
+            events = self._flush_tool_preamble()
+            events.extend(self._on_terminal(terminal, value, token_count))
+            return events
+
         key = (self.state, terminal)
         transition = self.config.transitions.get(key)
 
@@ -412,6 +446,24 @@ class StreamingParserEngine:
 
         if self.skip_reasoning_parsing and terminal in self._reasoning_markup_terminals:
             return self._emit_for_state(value, token_count)
+
+        if (
+            self.config.guard_literal_tool_markers
+            and not confirmed_tool_start
+            and self.state in (ParserState.CONTENT, ParserState.REASONING)
+            and transition.next_state in self._TOOL_STATES
+            and self._marker_is_literal(terminal)
+        ):
+            return self._emit_for_state(value, token_count)
+
+        if (
+            self.config.validate_tool_preamble
+            and not confirmed_tool_start
+            and self.state in (ParserState.CONTENT, ParserState.REASONING)
+            and transition.next_state == ParserState.TOOL_PREAMBLE
+        ):
+            self._pending_tool_start = (terminal, value, token_count)
+            return []
 
         if self.skip_tool_parsing and terminal in self._tool_terminals:
             # Inkling reuses one terminal for tool, text, and reasoning exits.
@@ -470,7 +522,127 @@ class StreamingParserEngine:
 
         return self._apply_transition(transition, value, token_count)
 
+    def _reset_marker_guard(self) -> None:
+        self._marker_guard_state: ParserState | None = self.state
+        self._fence_open_run = 0
+        self._fence_open_char = ""
+        self._close_pending = False
+        self._begin_line()
+
+    def _begin_line(self) -> None:
+        self._line_state = "indent"
+        self._line_indent = 0
+        self._fence_run = 0
+        self._fence_run_char = ""
+
+    def _resolve_fence_run(self) -> None:
+        """Act on the fence run that just ended on this line.
+
+        CommonMark: a run of three or more opens, and only a run of the same
+        character at least as long closes. A shorter inner fence therefore
+        does not close the block around it.
+        """
+        run, char = self._fence_run, self._fence_run_char
+        self._fence_run = 0
+        self._line_state = "body"
+        if run < 3:
+            return
+        if not self._fence_open_run:
+            self._fence_open_run = run
+            self._fence_open_char = char
+        elif char == self._fence_open_char and run >= self._fence_open_run:
+            # Only a closer if nothing but whitespace follows it.
+            self._close_pending = True
+
+    def _sync_marker_guard(self) -> None:
+        """Reasoning and content are separate documents.
+
+        A fence left open in one must not carry into the other, and the
+        channel can change with no text in between (``</think><tool_call>``),
+        so this is checked on use as well as on the next chunk of text.
+        """
+        if self.state is not self._marker_guard_state:
+            self._reset_marker_guard()
+
+    def _marker_is_literal(self, terminal: str) -> bool:
+        """Report a tool marker the model cannot be using to open a call.
+
+        Inside a fenced code block it is quoting the format: Qwen emits a
+        call as bare markup, never from inside a fence. A wrapper-less
+        function header is a call only when it starts a line; mid-line it
+        is prose naming the marker.
+        """
+        self._sync_marker_guard()
+        if self._line_state == "run":
+            self._resolve_fence_run()
+        if self._fence_open_run:
+            return True
+        at_line_start = self._line_state != "body"
+        return terminal in self._bare_tool_headers and not at_line_start
+
+    def _track_literal_text(self, text: str) -> None:
+        """Follow fence state and line-start position through plain text."""
+        self._sync_marker_guard()
+        for ch in text:
+            if ch == "\n":
+                if self._line_state == "run":
+                    self._resolve_fence_run()
+                if self._close_pending:
+                    self._fence_open_run = 0
+                    self._fence_open_char = ""
+                    self._close_pending = False
+                self._begin_line()
+                continue
+            if self._line_state == "indent":
+                # Four or more leading spaces is indented code, not a fence.
+                if ch in " \t" and self._line_indent < 3:
+                    self._line_indent += 1
+                    continue
+                if ch in "`~":
+                    self._line_state = "run"
+                    self._fence_run_char = ch
+                    self._fence_run = 1
+                    continue
+                self._line_state = "body"
+                continue
+            if self._line_state == "run":
+                if ch == self._fence_run_char:
+                    self._fence_run += 1
+                    continue
+                self._resolve_fence_run()
+            if self._close_pending and ch not in " \t":
+                self._close_pending = False
+
     def _emit_for_state(self, text: str, token_count: int = 0) -> list[SemanticEvent]:
+        # A deferred wrapper replays its buffer through here once it is
+        # flushed; tracking it now would count every fence in it twice.
+        if (
+            self.config.guard_literal_tool_markers
+            and text
+            and self._pending_tool_start is None
+            and self.state in (ParserState.CONTENT, ParserState.REASONING)
+        ):
+            self._track_literal_text(text)
+        if self._pending_tool_start is not None:
+            self._tool_preamble_buffer += text
+            self._tool_preamble_token_count += token_count
+            if text.strip():
+                candidate = self._tool_preamble_buffer.lstrip()
+                for (state, terminal), tr in self.config.transitions.items():
+                    if (
+                        state == ParserState.TOOL_PREAMBLE
+                        and tr.next_state == ParserState.TOOL_NAME
+                        and (literal := self.config.terminals.get(terminal))
+                        and any(
+                            value.startswith(candidate)
+                            for value in (
+                                (literal,) if isinstance(literal, str) else literal
+                            )
+                        )
+                    ):
+                        return []
+                return self._flush_tool_preamble()
+            return []
         transition = self.config.non_whitespace_transitions.get(self.state)
         if transition is not None and text.strip():
             return self._apply_transition(transition, text, token_count)
@@ -500,6 +672,30 @@ class StreamingParserEngine:
                 )
             ]
         return []
+
+    def _flush_tool_preamble(self) -> list[SemanticEvent]:
+        if self._pending_tool_start is None:
+            return []
+        _, opener, opener_count = self._pending_tool_start
+        text = opener + self._tool_preamble_buffer
+        count = opener_count + self._tool_preamble_token_count
+        self._pending_tool_start = None
+        self._tool_preamble_buffer = ""
+        self._tool_preamble_token_count = 0
+        return self._emit_for_state(text, count)
+
+    def _confirm_tool_preamble(self) -> list[SemanticEvent]:
+        if self._pending_tool_start is None:
+            return []
+        opener = self._pending_tool_start
+        text = self._tool_preamble_buffer
+        count = self._tool_preamble_token_count
+        self._pending_tool_start = None
+        self._tool_preamble_buffer = ""
+        self._tool_preamble_token_count = 0
+        events = self._on_terminal(*opener, confirmed_tool_start=True)
+        events.extend(self._emit_for_state(text, count))
+        return events
 
     def _on_content(self, text: str, token_count: int = 0) -> list[SemanticEvent]:
         if not text:

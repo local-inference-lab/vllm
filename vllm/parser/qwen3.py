@@ -199,6 +199,8 @@ def qwen3_config(
         stream_arg_deltas=True,
         strip_trailing_reasoning_whitespace=False,
         tool_args_json=False,
+        validate_tool_preamble=name == "qwen3",
+        guard_literal_tool_markers=name == "qwen3",
     )
 
 

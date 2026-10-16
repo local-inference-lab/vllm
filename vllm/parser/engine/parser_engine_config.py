@@ -106,6 +106,14 @@ class ParserEngineConfig:
     # Reject tool calls whose names are absent from the request tools.
     validate_tool_names: bool = False
 
+    # Delay a tool wrapper until its whitespace-only preamble reaches TOOL_NAME.
+    validate_tool_preamble: bool = False
+
+    # Treat a tool marker that cannot be opening a real call as literal text:
+    # one inside a fenced code block, or a wrapper-less function header that
+    # does not start a line.
+    guard_literal_tool_markers: bool = False
+
     non_whitespace_transitions: dict[ParserState, Transition] = field(
         default_factory=dict,
     )

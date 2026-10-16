@@ -35,6 +35,8 @@ def nemotron_v3_config(thinking: bool = True) -> ParserEngineConfig:
     return dataclasses.replace(
         qwen3_config(thinking=thinking, turn_boundary_tokens=CHATML_TURN_BOUNDARIES),
         name="nemotron_v3",
+        validate_tool_preamble=False,
+        guard_literal_tool_markers=False,
         strip_trailing_reasoning_whitespace=True,
     )
 
