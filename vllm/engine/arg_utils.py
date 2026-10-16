@@ -609,6 +609,9 @@ class EngineArgs:
     recurrent_checkpoint_policy: RecurrentCheckpointPolicy = (
         CacheConfig.recurrent_checkpoint_policy
     )
+    recurrent_prefill_tail_stride: int | None = get_field(
+        CacheConfig, "recurrent_prefill_tail_stride"
+    )
     disable_sliding_window: bool = ModelConfig.disable_sliding_window
     disable_cascade_attn: bool = ModelConfig.disable_cascade_attn
     offload_backend: str = OffloadConfig.offload_backend
@@ -1385,6 +1388,10 @@ class EngineArgs:
         cache_group.add_argument(
             "--recurrent-checkpoint-policy",
             **cache_kwargs["recurrent_checkpoint_policy"],
+        )
+        cache_group.add_argument(
+            "--recurrent-prefill-tail-stride",
+            **cache_kwargs["recurrent_prefill_tail_stride"],
         )
         cache_group.add_argument(
             "--kv-cache-dtype-skip-layers", **cache_kwargs["kv_cache_dtype_skip_layers"]
@@ -2260,6 +2267,7 @@ class EngineArgs:
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             prefix_cache_retention_interval=self.prefix_cache_retention_interval,
             recurrent_checkpoint_policy=self.recurrent_checkpoint_policy,
+            recurrent_prefill_tail_stride=self.recurrent_prefill_tail_stride,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
             mamba_cache_dtype=self.mamba_cache_dtype,

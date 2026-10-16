@@ -662,6 +662,7 @@ def test_swa_block_size_cli_choices(tmp_path):
 
 
 def test_prefix_cache_default():
+    """Prefix-caching CLI flags parse and stay unset unless explicitly given."""
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     args = parser.parse_args([])
 
@@ -669,6 +670,7 @@ def test_prefix_cache_default():
     engine_args = EngineArgs.from_cli_args(args=args)
     assert engine_args.enable_prefix_caching is None
     assert engine_args.prefix_cache_retention_interval == 0
+    assert engine_args.recurrent_prefill_tail_stride is None
 
     # with flag to turn it on.
     args = parser.parse_args(["--enable-prefix-caching"])
@@ -683,6 +685,24 @@ def test_prefix_cache_default():
     args = parser.parse_args(["--prefix-cache-retention-interval", "64"])
     engine_args = EngineArgs.from_cli_args(args=args)
     assert engine_args.prefix_cache_retention_interval == 64
+
+    args = parser.parse_args(["--recurrent-prefill-tail-stride", "256"])
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.recurrent_prefill_tail_stride == 256
+
+
+@pytest.mark.parametrize("stride", [None, 256])
+def test_prefill_tail_stride_reaches_engine_config(tmp_path, stride):
+    """--recurrent-prefill-tail-stride flows from the CLI into CacheConfig."""
+    from transformers import OPTConfig
+
+    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    options = ["--model", str(tmp_path), "--skip-tokenizer-init"]
+    if stride is not None:
+        options += ["--recurrent-prefill-tail-stride", str(stride)]
+    config = EngineArgs.from_cli_args(parser.parse_args(options)).create_engine_config()
+    assert config.cache_config.recurrent_prefill_tail_stride == stride
 
 
 @pytest.mark.parametrize(

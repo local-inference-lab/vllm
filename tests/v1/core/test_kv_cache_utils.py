@@ -4489,11 +4489,17 @@ def test_auto_fit_max_model_len_with_hybrid():
 
 @pytest.mark.parametrize("dcp", [1, 2, 4])
 @pytest.mark.parametrize(
-    "num_blocks,expected_pages,chunk_budget",
-    [(38, 0, 1048576), (62, 0, 1048576), (70, 7, 1048576), (78, 7, 256)],
+    "num_blocks,expected_pages,chunk_budget,tail_stride",
+    [
+        (38, 0, 1048576, None),
+        (62, 0, 1048576, None),
+        (70, 7, 1048576, None),
+        (78, 7, 256, None),
+        (78, 7, 1048576, 256),
+    ],
 )
 def test_boundary_capacity_includes_private_endpoints(
-    dcp, num_blocks, expected_pages, chunk_budget
+    dcp, num_blocks, expected_pages, chunk_budget, tail_stride
 ):
     """Pool sizing includes private endpoints and the immutable restore source."""
     config = SimpleNamespace(
@@ -4502,7 +4508,9 @@ def test_boundary_capacity_includes_private_endpoints(
         attention_config=SimpleNamespace(hisparse_config=None),
         model_config=SimpleNamespace(max_model_len=1048576),
         parallel_config=SimpleNamespace(decode_context_parallel_size=dcp),
-        cache_config=SimpleNamespace(mamba_cache_mode="align"),
+        cache_config=SimpleNamespace(
+            mamba_cache_mode="align", recurrent_prefill_tail_stride=tail_stride
+        ),
     )
     attention = MLAAttentionSpec(
         block_size=2048,
@@ -4547,7 +4555,12 @@ def test_boundary_capacity_includes_private_endpoints(
             num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=groups
         )
         assert get_max_concurrency_for_kv_cache_config(config, cache) == (
-            num_blocks / (30 + (40 if chunk_budget == 256 else 32) + expected_pages)
+            num_blocks
+            / (
+                30
+                + (40 if chunk_budget == 256 or tail_stride == 256 else 32)
+                + expected_pages
+            )
         )
 
     # An aligned-policy control has no endpoint reservation. Its capacity

@@ -251,8 +251,25 @@ def test_speculative_config_hash_includes_graph_shape():
 
 
 def test_cache_config_hash_ignores_prefix_cache_retention_interval():
+    """The runtime-only retention interval must not change compute_hash."""
     base_hash = CacheConfig().compute_hash()
     assert CacheConfig(prefix_cache_retention_interval=64).compute_hash() == base_hash
+
+
+@pytest.mark.parametrize("stride", [1, 256, 8192])
+def test_prefill_tail_stride_does_not_change_compilation(stride):
+    """The runtime-only stride must not change compute_hash or split caches."""
+    assert (
+        CacheConfig(recurrent_prefill_tail_stride=stride).compute_hash()
+        == CacheConfig().compute_hash()
+    )
+
+
+@pytest.mark.parametrize("stride", [0, -1])
+def test_prefill_tail_stride_rejects_nonpositive_values(stride):
+    """CacheConfig rejects a non-positive recurrent_prefill_tail_stride."""
+    with pytest.raises(ValueError, match="recurrent_prefill_tail_stride"):
+        CacheConfig(recurrent_prefill_tail_stride=stride)
 
 
 def test_swa_page_sizes_have_distinct_compile_cache_hashes():

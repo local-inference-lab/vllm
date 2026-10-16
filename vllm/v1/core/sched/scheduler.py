@@ -3520,6 +3520,12 @@ class Scheduler(SchedulerInterface):
         return self.kv_cache_manager.usage
 
     def add_request(self, request: Request) -> None:
+        """Registers a request for scheduling.
+
+        New requests are queued, and their prefill-tail checkpoint boundary is
+        computed when boundary checkpoints are enabled. A request id that is
+        already known advances or finishes a streaming-input session instead.
+        """
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
@@ -3540,6 +3546,7 @@ class Scheduler(SchedulerInterface):
                         request.num_prompt_tokens,
                         self.max_num_scheduled_tokens,
                         request.recurrent_instruction_boundary,
+                        self.cache_config.recurrent_prefill_tail_stride,
                     )
                 )
             if request.resumable:
