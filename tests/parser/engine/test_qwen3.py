@@ -18,7 +18,9 @@ from tests.parser.engine.streaming_helpers import (
     collect_tool_arguments,
     simulate_tool_streaming,
 )
+from vllm.parser.engine.events import EventType
 from vllm.parser.engine.parser_engine import ParserEngine
+from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
 from vllm.parser.qwen3 import (
     TOOL_CALL_END,
     TOOL_CALL_START,
@@ -1269,3 +1271,139 @@ class TestNestedSchemaCoercion:
         assert questions[0]["question"] == "Pick a color"
         assert questions[0]["multiSelect"] is False
         assert questions[0]["answer"] is None
+
+
+_LITERAL_XML_CALL = (
+    "<tool_call>\n<function=lookup>\n<parameter=key>\n"
+    "hello\n</parameter>\n</function>\n</tool_call>"
+)
+_LITERAL_XML_CASES = [
+    (
+        "fenced",
+        "```xml\n" + _LITERAL_XML_CALL + "\n```\nDONE",
+        False,
+        0,
+        "```xml\n" + _LITERAL_XML_CALL + "\n```\nDONE",
+        None,
+    ),
+    (
+        "tilde",
+        "~~~xml\n" + _LITERAL_XML_CALL + "\n~~~\nDONE",
+        False,
+        0,
+        "~~~xml\n" + _LITERAL_XML_CALL + "\n~~~\nDONE",
+        None,
+    ),
+    (
+        "long_fence",
+        "````md\n```xml\n" + _LITERAL_XML_CALL + "\n```\n````\nDONE",
+        False,
+        0,
+        "````md\n```xml\n" + _LITERAL_XML_CALL + "\n```\n````\nDONE",
+        None,
+    ),
+    (
+        "indented_fence",
+        "   ```xml\n" + _LITERAL_XML_CALL + "\n   ```\nDONE",
+        False,
+        0,
+        "   ```xml\n" + _LITERAL_XML_CALL + "\n   ```\nDONE",
+        None,
+    ),
+    (
+        "quoted_marker",
+        "The marker is `<tool_call>`; DONE.",
+        False,
+        0,
+        "The marker is `<tool_call>`; DONE.",
+        None,
+    ),
+    (
+        "bare_header_prose",
+        "Use <function=lookup> in examples. DONE.",
+        False,
+        0,
+        "Use <function=lookup> in examples. DONE.",
+        None,
+    ),
+    (
+        "real_call",
+        "Running now.\n" + _LITERAL_XML_CALL,
+        False,
+        1,
+        "Running now.\n",
+        None,
+    ),
+    ("two_calls", _LITERAL_XML_CALL + "\n" + _LITERAL_XML_CALL, False, 2, "\n", None),
+    (
+        "example_then_call",
+        "```xml\n" + _LITERAL_XML_CALL + "\n```\n" + _LITERAL_XML_CALL,
+        False,
+        1,
+        "```xml\n" + _LITERAL_XML_CALL + "\n```\n",
+        None,
+    ),
+    (
+        "reasoning_example",
+        "Example:\n```xml\n" + _LITERAL_XML_CALL + "\n```\nDone thinking.</think>DONE",
+        True,
+        0,
+        "DONE",
+        "Example:\n```xml\n" + _LITERAL_XML_CALL + "\n```\nDone thinking.",
+    ),
+    (
+        "reasoning_state_reset",
+        "Example:\n```xml\n" + _LITERAL_XML_CALL + "\n</think>" + _LITERAL_XML_CALL,
+        True,
+        1,
+        "",
+        "Example:\n```xml\n" + _LITERAL_XML_CALL + "\n",
+    ),
+    (
+        "unclosed_fence",
+        "```xml\n" + _LITERAL_XML_CALL + "\nDONE",
+        False,
+        0,
+        "```xml\n" + _LITERAL_XML_CALL + "\nDONE",
+        None,
+    ),
+]
+
+
+@pytest.mark.parametrize("case", _LITERAL_XML_CASES, ids=lambda case: case[0])
+@pytest.mark.parametrize("chunk_size", [1, 2, 7, 10000])
+def test_literal_xml_preserves_text_and_real_calls(case, chunk_size):
+    """Quoted XML must survive without suppressing subsequent genuine calls."""
+    _, text, thinking, call_count, content, reasoning = case
+    engine = StreamingParserEngine(qwen3_config(thinking=thinking), None)
+    events = []
+    for offset in range(0, len(text), chunk_size):
+        events.extend(engine.feed(text[offset : offset + chunk_size], []))
+    events.extend(engine.finish())
+
+    def joined(kind):
+        return "".join(event.value for event in events if event.type == kind)
+
+    starts = [event for event in events if event.type == EventType.TOOL_CALL_START]
+    assert [event.tool_index for event in starts] == list(range(call_count))
+    assert joined(EventType.TEXT_CHUNK) == content
+    assert joined(EventType.TOOL_NAME) == "lookup" * call_count
+    if reasoning is not None:
+        assert joined(EventType.REASONING_CHUNK) == reasoning
+    if call_count:
+        assert joined(EventType.ARG_VALUE_CHUNK) == (
+            "\n<parameter=key>\nhello\n</parameter>\n" * call_count
+        )
+
+
+def test_reset_does_not_keep_unclosed_xml_fence():
+    """An unfinished example in one request must not hide the next tool call."""
+    engine = StreamingParserEngine(qwen3_config(thinking=False), None)
+    engine.feed("```xml\n" + _LITERAL_XML_CALL, [])
+    engine.finish()
+    engine.reset()
+    events = engine.feed(_LITERAL_XML_CALL, []) + engine.finish()
+    assert (
+        "".join(event.value for event in events if event.type == EventType.TOOL_NAME)
+        == "lookup"
+    )
