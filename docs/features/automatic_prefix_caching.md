@@ -79,8 +79,12 @@ request-boundary policy is active, including selection through `auto`.
 For example, with a 4,096-token scheduler budget and a 64,632-token prompt, the
 default endpoint is 57,344. Adding `--recurrent-prefill-tail-stride 256` places it
 at 64,256, leaving 376 tokens to replay after a final-token edit. The smaller
-stride favors small suffix changes; edits before the saved prefix still miss.
-Keeping the default can recover larger suffix edits. The setting reuses the same
+stride favors small suffix changes. An edit before the saved prefix misses this
+fallback and reuses at most the instruction checkpoint, which is close to a cold
+prefill for long conversations. The default recovers suffix edits spanning up to
+one to two scheduler chunks. If the endpoint is not on a scheduler-chunk
+boundary, the chunk containing it is split, adding one short step to a cold
+prefill. The setting reuses the same
 checkpoint slot, but can make it reachable for shorter prompts: a stride of 256
 allows a positive endpoint from 512 prompt tokens. Capacity estimation includes
 this bundle whenever it is reachable.
