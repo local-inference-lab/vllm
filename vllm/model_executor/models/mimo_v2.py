@@ -3,11 +3,12 @@
 from collections.abc import Iterable
 from copy import copy
 from itertools import islice
+from typing import ClassVar
 
 import torch
 from torch import nn
 
-import vllm.envs as envs
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
     CacheConfig,
@@ -55,7 +56,9 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.utils import sequence_parallel_chunk
-from vllm.model_executor.weight_transfer import copy_weight, materialize_weight
+from vllm.model_executor.parameter import copy_tensor_parallel_shard
+from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.weight_transfer import materialize_weight
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionType
@@ -79,6 +82,123 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+# TP3 pad scheme for the RL/MOPD checkpoints. Their QKV weights are fp8 with
+# 128-row scale blocks and pre-sharded into checkpoint_tp_size=4 [Q|K|V]
+# groups, so a rank's Q, K and V rows must all be whole 128-row blocks: an
+# even number of KV heads per rank (192-row K heads), and Q heads per rank
+# keeping the checkpoint's GQA ratio. Ranks 0 and 1 take whole checkpoint
+# groups; the last rank's heads are zero weights and contribute nothing.
+TP3 = 3
+CHECKPOINT_TP3_GROUPS = 4
+
+
+def _tp3_active(tp_size: int) -> bool:
+    return tp_size == TP3
+
+
+def _checkpoint_config_value(config, name):
+    return getattr(config, f"original_{name}", getattr(config, name))
+
+
+def _padded_head_counts(
+    num_heads: int, num_kv_heads: int, tp_size: int
+) -> tuple[int, int]:
+    """Head totals padded for TP3; unchanged where heads already divide."""
+    if not _tp3_active(tp_size) or (
+        num_heads % tp_size == 0 and num_kv_heads % tp_size == 0
+    ):
+        return num_heads, num_kv_heads
+    q_per_kv = num_heads // num_kv_heads
+    kv_per_rank = -(-num_kv_heads // tp_size)
+    if kv_per_rank % 2:
+        # An odd count leaves a rank's K rows off the 128-row block grid.
+        kv_per_rank += 1
+    q_per_rank = q_per_kv * kv_per_rank
+    return q_per_rank * tp_size, kv_per_rank * tp_size
+
+
+def _padded_fused_chunks(checkpoint_chunks: int, tp_size: int) -> int:
+    """Fused-QKV chunk count whose per-rank share is whole chunks."""
+    if not _tp3_active(tp_size) or checkpoint_chunks % tp_size == 0:
+        return checkpoint_chunks
+    return -(-checkpoint_chunks // tp_size) * tp_size
+
+
+def _padded_expert_intermediate(intermediate_size: int, tp_size: int) -> int:
+    """Expert width padded so every rank's shard keeps whole fp8 blocks."""
+    if not _tp3_active(tp_size) or intermediate_size % tp_size == 0:
+        return intermediate_size
+    from math import lcm
+
+    step = lcm(tp_size, 128)
+    return -(-intermediate_size // step) * step
+
+
+def _pad_tensor_to_param(loaded: torch.Tensor, param: torch.Tensor) -> torch.Tensor:
+    """Zero-pad a checkpoint tensor out to its padded parameter shape."""
+    pad = [p - s for p, s in zip(param.shape, loaded.shape) if p != s]
+    if not pad:
+        return loaded
+    if any(p < s for p, s in zip(param.shape, loaded.shape)) or len(pad) > 1:
+        raise ValueError(
+            f"Cannot pad checkpoint tensor {tuple(loaded.shape)} to parameter "
+            f"{tuple(param.shape)}"
+        )
+    padded = loaded.new_zeros(param.shape)
+    slices = tuple(slice(0, s) for s in loaded.shape)
+    padded[slices] = loaded
+    return padded
+
+
+def _pad_stacked_qkv(
+    loaded: torch.Tensor, name: str, shard_id: str, attn: "MiMoV2Attention"
+) -> torch.Tensor:
+    """Zero-pad a separate q/k/v checkpoint tensor to the padded head count."""
+    is_scale = name.endswith("weight_scale_inv")
+    if shard_id == "q":
+        gap_heads = attn.total_num_heads - attn.checkpoint_num_heads
+        head_dim = attn.head_dim
+    elif shard_id == "k":
+        gap_heads = attn.total_num_kv_heads - attn.checkpoint_num_kv_heads
+        head_dim = attn.head_dim
+    else:
+        gap_heads = attn.total_num_kv_heads - attn.checkpoint_num_kv_heads
+        head_dim = attn.v_head_dim
+    gap = gap_heads * head_dim
+    if is_scale:
+        gap //= 128
+    if not gap:
+        return loaded
+    shape = list(loaded.shape)
+    shape[0] = gap
+    return torch.cat([loaded, loaded.new_zeros(shape)], dim=0)
+
+
+def _pad_expert_tensor(
+    loaded: torch.Tensor, name: str, shard_id: str, padded_intermediate: int
+) -> torch.Tensor:
+    """Zero-pad one expert tensor to the padded expert width.
+
+    The MOPD/RL checkpoints store MXFP4 experts packed two values per byte
+    along the input dim, one e8m0 scale per 32-column block: gate/up are
+    [out, in/2] with scale [out, in/32] and shard on rows (the intermediate
+    dim); down is [hidden, inter/2] with scale [hidden, inter/32] and shards
+    on the packed input columns.
+    """
+    is_scale = name.endswith("weight_scale")
+    if shard_id == "w2":
+        dim = 1
+        target = padded_intermediate // 32 if is_scale else padded_intermediate // 2
+    else:
+        dim = 0
+        target = padded_intermediate
+    gap = target - loaded.shape[dim]
+    if gap <= 0:
+        return loaded
+    pad_shape = list(loaded.shape)
+    pad_shape[dim] = gap
+    return torch.cat([loaded, loaded.new_zeros(pad_shape)], dim=dim)
+
 
 class MiMoV2MLP(nn.Module):
     def __init__(
@@ -91,21 +211,27 @@ class MiMoV2MLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        padded_intermediate = _padded_expert_intermediate(
+            intermediate_size, get_tensor_model_parallel_world_size()
+        )
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
-            [intermediate_size] * 2,
+            [padded_intermediate] * 2,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
-            intermediate_size,
+            padded_intermediate,
             hidden_size,
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
+        if padded_intermediate != intermediate_size:
+            for param in self.parameters():
+                set_weight_attrs(param, {"allow_tp_padding": True})
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
@@ -175,11 +301,15 @@ class MiMoV2MoE(nn.Module):
             torch.empty(config.n_routed_experts, dtype=self.gate.out_dtype)
         )
 
+        padded_intermediate = _padded_expert_intermediate(
+            config.moe_intermediate_size, self.tp_size
+        )
+        self.padded_intermediate = padded_intermediate
         self.experts = FusedMoEFactory(
             num_experts=self.n_routed_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
+            intermediate_size=padded_intermediate,
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
@@ -247,10 +377,13 @@ class MiMoV2Attention(nn.Module):
         self.layer_id = layer_id
         tp_size = get_tensor_model_parallel_world_size()
 
-        self.total_num_heads = num_heads
+        self.checkpoint_num_heads = num_heads
+        self.checkpoint_num_kv_heads = num_kv_heads
+        self.total_num_heads, self.total_num_kv_heads = _padded_head_counts(
+            num_heads, num_kv_heads, tp_size
+        )
         self.num_heads = self.total_num_heads // tp_size
 
-        self.total_num_kv_heads = num_kv_heads
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
 
         self.head_dim = head_dim
@@ -281,7 +414,8 @@ class MiMoV2Attention(nn.Module):
                 hidden_size,
                 [
                     self.total_num_heads * self.head_dim,
-                    fused_qkv_chunks * self.kv_chunk_rows,
+                    _padded_fused_chunks(fused_qkv_chunks, tp_size)
+                    * self.kv_chunk_rows,
                 ],
                 bias=attention_bias,
                 quant_config=quant_config,
@@ -307,6 +441,10 @@ class MiMoV2Attention(nn.Module):
             reduce_results=True,
             prefix=f"{prefix}.o_proj",
         )
+
+        if self.total_num_heads != num_heads:
+            for param in self.o_proj.parameters():
+                set_weight_attrs(param, {"allow_tp_padding": True})
 
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
@@ -414,7 +552,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
 
         v_scale = getattr(config, "attention_value_scale", None)
         fused_qkv_chunks = (
-            config.num_key_value_heads
+            _checkpoint_config_value(config, "num_key_value_heads")
             if getattr(config, "attention_projection_layout", None) == "fused_qkv"
             and getattr(quant_config, "weight_block_size", None)
             else 0
@@ -423,8 +561,10 @@ class MiMoV2FlashDecoderLayer(nn.Module):
         if self.is_compressed_softmax_layer():
             self.self_attn = MiMoV2Attention(
                 hidden_size=self.hidden_size,
-                num_heads=config.swa_num_attention_heads,
-                num_kv_heads=config.swa_num_key_value_heads,
+                num_heads=_checkpoint_config_value(config, "swa_num_attention_heads"),
+                num_kv_heads=_checkpoint_config_value(
+                    config, "swa_num_key_value_heads"
+                ),
                 head_dim=config.swa_head_dim,
                 v_head_dim=getattr(config, "swa_v_head_dim", None),
                 v_scale=v_scale,
@@ -445,8 +585,8 @@ class MiMoV2FlashDecoderLayer(nn.Module):
         else:
             self.self_attn = MiMoV2Attention(
                 hidden_size=self.hidden_size,
-                num_heads=config.num_attention_heads,
-                num_kv_heads=config.num_key_value_heads,
+                num_heads=_checkpoint_config_value(config, "num_attention_heads"),
+                num_kv_heads=_checkpoint_config_value(config, "num_key_value_heads"),
                 head_dim=config.head_dim,
                 v_head_dim=getattr(config, "v_head_dim", None),
                 v_scale=v_scale,
@@ -539,7 +679,11 @@ def _fused_qkv_kv_chunk_rows(
 
     and this returns the padded ``K | V`` rows per chunk.
     """
-    if checkpoint_tp_size <= tp_size or checkpoint_tp_size % tp_size:
+    if checkpoint_tp_size <= tp_size:
+        return 0
+    if checkpoint_tp_size % tp_size and not (
+        checkpoint_tp_size == CHECKPOINT_TP3_GROUPS and tp_size == TP3
+    ):
         return 0
     q_rows = num_heads // checkpoint_tp_size * head_dim
     k_rows = num_kv_heads // checkpoint_tp_size * head_dim
@@ -575,6 +719,8 @@ def _shard_fp8_qkv_proj(
     checkpoint_tp_size: int,
     block: int = 128,
     kv_chunk_rows: int = 0,
+    padded_num_heads: int | None = None,
+    padded_num_kv_heads: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Shard the fp8 qkv_proj weights for ``tp_rank``.
 
@@ -598,6 +744,50 @@ def _shard_fp8_qkv_proj(
     exact. Only when neither applies do we dequantize this rank's groups to
     float, reorder the rows into the layout above, and re-quantize to fp8.
     """
+    if checkpoint_tp_size == CHECKPOINT_TP3_GROUPS and tp_size == TP3:
+        # Whole checkpoint groups on the first ranks; the last rank's heads
+        # are zero weights (see _padded_head_counts).
+        if tp_rank == tp_size - 1:
+            padded_num_heads = padded_num_heads or num_heads
+            padded_num_kv_heads = padded_num_kv_heads or num_kv_heads
+            q_rows = padded_num_heads // tp_size * head_dim
+            kv_heads_per_rank = padded_num_kv_heads // tp_size
+            if kv_chunk_rows:
+                rows = q_rows + kv_heads_per_rank * kv_chunk_rows
+                scale_rows = cdiv(q_rows, block) + kv_heads_per_rank * cdiv(
+                    kv_chunk_rows, block
+                )
+            else:
+                k_rows = kv_heads_per_rank * head_dim
+                v_rows = kv_heads_per_rank * v_head_dim
+                rows = q_rows + k_rows + v_rows
+                scale_rows = (
+                    cdiv(q_rows, block) + cdiv(k_rows, block) + cdiv(v_rows, block)
+                )
+            return (
+                torch.zeros(
+                    rows, w_full.shape[1], dtype=w_full.dtype, device=w_full.device
+                ),
+                torch.zeros(
+                    scale_rows,
+                    s_full.shape[1],
+                    dtype=s_full.dtype,
+                    device=s_full.device,
+                ),
+            )
+        return _shard_fp8_qkv_proj(
+            w_full,
+            s_full,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            v_head_dim,
+            tp_rank,
+            tp_size - 1,
+            checkpoint_tp_size,
+            block,
+            kv_chunk_rows,
+        )
     assert checkpoint_tp_size % tp_size == 0, (
         "TP size must evenly split the checkpoint TP size."
     )
@@ -779,6 +969,7 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
+                padding_size=128,
                 quant_config=quant_config,
                 prefix=f"{prefix}.embed_tokens",
             )
@@ -896,6 +1087,9 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
 
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
+        padded_expert_intermediate = _padded_expert_intermediate(
+            self.config.moe_intermediate_size, tp_size
+        )
 
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: set[str] = set()
@@ -923,8 +1117,9 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
                     continue
 
                 if (
-                    name_rewritten.endswith(".bias") or name_rewritten.endswith("_bias")
-                ) and name_rewritten not in params_dict:
+                    name_rewritten.endswith((".bias", "_bias"))
+                    and name_rewritten not in params_dict
+                ):
                     continue
 
                 if name_rewritten not in params_dict:
@@ -932,6 +1127,14 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
 
                 param = params_dict[name_rewritten]
                 weight_loader = param.weight_loader
+
+                if tp_size == TP3:
+                    loaded_weight = _pad_expert_tensor(
+                        loaded_weight,
+                        name_rewritten,
+                        shard_id,
+                        padded_expert_intermediate,
+                    )
 
                 weight_loader(
                     param,
@@ -976,6 +1179,12 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
                     continue
 
                 param = params_dict[name_rewritten]
+                if tp_size == TP3 and stacked_shard_id in ("q", "k", "v"):
+                    module_prefix = name_rewritten.rsplit(".", 1)[0]
+                    attn = self.get_submodule(module_prefix.rsplit(".", 1)[0])
+                    loaded_weight = _pad_stacked_qkv(
+                        loaded_weight, name_rewritten, stacked_shard_id, attn
+                    )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, stacked_shard_id)
                 loaded_params.add(name_rewritten)
@@ -999,12 +1208,14 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             param = params_dict[name]
 
             if "attention_sink_bias" in name:
-                total_heads = loaded_weight.shape[0]
-                heads_per_rank = total_heads // tp_size
-                head_start = tp_rank * heads_per_rank
-                narrow_weight = loaded_weight.narrow(0, head_start, heads_per_rank)
-
-                copy_weight(param.data, narrow_weight)
+                copy_tensor_parallel_shard(
+                    param.data,
+                    loaded_weight,
+                    0,
+                    tp_rank * param.shape[0],
+                    param.shape[0],
+                    allow_padding=tp_size == TP3,
+                )
                 loaded_params.add(name)
             else:
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -1060,28 +1271,32 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
         w_rank, s_rank = _shard_fp8_qkv_proj(
             entry["weight"],
             entry["weight_scale_inv"],
-            num_heads=attn.total_num_heads,
-            num_kv_heads=attn.total_num_kv_heads,
+            num_heads=attn.checkpoint_num_heads,
+            num_kv_heads=attn.checkpoint_num_kv_heads,
             head_dim=attn.head_dim,
             v_head_dim=attn.v_head_dim,
             tp_rank=tp_rank,
             tp_size=tp_size,
-            checkpoint_tp_size=self.config.num_key_value_heads,
+            checkpoint_tp_size=_checkpoint_config_value(
+                self.config, "num_key_value_heads"
+            ),
             kv_chunk_rows=getattr(attn, "kv_chunk_rows", 0),
+            padded_num_heads=attn.total_num_heads,
+            padded_num_kv_heads=attn.total_num_kv_heads,
         )
         sharded = {"weight": w_rank, "weight_scale_inv": s_rank}
-        for kind, tensor in sharded.items():
+        for kind, shard in sharded.items():
             param_name = f"{prefix}.{kind}"
             param = params_dict[param_name]
-            if tensor.shape[0] > param.shape[0]:
-                tensor = tensor[: param.shape[0]]
-            default_weight_loader(param, tensor)
+            if shard.shape[0] > param.shape[0]:
+                shard = shard[: param.shape[0]]
+            default_weight_loader(param, shard)
             loaded_params.add(param_name)
         return True
 
 
 class MiMoV2FlashForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsEagle3):
-    packed_modules_mapping = {
+    packed_modules_mapping: ClassVar[dict[str, list[str]]] = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
@@ -1102,6 +1317,7 @@ class MiMoV2FlashForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsEa
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
+                padding_size=128,
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
@@ -1145,7 +1361,7 @@ class MiMoV2FlashForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsEa
 
 
 class MiMoV2ForCausalLM(MiMoV2FlashForCausalLM):
-    packed_modules_mapping = {
+    packed_modules_mapping: ClassVar[dict[str, list[str]]] = {
         "qkv_proj": ["qkv_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }

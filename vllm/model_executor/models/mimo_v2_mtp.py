@@ -45,7 +45,15 @@ from .interfaces import (
     SupportsMultiModal,
     _require_is_multimodal,
 )
-from .mimo_v2 import MiMoV2Attention, MiMoV2MLP
+from .mimo_v2 import (
+    TP3,
+    MiMoV2Attention,
+    MiMoV2MLP,
+    _pad_stacked_qkv,
+    _pad_tensor_to_param,
+    _padded_expert_intermediate,
+    _shard_fp8_qkv_proj,
+)
 from .utils import _merge_multimodal_embeddings, maybe_prefix
 
 # MiMo-V2 checkpoints contain multiple MTP layers, but vLLM currently supports
@@ -111,7 +119,9 @@ class MiMoV2MTPLayer(nn.Module):
         )
         self.mlp = MiMoV2MLP(
             hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
+            intermediate_size=_padded_expert_intermediate(
+                config.intermediate_size, get_tensor_model_parallel_world_size()
+            ),
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
@@ -181,6 +191,7 @@ class MiMoV2MultiTokenPredictor(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            padding_size=128,
         )
 
         self.mtp = _MiMoV2MTPLayers(
@@ -230,6 +241,7 @@ class MiMoV2MTP(nn.Module):
         self.lm_head = ParallelLMHead(
             self.config.vocab_size,
             self.config.hidden_size,
+            padding_size=128,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
 
@@ -271,6 +283,7 @@ class MiMoV2MTP(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        mtp_qkv_pending: dict[str, dict[str, torch.Tensor]] = {}
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -284,18 +297,38 @@ class MiMoV2MTP(nn.Module):
             ):
                 continue
 
-            # Support fused qkv_proj checkpoint (Pro format).
-            # The checkpoint is stored pre-sharded for TP=8 as
-            # [Q_rank0, K_rank0, V_rank0, Q_rank1, ...], so splitting along
-            # dim 0 with chunk(tp_size) gives each rank its Q+K+V slice for
-            # both the FP8 weight and the block weight_scale_inv. This matches
-            # how the main model loads the same layout.
+            # Fused fp8 qkv_proj (weight and block scale arrive separately):
+            # shard them together, exactly like the main model's loader.
             if "qkv_proj" in name:
-                if name in params_dict:
-                    param = params_dict[name]
-                    loaded_weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
-                    default_weight_loader(param, loaded_weight)
-                    loaded_params.add(name)
+                prefix, qkv_kind = name.rsplit(".", 1)
+                entry = mtp_qkv_pending.setdefault(prefix, {})
+                entry[qkv_kind] = loaded_weight
+                if "weight" in entry and "weight_scale_inv" in entry:
+                    del mtp_qkv_pending[prefix]
+                    attn = self.get_submodule(prefix.rsplit(".", 1)[0])
+                    w_rank, s_rank = _shard_fp8_qkv_proj(
+                        entry["weight"],
+                        entry["weight_scale_inv"],
+                        num_heads=attn.checkpoint_num_heads,
+                        num_kv_heads=attn.checkpoint_num_kv_heads,
+                        head_dim=attn.head_dim,
+                        v_head_dim=attn.v_head_dim,
+                        tp_rank=tp_rank,
+                        tp_size=tp_size,
+                        checkpoint_tp_size=self.config.num_key_value_heads,
+                        kv_chunk_rows=getattr(attn, "kv_chunk_rows", 0),
+                        padded_num_heads=attn.total_num_heads,
+                        padded_num_kv_heads=attn.total_num_kv_heads,
+                    )
+                    for kind, tensor in (
+                        ("weight", w_rank),
+                        ("weight_scale_inv", s_rank),
+                    ):
+                        param = params_dict[f"{prefix}.{kind}"]
+                        if tensor.shape[0] > param.shape[0]:
+                            tensor = tensor[: param.shape[0]]
+                        default_weight_loader(param, tensor)
+                        loaded_params.add(f"{prefix}.{kind}")
                 continue
 
             # gate_proj/up_proj → gate_up_proj stacking (both formats);
@@ -313,6 +346,15 @@ class MiMoV2MTP(nn.Module):
                 if name_rewritten not in params_dict:
                     continue
                 param = params_dict[name_rewritten]
+                if tp_size == TP3:
+                    if shard_id in ("q", "k", "v"):
+                        module_prefix = name_rewritten.rsplit(".", 1)[0]
+                        attn = self.get_submodule(module_prefix.rsplit(".", 1)[0])
+                        loaded_weight = _pad_stacked_qkv(
+                            loaded_weight, name_rewritten, shard_id, attn
+                        )
+                    else:
+                        loaded_weight = _pad_tensor_to_param(loaded_weight, param)
                 weight_loader = getattr(param, "weight_loader", None)
                 if weight_loader is None:
                     default_weight_loader(param, loaded_weight)
@@ -331,9 +373,17 @@ class MiMoV2MTP(nn.Module):
                 continue
 
             param = params_dict[name]
+            if tp_size == TP3 and "embed_tokens" not in name and "lm_head" not in name:
+                loaded_weight = _pad_tensor_to_param(loaded_weight, param)
             # attention_sink_bias is head-parallel; slice by tp
             if "attention_sink_bias" in name:
                 total_heads = loaded_weight.shape[0]
+                padded_heads = param.shape[0] * tp_size
+                if padded_heads > total_heads:
+                    padded = loaded_weight.new_zeros(padded_heads)
+                    padded[:total_heads] = loaded_weight
+                    loaded_weight = padded
+                    total_heads = padded_heads
                 heads_per_rank = total_heads // tp_size
                 loaded_weight = loaded_weight.narrow(
                     0, tp_rank * heads_per_rank, heads_per_rank
