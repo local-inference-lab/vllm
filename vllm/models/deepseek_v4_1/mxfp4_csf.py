@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Losslessly compressed DS4.1 routed experts with native dense tensors."""
 
+import itertools
+
 import regex as re
 import torch
 
@@ -14,7 +16,10 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
+from vllm.model_executor.layers.fused_moe.b12x import (
+    B12xExperts,
+    _is_current_stream_capturing,
+)
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     FusedMoEQuantDesc,
@@ -31,6 +36,192 @@ from vllm.utils.torch_utils import set_default_torch_num_threads
 from .quant_config import DeepseekV41FP8Config
 
 logger = init_logger(__name__)
+
+# Per-forward token counter (shared with nvfp4_csf.py via the same forward
+# context attribute; see _forward_token).
+_FORWARD_TOKENS = itertools.count()
+
+
+def _spec_decode_query_width() -> int:
+    """Rows per request in a uniform decode/verification batch.
+
+    ``1 + num_speculative_tokens`` (the runner's ``uniform_decode_query_len``):
+    MTP=3 gives 4, DFlash=7 gives 8. Queries at or below this width are
+    decode or speculative-verification rows, not prefill rows.
+    """
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    spec = getattr(config, "speculative_config", None) if config is not None else None
+    return 1 + int(getattr(spec, "num_speculative_tokens", 0) or 0)
+
+
+def _batch_has_prefill_rows() -> bool:
+    """Whether the current batch contains actual prefill rows (Codex 9.5).
+
+    Row-type eligibility, never a total-row threshold: a batch qualifies only
+    when some request's query exceeds the decode/verification width
+    (``1 + num_speculative_tokens``, taken from the speculative config).
+    DFlash verification batches (uniform 1+spec-token queries) and pure decode
+    batches never qualify, whatever their row count. Host-side metadata only
+    (``max_query_len``): no device read, no synchronization. Missing metadata
+    means no arming.
+
+    Codex §10.2.2 correction: the classification width is derived from the
+    SPECULATIVE CONFIG ONLY (``_spec_decode_query_width``). Metadata
+    ``num_spec_decode_tokens`` is deliberately NOT consulted: in the real
+    builder (``gdn_attn.py:555``) it is the AGGREGATE speculative token
+    count for the whole batch (``query_lens.sum() - prefill_tokens -
+    decode_tokens``), not a per-request width. Refining the width with that
+    aggregate lets many verification requests inflate it past a shorter REAL
+    prefill query and suppress arming for a batch that does contain prefill
+    rows. Production MiMo's ``B12xPagedMetadata`` has no
+    ``num_spec_decode_tokens`` field at all, so this correction cannot change
+    MiMo behavior -- it fixes the semantics for backends (GDN/KDA) that do
+    report it.
+    """
+    from vllm.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+
+    if not is_forward_context_available():
+        return False
+    metadata = getattr(get_forward_context(), "attn_metadata", None)
+    if metadata is None:
+        return False
+    values: list = []
+    if isinstance(metadata, dict):
+        values = list(metadata.values())
+    elif isinstance(metadata, (list, tuple)):
+        for entry in metadata:
+            if isinstance(entry, dict):
+                values.extend(entry.values())
+    width = _spec_decode_query_width()
+    return any(
+        isinstance(getattr(value, "max_query_len", None), int)
+        and int(value.max_query_len) > width
+        for value in values
+    )
+
+
+def _b12x_csf_prefetch_supported(prepared) -> bool:
+    """Whether b12x exposes prepared CSF scale expansion + consumer skip.
+
+    Requires both halves of the coordinated contract: ``expand_scales`` must
+    handle this prepared payload (the ``nvfp4_csf`` decoder branch installed
+    by the FlashInfer CSF-block preparation — 97fde4bd5/7e5a142e9 made it
+    carry BOTH the NVFP4 and the MXFP4 compact-scale payloads) and ``bind``
+    must accept ``scales_expanded`` (the per-call consumer skip). Older b12x
+    builds have neither; arming there would duplicate work (a side-stream
+    expansion with the per-call decode still running), so prefetch stays off.
+    Fails closed on any missing piece.
+    """
+    if getattr(getattr(prepared, "_impl", None), "nvfp4_csf", None) is None:
+        return False
+    try:
+        import inspect
+
+        from b12x.moe import fused_moe
+        from b12x.moe.fused_moe._impl import TPMoEScratchPlan
+
+        if not hasattr(fused_moe, "expand_scales"):
+            return False
+        return "scales_expanded" in inspect.signature(
+            TPMoEScratchPlan.bind
+        ).parameters
+    except Exception:
+        return False
+
+
+class MimoMxfp4CsfScalePrefetch:
+    """Owner-carried MXFP4/CSF scale-prefetch state for one MiMo expert owner.
+
+    Mirrors ``Nvfp4CsfConfig``'s scale_layers/scale_stream/scale_prefetch +
+    moe_done/scales_ready pattern (nvfp4_csf.py), with Codex §9.3 corrections
+    for the shared per-rank scale scratch:
+
+    * The overlap window is layer L+1's ATTENTION: after L's MoE completes
+      (``moe_done``), the side stream expands L+1's scales into the shared
+      scratch while L+1's attention runs; L+1's MoE consumes them.
+    * A pending prefetch is always awaited before the consumer runs OR before
+      any inline expansion overwrites the same scratch — a stale/mismatched
+      generation still needs that wait (§9.3 point 3/4).
+    * The per-call consumer skip flag is set only for the matching
+      (layer, forward-token) and cleared in ``finally``.
+    * CUDA-graph capture: new prefetch is disabled and any pending triple is
+      CLEARED at capture entry without waiting (Codex §10.1) — the serving
+      runner device-synchronizes before capture, and adopting an external
+      event dependency inside a capture raises
+      cudaErrorStreamCaptureIsolation even for a completed event; the
+      captured graph runs inline (flag never declared under capture).
+    * Eligibility is per-row-type (``_batch_has_prefill_rows``): DFlash
+      verification and pure-decode batches never arm (Codex 9.5).
+
+    2026-10-12 port (csfdelta): the mechanism now targets the NATIVE CSF
+    scale machinery the FlashInfer 97fde4bd5/7e5a142e9 bases installed in
+    place of the old X4T paired-program surface: an MXFP4-CSF prepared
+    payload carries an ``nvfp4_csf`` decoder whose ``decode_all`` is what
+    ``b12x_fused_moe.expand_scales`` drives on the side stream, and whose
+    per-call selective decode is what ``bind(..., scales_expanded=True)``
+    (the stock ``B12xExperts.scales_expanded`` flag) skips. The class and
+    env names keep their X4T-era spelling for launcher compatibility; the
+    owner capability attribute ``x4t_scale_prefetch`` is unchanged.
+
+    PP1, no ubatching, no concurrent forwards sharing the owner (enforced by
+    the shared method's PP1/no-ubatching requirement). IDs/events/streams are
+    allocated at preparation; nothing is allocated per request.
+    """
+
+    def __init__(self):
+        self.scale_layers: dict[int, "Mxfp4CsfMoEMethod"] = {}
+        self.scale_stream: torch.cuda.Stream | None = None
+        # (destination layer index, forward token, ready event)
+        self.scale_prefetch: tuple[int, int, torch.cuda.Event] | None = None
+
+    def register(self, method: "Mxfp4CsfMoEMethod", device: torch.device) -> None:
+        self.scale_layers[method.layer_index] = method
+        if self.scale_stream is None:
+            self.scale_stream = torch.cuda.Stream(device)
+
+    def drain(self) -> None:
+        """Wait out any in-flight side-stream expansion OUTSIDE capture only.
+
+        Codex §10.1: this is the EAGER-transition helper (a caller that is NOT
+        capturing and wants a device-ordered join). The capture transition no
+        longer calls it: the serving runner synchronizes the device before
+        capture begins, and waiting an externally-recorded event INSIDE a
+        capture raises cudaErrorStreamCaptureIsolation (invalidating the
+        capture) even for a completed event — ``apply()``'s capture branch
+        therefore clears the pending triple WITHOUT waiting.
+        """
+        pending = self.scale_prefetch
+        self.scale_prefetch = None
+        if pending is not None:
+            torch.cuda.current_stream().wait_event(pending[2])
+
+
+def _forward_token() -> int | None:
+    """An id of the current forward pass, or None outside of one.
+
+    Duplicated from nvfp4_csf.py's tiny helper with the same context attribute
+    (``_b12x_csf_token``), so the MXFP4 and NVFP4 prefetch mechanisms share one
+    per-forward identity. The import is avoided deliberately: nvfp4_csf imports
+    the modelopt graph, and this module is imported by the shared CSF config.
+    """
+    from vllm.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+
+    if not is_forward_context_available():
+        return None
+    context = get_forward_context()
+    token = getattr(context, "_b12x_csf_token", None)
+    if token is None:
+        token = next(_FORWARD_TOKENS)
+        context._b12x_csf_token = token
+    return token
 
 
 class DeepseekV41Mxfp4CsfConfig(DeepseekV41FP8Config):
@@ -105,6 +296,8 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
         if activation_mode not in ("a16", "a8"):
             raise ValueError("MXFP4-CSF requires A16 or MXFP8 activations")
         self.activation_mode = activation_mode
+        # Set at weight-load time when the owner arms the CSF scale prefetch.
+        self.scale_prefetch_owner = None
         parallel = moe.moe_parallel_config
         if (
             parallel.use_ep
@@ -220,14 +413,35 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
         self.moe_kernel = mk.FusedMoEKernel(
             MoEPrepareAndFinalizeNoDPEPModular(), backend
         )
+        self.backend, self.prepared = backend, prepared
+        # MiMo-owned CSF scale prefetch (Codex §9.2/§9.3): default OFF, owner
+        # capability attribute only (never an isinstance check against the
+        # MiMo config, which would be a circular import for non-MiMo owners).
+        # Codex review fix: the two CUDA events exist only for an ARMED layer
+        # -- with the gate OFF nothing is allocated (gate-OFF cost is zero,
+        # not "small").
+        self.scale_prefetch_owner = None
+        if (
+            getattr(self.owner, "x4t_scale_prefetch", False)
+            and self.activation_mode == "a16"
+            and envs.VLLM_B12X_MXFP4_CSF_SCALE_PREFETCH
+            and _b12x_csf_prefetch_supported(prepared)
+        ):
+            state = getattr(self.owner, "scale_prefetch_state", None)
+            if state is not None:
+                self.moe_done = torch.cuda.Event()
+                self.scales_ready = torch.cuda.Event()
+                self.scale_prefetch_owner = state
+                state.register(self, device)
         logger.info(
             "MXFP4-CSF lossless MXFP4 layer %d rank %d/%d: %s activations, "
-            "compressed scales, shared scratch %d bytes",
+            "compressed scales, shared scratch %d bytes, csf-scale-prefetch=%s",
             self.layer_index,
             rank,
             tp,
             "MXFP8" if self.activation_mode == "a8" else "BF16",
             sum(t.numel() for t in scratch),
+            self.scale_prefetch_owner is not None,
         )
 
     def apply(
@@ -241,17 +455,140 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
         workspace=None,
     ):
         assert self.moe_kernel is not None
-        return self.moe_kernel.apply(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            activation=layer.activation,
-            global_num_experts=layer.global_num_experts,
-            expert_map=layer.expert_map,
-            apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            shared_experts=shared_experts,
-            shared_experts_input=shared_experts_input,
-            workspace=workspace,
+
+        def run():
+            return self.moe_kernel.apply(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=layer.activation,
+                global_num_experts=layer.global_num_experts,
+                expert_map=layer.expert_map,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                shared_experts=shared_experts,
+                shared_experts_input=shared_experts_input,
+                workspace=workspace,
+            )
+
+        owner = self.scale_prefetch_owner
+        if owner is None:
+            return run()
+        stream = torch.cuda.current_stream()
+        if _is_current_stream_capturing():
+            # Codex §10.1: capture-entry CLEAR-ONLY, never a wait. The real
+            # serving capture path (gpu_model_runner.capture_model /
+            # _warmup_and_capture) performs a device-wide
+            # torch.accelerator.synchronize() BEFORE entering capture (and
+            # torch.cuda.graph's own entry does torch.cuda.synchronize()), so
+            # any side-stream expansion armed by an earlier forward is already
+            # complete when capture begins: there is nothing left to wait.
+            # Waiting inside capture is not merely unnecessary, it is ILLEGAL:
+            # cudaStreamWaitEvent on an externally-recorded event inside a
+            # capture raises cudaErrorStreamCaptureIsolation and invalidates
+            # the capture -- even when the event has already completed (pinned
+            # empirically on this build; the captured graph must never adopt
+            # an external event dependency). So the transition drops the
+            # pending triple without touching the event. The captured graph
+            # runs flag-OFF/inline anyway (new arming is disabled under
+            # capture below and the flag is never declared inside capture),
+            # so the cleared triple cannot be missed: each replay re-expands
+            # inline exactly as if no prefetch had ever been armed.
+            owner.scale_prefetch = None
+            return run()
+        token = _forward_token()
+        # Codex §9.3 point 3: consume-or-drop the pending prefetch, but always
+        # WAIT it before this call: whether or not the generation matches, the
+        # side-stream expansion may be in flight over the same shared scratch
+        # this call's inline expansion would overwrite.
+        pending, owner.scale_prefetch = owner.scale_prefetch, None
+        if pending is not None:
+            stream.wait_event(pending[2])
+        self.backend.scales_expanded = (
+            token is not None
+            and pending is not None
+            and (pending[:2] == (self.layer_index, token))
         )
+        try:
+            result = run()
+        finally:
+            self.backend.scales_expanded = False
+        following = owner.scale_layers.get(self.layer_index + 1)
+        if (
+            token is not None
+            and following is not None
+            and self._expands(x)
+            and _batch_has_prefill_rows()
+        ):
+            # The next layer's MoE would expand its scales into the same
+            # scratch: do it now on a side stream, overlapping that layer's
+            # attention (NOT this layer's: it is already done).
+            from b12x.moe import fused_moe as b12x_fused_moe
+
+            self.moe_done.record(stream)
+            side = owner.scale_stream
+            side.wait_event(self.moe_done)
+            with torch.cuda.stream(side):
+                # Codex review fix: publish the (layer, token, event) triple
+                # ONLY after expand_scales() returns True. Its Boolean is the
+                # readiness contract -- fail closed on False (nothing was
+                # enqueued; no event, no pending triple) and, if it RAISES
+                # after side-stream work may already be enqueued over the
+                # shared scratch, preserve a dependency that later scratch
+                # reuse must wait: an await-only triple whose token is None
+                # can never match a live forward (consumption requires a
+                # real forward token), so it is drained/waited and dropped,
+                # never consumed.
+                try:
+                    expanded = bool(
+                        b12x_fused_moe.expand_scales(following.prepared)
+                    )
+                except Exception:
+                    following.scales_ready.record(side)
+                    owner.scale_prefetch = (
+                        following.layer_index,
+                        None,
+                        following.scales_ready,
+                    )
+                    raise
+                if expanded:
+                    following.scales_ready.record(side)
+                    owner.scale_prefetch = (
+                        following.layer_index,
+                        token,
+                        following.scales_ready,
+                    )
+        return result
+
+    def _expands(self, x: torch.Tensor) -> bool:
+        """Whether this call's consumers decode CSF scales into the scratch.
+
+        Codex review fix (P1) carried over from the X4T design: eligibility
+        is derived from the PREPARED CSF PAYLOAD, never from the NVFP4 knob.
+        History: the reviewed commit consulted
+        ``_w4a16_a4_prefill_enabled()`` (``B12X_W4A16_A4_PREFILL_MIN_TOKENS``,
+        an NVFP4 switch) while the MiMo launcher sets
+        ``B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS`` and leaves the NVFP4 knob
+        unset, so production MiMo never armed. On the 97fde4bd5-era bases
+        every consumer of a CSF payload consumes the shared native scale
+        grids: the per-call selective decode at launch fills them unless
+        ``bind(..., scales_expanded=True)`` skips it, and ALL routed
+        consumers -- the A16 runners (small-M direct arm, packed/direct
+        route) and the MXFP4 A4 prefill runner -- read the grids, so a
+        prepared payload retaining the ``nvfp4_csf`` decoder IS the
+        eligibility, and the knobs only pick WHICH consumer runs.
+
+        Codex §9.5 still holds: this says the consumer decodes into the
+        shared scratch, not that this call should arm -- the caller
+        separately requires actual prefill rows (``_batch_has_prefill_rows``)
+        and CUDA-graph capture excludes arming in ``apply``. Row
+        classification uses the host metadata's verification width
+        (``_spec_decode_query_width``), never
+        ``_num_leading_decode_tokens`` (that helper assumes query width <= 4
+        and reads ``query_start_loc.tolist()``; it is not a DFlash7
+        classifier and is not used here).
+        """
+        prepared = getattr(self, "prepared", None)
+        decoder = getattr(getattr(prepared, "_impl", None), "nvfp4_csf", None)
+        return decoder is not None

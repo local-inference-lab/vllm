@@ -5,8 +5,33 @@
 Compressed routed experts are owned by the model's quantization method.
 Engram tensors retain their immutable file-range descriptors, avoiding full
 CPU/GPU staging allocations for the host-mapped embedding tables.
+
+[heo 2026-10-05, turin local overlay — MiMo-V2.6-Pro support, private]
+Additions vs kk-beta 6008f020 (everything else verbatim):
+  * FAMILIES += "mimo_v26_pro_mxfp4": (384, 6144, 2048, range(1, 70))
+    (69 MoE layers; layer 0 dense per moe_layer_freq)
+  * expert_tensor_names: MiMo branch — model.layers.N.mlp.experts.E with
+    {gate,up,down}_proj.{weight,weight_scale} names (gate-first order to
+    match W13Layout.W31, proven byte-exact by the TP8 harness 2026-10-05)
+  * Mxfp4CsfModelLoader._root: accept the MiMo source config's
+    quant_method="fp8" + store_dtype="mxfp4" (hybrid FP8 dense / MXFP4
+    experts checkpoint) and resolve checkpoint_root from MIMO_CSF_ROOT when
+    the config omits it; read_csf_contract still validates family/schema/
+    codec, so acceptance is not unconditional.
+  * get_all_weights: the expert-skip regex also matches `mlp.experts`
+    (MiMo namespace) alongside ffn/block_sparse_moe.
+  * [csfdelta 2026-10-12] `_load_mxfp4_csf_weights` constructs legacy-encoding
+    (`encoding="csf"`) `b12x.loader._csf_source.CsfSource` planes instead of
+    the pre-97fde4bd5 `CsfScalePlanes` type: FlashInfer 97fde4bd5/7e5a142e9
+    replaced per-expert host planes with CsfSource (batched components +
+    per-segment exception starts) and moved scale expansion onto CUDA, so
+    the old symbol no longer exists on the paired flashinfer kk-mimo branch
+    and its import failed at weight-load time. The sliced slab layout and
+    u24 exception words are byte-identical under both spellings.
 """
 
+import hashlib
+import os
 import time
 from collections.abc import Iterable
 from functools import lru_cache
@@ -36,6 +61,7 @@ FAMILIES = {
     "deepseek_v41": (384, 5120, 2304, range(40)),
     "deepseek_v4_flash": (256, 4096, 2048, range(43)),
     "kimi_k3": (896, 3584, 3072, range(1, 93)),
+    "mimo_v26_pro_mxfp4": (384, 6144, 2048, range(1, 70)),
 }
 
 
@@ -53,13 +79,20 @@ def expert_tensor_names(family, layer_index, expert):
             f"block_sparse_moe.experts.{expert}"
         )
         weight, scale = "weight_packed", "weight_scale"
+        order = ("w1", "w3", "w2")
+    elif family == "mimo_v26_pro_mxfp4":
+        prefix = f"model.layers.{layer_index}.mlp.experts.{expert}"
+        weight, scale = "weight", "weight_scale"
+        # gate-first: W13Layout.W31 fusion order (vLLM fuses [gate; up])
+        order = ("gate_proj", "up_proj", "down_proj")
     else:
         # DeepSeek-V4.1-Flash and DeepSeek-V4-Flash, including its vision
         # variant, keep DeepSeek's native routed-expert names.
         prefix = f"layers.{layer_index}.ffn.experts.{expert}"
         weight, scale = "weight", "scale"
+        order = ("w1", "w3", "w2")
     return tuple(
-        (f"{prefix}.{p}.{weight}", f"{prefix}.{p}.{scale}") for p in ("w1", "w3", "w2")
+        (f"{prefix}.{p}.{weight}", f"{prefix}.{p}.{scale}") for p in order
     )
 
 
@@ -177,7 +210,8 @@ def _load_mxfp4_csf_weights(
     stores, manifests and model-specific tensor names belong to the caller.
     Expanded scale buffers remain caller-owned for serialized layer execution.
     """
-    from b12x.moe.fused_moe import CsfScalePlanes, Mxfp4CsfWeights
+    from b12x.loader._csf_source import CsfSource
+    from b12x.moe.fused_moe import Mxfp4CsfWeights
 
     if num_experts <= 0 or hidden_size <= 0 or hidden_size % 64:
         raise ValueError("MXFP4-CSF requires experts and 64-aligned hidden channels")
@@ -238,35 +272,177 @@ def _load_mxfp4_csf_weights(
                 exceptions2.append(exceptions)
         fixed13.append(torch.cat(f13))
         exceptions13.append(torch.cat(e13))
+
+    def csf_source(fixed, exceptions, rows, columns):
+        """Batch sliced per-expert slab planes into one legacy ``CsfSource``.
+
+        The sliced planes already carry the checkpoint's row-base/selector slab
+        layout (16 base bytes followed by packed one-bit selector bytes per
+        16-row slab) and u24-position exception words; the FlashInfer
+        ``"csf"`` CsfSource encoding is byte-identical, so the slices upload
+        verbatim and the b12x preparation expands them into the native scale
+        layout on CUDA (FlashInfer 7e5a142e9) instead of the caller decoding
+        scale values on the host. ``starts`` segments the concatenated
+        exception words per expert.
+        """
+        sizes = [int(t.numel()) for t in exceptions]
+        starts = torch.zeros(len(sizes) + 1, dtype=torch.int64)
+        torch.cumsum(torch.tensor(sizes, dtype=torch.int64), 0, out=starts[1:])
+        return CsfSource(
+            (torch.stack(fixed), torch.cat(exceptions)),
+            starts,
+            rows,
+            columns,
+            "mxfp4",
+            len(sizes),
+            encoding="csf",
+        )
+
     return Mxfp4CsfWeights(
         w13=w13.to(device),
         w2=w2.to(device),
-        w13_scales=CsfScalePlanes(tuple(fixed13), tuple(exceptions13)),
-        w2_scales=CsfScalePlanes(tuple(fixed2), tuple(exceptions2)),
+        w13_scales=csf_source(
+            fixed13, exceptions13, 2 * local, hidden_size // 32
+        ),
+        w2_scales=csf_source(fixed2, exceptions2, hidden_size, local // 32),
         w13_scale_scratch=w13_scale_scratch,
         w2_scale_scratch=w2_scale_scratch,
     )
 
 
 class Mxfp4CsfModelLoader(DefaultModelLoader):
-    def _root(self, model_config):
+    # [heo overlay] structural geometry + identity gate: the container contract
+    # must match the model config's expert geometry AND be pinned to the exact
+    # source checkpoint identity (review §21-P1.4), otherwise this is NOT the
+    # CSF main model (e.g. the DFlash draft) and must not be CSF-loaded.
+    @staticmethod
+    def _text_geometry(text_config):
+        return (
+            getattr(text_config, "n_routed_experts", None),
+            getattr(text_config, "hidden_size", None),
+            getattr(text_config, "moe_intermediate_size", None),
+        )
+
+    def _resolve_csf_root(self, quant, text_config, model_root=None):
+        """Validated CSF container root for THIS model, or None (pass-through).
+
+        None means: load this model with a DEFAULT-format loader (draft models,
+        non-MiMo models served under the same load format).
+        """
+        if not isinstance(quant, dict):
+            return None
+        stored = quant.get("quant_method")
+        root = None
+        if stored == "mxfp4_csf":
+            root = quant.get("checkpoint_root") or os.environ.get("MIMO_CSF_ROOT")
+        elif (
+            stored == "fp8"
+            and quant.get("store_dtype") == "mxfp4"
+            and getattr(text_config, "model_type", "").startswith("mimo_v2")
+        ):
+            # Hybrid MiMo source checkpoint: FP8 dense + MXFP4 routed experts.
+            root = quant.get("checkpoint_root") or os.environ.get("MIMO_CSF_ROOT")
+        if not root:
+            return None
+        root_path = Path(root)
+        if not root_path.is_absolute():
+            raise ValueError("MXFP4-CSF checkpoint_root must be an absolute local path")
+        contract = checkpoint_contract(str(root_path.resolve()))
+        e, h, n, _ = FAMILIES[contract["family"]]
+        # Strict geometry + identity contract is scoped to the MiMo family
+        # only (Codex §12.2): upstream families keep their stock pass-through
+        # behavior for geometry-mismatched configs, unchanged by this commit.
+        if contract["family"] == "mimo_v26_pro_mxfp4":
+            if self._text_geometry(text_config) != (e, h, n):
+                # Geometry mismatch: not the model this container was built for.
+                if stored == "mxfp4_csf":
+                    raise ValueError(
+                        "MXFP4-CSF container geometry does not match the model config"
+                    )
+                return None
+        # [heo overlay] Identity pin (§21-P1.4, hardened §23-P1): MANDATORY
+        # for the CSF main target, scoped to the MiMo family (Codex §12.2):
+        # our containers record source_index_sha256 and the serving tree must
+        # carry a matching index. Upstream families keep stock behavior
+        # (no identity pin) — their fixtures and containers predate it.
+        if contract["family"] == "mimo_v26_pro_mxfp4":
+            if model_root is None:
+                raise ValueError(
+                    "MXFP4-CSF loading requires the model path for identity pinning"
+                )
+            index_path = Path(model_root) / "model.safetensors.index.json"
+            if not index_path.is_file():
+                raise ValueError(
+                    f"MXFP4-CSF identity pin requires {index_path} (not found)"
+                )
+            actual = hashlib.sha256(index_path.read_bytes()).hexdigest()
+            recorded = contract.get("source_index_sha256")
+            if not recorded:
+                raise ValueError(
+                    "MXFP4-CSF container contract lacks source_index_sha256 - "
+                    "identity pin is mandatory (§23-P1)"
+                )
+            if actual != recorded:
+                raise ValueError(
+                    "MXFP4-CSF container was built from a different source "
+                    f"checkpoint (index sha {actual[:16]}… != container "
+                    f"record {recorded[:16]}…) - refusing to load"
+                )
+        # Path, not str: get_all_weights() applies `/` to this value (§23-P0).
+        return root_path, contract
+
+    def _resolve_for(self, model_config):
+        """(resolved-root-or-None, text_config, quant, model_root)."""
         text_config = getattr(model_config, "hf_text_config", model_config.hf_config)
-        quant = getattr(model_config.hf_config, "quantization_config", None)
-        quant = quant or text_config.quantization_config
-        if quant.get("quant_method") not in ("mxfp4_csf",):
+        hf_config = model_config.hf_config
+        quant = getattr(hf_config, "quantization_config", None)
+        if not isinstance(quant, dict):
+            # Draft models may have NO quantization_config at all (the real
+            # DFlash draft does not) - plain pass-through (review §21-P0.2).
+            quant = getattr(text_config, "quantization_config", None)
+        model_root = getattr(model_config, "model", None) or getattr(
+            model_config, "model_path", None
+        )
+        resolved = self._resolve_csf_root(quant, text_config, model_root)
+        return resolved, text_config, quant, model_root
+
+    @staticmethod
+    def _default_loader_for(model_config):
+        """A DefaultModelLoader with a SUPPORTED load format for pass-through
+        models (review §21-P0.2: DefaultModelLoader rejects load_format
+        mxfp4_csf; never delegate on the CSF LoadConfig)."""
+        from vllm.config import LoadConfig
+
+        load_config = model_config.load_config if hasattr(model_config, "load_config") else None
+        fmt = getattr(load_config, "load_format", None) if load_config else None
+        if fmt in (None, "auto", "mxfp4_csf"):
+            fmt = "auto"
+        fresh = LoadConfig(load_format=fmt)
+        return DefaultModelLoader(fresh)
+
+    def _root(self, model_config):
+        resolved, _, _, _ = self._resolve_for(model_config)
+        if resolved is None:
             raise ValueError(
                 "MXFP4-CSF loading requires a compressed-scale model config"
             )
-        root = Path(quant["checkpoint_root"])
-        if not root.is_absolute():
-            raise ValueError("MXFP4-CSF checkpoint_root must be an absolute local path")
-        return root, checkpoint_contract(str(root.resolve()))
+        return resolved
 
     def download_model(self, model_config):
-        self._root(model_config)
+        resolved, _, _, _ = self._resolve_for(model_config)
+        if resolved is None:
+            # [heo overlay] pass-through with a SUPPORTED load format.
+            self._default_loader_for(model_config).download_model(model_config)
 
     def get_all_weights(self, model_config, model):
-        root, contract = self._root(model_config)
+        resolved, _, _, _ = self._resolve_for(model_config)
+        if resolved is None:
+            # [heo overlay] pass-through with a SUPPORTED load format.
+            yield from self._default_loader_for(model_config).get_all_weights(
+                model_config, model
+            )
+            return
+        root, contract = resolved
         if getattr(model, "secondary_weights", ()):
             raise NotImplementedError(
                 "MXFP4-CSF does not support secondary weight sources"
@@ -284,7 +460,7 @@ class Mxfp4CsfModelLoader(DefaultModelLoader):
                     if prefixes is not None and not name.startswith(prefixes):
                         continue
                     match = re.search(
-                        r"(?:^|\.)layers\.(\d+)\.(?:ffn|block_sparse_moe)\.experts\.",
+                        r"(?:^|\.)layers\.(\d+)\.(?:ffn|block_sparse_moe|mlp)\.experts\.",
                         name,
                     )
                     if match and int(match.group(1)) < layers:

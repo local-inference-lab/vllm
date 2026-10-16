@@ -104,7 +104,8 @@ def prepare_nvfp4_csf_weights(
     projection in the packed layout; it is used as the weight storage, and
     the projections then supply only scales and calibration.
     """
-    from b12x.moe.fused_moe import CsfScalePlanes, Nvfp4CsfWeights, PackedWeights
+    from b12x.loader._csf_source import CsfSource
+    from b12x.moe.fused_moe import Nvfp4CsfWeights, PackedWeights
 
     if num_experts <= 0 or hidden_size <= 0 or hidden_size % 128:
         raise ValueError("NVFP4-CSF requires experts and 128-aligned hidden channels")
@@ -215,6 +216,37 @@ def prepare_nvfp4_csf_weights(
         a13[expert] = torch.stack(input13).amax()
         fixed13.append(np.concatenate(f13))
         exceptions13.append(np.concatenate(e13))
+
+    def csf_source(fixed, exceptions, rows, columns):
+        """Batch sliced per-expert slab planes into one legacy ``CsfSource``.
+
+        The sliced planes already carry the checkpoint's four-bit row-offset
+        slab layout (16 base bytes followed by packed nibble-pair selector
+        bytes per 16-row slab) and u24-position exception words; the
+        FlashInfer ``"csf"`` CsfSource encoding is byte-identical, so the
+        slices upload verbatim and the b12x preparation expands them into
+        the native scale layout on CUDA (FlashInfer 7e5a142e9). Padded TP
+        shards are materialized by the slicing above, so the source geometry
+        is the padded local rectangle. ``starts`` segments the concatenated
+        exception words per expert.
+        """
+        sizes = [int(p.size) for p in exceptions]
+        starts = torch.from_numpy(
+            np.concatenate(([np.int64(0)], np.cumsum(sizes, dtype=np.int64)))
+        )
+        return CsfSource(
+            (
+                torch.from_numpy(np.stack(fixed)),
+                torch.from_numpy(np.concatenate(exceptions)),
+            ),
+            starts,
+            rows,
+            columns,
+            "nvfp4",
+            len(sizes),
+            encoding="csf",
+        )
+
     return Nvfp4CsfWeights(
         packed=PackedWeights(
             w13=w13.to(device),
@@ -227,12 +259,6 @@ def prepare_nvfp4_csf_weights(
             intermediate_scale=a2.to(device).reciprocal(),
             immutable_input_scales=True,
         ),
-        w13_scales=CsfScalePlanes(
-            tuple(torch.from_numpy(p) for p in fixed13),
-            tuple(torch.from_numpy(p) for p in exceptions13),
-        ),
-        w2_scales=CsfScalePlanes(
-            tuple(torch.from_numpy(p) for p in fixed2),
-            tuple(torch.from_numpy(p) for p in exceptions2),
-        ),
+        w13_scales=csf_source(fixed13, exceptions13, 2 * local, hidden_size // 16),
+        w2_scales=csf_source(fixed2, exceptions2, hidden_size, local // 16),
     )

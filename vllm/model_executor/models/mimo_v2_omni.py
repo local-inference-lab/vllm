@@ -694,7 +694,7 @@ class MiMoV2OmniProcessingInfo(BaseProcessingInfo):
     def get_data_parser(self):
         from vllm.multimodal.parse import MultiModalDataParser
 
-        return MultiModalDataParser(target_sr=24000.0)
+        return MultiModalDataParser(target_sr=24000.0, target_channels=1)
 
     def get_mm_max_tokens_per_item(
         self,
