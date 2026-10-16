@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-mimo-tp3",
+  "category": "feature",
+  "summary": "Serve MiMo-V2.6-Flash at tensor parallel size 3 with zero-padded attention heads, routed-expert width and vocabulary",
+  "models": ["MiMo-V2.6-Flash"],
+  "compatibility": "No user action required.",
+  "details": [
+    "At tensor parallel size 3 the query, full-attention KV and SWA KV head counts pad to 96, 6 and 12 so each rank holds whole 128-row fp8 scale blocks; ranks 0 and 1 take whole checkpoint QKV groups and the padded rows on the last rank are zeros.",
+    "The routed-expert intermediate pads to a multiple of lcm(TP, 128) and the vocabulary, embeddings and logits head pad to multiples of 128.",
+    "The mimo_tp3 general plugin sets the padded head counts before model construction, runs the multimodal towers data parallel and replicates the vision attention across ranks.",
+    "Tensor parallel sizes other than 3 keep their previous shapes and loaders."
+  ],
+  "authors": ["peperunas"]
+}
