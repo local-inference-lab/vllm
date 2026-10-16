@@ -59,10 +59,31 @@ The settings control different parts of caching:
 | Setting | Purpose |
 | --- | --- |
 | `--mamba-cache-mode align` | Maintains the running recurrent state and temporary speculative rollback states. |
-| `--recurrent-checkpoint-policy request_boundaries` | Publishes reusable state after a verified leading system/developer segment, the full prompt, and the processed response endpoint. Arbitrary intermediate recurrent checkpoints are disabled. |
+| `--recurrent-checkpoint-policy request_boundaries` | Publishes reusable state after a verified leading system/developer segment, a prefill-tail fallback, the full prompt, and the processed response endpoint. Arbitrary intermediate recurrent checkpoints are disabled. |
 | `--recurrent-checkpoint-policy aligned` | Uses the previous block-aligned checkpoint policy. |
 | `--recurrent-checkpoint-policy auto` | Selects request boundaries for supported configurations and the aligned policy otherwise. |
 | `--prefix-cache-retention-interval` | Controls intermediate retention under the aligned policy; it does not add recurrent checkpoints under the request-boundary policy. |
+
+The prefill-tail checkpoint provides a fallback when extending a conversation
+changes tokens near the end of the preceding prompt. For example, serializing an
+assistant history without its reasoning can change the final newline token of a
+thinking prompt, invalidating the full-prompt checkpoint.
+
+`--recurrent-prefill-tail-stride` caps the token stride used to place this single
+fallback. When unset, the stride is the scheduler chunk budget. A positive value
+uses `min(chunk_budget, recurrent_prefill_tail_stride)`, and the endpoint is
+`(prompt_tokens // stride - 1) * stride`. It is omitted if it does not follow the
+instruction checkpoint or is not positive. This setting applies only when the
+request-boundary policy is active, including selection through `auto`.
+
+For example, with a 4,096-token scheduler budget and a 64,632-token prompt, the
+default endpoint is 57,344. Adding `--recurrent-prefill-tail-stride 256` places it
+at 64,256, leaving 376 tokens to replay after a final-token edit. The smaller
+stride favors small suffix changes; edits before the saved prefix still miss.
+Keeping the default can recover larger suffix edits. The setting reuses the same
+checkpoint slot, but can make it reachable for shorter prompts: a stride of 256
+allows a positive endpoint from 512 prompt tokens. Capacity estimation includes
+this bundle whenever it is reachable.
 
 The response checkpoint covers committed tokens that the model actually
 processed. The final emitted token usually has not been processed, so the next

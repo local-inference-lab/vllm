@@ -165,13 +165,20 @@ class CacheConfig:
     Applies only to sliding-window and Mamba cache groups."""
     recurrent_checkpoint_policy: RecurrentCheckpointPolicy = "auto"
     """Retention policy for reusable recurrent state. ``request_boundaries``
-    retains a verified leading chat-instruction prefix, one prefill checkpoint
-    before the final chunk of a long prompt, the completed prompt,
+    retains a verified leading chat-instruction prefix, one prefill-tail
+    checkpoint, the completed prompt,
     and the committed response endpoint, disabling arbitrary intermediate
     checkpoints. ``aligned`` preserves block-aligned retention. ``auto`` selects
     request boundaries for supported configurations and aligned retention
     otherwise. Temporary speculative rollback state is independent of this
     policy."""
+    recurrent_prefill_tail_stride: int | None = Field(default=None, gt=0)
+    """Cap the token stride used to place the single prefill-tail checkpoint
+    under the request-boundary policy. None uses the scheduler chunk budget.
+    A positive value uses the smaller of that value and the chunk budget,
+    leaving one to two strides before the prompt end. Smaller strides reduce
+    replay for small suffix edits but cannot recover edits before the saved
+    prefix. This does not add checkpoint slots or affect aligned retention."""
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
@@ -292,6 +299,7 @@ class CacheConfig:
             "prefix_caching_hash_algo",
             "prefix_cache_retention_interval",
             "recurrent_checkpoint_policy",
+            "recurrent_prefill_tail_stride",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "prefix_match_unit",
             "enable_mamba_fine_grained_prefix_cache",

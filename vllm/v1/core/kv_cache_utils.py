@@ -1099,7 +1099,10 @@ def _request_boundary_reserve_blocks(vllm_config: VllmConfig, num_groups: int) -
     )
     has_prefill_tail = (
         get_prefill_tail_checkpoint_position(
-            vllm_config.model_config.max_model_len, chunk_budget, None
+            vllm_config.model_config.max_model_len,
+            chunk_budget,
+            None,
+            getattr(vllm_config.cache_config, "recurrent_prefill_tail_stride", None),
         )
         is not None
     )

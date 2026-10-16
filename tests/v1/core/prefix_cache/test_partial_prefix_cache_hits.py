@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from tests.v1.core.test_prefix_caching import make_kv_cache_manager, make_request
+from vllm.config import CacheConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
 from vllm.utils.hashing import sha256
 from vllm.v1.core.boundary_checkpoint import get_prefill_tail_checkpoint_position
@@ -2702,32 +2703,68 @@ def test_request_boundaries_split_prefill_at_instruction_endpoint():
 
 
 @pytest.mark.parametrize(
-    "prompt,budget,instruction,expected",
+    "prompt,budget,instruction,stride,expected",
     [
-        (8191, 4096, None, None),
-        (8192, 4096, None, 4096),
-        (10000, 4096, None, 4096),
-        (520013, 3072, None, 516096),
-        (12000, 4096, 5000, None),
-        (16000, 4096, 5000, 8192),
+        (8191, 4096, None, None, None),
+        (8192, 4096, None, None, 4096),
+        (10000, 4096, None, None, 4096),
+        (520013, 3072, None, None, 516096),
+        (12000, 4096, 5000, None, None),
+        (16000, 4096, 5000, None, 8192),
+        (64632, 4096, None, None, 57344),
+        (64632, 4096, None, 256, 64256),
+        (130164, 4096, None, 256, 129792),
+        (244854, 4096, None, 256, 244480),
+        (511, 4096, None, 256, None),
+        (512, 4096, None, 256, 256),
+        (512, 4096, 256, 256, None),
+        (512, 4096, 255, 256, 256),
+        (512, 128, None, 256, 384),
+        (8192, 4096, None, 8192, 4096),
+        (512, 0, None, 256, None),
     ],
 )
 def test_prefill_tail_leaves_a_bounded_suffix_without_duplicating_instructions(
-    prompt, budget, instruction, expected
+    prompt, budget, instruction, stride, expected
 ):
-    assert get_prefill_tail_checkpoint_position(prompt, budget, instruction) == expected
+    assert (
+        get_prefill_tail_checkpoint_position(prompt, budget, instruction, stride)
+        == expected
+    )
 
 
-def test_request_boundaries_stop_at_instruction_and_prefill_tail_once():
+@pytest.mark.parametrize(
+    "stride,endpoint,stops",
+    [
+        (None, 4096, [(0, 3000), (3000, 1096), (4096, 4096)]),
+        (256, 8704, [(0, 3000), (3000, 4096), (7096, 1608), (8704, 296)]),
+    ],
+)
+def test_request_boundaries_stop_at_instruction_and_prefill_tail_once(
+    stride, endpoint, stops
+):
     request = make_request("chat", [0] * 9000, 32, sha256)
     request.use_boundary_checkpoints = True
     request.recurrent_instruction_boundary = 3000
-    request.recurrent_prefill_tail_boundary = 4096
-    scheduler = SimpleNamespace()
-    for start, expected in ((0, 3000), (3000, 1096), (4096, 4096)):
+    scheduler = SimpleNamespace(
+        requests={},
+        kv_cache_manager=SimpleNamespace(boundary_checkpoints=object()),
+        cache_config=CacheConfig(recurrent_prefill_tail_stride=stride),
+        max_num_scheduled_tokens=4096,
+        _enqueue_waiting_request=MagicMock(),
+        spec_decode_metrics_level="none",
+        connector=None,
+        log_stats=False,
+    )
+    Scheduler.add_request(scheduler, request)
+    assert request.recurrent_prefill_tail_boundary == endpoint
+    for start, expected in stops:
         request.num_computed_tokens = start
         assert (
-            Scheduler._mamba_block_aligned_split(scheduler, request, 4096) == expected
+            Scheduler._mamba_block_aligned_split(
+                scheduler, request, min(4096, request.num_prompt_tokens - start)
+            )
+            == expected
         )
     request.num_computed_tokens = 0
     assert (
@@ -2769,7 +2806,10 @@ def test_optional_boundary_slots_allocate_only_active_bundles(instruction, tail)
 
 
 @pytest.mark.parametrize("dcp", [1, 2, 4])
-def test_prefill_tail_recovers_suffix_edits_but_never_earlier_divergence(dcp):
+@pytest.mark.parametrize("stride,endpoint", [(None, 16), (4, 24), (7, 21)])
+def test_prefill_tail_recovers_suffix_edits_but_never_earlier_divergence(
+    dcp, stride, endpoint
+):
     manager = make_full_mamba_manager(
         dcp_world_size=dcp,
         hash_block_size=4,
@@ -2779,20 +2819,25 @@ def test_prefill_tail_recovers_suffix_edits_but_never_earlier_divergence(dcp):
     )
     tokens = list(range(29))
     producer = make_request("producer", tokens, 4, sha256)
-    producer.recurrent_prefill_tail_boundary = 17
+    producer.recurrent_prefill_tail_boundary = get_prefill_tail_checkpoint_position(
+        len(tokens), 8, None, stride
+    )
+    assert producer.recurrent_prefill_tail_boundary == endpoint
     manager.get_computed_blocks(producer)
-    assert manager.allocate_slots(producer, 17) is not None
-    tail = manager.publish_boundary_checkpoint(producer, 17, kind="prefill_tail")
+    assert manager.allocate_slots(producer, endpoint) is not None
+    tail = manager.publish_boundary_checkpoint(producer, endpoint, kind="prefill_tail")
     assert tail is not None and tail.kind == "prefill_tail"
-    producer.num_computed_tokens = 17
-    assert manager.allocate_slots(producer, 12) is not None
+    producer.num_computed_tokens = endpoint
+    assert manager.allocate_slots(producer, len(tokens) - endpoint) is not None
     assert manager.publish_boundary_checkpoint(producer, 29, kind="prompt") is not None
     manager.free(producer)
 
     for name, suffix, expected in (
         ("extended", tokens + [80, 81], 29),
-        ("tail-edit", tokens[:27] + [80, 81, 82], 17),
-        ("earlier-edit", tokens[:16] + [80] + tokens[17:], 0),
+        ("last-token-edit", tokens[:-1] + [80, 81], endpoint),
+        ("tail-edit", tokens[:27] + [80, 81, 82], endpoint),
+        ("larger-tail-edit", tokens[:22] + [80], endpoint if endpoint <= 22 else 0),
+        ("earlier-edit", tokens[:15] + [80] + tokens[16:], 0),
     ):
         consumer = make_request(name, suffix, 4, sha256)
         blocks, hit, _ = manager.get_computed_blocks(consumer)

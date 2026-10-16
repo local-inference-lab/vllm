@@ -3540,6 +3540,7 @@ class Scheduler(SchedulerInterface):
                         request.num_prompt_tokens,
                         self.max_num_scheduled_tokens,
                         request.recurrent_instruction_boundary,
+                        self.cache_config.recurrent_prefill_tail_stride,
                     )
                 )
             if request.resumable:

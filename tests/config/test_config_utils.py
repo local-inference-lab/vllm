@@ -255,6 +255,20 @@ def test_cache_config_hash_ignores_prefix_cache_retention_interval():
     assert CacheConfig(prefix_cache_retention_interval=64).compute_hash() == base_hash
 
 
+@pytest.mark.parametrize("stride", [1, 256, 8192])
+def test_prefill_tail_stride_does_not_change_compilation(stride):
+    assert (
+        CacheConfig(recurrent_prefill_tail_stride=stride).compute_hash()
+        == CacheConfig().compute_hash()
+    )
+
+
+@pytest.mark.parametrize("stride", [0, -1])
+def test_prefill_tail_stride_rejects_nonpositive_values(stride):
+    with pytest.raises(ValueError, match="recurrent_prefill_tail_stride"):
+        CacheConfig(recurrent_prefill_tail_stride=stride)
+
+
 def test_swa_page_sizes_have_distinct_compile_cache_hashes():
     configs = (
         CacheConfig(swa_block_size=32),
