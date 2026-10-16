@@ -645,6 +645,33 @@ def test_mla_dcp_b12x_is_serial_and_capacity_bounded(monkeypatch, ubatches):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mla_dcp_exchange_uses_rank_gpu_for_meta_weights(monkeypatch):
+    """Online quantization builds the attention weights on the meta device."""
+    from vllm.distributed.device_communicators import b12x_dcp
+
+    monkeypatch.setattr(dcp, "get_dcp_group", lambda: MagicMock(world_size=2))
+    factory = MagicMock(return_value=MagicMock(max_tokens=4))
+    monkeypatch.setattr(b12x_dcp, "get_b12x_dcp_transport", factory)
+    manager = dcp.MLADCPManager(
+        vllm_config=_manager_config(),
+        device=torch.device("meta"),
+        num_heads=2,
+        query_head_dim=576,
+        output_head_dim=512,
+        query_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        padded_num_heads=None,
+        is_lse_base_on_e=True,
+        use_pcp=False,
+        use_b12x=True,
+    )
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    assert manager.device == device
+    assert factory.call_args.args[1] == device
+
+
 def test_mla_dcp_manager_selects_pcp_combine(monkeypatch):
     import vllm.v1.attention.ops.dcp as dcp_manager
 

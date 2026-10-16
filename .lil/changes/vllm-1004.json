@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-1004",
+  "category": "performance",
+  "summary": "GLM-5.3 (744B) with decode context parallelism prefills prompts that arrive while other requests decode up to 17x faster",
+  "models": ["GLM-5.3"],
+  "compatibility": "Opt-in: set VLLM_B12X_MLA_CKV_GATHER_MIXED=1 together with VLLM_B12X_MLA_CKV_GATHER=1 for GLM-5.3 DSA launches with DCP > 1. Decode-only steps, pure prefill batches, DCP1 and GLM-5.3-Flash are unchanged.",
+  "details": [
+    "Batches that mix a prefill chunk with decode rows used to exchange every head's queries and outputs for all rows. Their prefill rows now attend over the gathered compressed KV cache of their own requests, and only the decode rows keep the query exchange and LSE combine.",
+    "GLM-5.3-NVFP4-CSF (MTP3) on RTX PRO 6000, 64 concurrent 8K prompts / TTFT of a 128K prompt arriving into 16 decoding streams: TP8 DCP8 1,333 -> 102 s / 385.5 -> 22.9 s; TP8 DCP2 99.7 -> 83.5 s / 22.2 -> 18.7 s; TP6 DCP3 181 -> 127 s / 42.6 -> 31.6 s; TP6 DCP6 255 -> 131 s / 71.7 -> 32.6 s.",
+    "MTP acceptance is unchanged (0.791 against 0.793 greedy) and peak GPU memory is the same or lower: TP8 DCP8 keeps 4.2 GiB free instead of 2.6 GiB under 64 concurrent prefills."
+  ],
+  "authors": ["voipmonitor"],
+  "pull_requests": [1004],
+  "requires": ["vllm-998"]
+}

@@ -1,0 +1,16 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-1000",
+  "category": "performance",
+  "summary": "GLM-5.3 (744B) MTP can draft with an NVFP4 copy of the vocabulary head",
+  "models": ["GLM-5.3"],
+  "compatibility": "Opt-in: VLLM_GLM53_MTP_DRAFT_HEAD=nvfp4. The default BF16 draft head and GLM-5.3-Flash are unchanged.",
+  "details": [
+    "The GLM-5.3 (744B) MTP layer drafts with a W4A16 NVFP4 copy of the shared vocabulary head, as GLM-5.3-Flash already can, while the verifier keeps its own head. A target head already packed by VLLM_MXFP8_LM_HEAD drafts as is.",
+    "Vocabulary shards that are not a multiple of the 64-row CuTe-DSL tile (19,360 rows at TP8) are padded with zero rows whose logits are dropped.",
+    "TP8 DCP1 on 8x RTX PRO 6000 (GLM-5.3-NVFP4-CSF, MTP3): decode steps/s +2.4% at C1 (87.6 -> 89.7) and +0.2-0.7% at C2/C4; acceptance 2.57 -> 2.52 tokens per step on random text and 3.29 -> 3.39 on coding prompts; 0.4% fewer KV tokens (the copy takes 63.9 MiB per GPU)."
+  ],
+  "authors": ["voipmonitor"],
+  "pull_requests": [1000],
+  "requires": []
+}

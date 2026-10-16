@@ -60,6 +60,7 @@ from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     _round_up_ckv_rank_tokens,
     _selected_index_block_stride_rows,
     _use_b12x_full_ckv_gather,
+    _use_b12x_split_ckv_gather,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import _remap_tiling
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -857,12 +858,13 @@ def test_b12x_full_ckv_gather_admits_glm_dsa_eager_prefill(
 
 
 def _bare_glm_dsa_ckv_metadata_builder(
-    *, dcp_rank: int, max_tokens: int = 64, max_reqs: int = 4
+    *, dcp_rank: int, max_tokens: int = 64, max_reqs: int = 4, split: bool = False
 ) -> B12xMLASparseMetadataBuilder:
     builder = B12xMLASparseMetadataBuilder.__new__(B12xMLASparseMetadataBuilder)
     builder.requires_glm_next_selector_metadata = False
     builder._is_glm_dsa = True
     builder._ckv_gather_requested = True
+    builder._ckv_split_requested = split
     builder.dcp_world_size = 2
     builder.dcp_rank = dcp_rank
     builder.cp_kv_cache_interleave_size = 1
@@ -949,6 +951,94 @@ def test_glm_dsa_builder_gathers_full_ckv_only_for_eager_prefill(
     # Two 32-token rank spans form one 64-token page of the gathered cache.
     assert metadata.dcp_padded_total_tokens == 32
     assert metadata.ckv_selected_indices.shape == (rows, 2048)
+    assert torch.equal(metadata.global_cache_seq_lens_per_req, global_seq_lens)
+
+
+@pytest.mark.parametrize(
+    ("is_glm_dsa", "num_decode_tokens", "num_prefills", "prefill_tokens", "expected"),
+    [
+        (True, 8, 1, 8192, True),
+        (True, 0, 1, 8192, False),  # pure prefill takes the full-batch gather
+        (True, 8, 0, 0, False),  # pure decode keeps the query exchange
+        (True, 8, 1, 8, False),  # too few prefill rows to pay for a gather
+        (True, 8, 1, 600000, False),  # beyond the gathered-cache capacity
+        (False, 8, 1, 8192, False),  # GLM5Next keeps its own policy
+    ],
+)
+def test_b12x_split_ckv_gather_needs_a_mixed_glm_dsa_batch(
+    is_glm_dsa: bool,
+    num_decode_tokens: int,
+    num_prefills: int,
+    prefill_tokens: int,
+    expected: bool,
+) -> None:
+    assert (
+        _use_b12x_split_ckv_gather(
+            enabled=True,
+            is_glm_dsa=is_glm_dsa,
+            dcp_world_size=2,
+            num_decode_tokens=num_decode_tokens,
+            num_prefills=num_prefills,
+            num_prefill_tokens=prefill_tokens,
+            min_tokens=16,
+            max_tokens=524288,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize("dcp_rank", [0, 1])
+@pytest.mark.parametrize("split", [False, True])
+def test_glm_dsa_builder_gathers_only_the_prefill_requests_of_a_mixed_batch(
+    monkeypatch: pytest.MonkeyPatch, dcp_rank: int, split: bool
+) -> None:
+    # Request 0 decodes 4 verification rows over 50 tokens; request 1
+    # prefills a 24-token chunk of a 40-token prompt.
+    query_lens = [4, 24]
+    seq_lens = [50, 40]
+    rows = sum(query_lens)
+    monkeypatch.setattr(
+        SparseMLACommonMetadataBuilder,
+        "build",
+        lambda *args, **kwargs: SimpleNamespace(
+            num_prefills=1,
+            num_decodes=1,
+            num_decode_tokens=4,
+            dcp_ckv_gather_eligible=False,
+            dcp_ckv_split_eligible=False,
+        ),
+    )
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
+    builder = _bare_glm_dsa_ckv_metadata_builder(dcp_rank=dcp_rank, split=split)
+    query_start_loc = torch.tensor([0, query_lens[0], rows], dtype=torch.int32)
+    global_seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+    common = SimpleNamespace(
+        num_reqs=2,
+        num_actual_tokens=rows,
+        max_query_len=max(query_lens),
+        seq_lens=global_seq_lens,
+        dcp_local_seq_lens=(global_seq_lens + 1 - dcp_rank) // 2,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc,
+        seq_lens_cpu=global_seq_lens,
+        seq_lens_cpu_upper_bound=global_seq_lens,
+        positions=None,
+        is_prefilling=torch.tensor([False, True]),
+    )
+
+    metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+    assert metadata.dcp_ckv_gather_eligible is False
+    assert metadata.dcp_ckv_split_eligible is split
+    if not split:
+        return
+    # The decode request gathers nothing; the prefill request's 40 tokens
+    # split 20/20 across the two ranks.
+    assert metadata.dcp_rank_req_lens.tolist() == [[0, 20], [0, 20]]
+    assert metadata.dcp_rank_req_starts.tolist() == [[0, 0], [0, 0]]
+    assert metadata.dcp_local_cu_seq_lens.tolist() == [0, 0, 20]
+    assert metadata.dcp_local_total_tokens == 20
+    # Causal lengths still use every request's full global length.
     assert torch.equal(metadata.global_cache_seq_lens_per_req, global_seq_lens)
 
 
