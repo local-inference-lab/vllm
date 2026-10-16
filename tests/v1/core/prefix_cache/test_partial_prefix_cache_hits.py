@@ -2691,6 +2691,8 @@ def test_request_boundaries_reuse_leading_instructions_across_user_prompts():
 
 
 def test_request_boundaries_split_prefill_at_instruction_endpoint():
+    """Chunk splitting stops at the instruction endpoint, then resumes at
+    full size."""
     request = make_request("chat", [0] * 9000, 32, sha256)
     request.use_boundary_checkpoints = True
     request.recurrent_instruction_boundary = 3000
@@ -2782,6 +2784,8 @@ def test_request_boundaries_stop_at_instruction_and_prefill_tail_once(
 @pytest.mark.parametrize("instruction", [None, 5])
 @pytest.mark.parametrize("tail", [None, 12])
 def test_optional_boundary_slots_allocate_only_active_bundles(instruction, tail):
+    """Only enabled boundaries allocate checkpoint bundles, and freeing the
+    request returns every block."""
     manager = make_full_mamba_manager(
         dcp_world_size=1,
         hash_block_size=4,

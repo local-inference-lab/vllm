@@ -13,7 +13,14 @@ from benchmarks import benchmark_recurrent_prefill_tail as benchmark
 
 class TestRecurrentPrefillTail(unittest.TestCase):
     def run_probe(self, usage):
-        """Run the CLI against an in-memory completion stream."""
+        """Run the CLI against an in-memory completion stream.
+
+        Args:
+            usage: The usage object reported by the mocked completion chunk.
+
+        Returns:
+            The JSON rows printed by the benchmark, as parsed dicts.
+        """
         chunks = [{"choices": [{"text": "ok"}], "usage": usage}]
         stream = (
             b"".join(

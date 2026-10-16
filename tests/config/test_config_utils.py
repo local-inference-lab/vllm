@@ -251,6 +251,7 @@ def test_speculative_config_hash_includes_graph_shape():
 
 
 def test_cache_config_hash_ignores_prefix_cache_retention_interval():
+    """The runtime-only retention interval must not change compute_hash."""
     base_hash = CacheConfig().compute_hash()
     assert CacheConfig(prefix_cache_retention_interval=64).compute_hash() == base_hash
 
