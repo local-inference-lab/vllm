@@ -100,7 +100,18 @@ def get_prefill_tail_checkpoint_position(
     instruction_boundary: int | None,
     tail_stride: int | None = None,
 ) -> int | None:
-    """Leave one to two strides after a bounded suffix-recovery point."""
+    """Leave one to two strides after a bounded suffix-recovery point.
+
+    Args:
+        prompt_tokens: Number of tokens in the complete prompt.
+        chunk_budget: Scheduler token budget per prefill chunk.
+        instruction_boundary: Instruction checkpoint position, or None if absent.
+        tail_stride: Positive stride capped at chunk_budget; None uses chunk_budget.
+
+    Returns:
+        Checkpoint position, or None if the budget is nonpositive or the endpoint
+        does not exceed the instruction boundary (zero if absent).
+    """
     if chunk_budget <= 0:
         return None
     stride = chunk_budget if tail_stride is None else min(chunk_budget, tail_stride)

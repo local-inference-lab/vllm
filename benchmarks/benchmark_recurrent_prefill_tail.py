@@ -19,6 +19,7 @@ import uuid
 
 
 def main():
+    """Print cache usage and timings for cold, repeated, and edited prompts."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument("--model", required=True)
@@ -73,6 +74,10 @@ def main():
                     c.get("text") for c in chunk.get("choices", [])
                 ):
                     ttft = time.monotonic() - started
+        if not usage:
+            raise RuntimeError("Stream ended without a usage chunk")
+        if "prompt_tokens" not in usage:
+            raise RuntimeError("Usage chunk is missing prompt_tokens")
         details = usage.get("prompt_tokens_details") or {}
         cached = details.get("cached_tokens")
         if cached is None:

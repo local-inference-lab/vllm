@@ -72,7 +72,7 @@ thinking prompt, invalidating the full-prompt checkpoint.
 `--recurrent-prefill-tail-stride` caps the token stride used to place this single
 fallback. When unset, the stride is the scheduler chunk budget. A positive value
 uses `min(chunk_budget, recurrent_prefill_tail_stride)`, and the endpoint is
-`(prompt_tokens // stride - 1) * stride`. It is omitted if it does not follow the
+`(prompt_tokens // stride - 1) * stride`. The endpoint is omitted if it does not follow the
 instruction checkpoint or is not positive. This setting applies only when the
 request-boundary policy is active, including selection through `auto`.
 
