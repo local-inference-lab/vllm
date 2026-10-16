@@ -257,6 +257,7 @@ def test_cache_config_hash_ignores_prefix_cache_retention_interval():
 
 @pytest.mark.parametrize("stride", [1, 256, 8192])
 def test_prefill_tail_stride_does_not_change_compilation(stride):
+    """The runtime-only stride must not change compute_hash or split caches."""
     assert (
         CacheConfig(recurrent_prefill_tail_stride=stride).compute_hash()
         == CacheConfig().compute_hash()
@@ -265,6 +266,7 @@ def test_prefill_tail_stride_does_not_change_compilation(stride):
 
 @pytest.mark.parametrize("stride", [0, -1])
 def test_prefill_tail_stride_rejects_nonpositive_values(stride):
+    """CacheConfig rejects a non-positive recurrent_prefill_tail_stride."""
     with pytest.raises(ValueError, match="recurrent_prefill_tail_stride"):
         CacheConfig(recurrent_prefill_tail_stride=stride)
 

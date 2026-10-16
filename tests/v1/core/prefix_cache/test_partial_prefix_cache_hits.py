@@ -2727,6 +2727,8 @@ def test_request_boundaries_split_prefill_at_instruction_endpoint():
 def test_prefill_tail_leaves_a_bounded_suffix_without_duplicating_instructions(
     prompt, budget, instruction, stride, expected
 ):
+    """The checkpoint caps the recomputed suffix and stays clear of the
+    instruction boundary."""
     assert (
         get_prefill_tail_checkpoint_position(prompt, budget, instruction, stride)
         == expected
@@ -2743,6 +2745,8 @@ def test_prefill_tail_leaves_a_bounded_suffix_without_duplicating_instructions(
 def test_request_boundaries_stop_at_instruction_and_prefill_tail_once(
     stride, endpoint, stops
 ):
+    """Chunk splitting stops at the instruction and prefill-tail boundaries
+    exactly once each, then resumes full-size chunks."""
     request = make_request("chat", [0] * 9000, 32, sha256)
     request.use_boundary_checkpoints = True
     request.recurrent_instruction_boundary = 3000
@@ -2810,6 +2814,8 @@ def test_optional_boundary_slots_allocate_only_active_bundles(instruction, tail)
 def test_prefill_tail_recovers_suffix_edits_but_never_earlier_divergence(
     dcp, stride, endpoint
 ):
+    """A published prefill-tail checkpoint serves requests whose edits start
+    after it; requests diverging before it get no hit."""
     manager = make_full_mamba_manager(
         dcp_world_size=dcp,
         hash_block_size=4,

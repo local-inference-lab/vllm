@@ -662,6 +662,7 @@ def test_swa_block_size_cli_choices(tmp_path):
 
 
 def test_prefix_cache_default():
+    """Prefix-caching CLI flags parse and stay unset unless explicitly given."""
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     args = parser.parse_args([])
 
@@ -692,6 +693,7 @@ def test_prefix_cache_default():
 
 @pytest.mark.parametrize("stride", [None, 256])
 def test_prefill_tail_stride_reaches_engine_config(tmp_path, stride):
+    """--recurrent-prefill-tail-stride flows from the CLI into CacheConfig."""
     from transformers import OPTConfig
 
     OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
