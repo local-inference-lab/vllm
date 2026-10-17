@@ -956,13 +956,18 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if isinstance(data.get("tool_choice"), dict):
             data["tool_choice"] = normalize_tool_namespace(data["tool_choice"])
 
-        # Reject empty tools array, matching OpenAI API behavior
+        # Treat an empty tools array like an omitted field, matching OpenAI
+        # API behavior; some clients (e.g. Xcode AI assistants) send
+        # tools=[] unconditionally.
         if data.get("tools") == []:
-            raise VLLMValidationError(
-                "`tools` must not be an empty array. "
-                "Either provide at least one tool or omit the field entirely.",
-                parameter="tools",
-            )
+            data.pop("tools")
+            # A dangling tool_choice of "auto"/"none"/explicit null composes
+            # with no-tools by omitting it as well. A named tool or
+            # "required" is left in place so the "When using `tool_choice`,
+            # `tools` must be set" validation below rejects the genuinely
+            # invalid forced call.
+            if data.get("tool_choice") in ("auto", "none", None):
+                data.pop("tool_choice", None)
 
         # if "tool_choice" is not specified but tools are provided,
         # default to "auto" tool_choice
