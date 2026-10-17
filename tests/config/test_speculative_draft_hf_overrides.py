@@ -13,6 +13,7 @@ when the target itself is shrunk — which is what kept spec-decode archs like
 
 import functools
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -355,3 +356,58 @@ def test_draft_subfolder_resolves_config_and_weight_directory(tmp_path, hub_mode
             assert kwargs["allow_patterns"] == "dflash/*"
         else:
             api.assert_not_called()
+
+
+@pytest.mark.cpu_test
+def test_same_model_draft_inherits_smaller_target_position_limit():
+    target_text = SimpleNamespace(max_position_embeddings=600_000)
+    draft_text = SimpleNamespace(max_position_embeddings=1_000_000)
+    spec = SimpleNamespace(
+        model="org/model",
+        target_model_config=SimpleNamespace(
+            model="org/model",
+            hf_config=SimpleNamespace(),
+            hf_text_config=target_text,
+        ),
+        draft_model_config=SimpleNamespace(
+            model="org/model",
+            hf_config=SimpleNamespace(),
+            hf_text_config=draft_text,
+        ),
+    )
+
+    changed = SpeculativeConfig._cap_same_model_draft_position_embeddings(spec)
+
+    assert changed is True
+    assert draft_text.max_position_embeddings == 600_000
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("draft_model", "draft_max"),
+    [
+        ("org/other-draft", 1_000_000),
+        ("org/model", 500_000),
+    ],
+)
+def test_draft_position_limit_is_not_increased_or_applied_cross_model(
+    draft_model: str,
+    draft_max: int,
+):
+    draft_text = SimpleNamespace(max_position_embeddings=draft_max)
+    spec = SimpleNamespace(
+        model=draft_model,
+        target_model_config=SimpleNamespace(
+            model="org/model",
+            hf_text_config=SimpleNamespace(max_position_embeddings=600_000),
+        ),
+        draft_model_config=SimpleNamespace(
+            model=draft_model,
+            hf_text_config=draft_text,
+        ),
+    )
+
+    changed = SpeculativeConfig._cap_same_model_draft_position_embeddings(spec)
+
+    assert changed is False
+    assert draft_text.max_position_embeddings == draft_max
