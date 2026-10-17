@@ -1515,6 +1515,12 @@ class Scheduler(SchedulerInterface):
                         continue
 
                     # Get externally-cached tokens if using a KVConnector.
+                    # Even when reads are disabled, call the connector so it
+                    # can establish its per-request lifecycle state before
+                    # update_state_after_alloc(). Prompt logprobs must not
+                    # *admit* an external hit because cached KV cannot recover
+                    # logits for skipped prompt tokens, so discard the lookup
+                    # result and force a local forward pass in that case.
                     if self.connector is not None:
                         # Present a block-aligned local hit to the connector so
                         # a strictly longer remote hit can supersede a local
@@ -1528,6 +1534,10 @@ class Scheduler(SchedulerInterface):
                                 request, block_aligned_local
                             )
                         )
+
+                        if request.skip_reading_prefix_cache:
+                            ext_tokens = 0
+                            load_kv_async = False
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because
