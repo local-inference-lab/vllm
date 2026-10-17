@@ -180,6 +180,7 @@ if TYPE_CHECKING:
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S: float = 60.0
     VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS: bool = False
+    VLLM_PROMPT_LOGPROBS_CHUNK_SIZE: int = 1024
     VLLM_MLA_DISABLE: bool = False
     VLLM_K3_DENSE_MLA_PARTIAL_DTYPE: Literal["bf16", "fp32"] = "bf16"
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
@@ -337,6 +338,7 @@ if TYPE_CHECKING:
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC: bool = False
+    VLLM_SYMM_MEM_PCIE_SAFE_BARRIER: bool = False
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -1568,6 +1570,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS": lambda: (
         os.getenv("VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS", "0") == "1"
     ),
+    # Maximum prompt-token rows materialized in the full-vocabulary logits
+    # tensor at once while computing V1 prompt logprobs.
+    "VLLM_PROMPT_LOGPROBS_CHUNK_SIZE": lambda: int(
+        os.getenv("VLLM_PROMPT_LOGPROBS_CHUNK_SIZE", "1024")
+    ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
     # Keep dense MLA split partials in FP32 until the merge when requested.
@@ -2244,6 +2251,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PCIE_DMA_MIN_BYTES": lambda: os.getenv("VLLM_PCIE_DMA_MIN_BYTES", "6MB"),
     # Optional B12X DMA wire codec. Unset uses lossless transport.
     "VLLM_PCIE_DMA_FP8": lambda: os.getenv("VLLM_PCIE_DMA_FP8"),
+    # Replace the torch symm-mem group barrier with a stream-memops
+    # sequence protocol (peer plain writes + local waits). Needed for the
+    # pipelined fused GEMM+comm ops on platforms without native P2P
+    # atomics, where the stock CAS-based barrier wedges under load.
+    "VLLM_SYMM_MEM_PCIE_SAFE_BARRIER": lambda: bool(
+        int(os.getenv("VLLM_SYMM_MEM_PCIE_SAFE_BARRIER", "0"))
+    ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(
         int(os.getenv("VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", "0"))
@@ -2713,6 +2727,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_WORKER_MULTIPROC_METHOD",
         "VLLM_ENABLE_V1_MULTIPROCESSING",
         "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE",
+        "VLLM_PROMPT_LOGPROBS_CHUNK_SIZE",
         "VLLM_CPU_KVCACHE_SPACE",
         "VLLM_CPU_MOE_PREPACK",
         "VLLM_ZENTORCH_WEIGHT_PREPACK",

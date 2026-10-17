@@ -88,7 +88,10 @@ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.structured_output.utils import strip_speculative_padding
-from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.utils import (
+    compute_iteration_details,
+    record_function_or_nullcontext,
+)
 
 logger = init_logger(__name__)
 
@@ -1512,6 +1515,12 @@ class Scheduler(SchedulerInterface):
                         continue
 
                     # Get externally-cached tokens if using a KVConnector.
+                    # Even when reads are disabled, call the connector so it
+                    # can establish its per-request lifecycle state before
+                    # update_state_after_alloc(). Prompt logprobs must not
+                    # *admit* an external hit because cached KV cannot recover
+                    # logits for skipped prompt tokens, so discard the lookup
+                    # result and force a local forward pass in that case.
                     if self.connector is not None:
                         # Present a block-aligned local hit to the connector so
                         # a strictly longer remote hit can supersede a local
@@ -1525,6 +1534,10 @@ class Scheduler(SchedulerInterface):
                                 request, block_aligned_local
                             )
                         )
+
+                        if request.skip_reading_prefix_cache:
+                            ext_tokens = 0
+                            load_kv_async = False
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because
@@ -3331,6 +3344,9 @@ class Scheduler(SchedulerInterface):
                 kv_connector_stats,
                 cudagraph_stats,
                 perf_stats,
+                num_scheduled_prompt_tokens=compute_iteration_details(
+                    scheduler_output
+                ).num_ctx_tokens,
             )
         ) is not None:
             # Return stats to only one of the front-ends.
@@ -3830,6 +3846,7 @@ class Scheduler(SchedulerInterface):
         kv_connector_stats: KVConnectorStats | None = None,
         cudagraph_stats: CUDAGraphStat | None = None,
         perf_stats: PerfStats | None = None,
+        num_scheduled_prompt_tokens: int = 0,
     ) -> SchedulerStats | None:
         if not self.log_stats:
             return None
@@ -3879,6 +3896,7 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
+            num_scheduled_prompt_tokens=num_scheduled_prompt_tokens,
             decode_compute_seconds=decode_compute_seconds,
             prefill_compute_seconds=prefill_compute_seconds,
             prefill_compute_share=prefill_compute_share,

@@ -3168,9 +3168,18 @@ def get_kv_cache_configs(
                 adjusted_memory.append(avail_mem)
                 continue
             bytes_per_block = _pool_bytes_per_block(groups)
+            profiled_num_blocks = avail_mem // bytes_per_block
+            if override > profiled_num_blocks:
+                logger.warning(
+                    "num_gpu_blocks_override=%d exceeds the capacity of %d "
+                    "blocks implied by available KV memory. The override "
+                    "bypasses memory accounting and can cause runtime CUDA OOMs.",
+                    override,
+                    profiled_num_blocks,
+                )
             logger.info(
                 "Overriding num_gpu_blocks=%d with num_gpu_blocks_override=%d",
-                avail_mem // bytes_per_block,
+                profiled_num_blocks,
                 override,
             )
             adjusted_memory.append(override * bytes_per_block)

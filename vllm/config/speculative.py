@@ -1186,6 +1186,28 @@ class SpeculativeConfig:
         parts = model.split(".")
         return len(parts) >= 2 and all(part.isidentifier() for part in parts)
 
+    def _cap_same_model_draft_position_embeddings(self) -> bool:
+        """Cap an in-checkpoint draft to the target's effective RoPE table."""
+        target = self.target_model_config
+        draft = self.draft_model_config
+        if target is None or draft is None or draft.model != target.model:
+            return False
+
+        target_hf = target.hf_text_config
+        draft_hf = draft.hf_text_config
+        target_max = getattr(target_hf, "max_position_embeddings", None)
+        draft_max = getattr(draft_hf, "max_position_embeddings", None)
+        if target_max is None or draft_max is None or target_max >= draft_max:
+            return False
+
+        draft_hf.max_position_embeddings = target_max
+        logger.info(
+            "Capped same-model draft max_position_embeddings from %d to %d.",
+            draft_max,
+            target_max,
+        )
+        return True
+
     def __post_init__(self):
         """Validate speculative settings and construct the draft configuration."""
         # Note: "method" is a new parameter that helps to extend the
@@ -1436,6 +1458,8 @@ class SpeculativeConfig:
                         self.target_model_config.enable_cumem_allocator
                     ),
                 )
+
+                self._cap_same_model_draft_position_embeddings()
 
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
                 # omit vocab_size in config.json, so MedusaConfig falls back to

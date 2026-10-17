@@ -19,6 +19,7 @@ import vllm.v1.core.kv_cache_utils as kv_cache_utils
 import vllm.v1.hisparse.runtime as hisparse_runtime_module
 from vllm.config import (
     CacheConfig,
+    DeviceConfig,
     KVTransferConfig,
     ModelConfig,
     SchedulerConfig,
@@ -2363,6 +2364,30 @@ def test_get_kv_cache_configs_preserves_model_sliding_window_retention():
     )
 
     assert configs[0].kv_cache_groups[0].kv_cache_spec.extra_retained_tokens == 2048
+
+
+def test_warns_when_num_gpu_blocks_override_exceeds_profiled_capacity(caplog):
+    model_config = ModelConfig(max_model_len=16)
+    vllm_config = VllmConfig(
+        model_config=model_config, device_config=DeviceConfig(device="cpu")
+    )
+    vllm_config.cache_config.num_gpu_blocks_override = 33
+    mem_per_block_per_layer = 16 * 2 * 64 * 4 * 2
+    kv_cache_specs = {
+        "layer_1": new_kv_cache_spec(),
+        "layer_2": new_kv_cache_spec(),
+    }
+
+    with caplog.at_level("WARNING"):
+        get_kv_cache_configs(
+            vllm_config,
+            [kv_cache_specs],
+            [mem_per_block_per_layer * 2 * 32],
+        )
+
+    assert "exceeds the capacity of 32 blocks implied by available KV memory" in (
+        caplog.text
+    )
 
 
 def test_generate_uniform_type_kv_cache_specs():

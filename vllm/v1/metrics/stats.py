@@ -213,6 +213,9 @@ class SchedulerStats:
 
     perf_stats: PerfStats | None = None
 
+    num_scheduled_prompt_tokens: int = 0
+    """Prompt/context tokens scheduled for model execution in this step."""
+
     decode_compute_seconds: float = 0.0
     prefill_compute_seconds: float = 0.0
     prefill_compute_share: float = 0.0
