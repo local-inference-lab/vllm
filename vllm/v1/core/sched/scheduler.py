@@ -1102,12 +1102,24 @@ class Scheduler(SchedulerInterface):
                 ):
                     num_new_tokens = self.scheduler_config.long_prefill_token_threshold
                 if request.is_prefill_chunk and prefill_interleave_step is not None:
-                    num_new_tokens = min(
-                        num_new_tokens,
-                        prefill_interleave_step.token_budget(
-                            token_budget, scheduled_prefill_req_ids
-                        ),
+                    lane_share = prefill_interleave_step.token_budget(
+                        token_budget, scheduled_prefill_req_ids
                     )
+                    # Invariant: a lane share must never fall below the
+                    # recurrent-state align quantum - the aligned split
+                    # floors a chunk ending before a block boundary to
+                    # zero tokens, consuming the lane before the
+                    # allocator is reached. When the step budget covers
+                    # a full quantum, drop the share cap so an
+                    # unrunnable lane-holder cannot tax a runnable
+                    # chunk.
+                    if (
+                        self.need_mamba_block_aligned_split
+                        and lane_share < self.cache_config.block_size
+                        and token_budget >= self.cache_config.block_size
+                    ):
+                        lane_share = num_new_tokens
+                    num_new_tokens = min(num_new_tokens, lane_share)
                 num_new_tokens = min(
                     num_new_tokens, token_budget, input_budget - draft_slots
                 )
@@ -1626,11 +1638,13 @@ class Scheduler(SchedulerInterface):
                 has_local_prefill = (
                     not load_kv_async and num_computed_tokens < request.num_tokens - 1
                 )
-                interleaved_local_prefill = (
+                # Latch the lane selection before the release below can drop
+                # this request from selected_ids.
+                lane_selected = (
                     prefill_interleave_step is not None
                     and prefill_interleave_step.is_selected(request_id)
-                    and has_local_prefill
                 )
+                interleaved_local_prefill = lane_selected and has_local_prefill
                 if prefill_interleave_step is not None and not has_local_prefill:
                     prefill_interleave_step.release(request_id)
                 if load_kv_async:
@@ -1823,20 +1837,26 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
-                    if not interleaved_local_prefill:
-                        # FCFS stops here; imports that already own their
-                        # capacity cannot take it from this request.
-                        if ready_imports is None:
-                            ready_imports = self._ready_imports_to_consider(
-                                considered_ids, prefill_interleave_step
-                            )
-                        if not ready_imports:
-                            break
+                    if lane_selected:
+                        # Invariant: a lane-holder that cannot allocate must
+                        # leave the waiting loop without holding a lane:
+                        # park it and release the lane so _replenish rotates
+                        # lanes toward the running chunks and the remaining
+                        # lane-holders get processed instead of stranded by
+                        # the FCFS stop.
+                        request_queue.remove_request(request)
+                        assert prefill_interleave_step is not None
+                        prefill_interleave_step.mark_unavailable(request_id)
+                        step_skipped_waiting.prepend_request(request)
                         continue
-                    request_queue.remove_request(request)
-                    assert prefill_interleave_step is not None
-                    prefill_interleave_step.mark_unavailable(request_id)
-                    step_skipped_waiting.prepend_request(request)
+                    # FCFS stops here; imports that already own their
+                    # capacity cannot take it from this request.
+                    if ready_imports is None:
+                        ready_imports = self._ready_imports_to_consider(
+                            considered_ids, prefill_interleave_step
+                        )
+                    if not ready_imports:
+                        break
                     continue
 
                 # KVTransfer: the connector uses this info to determine
@@ -1985,7 +2005,21 @@ class Scheduler(SchedulerInterface):
             and not defer_prefills
             and token_budget > 0
         ):
-            schedule_running_requests("prefill", allow_preemption=False)
+            # A request preempted after being scheduled keeps its lane
+            # rank, so a waiting pair can own the lanes at step start
+            # and leave this as the only pass a running chunk reaches.
+            # On a step that scheduled nothing, forbidding preemption
+            # here locks the engine into empty steps at free == 0.
+            # Preempting a request with an in-flight connector job
+            # would flush into an unbounded worker-side wait(), so
+            # allow it only while has_pending_push_work() is False:
+            # no connector transfer jobs and no tier-manager pending
+            # work. Lane aging is the recovery path meanwhile.
+            allow_preemption = not num_scheduled_tokens and (
+                self.connector is None
+                or not self.connector.has_pending_push_work()
+            )
+            schedule_running_requests("prefill", allow_preemption=allow_preemption)
 
         # The coarse runnable check can race async-completion guards. If a
         # selected decode turn produced no work, give an already-running
