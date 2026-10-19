@@ -425,6 +425,33 @@ def test_csf_contract_rejects_invalid_encoding_and_index(tmp_path, fault):
         reader.checkpoint_contract(str(tmp_path))
 
 
+def test_csf_contract_takes_the_family_from_the_top_level_model_type(tmp_path):
+    """DeepSeek's multimodal configs name the model at the top (deepseek_v41)
+    and the text tower in text_config (deepseek_v41_text); the contract's
+    family is the model's, whichever section carries quantization_config."""
+    from vllm.model_executor.model_loader import mxfp4_csf_loader as reader
+
+    write_index(tmp_path, {"weight": None}, "weights.safetensors", "deepseek_v41")
+    config = json.loads((tmp_path / "config.json").read_text())
+    config["text_config"] = {"model_type": "deepseek_v41_text"}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    assert reader.checkpoint_contract(str(tmp_path))["family"] == "deepseek_v41"
+
+    # checkpoint_contract caches by root; the nested variant gets its own.
+    nested_root = tmp_path / "nested"
+    nested_root.mkdir()
+    write_index(nested_root, {"weight": None}, "weights.safetensors", "deepseek_v4")
+    nested = {
+        "model_type": "deepseek_v4",
+        "text_config": {
+            "model_type": "deepseek_v4_text",
+            "quantization_config": config["quantization_config"],
+        },
+    }
+    (nested_root / "config.json").write_text(json.dumps(nested))
+    assert reader.checkpoint_contract(str(nested_root))["family"] == "deepseek_v4_flash"
+
+
 def test_csf_tensor_reader_resolves_separate_shards_and_closes_after_failure(
     tmp_path, monkeypatch
 ):
@@ -479,6 +506,48 @@ def test_csf_tensor_reader_resolves_separate_shards_and_closes_after_failure(
         == sorted(closed)
         == ["scales.safetensors", "weights.safetensors"]
     )
+
+
+def test_csf_tensor_reader_shapes_slab_scales_for_the_source(tmp_path):
+    """A container stores one projection's slab scales flat; the reader must
+    hand them to CsfSource as one segment of 16-row groups."""
+    from vllm.model_executor.model_loader import csf_utils
+
+    rows, columns = 64, 160
+    rng = np.random.default_rng(5)
+    bases = rng.integers(0, 254, (rows // 16, 16), dtype=np.uint8)
+    bits = rng.integers(0, 2, (rows, columns), dtype=np.uint8)
+    fixed = np.concatenate(
+        (bases, np.packbits(bits, axis=1, bitorder="little").reshape(rows // 16, -1)),
+        1,
+    ).reshape(-1)
+    exceptions = (np.array([3, 700], dtype=np.uint32) | np.uint32(200) << 24).astype(
+        np.uint32
+    )
+    weight = torch.zeros((rows, columns * 32 // 2), dtype=torch.int8)
+    tensors = tmp_path / "tensors"
+    tensors.mkdir()
+    save_file(
+        {
+            "w.weight": weight,
+            "w.scale.mxfp4_csf_fixed": torch.from_numpy(fixed),
+            "w.scale.mxfp4_csf_exceptions": torch.from_numpy(exceptions),
+        },
+        tensors / "shard.safetensors",
+    )
+    index = {
+        name: "tensors/shard.safetensors"
+        for name in ("w.weight", "w.scale.mxfp4_csf_fixed", "w.scale.mxfp4_csf_exceptions")
+    }
+    with csf_utils.CsfTensorReader(tmp_path, index, "mxfp4") as reader:
+        source = reader.matrix("w.weight", "w.scale")
+    plane = source.scales
+    assert plane.encoding == "csf" and plane.segments == 1
+    assert plane.components[0].shape == (1, rows // 16, 16 * (1 + (columns + 7) // 8))
+    assert np.array_equal(plane.components[0].numpy().reshape(-1), fixed)
+    assert np.array_equal(plane.components[1].numpy(), exceptions)
+    assert torch.equal(plane.starts, torch.tensor([0, 2], dtype=torch.int64))
+    assert plane.source_rows == rows and plane.source_columns == columns
 
 
 def decode(fixed, exceptions, rows, columns):

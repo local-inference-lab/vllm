@@ -70,7 +70,9 @@ def read_csf_contract(root, *, families):
         raise ValueError(
             f"CSF requires weight_scale_encoding='csf' or {CSF_ENCODING!r}"
         )
-    model_type = text.get("model_type", config.get("model_type"))
+    # A multimodal config names the model at the top (deepseek_v41) and its
+    # text tower in text_config (deepseek_v41_text); the family is the model's.
+    model_type = config.get("model_type") or text.get("model_type")
     family = {
         "deepseek_v4_1": "deepseek_v41",
         "deepseek_v4": "deepseek_v4_flash",
@@ -131,8 +133,10 @@ class CsfTensorReader(ExitStack):
                 self._handle(prefix + name).get_tensor(prefix + name)
                 for name in ("fixed", "exceptions")
             )
+            # One slab segment: 16-row groups of 16 base bytes plus the packed
+            # scale bits, stored flat in the checkpoint.
             plane = CsfSource(
-                (fixed[None], exceptions),
+                (fixed.view(1, rows // 16, -1), exceptions),
                 torch.tensor([0, exceptions.numel()], dtype=torch.int64),
                 rows,
                 columns,
