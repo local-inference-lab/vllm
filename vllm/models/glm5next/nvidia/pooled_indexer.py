@@ -17,6 +17,7 @@ from vllm.distributed import get_dcp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import LayerNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.v1.attention.ops.kvarn_mla import KvarnMlaLayout
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_and_maybe_dequant_weights,
@@ -51,6 +52,18 @@ _SELECTION_WIDTH = 2051
 _INDEX_CACHE_WIDTH = 132
 _INDEX_PAGE_SIZE = 64
 _INDEX_PAGE_BYTES = _INDEX_PAGE_SIZE * _INDEX_CACHE_WIDTH
+# KVarN dual-rate / single-plane record widths (unambiguous vs the 528/304
+# GLM_NEXT dense records) -> (k_bits, v_bits). Stride and tail rules live in
+# KvarnMlaLayout (vllm.v1.attention.ops.kvarn_mla) -- this map only resolves
+# the variant from the concrete record width. All launched variants are
+# g256 (the only selectable group; config registers _g256 dtypes only), and
+# the C4 index page (8448 = 33 * 256) pins that group for every variant.
+_KVARN_RECORD_VARIANTS = {
+    536: (4, 4), 648: (5, 5), 600: (5, 4), 400: (4, 2), 264: (4, 0),
+}
+# All selectable kvarn dtypes are g256; the C4 index page pins it
+# (8448 = 33 * 256).
+_KVARN_GROUP = 256
 
 
 class Glm5NextIndexerScratch(nn.Module):
@@ -336,7 +349,22 @@ class Glm5NextPooledIndexer(nn.Module):
 
         subpages_per_parent = block_size // (_POOL_SIZE * _INDEX_PAGE_SIZE)
         parent_stride_bytes = int(main_cache.stride(0))
-        semantic_page_bytes = block_size * record_bytes
+        if record_bytes in _KVARN_RECORD_VARIANTS:
+            # KVarN kernels stride 256-token tiles at tile_stride (records +
+            # reserved tail), NOT densely: the latent span of a parent page
+            # is subpages_per_parent * tile_stride. Placing the FP8 index
+            # tail at the dense span put it inside the last tiles' records,
+            # and record writes clobbered it (selection degraded with
+            # context length). The stride/tail rules (incl. single-plane
+            # records ending flush on the C4 boundary) live in
+            # KvarnMlaLayout -- reuse them here so the two can't drift.
+            k_bits, v_bits = _KVARN_RECORD_VARIANTS[record_bytes]
+            layout = KvarnMlaLayout(
+                k_bits=k_bits, v_bits=v_bits, group=_KVARN_GROUP)
+            tile_stride = layout.tile_stride_bytes
+            semantic_page_bytes = subpages_per_parent * tile_stride
+        else:
+            semantic_page_bytes = block_size * record_bytes
         index_tail_offset_bytes = (
             (semantic_page_bytes + _INDEX_PAGE_BYTES - 1) // _INDEX_PAGE_BYTES
         ) * _INDEX_PAGE_BYTES
@@ -345,7 +373,9 @@ class Glm5NextPooledIndexer(nn.Module):
             raise ValueError("GLM MLA cache page does not contain its FP8 index tail")
         if parent_stride_bytes % _INDEX_PAGE_BYTES:
             raise ValueError(
-                "GLM MLA parent-page stride must be an exact number of C4 pages"
+                "GLM MLA parent-page stride must be an exact number of C4 pages; "
+                f"shape={tuple(main_cache.shape)} strides={tuple(main_cache.stride())} "
+                f"parent_stride_bytes={parent_stride_bytes}"
             )
         parent_stride_pages = parent_stride_bytes // _INDEX_PAGE_BYTES
         max_virtual_page = (pages - 1) * parent_stride_pages + subpages_per_parent - 1

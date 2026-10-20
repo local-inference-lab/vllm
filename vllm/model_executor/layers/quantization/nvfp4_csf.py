@@ -48,6 +48,15 @@ def _forward_token() -> int | None:
     return token
 
 
+def _stage_max_tokens() -> int:
+    """Calls up to this size read compressed scales per stage, without expansion."""
+    try:
+        from b12x.moe.fused_moe._impl import W4A16_CSF_STAGE_MAX_TOKENS
+    except ImportError:
+        return 1536
+    return W4A16_CSF_STAGE_MAX_TOKENS
+
+
 @dataclass
 class Nvfp4CsfState:
     scale_scratch: tuple[torch.Tensor, ...] | None = None
@@ -59,9 +68,8 @@ class Nvfp4CsfState:
 class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
     """Decode selected scale planes into model-owned native E4M3 scratch."""
 
-    def __init__(self, moe, owner, *, use_a16=False, encoding="csf_32x2_v1"):
+    def __init__(self, moe, owner, *, use_a16=False):
         super().__init__(moe)
-        self.encoding = encoding
         self.owner = owner
         self.use_a16 = use_a16 or bool(envs.VLLM_B12X_MOE_FP4_FORCE_A16)
         config = get_current_vllm_config_or_none()
@@ -128,27 +136,16 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
                 param.csf_component = component
                 layer.register_parameter(f"{prefix}_{component}", param)
             scales = torch.nn.Module()
-            fields = (
-                (("fixed", torch.uint8), ("exceptions", torch.uint32))
-                if self.encoding == "csf"
-                else (
-                    ("bases", torch.uint8),
-                    ("codes", torch.uint8),
-                    ("page_bases", torch.uint32),
-                    ("offsets", torch.uint16),
-                    ("exceptions", torch.uint16),
-                )
-            )
-            for component, dtype in fields:
+            for component, dtype in (
+                ("fixed", torch.uint8),
+                ("exceptions", torch.uint32),
+            ):
                 param = torch.nn.Parameter(
                     torch.empty(0, dtype=dtype), requires_grad=False
                 )
                 param.weight_loader = self.weight_loader
                 param.csf_component = component
-                scales.register_parameter(
-                    f"{'nvfp4_csf' if self.encoding == 'csf' else 'csf32'}_{component}",
-                    param,
-                )
+                scales.register_parameter(f"nvfp4_csf_{component}", param)
             layer.add_module(f"{prefix}_weight_scale", scales)
 
     def weight_loader(
@@ -160,7 +157,7 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
         expert_id=None,
         return_success=False,
     ):
-        from b12x.loader._csf_source import stage_csf_sources
+        from .utils.nvfp4_csf_utils import _slice_scale_plane
 
         if (
             shard_id not in ("w1", "w2", "w3")
@@ -221,8 +218,8 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
             values[field_name] = materialize_weight(loaded_weight).cpu()
         else:
             parts = self._scale_parts.setdefault(key, {})
-            parts[field_name] = materialize_weight(loaded_weight)
-            if len(parts) == (2 if self.encoding == "csf" else 5):
+            parts[field_name] = materialize_weight(loaded_weight).cpu()
+            if len(parts) == 2:
                 if shard_id == "w2":
                     rows, columns = h, width // 16
                     row_slice, column_slice = (0, h), (first // 16, last // 16)
@@ -231,24 +228,18 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
                     rows, columns = width, h // 16
                     row_slice, column_slice = (first, last), (0, columns)
                     out_rows, out_columns = n, columns
-                fields = (
-                    ("fixed", "exceptions")
-                    if self.encoding == "csf"
-                    else ("bases", "codes", "page_bases", "offsets", "exceptions")
+                fixed, exceptions = _slice_scale_plane(
+                    parts["fixed"],
+                    parts["exceptions"],
+                    rows,
+                    columns,
+                    row_slice,
+                    column_slice,
+                    out_rows,
+                    out_columns,
                 )
-                values["scales"] = stage_csf_sources(
-                    [tuple(parts[field] for field in fields)],
-                    rows=rows,
-                    columns=columns,
-                    quantization="nvfp4",
-                    encoding=self.encoding,
-                    device=param.device,
-                    row_range=row_slice,
-                    column_range=column_slice,
-                    padded_rows=out_rows,
-                    padded_columns=out_columns,
-                    padding_base=0x38,
-                )
+                values["fixed"] = torch.from_numpy(fixed)
+                values["exceptions"] = torch.from_numpy(exceptions)
                 del self._scale_parts[key]
         return True if return_success else None
 
@@ -261,7 +252,7 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
             projections = []
             for shard in ("w3", "w1", "w2"):
                 values = self._components.get((expert, shard), {})
-                required = {"weight", "scales", "weight_scale_2"}
+                required = {"weight", "fixed", "exceptions", "weight_scale_2"}
                 if not self.use_a16:
                     required.add("input_scale")
                 missing = required - values.keys()
@@ -273,7 +264,8 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
                 projections.append(
                     CsfMatrix(
                         weight=TensorView(values["weight"]),
-                        scales=values["scales"],
+                        fixed=values["fixed"],
+                        exceptions=values["exceptions"],
                         global_scale=values["weight_scale_2"],
                         input_scale=values.get(
                             "input_scale",
@@ -442,7 +434,7 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
         if (
             token is not None
             and following is not None
-            and following._prefetches_all_experts(x, topk_ids)
+            and following._expands(x, topk_ids)
         ):
             # The next layer's MoE would expand its scales into the same scratch:
             # do it now on a side stream, overlapping that layer's attention.
@@ -461,12 +453,10 @@ class Nvfp4CsfMoEMethod(FusedMoEMethodBase):
             )
         return result
 
-    def _prefetches_all_experts(self, x: torch.Tensor, topk_ids: torch.Tensor) -> bool:
-        """Whether prefetch matches the call's full-expert expansion workload."""
-        if topk_ids.numel() < 16 * self.num_experts:
-            return False
+    def _expands(self, x: torch.Tensor, topk_ids: torch.Tensor) -> bool:
+        """Whether the layer's selected consumers need the shared scale scratch."""
         if self.backend._a4_prefill_enabled:
             return self.backend.uses_expanded_nvfp4_scales(
                 int(x.shape[0]), topk_ids.dtype
             )
-        return True
+        return int(x.shape[0]) > _stage_max_tokens()

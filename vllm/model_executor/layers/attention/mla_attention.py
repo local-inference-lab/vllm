@@ -503,7 +503,9 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
     return kv_cache_dtype
 
 
-_PACKED_SPARSE_MLA_CACHE_DTYPES = frozenset({"fp8_ds_mla", "nvfp4_ds_mla"})
+_PACKED_SPARSE_MLA_CACHE_DTYPES = frozenset(
+    {"fp8_ds_mla", "nvfp4_ds_mla"}
+)
 
 
 def _is_packed_sparse_mla_cache_dtype(kv_cache_dtype: CacheDType) -> bool:
@@ -515,7 +517,10 @@ def _is_packed_sparse_mla_cache_dtype(kv_cache_dtype: CacheDType) -> bool:
     Returns:
         Whether the dtype represents a packed sparse MLA record.
     """
-    return kv_cache_dtype in _PACKED_SPARSE_MLA_CACHE_DTYPES
+    return kv_cache_dtype in _PACKED_SPARSE_MLA_CACHE_DTYPES or (
+        isinstance(kv_cache_dtype, str)
+        and kv_cache_dtype.startswith("kvarn_mla_")
+    )
 
 
 def _uses_packed_sparse_mla_workspace(kv_cache_spec: AttentionSpec) -> bool:
@@ -647,6 +652,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             kv_cache_dtype: CacheDType = cache_config.cache_dtype
         else:
             kv_cache_dtype = "auto"
+        from vllm.v1.attention.ops.kvarn_mla import kvarn_cache_dtype_enabled
+
+        self._kvarn_rotate = kvarn_cache_dtype_enabled(kv_cache_dtype)
         self.quant_config = quant_config
 
         if cache_config is not None and cache_config.kv_cache_dtype_skip_layers:
@@ -987,6 +995,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             slot_mapping,
             kv_cache_dtype,
             k_scale,
+            attn_metadata=attn_metadata,
         )
         if cache is not None:
             mirror_target = cache.mirror_write_target(kv_c_normed.shape[0])
@@ -999,6 +1008,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     mirror_slots,
                     kv_cache_dtype,
                     k_scale,
+                    attn_metadata=attn_metadata,
                 )
 
     def prepare_kv_cache_update(
@@ -1598,6 +1608,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         else:
             # Convert from (L, N, V) to (N, L, V)
             w_uv = W_UV.transpose(0, 1)
+            if self._kvarn_rotate:
+                # KVarN: the kernel's V accumulator holds H-rotated latents
+                # (rows); the in-kernel W_UV projection must map them back:
+                # (H v) @ (H W_UV) == v @ W_UV.
+                from vllm.v1.attention.ops.kvarn_mla import hadamard_matrix
+
+                h = hadamard_matrix(self.kv_lora_rank, w_uv.device).to(w_uv.dtype)
+                w_uv = torch.matmul(h.expand(w_uv.shape[0], -1, -1), w_uv)
             if pre_w_uv is not None:
                 pre_w_uv.copy_(w_uv)
                 w_uv = pre_w_uv
@@ -1607,6 +1625,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if pre_w_uk_t is not None:
                 pre_w_uk_t.copy_(w_uk_t)
                 w_uk_t = pre_w_uk_t
+            if self._kvarn_rotate:
+                # KVarN: cache records hold H-rotated latents; the absorbed
+                # query must live in the rotated frame too. The absorbed
+                # projection q_c = q_nope @ W_UK_T is folded here (bf16
+                # dequantized copy, no requantization): q_c' = q_c @ H^T.
+                from vllm.v1.attention.ops.kvarn_mla import hadamard_matrix
+
+                h_t = hadamard_matrix(
+                    self.kv_lora_rank, w_uk_t.device
+                ).transpose(-2, -1).to(w_uk_t.dtype)
+                w_uk_t = torch.matmul(w_uk_t, h_t)
             replace_parameter(self, "W_UK_T", w_uk_t, prefer_copy=True)
             if self.dcp_q_replicate:
                 self.W_UK_T_dcp_qrep = get_dcp_group().all_gather(

@@ -53,7 +53,6 @@ if TYPE_CHECKING:
     VLLM_DFLASH_VOCAB_PARALLEL_DRAFT: bool = False
     VLLM_GLM53_VISION_MXFP8: bool = False
     VLLM_GLM53_EMBED_HOST: bool = False
-    VLLM_GLM53_KDA_MXFP8_ACTIVATION_MODE: Literal["auto", "a16", "prefill"] = "auto"
     VLLM_SHARE_PYNCCL_COMMS: bool = False
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
@@ -969,15 +968,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Keep the GLM-5.3 input embedding table in pinned host RAM; the GPU reads
     # the rows of the current tokens through a UVA view.
     "VLLM_GLM53_EMBED_HOST": lambda: bool(int(os.getenv("VLLM_GLM53_EMBED_HOST", "0"))),
-    # Activation precision of the GLM-5.3 KDA projections stored as B12X MXFP8.
-    # "auto" follows VLLM_B12X_MXFP8_ACTIVATION_MODE; "a16" keeps their BF16
-    # activations (W8A16) for every call; "prefill" does so for calls of at least
-    # 128 rows and leaves shorter calls to the auto mode. A checkpoint with BF16
-    # KDA gates, indexer and kv_b needs BF16 activations in prefill for its
-    # long-context recall.
-    "VLLM_GLM53_KDA_MXFP8_ACTIVATION_MODE": env_with_choices(
-        "VLLM_GLM53_KDA_MXFP8_ACTIVATION_MODE", "auto", ["auto", "a16", "prefill"]
-    ),
     # Groups over the same ranks share one PyNCCL communicator.
     "VLLM_SHARE_PYNCCL_COMMS": lambda: bool(
         int(os.getenv("VLLM_SHARE_PYNCCL_COMMS", "0"))

@@ -19,7 +19,6 @@ from vllm.utils.b12x import (
     B12xWorkload,
     b12x_layer_prefix,
     get_b12x_dense_activation_mode,
-    get_b12x_projection_workspace_sizes,
     register_b12x_layer,
     reuse_packed_weight_storage,
     run_b12x_blockscaled_linear,
@@ -102,22 +101,6 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
                 activation_mode=layer.b12x_activation_mode,
                 layer_name=name,
             )
-        # A layer marked b12x_prefill_a16 runs prefill-sized calls with BF16
-        # activations through a second plan over the same packed weight.
-        wants_prefill = (
-            getattr(layer, "b12x_prefill_a16", False)
-            and layer.b12x_activation_mode != "a16"
-        )
-        prefill = getattr(layer, "b12x_linear_prefill", None)
-        if not wants_prefill:
-            layer.b12x_linear_prefill = None
-        elif prefill is None or not prefill.holds(layer.b12x_mxfp8_packed_weight):
-            layer.b12x_linear_prefill = B12xBlockscaledLinear(
-                layer.b12x_mxfp8_packed_weight,
-                recipe="mxfp8",
-                activation_mode="a16",
-                layer_name=name,
-            )
         layer.b12x_layer_name = _encode_layer_name(name)
         register_b12x_layer(name, layer)
         replace_parameter(layer, "weight", weight.new_empty((0,)))
@@ -132,16 +115,11 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
         if packed.weight.values.is_meta:
             return ()
         linear = layer.b12x_linear
-        units = [linear.unit(workload, name=f"linear.mxfp8.{linear.layer_name}")]
-        prefill = getattr(layer, "b12x_linear_prefill", None)
-        if prefill is not None:
-            units.append(
-                prefill.unit(workload, name=f"linear.mxfp8.a16.{prefill.layer_name}")
-            )
-        return tuple(units)
+        return (linear.unit(workload, name=f"linear.mxfp8.{linear.layer_name}"),)
 
     def get_workspace_size(self, layer: torch.nn.Module, rows: int) -> int:
-        return get_b12x_projection_workspace_sizes(rows, layer)[0]
+        linear = getattr(layer, "b12x_linear", None)
+        return 0 if linear is None else linear.get_workspace_size(rows)
 
     def apply_weights(
         self,

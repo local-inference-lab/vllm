@@ -1,6 +1,6 @@
 # MXFP4-CSF and NVFP4-CSF
 
-The `csf_32x2_v1` encoding compresses FP4 block-scale tensors losslessly. Weight nibbles,
+These formats compress FP4 block-scale tensors losslessly. Weight nibbles,
 original scale bytes, calibration values and other tensors are preserved.
 The B12X backend keeps scales compressed between layers and reconstructs
 the needed scales into shared GPU scratch before expert computation.
@@ -33,21 +33,17 @@ quantization settings:
       "model.language_model.layers.3.mlp.experts": {
         "quant_algo": "NVFP4",
         "group_size": 16,
-        "weight_scale_encoding": "csf_32x2_v1"
+        "weight_scale_encoding": "csf"
       }
     }
   }
 }
 ```
 
-Each compressed `weight_scale` has five components in ordinary safetensors
-shards: `.csf32_bases` and `.csf32_codes` (uint8), `.csf32_page_bases`
-(uint32), and `.csf32_offsets` and `.csf32_exceptions` (uint16). The standard
-shard index locates every component, including components in separate files.
-Blocks cover 32 rows and two scale columns, grouped into logical 128-row by
-four-column tiles. Boundary tiles store only logical fields. Index pages
-contain 32 whole tile groups. No CSF manifest, checkpoint-root setting, or
-custom load format is required for NVFP4.
+Each compressed `weight_scale` is stored as `weight_scale.nvfp4_csf_fixed`
+(uint8) and `weight_scale.nvfp4_csf_exceptions` (uint32) tensors in ordinary
+safetensors shards. The standard shard index locates all tensors. No CSF
+manifest, checkpoint-root setting, or custom load format is required.
 
 Run in an environment with matching vLLM/B12X CSF support:
 
@@ -82,7 +78,7 @@ and the PLE embedding table retain their source precision.
 VLLM_PLE_TABLE_MEMORY=ram vllm serve /models/Qwen3.8-Flash-Next-NVFP4-CSF \
   --quantization modelopt_mixed --load-format safetensors \
   --tensor-parallel-size 2 --pipeline-parallel-size 1 --dtype bfloat16 \
-  --moe-backend b12x --linear-backend b12x \
+  --moe-backend b12x --linear-backend b12x --no-enable-flashinfer-autotune \
   --mm-encoder-tp-mode data --mamba-cache-mode align \
   --no-enable-prefix-caching --enable-chunked-prefill \
   --kv-cache-dtype bfloat16 --kv-cache-memory-bytes 2147483648 --block-size 16 \
@@ -97,9 +93,8 @@ GiB of host RAM for both TP ranks' table payloads, plus loading and process
 memory. `VLLM_PLE_TABLE_MEMORY=disk` selects file-backed table access; its
 performance depends on storage and is not represented by the RAM example.
 The example reserves 2 GiB/GPU for KV cache. Qwen's intermediate dimension
-supports TP1, TP2, and TP4 scale preparation. Its TP4 intermediate partitions
-have 160 channels. The checkpoint remains unpadded; expansion writes the native
-kernel's boundary tiles into shared scratch.
+supports TP1 and TP2 with this scale preparation; TP4 does not satisfy the 64-channel
+local alignment requirement.
 
 ## DeepSeek-V4-Flash on two 96 GiB Blackwell GPUs
 
@@ -107,10 +102,7 @@ This also applies to DeepSeek-V4-Flash-Vision-Exp. The serving directory
 contains the source tokenizer metadata and a `config.json` whose
 `quantization_config` keeps the source block-FP8 fields, including
 `weight_block_size` equal to `[128, 128]`, and sets `quant_method` to
-`mxfp4_csf`, `format_version` to 1 and an absolute `checkpoint_root`. The
-checkpoint at that root declares `weight_scale_encoding: "csf_32x2_v1"`
-and uses a standard `model.safetensors.index.json` with the same five scale
-components as NVFP4. Its model configuration determines expert tensor names.
+`mxfp4_csf`, `format_version` to 1 and an absolute `checkpoint_root`.
 
 The `deepseek_v4_flash` container compresses the routed-expert scales of the
 43 target layers. Attention, dense and shared-expert weights retain block
@@ -128,34 +120,21 @@ vllm serve /models/DeepSeek-V4-Flash-MXFP4-CSF/serve \
   --tool-call-parser deepseek_v4 --host 0.0.0.0 --port 8000
 ```
 
-The scale reader accepts equal TP partitions containing complete 32-channel
-groups. Model and native-kernel geometry requirements also apply. Execution
-requires pipeline parallel size 1, without expert/data parallelism or ubatching.
+The reader supports TP1, TP2, TP4 and TP8 with pipeline parallel size 1,
+without expert/data parallelism or ubatching.
 
 ## Compatibility
 
 Install matching vLLM and B12X CSF support. For NVFP4, the standard model
 loader delivers scale components through the model's normal weight-loading
 hooks. ModelOpt selects the CSF expert method from `weight_scale_encoding`;
-that method slices packed weights and stages compressed scale components without
-CPU decoding or regrouping. B12X validates and gathers TP-local scale fields on
-CUDA, scans exception counts, and constructs compact native-layout payloads.
+that method validates and slices TP-local tensors. B12X receives those weights
+and compressed CPU scale planes through `prepare_weights`, which uploads and
+rearranges them for the selected kernels.
 
-Both `csf_32x2_v1` and the slab encoding `csf` are accepted. Slab checkpoints
-store 16-row base/code streams and 32-bit position/value exceptions under
-`nvfp4_csf_fixed` / `nvfp4_csf_exceptions` or their `mxfp4_csf_` equivalents.
-Both encodings produce the same compact runtime representation. MXFP4's
-separate loader preserves native dense, draft, and file-backed embedding tensors.
-
-Preparation permutes compressed fields and exception positions for the selected
-scale destination: F8_128x4, packed W4A16, or MXFP4 A8 N256/N64 tiles. Expansion
-writes that destination directly. Small calls expand routed experts; large
-calls expand every expert. vLLM declares expansion sweeps as dependencies of
-MoE tuning, and prepared bindings retain their selected programs. CSF requests
-time candidates through CUDA graph replay with live activation and route
-producers, using separate selection keys from direct-launch timing. Trial
-graphs and buffers are released after tuning. Ordinary
-expert kernels consume native scales with no inline CSF decoding.
+MXFP4's separate loader requires `lil-mxfp4-csf-checkpoint/1`, a manifest,
+and `.mxfp4_csf_*` tensor components. It does not accept predecessor X4T/LSC
+names, schemas, or suffixes.
 
 Runtimes without the corresponding scale decoder require uncompressed scale
 tensors. Including both representations in one download removes the storage

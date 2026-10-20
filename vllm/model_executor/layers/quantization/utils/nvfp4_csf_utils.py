@@ -4,6 +4,7 @@
 
 from collections.abc import Iterable
 
+import numpy as np
 import torch
 
 from vllm.model_executor.model_loader.csf_utils import CsfMatrix, tp_extent
@@ -23,6 +24,58 @@ class TensorView:
 
     def __getitem__(self, extent):
         return self.tensor[extent]
+
+
+def _slice_scale_plane(
+    fixed,
+    exceptions,
+    rows,
+    columns,
+    row_slice,
+    column_slice,
+    out_rows=None,
+    out_columns=None,
+):
+    """Copy aligned compressed extents and rebase exception positions.
+
+    ``out_rows``/``out_columns`` extend the slice to a padded TP shard whose
+    weights are zero there: appended rows get the E4M3 scale 1.0 (a zero scale
+    would be stored as a replacement word in every packed word), appended
+    columns zero codes over their row's base.
+    """
+    r0, r1 = row_slice
+    c0, c1 = column_slice
+    if not (0 <= r0 < r1 <= rows and r0 % 16 == r1 % 16 == 0):
+        raise ValueError("NVFP4-CSF row slices require complete 16-row slabs")
+    if not (0 <= c0 < c1 <= columns and c0 % 2 == c1 % 2 == columns % 2 == 0):
+        raise ValueError("NVFP4-CSF column slices require complete nibble pairs")
+    if fixed.dtype != torch.uint8 or exceptions.dtype != torch.uint32:
+        raise TypeError("NVFP4-CSF requires uint8 fixed and uint32 exception tensors")
+    stream = fixed.numpy().reshape(rows // 16, 16 * (1 + columns // 2))
+    bases = stream[:, :16]
+    if np.any(bases > 240):
+        raise ValueError("NVFP4-CSF row bases must be in 0..240")
+    packed = stream[:, 16:].reshape(rows, columns // 2)
+    out_rows = r1 - r0 if out_rows is None else out_rows
+    out_columns = c1 - c0 if out_columns is None else out_columns
+    if out_rows < r1 - r0 or out_rows % 16 or out_columns < c1 - c0 or out_columns % 2:
+        raise ValueError("NVFP4-CSF padded slices must extend whole slabs and pairs")
+    selected = np.zeros((out_rows, out_columns // 2), dtype=np.uint8)
+    selected[: r1 - r0, : (c1 - c0) // 2] = packed[r0:r1, c0 // 2 : c1 // 2]
+    slab_bases = np.full((out_rows // 16, 16), _PADDED_SCALE, dtype=np.uint8)
+    slab_bases[: (r1 - r0) // 16] = bases[r0 // 16 : r1 // 16]
+    result = np.concatenate((slab_bases, selected.reshape(out_rows // 16, -1)), 1)
+    words = exceptions.numpy().reshape(-1)
+    positions = words & np.uint32(0xFFFFFF)
+    if len(words) and (
+        positions[-1] >= rows * columns or np.any(positions[1:] <= positions[:-1])
+    ):
+        raise ValueError("NVFP4-CSF exception positions must be sorted and unique")
+    rr, cc = positions // columns, positions % columns
+    keep = (rr >= r0) & (rr < r1) & (cc >= c0) & (cc < c1)
+    local_positions = (rr[keep] - r0) * out_columns + cc[keep] - c0
+    selected_words = (words[keep] & np.uint32(0xFF000000)) | local_positions
+    return result.copy(), selected_words.astype(np.uint32)
 
 
 def prepare_nvfp4_csf_weights(
@@ -51,16 +104,12 @@ def prepare_nvfp4_csf_weights(
     projection in the packed layout; it is used as the weight storage, and
     the projections then supply only scales and calibration.
     """
-    from b12x.loader._csf_blocks import CsfBlockPlane
-    from b12x.loader._csf_source import CsfSource, batch_csf_sources
-    from b12x.moe.fused_moe import Nvfp4CsfWeights, PackedWeights
+    from b12x.moe.fused_moe import CsfScalePlanes, Nvfp4CsfWeights, PackedWeights
 
     if num_experts <= 0 or hidden_size <= 0 or hidden_size % 128:
         raise ValueError("NVFP4-CSF requires experts and 128-aligned hidden channels")
-    if tp_size <= 0 or not 0 <= tp_rank < tp_size:
-        raise ValueError("NVFP4-CSF requires a valid TP rank and size")
     if local_size is None:
-        first, last = tp_extent(intermediate_size, tp_rank, tp_size, 32)
+        first, last = tp_extent(intermediate_size, tp_rank, tp_size, 64)
         local = last - first
     else:
         local = int(local_size)
@@ -78,7 +127,7 @@ def prepare_nvfp4_csf_weights(
         (num_experts, hidden_size, local // 2),
     )
     if packed is None:
-        w13, w2 = (torch.zeros(s, dtype=torch.uint8, device=device) for s in shapes)
+        w13, w2 = (torch.zeros(s, dtype=torch.uint8, device="cpu") for s in shapes)
     else:
         w13, w2 = packed
         if any(
@@ -94,8 +143,7 @@ def prepare_nvfp4_csf_weights(
     a13, a2 = (
         torch.empty(num_experts, dtype=torch.float32, device="cpu") for _ in range(2)
     )
-    scales13: list[CsfBlockPlane | CsfSource] = []
-    scales2: list[CsfBlockPlane | CsfSource] = []
+    fixed13, fixed2, exceptions13, exceptions2 = [], [], [], []
 
     def scalar(value, role):
         if value is None or value.numel() != 1 or value.dtype != torch.float32:
@@ -107,7 +155,7 @@ def prepare_nvfp4_csf_weights(
     for expert, (first_projection, second_projection, down) in zip(
         range(num_experts), experts, strict=True
     ):
-        global13, input13 = [], []
+        f13, e13, global13, input13 = [], [], [], []
         for matrix, projection in enumerate(
             (first_projection, second_projection, down)
         ):
@@ -143,32 +191,34 @@ def prepare_nvfp4_csf_weights(
                 row_slice, column_slice = (0, rows), (first // 16, last // 16)
                 out_rows, out_columns = rows, local // 16
                 g2[expert], a2[expert] = global_scale, input_scale
-            if (
-                projection.scales.rows,
-                projection.scales.columns,
-                projection.scales.quantization,
-            ) != (rows, columns, "nvfp4"):
-                raise ValueError(
-                    "NVFP4-CSF scale geometry differs from its packed weights"
-                )
-            scales = projection.scales
-            if isinstance(scales, CsfSource) and (tp_size != 1 or real != local):
-                scales = scales.select(
-                    row_range=row_slice,
-                    column_range=column_slice,
-                    padded_rows=out_rows,
-                    padded_columns=out_columns,
-                    padding_base=_PADDED_SCALE,
-                )
-            (scales13 if matrix < 2 else scales2).append(scales)
+            fixed, exceptions = _slice_scale_plane(
+                projection.fixed,
+                projection.exceptions,
+                rows,
+                columns,
+                row_slice,
+                column_slice,
+                out_rows,
+                out_columns,
+            )
+            if matrix < 2:
+                f13.append(fixed)
+                if matrix:
+                    exceptions += np.uint32(local * columns)
+                e13.append(exceptions)
+            else:
+                fixed2.append(fixed)
+                exceptions2.append(exceptions)
         if not torch.equal(global13[0], global13[1]):
             raise ValueError("NVFP4-CSF requires equal gate/up global weight scales")
         g13[expert] = global13[0]
         a13[expert] = torch.stack(input13).amax()
+        fixed13.append(np.concatenate(f13))
+        exceptions13.append(np.concatenate(e13))
     return Nvfp4CsfWeights(
         packed=PackedWeights(
-            w13=w13,
-            w2=w2,
+            w13=w13.to(device),
+            w2=w2.to(device),
             w13_block_scales=w13_scale_scratch,
             w2_block_scales=w2_scale_scratch,
             w13_global_scales=g13.to(device),
@@ -177,31 +227,12 @@ def prepare_nvfp4_csf_weights(
             intermediate_scale=a2.to(device).reciprocal(),
             immutable_input_scales=True,
         ),
-        w13_scales=batch_csf_sources(
-            scales13,
-            device,
-            join=2,
-            **(
-                {}
-                if isinstance(scales13[0], CsfSource)
-                else dict(
-                    row_range=(first, last),
-                    padded_rows=local,
-                    padding_base=_PADDED_SCALE,
-                )
-            ),
+        w13_scales=CsfScalePlanes(
+            tuple(torch.from_numpy(p) for p in fixed13),
+            tuple(torch.from_numpy(p) for p in exceptions13),
         ),
-        w2_scales=batch_csf_sources(
-            scales2,
-            device,
-            **(
-                {}
-                if isinstance(scales2[0], CsfSource)
-                else dict(
-                    column_range=(first // 16, last // 16),
-                    padded_columns=local // 16,
-                    padding_base=_PADDED_SCALE,
-                )
-            ),
+        w2_scales=CsfScalePlanes(
+            tuple(torch.from_numpy(p) for p in fixed2),
+            tuple(torch.from_numpy(p) for p in exceptions2),
         ),
     )

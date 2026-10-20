@@ -55,6 +55,15 @@ CacheDType = Literal[
     "fp8_per_token_head",
     "nvfp4",
     "nvfp4_4over6",
+    # KVarN MLA (arXiv:2606.03458): dual-rate packed latent records for
+    # glm5_next. Self-describing: k<k> score-path bits, v<v> value-path bits,
+    # g<group> == cache block size. Opaque uint8 pages, B12X sparse MLA.
+    # Omitting v<v> selects the single-plane variant (one shared code plane).
+    "kvarn_mla_k4v4_g256",
+    "kvarn_mla_k5v5_g256",
+    "kvarn_mla_k5v4_g256",
+    "kvarn_mla_k4v2_g256",
+    "kvarn_mla_k4_g256",
 ]
 
 

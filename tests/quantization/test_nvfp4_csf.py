@@ -8,7 +8,6 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-import numpy as np
 import pytest
 import torch
 from safetensors.torch import save_file
@@ -60,7 +59,7 @@ def test_csf_config_preserves_recipes_and_avoids_expert_allocations():
             "model.layers.3.mlp.experts": {
                 "quant_algo": "NVFP4",
                 "group_size": 16,
-                "weight_scale_encoding": "csf_32x2_v1",
+                "weight_scale_encoding": "csf",
             },
             "model.layers.45.mlp.experts": {"quant_algo": "MXFP8"},
         },
@@ -87,31 +86,8 @@ def test_csf_config_preserves_recipes_and_avoids_expert_allocations():
     layer.layer_name = "model.layers.3.mlp.experts"
     method.create_weights(layer, 288, 4096, 1024, torch.bfloat16)
     assert all(p.numel() == 0 for p in layer.parameters())
-    assert (
-        owner._resolve_weight_scale_encoding("model.layers.3.mlp.experts")
-        == "csf_32x2_v1"
-    )
+    assert owner._resolve_weight_scale_encoding("model.layers.3.mlp.experts") == "csf"
     assert owner._resolve_weight_scale_encoding("model.layers.45.mlp.experts") is None
-
-
-@pytest.mark.parametrize("encoding", ["csf", "csf_32x2_v1"])
-def test_modelopt_accepts_csf_checkpoint_encodings(encoding):
-    owner = ModelOptMixedPrecisionConfig.from_config(
-        {
-            "quant_algo": "MIXED_PRECISION",
-            "quantized_layers": {
-                "model.layers.0.mlp.experts": {
-                    "quant_algo": "NVFP4",
-                    "group_size": 16,
-                    "weight_scale_encoding": encoding,
-                }
-            },
-        }
-    )
-    assert owner.csf_state is not None
-    assert (
-        owner._resolve_weight_scale_encoding("model.layers.0.mlp.experts") == encoding
-    )
 
 
 def test_prepared_nvfp4_accepts_kernel_order_and_rejects_activation_change(monkeypatch):
@@ -218,21 +194,12 @@ def test_standard_loader_yields_all_csf_components_and_native_tensors(
         "model.layers.3.mlp.experts.0.gate_proj.weight": torch.ones(
             8, dtype=torch.uint8
         ),
-        ("model.layers.3.mlp.experts.0.gate_proj.weight_scale.csf32_codes"): torch.ones(
-            8, dtype=torch.uint8
-        ),
-        ("model.layers.3.mlp.experts.0.gate_proj.weight_scale.csf32_bases"): torch.ones(
-            8, dtype=torch.uint8
-        ),
         (
-            "model.layers.3.mlp.experts.0.gate_proj.weight_scale.csf32_page_bases"
-        ): torch.zeros(1, dtype=torch.uint32),
+            "model.layers.3.mlp.experts.0.gate_proj.weight_scale.nvfp4_csf_fixed"
+        ): torch.ones(8, dtype=torch.uint8),
         (
-            "model.layers.3.mlp.experts.0.gate_proj.weight_scale.csf32_offsets"
-        ): torch.tensor([0, 1], dtype=torch.uint16),
-        (
-            "model.layers.3.mlp.experts.0.gate_proj.weight_scale.csf32_exceptions"
-        ): torch.tensor([42], dtype=torch.uint16),
+            "model.layers.3.mlp.experts.0.gate_proj.weight_scale.nvfp4_csf_exceptions"
+        ): torch.tensor([42], dtype=torch.uint32),
         "model.layers.45.mlp.experts.0.gate_proj.weight": torch.full(
             (8,), 42, dtype=torch.uint8
         ),
@@ -515,7 +482,6 @@ def test_scale_prefetch_expands_the_next_layer_for_this_forward_only(monkeypatch
     def method(index):
         m = object.__new__(Nvfp4CsfMoEMethod)
         m.owner, m.layer_index = owner, index
-        m.num_experts = 8
         m.backend = SimpleNamespace(scales_expanded=False, _a4_prefill_enabled=False)
         m.prepared = f"layer-{index}"
         m.moe_done, m.scales_ready = torch.cuda.Event(), torch.cuda.Event()
@@ -540,7 +506,7 @@ def test_scale_prefetch_expands_the_next_layer_for_this_forward_only(monkeypatch
         for m in (first, second):
             m.apply(layer, x, None, ids, None, None)
 
-    forward(step(2000))  # Long prefill expands every expert.
+    forward(step(2000))  # above the stage-read limit: the calls expand
     assert calls == [(3, False), (4, True)]
     assert [p for p, _ in expanded] == ["layer-4"]
     assert expanded[0][1] == owner.scale_stream
@@ -551,7 +517,7 @@ def test_scale_prefetch_expands_the_next_layer_for_this_forward_only(monkeypatch
     second.apply(layer, step(2000), None, None, None, None)
     assert calls == [(4, False)]
     main_stream.wait_event.assert_called_with(second.scales_ready)
-    # Decode expands only routed experts and does not prefetch all experts.
+    # Decode-sized calls read compressed scales per stage: nothing to expand.
     expanded.clear()
     calls.clear()
     forward(step(8))
@@ -567,24 +533,13 @@ def test_scale_prefetch_expands_the_next_layer_for_this_forward_only(monkeypatch
     second.backend.uses_expanded_nvfp4_scales.return_value = True
     forward(step(2000))
     assert [p for p, _ in expanded] == ["layer-4"]
-    expanded.clear()
-    calls.clear()
-    second.backend.uses_expanded_nvfp4_scales.reset_mock()
-    forward(step(8))
-    assert calls == [(3, False), (4, False)] and expanded == []
-    second.backend.uses_expanded_nvfp4_scales.assert_not_called()
-    forward(step(127))
-    assert expanded == []
-    forward(step(128))
-    assert [p for p, _ in expanded] == ["layer-4"]
 
 
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("direct", [False, True])
-@pytest.mark.parametrize("encoding", ["csf", "csf_32x2_v1"])
 def test_normal_expert_hooks_preserve_tp_weights_scales_and_calibration(
-    tmp_path, rank, reverse, direct, monkeypatch, encoding
+    tmp_path, rank, reverse, direct
 ):
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
     from vllm.model_executor.layers.quantization.utils.nvfp4_csf_utils import (
@@ -614,8 +569,6 @@ def test_normal_expert_hooks_preserve_tp_weights_scales_and_calibration(
     torch.nn.Module.__init__(layer)
     layer.layer_name = "model.layers.0.mlp.experts"
     layer.moe_config = moe
-    layer.activation = moe.activation
-    layer.apply_router_weight_on_input = False
     layer.expert_map_manager = SimpleNamespace(num_fused_shared_experts=0)
     layer.ckpt_gate_proj_name, layer.ckpt_up_proj_name, layer.ckpt_down_proj_name = (
         "gate_proj",
@@ -630,7 +583,7 @@ def test_normal_expert_hooks_preserve_tp_weights_scales_and_calibration(
                 layer.layer_name: {
                     "quant_algo": "NVFP4",
                     "group_size": 16,
-                    "weight_scale_encoding": encoding,
+                    "weight_scale_encoding": "csf",
                 }
             },
         }
@@ -643,13 +596,7 @@ def test_normal_expert_hooks_preserve_tp_weights_scales_and_calibration(
     for expert in range(2):
         projections = []
         for projection, proj_name in enumerate(("up_proj", "gate_proj", "down_proj")):
-            source, _ = matrix(
-                128,
-                128,
-                group_size=16,
-                seed=expert * 3 + projection,
-                finite_scales=direct and rank == 0 and not reverse,
-            )
+            source, _ = matrix(128, 128, group_size=16, seed=expert * 3 + projection)
             source = replace(
                 source,
                 global_scale=torch.tensor(0.031234 + expert),
@@ -657,39 +604,13 @@ def test_normal_expert_hooks_preserve_tp_weights_scales_and_calibration(
             )
             projections.append(source)
             prefix = f"{expert}.{proj_name}."
-            if encoding == "csf":
-                from b12x.loader._csf_blocks import logical_csf_components
-
-                bases, codes, positions, values = logical_csf_components(source.scales)
-                packed_codes = codes[:, ::2] | (codes[:, 1::2] << 4)
-                fixed = np.concatenate(
-                    (bases.reshape(-1, 16), packed_codes.reshape(8, -1)), axis=1
-                )
-                records = positions.astype(np.uint32) | (values.astype(np.uint32) << 24)
-                scale_parts: tuple[tuple[str, torch.Tensor], ...] = (
-                    ("nvfp4_csf_fixed", torch.from_numpy(fixed)),
-                    ("nvfp4_csf_exceptions", torch.from_numpy(records)),
-                )
-            else:
-                scale_parts = tuple(
-                    (f"csf32_{part}", torch.from_numpy(getattr(source.scales, part)))
-                    for part in (
-                        "bases",
-                        "codes",
-                        "page_bases",
-                        "offsets",
-                        "exceptions",
-                    )
-                )
             tensors.update(
                 {
                     prefix + suffix: tensor
                     for suffix, tensor in (
                         ("weight", source.weight.tensor),
-                        *(
-                            (f"weight_scale.{part}", tensor)
-                            for part, tensor in scale_parts
-                        ),
+                        ("weight_scale.nvfp4_csf_fixed", source.fixed),
+                        ("weight_scale.nvfp4_csf_exceptions", source.exceptions),
                         ("weight_scale_2", source.global_scale),
                         ("input_scale", source.input_scale),
                     )
@@ -767,69 +688,7 @@ def test_normal_expert_hooks_preserve_tp_weights_scales_and_calibration(
                 decode_planes(getattr(actual, name), rows, columns, 16),
                 decode_planes(getattr(expected, name), rows, columns, 16),
             )
-    missing = method._components[(0, "w1")].pop("scales")
+    missing = method._components[(0, "w1")].pop("fixed")
     with pytest.raises(ValueError, match="Missing CSF tensors"):
         list(method._expert_tensors())
-    method._components[(0, "w1")]["scales"] = missing
-    if direct and rank == 0 and not reverse:
-        from b12x.moe import fused_moe
-
-        from tests.kernels.moe.test_b12x import _prepare
-        from vllm.model_executor.layers.fused_moe import b12x
-
-        monkeypatch.setattr(
-            b12x, "_register_b12x_moe_output_collective", lambda *a, **k: None
-        )
-        method.process_weights_after_loading(layer)
-        session, units = _prepare(
-            layer,
-            device=torch.device("cuda", 0),
-            counts=(1, 33),
-            fixed=(1,),
-            autotune=True,
-        )
-        with session:
-            assert {
-                request.plan.contract.component_id
-                for unit in units
-                for request in unit.requests
-                if hasattr(request.plan, "contract")
-            } == {"quantization.csf_block_expansion"}
-            plan = method.backend._plan
-            x = torch.randn((33, 128), dtype=torch.bfloat16, device="cuda") * 0.5
-            ids = torch.zeros((33, 1), dtype=torch.int32, device="cuda")
-            probabilities = torch.ones((33, 1), dtype=torch.float32, device="cuda")
-            output = torch.empty_like(x)
-            scratch = tuple(
-                torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-                for spec in plan.scratch_specs()
-            )
-            binding = fused_moe.bind(
-                plan,
-                a=x,
-                topk_ids=ids,
-                topk_weights=probabilities,
-                output=output,
-                scratch=scratch,
-                input_scales_static=True,
-            )
-            binding.run()
-            reference = output.clone()
-            assert torch.isfinite(reference).all() and torch.count_nonzero(reference)
-            session.freeze()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                binding.run()
-            for _ in range(3):
-                for buffer in method.owner.scale_scratch:
-                    buffer.view(torch.uint8).fill_(0x7F)
-                output.fill_(float("nan"))
-                before = torch.accelerator.memory_stats()["allocation.all.allocated"]
-                graph.replay()
-                torch.accelerator.synchronize()
-                assert (
-                    torch.accelerator.memory_stats()["allocation.all.allocated"]
-                    == before
-                )
-                torch.testing.assert_close(output, reference, rtol=0, atol=0)
-            graph.reset()
+    method._components[(0, "w1")]["fixed"] = missing

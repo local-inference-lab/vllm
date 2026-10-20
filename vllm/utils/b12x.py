@@ -506,23 +506,6 @@ def get_b12x_ple_hash() -> ModuleType | None:
     return _get_submodule("b12x.sequence.ple_hash")
 
 
-# Calls of at least this many rows take a layer's prefill holder (BF16
-# activations); b12x runs such A16 MXFP8 calls as a BF16 GEMM over the expanded
-# weight from the same row count.
-B12X_MXFP8_PREFILL_A16_MIN_ROWS = 128
-
-
-def _b12x_holders(layer: torch.nn.Module) -> tuple:
-    return tuple(
-        holder
-        for holder in (
-            getattr(layer, "b12x_linear", None),
-            getattr(layer, "b12x_linear_prefill", None),
-        )
-        if holder is not None
-    )
-
-
 def _b12x_blockscaled_linear(
     source: torch.Tensor,
     bias: torch.Tensor | None,
@@ -530,12 +513,6 @@ def _b12x_blockscaled_linear(
     layer_name: LayerNameType,
 ) -> torch.Tensor:
     layer = b12x_layer(_resolve_layer_name(layer_name))
-    prefill = getattr(layer, "b12x_linear_prefill", None)
-    if (
-        prefill is not None
-        and source.numel() >= B12X_MXFP8_PREFILL_A16_MIN_ROWS * source.shape[-1]
-    ):
-        return prefill.run(source, bias)
     return layer.b12x_linear.run(source, bias)
 
 
@@ -573,10 +550,9 @@ def get_b12x_projection_workspace_sizes(
 ) -> tuple[int, ...]:
     """Describe projection scratch without allocating CUDA storage."""
     return tuple(
-        max(
-            (holder.get_workspace_size(rows) for holder in _b12x_holders(layer)),
-            default=0,
-        )
+        holder.get_workspace_size(rows)
+        if (holder := getattr(layer, "b12x_linear", None)) is not None
+        else 0
         for layer in layers
     )
 
