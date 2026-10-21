@@ -77,6 +77,8 @@ class TransferJobStatus:
     # Offload keys this job covers; passed to manager.complete_*().
     keys: set[OffloadKey]
     is_store: bool
+    # Whether any worker reported the transfer as failed.
+    failed: bool = False
     # Store source blocks fenced after the request finishes.
     deferred_fence_block_ids: list[int] | None = None
     # Store source blocks fenced when the transfer is created.
@@ -391,6 +393,9 @@ class RequestOffloadState:
     # time.monotonic() of this request's first deferred offload lookup;
     # None once consumed (observed) or while no lookup is pending.
     deferred_lookup_start_time: float | None = None
+    # A load of this request failed: its offloaded chunks are not trusted
+    # again, so a retry recomputes instead of repeating the load.
+    load_failed: bool = False
     # Fine-grained token boundary selected beyond the last complete offload
     # chunk. It is consumed when the corresponding load is scheduled.
     partial_tail_boundary: int | None = None
@@ -1135,7 +1140,7 @@ class OffloadingConnectorScheduler:
         req_status.num_locally_computed_tokens = num_computed_tokens
 
         num_hit_tokens: int | None
-        if request.skip_reading_prefix_cache:
+        if request.skip_reading_prefix_cache or req_status.load_failed:
             num_hit_tokens = 0
         else:
             lookup_start = time.monotonic()
@@ -2013,19 +2018,32 @@ class OffloadingConnectorScheduler:
                 continue
             job_status = self._jobs[job_id]
             job_status.pending_count -= count
+            job_status.failed |= job_id in meta.failed_jobs
             if job_status.pending_count > 0:
                 continue
             assert job_status.pending_count == 0
 
             req_status = self._req_status[job_status.req_id]
             if job_status.is_store:
-                self.manager.complete_store(job_status.keys, req_status.req_context)
+                # A failed store drops the keys it did not mark stored.
+                self.manager.complete_store(
+                    job_status.keys,
+                    req_status.req_context,
+                    success=not job_status.failed,
+                )
+                if job_status.failed:
+                    # No stored event follows, so its metadata would stay.
+                    self._events_tracker.discard_failed_store(job_status.keys)
                 # Every worker's D2H read of the source blocks is done (I4):
                 # release the manager pin on any frozen capture sources.
                 # No-op for block ids the manager never pinned.
                 for block_id in job_status.fenced_block_ids or ():
                     self._release_capture(block_id)
             else:
+                # The worker reported a failed load's blocks as load errors;
+                # the core recomputes or fails the request
+                # (kv_load_failure_policy).
+                req_status.load_failed |= job_status.failed
                 self.manager.complete_load(job_status.keys, req_status.req_context)
                 if self._chunks_being_loaded:
                     self._chunks_being_loaded.difference_update(job_status.keys)
