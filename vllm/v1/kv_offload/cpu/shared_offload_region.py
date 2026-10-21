@@ -340,6 +340,21 @@ class SharedOffloadRegion:
         )
         return memoryview(np_arr)
 
+    @property
+    def created_file(self) -> bool:
+        """Whether this process created the backing file and still names it."""
+        return self._creator
+
+    def release_name(self) -> None:
+        """Unlink the backing file once every process sharing it has mapped it.
+
+        The kernel then frees the region when the last mapping closes, so no
+        exit path, including SIGKILL, leaves the file behind in /dev/shm.
+        """
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(self.mmap_path)
+        self._creator = False
+
     def cleanup(self) -> None:
         if self.is_pinned and self._base is not None:
             if current_platform.is_cuda_alike():
@@ -380,6 +395,9 @@ class SharedOffloadRegion:
             try:
                 os.unlink(self.mmap_path)
                 logger.info("Removed mmap file %s", self.mmap_path)
+            except FileNotFoundError:
+                # A process sharing the region already released its name.
+                pass
             except Exception:
                 logger.warning(
                     "Failed to unlink path %s", self.mmap_path, exc_info=True

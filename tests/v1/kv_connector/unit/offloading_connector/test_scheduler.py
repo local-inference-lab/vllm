@@ -78,6 +78,7 @@ from vllm.v1.kv_offload.base import (
     make_offload_key,
 )
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.tiering.manager import TieringOffloadingManager
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
@@ -687,6 +688,48 @@ def test_partial_lookup_requires_every_cache_group():
     scheduler.manager.lookup.side_effect = lookup
     assert scheduler._lookup(req_status) == 16
     assert req_status.partial_tail_boundary is None
+
+
+def test_cache_reset_without_promotions_keeps_lookups():
+    # Without secondary tiers no lookup writes a released chunk.
+    scheduler = _make_partial_tail_scheduler()
+    scheduler.config = scheduler.config._replace(supports_partial_tail=False)
+    request = _make_partial_tail_request(scheduler)
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+    scheduler._jobs[7] = MagicMock(pending_count=2, is_store=True)
+    scheduler._job_counter = 8
+
+    scheduler.reset_cache()
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (16, True)
+
+
+def test_cache_reset_offers_no_load_until_flushed_jobs_report():
+    # Until every worker reports a job flushed by a reset, it may still write
+    # its released chunk (a remote node pushes its slot only then), so no
+    # promotion may reuse that chunk.
+    scheduler = _make_partial_tail_scheduler()
+    scheduler.config = scheduler.config._replace(supports_partial_tail=False)
+    request = _make_partial_tail_request(scheduler)
+    scheduler.manager = MagicMock(
+        spec=TieringOffloadingManager, secondary_tiers=[MagicMock()]
+    )
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+    scheduler._jobs[7] = MagicMock(pending_count=2, is_store=True)
+    scheduler._job_counter = 8
+
+    scheduler.reset_cache()
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    # Lookups start promotions, so none runs while the fence holds.
+    scheduler.manager.lookup.assert_not_called()
+    for _ in range(2):
+        scheduler.update_connector_output(
+            KVConnectorOutput(
+                kv_connector_worker_meta=OffloadingWorkerMetadata(completed_jobs={7: 1})
+            )
+        )
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (16, True)
 
 
 def test_scheduler_reports_allocation_failure(request_runner):

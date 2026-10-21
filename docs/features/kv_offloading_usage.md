@@ -95,6 +95,20 @@ vllm serve <model> \
   }'
 ```
 
+With secondary tiers (outside `external_launcher`), `TieringOffloadingSpec` releases the name of its shared `/dev/shm` region once the engine core and the workers on its node have mapped it, so an engine killed after startup leaves no file on that node (nor, with secondary tiers, on the others); re-registering KV caches is therefore not supported.
+
+### Multiple Nodes
+
+Without secondary tiers, each node's CPU region serves only its own workers and nothing below applies. With secondary tiers, an engine whose workers span several nodes must run under the multiprocessing executor (`nnodes` > 1). The tiering scheduler and its secondary tiers run in the engine core, which must share a node with the engine's group rank 0 (the head node). Each node keeps its own CPU region:
+
+- The head node's region holds every rank's slot of each chunk; `cpu_bytes_to_use` is allocated there in full.
+- Workers on other nodes keep a region with only their own slot and mirror it through the head region over TCP: a store is reported after the worker's slot reached the head node, and a load fetches the worker's slot before its DMA.
+- Group rank 0 serves the mirror on `VLLM_HOST_IP`, which every worker must set to a specified IP address; it admits connections only from the remote workers' `VLLM_HOST_IP`, which they connect from. The port is free unless `mirror_port` is set, in which case data parallel replica `i` uses `mirror_port + i`: engines that share a node need disjoint port ranges. See [Security](../usage/security.md#inter-node-communication).
+- Secondary tiers that key storage through `FileMapper` (fs, obj, p2p) use their own namespace on multi-node engines, unless their rows are topology-agnostic.
+- `canonical_layout` is not supported across nodes.
+- A copy that fails after its retries (`mirror_attempts` attempts of `mirror_timeout_s` per request, 3 and 30 s by default) is reported as a failed transfer: a failed store is dropped, and a failed load's blocks are reported as load errors, which the engine recomputes or fails according to `kv_load_failure_policy` (set it to `recompute` to keep serving). A step waits on copies only for a load that a cache reset flushed. Copies move in requests of at most 32 MiB, and a load overtakes a store between its requests. Before a failed push is reported, a fence makes the head reject its delayed attempts; if the fence fails too, the mirror stops and every later copy fails at once.
+- When workers may span nodes (`nnodes` > 1 or Ray), data parallel replicas run node-placement collectives together when their workers are created, so replicas added or restarted alone (elastic scaling) are not supported, nor is `external_launcher` across nodes.
+
 ## `kv_connector_extra_config` Reference
 
 | Key | Required | Default | Scope | Notes |
@@ -108,6 +122,9 @@ vllm serve <model> \
 | `store_threshold` | no | `0` | single-tier | Min lookups before a block is offloaded. Values ≥ 2 are rejected by `TieringOffloadingSpec`. |
 | `max_tracker_size` | no | `64000` | single-tier | Max entries in the lookup tracker. |
 | `secondary_tiers` | no | `[]` | multi-tier | List of secondary tier configs (see below). |
+| `mirror_port` | no | free port | multi-tier | First port of the CPU region mirror when the engine spans several nodes; replica `i` uses `mirror_port + i` (see [Multiple Nodes](#multiple-nodes)). |
+| `mirror_timeout_s` | no | `30` | multi-tier | Seconds one request of the multi-node CPU region mirror waits before it is retried (see [Multiple Nodes](#multiple-nodes)). |
+| `mirror_attempts` | no | `3` | multi-tier | Attempts per mirror request before the copy is reported as a failed transfer. |
 | `offload_prompt_only` | no | `true` | both | If `true`, only prompt (prefill) blocks are offloaded; decode blocks are skipped. |
 | `self_describing_kv_events` | no | `false` | both | Opt-in. When `true` *and* KV cache events are enabled (`--kv-events-config` with `enable_kv_cache_events`), the connector emits self-describing block-granular `BlockStored`/`BlockRemoved` payloads (constituent block hashes, whole-chunk `token_ids`, per-block `block_size`, parent hash, LoRA + group/cache-spec metadata) instead of the placeholder fallback, so external KV-event consumers can index offloaded blocks. Inert unless events are enabled. With `TieringOffloadingSpec`, a CPU promotion is self-describing when a local request observes its primary-tier `HIT` before event translation; otherwise its stored event may retain the placeholder, while a later `HIT` can backfill metadata for removal. Pending-removal/re-promotion races and externally initiated promotions may also produce placeholders, and consumers must ignore removals for unknown hashes. Partial recurrent tails emit the hash-aligned portion from the physical block start through the tail boundary. Other sliding-window/SSM chunks keep the placeholder fallback. In chunk mode (`block_size` > GPU block size, or `blocks_per_chunk` > 1), overlapping chunks re-announce shared per-block hashes, so consumers must reference-count (deduplicate) repeated store/remove announcements. |
 | `spec_module_path` | no | — | both | Python import path for a custom `OffloadingSpec` not in the built-in registry. Required only when `spec_name` is not built-in (advanced). |
