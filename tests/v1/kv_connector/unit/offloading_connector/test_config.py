@@ -400,6 +400,59 @@ def test_hisparse_offloads_only_indexer_group():
     assert [group.group_idx for group in scheduler_config.kv_group_configs] == [1]
 
 
+def test_request_private_groups_are_not_offloaded():
+    # A compressor ring and a replayed decoder window are rebuilt by recompute,
+    # as for local prefix hits; the ring's 8-token blocks are not even a
+    # multiple of the 16-token hash block.
+    full = KVCacheGroupSpec(["full"], _full_attention_spec())
+    ring = KVCacheGroupSpec(
+        ["ring"],
+        CircularBufferSpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=64,
+            head_size_v=0,
+            dtype=torch.float32,
+        ),
+    )
+    replayed = KVCacheGroupSpec(
+        ["replayed"],
+        SlidingWindowMLASpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.float32,
+            sliding_window=128,
+            prefix_cache_enabled=False,
+            prefill_replay_window=128,
+        ),
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=4 * 96,
+                layers=["full", "ring", "replayed"],
+                layer_stride=32,
+                block_stride=96,
+            )
+        ],
+        kv_cache_groups=[full, ring, replayed],
+    )
+    config = _make_vllm_config()
+
+    offloading_config = build_offloading_config(config, kv_cache_config)
+    scheduler_config = SchedulerOffloadConfig.from_spec(
+        MockOffloadingSpec(offloading_config), config, kv_cache_config
+    )
+
+    assert [group.group_id for group in offloading_config.groups] == [0]
+    assert [group.group_idx for group in scheduler_config.kv_group_configs] == [0]
+    assert scheduler_config.prefill_replay_tokens == 128
+    # Selected groups share the device pool, so a block keeps its pool footprint.
+    assert offloading_config.worker_kv_bytes_per_block == 96
+
+
 def test_hisparse_partial_group_size_survives_scheduler_flattening():
     """Worker and scheduler representations must produce identical mmap rows."""
     layer_specs = {name: _full_attention_spec() for name in ("indexer.0", "indexer.1")}
@@ -947,3 +1000,32 @@ def test_blocks_per_chunk_must_be_positive():
 
     with pytest.raises(ValueError, match="greater than 0"):
         build_offloading_config(config, _make_kv_cache_config())
+
+
+def test_excluded_groups_set_the_hit_alignment():
+    # Hits end on scheduler blocks, so a group left out is rebuilt as after a
+    # local hit, whatever its block size: a 24-token ring neither divides nor
+    # is a multiple of the 16-token hash block.
+    full = KVCacheGroupSpec(["full"], _full_attention_spec())
+    ring = KVCacheGroupSpec(
+        ["ring"],
+        CircularBufferSpec(
+            block_size=24,
+            num_kv_heads=1,
+            head_size=64,
+            head_size_v=0,
+            dtype=torch.float32,
+        ),
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4, kv_cache_tensors=[], kv_cache_groups=[full, ring]
+    )
+
+    config = _make_vllm_config()
+    offloading_config = build_offloading_config(config, kv_cache_config)
+    scheduler_config = SchedulerOffloadConfig.from_spec(
+        MockOffloadingSpec(offloading_config), config, kv_cache_config
+    )
+
+    assert [group.group_id for group in offloading_config.groups] == [0]
+    assert scheduler_config.hit_alignment_tokens == 48

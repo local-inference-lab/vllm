@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import math
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
@@ -29,6 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.kv_cache_interface import (
@@ -188,6 +190,14 @@ class SchedulerOffloadConfig(NamedTuple):
     alignment_tokens: int | None = None
     retention_interval: int | None = None
     dcp_world_size: int = 1
+    # Uncached suffix every hit must leave to recompute so request-private
+    # state (e.g. replayed decoder windows) is rebuilt, as for local hits.
+    prefill_replay_tokens: int = 0
+    # Boundary every hit must end on. Groups left out of offloading rebuild
+    # their state from the first recomputed token, which must then sit on a
+    # scheduler block boundary, as it does for local hits without partial hash
+    # hits. 1 when no group is left out.
+    hit_alignment_tokens: int = 1
 
     @classmethod
     def from_spec(
@@ -303,11 +313,20 @@ class SchedulerOffloadConfig(NamedTuple):
             and config.tokens_per_block > spec.tokens_per_hash
             for config in kv_group_configs
         )
+        # Groups left out of offloading rebuild from a scheduler block boundary.
+        hit_alignment = (
+            resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)[0]
+            if kv_cache_config.hisparse_host_num_blocks is None
+            and len(kv_group_configs) < len(kv_cache_config.kv_cache_groups)
+            else 1
+        )
         # Partial tails currently require one physical block per offload chunk
         # and uniform, non-windowed groups so one boundary identifies every
         # group's source. EAGLE and DCP need additional hand-off semantics.
+        # Hits aligned for groups left out end on whole blocks, never in one.
         supports_partial_tail = (
-            spec.blocks_per_chunk == 1
+            hit_alignment == 1
+            and spec.blocks_per_chunk == 1
             and len(group_block_sizes) == 1
             and has_partial_recurrent_group
             and all(
@@ -358,6 +377,15 @@ class SchedulerOffloadConfig(NamedTuple):
             alignment_tokens=alignment_tokens,
             retention_interval=retention_interval,
             dcp_world_size=vllm_config.parallel_config.decode_context_parallel_size,
+            prefill_replay_tokens=max(
+                (
+                    group.kv_cache_spec.prefill_replay_tokens
+                    for group in kv_cache_config.kv_cache_groups
+                    if kv_cache_config.hisparse_host_num_blocks is None
+                ),
+                default=0,
+            ),
+            hit_alignment_tokens=hit_alignment,
         )
 
 
@@ -840,19 +868,35 @@ class OffloadingConnectorScheduler:
                 max_hit_size_tokens,
                 num_computed_tokens + req_status.max_load_tokens,
             )
+        replay_tokens = self.config.prefill_replay_tokens
+        if replay_tokens:
+            max_hit_size_tokens = min(
+                max_hit_size_tokens, req_status.req.num_tokens - replay_tokens
+            )
         if self._sliding_window_groups:
             # the last prompt token has to be recomputed to get the logprobs
             # for sliding window attention, we must reduce by 1 to make sure
-            # we still have a hit after reduction
-            max_hit_size_tokens -= 1
+            # we still have a hit after reduction. A replay suffix already
+            # leaves it out and ends where stores keep a window.
+            if not replay_tokens:
+                max_hit_size_tokens -= 1
             if self._mamba_align_size is not None:
                 # Constrain hit-window to the mamba block size.
                 max_hit_size_tokens = round_down(
                     max_hit_size_tokens, self._mamba_align_size
                 )
+        hit_alignment = self.config.hit_alignment_tokens
+        if hit_alignment > 1 and not replay_tokens:
+            # The engine recomputes the last prompt token of a whole-prompt
+            # hit, which would start recompute off the alignment.
+            max_hit_size_tokens = min(
+                max_hit_size_tokens, req_status.req.num_tokens - 1
+            )
+        max_hit_size_tokens = round_down(max_hit_size_tokens, hit_alignment)
 
         num_hit_tokens: int = 0
         defer_lookup = False
+        windows_unconfirmed = False
         lookup_groups = self._lookup_groups
 
         # Tracks which eagle groups have already popped their volatile trailing chunk
@@ -880,12 +924,13 @@ class OffloadingConnectorScheduler:
                 )
 
                 # Constrain to a chunk-aligned boundary for this group.
-                max_hit_size_tokens = min(
-                    max_hit_size_tokens, len(offload_keys) * tokens_per_chunk
+                max_hit_size_tokens = round_down(
+                    min(max_hit_size_tokens, len(offload_keys) * tokens_per_chunk),
+                    hit_alignment,
                 )
                 if req_status.max_load_tokens is not None:
                     max_hit_size_tokens = round_down(
-                        max_hit_size_tokens, tokens_per_chunk
+                        max_hit_size_tokens, math.lcm(tokens_per_chunk, hit_alignment)
                     )
                 if max_hit_size_tokens - num_computed_tokens < tokens_per_chunk:
                     # We can only load less than a chunk, so skip.
@@ -951,9 +996,16 @@ class OffloadingConnectorScheduler:
                         num_hit_chunks -= 1
                         eagle_verified.add(group_idx)
 
-                    max_hit_size_tokens = min(
+                    hit_end = min(
                         max_hit_size_tokens,
                         tokens_per_chunk * (start_chunk_idx + num_hit_chunks),
+                    )
+                    max_hit_size_tokens = round_down(hit_end, hit_alignment)
+                    # A window was confirmed ending at hit_end, not at the
+                    # rounded boundary: confirm the windows there again.
+                    windows_unconfirmed |= (
+                        sliding_window_size_in_chunks is not None
+                        and max_hit_size_tokens < hit_end
                     )
 
                 new_num_hit_tokens = max_hit_size_tokens - num_computed_tokens
@@ -973,6 +1025,10 @@ class OffloadingConnectorScheduler:
                         # we need another iteration to confirm previously looked up
                         # sliding window works with the new_num_hit_tokens
                         lookup_groups = self._sliding_window_groups
+
+                if windows_unconfirmed and not lookup_groups:
+                    windows_unconfirmed = False
+                    lookup_groups = self._sliding_window_groups
 
                 looked_up_sliding_window |= sliding_window_size_in_chunks is not None
                 num_hit_tokens = new_num_hit_tokens
@@ -1037,7 +1093,10 @@ class OffloadingConnectorScheduler:
 
         local_tokens = req_status.num_locally_computed_tokens
         complete_boundary = local_tokens + complete_hit
-        tokens_per_hash = self.config.tokens_per_hash
+        # A hit alignment is a multiple of the hash block.
+        tokens_per_hash = math.lcm(
+            self.config.tokens_per_hash, self.config.hit_alignment_tokens
+        )
         block_end = complete_boundary + self._partial_tail_block_size
         max_boundary = min(req_status.req.num_prompt_tokens - 1, block_end - 1)
         if max_num_new_tokens is not None:
@@ -1046,6 +1105,11 @@ class OffloadingConnectorScheduler:
             max_boundary = min(
                 max_boundary,
                 local_tokens + req_status.max_load_tokens,
+            )
+        if self.config.prefill_replay_tokens:
+            max_boundary = min(
+                max_boundary,
+                req_status.req.num_tokens - self.config.prefill_replay_tokens,
             )
         max_boundary = round_down(max_boundary, tokens_per_hash)
         if max_boundary <= complete_boundary:
@@ -1628,6 +1692,21 @@ class OffloadingConnectorScheduler:
             reachable_boundaries: tuple[int, ...] = ()
             if self.config.retention_interval is not None:
                 reachable_boundaries = (req.num_prompt_tokens - 1,)
+                # Loads end prefill_replay_tokens before the prompt end, on
+                # the hit alignment.
+                replay_boundary = round_down(
+                    req.num_prompt_tokens - max(1, self.config.prefill_replay_tokens),
+                    math.lcm(
+                        self.config.hit_alignment_tokens,
+                        self.config.alignment_tokens or 1,
+                        self._mamba_align_size or 1,
+                    ),
+                )
+                if (
+                    self.config.prefill_replay_tokens
+                    or self.config.hit_alignment_tokens > 1
+                ) and replay_boundary not in (0, *reachable_boundaries):
+                    reachable_boundaries += (replay_boundary,)
                 if req.shared_prefix_boundary:
                     reachable_boundaries += (req.shared_prefix_boundary,)
 

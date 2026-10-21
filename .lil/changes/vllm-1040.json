@@ -1,0 +1,22 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-1040",
+  "category": "fix",
+  "summary": "Align offloaded prefix hits for hybrid models with groups left out, which lets OffloadingConnector serve DeepSeek V4.1",
+  "models": [
+    "DeepSeek-V4.1-Flash"
+  ],
+  "compatibility": "Backports vllm-project/vllm#57145 (offload only prefix-cacheable KV cache groups) and #59504 (async loads skip zeroing only in the groups the loading connector restores). DeepSeek V4.1 can now use OffloadingConnector; other models with non-prefix-cacheable groups (GLM-5.3-Flash kpool tail, CircularBufferSpec rings such as qwen4_exp) change the same way and were not evaluated. With groups left out (outside HiSparse), external hits end on scheduler block boundaries, as local hits do, and leave the prefill replay suffix to recompute. Configurations whose groups are all prefix-cacheable and declare no prefill replay window, and HiSparse, are unchanged.",
+  "details": [
+    "OffloadingConnector offloads the groups the local prefix cache serves (#57145) and leaves the prefill replay suffix to recompute.",
+    "External hits end on scheduler block boundaries when groups are left out, and sliding windows are confirmed again where the rounded hit ends.",
+    "KVConnectorBase_V1.get_loaded_kv_cache_group_ids (#59504) replaces the token-range zeroing exemption of async loads."
+  ],
+  "authors": [
+    "javieratomic"
+  ],
+  "pull_requests": [
+    1040
+  ],
+  "requires": []
+}
