@@ -63,6 +63,7 @@ from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
 
+
 KV_LOAD_TIERS_KEY = "kv_load_tiers"
 MATCHER_MEDIUM_KEY = "medium"
 MATCHER_LOCALITY_KEY = "locality"
@@ -198,6 +199,11 @@ class SchedulerOffloadConfig(NamedTuple):
     # scheduler block boundary, as it does for local hits without partial hash
     # hits. 1 when no group is left out.
     hit_alignment_tokens: int = 1
+    # Most tokens one load may cover when hits are promoted from secondary
+    # tiers through a bounded primary tier; None when loads are not staged.
+    staged_load_tokens: int | None = None
+    # With a bound, a lookup deferred for longer than this recomputes instead.
+    staged_load_timeout_s: float = 300.0
 
     @classmethod
     def from_spec(
@@ -367,6 +373,57 @@ class SchedulerOffloadConfig(NamedTuple):
                         f"tokens_per_chunk ({config.tokens_per_chunk})."
                     )
 
+        primary_chunks = spec.staged_load_chunks
+        staged_timeout = (
+            float(spec.extra_config.get("staged_load_timeout_s", 300.0))
+            if primary_chunks
+            else 300.0
+        )
+        if primary_chunks and not (
+            math.isfinite(staged_timeout) and staged_timeout > 0
+        ):
+            raise ValueError(
+                f"staged_load_timeout_s must be positive, got {staged_timeout}"
+            )
+        staged_cap = (
+            staged_load_bound(
+                primary_chunks,
+                kv_group_configs,
+                retention_interval,
+                resolve_mamba_align_size(spec, kv_cache_config),
+                hit_alignment,
+            )
+            if primary_chunks
+            else None
+        )
+
+        if primary_chunks and staged_cap is None:
+            logger.warning(
+                "KV offloading: loads promoted through the primary tier are not "
+                "bounded (%s); a hit larger than the primary tier loads nothing.",
+                "windowed or recurrent groups keep state only at the replay "
+                "boundary; set prefix_cache_retention_interval"
+                if any(
+                    c.sliding_window_size_in_chunks is None for c in kv_group_configs
+                )
+                else "no full-attention group is offloaded",
+            )
+        elif staged_cap == 0:
+            # A bound of zero would drop hits that fit; keep loads unbounded.
+            logger.warning(
+                "KV offloading: the primary tier cannot stage a load ending on "
+                "the required alignment, so loads promoted through it are not "
+                "bounded. Increase cpu_bytes_to_use, or use a smaller nonzero "
+                "prefix_cache_retention_interval if it sets the alignment."
+            )
+            staged_cap = None
+        elif staged_cap is not None:
+            logger.info(
+                "KV offloading: a load staged through the primary tier covers "
+                "at most %d tokens",
+                staged_cap,
+            )
+
         return cls(
             num_workers=vllm_config.parallel_config.world_size,
             kv_group_configs=kv_group_configs,
@@ -386,7 +443,82 @@ class SchedulerOffloadConfig(NamedTuple):
                 default=0,
             ),
             hit_alignment_tokens=hit_alignment,
+            staged_load_tokens=staged_cap,
+            staged_load_timeout_s=staged_timeout,
         )
+
+
+def staged_load_alignment(
+    group_configs: Sequence[GroupOffloadConfig],
+    retention_interval: int | None = None,
+    mamba_align_size: int | None = None,
+    hit_alignment: int = 1,
+) -> int:
+    """Boundary shared by every group's chunks, the mamba alignment, the hit
+    alignment and, when windowed groups keep windows only on its multiples,
+    the retention interval."""
+    windowed = any(c.sliding_window_size_in_chunks is not None for c in group_configs)
+    return math.lcm(
+        (retention_interval or 1) if windowed else 1,
+        mamba_align_size or 1,
+        hit_alignment,
+        *(c.tokens_per_chunk for c in group_configs),
+    )
+
+
+def staged_load_bound(
+    num_chunks: int,
+    group_configs: Sequence[GroupOffloadConfig],
+    retention_interval: int | None = None,
+    mamba_align_size: int | None = None,
+    hit_alignment: int = 1,
+) -> int | None:
+    """Return the tokens one load may cover so its promotions fit the primary tier.
+
+    Secondary-tier hits are promoted into the primary tier before the GPU load
+    and a lookup walks the groups in turn, so an unbounded hit lets the first
+    group fill the primary tier and leaves the others without room: no group
+    set can complete and the request loads nothing. The bound holds for one
+    request on an idle primary tier whose lookups find what they query:
+    concurrent promotions, or a windowed lookup that scans past a missing or
+    retried chunk, can still exceed it, and the lookup then misses as before.
+
+    Args:
+        num_chunks: Primary tier capacity in chunks.
+        group_configs: Offloaded group configurations.
+        retention_interval: Prefix-cache retention interval. Windowed groups
+            store only windows ending on its multiples, so a load must end on
+            one to hit them.
+        mamba_align_size: Mamba alignment that hits are rounded to.
+        hit_alignment: Boundary every hit must end on.
+
+    Returns:
+        The token bound, or None without full-attention groups or when
+        windowed groups keep windows only at the replay boundary
+        (``retention_interval == 0``), where no shorter load can end.
+    """
+    full = [c for c in group_configs if c.sliding_window_size_in_chunks is None]
+    if not full or (retention_interval == 0 and len(full) < len(group_configs)):
+        return None
+    # A windowed group keeps its window plus a partial chunk at each edge; a
+    # full group may start in a partial chunk; an EAGLE group of either kind
+    # queries one extra chunk.
+    budget = num_chunks - sum(
+        c.sliding_window_size_in_chunks + 2 + int(c.is_eagle_group)
+        for c in group_configs
+        if c.sliding_window_size_in_chunks is not None
+    )
+    budget -= sum(1 + int(c.is_eagle_group) for c in full)
+    step = math.lcm(*(c.tokens_per_chunk for c in full))
+    chunks_per_step = sum(step // c.tokens_per_chunk for c in full)
+    tokens = max(0, budget // chunks_per_step) * step
+    # Lookups round a binding cap down to this boundary.
+    return round_down(
+        tokens,
+        staged_load_alignment(
+            group_configs, retention_interval, mamba_align_size, hit_alignment
+        ),
+    )
 
 
 @dataclass
@@ -419,6 +551,8 @@ class RequestOffloadState:
     # time.monotonic() of this request's first deferred offload lookup;
     # None once consumed (observed) or while no lookup is pending.
     deferred_lookup_start_time: float | None = None
+    # Whether the staged load bound shortened this request's last lookup.
+    staged_cap_bound: bool = False
     # Fine-grained token boundary selected beyond the last complete offload
     # chunk. It is consumed when the corresponding load is scheduled.
     partial_tail_boundary: int | None = None
@@ -635,6 +769,12 @@ class OffloadingConnectorScheduler:
         self._mamba_align_size: int | None = resolve_mamba_align_size(
             spec, kv_cache_config
         )
+        self._staged_alignment = staged_load_alignment(
+            self.config.kv_group_configs,
+            self.config.retention_interval,
+            self._mamba_align_size,
+            self.config.hit_alignment_tokens,
+        )
         self._partial_tail_block_size = (
             self.config.kv_group_configs[0].tokens_per_block
             if self.config.supports_partial_tail
@@ -813,6 +953,41 @@ class OffloadingConnectorScheduler:
                 )
         return None if defer_lookup or pending_in_window else consecutive_hits
 
+    def _touch_staged_range(
+        self,
+        req_status: RequestOffloadState,
+        num_computed_tokens: int,
+        staged_cap: int,
+    ) -> None:
+        """Make the chunks a bounded lookup may query the most recent.
+
+        Promotions nearly fill the primary tier, so the request's own ones
+        could evict its resident chunks. Policies treat the first key of a
+        touch as the most recent: keys go in token order across groups, the
+        prefix first, as the lookup needs it.
+        """
+        # A bounded load ends on the staged alignment.
+        end_tokens = round_down(
+            num_computed_tokens + staged_cap, self._staged_alignment
+        )
+        entries: list[tuple[int, OffloadKey]] = []
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            tokens_per_chunk = group_config.tokens_per_chunk
+            keys = group_state.offload_keys
+            end = min(cdiv(end_tokens, tokens_per_chunk), len(keys))
+            start = num_computed_tokens // tokens_per_chunk
+            window = group_config.sliding_window_size_in_chunks
+            if window is not None:
+                # The window and its edge chunks, as the bound budgets.
+                start = max(start, end - window - 2)
+            entries.extend(
+                (idx * tokens_per_chunk, keys[idx]) for idx in range(start, end)
+            )
+        entries.sort(key=lambda entry: entry[0])
+        self.manager.touch([key for _, key in entries], req_status.req_context)
+
     def _touch(self, req_status: RequestOffloadState):
         for group_config, group_state in zip(
             self.config.kv_group_configs, req_status.group_states
@@ -893,6 +1068,23 @@ class OffloadingConnectorScheduler:
                 max_hit_size_tokens, req_status.req.num_tokens - 1
             )
         max_hit_size_tokens = round_down(max_hit_size_tokens, hit_alignment)
+        # Applied last: a binding cap ends short of the prompt on a boundary
+        # every group's chunks and retained windows share, so no later
+        # rounding moves it.
+        staged_cap = self.config.staged_load_tokens
+        staged_cap_binds = (
+            staged_cap is not None
+            and num_computed_tokens + staged_cap < max_hit_size_tokens
+        )
+        req_status.staged_cap_bound = staged_cap_binds
+        if staged_cap_binds:
+            assert staged_cap is not None
+            max_hit_size_tokens = round_down(
+                num_computed_tokens + staged_cap, self._staged_alignment
+            )
+            # A group that hits less keeps the boundary where windows are kept,
+            # so windowed lookups query no more than the bound budgets.
+            hit_alignment = self._staged_alignment
 
         num_hit_tokens: int = 0
         defer_lookup = False
@@ -928,7 +1120,7 @@ class OffloadingConnectorScheduler:
                     min(max_hit_size_tokens, len(offload_keys) * tokens_per_chunk),
                     hit_alignment,
                 )
-                if req_status.max_load_tokens is not None:
+                if req_status.max_load_tokens is not None or staged_cap_binds:
                     max_hit_size_tokens = round_down(
                         max_hit_size_tokens, math.lcm(tokens_per_chunk, hit_alignment)
                     )
@@ -1111,6 +1303,13 @@ class OffloadingConnectorScheduler:
                 max_boundary,
                 req_status.req.num_tokens - self.config.prefill_replay_tokens,
             )
+        if self.config.staged_load_tokens is not None:
+            # Partial tails need blocks_per_chunk == 1, so the computed prefix
+            # is chunk-aligned and the partial first chunk the bound budgets
+            # per full group is free for the tail.
+            max_boundary = min(
+                max_boundary, local_tokens + self.config.staged_load_tokens
+            )
         max_boundary = round_down(max_boundary, tokens_per_hash)
         if max_boundary <= complete_boundary:
             return complete_hit
@@ -1133,6 +1332,10 @@ class OffloadingConnectorScheduler:
                     boundary_pending = True
 
             pending |= boundary_pending
+            if boundary_pending and req_status.staged_cap_bound:
+                # Each pending boundary starts promotions; the bound budgets
+                # the partial chunk of one boundary only.
+                break
             if not boundary_missed and not boundary_pending:
                 for group_config, key in zip(
                     self.config.kv_group_configs, boundary_keys
@@ -1202,6 +1405,9 @@ class OffloadingConnectorScheduler:
         if request.skip_reading_prefix_cache:
             num_hit_tokens = 0
         else:
+            staged_cap = self.config.staged_load_tokens
+            if staged_cap is not None and req_status.deferred_lookup_start_time is None:
+                self._touch_staged_range(req_status, num_computed_tokens, staged_cap)
             lookup_start = time.monotonic()
             num_hit_tokens = self._lookup(req_status, max_num_new_tokens)
             self._connector_stats.observe_histogram(
@@ -1211,11 +1417,33 @@ class OffloadingConnectorScheduler:
             if num_hit_tokens is None:
                 if req_status.deferred_lookup_start_time is None:
                     req_status.deferred_lookup_start_time = lookup_start
+                elif (
+                    req_status.staged_cap_bound
+                    and lookup_start - req_status.deferred_lookup_start_time
+                    > self.config.staged_load_timeout_s
+                ):
+                    # Concurrent stores can evict a bounded load's promoted
+                    # chunks before the load is prepared, so it may never
+                    # complete; recompute instead of waiting.
+                    logger.warning(
+                        "KV offloading: request %s waited over %.0f s for its "
+                        "lookup and recomputes instead",
+                        request.request_id,
+                        self.config.staged_load_timeout_s,
+                    )
+                    num_hit_tokens = 0
+                    self._maybe_observe_lookup_async_delay(req_status)
             else:
                 self._maybe_observe_lookup_async_delay(req_status)
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
         self._touch(req_status)
+        if self.config.staged_load_tokens is not None:
+            # Then the chunks a bounded load uses, in token order across
+            # groups, prefix most recent, on deferred retries too.
+            self._touch_staged_range(
+                req_status, num_computed_tokens, self.config.staged_load_tokens
+            )
 
         return num_hit_tokens, bool(num_hit_tokens)
 

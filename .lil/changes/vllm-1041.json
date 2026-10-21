@@ -1,0 +1,22 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-1041",
+  "category": "fix",
+  "summary": "Bound KV offload loads promoted from secondary tiers by the primary (CPU) tier capacity",
+  "models": [
+    "DeepSeek-V4.1-Flash"
+  ],
+  "compatibility": "Applies to TieringOffloadingSpec with secondary tiers: loads larger than the primary tier load a bounded prefix and recompute the rest instead of loading nothing. Hybrid models with windowed or recurrent groups need a prefix_cache_retention_interval other than 0 for the bound; with 0, or when the primary tier cannot hold one aligned load, loads stay unbounded and a warning says so. The bound is per request: concurrent promotions can still exceed the primary tier, and a lookup the bound shortened and that stays deferred longer than staged_load_timeout_s (300 s by default) recomputes. It also applies to hits already in the primary tier. A nonzero retention interval also changes GPU prefix-cache retention.",
+  "details": [
+    "One load covers at most the tokens whose chunks, over all groups, fit in the CPU tier; the bound is logged at startup."
+  ],
+  "authors": [
+    "javieratomic"
+  ],
+  "pull_requests": [
+    1041
+  ],
+  "requires": [
+    "vllm-1040"
+  ]
+}
