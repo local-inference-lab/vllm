@@ -422,6 +422,7 @@ class SingleTypeKVCacheManager(ABC):
         request_id: str,
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
+        record_for_zeroing: bool = True,
     ) -> None:
         """
         Allocate new blocks for external (KV-connector) computed tokens.
@@ -434,6 +435,9 @@ class SingleTypeKVCacheManager(ABC):
             request_id: The request ID.
             num_local_computed_tokens: The number of local computed tokens.
             num_external_computed_tokens: The number of external computed tokens.
+            record_for_zeroing: Whether the new blocks need zeroing. False when
+                the load writes them after this step, which zeroing would race.
+
         """
         num_total_computed_tokens = (
             num_local_computed_tokens + num_external_computed_tokens
@@ -454,7 +458,7 @@ class SingleTypeKVCacheManager(ABC):
         )
         allocated_blocks = self.block_pool.get_new_blocks(num_new_blocks)
         req_blocks.extend(allocated_blocks)
-        if self._record_new_block_ids:
+        if self._record_new_block_ids and record_for_zeroing:
             self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
     def allocate_new_blocks(
@@ -1645,13 +1649,15 @@ class CircularBufferManager(FullAttentionManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = False
     drops_eagle_block: ClassVar[bool] = False
 
-    def _claim_ring_block(self, request_id: str) -> list[KVCacheBlock]:
+    def _claim_ring_block(
+        self, request_id: str, record_for_zeroing: bool = True
+    ) -> list[KVCacheBlock]:
         req_blocks = self.req_to_blocks[request_id]
         if req_blocks:
             return []
         new_blocks = self.block_pool.get_new_blocks(1)
         req_blocks.extend(new_blocks)
-        if self._record_new_block_ids:
+        if self._record_new_block_ids and record_for_zeroing:
             self.new_block_ids.extend(block.block_id for block in new_blocks)
         return new_blocks
 
@@ -1677,8 +1683,9 @@ class CircularBufferManager(FullAttentionManager):
         request_id: str,
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
+        record_for_zeroing: bool = True,
     ) -> None:
-        self._claim_ring_block(request_id)
+        self._claim_ring_block(request_id, record_for_zeroing)
 
     @classmethod
     def find_longest_cache_hit(
@@ -2809,6 +2816,7 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         request_id: str,
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
+        record_for_zeroing: bool = True,
     ) -> None:
         # Cross-attention does not use prefix caching / external KV loads.
         return
@@ -2977,6 +2985,7 @@ class HiSparseSourceManager(FullAttentionManager):
         request_id: str,
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
+        record_for_zeroing: bool = True,
     ) -> None:
         if num_external_computed_tokens <= 0:
             return
@@ -2987,7 +2996,10 @@ class HiSparseSourceManager(FullAttentionManager):
             request_id, num_local_computed_tokens + num_external_computed_tokens
         )
         super().allocate_external_computed_blocks(
-            request_id, num_local_computed_tokens, num_external_computed_tokens
+            request_id,
+            num_local_computed_tokens,
+            num_external_computed_tokens,
+            record_for_zeroing,
         )
 
     def cache_blocks(
@@ -3127,6 +3139,7 @@ class HiSparseHotManager(_HiSparseAuxiliaryManager):
         request_id: str,
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
+        record_for_zeroing: bool = True,
     ) -> None:
         self.require_hot(request_id)
 
@@ -3185,6 +3198,7 @@ class HiSparseResidentManager(_HiSparseAuxiliaryManager):
         request_id: str,
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
+        record_for_zeroing: bool = True,
     ) -> None:
         """Represent imported host history with null resident pages."""
         assert num_external_computed_tokens > 0
