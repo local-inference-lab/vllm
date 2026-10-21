@@ -213,6 +213,26 @@ def test_take_events_forwards_locality_to_rich_store():
     assert events[0].locality == "LOCAL"
 
 
+def test_failed_store_drops_only_its_cpu_residency():
+    tracker = _tracker()
+    req = _request(block_hashes=[_hash(0), _hash(1)], token_count=8)
+    failed, shared = _record_chunks(tracker, req, _group_config(), num_chunks=2)
+    list(
+        tracker.take_events(
+            [_stored_event([shared], medium=Medium.STORAGE, removal_expected=True)]
+        )
+    )
+
+    tracker.discard_failed_store([failed, shared])
+
+    # The failed key's metadata no longer outlives its store; the other key
+    # keeps it for its secondary-tier copy.
+    assert failed not in tracker._pending_event_metadata
+    assert tracker._pending_event_metadata[shared].active_residencies == {
+        (Medium.STORAGE, None)
+    }
+
+
 def test_take_events_forwards_locality_to_placeholder_store():
     tracker = _tracker(self_describing_kv_events=False)
     req = _request(block_hashes=[_hash(0)], token_count=4)

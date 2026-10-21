@@ -592,3 +592,322 @@ def test_build_metric_definitions_returns_counter_at_threshold():
     metrics = spec_cls.build_metric_definitions(extra_config)
 
     assert CPUOffloadingMetrics.STORES_SKIPPED in metrics
+
+
+def _multi_node_tiering_spec(
+    monkeypatch, *, on_head: bool, rank: int, secondary_tiers: bool = True
+):
+    from dataclasses import replace
+
+    import vllm.v1.kv_offload.tiering.spec as tiering_spec_module
+    from vllm.v1.kv_offload.cpu.region_mirror import MirrorTopology
+
+    spec = _create_spec(
+        spec_name="TieringOffloadingSpec",
+        worker_kv_bytes_per_block=4096,
+        world_size=3,
+        extra_config=(
+            {"secondary_tiers": [{"type": "fs", "root_dir": "/unused"}]}
+            if secondary_tiers
+            else None
+        ),
+    )
+    spec.config = replace(spec.config, parallel=replace(spec.config.parallel, nnodes=3))
+    topology = MirrorTopology(
+        group=MagicMock(), rank=rank, on_head=on_head, remote_ranks=frozenset({1, 2})
+    )
+    monkeypatch.setattr(
+        tiering_spec_module, "multi_node_topology", lambda world_size: (topology, True)
+    )
+    monkeypatch.setattr(
+        tiering_spec_module.torch.accelerator, "current_device_index", lambda: 0
+    )
+    return spec, topology, tiering_spec_module
+
+
+def test_tiering_spec_multi_node_slot_follows_group_rank(monkeypatch):
+    spec, topology, module = _multi_node_tiering_spec(monkeypatch, on_head=True, rank=2)
+    region_calls: list[dict[str, Any]] = []
+    attached: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        module,
+        "SharedOffloadRegion",
+        lambda **kwargs: region_calls.append(kwargs) or MagicMock(),
+    )
+    monkeypatch.setattr(module, "CPUOffloadingWorker", MagicMock())
+    monkeypatch.setattr(module, "gather_construction_errors", lambda *args: None)
+    monkeypatch.setattr(
+        module,
+        "attach_region_mirror",
+        lambda *args, **kwargs: attached.append({"args": args, **kwargs}),
+    )
+
+    spec.create_worker(MagicMock())
+
+    assert region_calls[0]["rank"] == 2
+    assert attached[0]["args"][4] is topology
+
+
+def test_tiering_spec_rejects_secondary_tiers_under_external_launcher(monkeypatch):
+    from dataclasses import replace
+
+    spec, _, _ = _multi_node_tiering_spec(monkeypatch, on_head=True, rank=0)
+    spec.config = replace(
+        spec.config,
+        parallel=replace(spec.config.parallel, external_launcher=True),
+    )
+
+    with pytest.raises(RuntimeError, match="external_launcher"):
+        spec.create_worker(MagicMock())
+
+
+def test_tiering_spec_allows_external_launcher_on_one_node(monkeypatch):
+    from dataclasses import replace
+
+    spec, _, module = _multi_node_tiering_spec(monkeypatch, on_head=True, rank=0)
+    spec.config = replace(
+        spec.config,
+        parallel=replace(spec.config.parallel, nnodes=1, external_launcher=True),
+    )
+    worker = MagicMock()
+    monkeypatch.setattr(module, "SharedOffloadRegion", lambda **kwargs: MagicMock())
+    monkeypatch.setattr(module, "CPUOffloadingWorker", lambda **kwargs: worker)
+
+    assert spec.create_worker(MagicMock()) is worker
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"mirror_timeout_s": 0}, {"mirror_attempts": 0}, {"mirror_timeout_s": "nan"}],
+)
+def test_tiering_spec_rejects_invalid_mirror_retries(monkeypatch, extra):
+    spec, _, _ = _multi_node_tiering_spec(monkeypatch, on_head=True, rank=0)
+    spec.extra_config = {**spec.extra_config, **extra}
+
+    with pytest.raises(ValueError, match="mirror_timeout_s"):
+        spec._mirror_retries()
+
+
+def test_tiering_spec_passes_mirror_timeouts(monkeypatch):
+    spec, _, module = _multi_node_tiering_spec(monkeypatch, on_head=True, rank=0)
+    spec.extra_config = {
+        **spec.extra_config,
+        "mirror_timeout_s": 2.5,
+        "mirror_attempts": 5,
+    }
+    attached: list[dict] = []
+    monkeypatch.setattr(module, "SharedOffloadRegion", lambda **kwargs: MagicMock())
+    monkeypatch.setattr(module, "CPUOffloadingWorker", MagicMock())
+    monkeypatch.setattr(module, "gather_construction_errors", lambda *args: None)
+    monkeypatch.setattr(
+        module,
+        "attach_region_mirror",
+        lambda *args, **kwargs: attached.append(kwargs),
+    )
+
+    spec.create_worker(MagicMock())
+
+    assert attached[0]["timeout_ms"] == 2500
+    assert attached[0]["attempts"] == 5
+
+
+def test_tiering_spec_rejects_a_second_worker(monkeypatch):
+    # The region's name is released once mapped; a second worker would map a
+    # new file the scheduler does not share.
+    spec, _, module = _multi_node_tiering_spec(monkeypatch, on_head=True, rank=0)
+    monkeypatch.setattr(module, "SharedOffloadRegion", lambda **kwargs: MagicMock())
+    monkeypatch.setattr(module, "CPUOffloadingWorker", lambda **kwargs: MagicMock())
+    monkeypatch.setattr(module, "gather_construction_errors", lambda *args: None)
+    monkeypatch.setattr(
+        module, "attach_region_mirror", lambda worker, *args, **kwargs: worker
+    )
+    spec.create_worker(MagicMock())
+
+    with pytest.raises(RuntimeError, match="re-registering"):
+        spec.create_worker(MagicMock())
+
+
+def test_tiering_spec_without_secondary_tiers_keeps_regions_node_local(
+    monkeypatch,
+):
+    # No secondary tier reads remote slots: no collectives, no mirror.
+    spec, _, module = _multi_node_tiering_spec(
+        monkeypatch, on_head=False, rank=2, secondary_tiers=False
+    )
+    region_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        module,
+        "multi_node_topology",
+        MagicMock(side_effect=AssertionError("collective without a mirror")),
+    )
+    monkeypatch.setattr(
+        module,
+        "SharedOffloadRegion",
+        lambda **kwargs: region_calls.append(kwargs) or MagicMock(),
+    )
+    worker = MagicMock()
+    monkeypatch.setattr(module, "CPUOffloadingWorker", lambda **kwargs: worker)
+    monkeypatch.setattr(
+        module, "attach_region_mirror", MagicMock(side_effect=AssertionError)
+    )
+
+    assert spec.create_worker(MagicMock()) is worker
+    assert region_calls[0]["rank"] == 0
+    assert not region_calls[0]["engine_id"].endswith("_r2")
+
+
+def test_tiering_spec_mirrored_remote_region_holds_one_slot(monkeypatch):
+    spec, _, module = _multi_node_tiering_spec(
+        monkeypatch, on_head=False, rank=2, secondary_tiers=True
+    )
+    region_calls: list[dict[str, Any]] = []
+    attached: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        module,
+        "SharedOffloadRegion",
+        lambda **kwargs: region_calls.append(kwargs) or MagicMock(),
+    )
+    monkeypatch.setattr(module, "CPUOffloadingWorker", MagicMock())
+    monkeypatch.setattr(module, "gather_construction_errors", lambda *args: None)
+    monkeypatch.setattr(
+        module,
+        "attach_region_mirror",
+        lambda *args, **kwargs: attached.append({"args": args, **kwargs}),
+    )
+
+    spec.create_worker(MagicMock())
+
+    head_layout, local_layout = attached[0]["args"][2:4]
+    assert region_calls[0]["rank"] == 0
+    # Ranks sharing a remote node keep separate compact regions.
+    assert region_calls[0]["engine_id"].endswith("_r2")
+    assert region_calls[0]["kv_bytes_per_chunk"] == local_layout.row_stride
+    assert local_layout.row_stride < head_layout.row_stride
+    assert local_layout.size == head_layout.size
+
+
+def test_tiering_spec_shuts_the_worker_down_when_attach_fails(monkeypatch):
+    spec, _, module = _multi_node_tiering_spec(monkeypatch, on_head=False, rank=1)
+    worker = MagicMock()
+    monkeypatch.setattr(module, "SharedOffloadRegion", lambda **kwargs: MagicMock())
+    monkeypatch.setattr(module, "CPUOffloadingWorker", lambda **kwargs: worker)
+    monkeypatch.setattr(module, "gather_construction_errors", lambda *args: None)
+    monkeypatch.setattr(
+        module,
+        "attach_region_mirror",
+        MagicMock(side_effect=RuntimeError("mirror handshake failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="handshake"):
+        spec.create_worker(MagicMock())
+    worker.shutdown.assert_called_once()
+
+
+def test_tiering_spec_rejects_canonical_layout_across_nodes(monkeypatch):
+    from dataclasses import replace
+
+    spec, _, _ = _multi_node_tiering_spec(monkeypatch, on_head=True, rank=0)
+    spec.config = replace(spec.config, canonical_layout=True)
+
+    with pytest.raises(ValueError, match="canonical_layout"):
+        spec.create_worker(MagicMock())
+
+
+def test_tiering_spec_shares_a_construction_failure_with_every_rank(monkeypatch):
+    spec, topology, module = _multi_node_tiering_spec(
+        monkeypatch, on_head=False, rank=1
+    )
+    reported: list[Any] = []
+    region = MagicMock()
+    monkeypatch.setattr(module, "SharedOffloadRegion", lambda **kwargs: region)
+    monkeypatch.setattr(
+        module, "CPUOffloadingWorker", MagicMock(side_effect=OSError("pin failed"))
+    )
+
+    def gather(topology_arg, error):
+        reported.append(error)
+        raise RuntimeError("construction failed")
+
+    monkeypatch.setattr(module, "gather_construction_errors", gather)
+
+    with pytest.raises(RuntimeError, match="construction failed"):
+        spec.create_worker(MagicMock())
+
+    assert isinstance(reported[0], OSError)
+    region.cleanup.assert_called_once()
+
+
+def test_tiering_scheduler_must_join_the_workers_region(monkeypatch):
+    import vllm.v1.kv_offload.tiering.spec as tiering_spec_module
+
+    spec = _create_spec(
+        spec_name="TieringOffloadingSpec",
+        worker_kv_bytes_per_block=4096,
+        world_size=3,
+        extra_config={"secondary_tiers": [{"type": "fs", "root_dir": "/unused"}]},
+    )
+    region = MagicMock()
+    region.created_file = True
+    monkeypatch.setattr(
+        tiering_spec_module, "SharedOffloadRegion", lambda **kwargs: region
+    )
+
+    with pytest.raises(RuntimeError, match="share a node with worker rank 0"):
+        spec.get_manager()
+    region.cleanup.assert_called_once()
+
+
+def test_tiering_spec_requires_the_mirror_on_multi_node_engines(monkeypatch):
+    from dataclasses import replace
+
+    import vllm.v1.kv_offload.tiering.spec as tiering_spec_module
+
+    spec = _create_spec(
+        spec_name="TieringOffloadingSpec",
+        worker_kv_bytes_per_block=4096,
+        world_size=3,
+        extra_config={"secondary_tiers": [{"type": "fs", "root_dir": "/unused"}]},
+    )
+    spec.config = replace(spec.config, parallel=replace(spec.config.parallel, nnodes=3))
+    monkeypatch.setattr(
+        tiering_spec_module, "multi_node_topology", lambda world_size: (None, True)
+    )
+
+    with pytest.raises(RuntimeError, match="multiprocessing executor"):
+        spec.create_worker(MagicMock())
+
+
+def test_tiering_spec_rejects_multi_node_engines_without_a_node_count(monkeypatch):
+    # Ray leaves nnodes at 1, so the storage namespace cannot tell multi-node
+    # rows apart.
+    spec, _, _ = _multi_node_tiering_spec(
+        monkeypatch, on_head=False, rank=1, secondary_tiers=True
+    )
+    from dataclasses import replace
+
+    spec.config = replace(
+        spec.config,
+        parallel=replace(spec.config.parallel, nnodes=1, ray_executor=True),
+    )
+
+    with pytest.raises(RuntimeError, match="multiprocessing executor"):
+        spec.create_worker(MagicMock())
+
+
+@pytest.mark.parametrize("configured, replica, expected", [(0, 2, 0), (7000, 2, 7002)])
+def test_tiering_spec_offsets_the_mirror_port_per_replica(
+    configured, replica, expected
+):
+    from dataclasses import replace
+
+    spec = _create_spec(
+        spec_name="TieringOffloadingSpec",
+        worker_kv_bytes_per_block=4096,
+        extra_config={"mirror_port": configured} if configured else None,
+    )
+    spec.config = replace(
+        spec.config,
+        parallel=replace(spec.config.parallel, data_parallel_index=replica),
+    )
+
+    assert spec._mirror_port() == expected

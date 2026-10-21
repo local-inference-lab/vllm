@@ -60,6 +60,12 @@ class OffloadingParallelConfig:
     # under any topology; for the canonical layout, the canonical page itself
     # is topology-free.
     is_parallelism_agnostic: bool
+    # Nodes spanned by this engine's workers (one data parallel replica).
+    nnodes: int = 1
+    # Workers launched externally (SPMD), each with its own engine core.
+    external_launcher: bool = False
+    # Ray workers may span nodes without nnodes saying so.
+    ray_executor: bool = False
 
 
 @dataclass(frozen=True)

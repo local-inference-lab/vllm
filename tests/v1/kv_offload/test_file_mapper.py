@@ -55,6 +55,7 @@ def make_mapper_from_offloading_spec(**kwargs) -> FileMapper:
             data_parallel_size=1,
             data_parallel_rank_local=None,
             is_parallelism_agnostic=kwargs.get("is_parallelism_agnostic", False),
+            nnodes=kwargs.get("nnodes", 1),
         ),
         replicated_layout=kwargs.get("replicated_layout", False),
         canonical_layout=kwargs.get("canonical_layout", False),
@@ -327,3 +328,36 @@ def test_replicated_layout_run_config_tp_invariant():
     tp2 = make_mapper_from_offloading_spec(tp_size=2, world_size=2, rank=0, **shared)
     tp4 = make_mapper_from_offloading_spec(tp_size=4, world_size=4, rank=2, **shared)
     assert tp2.get_run_config() == tp4.get_run_config()
+
+
+def test_multi_node_rows_get_their_own_namespace(tmp_path):
+    kwargs = dict(
+        root_dir=str(tmp_path),
+        model_name="m",
+        tokens_per_hash=16,
+        blocks_per_file=1,
+        tp_size=3,
+        pp_size=1,
+        pcp_size=1,
+        dcp_size=1,
+        rank=0,
+        dtype="float16",
+    )
+
+    single = FileMapper(**kwargs)
+    multi = FileMapper(**kwargs, multi_node=True)
+
+    assert "slot_layout" not in single.fields
+    assert multi.fields["slot_layout"] == "group_rank"
+    assert multi.base_path != single.base_path
+
+
+def test_multi_node_namespace_spares_topology_agnostic_rows():
+    # Rows that do not depend on slot placement stay shared across topologies.
+    direct = make_mapper_from_offloading_spec(nnodes=2)
+    agnostic = make_mapper_from_offloading_spec(
+        nnodes=2, is_parallelism_agnostic=True, parallel_agnostic=True
+    )
+
+    assert direct.fields["slot_layout"] == "group_rank"
+    assert "slot_layout" not in agnostic.fields

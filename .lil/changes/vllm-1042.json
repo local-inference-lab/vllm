@@ -1,0 +1,24 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-1042",
+  "category": "fix",
+  "summary": "Mirror CPU offload regions across nodes so secondary KV offload tiers work with tensor parallelism across nodes",
+  "models": [
+    "all"
+  ],
+  "compatibility": "Multi-node tiering with secondary tiers needs the multiprocessing executor with nnodes > 1 and VLLM_HOST_IP set to a specified IP address on every worker, and opens a TCP port on group rank 0 (a free port unless kv_connector_extra_config sets mirror_port) that admits only the remote workers' addresses. Multi-node secondary tiers keyed through FileMapper (fs, obj, p2p) whose rows are not topology-agnostic start from an empty storage namespace; files of the previous one are no longer read or removed. After a cache reset, an OffloadingConnector whose manager promotes from secondary tiers skips lookups (requests recompute) until the flushed jobs report. With secondary tiers, TieringOffloadingSpec releases its /dev/shm region names once mapped and rejects re-registering KV caches, and, when workers may span nodes (nnodes > 1 or Ray), runs node-placement collectives over every data parallel replica at creation; elastic data parallel scaling is not supported and external_launcher is rejected across nodes. Without secondary tiers, regions stay node-local as before. Multi-node tiering with secondary tiers rejects canonical_layout. A multi-worker tiering engine with secondary tiers whose engine core does not share a node with group rank 0 now fails at startup instead of losing remote slots. A mirror copy that fails after its retries is reported as a failed transfer (vllm-1043) instead of stopping the engine.",
+  "details": [
+    "Workers on other nodes mirror their CPU region slots onto the engine-core node, which runs the secondary tiers; the mirror listener admits only the remote workers' addresses.",
+    "With secondary tiers, a cache reset skips lookups until every worker reported the jobs it flushed.",
+    "With secondary tiers, shared CPU region files are unlinked once mapped, so an engine killed after startup leaves none behind."
+  ],
+  "authors": [
+    "javieratomic"
+  ],
+  "pull_requests": [
+    1042
+  ],
+  "requires": [
+    "vllm-1043"
+  ]
+}

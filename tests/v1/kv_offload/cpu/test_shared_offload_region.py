@@ -1098,3 +1098,28 @@ def test_barrier_release_failure_keeps_original_error(iid, monkeypatch):
         _make_region(iid, barrier=MagicMock(side_effect=TimeoutError("barrier")))
 
     assert not os.path.exists(f"/dev/shm/vllm_offload_{iid}.mmap")
+
+
+def test_release_name_keeps_the_shared_mapping():
+    engine_id = f"test-release-{uuid.uuid4().hex}"
+    kwargs = dict(
+        engine_id=engine_id,
+        num_chunks=2,
+        rank=None,
+        kv_bytes_per_chunk=mmap.PAGESIZE,
+        cpu_page_size=mmap.PAGESIZE,
+    )
+    creator = SharedOffloadRegion(**kwargs)
+    joiner = SharedOffloadRegion(**kwargs)
+    try:
+        assert creator.created_file and not joiner.created_file
+
+        joiner.release_name()
+
+        assert not os.path.exists(creator.mmap_path)
+        assert not joiner.created_file
+        creator.mmap_obj[:4] = b"kv01"
+        assert joiner.mmap_obj[:4] == b"kv01"
+    finally:
+        joiner.cleanup()
+        creator.cleanup()
