@@ -55,6 +55,10 @@ does not query any secondary tier.
 
 The unit of operation is a **chunk** — a fixed-size piece of KV data covering a group of tokens. By default, a chunk maps to a single accelerator block. A configurable `blocks_per_chunk` parameter allows larger chunks, yielding larger I/Os to the host and secondary tiers.
 
+## Hybrid Models
+
+Outside HiSparse, only prefix-cacheable KV cache groups are offloaded, which covers DeepSeek V4.1 (compressor rings, request-private decoder windows) and any model with non-prefix-cacheable groups, such as GLM-5.3-Flash (kpool tail) or `CircularBufferSpec` rings. Groups the local prefix cache never restores, such as compressor rings or request-private windows, are rebuilt by recompute, as after a local hit: every offloaded hit leaves at least the model's prefill replay suffix to recompute and, when groups are left out, ends on a scheduler block boundary (the least common multiple of every group's block size), where local hits end unless partial hash hits are enabled. Async loads skip zeroing only in the groups the loading connector restores (`get_loaded_kv_cache_group_ids`), so the new blocks of groups left out are zeroed like any recomputed block. Windowed groups also store the window ending where such a hit of the prompt ends, so a request resumed with output tokens, whose hit ends later, may find a shorter hit.
+
 ## Single-Tier Setup (CPU Only)
 
 ```bash

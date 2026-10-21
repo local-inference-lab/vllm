@@ -18,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
 )
 from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheConfig,
@@ -337,6 +338,38 @@ def test_worker_kv_bytes_preserves_tensor_layout(packed: bool):
     assert offloading_config.cache.blocks_per_chunk == 2
 
 
+def test_offloading_skips_scratch_group():
+    kv_cache_config = _make_mamba_hybrid_kv_cache_config()
+    kv_cache_config.kv_cache_groups.insert(
+        1,
+        KVCacheGroupSpec(
+            ["scratch"],
+            CircularBufferSpec(
+                block_size=4, num_kv_heads=1, head_size=128, dtype=torch.float32
+            ),
+        ),
+    )
+    page_size = kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
+    kv_cache_config.kv_cache_tensors = [
+        KVCacheTensor(
+            size=page_size * kv_cache_config.num_blocks,
+            layers=["full_layer", "scratch", "mamba_layer"],
+            layer_stride=0,
+            block_stride=page_size,
+        )
+    ]
+    config = _make_vllm_config()
+
+    offloading_config = build_offloading_config(config, kv_cache_config)
+    scheduler_config = SchedulerOffloadConfig.from_spec(
+        MockOffloadingSpec(offloading_config), config, kv_cache_config
+    )
+
+    assert [group.group_id for group in offloading_config.groups] == [0, 2]
+    assert [group.group_idx for group in scheduler_config.kv_group_configs] == [0, 2]
+    assert offloading_config.worker_kv_bytes_per_block == page_size
+
+
 def test_hisparse_offloads_only_indexer_group():
     source = KVCacheGroupSpec(
         ["source"],
@@ -365,6 +398,59 @@ def test_hisparse_offloads_only_indexer_group():
         (group.group_id, group.layer_names) for group in offloading_config.groups
     ] == [(1, ("indexer",))]
     assert [group.group_idx for group in scheduler_config.kv_group_configs] == [1]
+
+
+def test_request_private_groups_are_not_offloaded():
+    # A compressor ring and a replayed decoder window are rebuilt by recompute,
+    # as for local prefix hits; the ring's 8-token blocks are not even a
+    # multiple of the 16-token hash block.
+    full = KVCacheGroupSpec(["full"], _full_attention_spec())
+    ring = KVCacheGroupSpec(
+        ["ring"],
+        CircularBufferSpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=64,
+            head_size_v=0,
+            dtype=torch.float32,
+        ),
+    )
+    replayed = KVCacheGroupSpec(
+        ["replayed"],
+        SlidingWindowMLASpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.float32,
+            sliding_window=128,
+            prefix_cache_enabled=False,
+            prefill_replay_window=128,
+        ),
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=4 * 96,
+                layers=["full", "ring", "replayed"],
+                layer_stride=32,
+                block_stride=96,
+            )
+        ],
+        kv_cache_groups=[full, ring, replayed],
+    )
+    config = _make_vllm_config()
+
+    offloading_config = build_offloading_config(config, kv_cache_config)
+    scheduler_config = SchedulerOffloadConfig.from_spec(
+        MockOffloadingSpec(offloading_config), config, kv_cache_config
+    )
+
+    assert [group.group_id for group in offloading_config.groups] == [0]
+    assert [group.group_idx for group in scheduler_config.kv_group_configs] == [0]
+    assert scheduler_config.prefill_replay_tokens == 128
+    # Selected groups share the device pool, so a block keeps its pool footprint.
+    assert offloading_config.worker_kv_bytes_per_block == 96
 
 
 def test_hisparse_partial_group_size_survives_scheduler_flattening():
@@ -914,3 +1000,32 @@ def test_blocks_per_chunk_must_be_positive():
 
     with pytest.raises(ValueError, match="greater than 0"):
         build_offloading_config(config, _make_kv_cache_config())
+
+
+def test_excluded_groups_set_the_hit_alignment():
+    # Hits end on scheduler blocks, so a group left out is rebuilt as after a
+    # local hit, whatever its block size: a 24-token ring neither divides nor
+    # is a multiple of the 16-token hash block.
+    full = KVCacheGroupSpec(["full"], _full_attention_spec())
+    ring = KVCacheGroupSpec(
+        ["ring"],
+        CircularBufferSpec(
+            block_size=24,
+            num_kv_heads=1,
+            head_size=64,
+            head_size_v=0,
+            dtype=torch.float32,
+        ),
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4, kv_cache_tensors=[], kv_cache_groups=[full, ring]
+    )
+
+    config = _make_vllm_config()
+    offloading_config = build_offloading_config(config, kv_cache_config)
+    scheduler_config = SchedulerOffloadConfig.from_spec(
+        MockOffloadingSpec(offloading_config), config, kv_cache_config
+    )
+
+    assert [group.group_id for group in offloading_config.groups] == [0]
+    assert scheduler_config.hit_alignment_tokens == 48

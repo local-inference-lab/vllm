@@ -54,9 +54,11 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheTensor,
     MambaSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
@@ -512,6 +514,182 @@ def test_lookup_cap_stops_at_authoritative_prefix_boundary():
 
     assert (tokens, load_async) == (20, True)
     assert scheduler._req_status["req"].partial_tail_boundary == 20
+
+
+@pytest.mark.parametrize(
+    "partial_tail, replay, expected",
+    [
+        (False, 0, 16),
+        (False, 16, 0),
+        # The replay suffix already leaves the last token out: 30 - 14 = 16.
+        (False, 14, 16),
+        (True, 0, 28),
+        (True, 6, 24),
+    ],
+)
+def test_lookup_leaves_prefill_replay_suffix_to_recompute(
+    partial_tail: bool, replay: int, expected: int
+):
+    # Groups excluded as request-private rebuild their state from the
+    # uncached suffix, so hits stop that many tokens before the request end.
+    scheduler = _make_partial_tail_scheduler()
+    scheduler.config = scheduler.config._replace(
+        supports_partial_tail=partial_tail, prefill_replay_tokens=replay
+    )
+    request = _make_partial_tail_request(scheduler)
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+
+    tokens, _ = scheduler.get_num_new_matched_tokens(request, 0)
+
+    assert tokens == expected
+
+
+@pytest.mark.parametrize(
+    "ring_block, num_tokens, replay, expected",
+    [
+        # 40 - 10 = 30 ends inside a 16-token block: the hit stops at 16.
+        (8, 40, 10, 16),
+        # A 32-token ring makes 32 the scheduler block: 50 rounds to 32, not
+        # to the 16-token hash block (48).
+        (32, 80, 30, 32),
+    ],
+)
+def test_hits_with_excluded_groups_end_where_local_hits_do(
+    ring_block: int, num_tokens: int, replay: int, expected: int
+):
+    # An excluded ring rebuilds its state from the first recomputed token, so
+    # a hit capped by the replay suffix ends on a scheduler block boundary,
+    # as local hits do.
+    full = KVCacheGroupSpec(
+        ["full"],
+        FullAttentionSpec(
+            block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float32
+        ),
+    )
+    ring = KVCacheGroupSpec(
+        ["ring"],
+        CircularBufferSpec(
+            block_size=ring_block,
+            num_kv_heads=1,
+            head_size=8,
+            head_size_v=0,
+            dtype=torch.float32,
+        ),
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=8 * 2048,
+                layers=["full", "ring"],
+                layer_stride=1024,
+                block_stride=2048,
+            )
+        ],
+        kv_cache_groups=[full, ring],
+    )
+    vllm_config = _make_vllm_config()
+    vllm_config.speculative_config = None
+    vllm_config.kv_events_config = KVEventsConfig(
+        enable_kv_cache_events=False, publisher="null"
+    )
+    spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+    scheduler = OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+    assert scheduler.config.tokens_per_hash == 16
+    assert scheduler.config.hit_alignment_tokens == max(16, ring_block)
+    scheduler.config = scheduler.config._replace(prefill_replay_tokens=replay)
+    request = MagicMock()
+    request.request_id = "req"
+    request.kv_transfer_params = None
+    request.num_prompt_tokens = request.num_tokens = num_tokens
+    request.block_hashes = [
+        BlockHash(f"h{i}".encode()) for i in range(num_tokens // 16)
+    ]
+    request.all_token_ids = list(range(num_tokens))
+    request.lora_request = None
+    request.skip_reading_prefix_cache = False
+    request.is_finished.return_value = False
+    scheduler.on_new_request(request)
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+
+    tokens, _ = scheduler.get_num_new_matched_tokens(request, 0)
+
+    assert tokens == expected
+
+
+def test_windows_are_confirmed_again_after_rounding_to_the_hit_alignment():
+    # A windowed group finds its window ending at 48, but the hit rounds down
+    # to the 32-token scheduler block set by an excluded ring: the window
+    # ending at 32 must be confirmed before the hit can end there.
+    full = KVCacheGroupSpec(
+        ["full"],
+        FullAttentionSpec(
+            block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float32
+        ),
+    )
+    window = KVCacheGroupSpec(
+        ["window"],
+        SlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=8,
+            dtype=torch.float32,
+            sliding_window=16,
+        ),
+    )
+    ring = KVCacheGroupSpec(
+        ["ring"],
+        CircularBufferSpec(
+            block_size=32,
+            num_kv_heads=1,
+            head_size=8,
+            head_size_v=0,
+            dtype=torch.float32,
+        ),
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=8 * 4096,
+                layers=["full", "window", "ring"],
+                layer_stride=1024,
+                block_stride=4096,
+            )
+        ],
+        kv_cache_groups=[full, window, ring],
+    )
+    vllm_config = _make_vllm_config()
+    vllm_config.speculative_config = None
+    vllm_config.kv_events_config = KVEventsConfig(
+        enable_kv_cache_events=False, publisher="null"
+    )
+    spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+    scheduler = OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+    assert scheduler.config.hit_alignment_tokens == 32
+    request = MagicMock()
+    request.request_id = "req"
+    request.kv_transfer_params = None
+    request.num_prompt_tokens = request.num_tokens = 80
+    request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(5)]
+    request.all_token_ids = list(range(80))
+    request.lora_request = None
+    request.skip_reading_prefix_cache = False
+    request.is_finished.return_value = False
+    scheduler.on_new_request(request)
+
+    def lookup(key, ctx):
+        window_keys = scheduler._req_status["req"].group_states[1].offload_keys
+        if key in window_keys and key != window_keys[2]:
+            return LookupResult.MISS
+        return LookupResult.HIT
+
+    scheduler.manager.lookup.side_effect = lookup
+
+    tokens, _ = scheduler.get_num_new_matched_tokens(request, 0)
+
+    # Only the window ending at 48 exists, so no 32-aligned hit is valid.
+    assert tokens == 0
 
 
 def test_max_load_tokens_zero_skips_partial_tail_lookup():
@@ -4539,6 +4717,77 @@ def test_retention_interval_sparsifies_swa_stores(
             (1, 11),
             (1, 14),
             (1, 15),
+        ),
+    )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_stores_keep_the_window_ending_at_the_replay_boundary(
+    request_runner, async_scheduling: bool
+):
+    """Loads end prefill_replay_tokens before the prompt end, so windowed
+    groups also store the window ending there (64 - 20 = 44, rounded down to 32)."""
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            SlidingWindowSpec(
+                block_size=4,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=8,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer2"],
+            SlidingWindowMLASpec(
+                block_size=4,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=8,
+                prefix_cache_enabled=False,
+                prefill_replay_window=20,
+            ),
+        ),
+    ]
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=200,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=kv_cache_groups,
+        retention_interval=0,
+    )
+    assert runner.connector_scheduler.config.prefill_replay_tokens == 20
+
+    runner.new_request(token_ids=[0] * 64)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(decoded_tokens=[0])
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        # Group 1 keeps the windows ending at 48 (num_prompt_tokens - 1,
+        # aligned) and at 32 (the replay boundary, aligned): blocks 6, 7,
+        # 10, 11. Group 2 is request-private and not offloaded.
+        expected_stored=(
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 6),
+            (1, 7),
+            (1, 10),
+            (1, 11),
         ),
     )
 
