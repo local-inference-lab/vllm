@@ -252,6 +252,16 @@ class OffloadingEventsTracker:
             else:
                 yield from self._take_stored_event(event)
 
+    def discard_failed_store(self, keys: Iterable[OffloadKey]) -> None:
+        """Drop the CPU residency recorded for keys whose store failed."""
+        for key in keys:
+            meta = self._pending_event_metadata.get(key)
+            if meta is None:
+                continue
+            meta.active_residencies.discard((Medium.CPU, None))
+            if not meta.active_residencies:
+                del self._pending_event_metadata[key]
+
     def reset(self) -> None:
         """Drop all tracked state; pending payloads are stale after a
         manager cache reset."""

@@ -1,0 +1,22 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-1043",
+  "category": "fix",
+  "summary": "Report failed KV offload transfers to the scheduler instead of asserting that every transfer succeeds",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No change with the CPU offloading worker, which never fails a transfer. With workers that can fail (the multi-node region mirror), a failed store is dropped and a failed load's blocks are reported as load errors, handled per kv_load_failure_policy.",
+  "details": [
+    "OffloadingWorkerMetadata.failed_jobs reports failed jobs; a job fails if it fails on any worker.",
+    "A failed store completes with complete_store(success=False) and drops the KV event metadata recorded for its chunks; a failed load's GPU blocks come back from get_block_ids_with_load_errors.",
+    "Failed transfers are not counted in the transfer statistics."
+  ],
+  "authors": [
+    "javieratomic"
+  ],
+  "pull_requests": [
+    1043
+  ],
+  "requires": []
+}
