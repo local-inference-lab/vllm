@@ -73,6 +73,7 @@ from vllm.v1.kv_cache_interface import (
     get_mamba_prefill_checkpoint_position,
     is_mamba_prefill_checkpoint_valid,
 )
+from vllm.v1.metrics.b12x_row_cache import B12xRowCacheStats
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import (
     PrefixCacheStats,
@@ -2861,6 +2862,7 @@ class Scheduler(SchedulerInterface):
         kv_connector_output = model_runner_output.kv_connector_output
         ec_connector_output = model_runner_output.ec_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        b12x_row_cache_stats = model_runner_output.b12x_row_cache_stats
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
@@ -3331,6 +3333,7 @@ class Scheduler(SchedulerInterface):
                 kv_connector_stats,
                 cudagraph_stats,
                 perf_stats,
+                b12x_row_cache_stats,
             )
         ) is not None:
             # Return stats to only one of the front-ends.
@@ -3830,6 +3833,7 @@ class Scheduler(SchedulerInterface):
         kv_connector_stats: KVConnectorStats | None = None,
         cudagraph_stats: CUDAGraphStat | None = None,
         perf_stats: PerfStats | None = None,
+        b12x_row_cache_stats: B12xRowCacheStats | None = None,
     ) -> SchedulerStats | None:
         if not self.log_stats:
             return None
@@ -3879,6 +3883,7 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
+            b12x_row_cache_stats=b12x_row_cache_stats,
             decode_compute_seconds=decode_compute_seconds,
             prefill_compute_seconds=prefill_compute_seconds,
             prefill_compute_share=prefill_compute_share,

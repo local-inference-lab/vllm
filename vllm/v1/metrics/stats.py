@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.v1.metrics.b12x_row_cache import B12xRowCacheStats
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
@@ -212,6 +213,10 @@ class SchedulerStats:
     cudagraph_stats: CUDAGraphStat | None = None
 
     perf_stats: PerfStats | None = None
+
+    # B12X disk row-cache and advisory prefetch counters, relayed from the
+    # worker that ran the step; None when no model state holds disk tables.
+    b12x_row_cache_stats: B12xRowCacheStats | None = None
 
     decode_compute_seconds: float = 0.0
     prefill_compute_seconds: float = 0.0

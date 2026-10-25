@@ -2600,6 +2600,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.req_states.draft_tokens, input_batch
                 )
 
+        self.model_state.prefetch_next_step(
+            input_batch, self.req_states, draft_tokens_for_next_step
+        )
+
         if boundary_state is not None:
             assert boundary_capture is not None
             boundary_state.capture_attention(
@@ -2610,6 +2614,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
         model_runner_output.ec_connector_output = ec_connector_output
+
+        # These counters ride the same output the scheduler turns into
+        # SchedulerStats for the frontend's Prometheus registry.
+        model_runner_output.b12x_row_cache_stats = self.model_state.row_cache_stats()
 
         return async_output
 

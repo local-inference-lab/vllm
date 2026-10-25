@@ -235,6 +235,7 @@ if TYPE_CHECKING:
     VLLM_PLE_SHARED_TABLE_ROLE: Literal["auto", "populate", "attach"] = "auto"
     VLLM_PLE_SHARED_TABLE_LOCK_TIMEOUT_S: float = 3600.0
     VLLM_PLE_SHARED_TABLE_IDENTITY: str | None = None
+    VLLM_PLE_PREFETCH: bool = False
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
@@ -1953,6 +1954,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PLE_SHARED_TABLE_IDENTITY": lambda: os.getenv(
         "VLLM_PLE_SHARED_TABLE_IDENTITY"
     ),
+    # Advisory prefetch of disk-backed PLE/Engram rows that the next step will
+    # hash. b12x issues the reads only when a B12X_ROW_CACHE_* size is set.
+    "VLLM_PLE_PREFETCH": lambda: bool(int(os.getenv("VLLM_PLE_PREFETCH", "0"))),
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_INT4", "0"))

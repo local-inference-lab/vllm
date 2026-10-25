@@ -1,0 +1,23 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-1044",
+  "category": "feature",
+  "summary": "Qwen PLE and DeepSeek V4.1 Engram rows are prefetched into the disk row cache before the step needs them, and row-cache counters are visible on /metrics",
+  "models": [
+    "Qwen3.8-Flash-Next",
+    "DeepSeek-V4.1-Flash"
+  ],
+  "compatibility": "Prefetch is opt-in with VLLM_PLE_PREFETCH=1 and needs a b12x build at or after commit 0b6e5ee8b of feat/b12x-row-cache-lil; older builds disable the prefetcher with one warning and serve rows synchronously as before. Cache totals appear on /metrics without any setting.",
+  "details": [
+    "The runner hook predicts the token windows the next step will hash, records non-blocking device-to-host copies plus a CUDA event on the engine thread, and hands the rows to b12x DiskTable.prefetch from a daemon worker. Both pinned slots in flight makes a step drop its prefetch instead of waiting.",
+    "Row-cache stats are sampled on a daemon thread so the step path only reads the last published snapshot: 0.6 us median against 14.0 us when the read queued behind the cache lock of a busy prefetch worker (SM120, io_uring-backed cache).",
+    "B12xRowCacheProm publishes per-kind counters (submissions, dropped submissions, staged rows, hits, misses, residency, queue depth) labelled ple or engram, so the two tables never merge into one unlabeled total."
+  ],
+  "authors": [
+    "randomvariable"
+  ],
+  "pull_requests": [
+    1044
+  ],
+  "requires": []
+}
