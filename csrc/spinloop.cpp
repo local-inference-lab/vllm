@@ -51,11 +51,19 @@ extern "C" {
 typedef struct {
   unsigned int cpu_support;
   unsigned int max_monitor_line_size;
+#if defined(__x86_64__)
+  // TSC frequency in Hz, cached at init from the invariant-TSC leaf; 0 when
+  // unusable, which keeps CPU_SUPPORT_WAITPKG from being selected.
+  double tsc_hz;
+#endif
 } spinloop_state_t;
 
 static void determine_cpu_support(spinloop_state_t* state) {
   state->cpu_support = CPU_SUPPORT_NONE;
   state->max_monitor_line_size = 0;
+#if defined(__x86_64__)
+  state->tsc_hz = 0.0;
+#endif
 
 #if defined(__i386__) || defined(__x86_64__)
   unsigned int eax, ebx, ecx, edx;
@@ -86,7 +94,18 @@ static void determine_cpu_support(spinloop_state_t* state) {
   if (state->cpu_support == CPU_SUPPORT_NONE &&
       __get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) == 1 &&
       (edx & (1 << 5)) != 0) {
-    state->cpu_support = CPU_SUPPORT_WAITPKG;
+    // umwait's counter deadline is in TSC ticks, so WAITPKG is selected only
+    // when the invariant-TSC leaf (0x15) gives a usable frequency: cache it
+    // here so umwait_bounded_wait never runs CPUID on the wait path. Parts
+    // without a usable leaf (or with a degenerate ratio) take the pause
+    // fallback instead.
+    if (__get_cpuid(0x15, &eax, &ebx, &ecx, &edx) == 1 && eax != 0 &&
+        ebx != 0 && ecx != 0) {
+      state->tsc_hz = (double)ecx * (double)ebx / (double)eax;
+    }
+    if (state->tsc_hz > 0.0) {
+      state->cpu_support = CPU_SUPPORT_WAITPKG;
+    }
   }
 #endif
 
@@ -162,7 +181,8 @@ static enum bounded_wait_status wfet_bounded_wait(
 // Returns WAIT_OK, WAIT_SPUN_OUT when the overall timeout expired, or
 // WAIT_CLOCK_ERR when clock_gettime fails (caller defers the PyErr).
 static enum bounded_wait_status umwait_bounded_wait(
-    const void* addr, double timeout, const struct timespec* t_start) {
+    const void* addr, double timeout, const struct timespec* t_start,
+    double tsc_hz) {
   double remaining_s = INFINITY;
   if (timeout > 1e-9) {
     struct timespec t_now;
@@ -178,19 +198,12 @@ static enum bounded_wait_status umwait_bounded_wait(
   }
   const double budget_s = (double)UMWAIT_BUDGET_US * 1e-6;
   const double wait_s = remaining_s < budget_s ? remaining_s : budget_s;
-  // umwait's counter deadline is in TSC ticks. Determine the TSC frequency
-  // once per call from the invariant-TSC leaf when present; fall back to
-  // rdtsc/rdtscp only if the leaf is missing (never on WAITPKG parts, which
-  // are all post-Skylake invariant-TSC).
-  unsigned int eax, ebx, ecx, edx;
-  if (__get_cpuid(0x15, &eax, &ebx, &ecx, &edx) != 1 || eax == 0 || ebx == 0 ||
-      ecx == 0) {
-    // Keep this degraded fallback polite to sibling hyperthreads.
-    __builtin_ia32_pause();
-    return WAIT_OK;  // no invariant TSC ratio: degrade to the next iteration
-  }
-  const double tsc_hz = (double)ecx * (double)ebx / (double)eax;
+  // umwait's counter deadline is in TSC ticks; tsc_hz is the frequency
+  // cached at module init from the invariant-TSC leaf. A non-positive value
+  // means the leaf was unusable: stay polite to sibling hyperthreads and
+  // degrade to the next iteration of the caller's loop.
   if (!(tsc_hz > 0.0)) {
+    __builtin_ia32_pause();
     return WAIT_OK;
   }
   unsigned int lo, hi;
@@ -346,7 +359,8 @@ static PyObject* method_spinloop(PyObject* self, PyObject* args,
 // formatter's brace/indent tracking; keep hand-aligned.
 #if defined(__x86_64__)
       if (state->cpu_support == CPU_SUPPORT_WAITPKG) {
-        umwait_status = umwait_bounded_wait(buffer.buf, timeout, &t_start);
+        umwait_status =
+            umwait_bounded_wait(buffer.buf, timeout, &t_start, state->tsc_hz);
         if (umwait_status == WAIT_CLOCK_ERR) {
           clock_error = true;
           error = true;
