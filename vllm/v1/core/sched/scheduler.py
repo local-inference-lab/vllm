@@ -12,6 +12,9 @@ import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
+from vllm.distributed.device_communicators.shm_broadcast import (
+    drain_shm_broadcast_wait_metrics,
+)
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorBase,
     ECConnectorMetadata,
@@ -146,6 +149,9 @@ class Scheduler(SchedulerInterface):
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
+        # Blocked shared-memory broadcast waits waiting to be reported: the
+        # engine core's own queues plus the worker values it has received.
+        self._shm_broadcast_waits: dict[str, list[float]] = {}
         self.observability_config = vllm_config.observability_config
         self.spec_decode_metrics_level = (
             self.observability_config.per_request_spec_decode_metrics
@@ -3009,6 +3015,7 @@ class Scheduler(SchedulerInterface):
         kv_connector_output = model_runner_output.kv_connector_output
         ec_connector_output = model_runner_output.ec_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        self._merge_shm_broadcast_waits(model_runner_output.shm_broadcast_waits)
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
@@ -3972,6 +3979,34 @@ class Scheduler(SchedulerInterface):
         """
         self.encoder_cache_manager.reset()
 
+    def _merge_shm_broadcast_waits(self, waits: dict[str, tuple[int, float]]) -> None:
+        """Fold one report of blocked shared-memory broadcast waits in.
+
+        Args:
+            waits: Blocked-wait count and seconds per queue role.
+
+        """
+        for role, (count, seconds) in waits.items():
+            totals = self._shm_broadcast_waits.setdefault(role, [0, 0.0])
+            totals[0] += count
+            totals[1] += seconds
+
+    def _drain_shm_broadcast_waits(self) -> dict[str, tuple[int, float]]:
+        """Return and reset this engine's blocked shared-memory broadcast waits.
+
+        Returns:
+            Blocked-wait count and seconds per queue role, collected from this
+            process's queues and the worker values merged earlier.
+
+        """
+        self._merge_shm_broadcast_waits(drain_shm_broadcast_wait_metrics())
+        drained = {
+            role: (int(count), seconds)
+            for role, (count, seconds) in self._shm_broadcast_waits.items()
+        }
+        self._shm_broadcast_waits = {}
+        return drained
+
     def make_stats(
         self,
         spec_decoding_stats: SpecDecodingStats | None = None,
@@ -4041,6 +4076,7 @@ class Scheduler(SchedulerInterface):
             decode_compute_pressure=decode_compute_pressure,
             prefill_compute_pressure=prefill_compute_pressure,
             local_prefill_backlog_tokens=local_prefill_backlog_tokens,
+            shm_broadcast_waits=self._drain_shm_broadcast_waits(),
         )
 
     def make_spec_decoding_stats(

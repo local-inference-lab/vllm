@@ -14,12 +14,14 @@ from collections import deque
 
 import pytest
 
+from vllm.distributed.device_communicators import shm_broadcast
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.v1.executor.multiproc_executor import (
     MultiprocExecutor,
     WorkerProc,
     _gather_responses,
 )
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 
 SUCCESS = WorkerProc.ResponseStatus.SUCCESS
 FAILURE = WorkerProc.ResponseStatus.FAILURE
@@ -291,3 +293,73 @@ def test_a_single_reply_names_its_rank():
         _gather_responses([boom], (3,), None, "m")
     ok = _Queue((SUCCESS, "ok"), ready_after=-1)
     assert _gather_responses([ok], (3,), None, "m") == ["ok"]
+
+
+def test_the_reply_carries_the_worker_s_blocked_waits(monkeypatch):
+    """Worker-side waits ride the reply, because only the frontend's registry
+    is scraped, and the drain is taken on the way out so the values are
+    reported once.
+    """
+    monkeypatch.setattr(shm_broadcast, "_shm_broadcast_wait_totals", {})
+    shm_broadcast._report_shm_broadcast_wait_metrics("reader", 2, 0.25)
+    proc = _worker_proc(rank=0)
+    output = ModelRunnerOutput(req_ids=[], req_id_to_index={})
+
+    proc.enqueue_output(output)
+
+    assert output.shm_broadcast_waits == {"reader": (2, pytest.approx(0.25))}
+    assert shm_broadcast.drain_shm_broadcast_wait_metrics() == {}
+    assert isinstance(proc.worker_response_mq, _ResponseQueue)
+    assert proc.worker_response_mq.sent == [(SUCCESS, output)]
+
+
+def test_a_reply_without_an_output_leaves_the_waits_for_the_next_drain(
+    monkeypatch,
+):
+    """A reply carrying no model-runner output does not drop the counts."""
+    monkeypatch.setattr(shm_broadcast, "_shm_broadcast_wait_totals", {})
+    shm_broadcast._report_shm_broadcast_wait_metrics("reader", 1, 0.5)
+    proc = _worker_proc(rank=0)
+
+    proc.enqueue_output("not-an-output")
+
+    assert isinstance(proc.worker_response_mq, _ResponseQueue)
+    assert proc.worker_response_mq.sent == [(SUCCESS, "not-an-output")]
+    assert shm_broadcast.drain_shm_broadcast_wait_metrics() == {
+        "reader": (1, pytest.approx(0.5))
+    }
+
+
+def test_the_counts_survive_the_reply_ring(monkeypatch):
+    """A real ring carries the counts to the engine, pickled intact."""
+    monkeypatch.setattr(shm_broadcast, "_shm_broadcast_wait_totals", {})
+    shm_broadcast._report_shm_broadcast_wait_metrics("writer", 4, 0.125)
+    writer, reader = _queue_pair(max_chunk_bytes=4096)
+    try:
+        proc = _worker_proc(rank=0)
+        proc.worker_response_mq = writer
+        proc.enqueue_output(ModelRunnerOutput(req_ids=["a"], req_id_to_index={"a": 0}))
+
+        status, output = reader.dequeue(timeout=5)
+
+        assert status is SUCCESS
+        assert output.shm_broadcast_waits == {"writer": (4, pytest.approx(0.125))}
+    finally:
+        writer.shutdown()
+        reader.shutdown()
+
+
+def test_the_shared_empty_output_is_never_written_to(monkeypatch):
+    """Writing the counts to the shared empty would leak into every copy."""
+    monkeypatch.setattr(shm_broadcast, "_shm_broadcast_wait_totals", {})
+    shm_broadcast._report_shm_broadcast_wait_metrics("reader", 1, 0.5)
+    proc = _worker_proc(rank=0)
+
+    proc.enqueue_output(EMPTY_MODEL_RUNNER_OUTPUT)
+
+    assert EMPTY_MODEL_RUNNER_OUTPUT.shm_broadcast_waits == {}
+    assert isinstance(proc.worker_response_mq, _ResponseQueue)
+    status, output = proc.worker_response_mq.sent[0]
+    assert status is SUCCESS
+    assert output is not EMPTY_MODEL_RUNNER_OUTPUT
+    assert output.shm_broadcast_waits == {"reader": (1, pytest.approx(0.5))}

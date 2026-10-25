@@ -13,6 +13,7 @@ from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, InvalidStateError
 from contextlib import suppress
+from copy import copy
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -33,6 +34,7 @@ from vllm.distributed.device_communicators.shm_broadcast import (
     LONG_WAIT_TIME_LOG_MSG,
     Handle,
     MessageQueue,
+    drain_shm_broadcast_wait_metrics,
 )
 from vllm.distributed.ec_transfer.ec_connector.utils import ECOutputAggregator
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
@@ -74,7 +76,12 @@ from vllm.utils.torch_utils import (
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
-from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    AsyncModelRunnerOutput,
+    DraftTokenIds,
+    ModelRunnerOutput,
+)
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
@@ -1127,6 +1134,15 @@ class WorkerProc:
             except Exception as e:
                 logger.exception("Error getting async model runner output")
                 output = e
+
+        if isinstance(output, ModelRunnerOutput):
+            # This process's registry is not the one /metrics serves, so the
+            # blocked shared-memory waits the worker took ride its reply to
+            # the scheduler, which reports them through SchedulerStats. The
+            # shared empty output is never written to, so copy it first.
+            if output is EMPTY_MODEL_RUNNER_OUTPUT:
+                output = copy(output)
+            output.shm_broadcast_waits = drain_shm_broadcast_wait_metrics()
 
         if isinstance(output, Exception):
             result = (WorkerProc.ResponseStatus.FAILURE, str(output))

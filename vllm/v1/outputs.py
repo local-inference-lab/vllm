@@ -316,6 +316,11 @@ class ModelRunnerOutput:
     # prefill-tail checkpoint token counts, or 0 for an uncaptured endpoint.
     boundary_checkpoint_tokens: list[list[int]] | None = None
 
+    # Blocked shared-memory broadcast waits this worker process took since its
+    # previous reply, per role. The scheduler merges them into SchedulerStats,
+    # because the registry /metrics serves belongs to the frontend process.
+    shm_broadcast_waits: dict[str, tuple[int, float]] = field(default_factory=dict)
+
     @staticmethod
     def with_kv_conn_output_only(
         kv_connector_output: KVConnectorOutput | None,

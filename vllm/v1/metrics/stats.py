@@ -261,6 +261,11 @@ class SchedulerStats:
     prefill_compute_pressure: float = 1.0
     local_prefill_backlog_tokens: int = 0
 
+    # Blocked shared-memory broadcast waits since the last report, per role:
+    # (count, seconds). The engine core drains its own queues, and worker-side
+    # waits ride in on the model-runner output.
+    shm_broadcast_waits: dict[str, tuple[int, float]] = field(default_factory=dict)
+
 
 @dataclass
 class RequestStateStats:

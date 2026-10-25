@@ -334,6 +334,11 @@ pub struct SchedulerStats {
     pub cudagraph_stats: Option<CudagraphStats>,
     /// Estimated MFU/performance stats, when enabled.
     pub perf_stats: Option<PerfStats>,
+    /// Blocked shared-memory broadcast waits since the engine's last report,
+    /// per queue role (`reader`/`writer`) as `(count, seconds)`. The engine
+    /// core and each worker count them in their own process.
+    #[serde(default)]
+    pub shm_broadcast_waits: BTreeMap<String, (u64, f64)>,
 }
 
 #[cfg(test)]
