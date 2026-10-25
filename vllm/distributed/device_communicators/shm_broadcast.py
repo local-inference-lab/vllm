@@ -6,7 +6,6 @@ import io
 import math
 import os
 import pickle
-import queue
 import shutil
 import sys
 import threading
@@ -22,7 +21,6 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 import zmq
-from prometheus_client import REGISTRY, Counter
 from torch.distributed import ProcessGroup
 from zmq import (  # type: ignore
     IPV6,  # type: ignore
@@ -119,74 +117,57 @@ LONG_WAIT_TIME_LOG_MSG = (
 _WRITE_PARK_MIN_S = 50e-6
 _SHM_BROADCAST_METRIC_BATCH_SIZE = 128
 
-_shm_broadcast_blocked_waits: Counter | None = None
-_shm_broadcast_blocked_wait_seconds: Counter | None = None
-_shm_broadcast_metrics_queue: queue.SimpleQueue[tuple[str, int, float] | None] = (
-    queue.SimpleQueue()
-)
-_shm_broadcast_metrics_thread: threading.Thread | None = None
-_shm_broadcast_metrics_thread_lock = threading.Lock()
+
+# Blocked shared-memory waits are counted in the process that takes them: the
+# writer side of a ring lives in the engine-core process and the reader side in
+# a worker, so a Prometheus metric registered there is invisible to the
+# frontend that serves /metrics (even a single-API-server deployment keeps the
+# engine core and the workers in their own processes). Counts accumulate here
+# instead and are drained onto SchedulerStats, which the frontend's
+# PrometheusStatLogger exports.
+@dataclass
+class _ShmBroadcastWaitTotals:
+    """Blocked shared-memory broadcast waits taken by this process."""
+
+    count: int = 0
+    seconds: float = 0.0
+
+
+_shm_broadcast_wait_totals: dict[str, _ShmBroadcastWaitTotals] = {}
+_shm_broadcast_wait_lock = threading.Lock()
 
 
 def _report_shm_broadcast_wait_metrics(
     role: str, count: int, wait_seconds: float
 ) -> None:
-    """Publish one accumulated batch of blocked shared-memory waits."""
-    global _shm_broadcast_blocked_waits
-    global _shm_broadcast_blocked_wait_seconds
-
-    if _shm_broadcast_blocked_waits is None:
-        try:
-            _shm_broadcast_blocked_waits = Counter(
-                "vllm:shm_broadcast_blocked_waits",
-                "Total shared-memory broadcast waits that blocked.",
-                ["role"],
-            )
-            _shm_broadcast_blocked_wait_seconds = Counter(
-                "vllm:shm_broadcast_blocked_wait_seconds",
-                "Total seconds spent in blocked shared-memory broadcast waits.",
-                ["role"],
-            )
-        except ValueError:
-            _shm_broadcast_blocked_waits = cast(
-                Counter,
-                REGISTRY._names_to_collectors["vllm:shm_broadcast_blocked_waits"],
-            )
-            _shm_broadcast_blocked_wait_seconds = cast(
-                Counter,
-                REGISTRY._names_to_collectors[
-                    "vllm:shm_broadcast_blocked_wait_seconds"
-                ],
-            )
-
-    assert _shm_broadcast_blocked_wait_seconds is not None
-    _shm_broadcast_blocked_waits.labels(role=role).inc(count)
-    _shm_broadcast_blocked_wait_seconds.labels(role=role).inc(wait_seconds)
+    """Add one accumulated batch of blocked waits to this process's totals."""
+    with _shm_broadcast_wait_lock:
+        totals = _shm_broadcast_wait_totals.get(role)
+        if totals is None:
+            totals = _shm_broadcast_wait_totals[role] = _ShmBroadcastWaitTotals()
+        totals.count += count
+        totals.seconds += wait_seconds
 
 
-def _shm_broadcast_metrics_loop() -> None:
-    """Export accumulated shared-memory wait metrics on a background thread."""
-    while item := _shm_broadcast_metrics_queue.get():
-        _report_shm_broadcast_wait_metrics(*item)
+def drain_shm_broadcast_wait_metrics() -> dict[str, tuple[int, float]]:
+    """Return and reset this process's blocked shared-memory waits.
 
+    Returns:
+        Mapping of queue role (``reader``/``writer``) to the number of blocked
+        waits and the seconds spent in them since the previous drain.
 
-def _start_shm_broadcast_metrics_thread() -> None:
-    """Start the background metrics exporter once per process."""
-    global _shm_broadcast_metrics_thread
-
-    with _shm_broadcast_metrics_thread_lock:
-        if _shm_broadcast_metrics_thread is not None:
-            return
-        _shm_broadcast_metrics_thread = threading.Thread(
-            target=_shm_broadcast_metrics_loop,
-            name="vllm-shm-broadcast-metrics",
-            daemon=True,
-        )
-        _shm_broadcast_metrics_thread.start()
+    """
+    with _shm_broadcast_wait_lock:
+        drained = {
+            role: (totals.count, totals.seconds)
+            for role, totals in _shm_broadcast_wait_totals.items()
+        }
+        _shm_broadcast_wait_totals.clear()
+    return drained
 
 
 class _BatchedShmBroadcastWaitMetrics:
-    """Batch blocked waits for asynchronous metrics export."""
+    """Batch blocked waits so the totals lock is taken once per batch."""
 
     def __init__(self, role: str) -> None:
         self._role = role
@@ -194,18 +175,17 @@ class _BatchedShmBroadcastWaitMetrics:
         self._wait_seconds = 0.0
 
     def record(self, wait_seconds: float) -> None:
-        """Accumulate a completed blocked wait without exporting metrics."""
+        """Accumulate a completed blocked wait without taking the lock."""
         self._count += 1
         self._wait_seconds += wait_seconds
         if self._count >= _SHM_BROADCAST_METRIC_BATCH_SIZE:
             self.flush()
 
     def flush(self) -> None:
-        """Queue the current batch for the background metrics exporter."""
+        """Publish the current batch to this process's totals."""
         if self._count == 0:
             return
-        _start_shm_broadcast_metrics_thread()
-        _shm_broadcast_metrics_queue.put((self._role, self._count, self._wait_seconds))
+        _report_shm_broadcast_wait_metrics(self._role, self._count, self._wait_seconds)
         self._count = 0
         self._wait_seconds = 0.0
 
@@ -221,6 +201,7 @@ def _positive_ms_env(name: str) -> float:
 
     Raises:
         ValueError: If the value is not finite and positive.
+
     """
     ms = float(getattr(envs, name))
     if not math.isfinite(ms) or ms <= 0:
@@ -253,6 +234,7 @@ class _AdaptiveSpinGrace:
         Raises:
             ValueError: If ``fixed_s`` or any adaptive tunable is out of
                 range.
+
         """
         if fixed_s is not None and (not math.isfinite(fixed_s) or fixed_s < 0):
             raise ValueError(
@@ -290,6 +272,7 @@ class _AdaptiveSpinGrace:
 
         Returns:
             Fixed grace, or the bounded grace derived from the interval EMA.
+
         """
         if self.mode == "fixed":
             return self.fixed_s
@@ -301,6 +284,7 @@ class _AdaptiveSpinGrace:
 
         Args:
             interval_s: Seconds between consecutive observed events.
+
         """
         if self.mode != "adaptive":
             return
@@ -342,6 +326,7 @@ class SpinCondition:
             busy_loop_s: Pins the reader spin grace to a fixed number of
                 seconds. ``None`` uses the experimental adaptive policy when
                 enabled, otherwise the fixed one-second reader grace.
+
         """
         self.is_reader = is_reader
 
@@ -401,6 +386,7 @@ class SpinCondition:
 
         Args:
             interval_s: Seconds since the preceding completed read.
+
         """
         self._grace.train(interval_s)
         self.busy_loop_s = self._grace.current()
@@ -420,6 +406,7 @@ class SpinCondition:
 
         Returns:
             Remaining spin grace in seconds, clamped to zero.
+
         """
         if now is None:
             now = time.monotonic()
@@ -749,6 +736,7 @@ class MessageQueue:
             max_chunks: Number of blocks in the ring buffer.
             connect_ip: Address remote readers connect to; probed when
                 omitted.
+
         """
         if local_reader_ranks is None:
             local_reader_ranks = list(range(n_local_reader))
@@ -969,6 +957,7 @@ class MessageQueue:
 
         Raises:
             TimeoutError: If no block frees within ``timeout``.
+
         """
         assert self._is_writer, "Only writers can acquire write"
         wait_metrics = self._wait_metrics
@@ -1160,6 +1149,7 @@ class MessageQueue:
 
         Raises:
             TimeoutError: If no block is written within ``timeout``.
+
         """
         assert self._is_local_reader, "Only readers can acquire read"
         wait_metrics = self._wait_metrics
@@ -1249,6 +1239,7 @@ class MessageQueue:
         Args:
             obj: Pickle-serializable object to broadcast.
             timeout: Seconds to wait for a free local buffer block.
+
         """
         assert self._is_writer, "Only writers can enqueue"
         all_buffers: list[SizedBuffer] = [b""]
@@ -1357,6 +1348,7 @@ class MessageQueue:
 
         Raises:
             TimeoutError: If no object arrives within ``timeout``.
+
         """
         if self._is_local_reader:
             with self.acquire_read(timeout, indefinite) as buf:

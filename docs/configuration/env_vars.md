@@ -15,7 +15,7 @@ Set `VLLM_EXPERIMENTAL_SHM_BROADCAST_ADAPTIVE_SPIN=1` to opt into adaptive reade
 
 When enabled, `VLLM_SHM_BROADCAST_ADAPTIVE_*` tunes the reader grace. vLLM measures the interval between reads and spins longer during bursts and parks sooner when traffic slows. The bounds (`MIN_GRACE` / `MAX_GRACE`) and the pivot (`BUDGET`) clamp this behavior. The writer uses the same adaptive policy while a reader holds a buffer block, then sleeps in steps that double from 50 microseconds up to `VLLM_SHM_BROADCAST_WRITE_PARK_MAX_MS` (1 ms by default). These adaptive tunables apply only when the experimental switch is enabled.
 
-vLLM exports cumulative `vllm:shm_broadcast_blocked_waits_total` and `vllm:shm_broadcast_blocked_wait_seconds_total` metrics with a `role` label (`reader` or `writer`). Each queue queues an update every 128 blocked waits, or during shutdown. A background thread publishes the batches. The spin and park loops never call the metrics exporter.
+vLLM exports cumulative `vllm:shm_broadcast_blocked_waits_total` and `vllm:shm_broadcast_blocked_wait_seconds_total` metrics with a `role` label (`reader` or `writer`). Each queue accumulates its blocked waits locally and publishes them every 128 waits, or during shutdown. The counts live in the process that takes the wait — the engine core or a worker — so they travel to the frontend on the scheduler stats, which is the process whose registry `/metrics` serves. The spin and park loops never touch the metrics counters.
 
 `VLLM_USE_SPINLOOP_EXT` independently enables the native hardware wait extension. It remains available with both fixed and adaptive grace policies.
 

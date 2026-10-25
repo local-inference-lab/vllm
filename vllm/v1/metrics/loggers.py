@@ -596,6 +596,31 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             for service_class in ("decode", "prefill")
         }
 
+        #
+        # Shared-memory broadcast waits: counted in the engine-core and worker
+        # processes, so they reach this registry through SchedulerStats rather
+        # than a metric registered where the waits happen.
+        #
+        counter_shm_broadcast_blocked_waits = self._counter_cls(
+            name="vllm:shm_broadcast_blocked_waits",
+            documentation=(
+                "Total shared-memory broadcast waits that blocked, by role."
+            ),
+            labelnames=labelnames + ["role"],
+        )
+        self.counter_shm_broadcast_blocked_waits = counter_shm_broadcast_blocked_waits
+
+        counter_shm_broadcast_blocked_wait_seconds = self._counter_cls(
+            name="vllm:shm_broadcast_blocked_wait_seconds",
+            documentation=(
+                "Total seconds spent in blocked shared-memory broadcast waits, by role."
+            ),
+            labelnames=labelnames + ["role"],
+        )
+        self.counter_shm_broadcast_blocked_wait_seconds = (
+            counter_shm_broadcast_blocked_wait_seconds
+        )
+
         gauge_waiting_by_reason = self._gauge_cls(
             name="vllm:num_requests_waiting_by_reason",
             documentation=(
@@ -1197,6 +1222,14 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.counter_scheduler_compute_seconds["prefill"][engine_idx].inc(
                 scheduler_stats.prefill_compute_seconds
             )
+            for role, (count, seconds) in scheduler_stats.shm_broadcast_waits.items():
+                labelvalues = self.per_engine_labelvalues[engine_idx]
+                self.counter_shm_broadcast_blocked_waits.labels(*labelvalues, role).inc(
+                    count
+                )
+                self.counter_shm_broadcast_blocked_wait_seconds.labels(
+                    *labelvalues, role
+                ).inc(seconds)
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries
             )

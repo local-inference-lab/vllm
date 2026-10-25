@@ -824,7 +824,6 @@ def test_remote_subscribe_addr_unique_concurrent_writers(
 
 def _make_adaptive_reader():
     """Construct a SpinCondition reader with default adaptive env tunables."""
-
     ctx = mock.Mock()
     ctx.socket.return_value = mock.Mock()
     with mock.patch.dict(
@@ -884,50 +883,34 @@ def test_shm_broadcast_wait_metrics_publish_batched(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """Blocked wait metrics publish only at the batch boundary or flush."""
-    reports: list[tuple[str, int, float]] = []
-    monkeypatch.setattr(
-        shm_broadcast,
-        "_shm_broadcast_metrics_queue",
-        mock.Mock(put=reports.append),
-    )
-    monkeypatch.setattr(
-        shm_broadcast, "_start_shm_broadcast_metrics_thread", lambda: None
-    )
+    monkeypatch.setattr(shm_broadcast, "_shm_broadcast_wait_totals", {})
     metrics = shm_broadcast._BatchedShmBroadcastWaitMetrics("reader")
-    for _ in range(shm_broadcast._SHM_BROADCAST_METRIC_BATCH_SIZE):
+    for _ in range(shm_broadcast._SHM_BROADCAST_METRIC_BATCH_SIZE - 1):
         metrics.record(0.001)
+    assert shm_broadcast.drain_shm_broadcast_wait_metrics() == {}
 
-    assert reports == [
-        (
-            "reader",
+    metrics.record(0.001)
+    assert shm_broadcast.drain_shm_broadcast_wait_metrics() == {
+        "reader": (
             shm_broadcast._SHM_BROADCAST_METRIC_BATCH_SIZE,
             pytest.approx(shm_broadcast._SHM_BROADCAST_METRIC_BATCH_SIZE * 0.001),
         )
-    ]
+    }
 
     metrics.record(0.002)
-    assert len(reports) == 1
+    assert shm_broadcast.drain_shm_broadcast_wait_metrics() == {}
     metrics.flush()
-    assert reports[1] == ("reader", 1, pytest.approx(0.002))
+    assert shm_broadcast.drain_shm_broadcast_wait_metrics() == {
+        "reader": (1, pytest.approx(0.002))
+    }
 
 
 @pytest.mark.skip_global_cleanup
 def test_shm_broadcast_wait_metrics_support_fake_accelerator_device(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Metrics export does not initialize the configured accelerator."""
-    monkeypatch.setattr(shm_broadcast, "_shm_broadcast_blocked_waits", None)
-    monkeypatch.setattr(shm_broadcast, "_shm_broadcast_blocked_wait_seconds", None)
-    reports: list[tuple[str, int, float]] = []
-    monkeypatch.setattr(
-        shm_broadcast,
-        "_shm_broadcast_metrics_queue",
-        mock.Mock(put=reports.append),
-    )
-    monkeypatch.setattr(
-        shm_broadcast, "_start_shm_broadcast_metrics_thread", lambda: None
-    )
-
+    """Counting and draining waits does not initialize the configured device."""
+    monkeypatch.setattr(shm_broadcast, "_shm_broadcast_wait_totals", {})
     metrics = shm_broadcast._BatchedShmBroadcastWaitMetrics("cuda")
     with mock.patch.object(
         torch.cuda,
@@ -936,15 +919,9 @@ def test_shm_broadcast_wait_metrics_support_fake_accelerator_device(
     ):
         metrics.record(0.003)
         metrics.flush()
-        shm_broadcast._report_shm_broadcast_wait_metrics(*reports[0])
-
-    assert (
-        shm_broadcast._shm_broadcast_blocked_waits.labels(role="cuda")._value.get() == 1
-    )
-    assert shm_broadcast._shm_broadcast_blocked_wait_seconds.labels(
-        role="cuda"
-    )._value.get() == pytest.approx(0.003)
-    assert reports == [("cuda", 1, pytest.approx(0.003))]
+        assert shm_broadcast.drain_shm_broadcast_wait_metrics() == {
+            "cuda": (1, pytest.approx(0.003))
+        }
 
 
 @pytest.mark.skip_global_cleanup
@@ -1048,7 +1025,6 @@ def test_adaptive_grace_direction(interval_s, expect):
 @pytest.mark.skip_global_cleanup
 def test_adaptive_grace_fixed_pin_supersedes():
     """A pinned busy_loop_s freezes the grace regardless of traffic."""
-
     ctx = mock.Mock()
     ctx.socket.return_value = mock.Mock()
     with mock.patch.dict(
