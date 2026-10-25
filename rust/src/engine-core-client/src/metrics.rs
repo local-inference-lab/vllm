@@ -6,10 +6,11 @@ use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vllm_metrics::{
-    CacheHitSourceLabels, EngineLabels, EnginePositionLabels, F64Gauge, Family, HistogramMetric,
-    LoraAdapterNames, LoraInfoLabels, MooncakeOperationCounterFamily,
+    CacheHitSourceLabels, EngineLabels, EnginePositionLabels, F64Counter, F64Gauge, Family,
+    HistogramMetric, LoraAdapterNames, LoraInfoLabels, MooncakeOperationCounterFamily,
     MooncakeOperationHistogramFamily, MooncakeOperationLabels, RequestMetrics,
-    SchedulerLogStatsAccumulator, SchedulerMetrics, U64Counter, U64Gauge, WaitingReasonLabels,
+    SchedulerLogStatsAccumulator, SchedulerMetrics, ShmBroadcastWaitLabels, U64Counter, U64Gauge,
+    WaitingReasonLabels,
 };
 
 use crate::protocol::stats::{
@@ -97,6 +98,10 @@ struct SchedulerStatsHandles {
     nixl_num_failed_transfers: U64Counter,
     nixl_num_failed_notifications: U64Counter,
     nixl_num_kv_expired_reqs: U64Counter,
+
+    // Blocked shared-memory broadcast waits, labelled by queue role.
+    shm_broadcast_blocked_waits: Family<ShmBroadcastWaitLabels, U64Counter>,
+    shm_broadcast_blocked_wait_seconds: Family<ShmBroadcastWaitLabels, F64Counter>,
 
     // Non-Prometheus interval accumulator for periodic text-log helpers.
     log_stats: SchedulerLogStatsAccumulator,
@@ -214,6 +219,8 @@ fn resolve_scheduler_stats_handles(
             .nixl_num_failed_notifications
             .get_or_create_owned(&labels),
         nixl_num_kv_expired_reqs: metrics.nixl_num_kv_expired_reqs.get_or_create_owned(&labels),
+        shm_broadcast_blocked_waits: metrics.shm_broadcast_blocked_waits.clone(),
+        shm_broadcast_blocked_wait_seconds: metrics.shm_broadcast_blocked_wait_seconds.clone(),
         labels,
     }
 }
@@ -285,6 +292,20 @@ fn record_scheduler_stats_with_handles(handles: &SchedulerStatsHandles, stats: &
         handles.estimated_flops_per_gpu.inc_by(perf_stats.num_flops_per_gpu);
         handles.estimated_read_bytes_per_gpu.inc_by(perf_stats.num_read_bytes_per_gpu);
         handles.estimated_write_bytes_per_gpu.inc_by(perf_stats.num_write_bytes_per_gpu);
+    }
+
+    // Blocked shared-memory broadcast waits, reported per queue role.
+    for (role, (count, seconds)) in &stats.shm_broadcast_waits {
+        let labels = ShmBroadcastWaitLabels {
+            model_name: handles.labels.model_name.clone(),
+            engine: handles.labels.engine,
+            role: role.clone(),
+        };
+        handles.shm_broadcast_blocked_waits.get_or_create(&labels).inc_by(*count);
+        handles
+            .shm_broadcast_blocked_wait_seconds
+            .get_or_create(&labels)
+            .inc_by(*seconds);
     }
 
     if let Some(cudagraph_stats) = &stats.cudagraph_stats {
@@ -557,5 +578,33 @@ mod tests {
             rendered
                 .contains("vllm:nixl_xfer_time_seconds_count{model_name=\"model\",engine=\"0\"} 2")
         );
+    }
+
+    /// The engine's blocked shared-memory waits reach the role-labelled counters.
+    #[test]
+    fn shm_broadcast_waits_are_recorded_per_role() {
+        let metrics = Metrics::new();
+        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+
+        let stats = SchedulerStats {
+            shm_broadcast_waits: BTreeMap::from([
+                ("reader".to_string(), (2_u64, 0.5_f64)),
+                ("writer".to_string(), (1_u64, 0.25_f64)),
+            ]),
+            ..Default::default()
+        };
+
+        super::record_scheduler_stats_with_handles(&handles, &stats);
+        super::record_scheduler_stats_with_handles(&handles, &stats);
+
+        let rendered = metrics.render().unwrap();
+        assert!(rendered.contains(
+            "vllm:shm_broadcast_blocked_waits_total{model_name=\"model\",engine=\"0\",\
+             role=\"reader\"} 4"
+        ));
+        assert!(rendered.contains(
+            "vllm:shm_broadcast_blocked_wait_seconds_total{model_name=\"model\",engine=\"0\",\
+             role=\"writer\"} 0.5"
+        ));
     }
 }

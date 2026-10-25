@@ -9,7 +9,7 @@ use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEn
 use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
 
-use crate::{F64Gauge, Histogram, HistogramFamily, U64Counter, U64Gauge};
+use crate::{F64Counter, F64Gauge, Histogram, HistogramFamily, U64Counter, U64Gauge};
 
 const KV_CACHE_RESIDENCY_BUCKETS: [f64; 21] = [
     0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0,
@@ -105,6 +105,16 @@ pub struct WaitingReasonLabels {
     pub model_name: String,
     pub engine: u32,
     pub reason: &'static str,
+}
+
+/// Labels for the blocked shared-memory broadcast wait counters. `role` is the
+/// queue role reported by the engine (`reader`/`writer`), so it is dynamic like
+/// the Mooncake connector labels.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ShmBroadcastWaitLabels {
+    pub model_name: String,
+    pub engine: u32,
+    pub role: String,
 }
 
 /// Labels for per-operation Mooncake store connector telemetry. `operation`
@@ -244,6 +254,11 @@ pub struct SchedulerMetrics {
     pub external_prefix_cache_queries: Family<EngineLabels, U64Counter>,
     pub external_prefix_cache_hits: Family<EngineLabels, U64Counter>,
     pub prompt_tokens_cached_by_source: Family<CacheHitSourceLabels, U64Counter>,
+
+    /// Blocked shared-memory broadcast waits per queue role, reported on the
+    /// scheduler stats by the process that took them.
+    pub shm_broadcast_blocked_waits: Family<ShmBroadcastWaitLabels, U64Counter>,
+    pub shm_broadcast_blocked_wait_seconds: Family<ShmBroadcastWaitLabels, F64Counter>,
 
     // Speculative decoding counters.
     pub spec_decode_num_drafts: Family<EngineLabels, U64Counter>,
@@ -533,6 +548,20 @@ impl SchedulerMetrics {
             nixl_num_kv_expired_reqs.clone(),
         );
 
+        let shm_broadcast_blocked_waits = Family::default();
+        registry.register(
+            "vllm:shm_broadcast_blocked_waits",
+            "Total shared-memory broadcast waits that blocked.",
+            shm_broadcast_blocked_waits.clone(),
+        );
+
+        let shm_broadcast_blocked_wait_seconds = Family::default();
+        registry.register(
+            "vllm:shm_broadcast_blocked_wait_seconds",
+            "Total seconds spent in blocked shared-memory broadcast waits.",
+            shm_broadcast_blocked_wait_seconds.clone(),
+        );
+
         Self {
             scheduler_running,
             scheduler_waiting,
@@ -566,6 +595,8 @@ impl SchedulerMetrics {
             nixl_num_failed_transfers,
             nixl_num_failed_notifications,
             nixl_num_kv_expired_reqs,
+            shm_broadcast_blocked_waits,
+            shm_broadcast_blocked_wait_seconds,
             log_stats: Family::default(),
         }
     }

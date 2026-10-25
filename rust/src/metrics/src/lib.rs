@@ -27,6 +27,7 @@ pub use scheduler::*;
 pub type U64Counter = Counter<u64, AtomicU64>;
 pub type U64Gauge = Gauge<u64, AtomicU64>;
 pub type F64Gauge = Gauge<f64, AtomicU64>;
+pub type F64Counter = Counter<f64, AtomicU64>;
 /// Histogram metric handle cloned out of a Prometheus family.
 pub type HistogramMetric = Histogram;
 pub(crate) type HistogramFamily = Family<EngineLabels, Histogram, fn() -> Histogram>;
