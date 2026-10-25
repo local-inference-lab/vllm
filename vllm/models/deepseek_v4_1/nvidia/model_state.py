@@ -5,12 +5,14 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.models.deepseek_v4_1.ced import CED_WINDOW, CEDState, ced_decoder_start
 from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
 from vllm.triton_utils import tl, triton
+from vllm.utils import b12x_row_prefetch
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -128,6 +130,38 @@ class DeepseekV41ModelState(DefaultModelState):
             for module in model.modules()
             if isinstance(module, DeepseekV4Model) and module.disk_engram
         )
+        self.row_prefetcher = None
+        self.row_cache_sampler = None
+        if self.disk_engram_models:
+            from ..common.engram_prefetch import engram_disk_row_tables
+
+            # The cache serves the synchronous lookups whether or not advisory
+            # prefetch is on, so its counters are sampled either way.
+            self.row_cache_sampler = b12x_row_prefetch.RowCacheSampler(
+                tuple(
+                    table
+                    for engram_model in self.disk_engram_models
+                    for table in engram_disk_row_tables(engram_model)
+                )
+            )
+
+        if envs.VLLM_PLE_PREFETCH and self.disk_engram_models:
+            from ..common.engram_prefetch import engram_prefetch_targets
+
+            self.row_prefetcher = b12x_row_prefetch.RowPrefetcher(
+                tuple(
+                    target
+                    for engram_model in self.disk_engram_models
+                    for target in engram_prefetch_targets(engram_model)
+                ),
+                # NgramHashState.lookback_depth and _gather_lookback_kernel's
+                # empty-slot fill.
+                history_len=3,
+                history_pad=-1,
+                max_num_reqs=self.max_num_reqs,
+                num_speculative_tokens=vllm_config.num_speculative_tokens,
+                device=device,
+            )
 
     def prepare_streaming_update(self, req_id: str) -> None:
         """Keep decoder history when the runner refreshes a live request."""
@@ -207,6 +241,7 @@ class DeepseekV41ModelState(DefaultModelState):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
+        ubatch_idx: int = 0,
     ) -> dict[str, Any]:
         # Runtime prepares attention before model inputs. Capture does the reverse;
         # both paths populate the same persistent packing buffers.
@@ -219,6 +254,7 @@ class DeepseekV41ModelState(DefaultModelState):
             attn_groups,
             kv_cache_config,
             for_capture,
+            ubatch_idx,
         )
         state = self.ced_state
         if state is not None:
@@ -278,3 +314,18 @@ class DeepseekV41ModelState(DefaultModelState):
         for model in self.disk_engram_models:
             model.prepare_dummy_engram(num_tokens)
         return model_inputs
+
+    def prefetch_next_step(
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+        draft_tokens: torch.Tensor | None,
+    ) -> None:
+        if self.row_prefetcher is not None:
+            self.row_prefetcher.submit(input_batch, req_states, draft_tokens)
+
+    def row_cache_stats(self):
+        """Prefetch and row-cache counters for this worker's metrics payload."""
+        return b12x_row_prefetch.row_cache_stats(
+            self.row_prefetcher, self.row_cache_sampler
+        )

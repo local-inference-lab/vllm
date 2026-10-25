@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Model-runner state for Qwen4Exp PLE and QSA inputs."""
 
+import functools
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,9 +10,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.triton_utils import tl, triton
+from vllm.utils import b12x_row_prefetch
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.utils import CpuGpuBuffer
@@ -134,6 +137,8 @@ class Qwen4ExpModelState(MambaHybridModelState):
             if isinstance(module, B12xNGramEmbedding)
             and module.requires_disk_preparation
         )
+        self.row_prefetcher = None
+        self.row_cache_sampler = None
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
@@ -169,6 +174,62 @@ class Qwen4ExpModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
+
+        if self.disk_embeddings:
+
+            def disk_table(embedding: B12xNGramEmbedding):
+                """The embedding's b12x disk table, or None while unbuilt.
+
+                The table is created lazily by the b12x preparation path, so
+                this reads ``None`` until the first real step has run.
+                """
+                return embedding.ngram_embedding.disk_table
+
+            # The cache serves the synchronous lookups whether or not advisory
+            # prefetch is on, so its counters are sampled either way.
+            self.row_cache_sampler = b12x_row_prefetch.RowCacheSampler(
+                tuple(
+                    ("ple", functools.partial(disk_table, embedding))
+                    for embedding in self.disk_embeddings
+                )
+            )
+
+        if envs.VLLM_PLE_PREFETCH and self.disk_embeddings:
+            from b12x.sequence.ple_hash.host import query_row_ids
+
+            def target(
+                embedding: B12xNGramEmbedding,
+            ) -> b12x_row_prefetch.PrefetchTarget:
+                """One prefetch target for a disk-backed PLE embedding.
+
+                The hash geometry is copied to the host once here, at
+                construction, because the b12x row-id predictor is a host
+                routine and the step path must not page it back per block.
+                """
+                multipliers = embedding.layer_multipliers.detach().cpu()
+                prime_sizes = embedding.ngram_heads_vocab_sizes.detach().cpu()
+                table_offsets = embedding.ngram_heads_offsets.detach().cpu()
+                return b12x_row_prefetch.PrefetchTarget(
+                    resolve_table=lambda: embedding.ngram_embedding.disk_table,
+                    row_ids=functools.partial(
+                        query_row_ids,
+                        eos_token_id=embedding.eos_token_id,
+                        max_order=embedding.ngram_size,
+                        multipliers=multipliers.contiguous(),
+                        prime_sizes=prime_sizes.contiguous(),
+                        table_offsets=table_offsets.contiguous(),
+                        heads_per_order=embedding.heads_per_ngram,
+                    ),
+                )
+
+            self.row_prefetcher = b12x_row_prefetch.RowPrefetcher(
+                tuple(target(e) for e in self.disk_embeddings),
+                history_len=self.disk_embeddings[0].ngram_size - 1,
+                history_pad=self.ngram_eos_token_id,
+                max_num_reqs=self.max_num_reqs,
+                num_speculative_tokens=vllm_config.num_speculative_tokens,
+                device=self.device,
+            )
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -484,6 +545,21 @@ class Qwen4ExpModelState(MambaHybridModelState):
             idx_mapping,
             num_sampled,
             num_computed_tokens,
+        )
+
+    def prefetch_next_step(
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+        draft_tokens: torch.Tensor | None,
+    ) -> None:
+        if self.row_prefetcher is not None:
+            self.row_prefetcher.submit(input_batch, req_states, draft_tokens)
+
+    def row_cache_stats(self):
+        """Prefetch and row-cache counters for this worker's metrics payload."""
+        return b12x_row_prefetch.row_cache_stats(
+            self.row_prefetcher, self.row_cache_sampler
         )
 
     def _prepare_ngram_context(

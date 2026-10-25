@@ -84,6 +84,7 @@ class EngramLayout:
         token_map, compressed_size = _token_map(
             mc.tokenizer, mc.revision, mc.trust_remote_code
         )
+        self.token_map = token_map
         if compressed_size != config.engram_compressed_vocab_size:
             raise ValueError("Engram tokenizer compressed vocabulary mismatch")
         device = torch.device("cuda", torch.accelerator.current_device_index())

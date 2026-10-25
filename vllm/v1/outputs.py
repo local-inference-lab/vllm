@@ -13,6 +13,7 @@ import torch
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.metrics.b12x_row_cache import B12xRowCacheStats
 
 if TYPE_CHECKING:
     from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorWorkerMetadata
@@ -358,6 +359,10 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+
+    # Cumulative B12X disk row-cache and advisory prefetch counters from the
+    # worker that served this step; None when no model state holds disk tables.
+    b12x_row_cache_stats: B12xRowCacheStats | None = None
 
     # Actual per-request verification depths selected by adaptive verification.
     # None when the scheduled draft lengths are exact.

@@ -194,6 +194,30 @@ class ModelState(ABC):
     ) -> None:
         return None
 
+    def prefetch_next_step(
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+        draft_tokens: torch.Tensor | None,
+    ) -> None:
+        """Start advisory host-side work for the next step's inputs.
+
+        Runs at the end of ``sample_tokens`` after the next step's draft tokens
+        are staged. ``draft_tokens`` is in batch order or ``None``. Must not
+        block on the GPU. No-op by default.
+        """
+        return None
+
+    def row_cache_stats(self) -> Any | None:
+        """Advisory prefetch and row-cache counters for this worker's step.
+
+        Returns a ``B12xRowCacheStats``, or None when the model holds no
+        disk-backed B12X row tables. The runner attaches it to
+        ``ModelRunnerOutput`` and the frontend publishes it; annotated loosely
+        so this interface keeps no import of the metrics module.
+        """
+        return None
+
     def prepare_draft_attn_metadata(
         self,
         *,
