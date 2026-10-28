@@ -122,6 +122,7 @@ class WholeTensorView:
         return self.view.get_dtype()
 
     def __getitem__(self, extent: tuple[slice, slice]) -> torch.Tensor:
+        """Slice the tensor, reading it whole from its shard on first use."""
         if self.tensor is None:
             data, table = self.header
             entry = table[self.name]
@@ -161,6 +162,7 @@ class CsfTensorReader(ExitStack):
         return self.handles[filename]
 
     def _whole(self, name, view):
+        """Wrap a packed weight's lazy view so it is read in one pass."""
         if view.get_dtype() not in PACKED_DTYPES:
             return view
         path = self.root / self.source_names[name]

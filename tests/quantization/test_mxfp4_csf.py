@@ -469,6 +469,7 @@ def test_csf_tensor_reader_resolves_separate_shards_and_closes_after_failure(
     ):
         for _ in range(2):
             source = reader.matrix("arbitrary.packed", "arbitrary.scales")
+            assert isinstance(source.weight, csf_utils.WholeTensorView)
             assert source.weight.get_shape() == [64, 48]
             assert torch.equal(source.weight[8:16, 2:6], weight[8:16, 2:6])
             actual = decode_planes(SimpleNamespace(planes=(source.scales,)), 64, 3, 32)
@@ -481,10 +482,19 @@ def test_csf_tensor_reader_resolves_separate_shards_and_closes_after_failure(
     )
 
 
-def test_csf_tensor_reader_reads_packed_weights_whole(tmp_path):
+def test_csf_tensor_reader_reads_packed_weights_whole(tmp_path, monkeypatch):
     from safetensors import safe_open
 
     from vllm.model_executor.model_loader import csf_utils
+
+    header_reads = []
+    read_header = csf_utils.read_safetensors_header
+
+    def counting_header(path):
+        header_reads.append(path)
+        return read_header(path)
+
+    monkeypatch.setattr(csf_utils, "read_safetensors_header", counting_header)
 
     generator = torch.Generator().manual_seed(11)
     packed = torch.randint(0, 256, (64, 48), dtype=torch.uint8, generator=generator)
@@ -507,9 +517,13 @@ def test_csf_tensor_reader_reads_packed_weights_whole(tmp_path):
             assert view.get_dtype() == lazy.get_slice(name).get_dtype()
             for extent in (rows, columns):
                 assert torch.equal(view[extent], lazy.get_slice(name)[extent])
+            buffer = view.tensor
+            assert buffer is not None
+            view[rows]
+            assert view.tensor is buffer
         scale = reader._handle("c.scale").get_slice("c.scale")
         assert reader._whole("c.scale", scale) is scale
-        assert len(reader.headers) == 1
+        assert header_reads == [tmp_path / "weights.safetensors"]
 
 
 def decode(fixed, exceptions, rows, columns):
