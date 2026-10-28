@@ -469,6 +469,7 @@ def test_csf_tensor_reader_resolves_separate_shards_and_closes_after_failure(
     ):
         for _ in range(2):
             source = reader.matrix("arbitrary.packed", "arbitrary.scales")
+            assert isinstance(source.weight, csf_utils.WholeTensorView)
             assert source.weight.get_shape() == [64, 48]
             assert torch.equal(source.weight[8:16, 2:6], weight[8:16, 2:6])
             actual = decode_planes(SimpleNamespace(planes=(source.scales,)), 64, 3, 32)
@@ -479,6 +480,50 @@ def test_csf_tensor_reader_resolves_separate_shards_and_closes_after_failure(
         == sorted(closed)
         == ["scales.safetensors", "weights.safetensors"]
     )
+
+
+def test_csf_tensor_reader_reads_packed_weights_whole(tmp_path, monkeypatch):
+    from safetensors import safe_open
+
+    from vllm.model_executor.model_loader import csf_utils
+
+    header_reads = []
+    read_header = csf_utils.read_safetensors_header
+
+    def counting_header(path):
+        header_reads.append(path)
+        return read_header(path)
+
+    monkeypatch.setattr(csf_utils, "read_safetensors_header", counting_header)
+
+    generator = torch.Generator().manual_seed(11)
+    packed = torch.randint(0, 256, (64, 48), dtype=torch.uint8, generator=generator)
+    tensors = {
+        "a.packed": packed,
+        "b.packed": packed[:32].view(torch.int8).clone(),
+        "c.scale": torch.rand(4, 4, generator=generator),
+    }
+    save_file(tensors, tmp_path / "weights.safetensors")
+    index = dict.fromkeys(tensors, "weights.safetensors")
+    rows, columns = (slice(16, 48), slice(None)), (slice(None), slice(12, 36))
+    with (
+        csf_utils.CsfTensorReader(tmp_path, index, "mxfp4") as reader,
+        safe_open(tmp_path / "weights.safetensors", framework="pt") as lazy,
+    ):
+        for name in ("a.packed", "b.packed"):
+            view = reader._whole(name, reader._handle(name).get_slice(name))
+            assert isinstance(view, csf_utils.WholeTensorView)
+            assert view.get_shape() == list(tensors[name].shape)
+            assert view.get_dtype() == lazy.get_slice(name).get_dtype()
+            for extent in (rows, columns):
+                assert torch.equal(view[extent], lazy.get_slice(name)[extent])
+            buffer = view.tensor
+            assert buffer is not None
+            view[rows]
+            assert view.tensor is buffer
+        scale = reader._handle("c.scale").get_slice("c.scale")
+        assert reader._whole("c.scale", scale) is scale
+        assert header_reads == [tmp_path / "weights.safetensors"]
 
 
 def decode(fixed, exceptions, rows, columns):

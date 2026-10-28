@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-1047",
+  "category": "performance",
+  "summary": "Read each MXFP4-CSF expert weight in one pass: about 10x faster expert loading on ZFS model stores",
+  "models": ["DeepSeek-V4-Flash", "DeepSeek-V4.1-Flash", "Kimi-K3"],
+  "compatibility": "No user action required.",
+  "details": [
+    "A rank's half of the down projection is a column slice. Through safetensors' mmap view it faulted every row in separately, and ZFS with primarycache=metadata re-read a whole record for each fault: DeepSeek-V4-Flash's 43 expert layers took about 35 minutes at TP2, on warm boots too.",
+    "The reader now reads each packed weight once, sequentially, and slices the rank's share in memory: about 3 seconds a layer. Scales, shapes and the loaded bytes are unchanged."
+  ],
+  "pull_requests": [1047],
+  "requires": [],
+  "authors": ["pierloh"]
+}
