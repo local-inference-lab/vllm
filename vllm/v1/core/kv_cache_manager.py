@@ -484,6 +484,7 @@ class KVCacheManager:
         full_sequence_must_fit: bool = False,
         reserved_blocks: int = 0,
         has_scheduled_reqs: bool = True,
+        full_sequence_reserved_blocks: int = 0,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -516,6 +517,10 @@ class KVCacheManager:
                 blocks an already in-flight (prefilling) sequence is relying on.
             has_scheduled_reqs: Whether any requests are already scheduled to run
                 this step, controls whether watermark is applied.
+            full_sequence_reserved_blocks: Free blocks the full-sequence check
+                must leave for other in-flight prefills. Size-classed prefill
+                lanes pass it for long admissions, so two long prompts cannot
+                both pass the check against the same free blocks.
 
         Blocks layout:
         ```
@@ -650,7 +655,12 @@ class KVCacheManager:
             required_blocks = (
                 num_blocks_to_allocate + watermark_blocks + boundary_blocks
             )
-            if required_blocks > self.block_pool.get_num_free_blocks() - import_reserve:
+            if (
+                required_blocks
+                > self.block_pool.get_num_free_blocks()
+                - import_reserve
+                - full_sequence_reserved_blocks
+            ):
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens

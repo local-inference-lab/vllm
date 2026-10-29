@@ -728,6 +728,8 @@ class EngineArgs:
     max_parallel_prefills: MaxParallelPrefills = SchedulerConfig.max_parallel_prefills
     prefill_policy: PrefillPolicy = SchedulerConfig.prefill_policy
     decode_refill_target: DecodeRefillTarget = SchedulerConfig.decode_refill_target
+    prefill_long_threshold: int = SchedulerConfig.prefill_long_threshold
+    max_long_prefills: int = SchedulerConfig.max_long_prefills
 
     watermark: float = SchedulerConfig.watermark
 
@@ -1765,6 +1767,14 @@ class EngineArgs:
             "--decode-refill-target", **decode_refill_target_kwargs
         )
         scheduler_group.add_argument(
+            "--prefill-long-threshold",
+            **scheduler_kwargs["prefill_long_threshold"],
+        )
+        scheduler_group.add_argument(
+            "--max-long-prefills",
+            **scheduler_kwargs["max_long_prefills"],
+        )
+        scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
             **scheduler_kwargs["disable_hybrid_kv_cache_manager"],
         )
@@ -2616,6 +2626,8 @@ class EngineArgs:
             max_parallel_prefills=self.max_parallel_prefills,
             prefill_policy=self.prefill_policy,
             decode_refill_target=self.decode_refill_target,
+            prefill_long_threshold=self.prefill_long_threshold,
+            max_long_prefills=self.max_long_prefills,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,

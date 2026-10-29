@@ -208,6 +208,10 @@ class Request:
 
         # True if this request is scheduled as a non-final prefill chunk.
         self.is_prefill_chunk = False
+        # Size-classed prefill lanes: computed tokens (local prefix plus
+        # connector hits) that the last waiting-pass lookup found. None until
+        # the request has been looked up.
+        self.qos_cached_tokens_hint: int | None = None
 
         # Block-aligned token position of a proven shared prefix worth pinning
         # in the (sparse) prefix cache; 0 means none. Set at admission for

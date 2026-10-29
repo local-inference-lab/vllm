@@ -245,6 +245,29 @@ class SchedulerConfig:
     This setting is ignored by ``round-robin`` when left at ``auto``.
     """
 
+    prefill_long_threshold: int = Field(default=0, ge=0)
+    """Size-classed prefill lanes: QoS for many concurrent users.
+
+    A local prefill whose uncached remaining work is at least this many
+    tokens is long; other prefills are short. The estimate uses the prefix
+    and connector cache hits found when the request was last looked up, not
+    the prompt length, so a mostly cached follow-up turn is short. Zero
+    disables size classes and lanes behave as before.
+
+    With size classes, long prefills hold at most ``max_long_prefills`` lanes
+    while short prefills wait, always keep at least one lane while one is
+    runnable, and take any lane that short work leaves unused. A long
+    admission waits, without blocking the short work behind it, while
+    ``max_long_prefills`` long prefills are already in flight. Requires
+    ``max_parallel_prefills`` greater than one.
+    """
+
+    max_long_prefills: int = Field(default=1, ge=1)
+    """Long prefills (see ``prefill_long_threshold``) that may be in flight
+    and hold lanes while short work waits. At least one lane always stays
+    available to short work, so the effective value is at most the lane count
+    minus one."""
+
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
     avoid gaps in GPU utilization, leading to better latency and throughput.
@@ -380,6 +403,10 @@ class SchedulerConfig:
         if interleaving_enabled and not self.enable_chunked_prefill:
             raise ValueError(
                 "prefill interleaving requires enable_chunked_prefill=True"
+            )
+        if self.prefill_long_threshold > 0 and not interleaving_enabled:
+            raise ValueError(
+                "prefill_long_threshold requires max_parallel_prefills greater than one"
             )
 
         if is_encoder_decoder:
