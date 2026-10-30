@@ -2201,6 +2201,9 @@ class Scheduler(SchedulerInterface):
         if self.connector is not None:
             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
+            scheduler_output.kv_connector_gather_all_ranks = (
+                self.connector.requires_all_worker_outputs()
+            )
 
         # Build the connector meta for ECConnector
         if self.ec_connector is not None:

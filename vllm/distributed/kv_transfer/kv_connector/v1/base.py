@@ -716,6 +716,18 @@ class KVConnectorBase_V1(ABC):
         """Whether pending transfers can release blocks instead of preemption."""
         return False
 
+    def requires_all_worker_outputs(self) -> bool:
+        """Whether the step being scheduled must gather every worker's output.
+
+        Called once per step, after build_connector_meta(). With a connector
+        the executor normally waits for every rank's reply to aggregate
+        their connector outputs, where it otherwise takes one rank's. A
+        connector whose workers report only on work the scheduler handed
+        them can return False while none is outstanding, which saves the
+        all-rank gather on idle steps (it matters when ranks span hosts).
+        """
+        return True
+
     def has_pending_push_work(self) -> bool:
         """Return True if the connector has push-mode work that requires
         the engine main loop to keep stepping (e.g. a P-side request whose
