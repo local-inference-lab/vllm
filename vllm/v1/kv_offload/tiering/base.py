@@ -28,6 +28,7 @@ if TYPE_CHECKING:
         OffloadingConnectorStats,
     )
     from vllm.v1.kv_offload.base import OffloadingSpec
+    from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 
 # Type alias for job IDs used in async transfer tracking
@@ -330,6 +331,22 @@ class SecondaryTierManager(ABC):
     ) -> dict[str, OffloadingMetricMetadata]:
         """Return Prometheus metric definitions emitted by this tier."""
         return {}
+
+    @classmethod
+    def start_worker_agent(
+        cls,
+        tier_config: dict[str, Any],
+        offloading_spec: "OffloadingSpec",
+        mmap_region: "SharedOffloadRegion",
+    ) -> Any:
+        """Start this tier's worker-side helper, if it has one.
+
+        Called in every worker process once its view of the CPU primary
+        region exists. A tier whose I/O must also run on hosts other than the
+        scheduler's (where the scheduler cannot see the region) returns a
+        handle with a ``stop()`` method; the default runs nothing.
+        """
+        return None
 
     def get_stats(self) -> "OffloadingConnectorStats | None":
         """Return and reset metric observations collected by this tier."""

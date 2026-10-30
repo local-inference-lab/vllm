@@ -113,6 +113,12 @@ SecondaryTierFactory.register_tier(
 )
 
 SecondaryTierFactory.register_tier(
+    "fs_multinode",
+    "vllm.v1.kv_offload.tiering.fs.multinode",
+    "MultiNodeFileSystemTierManager",
+)
+
+SecondaryTierFactory.register_tier(
     "p2p",
     "vllm.v1.kv_offload.tiering.p2p.manager",
     "P2PSecondaryTierManager",

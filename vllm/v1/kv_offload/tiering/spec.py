@@ -264,6 +264,10 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         # Scheduler-side mmap (rank=None); kept for cleanup
         self._scheduler_mmap: SharedOffloadRegion | None = None
 
+        # Worker-side tier helpers started by create_worker (see
+        # SecondaryTierManager.start_worker_agent)
+        self._worker_agents: list[Any] = []
+
         # Set by create_worker when canonical_layout is enabled: True when
         # every layer's canonical bytes are parallelism-agnostic (portable),
         # False when some layers use the opaque fallback (exact-topology only)
@@ -401,6 +405,12 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         try:
             if self.config.canonical_layout:
                 self._validate_canonical_refs(kv_caches)
+            for tier_config in self.secondary_tier_configs:
+                agent = SecondaryTierFactory.get_tier_class(
+                    tier_config
+                ).start_worker_agent(tier_config, self, worker_mmap)
+                if agent is not None:
+                    self._worker_agents.append(agent)
             return CPUOffloadingWorker(
                 kv_caches=kv_caches,
                 blocks_per_chunk=self.blocks_per_chunk,
@@ -409,6 +419,8 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 canonical_layout=self.config.canonical_layout,
             )
         except Exception:
+            for agent in self._worker_agents:
+                agent.stop()
             worker_mmap.cleanup()
             raise
 
