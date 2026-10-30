@@ -106,6 +106,8 @@ class FileSystemTierManager(SecondaryTierManager):
     """
 
     medium: ClassVar[Medium] = Medium.STORAGE
+    # Block I/O goes through the host primary region only.
+    retains_gpu_page_registrations: ClassVar[bool] = False
 
     def __init__(
         self,

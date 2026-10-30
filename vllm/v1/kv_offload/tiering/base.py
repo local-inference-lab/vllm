@@ -133,6 +133,11 @@ class SecondaryTierManager(ABC):
     """
 
     medium: ClassVar[Medium | None] = None
+    # Whether this tier may register GPU pages for direct access (RDMA,
+    # GPUDirect, GDS). A tier that only reads and writes the host-side
+    # primary region sets False, which keeps the connector usable with the
+    # CUDA VMM allocator (see SupportsVmmSafeTransfers).
+    retains_gpu_page_registrations: ClassVar[bool] = True
 
     def __init__(
         self,

@@ -1,0 +1,21 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-1050",
+  "category": "compatibility",
+  "summary": "Allow TieringOffloadingSpec with a filesystem tier under expandable_segments without enable_cumem_allocator",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required. Tiers that do not declare host-only I/O (p2p, obj, out-of-tree) stay rejected under expandable_segments as before.",
+  "details": [
+    "SecondaryTierManager.retains_gpu_page_registrations (default True) lets a tier declare that it only touches the host primary region.",
+    "The fs tier declares False, so TieringOffloadingSpec with fs tiers counts as VMM-safe."
+  ],
+  "authors": [
+    "zengjiajun0623"
+  ],
+  "pull_requests": [
+    1050
+  ],
+  "requires": []
+}

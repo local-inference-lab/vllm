@@ -61,9 +61,22 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
         cls, kv_transfer_config: KVTransferConfig
     ) -> bool:
         # CPU copies pin host storage, not GPU cache pages. Tiered or external
-        # storage implementations may retain GPU page registrations.
+        # storage implementations may retain GPU page registrations, unless
+        # every secondary tier declares it works on the host region only.
         extra = kv_transfer_config.kv_connector_extra_config or {}
-        return extra.get("spec_name", "CPUOffloadingSpec") == "CPUOffloadingSpec"
+        spec_name = extra.get("spec_name", "CPUOffloadingSpec")
+        if spec_name == "CPUOffloadingSpec":
+            return True
+        if spec_name != "TieringOffloadingSpec":
+            return False
+        from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
+
+        return all(
+            not SecondaryTierFactory.get_tier_class(
+                tier_config
+            ).retains_gpu_page_registrations
+            for tier_config in extra.get("secondary_tiers", [])
+        )
 
     @cached_property
     def _bounding_group_ids(self) -> tuple[int, ...]:
