@@ -291,6 +291,10 @@ class SchedulerOutput:
     # KV Cache Connector metadata.
     kv_connector_metadata: KVConnectorMetadata | None = None
 
+    # Whether this step's connector output must be gathered from every worker
+    # (see KVConnectorBase_V1.requires_all_worker_outputs).
+    kv_connector_gather_all_ranks: bool = True
+
     # Whether any scheduled request consumes KV that the connector loads
     # synchronously during this step (load_async=False).
     has_sync_kv_loads: bool = False

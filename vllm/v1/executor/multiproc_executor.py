@@ -225,6 +225,8 @@ class FutureWrapper(Future):
 
 class MultiprocExecutor(Executor):
     supports_pp: bool = True
+    # Set per step by execute_model(); see _step_kv_output_aggregator().
+    _kv_gather_all_ranks: bool = True
 
     def __init__(self, vllm_config: VllmConfig, monitor_workers: bool = True):
         self.monitor_workers = monitor_workers
@@ -469,15 +471,22 @@ class MultiprocExecutor(Executor):
     def execute_model(  # type: ignore[override]
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+        # The step's sample_tokens() follows with the same choice.
+        self._kv_gather_all_ranks = scheduler_output.kv_connector_gather_all_ranks
         return self.collective_rpc(
             "execute_model",
             args=(scheduler_output,),
             unique_reply_rank=self.output_rank,
             non_block=non_block,
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
-            kv_output_aggregator=self.kv_output_aggregator,
+            kv_output_aggregator=self._step_kv_output_aggregator(),
             ec_output_aggregator=self.ec_output_aggregator,
         )
+
+    def _step_kv_output_aggregator(self) -> KVOutputAggregator | None:
+        if not self._kv_gather_all_ranks:
+            return None
+        return self.kv_output_aggregator
 
     def sample_tokens(  # type: ignore[override]
         self, grammar_output: GrammarOutput | None, non_block: bool = False
@@ -488,7 +497,7 @@ class MultiprocExecutor(Executor):
             unique_reply_rank=self.output_rank,
             non_block=non_block,
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
-            kv_output_aggregator=self.kv_output_aggregator,
+            kv_output_aggregator=self._step_kv_output_aggregator(),
             ec_output_aggregator=self.ec_output_aggregator,
         )
 

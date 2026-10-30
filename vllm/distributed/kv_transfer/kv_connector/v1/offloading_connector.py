@@ -221,6 +221,24 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
         assert self.connector_scheduler is not None
         return self.connector_scheduler.has_pending_push_work()
 
+    # Steps that keep gathering every worker after the last outstanding job:
+    # a deferred sample_tokens() of an earlier step can follow the next
+    # step's execute_model(), and takes that step's choice.
+    _GATHER_TRAILING_STEPS = 2
+    _gather_steps_left = 0
+
+    def requires_all_worker_outputs(self) -> bool:
+        # Workers report only completions of jobs the scheduler handed them,
+        # and a job stays outstanding until every worker has reported it, so
+        # a step with none outstanding has nothing to gather.
+        if self.scheduler.has_pending_push_work():
+            self._gather_steps_left = self._GATHER_TRAILING_STEPS
+            return True
+        if self._gather_steps_left > 0:
+            self._gather_steps_left -= 1
+            return True
+        return False
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         assert self.connector_scheduler is not None
         self.connector_scheduler.update_connector_output(connector_output)
