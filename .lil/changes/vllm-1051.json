@@ -1,0 +1,21 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-1051",
+  "category": "feature",
+  "summary": "Add the fs_multinode KV offload tier: persist and restore the CPU primary tier across nodes with node-local disks under multi-node TP",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required. New opt-in secondary tier type \"fs_multinode\"; existing tiers are unchanged.",
+  "details": [
+    "Each node persists only its own slots of every chunk row to its own disk; the head runs I/O in the scheduler, other nodes in an agent thread in their local-rank-0 worker, coordinated over ZMQ.",
+    "SecondaryTierManager.start_worker_agent (default: no agent) lets a tier start a helper in every worker once the primary region is mapped."
+  ],
+  "authors": [
+    "zengjiajun0623"
+  ],
+  "pull_requests": [
+    1051
+  ],
+  "requires": []
+}
