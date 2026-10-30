@@ -1,0 +1,22 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-1049",
+  "category": "performance",
+  "summary": "Gather every worker's output only while KV offload transfers are outstanding",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No user action required. Connectors other than OffloadingConnector keep gathering every step.",
+  "details": [
+    "KVConnectorBase_V1.requires_all_worker_outputs() (default True) lets a connector skip the all-rank gather on steps with nothing to report.",
+    "OffloadingConnector gathers while transfer jobs are outstanding and for two steps after.",
+    "Restores single-stream decode with multi-node TP and OffloadingConnector (59.7 to 65.2 tok/s on 4 GB10 nodes over Wi-Fi)."
+  ],
+  "authors": [
+    "zengjiajun0623"
+  ],
+  "pull_requests": [
+    1049
+  ],
+  "requires": []
+}
