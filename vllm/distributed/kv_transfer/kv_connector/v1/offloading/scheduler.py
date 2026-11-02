@@ -61,6 +61,10 @@ from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
 
+# A cache reset fence held this long is reported once.
+_RESET_FENCE_WARN_S = 60
+
+
 KV_LOAD_TIERS_KEY = "kv_load_tiers"
 MATCHER_MEDIUM_KEY = "medium"
 MATCHER_LOCALITY_KEY = "locality"
@@ -77,6 +81,8 @@ class TransferJobStatus:
     # Offload keys this job covers; passed to manager.complete_*().
     keys: set[OffloadKey]
     is_store: bool
+    # Whether any worker reported the transfer as failed.
+    failed: bool = False
     # Store source blocks fenced after the request finishes.
     deferred_fence_block_ids: list[int] | None = None
     # Store source blocks fenced when the transfer is created.
@@ -391,6 +397,9 @@ class RequestOffloadState:
     # time.monotonic() of this request's first deferred offload lookup;
     # None once consumed (observed) or while no lookup is pending.
     deferred_lookup_start_time: float | None = None
+    # A load of this request failed: its offloaded chunks are not trusted
+    # again, so a retry recomputes instead of repeating the load.
+    load_failed: bool = False
     # Fine-grained token boundary selected beyond the last complete offload
     # chunk. It is consumed when the corresponding load is scheduled.
     partial_tail_boundary: int | None = None
@@ -647,6 +656,12 @@ class OffloadingConnectorScheduler:
         # Threshold value for stale jobs. All job ids >= _stale_job_threshold are
         # active jobs.
         self._stale_job_threshold: int = 0
+        # Jobs discarded by a cache reset -> worker reports still due. Their
+        # chunks are released at once, but a worker may still write them (a
+        # late DMA, or a remote node's pending slot push) until it reports;
+        # no load is offered meanwhile, so no promotion reuses those chunks.
+        self._reset_fence: dict[int, int] = {}
+        self._reset_fence_since = 0.0
         # job_id -> capture-pinned source blocks of store jobs orphaned by a
         # cache reset; released when the worker's stale ack drains them (I4).
         self._stale_capture_blocks: dict[int, list[int]] = {}
@@ -1135,8 +1150,23 @@ class OffloadingConnectorScheduler:
         req_status.num_locally_computed_tokens = num_computed_tokens
 
         num_hit_tokens: int | None
-        if request.skip_reading_prefix_cache:
+        if (
+            request.skip_reading_prefix_cache
+            or req_status.load_failed
+            or self._reset_fence
+        ):
+            # Until workers report the jobs a cache reset flushed, a lookup
+            # could promote into a chunk they still write: recompute instead.
             num_hit_tokens = 0
+            if self._reset_fence:
+                req_status.deferred_lookup_start_time = None
+                if time.monotonic() - self._reset_fence_since > _RESET_FENCE_WARN_S:
+                    logger.warning_once(
+                        "KV offloading: workers have not reported %d jobs a "
+                        "cache reset flushed for over %d s; lookups stay off",
+                        len(self._reset_fence),
+                        _RESET_FENCE_WARN_S,
+                    )
         else:
             lookup_start = time.monotonic()
             num_hit_tokens = self._lookup(req_status, max_num_new_tokens)
@@ -1993,6 +2023,14 @@ class OffloadingConnectorScheduler:
         for job_id, count in meta.completed_jobs.items():
             assert count > 0
             if job_id < self._stale_job_threshold:
+                if job_id in self._reset_fence:
+                    self._reset_fence[job_id] -= count
+                    if self._reset_fence[job_id] <= 0:
+                        del self._reset_fence[job_id]
+                        if not self._reset_fence:
+                            logger.info(
+                                "KV offloading: lookups resume after the cache reset"
+                            )
                 logger.debug(
                     "Skipping stale completed job %d (pre-reset counter: %d)",
                     job_id,
@@ -2013,19 +2051,32 @@ class OffloadingConnectorScheduler:
                 continue
             job_status = self._jobs[job_id]
             job_status.pending_count -= count
+            job_status.failed |= job_id in meta.failed_jobs
             if job_status.pending_count > 0:
                 continue
             assert job_status.pending_count == 0
 
             req_status = self._req_status[job_status.req_id]
             if job_status.is_store:
-                self.manager.complete_store(job_status.keys, req_status.req_context)
+                # A failed store drops the keys it did not mark stored.
+                self.manager.complete_store(
+                    job_status.keys,
+                    req_status.req_context,
+                    success=not job_status.failed,
+                )
+                if job_status.failed:
+                    # No stored event follows, so its metadata would stay.
+                    self._events_tracker.discard_failed_store(job_status.keys)
                 # Every worker's D2H read of the source blocks is done (I4):
                 # release the manager pin on any frozen capture sources.
                 # No-op for block ids the manager never pinned.
                 for block_id in job_status.fenced_block_ids or ():
                     self._release_capture(block_id)
             else:
+                # The worker reported a failed load's blocks as load errors;
+                # the core recomputes or fails the request
+                # (kv_load_failure_policy).
+                req_status.load_failed |= job_status.failed
                 self.manager.complete_load(job_status.keys, req_status.req_context)
                 if self._chunks_being_loaded:
                     self._chunks_being_loaded.difference_update(job_status.keys)
@@ -2114,6 +2165,14 @@ class OffloadingConnectorScheduler:
         """
         yield from self._events_tracker.take_events(self.manager.take_events())
 
+    def _lookups_promote(self) -> bool:
+        """Whether lookups copy secondary-tier hits into released chunks."""
+        from vllm.v1.kv_offload.tiering.manager import TieringOffloadingManager
+
+        return isinstance(self.manager, TieringOffloadingManager) and bool(
+            self.manager.secondary_tiers
+        )
+
     def reset_cache(self) -> None:
         """Reset the offloading manager cache, evicting all stored chunks."""
 
@@ -2143,6 +2202,18 @@ class OffloadingConnectorScheduler:
 
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter
+        if self._lookups_promote() and self._jobs:
+            # Promotions rewrite released chunks; a late write must not land
+            # after one.
+            self._reset_fence.update(
+                (job_id, job.pending_count) for job_id, job in self._jobs.items()
+            )
+            self._reset_fence_since = time.monotonic()
+            logger.info(
+                "KV offloading: lookups skipped until workers report %d jobs "
+                "flushed by the cache reset",
+                len(self._reset_fence),
+            )
         # Stale acks skip the release loop; record orphaned store fences so a
         # reset that bypassed the manager's release-all can't leak pins (I4).
         self._stale_capture_blocks.update(

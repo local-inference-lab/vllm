@@ -7,6 +7,7 @@ import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
+    OffloadingWorkerMetadata,
     TransferJob,
 )
 from vllm.platforms import current_platform
@@ -30,6 +31,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingManager,
     OffloadingSpec,
     OffloadingWorker,
+    TransferResult,
 )
 from vllm.v1.kv_offload.config import (
     OffloadingCacheConfig,
@@ -271,6 +273,45 @@ def test_start_kv_transfers_non_writer_still_submits_load():
     assert worker.worker is not None
     worker.worker.submit_load.assert_called_once()
     assert worker.build_connector_worker_meta() is None
+
+
+def test_failed_transfers_are_reported_instead_of_asserting():
+    # A failed load still finishes receiving and reports its GPU blocks as
+    # load errors; a failed store is reported to the scheduler.
+    worker, _ = _make_worker(
+        KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+    )
+    worker.start_kv_transfers(_load_metadata(10))
+    assert worker.worker is not None
+    worker.worker.get_finished.return_value = [
+        TransferResult(job_id=10, success=False, transfer_size=64, transfer_time=1.0),
+        TransferResult(job_id=11, success=False, transfer_size=64, transfer_time=1.0),
+    ]
+
+    assert worker.get_finished(set()) == (set(), {"req"})
+    assert worker.get_block_ids_with_load_errors() == {0}
+    assert worker.get_block_ids_with_load_errors() == set()
+    meta = worker.build_connector_worker_meta()
+    assert meta is not None
+    assert meta.completed_jobs == {10: 1, 11: 1}
+    assert meta.failed_jobs == {10, 11}
+    # Failed transfers moved no data and are not counted as transfers.
+    assert meta.transfer_stats.is_empty()
+
+
+def test_worker_metadata_unions_failures_across_workers():
+    a = OffloadingWorkerMetadata()
+    a.mark_failed(1)
+    a.mark_completed(2)
+    b = OffloadingWorkerMetadata()
+    b.mark_completed(1)
+    b.mark_failed(2)
+
+    merged = a.aggregate(b)
+
+    assert isinstance(merged, OffloadingWorkerMetadata)
+    assert merged.completed_jobs == {1: 2, 2: 2}
+    assert merged.failed_jobs == {1, 2}
 
 
 def test_offloading_connector_worker_accepts_plugin_spec_default_layout():

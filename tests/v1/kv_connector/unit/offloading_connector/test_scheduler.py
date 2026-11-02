@@ -34,6 +34,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
     RequestOffloadState,
+    TransferJobStatus,
     get_sliding_window_size_in_chunks,
 )
 from vllm.v1.core.block_pool import BlockPool
@@ -77,6 +78,7 @@ from vllm.v1.kv_offload.base import (
     make_offload_key,
 )
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.tiering.manager import TieringOffloadingManager
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
@@ -514,6 +516,59 @@ def test_lookup_cap_stops_at_authoritative_prefix_boundary():
     assert scheduler._req_status["req"].partial_tail_boundary == 20
 
 
+@pytest.mark.parametrize("failed", [False, True])
+def test_failed_store_is_completed_unsuccessfully(failed: bool):
+    # A store that failed on any worker drops the keys it did not store.
+    scheduler = _make_partial_tail_scheduler()
+    _make_partial_tail_request(scheduler)
+    key = BlockHash(b"k")
+    scheduler._jobs[5] = TransferJobStatus(
+        req_id="req", pending_count=2, keys={key}, is_store=True
+    )
+    scheduler._req_status["req"].transfer_jobs.add(5)
+    scheduler._job_counter = 6
+    scheduler._events_tracker = MagicMock()
+
+    for worker_failed in (failed, False):
+        scheduler.update_connector_output(
+            KVConnectorOutput(
+                kv_connector_worker_meta=OffloadingWorkerMetadata(
+                    completed_jobs={5: 1}, failed_jobs={5} if worker_failed else set()
+                )
+            )
+        )
+
+    scheduler.manager.complete_store.assert_called_once_with(
+        {key}, scheduler._req_status["req"].req_context, success=not failed
+    )
+    # A failed store publishes no stored event, so its metadata is dropped.
+    assert scheduler._events_tracker.discard_failed_store.call_count == int(failed)
+
+
+def test_a_failed_load_is_not_retried_from_offloaded_chunks():
+    # A retry would hit the same chunks and repeat the failing load.
+    scheduler = _make_partial_tail_scheduler()
+    scheduler.config = scheduler.config._replace(supports_partial_tail=False)
+    request = _make_partial_tail_request(scheduler)
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (16, True)
+    scheduler._jobs[5] = TransferJobStatus(
+        req_id="req", pending_count=1, keys=set(), is_store=False
+    )
+    scheduler._req_status["req"].transfer_jobs.add(5)
+    scheduler._job_counter = 6
+
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={5: 1}, failed_jobs={5}
+            )
+        )
+    )
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+
+
 def test_max_load_tokens_zero_skips_partial_tail_lookup():
     scheduler = _make_partial_tail_scheduler()
     request = _make_partial_tail_request(
@@ -633,6 +688,48 @@ def test_partial_lookup_requires_every_cache_group():
     scheduler.manager.lookup.side_effect = lookup
     assert scheduler._lookup(req_status) == 16
     assert req_status.partial_tail_boundary is None
+
+
+def test_cache_reset_without_promotions_keeps_lookups():
+    # Without secondary tiers no lookup writes a released chunk.
+    scheduler = _make_partial_tail_scheduler()
+    scheduler.config = scheduler.config._replace(supports_partial_tail=False)
+    request = _make_partial_tail_request(scheduler)
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+    scheduler._jobs[7] = MagicMock(pending_count=2, is_store=True)
+    scheduler._job_counter = 8
+
+    scheduler.reset_cache()
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (16, True)
+
+
+def test_cache_reset_offers_no_load_until_flushed_jobs_report():
+    # Until every worker reports a job flushed by a reset, it may still write
+    # its released chunk (a remote node pushes its slot only then), so no
+    # promotion may reuse that chunk.
+    scheduler = _make_partial_tail_scheduler()
+    scheduler.config = scheduler.config._replace(supports_partial_tail=False)
+    request = _make_partial_tail_request(scheduler)
+    scheduler.manager = MagicMock(
+        spec=TieringOffloadingManager, secondary_tiers=[MagicMock()]
+    )
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+    scheduler._jobs[7] = MagicMock(pending_count=2, is_store=True)
+    scheduler._job_counter = 8
+
+    scheduler.reset_cache()
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    # Lookups start promotions, so none runs while the fence holds.
+    scheduler.manager.lookup.assert_not_called()
+    for _ in range(2):
+        scheduler.update_connector_output(
+            KVConnectorOutput(
+                kv_connector_worker_meta=OffloadingWorkerMetadata(completed_jobs={7: 1})
+            )
+        )
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (16, True)
 
 
 def test_scheduler_reports_allocation_failure(request_runner):

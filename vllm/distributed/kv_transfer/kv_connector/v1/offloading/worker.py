@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections import defaultdict
 from dataclasses import replace
 
@@ -57,8 +58,13 @@ class OffloadingConnectorWorker:
             not self.spec.replicated_layout or self.spec.config.parallel.rank == 0
         )
 
-        # job_id -> req_id for in-flight loads.
-        self._load_jobs: dict[int, ReqId] = {}
+        # job_id -> (req_id, GPU destination) for in-flight loads.
+        self._load_jobs: dict[int, tuple[ReqId, GPULoadStoreSpec]] = {}
+        # GPU blocks of failed loads, reported once to the scheduler.
+        self._invalid_block_ids: set[int] = set()
+        # Failed transfers are logged at most once every 10 s.
+        self._failed_since_log = 0
+        self._failed_logged_at = 0.0
         self._unsubmitted_store_jobs: list[
             tuple[int, GPULoadStoreSpec, LoadStoreSpec]
         ] = []
@@ -260,8 +266,8 @@ class OffloadingConnectorWorker:
         self._unsubmitted_store_jobs.clear()
 
         for job_id, entry in metadata.load_jobs.items():
-            self._load_jobs[job_id] = entry.req_id
             assert isinstance(entry.dst_spec, GPULoadStoreSpec)
+            self._load_jobs[job_id] = (entry.req_id, entry.dst_spec)
             success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
             assert success
 
@@ -292,12 +298,11 @@ class OffloadingConnectorWorker:
         assert self.worker is not None
         finished_recving: set[str] = set()
         for transfer_result in self.worker.get_finished():
-            # we currently do not support job failures
             job_id = transfer_result.job_id
-            assert transfer_result.success
             is_load = job_id in self._load_jobs
             if (
-                transfer_result.transfer_time is not None
+                transfer_result.success
+                and transfer_result.transfer_time is not None
                 and transfer_result.transfer_size is not None
             ):
                 if is_load:
@@ -309,12 +314,36 @@ class OffloadingConnectorWorker:
                     transfer_result.transfer_time,
                 )
 
-            self._connector_worker_meta.mark_completed(job_id)
-            req_id = self._load_jobs.pop(job_id, None)
-            if req_id is not None:
-                finished_recving.add(req_id)
+            load = self._load_jobs.pop(job_id, None)
+            if transfer_result.success:
+                self._connector_worker_meta.mark_completed(job_id)
+            else:
+                # A failed store is dropped by the scheduler; a failed load's
+                # blocks are reported as load errors, and the request is
+                # still reported as received, as the base connector requires.
+                self._failed_since_log += 1
+                now = time.monotonic()
+                if now - self._failed_logged_at >= 10.0:
+                    logger.warning(
+                        "%d KV offload transfer(s) failed; last: %s job %d",
+                        self._failed_since_log,
+                        "load" if load else "store",
+                        job_id,
+                    )
+                    self._failed_since_log = 0
+                    self._failed_logged_at = now
+                self._connector_worker_meta.mark_failed(job_id)
+                if load is not None:
+                    self._invalid_block_ids.update(load[1].block_ids.tolist())
+            if load is not None:
+                finished_recving.add(load[0])
 
         return set(), finished_recving
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        """GPU blocks of loads that failed since the last call."""
+        block_ids, self._invalid_block_ids = self._invalid_block_ids, set()
+        return block_ids
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         """Return completed transfer job IDs since the last call."""
@@ -327,6 +356,7 @@ class OffloadingConnectorWorker:
     def shutdown(self) -> None:
         self._unsubmitted_store_jobs.clear()
         self._load_jobs.clear()
+        self._invalid_block_ids.clear()
         self._connector_worker_meta = OffloadingWorkerMetadata()
         if self.worker is not None:
             self.worker.shutdown()
