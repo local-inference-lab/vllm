@@ -1663,6 +1663,101 @@ def test_two_groups_full_and_sliding_window(request_runner, async_scheduling: bo
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
+def test_hit_rebuilds_private_windows_left_dirty_by_an_earlier_decode(
+    request_runner, async_scheduling: bool
+):
+    # A request-private window is not offloaded: a hit restores the offloaded
+    # groups only, and the window is rebuilt by recomputing the replay suffix.
+    # Its blocks come back from the free queue holding an earlier request's
+    # decode state, so a hit reaching the end of the prompt would leave that
+    # stale state in place. Blocks are scarce here, so the second request
+    # reuses the first one's window blocks.
+    block_size = 4
+    replay = 8
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["full"],
+            FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["private"],
+            SlidingWindowMLASpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=replay,
+                prefix_cache_enabled=False,
+                prefill_replay_window=replay,
+            ),
+        ),
+    ]
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=13,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=kv_cache_groups,
+    )
+    private = runner.scheduler.kv_cache_manager.coordinator.single_type_managers[1]
+    window_blocks: dict[str, set[int]] = {}
+
+    def record_window_blocks():
+        for req_id, blocks in private.req_to_blocks.items():
+            window_blocks.setdefault(req_id, set()).update(
+                block.block_id for block in blocks if not block.is_null
+            )
+
+    matched: list[int] = []
+    lookup = runner.connector_scheduler.get_num_new_matched_tokens
+
+    def record_match(request, num_computed_tokens, **kwargs):
+        tokens, load_async = lookup(request, num_computed_tokens, **kwargs)
+        if tokens:
+            matched.append(tokens)
+        return tokens, load_async
+
+    runner.connector_scheduler.get_num_new_matched_tokens = record_match
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    # A first turn decodes into its window blocks, then finishes.
+    first_turn = list(range(1, 13))
+    runner.new_request(token_ids=first_turn)
+    runner.run(
+        decoded_tokens=[100, 101, 102, 103, 104, 105, 106, EOS_TOKEN_ID],
+        expected_stored=((0, 0), (0, 1), (0, 2), (0, 3)),
+        post_step_fn=record_window_blocks,
+    )
+    runner.scheduler.reset_prefix_cache()
+
+    # The next turn's first 16 tokens are offloaded, past where the bound
+    # stops the hit.
+    second_turn = first_turn + [100, 101, 102, 103, 104, 105, 106, 107, 200]
+    runner.new_request(token_ids=second_turn)
+    stored_keys = {key for key, _ in runner.offloaded}
+    runner.manager.lookup.side_effect = lambda key, req_context: (
+        LookupResult.HIT if key in stored_keys else LookupResult.MISS
+    )
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=((0, 3), (0, 4)),
+        expected_loaded=((0, 0), (0, 1), (0, 2)),
+        post_step_fn=record_window_blocks,
+    )
+
+    # The hit leaves the replay suffix to recompute...
+    assert matched == [(len(second_turn) - replay) // block_size * block_size]
+    # ...and that suffix lands in window blocks the first turn had written.
+    assert window_blocks["0"] & window_blocks["1"]
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
 def test_two_groups_different_block_sizes(request_runner, async_scheduling: bool):
     tokens_per_hash = 4
     num_gpu_blocks = 100

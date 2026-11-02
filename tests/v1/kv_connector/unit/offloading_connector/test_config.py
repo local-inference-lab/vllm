@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     SchedulerOffloadConfig,
 )
 from vllm.platforms import current_platform
+from vllm.v1.core.kv_cache_utils import generate_scheduler_kv_cache_config
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -487,6 +488,54 @@ def test_hisparse_partial_group_size_survives_scheduler_flattening():
 
     assert worker.worker_kv_bytes_per_block == scheduler.worker_kv_bytes_per_block
     assert worker.worker_kv_bytes_per_block == wrapped.page_size_bytes
+
+
+def test_mixed_page_sizes_survive_scheduler_flattening():
+    """A group whose layers differ in page size gets one CPU row size on both sides.
+
+    Workers keep the group's ``UniformTypeKVCacheSpecs``; the scheduler keeps
+    one layer's spec, whose page times the layer count disagrees with the row.
+    Both sides size it from the shared allocation instead.
+    """
+    num_blocks = 4
+    layer_specs = {
+        "compressed": _mla_spec(head_size=512),
+        "indexer": _mla_spec(head_size=64),
+    }
+    wrapped = UniformTypeKVCacheSpecs.from_specs(layer_specs)
+    assert wrapped is not None
+    pages = [spec.page_size_bytes for spec in layer_specs.values()]
+    assert len(set(pages)) == 2
+    row = sum(pages)
+    kv_cache_tensors = [
+        KVCacheTensor(
+            size=row * num_blocks,
+            layers=[name],
+            layer_stride=page,
+            block_stride=row,
+            offset=offset,
+        )
+        for name, page, offset in zip(layer_specs, pages, (0, pages[0]))
+    ]
+
+    def make_config(spec: KVCacheSpec) -> KVCacheConfig:
+        return KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=kv_cache_tensors,
+            kv_cache_groups=[KVCacheGroupSpec(list(layer_specs), spec)],
+        )
+
+    worker_config = make_config(wrapped)
+    scheduler_config = generate_scheduler_kv_cache_config([worker_config])
+    flattened = scheduler_config.kv_cache_groups[0].kv_cache_spec
+    assert flattened.page_size_bytes * len(layer_specs) != row
+
+    config = _make_vllm_config()
+    worker = build_offloading_config(config, worker_config)
+    scheduler = build_offloading_config(config, scheduler_config)
+
+    assert worker.worker_kv_bytes_per_block == row
+    assert scheduler.worker_kv_bytes_per_block == row
 
 
 def test_zero_blocks_skips_tensor_layout_validation():
