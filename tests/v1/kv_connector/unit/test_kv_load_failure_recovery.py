@@ -91,6 +91,7 @@ def test_async_load_failure(
     }
 
     scheduler.connector = Mock()
+    scheduler.connector.get_loaded_kv_cache_group_ids.return_value = (0,)
     scheduler.connector.get_num_new_matched_tokens.side_effect = (
         _make_get_num_new_matched_tokens(req_num_new_matched_tokens, async_load=True)
     )
@@ -320,6 +321,7 @@ def test_async_progressive_load_failure(
     }
 
     scheduler.connector = Mock()
+    scheduler.connector.get_loaded_kv_cache_group_ids.return_value = (0,)
     scheduler.connector.get_num_new_matched_tokens.side_effect = (
         _make_get_num_new_matched_tokens(req_num_new_matched_tokens, async_load=True)
     )
@@ -369,6 +371,10 @@ def _schedule_hybrid_async_load(
     scheduler.add_request(request=request)
 
     scheduler.connector = Mock()
+    # The connector transfers the request's own blocks, so it loads every group.
+    scheduler.connector.get_loaded_kv_cache_group_ids.return_value = tuple(
+        range(len(scheduler.kv_cache_config.kv_cache_groups))
+    )
     scheduler.connector.get_num_new_matched_tokens.side_effect = (
         _make_get_num_new_matched_tokens(
             {request.request_id: num_external_computed_blocks * scheduler.block_size},
@@ -539,6 +545,9 @@ def _schedule_deepseek_v4_async_load(
     scheduler.add_request(request)
 
     scheduler.connector = Mock()
+    scheduler.connector.get_loaded_kv_cache_group_ids.return_value = tuple(
+        range(len(scheduler.kv_cache_config.kv_cache_groups))
+    )
     scheduler.connector.get_num_new_matched_tokens.side_effect = (
         _make_get_num_new_matched_tokens(
             {request.request_id: num_external_tokens}, async_load=True

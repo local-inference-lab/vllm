@@ -606,6 +606,14 @@ class OffloadingSpec(ABC):
         self.tokens_per_hash = config.cache.tokens_per_hash
         self.blocks_per_chunk = config.cache.blocks_per_chunk
 
+    @property
+    def staged_load_chunks(self) -> int | None:
+        """Primary-tier chunks that a load promoted from secondary tiers uses.
+
+        None when hits are not promoted through a bounded primary tier.
+        """
+        return None
+
     @abstractmethod
     def get_manager(self) -> OffloadingManager:
         """

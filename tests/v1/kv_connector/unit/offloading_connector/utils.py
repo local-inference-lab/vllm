@@ -24,6 +24,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+    get_offloading_group_ids,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
@@ -267,7 +270,8 @@ class RequestRunner:
             kv_cache_groups=kv_cache_groups,
         )
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
-        self.num_kv_groups = len(kv_cache_config.kv_cache_groups)
+        # Groups the connector offloads; request-private groups are left out.
+        self.num_kv_groups = len(get_offloading_group_ids(kv_cache_config))
 
         scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
@@ -319,12 +323,10 @@ class RequestRunner:
         assert isinstance(manager, MagicMock)
         self.manager: MagicMock = manager
 
-        num_kv_groups = len(kv_cache_config.kv_cache_groups)
-        assert len(self.connector_scheduler.config.kv_group_configs) == num_kv_groups
-        for group_config, kv_cache_group in zip(
-            self.connector_scheduler.config.kv_group_configs,
-            kv_cache_config.kv_cache_groups,
-        ):
+        group_configs = self.connector_scheduler.config.kv_group_configs
+        assert len(group_configs) == self.num_kv_groups
+        for group_config in group_configs:
+            kv_cache_group = kv_cache_config.kv_cache_groups[group_config.group_idx]
             tokens_per_block = kv_cache_group.kv_cache_spec.block_size
             assert group_config.tokens_per_block == tokens_per_block
             assert group_config.tokens_per_chunk == tokens_per_block * blocks_per_chunk
