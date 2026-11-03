@@ -26,8 +26,7 @@ if has_triton_kernels():
     try:
         from triton_kernels.matmul_ogs import PrecisionConfig
     except (ImportError, AttributeError) as e:
-        # Only the Triton MoE backends use these kernels; stay quiet by default.
-        logger.debug(
+        logger.error(
             "Failed to import Triton kernels. Please make sure your triton "
             "version is compatible. Error: %s",
             e,

@@ -1085,6 +1085,7 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
         slot_mapping: torch.Tensor,
         kv_cache_dtype: str,
         k_scale: torch.Tensor,
+        attn_metadata: "AttentionMetadata | None" = None,
     ) -> None:
         if kv_cache.numel() == 0:
             return

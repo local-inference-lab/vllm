@@ -52,6 +52,11 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "turboquant_3bit_nc": torch.uint8,
     "nvfp4": torch.uint8,
     "nvfp4_4over6": torch.uint8,
+    "kvarn_mla_k4v4_g256": torch.uint8,
+    "kvarn_mla_k5v5_g256": torch.uint8,
+    "kvarn_mla_k5v4_g256": torch.uint8,
+    "kvarn_mla_k4v2_g256": torch.uint8,
+    "kvarn_mla_k4_g256": torch.uint8,
 }
 
 TORCH_DTYPE_TO_NUMPY_DTYPE = {
@@ -80,6 +85,7 @@ def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
         kv_cache_dtype.startswith("fp8")
         or kv_cache_dtype.endswith("per_token_head")
         or kv_cache_dtype.startswith("nvfp4")
+        or kv_cache_dtype.startswith("kvarn_mla_")
     )
 
 
@@ -440,6 +446,9 @@ def get_kv_cache_torch_dtype(
                 raise ValueError(f"Invalid model dtype: {model_dtype}")
         elif cache_dtype in STR_DTYPE_TO_TORCH_DTYPE:
             torch_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
+        elif isinstance(cache_dtype, str) and cache_dtype.startswith("kvarn_mla_"):
+            # Opaque packed uint8 records (dual-rate KVarN MLA).
+            torch_dtype = torch.uint8
         else:
             raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")
     elif isinstance(cache_dtype, torch.dtype):

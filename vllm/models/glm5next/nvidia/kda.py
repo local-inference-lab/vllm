@@ -19,9 +19,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from einops import rearrange
-from torch import nn
 
-import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
     KimiGatedDeltaNetAttention,
@@ -225,20 +223,6 @@ def _gate_stream(device: torch.device) -> torch.cuda.Stream:
     return stream
 
 
-def mark_b12x_activation_mode(projections, mode: str) -> None:
-    """Request BF16 activations (W8A16) for these projections' B12X MXFP8 GEMMs.
-
-    "a16" applies to every call, "prefill" to calls of at least
-    B12X_MXFP8_PREFILL_A16_MIN_ROWS rows. The MXFP8 kernel reads the marks when
-    it processes the loaded weights; projections in other formats ignore them.
-    """
-    for projection in projections:
-        if mode == "a16":
-            projection.b12x_activation_mode = "a16"
-        elif mode == "prefill":
-            projection.b12x_prefill_a16 = True
-
-
 class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
     """Adapt the shared out-buffer KDA layer to GLM's tensor-returning block."""
 
@@ -259,14 +243,6 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
             vllm_config = copy(vllm_config)
             vllm_config.quant_config = None
         super().__init__(config, vllm_config, prefix)
-        mark_b12x_activation_mode(
-            self.kda_projections(), envs.VLLM_GLM53_KDA_MXFP8_ACTIVATION_MODE
-        )
-
-    def kda_projections(self) -> tuple[nn.Module, ...]:
-        """Every linear projection of this KDA layer."""
-        gates = () if self.use_full_rank_gate else (self.g_a_proj, self.g_b_proj)
-        return (*self.input_projections(), self.f_b_proj, *gates, self.o_proj)
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         if self.cache_config.use_kda_recoverssm:

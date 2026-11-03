@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from collections import Counter
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass, fields, replace
@@ -55,6 +56,9 @@ class KVQuantMode(IntEnum):
     TURBOQUANT_K3V4_NC = 8
     TURBOQUANT_3BIT_NC = 9
     NVFP4_DS_MLA = 10  # opaque-bytes NVFP4 DS-MLA layouts (FlashMLA sparse)
+    # KVarN MLA (arXiv:2606.03458): dual-rate Hadamard+VarN packed latent
+    # records for glm5_next, consumed natively by the B12X sparse kernel.
+    KVARN_MLA = 11
 
     @property
     def is_per_token_head(self) -> bool:
@@ -80,6 +84,11 @@ class KVQuantMode(IntEnum):
             KVQuantMode.TURBOQUANT_3BIT_NC,
         )
 
+    @property
+    def is_kvarn_mla(self) -> bool:
+        """True for the KVarN MLA dual-rate packed record mode."""
+        return self == KVQuantMode.KVARN_MLA
+
 
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`."""
@@ -94,6 +103,8 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         # Page size is keyed on cache_dtype_str in the MLA specs, not
         # nvfp4_kv_cache_full_dim.
         return KVQuantMode.NVFP4_DS_MLA
+    if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("kvarn_mla_"):
+        return KVQuantMode.KVARN_MLA
     if kv_cache_dtype.startswith("nvfp4"):
         return KVQuantMode.NVFP4
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant_"):
@@ -105,6 +116,35 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
 
 def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
     return get_kv_quant_mode(kv_cache_dtype) != KVQuantMode.NONE
+
+
+_KVARN_MLA_DTYPE_RE = re.compile(
+    r"kvarn_mla_k(?P<k_bits>2|4|5)(?:v(?P<v_bits>2|4|5))?_g(?P<group>64|128|256)"
+)
+
+
+def parse_kvarn_mla_dtype(
+    kv_cache_dtype: str,
+) -> tuple[int, int, int] | None:
+    """Parse a ``kvarn_mla_k<k>[v<v>]_g<group>`` dtype string.
+
+    Returns ``(k_bits, v_bits, group)``. The single-rate form
+    (``kvarn_mla_k4_g256``) is the SINGLE-PLANE variant: ``v_bits == 0``
+    marks one shared code plane (one RTN grid, one inline fp16 scale +
+    zero-point) consumed by both the score (K) and value (V) paths through
+    their folded projections. Returns ``None`` when the string is not a
+    kvarn MLA dtype.
+    """
+    match = (
+        _KVARN_MLA_DTYPE_RE.fullmatch(kv_cache_dtype)
+        if isinstance(kv_cache_dtype, str)
+        else None
+    )
+    if match is None:
+        return None
+    k_bits = int(match["k_bits"])
+    v_bits = int(match["v_bits"]) if match["v_bits"] else 0
+    return k_bits, v_bits, int(match["group"])
 
 
 def replace_as(

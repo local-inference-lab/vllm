@@ -72,37 +72,6 @@ if TYPE_CHECKING:
     from b12x.preparation import PreparationSession
 
 
-@pytest.mark.parametrize("tokens", [1, 33, 129])
-def test_scale_expansion_trials_release_routing_storage(tokens):
-    class State:
-        def bind(self, **kwargs):
-            self.bound = kwargs
-            return SimpleNamespace(run=lambda: kwargs["out13"])
-
-    prepared = SimpleNamespace(
-        device=torch.device("cpu"),
-        num_experts=8,
-        _impl=SimpleNamespace(
-            w1_blockscale=torch.empty((8, 128, 4), dtype=torch.uint8),
-            w2_blockscale=torch.empty((8, 128, 4), dtype=torch.uint8),
-        ),
-    )
-    factory = b12x._prepared_scale_expansion_call_factory(
-        tokens=tokens, topk=2, prepared=prepared
-    )
-    state = State()
-    call = factory(state)
-    for produce in call.benchmark_producers:
-        produce()
-        assert state.bound["ids"].shape == (tokens, 2)
-        assert all(row.unique().numel() == 2 for row in state.bound["ids"])
-    refs = [weakref.ref(state.bound[name]) for name in ("ids", "scratch")]
-    assert call.owners == ()
-    del call, state, produce
-    gc.collect()
-    assert all(ref() is None for ref in refs)
-
-
 def _prepare(
     layer,
     *,

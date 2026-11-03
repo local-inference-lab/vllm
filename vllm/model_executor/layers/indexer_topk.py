@@ -26,8 +26,7 @@ try:
 except ImportError as e:
     from vllm.logger import init_logger
 
-    # Opt-in backend (SM100a/SM103a only); stay quiet by default.
-    init_logger(__name__).debug(
+    init_logger(__name__).warning(
         "Failed to import the DeepSelect extension (vllm._deepselect_C): %s", e
     )
 

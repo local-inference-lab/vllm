@@ -149,12 +149,7 @@ class _PreparedMoECall:
 
 
 def _prepared_moe_call_factory(
-    *,
-    tokens: int,
-    topk: int,
-    prepared: Any,
-    output_dtype: torch.dtype,
-    graph_benchmark: bool = False,
+    *, tokens: int, topk: int, prepared: Any, output_dtype: torch.dtype
 ):
     shared = None
 
@@ -201,59 +196,13 @@ def _prepared_moe_call_factory(
                 weights,
             )
             shared = tuple(weakref.ref(tensor) for tensor in tensors)
-        call = _PreparedMoECall(
+        return _PreparedMoECall(
             state=state,
             tokens=tokens,
             topk=topk,
             prepared=prepared,
             output_dtype=output_dtype,
         ).make(tensors)
-        if graph_benchmark:
-            from b12x.preparation._measurement import capture_benchmark_call
-
-            call = capture_benchmark_call(call)
-        return call
-
-    return factory
-
-
-def _prepared_scale_expansion_call_factory(
-    *, tokens, topk, prepared, graph_benchmark=False
-):
-    def factory(state):
-        from b12x.moe.fused_moe.workloads import make_tuning_routes
-        from b12x.preparation import PreparedCall
-
-        routes = make_tuning_routes(
-            tokens, topk, int(prepared.num_experts), device=prepared.device
-        )
-        ids = torch.empty_like(routes[0])
-        active = torch.empty(
-            prepared.num_experts, dtype=torch.int32, device=prepared.device
-        )
-        binding = state.bind(
-            ids=ids,
-            out13=prepared._impl.w1_blockscale,
-            out2=prepared._impl.w2_blockscale,
-            scratch=active,
-        )
-
-        def produce(pattern=0):
-            ids.copy_(routes[pattern])
-
-        call = PreparedCall(
-            run=binding.run,
-            produce=produce,
-            restore=produce,
-            benchmark_producers=tuple(
-                partial(produce, pattern) for pattern in range(routes.shape[0])
-            ),
-        )
-        if graph_benchmark:
-            from b12x.preparation._measurement import capture_benchmark_call
-
-            call = capture_benchmark_call(call)
-        return call
 
     return factory
 
@@ -920,23 +869,6 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         plan_key = (counts, activation, route_on_input, id(prepared))
         plan = self._plan if getattr(self, "_plan_key", None) == plan_key else None
         if plan is None:
-            self._scale_plans = (
-                {
-                    count: fused_moe.plan_scale_expansion(
-                        prepared,
-                        routes=count * topk,
-                        invocation=FrozenMapping(
-                            {
-                                "tuning_route_pattern": TUNING_WORKLOAD_VERSION,
-                                "tuning_execution": "cuda_graph",
-                            }
-                        ),
-                    )
-                    for count in counts
-                }
-                if prepared.has_csf_blocks
-                else {}
-            )
             # The layer holds one plan for its serving shapes; a later call with
             # the same workload reuses it so the prepared state stays installed.
             plan = fused_moe.plan_execution(
@@ -950,18 +882,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 routing=fused_moe.RoutingSpec(
                     apply_router_weight_on_input=route_on_input,
                 ),
-                scale_expansion=self._scale_plans or None,
                 # Tuning choices depend on the routing corpus. Invalidate only
                 # MoE choices when its distribution changes, not compiled code
                 # or unrelated component selections.
                 invocation=FrozenMapping(
                     {
                         "tuning_route_pattern": TUNING_WORKLOAD_VERSION,
-                        **(
-                            {"tuning_execution": "cuda_graph"}
-                            if prepared.has_csf_blocks
-                            else {}
-                        ),
                     }
                 ),
             )
@@ -970,19 +896,6 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             self._plan_activation = activation
             self._plan_route_on_input = route_on_input
         name = f"fused_moe:{id(layer)}"
-        scale_requests = tuple(
-            expansion.request(
-                name=f"{name}/scales/m{count}",
-                prepare_call=_prepared_scale_expansion_call_factory(
-                    tokens=count, topk=topk, prepared=prepared
-                ),
-                benchmark_call=_prepared_scale_expansion_call_factory(
-                    tokens=count, topk=topk, prepared=prepared, graph_benchmark=True
-                ),
-            )
-            for count, expansion in self._scale_plans.items()
-        )
-        dependencies = tuple(request.name for request in scale_requests)
         if hasattr(plan, "token_counts"):
             calls = {
                 count: _prepared_moe_call_factory(
@@ -999,7 +912,6 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                     topk=topk,
                     prepared=prepared,
                     output_dtype=self.output_dtype,
-                    graph_benchmark=prepared.has_csf_blocks,
                 )
                 for count in plan.token_counts
             }
@@ -1007,7 +919,6 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 name=name,
                 prepare_calls=calls,
                 benchmark_calls=benchmark_calls,
-                dependencies=dependencies,
             )
         else:
             prepare_call = _prepared_moe_call_factory(
@@ -1021,17 +932,14 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 topk=topk,
                 prepared=prepared,
                 output_dtype=self.output_dtype,
-                graph_benchmark=prepared.has_csf_blocks,
             )
             request = plan.request(
                 name=name,
                 prepare_call=prepare_call,
                 benchmark_call=benchmark_call,
-                dependencies=dependencies,
             )
         key = (
             self._quant_mode,
-            prepared.has_csf_blocks,
             self._a16_max_tokens,
             self._source_format,
             self._w13_layout,
@@ -1044,7 +952,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             B12xPreparationUnit(
                 name=self._quant_mode.upper(),
                 key=key,
-                requests=(*scale_requests, request),
+                requests=(request,),
                 stage="weights",
             ),
         )

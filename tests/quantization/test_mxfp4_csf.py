@@ -30,24 +30,6 @@ from vllm.models.deepseek_v4_1.mxfp4_csf import (
 from .csf_fixtures import decode_planes, matrix
 
 
-def write_index(root, tensors, filename, family):
-    (root / "config.json").write_text(
-        json.dumps(
-            {
-                "model_type": family,
-                "quantization_config": {"weight_scale_encoding": "csf_32x2_v1"},
-            }
-        )
-    )
-    (root / "model.safetensors.index.json").write_text(
-        json.dumps(
-            {
-                "weight_map": {name: f"tensors/{filename}" for name in tensors},
-            }
-        )
-    )
-
-
 @pytest.fixture
 def moe():
     return FusedMoEConfig(
@@ -98,11 +80,8 @@ def test_exact_config_and_loader_are_registered():
     )
 
 
-@pytest.mark.parametrize(
-    "activation_mode,width", [("a16", 288), ("a8", 288), ("a8", 576)]
-)
-def test_csf_cpu_shard_reader_sizes_native_scratch_and_restores_threads(
-    monkeypatch, moe, owner, activation_mode, width
+def test_csf_cpu_shard_reader_bounds_threads_and_restores_on_failure(
+    monkeypatch, moe, owner
 ):
     from vllm.model_executor.model_loader import mxfp4_csf_loader as checkpoint
     from vllm.models.deepseek_v4_1 import mxfp4_csf
@@ -110,19 +89,13 @@ def test_csf_cpu_shard_reader_sizes_native_scratch_and_restores_threads(
 
     monkeypatch.setattr(mxfp4_csf, "get_tensor_model_parallel_world_size", lambda: 4)
     monkeypatch.setattr(mxfp4_csf, "get_tensor_model_parallel_rank", lambda: 0)
-    method = Mxfp4CsfMoEMethod(moe, owner, activation_mode=activation_mode)
+    method = Mxfp4CsfMoEMethod(moe, owner)
     layer = torch.nn.Module()
     layer.layer_name = "model.layers.17.ffn.experts"
-    method.create_weights(layer, 384, 5120, width, torch.bfloat16)
+    method.create_weights(layer, 384, 5120, 576, torch.bfloat16)
 
     def fail_reader(*args, **kwargs):
         assert torch.get_num_threads() == 1
-        if activation_mode == "a8" and width == 288:
-            assert kwargs["w13_scale_scratch"].shape == (384, 768, 160)
-            assert kwargs["w2_scale_scratch"].shape == (384, 5120, 12)
-        else:
-            assert kwargs["w13_scale_scratch"].shape == (384, 160, 2 * width)
-            assert kwargs["w2_scale_scratch"].shape == (384, width // 32, 5120)
         raise OSError("checkpoint read failed")
 
     monkeypatch.setattr(checkpoint, "read_mxfp4_csf_layer", fail_reader)
@@ -241,18 +214,28 @@ def test_prepared_native_experts_validate_source_shape_and_swiglu_limit(
 
 
 def test_loader_preserves_file_backed_engram_and_native_draft(tmp_path):
+    from vllm.model_executor.model_loader.mxfp4_csf_loader import CODEC, SCHEMA
+
     tensor_dir = tmp_path / "tensors"
     tensor_dir.mkdir()
     name = "model-00001.safetensors"
     tensors = {
         "layers.0.ffn.experts.0.w1.weight": torch.ones(8, dtype=torch.uint8),
-        "layers.0.ffn.experts.0.w1.scale.csf32_codes": torch.ones(8, dtype=torch.uint8),
+        "layers.0.ffn.experts.0.w1.scale.mxfp4_csf_fixed": torch.ones(
+            8, dtype=torch.uint8
+        ),
         "layers.40.ffn.experts.0.w1.weight": torch.full((8,), 42, dtype=torch.uint8),
         "layers.1.engram.embedding.weight": torch.ones((8, 8), dtype=torch.uint8),
         "norm.weight": torch.ones(8, dtype=torch.bfloat16),
     }
     save_file(tensors, tensor_dir / name)
-    write_index(tmp_path, tensors, name, "deepseek_v41")
+    common = {"schema": SCHEMA, "codec": CODEC, "family": "deepseek_v41"}
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({**common, "shards": [{"file": name}]})
+    )
+    (tmp_path / "build-contract.json").write_text(
+        json.dumps({**common, "source_names": {k: name for k in tensors}})
+    )
     config = SimpleNamespace(
         hf_config=SimpleNamespace(
             num_hidden_layers=40,
@@ -321,6 +304,8 @@ def test_kimi_mxfp4_csf_keeps_bf16_dense_and_situ_experts(monkeypatch, moe):
 def test_kimi_loader_skips_compressed_experts_with_nested_text_config(
     tmp_path, quant_method, load_format
 ):
+    from vllm.model_executor.model_loader.mxfp4_csf_loader import CODEC, SCHEMA
+
     tensor_dir = tmp_path / "tensors"
     tensor_dir.mkdir()
     filename = "model-00001.safetensors"
@@ -328,11 +313,17 @@ def test_kimi_loader_skips_compressed_experts_with_nested_text_config(
     dense = "language_model.model.layers.0.mlp.gate_proj.weight"
     tensors = {
         expert + "weight_packed": torch.ones(8, dtype=torch.uint8),
-        expert + "weight_scale.csf32_codes": torch.ones(8, dtype=torch.uint8),
+        expert + "weight_scale.mxfp4_csf_fixed": torch.ones(8, dtype=torch.uint8),
         dense: torch.ones((8, 8), dtype=torch.bfloat16),
     }
     save_file(tensors, tensor_dir / filename)
-    write_index(tmp_path, tensors, filename, "kimi_k3")
+    common = {"schema": SCHEMA, "codec": CODEC, "family": "kimi_k3"}
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({**common, "shards": [{"file": filename}]})
+    )
+    (tmp_path / "build-contract.json").write_text(
+        json.dumps({**common, "source_names": {k: filename for k in tensors}})
+    )
     config = SimpleNamespace(
         hf_config=SimpleNamespace(),
         hf_text_config=SimpleNamespace(
@@ -404,23 +395,26 @@ def test_mxfp4_csf_selects_retained_precision_and_rejects_other_configs(
         )
 
 
-@pytest.mark.parametrize("fault", ["encoding", "family", "inventory", "path"])
-def test_csf_contract_rejects_invalid_encoding_and_index(tmp_path, fault):
+@pytest.mark.parametrize("fault", ["schema", "codec", "family", "inventory", "path"])
+def test_csf_contract_rejects_mismatched_identity_and_shard_inventory(tmp_path, fault):
     from vllm.model_executor.model_loader import mxfp4_csf_loader as reader
 
-    write_index(tmp_path, {"weight": None}, "weights.safetensors", "deepseek_v41")
-    config = json.loads((tmp_path / "config.json").read_text())
-    index = json.loads((tmp_path / "model.safetensors.index.json").read_text())
-    if fault == "encoding":
-        config["quantization_config"]["weight_scale_encoding"] = "unknown"
-    elif fault == "family":
-        config["model_type"] = "unrecognized"
+    identity = {
+        "schema": reader.SCHEMA,
+        "codec": reader.CODEC,
+        "family": next(iter(reader.FAMILIES)),
+    }
+    manifest = {**identity, "shards": [{"file": "weights.safetensors"}]}
+    contract = {**identity, "source_names": {"weight": "weights.safetensors"}}
+    if fault in ("schema", "codec", "family"):
+        contract[fault] = "unrecognized"
     elif fault == "inventory":
-        index["weight_map"] = {}
+        contract["source_names"]["weight"] = "missing.safetensors"
     else:
-        index["weight_map"]["weight"] = "../weights.safetensors"
-    (tmp_path / "config.json").write_text(json.dumps(config))
-    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
+        contract["source_names"]["weight"] = "../weights.safetensors"
+        manifest["shards"][0]["file"] = "../weights.safetensors"
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    (tmp_path / "build-contract.json").write_text(json.dumps(contract))
     with pytest.raises(ValueError):
         reader.checkpoint_contract(str(tmp_path))
 
@@ -432,19 +426,21 @@ def test_csf_tensor_reader_resolves_separate_shards_and_closes_after_failure(
 
     tensors = tmp_path / "tensors"
     tensors.mkdir()
-    fixture, expected = matrix(64, 96, group_size=32, seed=9)
-    weight = fixture.weight.tensor
+    weight = torch.arange(128, dtype=torch.uint8).reshape(16, 8)
+    fixed = torch.arange(32, dtype=torch.uint8).reshape(1, 32)
+    exceptions = torch.tensor([0xFE000009], dtype=torch.uint32)
     save_file({"arbitrary.packed": weight}, tensors / "weights.safetensors")
-    components = {
-        f"arbitrary.scales.csf32_{part}": torch.from_numpy(
-            getattr(fixture.scales, part)
-        )
-        for part in ("bases", "codes", "page_bases", "offsets", "exceptions")
-    }
-    save_file(components, tensors / "scales.safetensors")
+    save_file(
+        {
+            "arbitrary.scales.mxfp4_csf_fixed": fixed,
+            "arbitrary.scales.mxfp4_csf_exceptions": exceptions,
+        },
+        tensors / "csf_components.safetensors",
+    )
     index = {
-        "arbitrary.packed": "tensors/weights.safetensors",
-        **{name: "tensors/scales.safetensors" for name in components},
+        "arbitrary.packed": "weights.safetensors",
+        "arbitrary.scales.mxfp4_csf_fixed": "csf_components.safetensors",
+        "arbitrary.scales.mxfp4_csf_exceptions": "csf_components.safetensors",
     }
     opened, closed = [], []
     original_open = csf_utils.safe_open
@@ -469,15 +465,15 @@ def test_csf_tensor_reader_resolves_separate_shards_and_closes_after_failure(
     ):
         for _ in range(2):
             source = reader.matrix("arbitrary.packed", "arbitrary.scales")
-            assert source.weight.get_shape() == [64, 48]
+            assert source.weight.get_shape() == [16, 8]
             assert torch.equal(source.weight[8:16, 2:6], weight[8:16, 2:6])
-            actual = decode_planes(SimpleNamespace(planes=(source.scales,)), 64, 3, 32)
-            torch.testing.assert_close(actual[0], expected, rtol=0, atol=0)
+            assert torch.equal(source.fixed, fixed)
+            assert torch.equal(source.exceptions, exceptions)
         raise RuntimeError("preparation failed")
     assert (
         sorted(opened)
         == sorted(closed)
-        == ["scales.safetensors", "weights.safetensors"]
+        == ["csf_components.safetensors", "weights.safetensors"]
     )
 
 
@@ -494,7 +490,7 @@ def decode(fixed, exceptions, rows, columns):
 
 
 @pytest.mark.parametrize("columns", [9, 18, 36, 72, 160])
-@pytest.mark.parametrize("row_slice", [(0, 64), (0, 32), (32, 64)])
+@pytest.mark.parametrize("row_slice", [(0, 64), (16, 48), (48, 64)])
 def test_slices_preserve_all_scale_bytes(columns, row_slice):
     rng = np.random.default_rng(78)
     rows = 64
@@ -512,37 +508,23 @@ def test_slices_preserve_all_scale_bytes(columns, row_slice):
     positions = np.unique(rng.integers(0, rows * columns, 50)).astype(np.uint32)
     values = rng.integers(0, 256, len(positions), dtype=np.uint32)
     exceptions = torch.from_numpy(positions | values << 24)
-    from b12x.loader._csf_blocks import export_csf_blocks
-
     reference = decode(fixed, exceptions, rows, columns)
-    plane = export_csf_blocks(
-        fixed.numpy(),
-        exceptions.numpy(),
-        rows=rows,
-        columns=columns,
-        quantization="mxfp4",
-    )
     for c0, c1 in ((0, columns), (1, columns), (columns // 2, columns)):
-        sliced = slice_scale_plane(plane, rows, columns, row_slice, (c0, c1))
-        actual = decode_planes(
-            SimpleNamespace(planes=(sliced,)), row_slice[1] - row_slice[0], c1 - c0, 32
-        )[0].numpy()
+        sliced = slice_scale_plane(
+            fixed, exceptions, rows, columns, row_slice, (c0, c1)
+        )
+        actual = decode(sliced[0], sliced[1], row_slice[1] - row_slice[0], c1 - c0)
         assert np.array_equal(actual, reference[row_slice[0] : row_slice[1], c0:c1])
 
 
-def test_rejects_unaligned_rows_and_out_of_block_records():
-    source, _ = matrix(64, 288, group_size=32, seed=3)
-    with pytest.raises(ValueError, match="32-row"):
-        slice_scale_plane(source.scales, 64, 9, (1, 33), (0, 9))
-    records = source.scales.exceptions.copy()
-    records[0] |= 64
-    invalid = replace(source.scales, exceptions=records)
-    if not torch.cuda.is_available():
-        pytest.skip("GPU payload validation requires CUDA")
-    from b12x._lib.quant._csf_prepare import validate_source
-
-    with pytest.raises(ValueError, match="positions"):
-        validate_source(slice_scale_plane(invalid, 64, 9, (0, 64), (0, 9)).to("cuda"))
+def test_rejects_unaligned_rows_and_bad_padding():
+    fixed = torch.zeros((4, 48), dtype=torch.uint8)
+    exceptions = torch.empty(0, dtype=torch.uint32)
+    with pytest.raises(ValueError, match="16-row"):
+        slice_scale_plane(fixed, exceptions, 64, 9, (1, 17), (0, 9))
+    fixed[0, 17] = 128
+    with pytest.raises(ValueError, match="unused selector"):
+        slice_scale_plane(fixed, exceptions, 64, 9, (0, 64), (0, 9))
 
 
 @pytest.mark.parametrize("tp_size,rank", [(2, 0), (2, 1), (3, 0), (3, 1), (3, 2)])
@@ -705,12 +687,7 @@ def test_ds4_flash_reader_requests_native_target_expert_names(monkeypatch):
     monkeypatch.setattr(
         checkpoint,
         "checkpoint_contract",
-        lambda _: {
-            "family": "deepseek_v4_flash",
-            "source_names": {
-                "layers.42.ffn.experts.0.w1.weight": "weights.safetensors"
-            },
-        },
+        lambda _: {"family": "deepseek_v4_flash", "source_names": {}},
     )
     monkeypatch.setattr(checkpoint, "CsfTensorReader", Reader)
     monkeypatch.setattr(
@@ -740,10 +717,11 @@ def test_ds4_flash_reader_requests_native_target_expert_names(monkeypatch):
     "layer,geometry,tp_size,error",
     [
         (43, (256, 4096, 2048), 2, "outside the compressed expert inventory"),
-        (0, (256, 4096, 2048), 3, "aligned to 32"),
+        (0, (384, 5120, 2304), 2, "geometry"),
+        (0, (256, 4096, 2048), 16, "supports TP"),
     ],
 )
-def test_ds4_flash_reader_rejects_missing_layers_and_unaligned_tp(
+def test_ds4_flash_reader_rejects_draft_layers_geometry_and_tp(
     monkeypatch, layer, geometry, tp_size, error
 ):
     from vllm.model_executor.model_loader import mxfp4_csf_loader as checkpoint
@@ -773,12 +751,12 @@ def test_ds4_flash_reader_rejects_missing_layers_and_unaligned_tp(
     "family,geometry,tp_size,admitted",
     [
         ("deepseek_v41", (384, 5120, 2304), 3, True),
-        ("deepseek_v41", (384, 5120, 2304), 6, True),
+        ("deepseek_v41", (384, 5120, 2304), 6, False),
         ("deepseek_v4_flash", (256, 4096, 2048), 3, False),
-        ("kimi_k3", (896, 3584, 3072), 3, True),
+        ("kimi_k3", (896, 3584, 3072), 3, False),
     ],
 )
-def test_reader_accepts_tp_from_geometry(
+def test_reader_admits_tp3_for_deepseek_v41_only(
     monkeypatch, family, geometry, tp_size, admitted
 ):
     from vllm.model_executor.model_loader import mxfp4_csf_loader as checkpoint
@@ -792,21 +770,14 @@ def test_reader_accepts_tp_from_geometry(
     monkeypatch.setattr(
         checkpoint,
         "checkpoint_contract",
-        lambda _: {
-            "family": family,
-            "source_names": {
-                checkpoint.expert_tensor_names(family, 1, 0)[0][
-                    0
-                ]: "weights.safetensors"
-            },
-        },
+        lambda _: {"family": family, "source_names": {}},
     )
     monkeypatch.setattr(checkpoint, "CsfTensorReader", reader)
     num_experts, hidden_size, intermediate_size = geometry
     expected = (
         pytest.raises(PastTpGuard)
         if admitted
-        else pytest.raises(ValueError, match="aligned to 32")
+        else pytest.raises(ValueError, match="supports TP")
     )
     with expected:
         checkpoint.read_mxfp4_csf_layer(
@@ -950,6 +921,8 @@ def test_ds4_flash_csf_rejects_unsupported_execution(
 
 
 def test_ds4_flash_loader_keeps_vision_draft_and_dense_tensors(tmp_path):
+    from vllm.model_executor.model_loader.mxfp4_csf_loader import CODEC, SCHEMA
+
     tensor_dir = tmp_path / "tensors"
     tensor_dir.mkdir()
     name = "model-00001-of-00001.safetensors"
@@ -959,8 +932,8 @@ def test_ds4_flash_loader_keeps_vision_draft_and_dense_tensors(tmp_path):
 
     compressed = {
         "layers.0.ffn.experts.0.w1.weight": byte(),
-        "layers.0.ffn.experts.0.w1.scale.csf32_codes": byte(),
-        "layers.0.ffn.experts.0.w1.scale.csf32_exceptions": torch.zeros(
+        "layers.0.ffn.experts.0.w1.scale.mxfp4_csf_fixed": byte(),
+        "layers.0.ffn.experts.0.w1.scale.mxfp4_csf_exceptions": torch.zeros(
             1, dtype=torch.uint32
         ),
         "layers.42.ffn.experts.255.w2.weight": byte(),
@@ -982,7 +955,13 @@ def test_ds4_flash_loader_keeps_vision_draft_and_dense_tensors(tmp_path):
     }
     tensors = {**compressed, **retained}
     save_file(tensors, tensor_dir / name)
-    write_index(tmp_path, tensors, name, "deepseek_v4_flash")
+    common = {"schema": SCHEMA, "codec": CODEC, "family": "deepseek_v4_flash"}
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({**common, "shards": [{"file": name}]})
+    )
+    (tmp_path / "build-contract.json").write_text(
+        json.dumps({**common, "source_names": {k: name for k in tensors}})
+    )
     config = SimpleNamespace(
         hf_config=SimpleNamespace(
             num_hidden_layers=43,

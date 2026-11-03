@@ -26,7 +26,6 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
     MoEPrepareAndFinalizeNoDPEPModular,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import set_default_torch_num_threads
 
 from .quant_config import DeepseekV41FP8Config
@@ -174,11 +173,6 @@ class Mxfp4CsfMoEMethod(FusedMoEMethodBase):
         device = layer.w13_weight.device
         e, h, n = self.num_experts, self.hidden_size, self.local_intermediate
         shapes = ((e, h // 32, 2 * n), (e, n // 32, h))
-        if self.activation_mode == "a8" and n % 128 != 64:
-            shapes = (
-                (e, 2 * round_up(n, 128), round_up(h // 32, 4)),
-                (e, round_up(h, 256), round_up(n // 32, 4)),
-            )
         if self.owner.scale_scratch is None:
             # MXFP4-CSF disallows ubatching: every layer consumes these scale grids
             # before its successor may overwrite them on the same stream.
