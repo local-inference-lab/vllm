@@ -256,6 +256,23 @@ class TestReasoningStructuredOutput:
         assert result is True
         assert structured_req.reasoner is None
 
+    def test_should_advance_empty_parser_kwargs_bypasses_reasoner(
+        self, manager_with_reasoner, mock_request_with_structured_output
+    ):
+        """Empty parser kwargs behave like absent ones: a reasoner built
+        from no kwargs defaults to thinking enabled and would never open
+        the gate."""
+        structured_req = mock_request_with_structured_output.structured_output_request
+        structured_req.reasoning_parser_kwargs = {}
+        structured_req.reasoning_ended = None
+
+        result = manager_with_reasoner.should_advance(
+            mock_request_with_structured_output
+        )
+
+        assert result is True
+        assert structured_req.reasoner is None
+
     def test_should_advance_with_enable_in_reasoning(
         self,
         manager_with_reasoner,
