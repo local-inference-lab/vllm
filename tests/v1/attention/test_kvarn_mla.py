@@ -20,6 +20,7 @@ from vllm.v1.attention.ops.kvarn_mla import (
 DTYPES = [
     "kvarn_mla_k4v4_g256",
     "kvarn_mla_k5v5_g256",
+    "kvarn_mla_k5v4_g256",
     "kvarn_mla_k4v2_g256",
     "kvarn_mla_k4_g256",
 ]
@@ -60,6 +61,7 @@ def test_record_widths():
     # Content (codes + 4 fp16) 8-byte aligned, then the mod-33 rule.
     assert kvarn_mla_layout_from_dtype("kvarn_mla_k4v4_g256").record_bytes == 536
     assert kvarn_mla_layout_from_dtype("kvarn_mla_k5v5_g256").record_bytes == 648
+    assert kvarn_mla_layout_from_dtype("kvarn_mla_k5v4_g256").record_bytes == 600
     assert kvarn_mla_layout_from_dtype("kvarn_mla_k4v2_g256").record_bytes == 400
     assert kvarn_mla_layout_from_dtype("kvarn_mla_k4_g256").record_bytes == 264
 
