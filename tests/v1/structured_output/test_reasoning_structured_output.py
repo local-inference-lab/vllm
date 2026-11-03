@@ -14,7 +14,7 @@ from vllm.v1.structured_output.backend_types import StructuredOutputOptions
 
 
 class MockReasoner:
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, **kwargs):
         self.is_reasoning_end = Mock(return_value=False)
         self.is_reasoning_end_streaming = Mock(return_value=False)
 
@@ -63,7 +63,11 @@ class TestReasoningStructuredOutput:
         request.structured_output_request = Mock()
         request.structured_output_request.reasoning_ended = None
         request.structured_output_request.grammar = Mock()
-        request.structured_output_request.reasoning_parser_kwargs = None
+        # Chat requests always carry renderer-populated parser kwargs; the
+        # completions case (None) is covered by dedicated tests below.
+        request.structured_output_request.reasoning_parser_kwargs = {
+            "chat_template_kwargs": {"enable_thinking": True}
+        }
         request.structured_output_request.reasoner = None
         request.structured_output_request.grammar.is_terminated = Mock(
             return_value=False
@@ -201,6 +205,73 @@ class TestReasoningStructuredOutput:
             mock_request_with_structured_output.structured_output_request.reasoner
             is not None
         )
+
+    def test_should_fill_bitmask_completions_bypasses_reasoner(
+        self, manager_with_reasoner, mock_request_with_structured_output
+    ):
+        """A completions request has no reasoning-parser kwargs: the gate
+        must open immediately instead of consulting a reasoner that would
+        default to thinking_enabled=True and never open (grammar silently
+        ignored for the whole request)."""
+        structured_req = mock_request_with_structured_output.structured_output_request
+        structured_req.reasoning_parser_kwargs = None
+        structured_req.reasoning_ended = None
+
+        result = manager_with_reasoner.should_fill_bitmask(
+            mock_request_with_structured_output
+        )
+
+        assert result is True
+        assert structured_req.reasoner is None
+
+    def test_should_fill_bitmask_empty_parser_kwargs_bypasses_reasoner(
+        self, manager_with_reasoner, mock_request_with_structured_output
+    ):
+        """Empty parser kwargs behave like absent ones: a reasoner built
+        from no kwargs defaults to thinking enabled and would never open
+        the gate."""
+        structured_req = mock_request_with_structured_output.structured_output_request
+        structured_req.reasoning_parser_kwargs = {}
+        structured_req.reasoning_ended = None
+
+        result = manager_with_reasoner.should_fill_bitmask(
+            mock_request_with_structured_output
+        )
+
+        assert result is True
+        assert structured_req.reasoner is None
+
+    def test_should_advance_completions_bypasses_reasoner(
+        self, manager_with_reasoner, mock_request_with_structured_output
+    ):
+        """Mirror of the fill-bitmask bypass for FSM advancement."""
+        structured_req = mock_request_with_structured_output.structured_output_request
+        structured_req.reasoning_parser_kwargs = None
+        structured_req.reasoning_ended = None
+
+        result = manager_with_reasoner.should_advance(
+            mock_request_with_structured_output
+        )
+
+        assert result is True
+        assert structured_req.reasoner is None
+
+    def test_should_advance_empty_parser_kwargs_bypasses_reasoner(
+        self, manager_with_reasoner, mock_request_with_structured_output
+    ):
+        """Empty parser kwargs behave like absent ones: a reasoner built
+        from no kwargs defaults to thinking enabled and would never open
+        the gate."""
+        structured_req = mock_request_with_structured_output.structured_output_request
+        structured_req.reasoning_parser_kwargs = {}
+        structured_req.reasoning_ended = None
+
+        result = manager_with_reasoner.should_advance(
+            mock_request_with_structured_output
+        )
+
+        assert result is True
+        assert structured_req.reasoner is None
 
     def test_should_advance_with_enable_in_reasoning(
         self,

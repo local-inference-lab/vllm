@@ -377,6 +377,15 @@ class StructuredOutputManager:
         ):
             return True
 
+        # A completions request carries no reasoning-parser kwargs, so the
+        # request-local reasoner would default to thinking_enabled=True and
+        # this gate would never open: grammar would be silently ignored for
+        # the whole request. Absent parser kwargs means "no reasoning
+        # phase"; fill the bitmask immediately. Chat requests always carry
+        # renderer-populated kwargs and keep the gate.
+        if structured_req is not None and not structured_req.reasoning_parser_kwargs:
+            return True
+
         reasoner = self._get_reasoner(request)
         if reasoner is not None:
             assert structured_req is not None
@@ -408,6 +417,12 @@ class StructuredOutputManager:
         if self.enable_in_reasoning or (
             structured_req is not None and structured_req.reasoning_ended is True
         ):
+            return True
+
+        # Mirror should_fill_bitmask: completions requests carry no
+        # reasoning-parser kwargs, so without this bypass the reasoner
+        # defaults to thinking_enabled=True and the FSM never advances.
+        if structured_req is not None and not structured_req.reasoning_parser_kwargs:
             return True
 
         # by default, we should always advance
