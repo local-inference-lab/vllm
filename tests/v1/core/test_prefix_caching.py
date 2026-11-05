@@ -6128,6 +6128,114 @@ def test_ced_prefix_replays_short_prompt_boundary(prompt_length, expected_hit):
     )
 
 
+@pytest.mark.parametrize("retention_interval", [0, 512])
+@pytest.mark.parametrize("prompt_length", [4351, 4352, 4353, 4479, 4480, 4608])
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("producer_live", [False, True])
+def test_ced_retains_encoder_endpoint_for_extended_prompt(
+    retention_interval, prompt_length, chunked, producer_live
+):
+    # Production hit/page geometry: 256-token global pages, 128-token windows.
+    config = make_ced_kv_cache_config()
+    config.prefix_cache_retention_interval = retention_interval
+    for group in config.kv_cache_groups:
+        group.kv_cache_spec = replace(
+            group.kv_cache_spec,
+            block_size=256 if group.layer_names == ["global"] else 128,
+        )
+    manager = make_kv_cache_manager(config, max_model_len=8192, hash_block_size=128)
+    tokens = list(range(prompt_length))
+    producer = make_request("producer", tokens, 128, sha256)
+    first = prompt_length - 257 if chunked else prompt_length
+    assert manager.allocate_slots(producer, first) is not None
+    producer.num_computed_tokens = first
+    if chunked:
+        assert manager.allocate_slots(producer, prompt_length - first) is not None
+        producer.num_computed_tokens = prompt_length
+    if not producer_live:
+        manager.free(producer)
+
+    # Recycle all uncached scratch, retaining the hashed encoder/global pages.
+    pool = manager.block_pool
+    scratch_count = sum(
+        block.block_hash is None
+        for block in pool.free_block_queue.get_all_free_blocks()
+    )
+    pressure = pool.get_new_blocks(scratch_count)
+    assert all(block.block_hash is None for block in pressure)
+    free_before = pool.get_num_free_blocks()
+
+    # An appended tool result leaves at least 128 fresh decoder rows. The
+    # encoder can therefore resume at the producer's final complete page.
+    consumer = make_request("extension", tokens + [9000] * 129, 128, sha256)
+    hits, hit_tokens, _ = manager.get_computed_blocks(consumer)
+    assert hit_tokens == prompt_length // 256 * 256
+    assert not hits.blocks[2] and not hits.blocks[3]
+    assert pool.get_num_free_blocks() == free_before  # lookup owns no blocks
+
+    # An identical resend must still rebuild the last 128 prompt rows.
+    resend = make_request("resend", tokens, 128, sha256)
+    _, resend_tokens, _ = manager.get_computed_blocks(resend)
+    assert resend_tokens == (prompt_length - 128) // 256 * 256
+
+    # The same suffix under a changed leading token has no shared state.
+    changed = make_request("changed", [9001] + tokens[1:] + [9000] * 129, 128, sha256)
+    _, changed_tokens, _ = manager.get_computed_blocks(changed)
+    assert changed_tokens == 0
+    pool.free_blocks(pressure)
+    if producer_live:
+        original_private = {
+            block.block_id
+            for group_id in (2, 3)
+            for block in manager.coordinator.single_type_managers[group_id].req_to_blocks[
+                producer.request_id
+            ]
+            if not block.is_null
+        }
+        allocated = manager.allocate_slots(
+            consumer, consumer.num_tokens - hit_tokens, hit_tokens, hits
+        )
+        assert allocated is not None
+        for group_id in (2, 3):
+            private = manager.coordinator.single_type_managers[group_id].req_to_blocks[
+                consumer.request_id
+            ]
+            assert original_private.isdisjoint(
+                block.block_id for block in private if not block.is_null
+            )
+            assert all(block.block_hash is None for block in private if not block.is_null)
+        manager.free(consumer)
+        manager.free(producer)
+    assert pool.get_num_free_blocks() == config.num_blocks - 1
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_ced_endpoint_retention_respects_completion_and_eviction(cancelled):
+    manager = make_kv_cache_manager(
+        make_ced_kv_cache_config(), max_model_len=8192, hash_block_size=32
+    )
+    tokens = list(range(4224))
+    producer = make_request("producer", tokens, 32, sha256)
+    computed = 4096 if cancelled else len(tokens)
+    assert manager.allocate_slots(producer, computed) is not None
+    producer.num_computed_tokens = computed
+    producer.status = (
+        RequestStatus.FINISHED_ABORTED if cancelled else RequestStatus.FINISHED_STOPPED
+    )
+    manager.free(producer)
+    consumer = make_request("extension", tokens + [9000] * 129, 32, sha256)
+    hits, hit_tokens, _ = manager.get_computed_blocks(consumer)
+    assert hit_tokens == computed
+    assert not hits.blocks[2] and not hits.blocks[3]
+    if not cancelled:
+        # Evict one required encoder page. The global/compressed prefix alone
+        # must not allow reuse of an incomplete encoder window.
+        manager.block_pool.evict_blocks({hits.blocks[1][-1].block_id})
+        _, hit_tokens, _ = manager.get_computed_blocks(consumer)
+        assert hit_tokens == 4096
+    assert manager.block_pool.get_num_free_blocks() == 1023
+
+
 def test_default_mla_prefix_keeps_one_token_replay():
     manager = make_kv_cache_manager(
         make_ced_kv_cache_config(ced=False),

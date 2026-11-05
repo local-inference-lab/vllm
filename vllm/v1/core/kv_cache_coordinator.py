@@ -338,11 +338,12 @@ class KVCacheCoordinator(ABC):
         at each position; EAGLE groups also keep the block above, which they
         match and drop back from (see ``reachable_block_mask``).
 
-        Two positions are reachable: a resend of the identical prompt is capped
-        at ``num_tokens - 1`` (its last token is recomputed for logits), a
-        longer sibling matches the final aligned block. They differ only on a
-        block-aligned prompt, where retaining just the higher one collapses the
-        resend's hit to 0. The alignment is the scheduler block size, not the
+        A resend of the identical prompt must recompute its last token for
+        logits, or its request-private replay suffix (128 tokens for CED).
+        A longer sibling with enough new tokens can match the final complete
+        prompt block instead. Retain both endpoints: keeping only the resend
+        boundary needlessly shortens an extension hit under sparse retention.
+        The block-granular path uses the scheduler block alignment, not the
         finer hash granularity, which would over-estimate the reach.
         """
         if self.enable_partial_hash_hits:
@@ -362,9 +363,14 @@ class KVCacheCoordinator(ABC):
                 )
             )
         if not self.eagle_group_ids:
-            return (
-                max(request.num_prompt_tokens - max(1, self.prefill_replay_tokens), 0),
+            resend = max(
+                request.num_prompt_tokens - max(1, self.prefill_replay_tokens), 0
             )
+            if self.prefill_replay_tokens > 1:
+                # CED extensions can reuse the encoder's complete prompt tail
+                # while rebuilding their own private decoder/drafter suffix.
+                return (resend, request.num_prompt_tokens)
+            return (resend,)
         block = self.scheduler_block_size
         resend = (request.num_prompt_tokens - 1) // block * block
         extension = request.num_prompt_tokens // block * block
