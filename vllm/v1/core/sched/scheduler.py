@@ -688,6 +688,63 @@ class Scheduler(SchedulerInterface):
         )
         return blocks, num_local, shared_prefix_boundary, False
 
+    def _has_instruction_producer(self, request: Request) -> bool:
+        boundary = request.recurrent_instruction_boundary
+        cache = self.kv_cache_manager.boundary_checkpoints
+        if (
+            not self._inflight_prefills
+            or not request.use_boundary_checkpoints
+            or cache is None
+            or not boundary
+            or boundary < self.max_num_scheduled_tokens
+            or request.status != RequestStatus.WAITING
+            or request.skip_reading_prefix_cache
+            or self.connector is not None
+            or self.ec_connector is not None
+            or self.policy != SchedulingPolicy.FCFS
+            or request.mm_features
+            or request.prompt_embeds is not None
+            or request.prompt_token_ids is None
+            or request.lora_request is not None
+            or time.time() - request.arrival_time >= 10
+        ):
+            return False
+        # Match the chained full-block hash and the exact remaining text IDs.
+        whole, tail = divmod(boundary, cache.hash_block_size)
+        for producer in self._inflight_prefills:
+            if (
+                producer.status == RequestStatus.RUNNING
+                and producer.use_boundary_checkpoints
+                and producer.recurrent_instruction_boundary == boundary
+                and producer.num_computed_tokens < boundary
+                and producer.cache_salt == request.cache_salt
+                and not producer.mm_features
+                and producer.prompt_embeds is None
+                and producer.prompt_token_ids is not None
+                and producer.lora_request is None
+                and (
+                    not whole
+                    or producer.block_hashes[whole - 1]
+                    == request.block_hashes[whole - 1]
+                )
+                and (
+                    not tail
+                    or producer.prompt_token_ids[boundary - tail : boundary]
+                    == request.prompt_token_ids[boundary - tail : boundary]
+                )
+            ):
+                return True
+        return False
+
+    def _needs_instruction_prefill_lane(self, request: Request) -> bool:
+        # A follower already checked on the previous step can yield its lane.
+        return self._request_has_local_prefill(request) and not (
+            request.status == RequestStatus.WAITING
+            and request.use_boundary_checkpoints
+            and request.boundary_checkpoint is None
+            and self._has_instruction_producer(request)
+        )
+
     def _reserve_prefill_lookahead(
         self,
         request: Request,
@@ -937,7 +994,12 @@ class Scheduler(SchedulerInterface):
                 waiting=self.waiting if admission_open else (),
                 skipped_waiting=self.skipped_waiting if admission_open else (),
                 request_lookup=self.requests,
-                is_local_prefill=self._request_has_local_prefill,
+                is_local_prefill=(
+                    self._needs_instruction_prefill_lane
+                    if self._inflight_prefills
+                    and (self.waiting or self.skipped_waiting)
+                    else self._request_has_local_prefill
+                ),
                 max_parallel_prefills=self.max_parallel_prefills,
                 policy=self.scheduler_config.prefill_policy,
                 num_runnable_decodes=num_runnable_decodes,
@@ -1490,6 +1552,14 @@ class Scheduler(SchedulerInterface):
                         request.shared_prefix_boundary,
                         hit_diverged,
                     ) = self._get_local_prefix_cache_hit(request)
+                    if num_new_local_computed_tokens < (
+                        request.recurrent_instruction_boundary or 0
+                    ) and self._has_instruction_producer(request):
+                        request_queue.remove_request(request)
+                        if prefill_interleave_step is not None:
+                            prefill_interleave_step.mark_unavailable(request_id)
+                        step_skipped_waiting.prepend_request(request)
+                        continue
                     if (
                         self.connector is not None
                         and self.kv_cache_manager.boundary_checkpoints is not None

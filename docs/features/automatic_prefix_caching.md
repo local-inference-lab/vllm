@@ -81,6 +81,12 @@ deriving message boundaries from model-specific token IDs. Templates whose
 continuation prefix does not match continue to use full-prompt and response
 checkpoints.
 
+With first-come, first-served scheduling, a text chat request can wait for a
+running prefill that shares its verified instruction prefix. This applies to
+prefixes at least as long as the per-step token budget. Requests become eligible
+to compute their own prefix once the producer stops or the waiting request is
+ten seconds old.
+
 Each checkpoint includes the recurrent state, attention tails, private selector
 state, and final hidden state. MTP additionally saves its selector state and
 the target hidden state needed to rebuild its last, lookahead-dependent row.

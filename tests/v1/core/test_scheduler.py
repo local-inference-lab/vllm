@@ -10,6 +10,7 @@ import pytest
 import torch
 
 import vllm.envs as envs
+from tests.v1.core.test_prefix_caching import make_request
 from vllm.config import (
     CacheConfig,
     ECTransferConfig,
@@ -63,6 +64,42 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.parametrize(
+    "shared_tokens,cache_salt,waits",
+    [(97, None, True), (96, None, False), (97, "other", False)],
+)
+def test_instruction_prefill_waits_only_for_a_matching_producer(
+    shared_tokens, cache_salt, waits
+):
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        skip_tokenizer_init=True,
+        long_prefill_token_threshold=16,
+        max_num_batched_tokens=64,
+        max_model_len=256,
+    )
+    manager = scheduler.kv_cache_manager
+    manager.boundary_checkpoints = BoundaryCheckpointCache(manager.block_pool)
+    init_none_hash(sha256)
+    producer = make_request("producer", [0] * 128, 16, sha256)
+    follower = make_request(
+        "follower",
+        [0] * shared_tokens + [1] * (128 - shared_tokens),
+        16,
+        sha256,
+        cache_salt=cache_salt,
+    )
+    for request in (producer, follower):
+        request.recurrent_instruction_boundary = 97
+        scheduler.add_request(request)
+
+    step = scheduler.schedule()
+    assert producer.request_id in step.num_scheduled_tokens
+    assert (follower.request_id not in step.num_scheduled_tokens) == waits
+    scheduler.finish_requests(producer.request_id, RequestStatus.FINISHED_ABORTED)
+    assert follower.request_id in scheduler.schedule().num_scheduled_tokens
 
 
 def test_full_boundary_hit_preserves_async_speculative_decode_token_count():
