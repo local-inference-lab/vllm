@@ -107,7 +107,12 @@ def get_prefill_tail_checkpoint_position(
 def boundary_checkpoint_slots(request: Request) -> tuple[int, ...]:
     """Allocate only the endpoints that this request can publish."""
     slots: tuple[int, ...] = (PROMPT_CHECKPOINT_SLOT, RESPONSE_CHECKPOINT_SLOT)
-    if request.recurrent_instruction_boundary is not None:
+    boundary = request.recurrent_instruction_boundary
+    checkpoint = request.boundary_checkpoint
+    # Restoring this far marks the instruction slot seen on the worker.
+    if boundary is not None and (
+        checkpoint is None or checkpoint.num_tokens < boundary
+    ):
         slots += (INSTRUCTION_CHECKPOINT_SLOT,)
     if request.recurrent_prefill_tail_boundary is not None:
         slots += (PREFILL_TAIL_CHECKPOINT_SLOT,)
