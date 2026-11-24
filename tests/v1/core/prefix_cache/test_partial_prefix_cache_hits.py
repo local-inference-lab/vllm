@@ -2651,7 +2651,10 @@ def test_request_boundaries_keep_prompt_but_no_intermediate_recurrent_states():
     assert manager.reset_prefix_cache()
 
 
-def test_request_boundaries_reuse_leading_instructions_across_user_prompts():
+@pytest.mark.parametrize("sibling_boundary,expected_slots", [(4, 2), (5, 2), (6, 3)])
+def test_request_boundaries_reuse_leading_instructions_across_user_prompts(
+    sibling_boundary, expected_slots
+):
     """A verified chat instruction endpoint can seed divergent user turns."""
     manager = make_full_mamba_manager(
         dcp_world_size=1,
@@ -2673,10 +2676,13 @@ def test_request_boundaries_reuse_leading_instructions_across_user_prompts():
     manager.free(producer)
 
     sibling = make_request("sibling", [1, 2, 3, 4, 5, 20, 21], 4, sha256)
-    sibling.recurrent_instruction_boundary = instruction_len
+    sibling.recurrent_instruction_boundary = sibling_boundary
     blocks, hit, _ = manager.get_computed_blocks(sibling)
     assert hit == instruction_len
     assert manager.allocate_slots(sibling, 2, hit, blocks) is not None
+    # An instruction bundle is useful only if its endpoint is still ahead.
+    assert sibling.boundary_checkpoint_blocks is not None
+    assert len(sibling.boundary_checkpoint_blocks) == expected_slots
     manager.free(sibling)
     _, retained = manager.take_kv_cache_block_copies()
     manager.block_pool.free_blocks(retained)
@@ -2685,6 +2691,11 @@ def test_request_boundaries_reuse_leading_instructions_across_user_prompts():
     divergent.recurrent_instruction_boundary = instruction_len
     _, hit, _ = manager.get_computed_blocks(divergent)
     assert hit == 0
+    assert manager.allocate_slots(divergent, instruction_len) is not None
+    fresh = manager.publish_boundary_checkpoint(
+        divergent, instruction_len, kind="instruction"
+    )
+    assert fresh is not None
     manager.free(divergent)
     assert manager.reset_prefix_cache()
 
