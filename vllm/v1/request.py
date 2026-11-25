@@ -214,6 +214,7 @@ class Request:
         # hybrid/Mamba models when a shared prefix is detected (Marconi-style).
         self.shared_prefix_boundary = 0
         self.use_boundary_checkpoints = False
+        self.instruction_prefill_miss_generation: int | None = None
         self.boundary_checkpoint: BoundaryCheckpoint | None = None
         self.boundary_checkpoint_blocks: tuple[tuple[int, ...], ...] | None = None
 

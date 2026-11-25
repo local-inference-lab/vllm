@@ -207,6 +207,52 @@ def test_instruction_prefill_waits_for_async_boundary_result(captured: bool):
     assert admitted.num_computed_tokens == (boundary if captured else 0)
 
 
+@pytest.mark.parametrize(
+    "depth,matching", [(96, True), (97, False), (97, True), (101, True)]
+)
+def test_instruction_prefill_follower_rechecks_published_checkpoint(
+    depth, matching, monkeypatch
+):
+    scheduler, producer, follower = _instruction_prefill_pair(max_parallel_prefills=2)
+    output = ModelRunnerOutput(req_ids=["producer"], req_id_to_index={"producer": 0})
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens == {producer.request_id: 16}
+    assert follower.use_boundary_checkpoints and follower.boundary_checkpoint is None
+    scheduler.update_from_output(first, output)
+
+    # An unchanged cache must not be searched on each scheduling step.
+    manager = scheduler.kv_cache_manager
+    cache = manager.boundary_checkpoints
+    find = Mock(wraps=cache.find)
+    monkeypatch.setattr(cache, "find", find)
+    second = scheduler.schedule()
+    assert second.num_scheduled_tokens == {producer.request_id: 16}
+    find.assert_not_called()
+    scheduler.update_from_output(second, output)
+
+    tokens = list(follower.prompt_token_ids[:depth])
+    if not matching:
+        tokens[-1] += 1
+    publisher = make_request("publisher", tokens, 16, sha256)
+    manager.get_computed_blocks(publisher)
+    assert manager.allocate_slots(publisher, depth) is not None
+    assert manager.publish_boundary_checkpoint(publisher, depth, kind="prompt")
+    manager.free(publisher)
+
+    resumed = scheduler.schedule()
+    assert producer.num_computed_tokens < follower.recurrent_instruction_boundary
+    if matching and depth >= follower.recurrent_instruction_boundary:
+        (admitted,) = resumed.scheduled_new_reqs
+        assert admitted.req_id == follower.request_id
+        assert admitted.num_computed_tokens == depth
+    else:
+        assert resumed.num_scheduled_tokens == {producer.request_id: 16}
+        scheduler.update_from_output(resumed, output)
+        find.reset_mock()
+        assert scheduler.schedule().num_scheduled_tokens == {producer.request_id: 16}
+        find.assert_not_called()
+
+
 def test_full_boundary_hit_preserves_async_speculative_decode_token_count():
     """Sampling saved logits must not advance the processed-token frontier."""
     scheduler = create_scheduler(

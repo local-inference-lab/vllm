@@ -753,13 +753,24 @@ class Scheduler(SchedulerInterface):
         return False
 
     def _needs_instruction_prefill_lane(self, request: Request) -> bool:
-        # A follower already checked on the previous step can yield its lane.
-        return self._request_has_local_prefill(request) and not (
-            request.status == RequestStatus.WAITING
-            and request.use_boundary_checkpoints
-            and request.boundary_checkpoint is None
-            and self._has_instruction_producer(request)
-        )
+        if not self._request_has_local_prefill(request):
+            return False
+        generation = request.instruction_prefill_miss_generation
+        if generation is None or not self._has_instruction_producer(request):
+            return True
+        cache = self.kv_cache_manager.boundary_checkpoints
+        assert cache is not None
+        if generation != cache.publication_generation:
+            # Any publisher can make the previous miss stale. Admission checks
+            # the hit again before allocating blocks.
+            checkpoint = cache.find(request, request.num_tokens)
+            if checkpoint is not None and checkpoint.num_tokens >= (
+                request.recurrent_instruction_boundary or 0
+            ):
+                request.instruction_prefill_miss_generation = None
+                return True
+            request.instruction_prefill_miss_generation = cache.publication_generation
+        return False
 
     def _reserve_prefill_lookahead(
         self,
@@ -1571,6 +1582,11 @@ class Scheduler(SchedulerInterface):
                     if num_new_local_computed_tokens < (
                         request.recurrent_instruction_boundary or 0
                     ) and self._has_instruction_producer(request):
+                        cache = self.kv_cache_manager.boundary_checkpoints
+                        assert cache is not None
+                        request.instruction_prefill_miss_generation = (
+                            cache.publication_generation
+                        )
                         request_queue.remove_request(request)
                         if prefill_interleave_step is not None:
                             prefill_interleave_step.mark_unavailable(request_id)
