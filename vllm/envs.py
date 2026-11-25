@@ -179,6 +179,7 @@ if TYPE_CHECKING:
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S: float = 60.0
+    VLLM_INSTRUCTION_PREFILL_MAX_WAIT_S: int = 10
     VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS: bool = False
     VLLM_MLA_DISABLE: bool = False
     VLLM_K3_DENSE_MLA_PARTIAL_DTYPE: Literal["bf16", "fp32"] = "bf16"
@@ -1562,6 +1563,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S": lambda: max(
         0.0, float(os.getenv("VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S", "60"))
     ),
+    # Maximum request age in seconds for sharing an in-flight instruction prefill.
+    # Zero disables waiting for a producer.
+    "VLLM_INSTRUCTION_PREFILL_MAX_WAIT_S": lambda: int(
+        os.getenv("VLLM_INSTRUCTION_PREFILL_MAX_WAIT_S", "10")
+    ),
     # Let a scheduling step with no runnable decode use the full
     # max_num_batched_tokens for prefill instead of max_num_scheduled_tokens,
     # which only exists to keep decode streams moving.
@@ -2680,6 +2686,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOG_STATS_INTERVAL",
         "VLLM_REQUEST_STALL_WARNING_S",
         "VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S",
+        "VLLM_INSTRUCTION_PREFILL_MAX_WAIT_S",
         "VLLM_LOG_REQUEST_TIMELINE",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",

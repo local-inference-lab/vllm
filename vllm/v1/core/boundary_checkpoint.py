@@ -235,6 +235,7 @@ class BoundaryCheckpointCache:
         self._by_block: dict[int, set[int]] = {}
         self._pending_by_block: dict[int, set[int]] = {}
         self._next_id = 1
+        self.publication_generation = 0
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -333,6 +334,7 @@ class BoundaryCheckpointCache:
         for block_id in pending.checkpoint.dependencies:
             self._by_block.setdefault(block_id, set()).add(checkpoint_id)
         self._release(pending.checkpoint)
+        self.publication_generation += 1
         return True
 
     def is_pending(self, checkpoint_id: int) -> bool:

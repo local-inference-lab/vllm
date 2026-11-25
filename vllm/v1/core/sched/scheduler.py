@@ -93,6 +93,18 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+def _instruction_prefill_token_ids(request: Request) -> list[int] | None:
+    """Return prompt IDs for text-only requests eligible to share a checkpoint."""
+    if (
+        request.use_boundary_checkpoints
+        and not request.mm_features
+        and request.prompt_embeds is None
+        and request.lora_request is None
+    ):
+        return request.prompt_token_ids
+    return None
+
+
 def _build_kv_connector_block_state(
     kv_cache_config: KVCacheConfig,
     kv_cache_manager: KVCacheManager,
@@ -503,6 +515,7 @@ class Scheduler(SchedulerInterface):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
+        self._instruction_prefill_max_wait_s = envs.VLLM_INSTRUCTION_PREFILL_MAX_WAIT_S
 
     def _mamba_block_aligned_split(
         self,
@@ -687,6 +700,77 @@ class Scheduler(SchedulerInterface):
             self.kv_cache_manager.get_computed_blocks(request)
         )
         return blocks, num_local, shared_prefix_boundary, False
+
+    def _has_instruction_producer(self, request: Request) -> bool:
+        boundary = request.recurrent_instruction_boundary
+        cache = self.kv_cache_manager.boundary_checkpoints
+        if (
+            not self._inflight_prefills
+            or cache is None
+            or not boundary
+            or boundary < self.max_num_scheduled_tokens
+            or request.status != RequestStatus.WAITING
+            or request.skip_reading_prefix_cache
+            or self.connector is not None
+            or self.ec_connector is not None
+            or self.policy != SchedulingPolicy.FCFS
+        ):
+            return False
+        prompt_ids = _instruction_prefill_token_ids(request)
+        if prompt_ids is None:
+            return False
+        # A future frontend timestamp cannot establish how long we have waited.
+        age = time.time() - request.arrival_time
+        if not 0 <= age < self._instruction_prefill_max_wait_s:
+            return False
+        # Match the chained full-block hash and the exact remaining text IDs.
+        whole, tail = divmod(boundary, cache.hash_block_size)
+        for producer in self._inflight_prefills:
+            if producer.status != RequestStatus.RUNNING:
+                continue
+            producer_ids = _instruction_prefill_token_ids(producer)
+            # Scheduled tokens can reach the boundary before the worker reports it.
+            pending_tokens = (
+                producer.num_in_flight_tokens - producer.num_stale_output_tokens
+            )
+            if (
+                producer.recurrent_instruction_boundary == boundary
+                and producer.num_computed_tokens - pending_tokens < boundary
+                and producer.cache_salt == request.cache_salt
+                and producer_ids is not None
+                and (
+                    not whole
+                    or producer.block_hashes[whole - 1]
+                    == request.block_hashes[whole - 1]
+                )
+                and (
+                    not tail
+                    or producer_ids[boundary - tail : boundary]
+                    == prompt_ids[boundary - tail : boundary]
+                )
+            ):
+                return True
+        return False
+
+    def _needs_instruction_prefill_lane(self, request: Request) -> bool:
+        if not self._request_has_local_prefill(request):
+            return False
+        generation = request.instruction_prefill_miss_generation
+        if generation is None or not self._has_instruction_producer(request):
+            return True
+        cache = self.kv_cache_manager.boundary_checkpoints
+        assert cache is not None
+        if generation != cache.publication_generation:
+            # Any publisher can make the previous miss stale. Admission checks
+            # the hit again before allocating blocks.
+            checkpoint = cache.find(request, request.num_tokens)
+            if checkpoint is not None and checkpoint.num_tokens >= (
+                request.recurrent_instruction_boundary or 0
+            ):
+                request.instruction_prefill_miss_generation = None
+                return True
+            request.instruction_prefill_miss_generation = cache.publication_generation
+        return False
 
     def _reserve_prefill_lookahead(
         self,
@@ -937,7 +1021,12 @@ class Scheduler(SchedulerInterface):
                 waiting=self.waiting if admission_open else (),
                 skipped_waiting=self.skipped_waiting if admission_open else (),
                 request_lookup=self.requests,
-                is_local_prefill=self._request_has_local_prefill,
+                is_local_prefill=(
+                    self._needs_instruction_prefill_lane
+                    if self._inflight_prefills
+                    and (self.waiting or self.skipped_waiting)
+                    else self._request_has_local_prefill
+                ),
                 max_parallel_prefills=self.max_parallel_prefills,
                 policy=self.scheduler_config.prefill_policy,
                 num_runnable_decodes=num_runnable_decodes,
@@ -1490,6 +1579,19 @@ class Scheduler(SchedulerInterface):
                         request.shared_prefix_boundary,
                         hit_diverged,
                     ) = self._get_local_prefix_cache_hit(request)
+                    if num_new_local_computed_tokens < (
+                        request.recurrent_instruction_boundary or 0
+                    ) and self._has_instruction_producer(request):
+                        cache = self.kv_cache_manager.boundary_checkpoints
+                        assert cache is not None
+                        request.instruction_prefill_miss_generation = (
+                            cache.publication_generation
+                        )
+                        request_queue.remove_request(request)
+                        if prefill_interleave_step is not None:
+                            prefill_interleave_step.mark_unavailable(request_id)
+                        step_skipped_waiting.prepend_request(request)
+                        continue
                     if (
                         self.connector is not None
                         and self.kv_cache_manager.boundary_checkpoints is not None

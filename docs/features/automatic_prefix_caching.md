@@ -81,6 +81,18 @@ deriving message boundaries from model-specific token IDs. Templates whose
 continuation prefix does not match continue to use full-prompt and response
 checkpoints.
 
+With first-come, first-served scheduling, a text chat request can wait for a
+running prefill that shares its verified instruction prefix. This applies to
+prefixes at least as long as the per-step token budget. If any request publishes
+a matching checkpoint at or beyond the instruction boundary, the follower can
+reuse it on the next scheduling step with an available prefill lane. Otherwise,
+the follower waits for the producer's boundary result, including any outstanding
+async worker step, then computes the missing prefix. Waiting also ends if the
+producer stops or the request reaches `VLLM_INSTRUCTION_PREFILL_MAX_WAIT_S`
+seconds of age (default 10). Set this environment variable to 0 to disable
+waiting. Requests with an arrival timestamp ahead of the engine clock bypass
+the wait.
+
 Each checkpoint includes the recurrent state, attention tails, private selector
 state, and final hidden state. MTP additionally saves its selector state and
 the target hidden state needed to rebuild its last, lookahead-dependent row.

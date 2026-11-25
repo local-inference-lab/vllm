@@ -10,6 +10,7 @@ import pytest
 import torch
 
 import vllm.envs as envs
+from tests.v1.core.test_prefix_caching import make_request
 from vllm.config import (
     CacheConfig,
     ECTransferConfig,
@@ -63,6 +64,193 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def _instruction_prefill_pair(
+    *, boundary=97, shared_tokens=97, cache_salt=None, **kwargs
+):
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        skip_tokenizer_init=True,
+        long_prefill_token_threshold=16,
+        max_num_batched_tokens=64,
+        max_model_len=256,
+        **kwargs,
+    )
+    manager = scheduler.kv_cache_manager
+    manager.boundary_checkpoints = BoundaryCheckpointCache(manager.block_pool)
+    init_none_hash(sha256)
+    producer = make_request("producer", [0] * 128, 16, sha256)
+    follower = make_request(
+        "follower",
+        [0] * shared_tokens + [1] * (128 - shared_tokens),
+        16,
+        sha256,
+        cache_salt=cache_salt,
+    )
+    for request in (producer, follower):
+        request.recurrent_instruction_boundary = boundary
+        scheduler.add_request(request)
+    return scheduler, producer, follower
+
+
+@pytest.mark.parametrize(
+    "shared_tokens,cache_salt,waits",
+    [(97, None, True), (96, None, False), (97, "other", False)],
+)
+def test_instruction_prefill_waits_only_for_a_matching_producer(
+    shared_tokens, cache_salt, waits
+):
+    scheduler, producer, follower = _instruction_prefill_pair(
+        shared_tokens=shared_tokens, cache_salt=cache_salt
+    )
+
+    step = scheduler.schedule()
+    assert producer.request_id in step.num_scheduled_tokens
+    assert (follower.request_id not in step.num_scheduled_tokens) == waits
+    scheduler.finish_requests(producer.request_id, RequestStatus.FINISHED_ABORTED)
+    assert follower.request_id in scheduler.schedule().num_scheduled_tokens
+
+
+@pytest.mark.parametrize(
+    "boundary,options,waits",
+    [
+        pytest.param(63, {}, False, id="below-step-budget"),
+        pytest.param(64, {}, True, id="at-step-budget"),
+        pytest.param(97, {"scheduling_policy": "priority"}, False, id="priority"),
+        pytest.param(97, {"use_kv_connector": mock_kv(0, False)}, False, id="kv"),
+        pytest.param(
+            97, {"use_ec_connector": True, "ec_role": "ec_consumer"}, False, id="ec"
+        ),
+    ],
+)
+def test_instruction_prefill_admission_guards(boundary, options, waits):
+    scheduler, producer, follower = _instruction_prefill_pair(
+        boundary=boundary, **options
+    )
+    step = scheduler.schedule()
+    assert producer.request_id in step.num_scheduled_tokens
+    assert (follower.request_id not in step.num_scheduled_tokens) == waits
+
+
+@pytest.mark.parametrize("limit", [None, 2, 0], ids=["default", "override", "disabled"])
+def test_instruction_prefill_wait_deadline(monkeypatch, limit):
+    name = "VLLM_INSTRUCTION_PREFILL_MAX_WAIT_S"
+    if limit is None:
+        monkeypatch.delenv(name, raising=False)
+        limit = 10
+    else:
+        monkeypatch.setenv(name, str(limit))
+    scheduler, producer, follower = _instruction_prefill_pair()
+    now = follower.arrival_time
+    monkeypatch.setattr("vllm.v1.core.sched.scheduler.time.time", lambda: now)
+    if limit:
+        now = follower.arrival_time + limit - 0.125
+        first = scheduler.schedule()
+        assert first.num_scheduled_tokens == {producer.request_id: 16}
+        scheduler.update_from_output(
+            first,
+            ModelRunnerOutput(req_ids=["producer"], req_id_to_index={"producer": 0}),
+        )
+    now = follower.arrival_time + limit
+    step = scheduler.schedule()
+    assert producer.request_id in step.num_scheduled_tokens
+    assert follower.request_id in step.num_scheduled_tokens
+
+
+def test_instruction_prefill_future_arrival_skips_wait(monkeypatch):
+    scheduler, producer, follower = _instruction_prefill_pair()
+    now = follower.arrival_time - 60
+    monkeypatch.setattr("vllm.v1.core.sched.scheduler.time.time", lambda: now)
+    step = scheduler.schedule()
+    assert producer.request_id in step.num_scheduled_tokens
+    assert follower.request_id in step.num_scheduled_tokens
+
+
+@pytest.mark.parametrize("captured", [True, False])
+def test_instruction_prefill_waits_for_async_boundary_result(captured: bool):
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        enable_prefix_caching=True,
+        skip_tokenizer_init=True,
+        long_prefill_token_threshold=33,
+        max_num_batched_tokens=64,
+        max_model_len=128,
+    )
+    manager = scheduler.kv_cache_manager
+    manager.boundary_checkpoints = BoundaryCheckpointCache(manager.block_pool)
+    init_none_hash(sha256)
+    # Two prefill chunks end at a boundary between ordinary cache blocks.
+    boundary = 66
+    for req_id, suffix in [("producer", [1] * 34), ("follower", [2])]:
+        request = make_request(req_id, [0] * boundary + suffix, 16, sha256)
+        request.recurrent_instruction_boundary = boundary
+        scheduler.add_request(request)
+
+    output = ModelRunnerOutput(req_ids=["producer"], req_id_to_index={"producer": 0})
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens == {"producer": 33}
+    scheduler.update_from_output(first, output)
+    boundary_step = scheduler.schedule()
+    assert boundary_step.num_scheduled_tokens == {"producer": 33}
+
+    # Async scheduling can issue the suffix before the boundary result arrives.
+    assert scheduler.schedule().num_scheduled_tokens == {"producer": 33}
+    if captured:
+        output.boundary_checkpoint_tokens = [[0, 0, boundary, 0]]
+    scheduler.update_from_output(boundary_step, output)
+
+    # The follower can start while the producer is still finishing its suffix.
+    resumed = scheduler.schedule()
+    (admitted,) = resumed.scheduled_new_reqs
+    assert admitted.req_id == "follower"
+    assert admitted.num_computed_tokens == (boundary if captured else 0)
+
+
+@pytest.mark.parametrize(
+    "depth,matching", [(96, True), (97, False), (97, True), (101, True)]
+)
+def test_instruction_prefill_follower_rechecks_published_checkpoint(
+    depth, matching, monkeypatch
+):
+    scheduler, producer, follower = _instruction_prefill_pair(max_parallel_prefills=2)
+    output = ModelRunnerOutput(req_ids=["producer"], req_id_to_index={"producer": 0})
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens == {producer.request_id: 16}
+    assert follower.use_boundary_checkpoints and follower.boundary_checkpoint is None
+    scheduler.update_from_output(first, output)
+
+    # An unchanged cache must not be searched on each scheduling step.
+    manager = scheduler.kv_cache_manager
+    cache = manager.boundary_checkpoints
+    find = Mock(wraps=cache.find)
+    monkeypatch.setattr(cache, "find", find)
+    second = scheduler.schedule()
+    assert second.num_scheduled_tokens == {producer.request_id: 16}
+    find.assert_not_called()
+    scheduler.update_from_output(second, output)
+
+    tokens = list(follower.prompt_token_ids[:depth])
+    if not matching:
+        tokens[-1] += 1
+    publisher = make_request("publisher", tokens, 16, sha256)
+    manager.get_computed_blocks(publisher)
+    assert manager.allocate_slots(publisher, depth) is not None
+    assert manager.publish_boundary_checkpoint(publisher, depth, kind="prompt")
+    manager.free(publisher)
+
+    resumed = scheduler.schedule()
+    assert producer.num_computed_tokens < follower.recurrent_instruction_boundary
+    if matching and depth >= follower.recurrent_instruction_boundary:
+        (admitted,) = resumed.scheduled_new_reqs
+        assert admitted.req_id == follower.request_id
+        assert admitted.num_computed_tokens == depth
+    else:
+        assert resumed.num_scheduled_tokens == {producer.request_id: 16}
+        scheduler.update_from_output(resumed, output)
+        find.reset_mock()
+        assert scheduler.schedule().num_scheduled_tokens == {producer.request_id: 16}
+        find.assert_not_called()
 
 
 def test_full_boundary_hit_preserves_async_speculative_decode_token_count():
