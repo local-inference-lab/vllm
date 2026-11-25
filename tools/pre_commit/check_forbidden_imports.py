@@ -35,6 +35,8 @@ CHECK_IMPORTS = {
         ),
         allowed_files={
             # pickle
+            "vllm/v1/request.py",  # Protocol-5 PickleBuffer for worker IPC.
+            "tests/v1/test_request.py",  # Round-trip a local token buffer.
             "vllm/multimodal/hasher.py",
             "vllm/transformers_utils/config.py",
             "vllm/model_executor/models/registry.py",
