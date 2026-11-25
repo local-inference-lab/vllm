@@ -726,14 +726,15 @@ class Scheduler(SchedulerInterface):
         # Match the chained full-block hash and the exact remaining text IDs.
         whole, tail = divmod(boundary, cache.hash_block_size)
         for producer in self._inflight_prefills:
+            if producer.status != RequestStatus.RUNNING:
+                continue
             producer_ids = _instruction_prefill_token_ids(producer)
             # Scheduled tokens can reach the boundary before the worker reports it.
             pending_tokens = (
                 producer.num_in_flight_tokens - producer.num_stale_output_tokens
             )
             if (
-                producer.status == RequestStatus.RUNNING
-                and producer.recurrent_instruction_boundary == boundary
+                producer.recurrent_instruction_boundary == boundary
                 and producer.num_computed_tokens - pending_tokens < boundary
                 and producer.cache_salt == request.cache_salt
                 and producer_ids is not None
