@@ -93,6 +93,18 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+def _instruction_prefill_token_ids(request: Request) -> list[int] | None:
+    """Return prompt IDs for text-only requests eligible to share a checkpoint."""
+    if (
+        request.use_boundary_checkpoints
+        and not request.mm_features
+        and request.prompt_embeds is None
+        and request.lora_request is None
+    ):
+        return request.prompt_token_ids
+    return None
+
+
 def _build_kv_connector_block_state(
     kv_cache_config: KVCacheConfig,
     kv_cache_manager: KVCacheManager,
@@ -503,6 +515,7 @@ class Scheduler(SchedulerInterface):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
+        self._instruction_prefill_max_wait_s = envs.VLLM_INSTRUCTION_PREFILL_MAX_WAIT_S
 
     def _mamba_block_aligned_split(
         self,
@@ -693,7 +706,6 @@ class Scheduler(SchedulerInterface):
         cache = self.kv_cache_manager.boundary_checkpoints
         if (
             not self._inflight_prefills
-            or not request.use_boundary_checkpoints
             or cache is None
             or not boundary
             or boundary < self.max_num_scheduled_tokens
@@ -702,30 +714,29 @@ class Scheduler(SchedulerInterface):
             or self.connector is not None
             or self.ec_connector is not None
             or self.policy != SchedulingPolicy.FCFS
-            or request.mm_features
-            or request.prompt_embeds is not None
-            or request.prompt_token_ids is None
-            or request.lora_request is not None
-            or time.time() - request.arrival_time >= 10
         ):
+            return False
+        prompt_ids = _instruction_prefill_token_ids(request)
+        if prompt_ids is None:
+            return False
+        # A future frontend timestamp cannot establish how long we have waited.
+        age = time.time() - request.arrival_time
+        if not 0 <= age < self._instruction_prefill_max_wait_s:
             return False
         # Match the chained full-block hash and the exact remaining text IDs.
         whole, tail = divmod(boundary, cache.hash_block_size)
         for producer in self._inflight_prefills:
+            producer_ids = _instruction_prefill_token_ids(producer)
             # Scheduled tokens can reach the boundary before the worker reports it.
             pending_tokens = (
                 producer.num_in_flight_tokens - producer.num_stale_output_tokens
             )
             if (
                 producer.status == RequestStatus.RUNNING
-                and producer.use_boundary_checkpoints
                 and producer.recurrent_instruction_boundary == boundary
                 and producer.num_computed_tokens - pending_tokens < boundary
                 and producer.cache_salt == request.cache_salt
-                and not producer.mm_features
-                and producer.prompt_embeds is None
-                and producer.prompt_token_ids is not None
-                and producer.lora_request is None
+                and producer_ids is not None
                 and (
                     not whole
                     or producer.block_hashes[whole - 1]
@@ -733,8 +744,8 @@ class Scheduler(SchedulerInterface):
                 )
                 and (
                     not tail
-                    or producer.prompt_token_ids[boundary - tail : boundary]
-                    == request.prompt_token_ids[boundary - tail : boundary]
+                    or producer_ids[boundary - tail : boundary]
+                    == prompt_ids[boundary - tail : boundary]
                 )
             ):
                 return True

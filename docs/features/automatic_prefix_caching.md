@@ -87,7 +87,9 @@ prefixes at least as long as the per-step token budget. With async scheduling,
 the follower waits for the worker to return the step that reaches the instruction
 boundary. It can then reuse the checkpoint if the worker captured it, or compute
 the missing prefix otherwise. Waiting also ends if the producer stops or the
-waiting request is ten seconds old.
+request reaches `VLLM_INSTRUCTION_PREFILL_MAX_WAIT_S` seconds of age (default
+10). Set this environment variable to 0 to disable waiting. Requests with an
+arrival timestamp ahead of the engine clock bypass the wait.
 
 Each checkpoint includes the recurrent state, attention tails, private selector
 state, and final hidden state. MTP additionally saves its selector state and

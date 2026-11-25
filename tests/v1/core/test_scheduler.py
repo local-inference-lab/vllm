@@ -66,12 +66,8 @@ from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 pytestmark = pytest.mark.cpu_test
 
 
-@pytest.mark.parametrize(
-    "shared_tokens,cache_salt,waits",
-    [(97, None, True), (96, None, False), (97, "other", False)],
-)
-def test_instruction_prefill_waits_only_for_a_matching_producer(
-    shared_tokens, cache_salt, waits
+def _instruction_prefill_pair(
+    *, boundary=97, shared_tokens=97, cache_salt=None, **kwargs
 ):
     scheduler = create_scheduler(
         enable_prefix_caching=True,
@@ -79,6 +75,7 @@ def test_instruction_prefill_waits_only_for_a_matching_producer(
         long_prefill_token_threshold=16,
         max_num_batched_tokens=64,
         max_model_len=256,
+        **kwargs,
     )
     manager = scheduler.kv_cache_manager
     manager.boundary_checkpoints = BoundaryCheckpointCache(manager.block_pool)
@@ -92,14 +89,82 @@ def test_instruction_prefill_waits_only_for_a_matching_producer(
         cache_salt=cache_salt,
     )
     for request in (producer, follower):
-        request.recurrent_instruction_boundary = 97
+        request.recurrent_instruction_boundary = boundary
         scheduler.add_request(request)
+    return scheduler, producer, follower
+
+
+@pytest.mark.parametrize(
+    "shared_tokens,cache_salt,waits",
+    [(97, None, True), (96, None, False), (97, "other", False)],
+)
+def test_instruction_prefill_waits_only_for_a_matching_producer(
+    shared_tokens, cache_salt, waits
+):
+    scheduler, producer, follower = _instruction_prefill_pair(
+        shared_tokens=shared_tokens, cache_salt=cache_salt
+    )
 
     step = scheduler.schedule()
     assert producer.request_id in step.num_scheduled_tokens
     assert (follower.request_id not in step.num_scheduled_tokens) == waits
     scheduler.finish_requests(producer.request_id, RequestStatus.FINISHED_ABORTED)
     assert follower.request_id in scheduler.schedule().num_scheduled_tokens
+
+
+@pytest.mark.parametrize(
+    "boundary,options,waits",
+    [
+        pytest.param(63, {}, False, id="below-step-budget"),
+        pytest.param(64, {}, True, id="at-step-budget"),
+        pytest.param(97, {"scheduling_policy": "priority"}, False, id="priority"),
+        pytest.param(97, {"use_kv_connector": mock_kv(0, False)}, False, id="kv"),
+        pytest.param(
+            97, {"use_ec_connector": True, "ec_role": "ec_consumer"}, False, id="ec"
+        ),
+    ],
+)
+def test_instruction_prefill_admission_guards(boundary, options, waits):
+    scheduler, producer, follower = _instruction_prefill_pair(
+        boundary=boundary, **options
+    )
+    step = scheduler.schedule()
+    assert producer.request_id in step.num_scheduled_tokens
+    assert (follower.request_id not in step.num_scheduled_tokens) == waits
+
+
+@pytest.mark.parametrize("limit", [None, 2, 0], ids=["default", "override", "disabled"])
+def test_instruction_prefill_wait_deadline(monkeypatch, limit):
+    name = "VLLM_INSTRUCTION_PREFILL_MAX_WAIT_S"
+    if limit is None:
+        monkeypatch.delenv(name, raising=False)
+        limit = 10
+    else:
+        monkeypatch.setenv(name, str(limit))
+    scheduler, producer, follower = _instruction_prefill_pair()
+    now = follower.arrival_time
+    monkeypatch.setattr("vllm.v1.core.sched.scheduler.time.time", lambda: now)
+    if limit:
+        now = follower.arrival_time + limit - 0.125
+        first = scheduler.schedule()
+        assert first.num_scheduled_tokens == {producer.request_id: 16}
+        scheduler.update_from_output(
+            first,
+            ModelRunnerOutput(req_ids=["producer"], req_id_to_index={"producer": 0}),
+        )
+    now = follower.arrival_time + limit
+    step = scheduler.schedule()
+    assert producer.request_id in step.num_scheduled_tokens
+    assert follower.request_id in step.num_scheduled_tokens
+
+
+def test_instruction_prefill_future_arrival_skips_wait(monkeypatch):
+    scheduler, producer, follower = _instruction_prefill_pair()
+    now = follower.arrival_time - 60
+    monkeypatch.setattr("vllm.v1.core.sched.scheduler.time.time", lambda: now)
+    step = scheduler.schedule()
+    assert producer.request_id in step.num_scheduled_tokens
+    assert follower.request_id in step.num_scheduled_tokens
 
 
 @pytest.mark.parametrize("captured", [True, False])
