@@ -9,7 +9,7 @@ from collections.abc import Callable, Sequence
 from functools import partial
 from inspect import isclass
 from types import FunctionType
-from typing import Any, ClassVar, TypeAlias, cast, get_type_hints
+from typing import Annotated, Any, ClassVar, TypeAlias, cast, get_type_hints
 
 import cloudpickle
 import msgspec
@@ -37,6 +37,13 @@ from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.utils import tensor_data
 
 logger = init_logger(__name__)
+
+
+class PromptTokenIds(np.ndarray):
+    """Engine request field accepting either a packed array or a list of token IDs."""
+
+
+_Int32TokenId = Annotated[int, msgspec.Meta(ge=-(2**31), lt=2**31)]
 
 CUSTOM_TYPE_PICKLE = 1
 CUSTOM_TYPE_CLOUDPICKLE = 2
@@ -350,6 +357,27 @@ class MsgpackDecoder:
     def dec_hook(self, t: type, obj: Any) -> Any:
         # Given native types in `obj`, convert to type `t`.
         if isclass(t):
+            if t is PromptTokenIds:
+                # The encoder emits dtype.str, a vector shape, and either
+                # inline data or the index of a frame following the message.
+                match obj:
+                    case ["<i4" | ">i4" | "<u4" | ">u4", [size], data] if (
+                        type(size) is int
+                        and size >= 0
+                        and (
+                            isinstance(data, (bytes, memoryview))
+                            or type(data) is int
+                            and 0 < data < len(self.aux_buffers)
+                        )
+                    ):
+                        packed = self._decode_ndarray(obj)
+                        if packed.dtype.kind == "u" and packed.max(initial=0) >= 2**31:
+                            raise ValueError(
+                                "Prompt token ID exceeds signed int32 range"
+                            )
+                        return packed.view(PromptTokenIds)
+                ids = msgspec.convert(obj, type=list[_Int32TokenId])
+                return np.asarray(ids, dtype=np.int32).view(PromptTokenIds)
             if issubclass(t, np.ndarray):
                 return self._decode_ndarray(obj)
             if issubclass(t, torch.Tensor):

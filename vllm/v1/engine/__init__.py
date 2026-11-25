@@ -5,7 +5,7 @@ import enum
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import msgspec
 import numpy as np
@@ -22,7 +22,7 @@ from vllm.v1.metrics.stats import (
     SchedulerStats,
 )
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplingMaskLists
-from vllm.v1.serial_utils import UtilityResult
+from vllm.v1.serial_utils import PromptTokenIds, UtilityResult
 
 # Type for pause_generation mode parameter.
 # - "abort": Abort all in-flight requests immediately (default).
@@ -111,7 +111,13 @@ class EngineCoreRequest(
     gc=False,
 ):  # type: ignore[call-arg]
     request_id: str
-    prompt_token_ids: list[int] | None
+    # Frontend callers supply lists. Decoded IDs are an ndarray which may
+    # share a receive buffer. Avoid list mutators (clear, sort) and use
+    # np.array_equal for a scalar comparison: ndarray equality is elementwise.
+    if TYPE_CHECKING:
+        prompt_token_ids: list[int] | None
+    else:
+        prompt_token_ids: PromptTokenIds | None
     mm_features: list[MultiModalFeatureSpec] | None
     sampling_params: SamplingParams | None
     pooling_params: PoolingParams | None

@@ -7,6 +7,7 @@ import sys
 import uuid
 import weakref
 from abc import ABC, abstractmethod
+from array import array
 from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
@@ -18,6 +19,7 @@ from typing import Any, TypeAlias, TypeVar
 
 import msgspec
 import msgspec.msgpack
+import numpy as np
 import zmq
 import zmq.asyncio
 
@@ -74,6 +76,16 @@ AnyFuture: TypeAlias = asyncio.Future[Any] | Future[Any]
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 EngineIdentity = bytes
+
+
+def _with_packed_prompt(request: EngineCoreRequest) -> EngineCoreRequest:
+    """Copy of request with its prompt token ids as an int32 ndarray, which is
+    sent out of band when long and decoded by the engine without a Python int
+    per token. The frontend keeps the original."""
+    if not isinstance(request.prompt_token_ids, list):
+        return request
+    packed = np.frombuffer(array("i", request.prompt_token_ids), dtype=np.int32)
+    return msgspec.structs.replace(request, prompt_token_ids=packed)
 
 
 class EngineCoreClient(ABC):
@@ -1006,7 +1018,7 @@ class SyncMPClient(MPClient):
     def add_request(self, request: EngineCoreRequest) -> None:
         if self.is_dp:
             self.engines_running = True
-        self._send_input(EngineCoreRequestType.ADD, request)
+        self._send_input(EngineCoreRequestType.ADD, _with_packed_prompt(request))
 
     def abort_requests(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:
@@ -1254,7 +1266,7 @@ class AsyncMPClient(MPClient):
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         request.client_index = self.client_index
-        await self._send_input(EngineCoreRequestType.ADD, request)
+        await self._send_input(EngineCoreRequestType.ADD, _with_packed_prompt(request))
         self._ensure_output_queue_task()
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
@@ -1534,7 +1546,9 @@ class DPAsyncMPClient(AsyncMPClient):
         request.client_index = self.client_index
 
         chosen_engine = self.get_core_engine_for_request(request)
-        to_await = self._send_input(EngineCoreRequestType.ADD, request, chosen_engine)
+        to_await = self._send_input(
+            EngineCoreRequestType.ADD, _with_packed_prompt(request), chosen_engine
+        )
         if not self.engines_running:
             # Notify coordinator that we're sending a request
             req_msg = msgspec.msgpack.encode(("FIRST_REQ", chosen_engine))
