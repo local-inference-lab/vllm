@@ -102,6 +102,46 @@ def test_instruction_prefill_waits_only_for_a_matching_producer(
     assert follower.request_id in scheduler.schedule().num_scheduled_tokens
 
 
+@pytest.mark.parametrize("captured", [True, False])
+def test_instruction_prefill_waits_for_async_boundary_result(captured: bool):
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        enable_prefix_caching=True,
+        skip_tokenizer_init=True,
+        long_prefill_token_threshold=33,
+        max_num_batched_tokens=64,
+        max_model_len=128,
+    )
+    manager = scheduler.kv_cache_manager
+    manager.boundary_checkpoints = BoundaryCheckpointCache(manager.block_pool)
+    init_none_hash(sha256)
+    # Two prefill chunks end at a boundary between ordinary cache blocks.
+    boundary = 66
+    for req_id, suffix in [("producer", [1] * 34), ("follower", [2])]:
+        request = make_request(req_id, [0] * boundary + suffix, 16, sha256)
+        request.recurrent_instruction_boundary = boundary
+        scheduler.add_request(request)
+
+    output = ModelRunnerOutput(req_ids=["producer"], req_id_to_index={"producer": 0})
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens == {"producer": 33}
+    scheduler.update_from_output(first, output)
+    boundary_step = scheduler.schedule()
+    assert boundary_step.num_scheduled_tokens == {"producer": 33}
+
+    # Async scheduling can issue the suffix before the boundary result arrives.
+    assert scheduler.schedule().num_scheduled_tokens == {"producer": 33}
+    if captured:
+        output.boundary_checkpoint_tokens = [[0, 0, boundary, 0]]
+    scheduler.update_from_output(boundary_step, output)
+
+    # The follower can start while the producer is still finishing its suffix.
+    resumed = scheduler.schedule()
+    (admitted,) = resumed.scheduled_new_reqs
+    assert admitted.req_id == "follower"
+    assert admitted.num_computed_tokens == (boundary if captured else 0)
+
+
 def test_full_boundary_hit_preserves_async_speculative_decode_token_count():
     """Sampling saved logits must not advance the processed-token frontier."""
     scheduler = create_scheduler(

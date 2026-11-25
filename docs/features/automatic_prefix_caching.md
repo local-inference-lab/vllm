@@ -83,9 +83,11 @@ checkpoints.
 
 With first-come, first-served scheduling, a text chat request can wait for a
 running prefill that shares its verified instruction prefix. This applies to
-prefixes at least as long as the per-step token budget. Requests become eligible
-to compute their own prefix once the producer stops or the waiting request is
-ten seconds old.
+prefixes at least as long as the per-step token budget. With async scheduling,
+the follower waits for the worker to return the step that reaches the instruction
+boundary. It can then reuse the checkpoint if the worker captured it, or compute
+the missing prefix otherwise. Waiting also ends if the producer stops or the
+waiting request is ten seconds old.
 
 Each checkpoint includes the recurrent state, attention tails, private selector
 state, and final hidden state. MTP additionally saves its selector state and
