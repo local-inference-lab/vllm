@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Backend for GatedDeltaNet attention."""
 
+import os
+import time
 from copy import copy
 from dataclasses import dataclass, replace
 from typing import Literal
@@ -10,6 +12,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
@@ -27,8 +30,48 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import MambaSpec
 
+logger = init_logger(__name__)
 
-@triton.jit(do_not_specialize=["num_reqs", "source_stride", "accepted_stride"])
+# A uniform speculative-decode batch padded up to a captured graph size also
+# takes the single-launch metadata path. Off restores the generic path for
+# every padded batch.
+_PADDED_SPEC_DECODE_FASTPATH = bool(
+    int(os.getenv("VLLM_GDN_SPEC_DECODE_PADDED_FASTPATH", "1"))
+)
+_SPEC_PATH_LOG_SECONDS = 60.0
+
+
+class _SpecDecodePathStats:
+    """Counts which metadata path each speculative decode-only build took."""
+
+    def __init__(self) -> None:
+        self.uniform = 0
+        self.padded = 0
+        self.generic = 0
+        self._logged = time.monotonic()
+
+    def maybe_log(self) -> None:
+        now = time.monotonic()
+        if now - self._logged < _SPEC_PATH_LOG_SECONDS:
+            return
+        logger.info(
+            "GDN spec decode metadata builds in %.0fs: uniform=%d "
+            "padded_uniform=%d generic=%d",
+            now - self._logged,
+            self.uniform,
+            self.padded,
+            self.generic,
+        )
+        self.uniform = self.padded = self.generic = 0
+        self._logged = now
+
+
+_spec_path_stats = _SpecDecodePathStats()
+
+
+@triton.jit(
+    do_not_specialize=["num_live", "num_reqs", "source_stride", "accepted_stride"]
+)
 def _fill_uniform_spec_metadata(
     source,
     accepted_source,
@@ -37,28 +80,37 @@ def _fill_uniform_spec_metadata(
     sequence_masks,
     token_indices,
     query_start_loc,
+    num_live,
     num_reqs,
     source_stride,
     accepted_stride,
     WINDOW: tl.constexpr,
     BLOCK: tl.constexpr,
+    NULL_STATE: tl.constexpr,
 ):
+    # Rows below num_live are requests; rows from num_live to num_reqs are
+    # graph padding and get the values the generic path gives them.
     token = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     row = token // WINDOW
     column = token % WINDOW
-    live = row < num_reqs
-    state = tl.load(source + row.to(tl.int64) * source_stride + column, live, other=0)
-    tl.store(state_indices + token, state, live)
+    live = row < num_live
+    in_batch = row < num_reqs
+    state = tl.load(
+        source + row.to(tl.int64) * source_stride + column, live, other=NULL_STATE
+    )
+    tl.store(state_indices + token, state, in_batch)
     tl.store(token_indices + token, token, live)
-    first = live & (column == 0)
+    first = in_batch & (column == 0)
     count = tl.load(
-        accepted_source + row.to(tl.int64) * accepted_stride, first, other=0
+        accepted_source + row.to(tl.int64) * accepted_stride,
+        live & (column == 0),
+        other=1,
     )
     tl.store(accepted + row, count, first)
-    tl.store(sequence_masks + row, True, first)
-    tl.store(query_start_loc + row, token, first)
+    tl.store(sequence_masks + row, live, first)
+    tl.store(query_start_loc + row, tl.minimum(token, num_live * WINDOW), first)
     if tl.program_id(0) == 0:
-        tl.store(query_start_loc + num_reqs, num_reqs * WINDOW)
+        tl.store(query_start_loc + num_reqs, num_live * WINDOW)
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -281,6 +333,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self._uniform_spec_masks_cpu = torch.ones(
             self.decode_cudagraph_max_bs, dtype=torch.bool
         )
+        self._uniform_spec_rows_cpu = torch.arange(self.decode_cudagraph_max_bs)
         self._uniform_spec_tokens = torch.arange(
             self.decode_cudagraph_max_bs, dtype=torch.int32, device=device
         )
@@ -288,13 +341,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.decode_cudagraph_max_bs + 1, dtype=torch.int32, device=device
         ) * (self.num_spec + 1)
 
-    def _can_reuse_spec_inputs(
+    def _uniform_spec_live_reqs(
         self,
         m: CommonAttentionMetadata,
         num_accepted_tokens: torch.Tensor | None,
         num_decode_draft_tokens_cpu: torch.Tensor | None,
-    ) -> bool:
-        return (
+    ) -> int:
+        """Number of requests of a uniform speculative-decode batch, else 0.
+
+        Every request must carry one target token and ``num_spec`` drafts.
+        Rows after the requests must be graph padding: no tokens, no drafts.
+        """
+        if not (
             self._reuse_spec_decode_inputs
             and self.use_spec_decode
             and self.use_full_cuda_graph
@@ -303,25 +361,53 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and num_accepted_tokens is not None
             and num_decode_draft_tokens_cpu is not None
             and 0 < m.num_actual_tokens <= self.decode_cudagraph_max_bs
-            and m.num_actual_tokens == m.num_reqs * (self.num_spec + 1)
-            and bool(torch.all(num_decode_draft_tokens_cpu == self.num_spec))
-            and bool(torch.all(torch.diff(m.query_start_loc_cpu) == self.num_spec + 1))
+        ):
+            return 0
+        num_reqs = m.num_reqs
+        window = self.num_spec + 1
+        drafts = num_decode_draft_tokens_cpu[:num_reqs]
+        query_lens = torch.diff(m.query_start_loc_cpu)[:num_reqs]
+        if drafts.shape[0] != num_reqs or query_lens.shape[0] != num_reqs:
+            return 0
+        num_live = int(torch.count_nonzero(drafts == self.num_spec))
+        if num_live == num_reqs:
+            if m.num_actual_tokens != num_reqs * window:
+                return 0
+        elif (
+            not _PADDED_SPEC_DECODE_FASTPATH
+            or num_live == 0
+            or num_reqs > self.decode_cudagraph_max_bs
+            or not bool(torch.all(drafts[num_live:] < 0))
+            or not bool(torch.all(query_lens[num_live:] == 0))
+        ):
+            return 0
+        if not (
+            bool(torch.all(drafts[:num_live] == self.num_spec))
+            and bool(torch.all(query_lens[:num_live] == window))
             and (m.is_prefilling is None or not bool(torch.any(m.is_prefilling)))
-        )
+        ):
+            return 0
+        return num_live
 
     def _build_uniform_spec_decode(
         self,
         m: CommonAttentionMetadata | GDNAttentionMetadata,
         num_accepted_tokens: torch.Tensor,
+        num_live: int,
     ) -> GDNAttentionMetadata:
         """Populate uniform speculative metadata in builder-owned graph storage.
 
         Everything the layers read is written into the builder-owned graph
         buffers, exactly where the generic path writes it, so a full cudagraph
         captured through either path replays correctly through the other.
+
+        ``num_live`` requests lead the batch; the rows after them, up to
+        ``m.num_reqs``, are graph padding and get the generic path's padding
+        values: null state, not speculative, no tokens, one accepted token.
         """
         num_reqs = m.num_reqs
-        num_tokens = m.num_actual_tokens
+        window = self.num_spec + 1
+        num_tokens = num_live * window
         source = self.mamba_aligned_state_indices
         assert source is not None
         spec_state_indices = self.spec_state_indices_tensor[:num_reqs]
@@ -330,7 +416,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         spec_query_start_loc = self.spec_query_start_loc[: num_reqs + 1]
         accepted = self.num_accepted_tokens[:num_reqs]
         if source.is_cuda:
-            _fill_uniform_spec_metadata[(triton.cdiv(num_tokens, 128),)](
+            _fill_uniform_spec_metadata[(triton.cdiv(num_reqs * window, 128),)](
                 source,
                 num_accepted_tokens,
                 spec_state_indices,
@@ -338,30 +424,42 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_sequence_masks,
                 spec_token_indx,
                 spec_query_start_loc,
+                num_live,
                 num_reqs,
                 source.stride(0),
                 num_accepted_tokens.stride(0),
-                WINDOW=self.num_spec + 1,
+                WINDOW=window,
                 BLOCK=128,
+                NULL_STATE=NULL_BLOCK_ID,
             )
         else:
-            spec_state_indices.copy_(source[:num_reqs, : self.num_spec + 1])
-            spec_sequence_masks.fill_(True)
+            spec_state_indices[:num_live].copy_(source[:num_live, :window])
+            spec_state_indices[num_live:].fill_(NULL_BLOCK_ID)
+            spec_sequence_masks[:num_live].fill_(True)
+            spec_sequence_masks[num_live:].fill_(False)
             spec_token_indx.copy_(self._uniform_spec_tokens[:num_tokens])
-            spec_query_start_loc.copy_(self._uniform_spec_query_start[: num_reqs + 1])
-            accepted.copy_(num_accepted_tokens[:num_reqs])
+            spec_query_start_loc[: num_live + 1].copy_(
+                self._uniform_spec_query_start[: num_live + 1]
+            )
+            spec_query_start_loc[num_live + 1 :].fill_(num_tokens)
+            accepted[:num_live].copy_(num_accepted_tokens[:num_live])
+            accepted[num_live:].fill_(1)
+        if num_live == num_reqs:
+            spec_sequence_masks_cpu = self._uniform_spec_masks_cpu[:num_reqs]
+        else:
+            spec_sequence_masks_cpu = self._uniform_spec_rows_cpu[:num_reqs] < num_live
         return GDNAttentionMetadata(
             num_prefills=0,
             num_prefill_tokens=0,
             num_decodes=0,
             num_decode_tokens=0,
-            num_spec_decodes=num_reqs,
+            num_spec_decodes=num_live,
             num_spec_decode_tokens=num_tokens,
-            num_actual_tokens=num_tokens,
+            num_actual_tokens=m.num_actual_tokens,
             spec_query_start_loc=spec_query_start_loc,
             spec_state_indices_tensor=spec_state_indices,
             spec_sequence_masks=spec_sequence_masks,
-            spec_sequence_masks_cpu=self._uniform_spec_masks_cpu[:num_reqs],
+            spec_sequence_masks_cpu=spec_sequence_masks_cpu,
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=self.non_spec_token_indx[:0],
             num_accepted_tokens=accepted,
@@ -446,14 +544,21 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
-        if m.uniform_decode_graph and self._can_reuse_spec_inputs(
+        num_live = self._uniform_spec_live_reqs(
             m, num_accepted_tokens, num_decode_draft_tokens_cpu
-        ):
+        )
+        if num_live:
+            if num_live == m.num_reqs:
+                _spec_path_stats.uniform += 1
+            else:
+                _spec_path_stats.padded += 1
+            _spec_path_stats.maybe_log()
+        if m.uniform_decode_graph and num_live:
             assert num_accepted_tokens is not None
             # Uniform graphs read the packed decode metadata, not the mixed
             # prefill worklists. Mixed graphs keep their complete staging even
             # when the request rows happen to be uniform on this invocation.
-            return self._build_uniform_spec_decode(m, num_accepted_tokens)
+            return self._build_uniform_spec_decode(m, num_accepted_tokens, num_live)
         mixed = getattr(self, "_b12x_mixed", None)
         if mixed is not None:
             mixed.stage(
@@ -468,12 +573,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     else None
                 ),
             )
-        if self._can_reuse_spec_inputs(
-            m, num_accepted_tokens, num_decode_draft_tokens_cpu
-        ):
+        if num_live:
             assert num_accepted_tokens is not None
             return replace(
-                self._build_uniform_spec_decode(m, num_accepted_tokens),
+                self._build_uniform_spec_decode(m, num_accepted_tokens, num_live),
                 b12x_mixed=mixed,
             )
 
@@ -567,6 +670,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 num_decode_tokens = 0
 
             if num_prefills == 0 and num_decodes == 0:
+                _spec_path_stats.generic += 1
+                _spec_path_stats.maybe_log()
                 spec_token_size = min(
                     num_spec_decodes * (self.num_spec + 1),
                     query_start_loc_cpu[-1].item(),
@@ -932,7 +1037,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         ):
             assert metadata.num_accepted_tokens is not None
             return self._build_uniform_spec_decode(
-                metadata, metadata.num_accepted_tokens
+                metadata, metadata.num_accepted_tokens, metadata.num_spec_decodes
             )
         mixed = None
         if metadata.b12x_mixed is not None:
@@ -957,7 +1062,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         ):
             assert metadata.num_accepted_tokens is not None
             return replace(
-                self._build_uniform_spec_decode(metadata, metadata.num_accepted_tokens),
+                self._build_uniform_spec_decode(
+                    metadata, metadata.num_accepted_tokens, metadata.num_spec_decodes
+                ),
                 b12x_mixed=mixed,
                 b12x_prefill_live_counts=prefill_live_counts,
             )

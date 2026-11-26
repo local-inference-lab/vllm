@@ -12,6 +12,7 @@ import torch
 
 from vllm.v1.attention.backends.b12x_gdn_metadata import B12xGdnMixedMetadata
 from vllm.v1.attention.backends.gdn_attn import _fill_uniform_spec_metadata
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 
 def benchmark_case(rows: int) -> dict:
@@ -44,10 +45,12 @@ def benchmark_case(rows: int) -> dict:
             tokens,
             starts,
             rows,
+            rows,
             source.stride(0),
             counts.stride(0),
             WINDOW=window,
             BLOCK=128,
+            NULL_STATE=NULL_BLOCK_ID,
         )
 
     outputs = (state, accepted, masks, tokens, starts)

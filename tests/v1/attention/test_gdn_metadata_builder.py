@@ -82,7 +82,7 @@ def test_uniform_spec_metadata_gpu_preserves_live_values_and_graph_storage(
             setattr(owner, field, getattr(builder, field).clone())
 
     def build_metadata():
-        metadata = builder._build_uniform_spec_decode(common, counts)
+        metadata = builder._build_uniform_spec_decode(common, counts, num_reqs)
         if rebind_group:
             return owner.update_block_table(metadata, source, source)
         return metadata
